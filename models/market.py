@@ -1,7 +1,5 @@
 """Market data models: markets, order books, and price points."""
 
-"""Market domain models: prices, order books, and market metadata."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
