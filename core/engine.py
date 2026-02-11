@@ -149,6 +149,69 @@ class TradingEngine:
         for signal in exit_signals:
             await self._execute_signal(signal)
 
+    async def _check_resolutions(self) -> None:
+        """Check if any open paper trades have resolved and record P&L."""
+        open_trades = self.memory.get_open_trades()
+        if not open_trades:
+            return
+
+        logger.info(f"Checking resolution for {len(open_trades)} open paper trades...")
+
+        for trade_row in open_trades:
+            market_id = trade_row["market_id"]
+            try:
+                result = await self.polymarket.check_market_resolution(market_id)
+            except Exception as e:
+                logger.debug(f"Resolution check failed for {market_id}: {e}")
+                continue
+
+            if not result:
+                continue
+
+            # Market resolved — calculate P&L
+            winning_outcome = result["winning_outcome"]  # "Yes" or "No"
+            our_outcome = trade_row["outcome"]  # "Yes" or "No"
+            side = trade_row["side"]  # "BUY" or "SELL"
+            size_usd = trade_row["size_usd"]
+            price = trade_row["price"]
+            shares = size_usd / price if price > 0 else 0
+            question = trade_row["market_question"] or market_id
+
+            if side == "BUY":
+                # BUY YES @ 0.25: if YES wins, payout = shares * $1, profit = payout - cost
+                # BUY YES @ 0.25: if NO wins, payout = $0, loss = -cost
+                won = (our_outcome == winning_outcome)
+                if won:
+                    payout = shares * 1.0
+                    pnl = payout - size_usd
+                else:
+                    pnl = -size_usd
+            else:
+                # SELL YES @ 0.75: if NO wins (YES loses), profit = size_usd
+                # SELL YES @ 0.75: if YES wins, loss = shares * 1.0 - size_usd
+                won = (our_outcome != winning_outcome)
+                if won:
+                    pnl = size_usd
+                else:
+                    pnl = -(shares * 1.0 - size_usd)
+
+            # Record in DB
+            trade_result = self.memory.mark_trade_resolved(
+                trade_id=trade_row["id"],
+                market_id=market_id,
+                won=won,
+                pnl=pnl,
+            )
+
+            # Record in portfolio for live snapshot tracking
+            self.portfolio.record_result(trade_result)
+
+            status = "WON" if won else "LOST"
+            logger.info(
+                f"🎯 RESOLVED: {status} ${pnl:+.2f} on [{question[:80]}] "
+                f"(bought {our_outcome} @ {price:.3f}, resolved {winning_outcome})"
+            )
+
     async def _run_cycle(self) -> None:
         """Execute a single scan → evaluate → trade cycle."""
         # 0. Refresh market cache and check exits on existing positions
@@ -161,6 +224,9 @@ class TradingEngine:
 
         # 1b. Check existing positions for exits
         await self._check_exits()
+
+        # 1c. Check if any paper trades have resolved
+        await self._check_resolutions()
 
         # 2. Evaluate with each strategy
         all_signals: list[Signal] = []

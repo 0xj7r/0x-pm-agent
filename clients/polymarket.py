@@ -391,5 +391,61 @@ class PolymarketClient:
 
         return events
 
+    async def check_market_resolution(self, market_id: str) -> dict | None:
+        """Check if a market has resolved via the Gamma API.
+
+        Args:
+            market_id: Gamma market ID (also accepts condition_id).
+
+        Returns {"resolved": True, "winning_outcome": "Yes"|"No"} or None.
+        """
+        try:
+            # Try by ID first, fall back to condition_id
+            resp = await self._http.get(
+                f"{self.gamma_url}/markets/{market_id}",
+            )
+            if resp.status_code == 404:
+                resp = await self._http.get(
+                    f"{self.gamma_url}/markets",
+                    params={"condition_id": market_id},
+                )
+            resp.raise_for_status()
+            data = resp.json()
+
+            # API may return a single object or a list
+            markets = data if isinstance(data, list) else [data]
+            if not markets:
+                return None
+
+            market = markets[0]
+            if not market.get("closed", False):
+                return None
+
+            # outcomePrices is a JSON string like '["1","0"]' or '["0","1"]'
+            outcome_prices_raw = market.get("outcomePrices", "[]")
+            try:
+                prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+            except (json.JSONDecodeError, ValueError):
+                return None
+
+            if len(prices) < 2:
+                return None
+
+            yes_price = _safe_float(prices[0], 0.0)
+            no_price = _safe_float(prices[1], 0.0)
+
+            # A resolved market has one outcome at 1.0 and the other at 0.0
+            if yes_price >= 0.99:
+                return {"resolved": True, "winning_outcome": "Yes"}
+            elif no_price >= 0.99:
+                return {"resolved": True, "winning_outcome": "No"}
+
+            # Market is closed but not cleanly resolved (voided?)
+            return None
+
+        except Exception as e:
+            logger.warning(f"Failed to check resolution for {condition_id}: {e}")
+            return None
+
     async def close(self):
         await self._http.aclose()

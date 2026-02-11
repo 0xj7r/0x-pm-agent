@@ -143,6 +143,30 @@ class MemoryStore:
         )
         self.conn.commit()
 
+    def get_open_trades(self) -> list[dict]:
+        """Return all paper trades that have not been resolved yet."""
+        rows = self.conn.execute(
+            """SELECT t.*
+            FROM trades t
+            LEFT JOIN results r ON t.id = r.trade_id
+            WHERE t.paper = 1
+              AND (r.trade_id IS NULL OR r.resolved = 0)""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_trade_resolved(self, trade_id: str, market_id: str, won: bool, pnl: float):
+        """Mark a paper trade as resolved with its P&L."""
+        result = TradeResult(
+            trade_id=trade_id,
+            market_id=market_id,
+            resolved=True,
+            won=won,
+            pnl_usd=pnl,
+            resolved_at=datetime.utcnow(),
+        )
+        self.save_result(result)
+        return result
+
     def get_strategy_stats(self, source: str) -> dict:
         """Get win rate and average PnL for a strategy."""
         rows = self.conn.execute(
