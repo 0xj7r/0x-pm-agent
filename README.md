@@ -127,26 +127,65 @@ Discovers wallets with high win rates from the Polymarket leaderboard, monitors 
 - **Kill switch**: Agent shuts down if balance drops below threshold (default $5)
 - **API cost tracking**: Claude inference costs are deducted from P&L
 
+## Prerequisites
+
+- **Python 3.11+** (uses `match` statements, `|` union types)
+- **An Anthropic API key** for Claude Opus (the agent's brain)
+- **A Polymarket account** with API credentials (for live trading)
+- **USDC on Polygon** (for live trading - not needed for paper trading or backtesting)
+
 ## Setup
 
+### 1. Clone and install
+
 ```bash
+git clone https://github.com/0xj7r/polymarket-agent.git
+cd polymarket-agent
+
+# Create virtual environment (recommended)
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+
 # Install dependencies
 pip install -r requirements.txt
-
-# Configure
-cp .env.example .env
-# Edit .env with:
-#   POLYMARKET_PRIVATE_KEY - your Polygon wallet private key
-#   ANTHROPIC_API_KEY - your Claude API key
 ```
 
-### Wallet Setup
+### 2. Configure environment
 
-Polymarket is a decentralized exchange on Polygon. You need:
+```bash
+cp .env.example .env
+```
 
-1. An Ethereum wallet (the private key goes in `.env`)
-2. USDC on Polygon network in that wallet
-3. A small amount of MATIC for gas fees
+Edit `.env` with your credentials:
+
+```bash
+# Required for all modes
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Required for live trading only
+POLYMARKET_PRIVATE_KEY=0x...
+```
+
+### 3. Wallet setup (for live trading)
+
+Polymarket is a decentralized exchange on the Polygon network. To trade with real money:
+
+1. **Create a wallet** - Use MetaMask or any Ethereum wallet. Export the private key and put it in `.env`
+2. **Get USDC on Polygon** - You can:
+   - Bridge USDC from Ethereum mainnet to Polygon via [Polygon Bridge](https://portal.polygon.technology/bridge)
+   - Buy USDC directly on Polygon via an exchange (Coinbase, Binance) and withdraw to your wallet address
+   - Use a fiat onramp like MoonPay or Transak
+3. **Get POL for gas** - You need a small amount of POL (Polygon's native token) for transaction fees. ~$1 worth is plenty. Most exchanges let you withdraw POL directly to Polygon
+4. **Polymarket API credentials** - Visit [Polymarket](https://polymarket.com), connect your wallet, and the bot will derive API credentials from your private key automatically
+
+### 4. Verify setup
+
+```bash
+# Paper trading mode (no wallet needed, uses real market data)
+python main.py --log-level DEBUG
+```
+
+You should see the agent scanning markets and producing signals without placing real orders.
 
 ## Usage
 
@@ -157,7 +196,7 @@ python main.py
 # Backtest against historical resolved markets
 python main.py --backtest
 
-# Live trading (real money)
+# Live trading (real money - requires funded wallet)
 python main.py --live
 
 # Debug logging
@@ -166,10 +205,26 @@ python main.py --log-level DEBUG
 
 ### Recommended workflow
 
-1. Run backtests to validate strategy edge on historical data
-2. Run paper trading for a few days to verify real-time signal quality
-3. Go live with a small bankroll ($50-100)
-4. Monitor and tune parameters based on results
+1. **Backtest first** - Run `python main.py --backtest` to validate strategy edge on historical data
+2. **Paper trade** - Run `python main.py` for a few days to verify real-time signal quality. Check `trades.db` for results
+3. **Go live small** - Start with $50-100: `python main.py --live`. The kill switch will shut down the agent if balance drops below $5
+4. **Monitor** - Watch logs for trade execution, check portfolio snapshots in SQLite
+5. **Tune** - Adjust `MIN_EDGE_THRESHOLD`, `MAX_POSITION_PCT`, and strategy toggles based on what's working
+
+### Running on a VPS
+
+For 24/7 operation on a cheap VPS ($4-5/month):
+
+```bash
+# Using screen or tmux
+screen -S polymarket
+python main.py --live
+# Ctrl+A, D to detach
+
+# Or using systemd (create /etc/systemd/system/polymarket-agent.service)
+# Or using nohup
+nohup python main.py --live > agent.log 2>&1 &
+```
 
 ## Configuration
 
