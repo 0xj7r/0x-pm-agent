@@ -5,6 +5,7 @@ Wraps py-clob-client for trading and uses Gamma API for market discovery.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 
@@ -255,6 +256,135 @@ class PolymarketClient:
             liquidity=_safe_float(raw.get("liquidity"), 0.0),
             raw=raw,
         )
+
+    async def get_weather_events(
+        self,
+        cities: list[str],
+        dates: list[datetime],
+    ) -> list[dict]:
+        """Fetch weather temperature bucket events by slug pattern.
+
+        Args:
+            cities: City names (canonical, e.g. "New York", "London")
+            dates: Target dates to check
+
+        Returns:
+            List of dicts with keys: city, target_date, slug, buckets
+            where buckets is a list of TemperatureBucket objects.
+        """
+        from strategies.weather import (
+            CITY_SLUG_MAP,
+            TemperatureBucket,
+            parse_bucket_label,
+        )
+
+        events = []
+        for city in cities:
+            slug_city = CITY_SLUG_MAP.get(city)
+            if not slug_city:
+                logger.debug(f"No slug mapping for city: {city}")
+                continue
+
+            for date in dates:
+                month_name = date.strftime("%B").lower()
+                day = date.day  # no leading zero
+                slug = f"highest-temperature-in-{slug_city}-on-{month_name}-{day}"
+
+                try:
+                    resp = await self._http.get(
+                        f"{self.gamma_url}/events",
+                        params={"slug": slug},
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as e:
+                    logger.debug(f"Failed to fetch event {slug}: {e}")
+                    continue
+
+                # Gamma returns a list of events; we expect 0 or 1
+                event_list = data if isinstance(data, list) else [data]
+
+                for event in event_list:
+                    if not event or not isinstance(event, dict):
+                        continue
+
+                    sub_markets = event.get("markets", [])
+                    if not sub_markets:
+                        continue
+
+                    buckets = []
+                    for mkt in sub_markets:
+                        group_title = mkt.get("groupItemTitle", "")
+                        if not group_title:
+                            continue
+
+                        low, high = parse_bucket_label(group_title)
+                        if low is None and high is None:
+                            continue
+
+                        # Parse outcome prices: JSON string '["0.33", "0.67"]'
+                        outcome_prices_raw = mkt.get("outcomePrices", "[]")
+                        try:
+                            prices = json.loads(outcome_prices_raw)
+                            yes_price = float(prices[0]) if len(prices) > 0 else 0.5
+                            no_price = float(prices[1]) if len(prices) > 1 else 1.0 - yes_price
+                        except (json.JSONDecodeError, ValueError, IndexError):
+                            yes_price = 0.5
+                            no_price = 0.5
+
+                        # Extract token IDs
+                        tokens = mkt.get("tokens", [])
+                        yes_token = ""
+                        no_token = ""
+                        for tok in tokens:
+                            outcome = tok.get("outcome", "").lower()
+                            if outcome == "yes":
+                                yes_token = tok.get("token_id", "")
+                            elif outcome == "no":
+                                no_token = tok.get("token_id", "")
+
+                        # Also try clobTokenIds as fallback
+                        if not yes_token or not no_token:
+                            clob_ids_raw = mkt.get("clobTokenIds", "[]")
+                            try:
+                                clob_ids = json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+                                if len(clob_ids) >= 2:
+                                    yes_token = yes_token or clob_ids[0]
+                                    no_token = no_token or clob_ids[1]
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
+                        bucket = TemperatureBucket(
+                            label=group_title,
+                            low=low,
+                            high=high,
+                            yes_price=yes_price,
+                            no_price=no_price,
+                            market_id=str(mkt.get("id", "")),
+                            condition_id=str(mkt.get("conditionId", "")),
+                            question=mkt.get("question", ""),
+                            yes_token_id=yes_token,
+                            no_token_id=no_token,
+                            active=mkt.get("active", False),
+                            closed=mkt.get("closed", True),
+                            accepting_orders=mkt.get("acceptingOrders", False),
+                        )
+                        buckets.append(bucket)
+
+                    if buckets:
+                        events.append({
+                            "city": city,
+                            "target_date": date,
+                            "slug": slug,
+                            "event_id": event.get("id", ""),
+                            "title": event.get("title", ""),
+                            "buckets": buckets,
+                        })
+                        logger.info(
+                            f"Weather event: {slug} → {len(buckets)} buckets"
+                        )
+
+        return events
 
     async def close(self):
         await self._http.aclose()

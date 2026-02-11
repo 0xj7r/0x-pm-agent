@@ -44,7 +44,10 @@ class TradingEngine:
     async def initialize(self):
         """Set up the agent: fetch balance, load state."""
         balance = await self.polymarket.get_balance()
-        if balance <= 0 and not self.config.PAPER_TRADE:
+        if balance <= 0 and self.config.PAPER_TRADE:
+            balance = 100.0
+            logger.info(f"Paper mode: using starting balance of ${balance:.2f}")
+        elif balance <= 0:
             logger.warning("No balance detected. Ensure wallet is funded with USDC on Polygon.")
             balance = 0.0
 

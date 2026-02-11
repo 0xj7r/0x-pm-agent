@@ -1,21 +1,21 @@
-"""Weather market strategy.
+"""Weather market strategy for Polymarket temperature bucket markets.
 
-Uses NOAA GEFS ensemble forecasts to build probability distributions,
-then finds mispriced weather markets on Polymarket.
-
-The edge: government satellites + 21 independent model runs vs. retail gut feeling.
+Discovers weather events via Gamma API slug pattern, builds probability
+distributions from NOAA GEFS ensemble forecasts, and finds mispriced
+temperature buckets.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from clients.claude_client import ClaudeClient
-from clients.weather import CITY_COORDS, WeatherClient
+from clients.polymarket import PolymarketClient
+from clients.weather import WeatherClient
 from config import Config
 from models.market import Market, MarketCategory, Outcome
 from models.trade import Side, Signal, SignalSource
@@ -23,270 +23,300 @@ from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
+# City name → slug component mapping
+CITY_SLUG_MAP = {
+    "Seoul": "seoul",
+    "London": "london",
+    "Toronto": "toronto",
+    "New York": "nyc",
+    "NYC": "nyc",
+    "Atlanta": "atlanta",
+    "Ankara": "ankara",
+    "Chicago": "chicago",
+    "Dallas": "dallas",
+    "Miami": "miami",
+    "Seattle": "seattle",
+    "Auckland": "auckland",
+    "Buenos Aires": "buenos-aires",
+}
+
+# Reverse: slug component → canonical city name (for weather client lookup)
+SLUG_TO_CITY = {v: k for k, v in CITY_SLUG_MAP.items()}
+# Fix NYC duplicate
+SLUG_TO_CITY["nyc"] = "New York"
+
+
+@dataclass
+class TemperatureBucket:
+    """A parsed temperature bucket from a Polymarket sub-market."""
+    label: str           # raw groupItemTitle e.g. "36-37°F"
+    low: float | None    # None for "X or below" buckets
+    high: float | None   # None for "X or higher" buckets
+    yes_price: float
+    no_price: float
+    market_id: str
+    condition_id: str
+    question: str
+    yes_token_id: str
+    no_token_id: str
+    active: bool
+    closed: bool
+    accepting_orders: bool
+
+    @property
+    def tradeable(self) -> bool:
+        return self.active and not self.closed and self.accepting_orders
+
 
 @dataclass
 class ForecastSnapshot:
     """A single forecast observation for trend tracking."""
-
     city: str
-    threshold: float
-    direction: str
+    bucket_label: str
     ensemble_prob: float
-    bucket: str  # rounded to nearest 5% for agreement detection
+    prob_bucket: str  # rounded to nearest 5%
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
-# Common patterns in Polymarket weather questions.
-QUESTION_PATTERNS = [
-    r"(?:Will|will)\s+(.+?)\s+(?:high\s+)?temperature.*?(?:above|over|exceed|reach)\s+(\d+)",
-    r"(?:Will|will)\s+(.+?)\s+(?:high\s+)?temperature.*?(?:below|under)\s+(\d+)",
-    r"(.+?)\s+(?:high\s+)?temp.*?(?:above|over|exceed)\s+(\d+)",
-    r"(.+?)\s+(?:high\s+)?temp.*?(?:below|under)\s+(\d+)",
-]
 
+def parse_bucket_label(label: str) -> tuple[float | None, float | None]:
+    """Parse groupItemTitle to extract (low, high) temperature bounds.
 
-def extract_temperature_threshold(question: str) -> tuple[str | None, float | None, str | None]:
-    """Parse a weather market question to extract city, temperature, and direction.
+    Returns:
+        (low, high) where None means unbounded on that side.
 
     Examples:
-        "Will NYC high temperature be above 80°F tomorrow?" → ("New York", 80.0, "above")
-        "Will Chicago temperature reach 32°F or below?" → ("Chicago", 32.0, "below")
+        "35°F or below"  → (None, 35.0)
+        "36-37°F"        → (36.0, 37.0)
+        "46°F or higher" → (46.0, None)
     """
-    question_lower = question.lower()
-    direction = "above" if any(w in question_lower for w in ["above", "over", "exceed"]) else "below"
+    label = label.strip()
 
-    for pattern in QUESTION_PATTERNS:
-        match = re.search(pattern, question, re.IGNORECASE)
-        if match:
-            city_raw = match.group(1).strip()
-            threshold = float(match.group(2))
-            return city_raw, threshold, direction
+    # "X°F or below" / "X°F or less"
+    m = re.match(r"(\d+)°?F?\s+or\s+(?:below|less)", label, re.IGNORECASE)
+    if m:
+        return (None, float(m.group(1)))
 
-    return None, None, None
+    # "X°F or higher" / "X°F or more" / "X°F or above"
+    m = re.match(r"(\d+)°?F?\s+or\s+(?:higher|more|above)", label, re.IGNORECASE)
+    if m:
+        return (float(m.group(1)), None)
 
+    # "X-Y°F" range
+    m = re.match(r"(\d+)\s*[-–]\s*(\d+)°?F?", label, re.IGNORECASE)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
 
-# Map common abbreviations/variants to our canonical city names
-CITY_ALIASES = {
-    "nyc": "New York",
-    "new york city": "New York",
-    "la": "Los Angeles",
-    "sf": "San Francisco",
-    "dc": "Washington DC",
-    "washington": "Washington DC",
-    "philly": "Philadelphia",
-    "vegas": "Las Vegas",
-}
+    logger.warning(f"Could not parse bucket label: {label}")
+    return (None, None)
 
 
-def resolve_city(raw: str) -> str | None:
-    """Map a raw city name from a market question to our canonical name."""
-    lower = raw.lower().strip()
+def ensemble_prob_for_bucket(
+    member_temps: list[float],
+    low: float | None,
+    high: float | None,
+) -> float:
+    """Calculate fraction of ensemble members whose high temp falls in bucket.
 
-    # Check aliases
-    if lower in CITY_ALIASES:
-        return CITY_ALIASES[lower]
+    Polymarket buckets are inclusive on both ends based on question wording.
+    """
+    if not member_temps:
+        return 0.0
 
-    # Check direct match
-    for city in CITY_COORDS:
-        if city.lower() == lower or city.lower() in lower or lower in city.lower():
-            return city
-
-    return None
+    count = 0
+    for t in member_temps:
+        # Round to nearest integer to match Polymarket's integer °F buckets
+        t_rounded = round(t)
+        if low is None and high is not None:
+            # "X or below": temp <= high
+            if t_rounded <= high:
+                count += 1
+        elif low is not None and high is None:
+            # "X or higher": temp >= low
+            if t_rounded >= low:
+                count += 1
+        elif low is not None and high is not None:
+            # "X-Y": low <= temp <= high
+            if low <= t_rounded <= high:
+                count += 1
+    return count / len(member_temps)
 
 
 class WeatherStrategy(Strategy):
-    def __init__(self, config: Config, weather_client: WeatherClient, claude_client: ClaudeClient):
+    def __init__(
+        self,
+        config: Config,
+        weather_client: WeatherClient,
+        polymarket_client: PolymarketClient,
+    ):
         self.config = config
         self.weather = weather_client
-        self.claude = claude_client
-        self.cities = config.WEATHER_CITIES
+        self.polymarket = polymarket_client
+        self.min_edge = config.MIN_EDGE_THRESHOLD
         self.enable_trend = config.ENABLE_TREND_DETECTION
-        # Trend detection: track forecast history per (city, threshold, direction)
+        # Trend tracking
         self._forecast_history: dict[str, list[ForecastSnapshot]] = defaultdict(list)
-        self._max_history = 20  # keep last N snapshots per key
-
-    def _trend_key(self, city: str, threshold: float, direction: str) -> str:
-        return f"{city}:{threshold}:{direction}"
-
-    def _bucket_prob(self, prob: float) -> str:
-        """Round probability to nearest 5% bucket for agreement detection."""
-        return f"{round(prob * 20) * 5}"
-
-    def _record_snapshot(self, city: str, threshold: float, direction: str, ensemble_prob: float):
-        """Store a forecast snapshot for trend tracking."""
-        key = self._trend_key(city, threshold, direction)
-        snapshot = ForecastSnapshot(
-            city=city,
-            threshold=threshold,
-            direction=direction,
-            ensemble_prob=ensemble_prob,
-            bucket=self._bucket_prob(ensemble_prob),
-        )
-        history = self._forecast_history[key]
-        history.append(snapshot)
-        if len(history) > self._max_history:
-            self._forecast_history[key] = history[-self._max_history :]
-
-    def _get_trend_multiplier(self, city: str, threshold: float, direction: str) -> float:
-        """Calculate confidence multiplier based on consecutive ensemble agreement.
-
-        If the ensemble has agreed on the same bucket for N consecutive snapshots,
-        boost confidence: 1.0 (no trend), up to 1.5 (5+ consecutive agreements).
-        """
-        if not self.enable_trend:
-            return 1.0
-
-        key = self._trend_key(city, threshold, direction)
-        history = self._forecast_history.get(key, [])
-
-        if len(history) < 2:
-            return 1.0
-
-        # Count consecutive agreements from most recent backward
-        current_bucket = history[-1].bucket
-        streak = 1
-        for snap in reversed(history[:-1]):
-            if snap.bucket == current_bucket:
-                streak += 1
-            else:
-                break
-
-        if streak >= 5:
-            multiplier = 1.5
-        elif streak >= 3:
-            multiplier = 1.25
-        elif streak >= 2:
-            multiplier = 1.1
-        else:
-            multiplier = 1.0
-
-        if multiplier > 1.0:
-            logger.info(
-                f"Trend detected: {city} {direction} {threshold}°F | "
-                f"Bucket {current_bucket}% agreed {streak}x | "
-                f"Confidence multiplier: {multiplier:.2f}"
-            )
-
-        return multiplier
+        self._max_history = 20
 
     @property
     def name(self) -> str:
         return "weather"
 
-    async def evaluate(self, markets: list[Market]) -> list[Signal]:
-        """Find mispriced weather markets using NOAA ensemble data."""
-        # 1. Filter to weather markets only
-        weather_markets = [m for m in markets if m.category == MarketCategory.WEATHER]
-        logger.info(f"Found {len(weather_markets)} weather markets")
+    # ── Trend detection (preserved from original) ──
 
-        if not weather_markets:
-            return []
+    def _trend_key(self, city: str, bucket_label: str) -> str:
+        return f"{city}:{bucket_label}"
 
-        # 2. Fetch ensemble forecasts for all relevant cities
-        cities_needed = set()
-        parsed_markets = []
+    def _bucket_prob(self, prob: float) -> str:
+        return f"{round(prob * 20) * 5}"
 
-        for market in weather_markets:
-            city_raw, threshold, direction = extract_temperature_threshold(market.question)
-            if city_raw and threshold and direction:
-                city = resolve_city(city_raw)
-                if city:
-                    cities_needed.add(city)
-                    parsed_markets.append((market, city, threshold, direction))
-                else:
-                    logger.debug(f"Unknown city '{city_raw}' in: {market.question}")
+    def _record_snapshot(self, city: str, bucket_label: str, ensemble_prob: float):
+        key = self._trend_key(city, bucket_label)
+        snapshot = ForecastSnapshot(
+            city=city,
+            bucket_label=bucket_label,
+            ensemble_prob=ensemble_prob,
+            prob_bucket=self._bucket_prob(ensemble_prob),
+        )
+        history = self._forecast_history[key]
+        history.append(snapshot)
+        if len(history) > self._max_history:
+            self._forecast_history[key] = history[-self._max_history:]
+
+    def _get_trend_multiplier(self, city: str, bucket_label: str) -> float:
+        if not self.enable_trend:
+            return 1.0
+
+        key = self._trend_key(city, bucket_label)
+        history = self._forecast_history.get(key, [])
+        if len(history) < 2:
+            return 1.0
+
+        current_bucket = history[-1].prob_bucket
+        streak = 1
+        for snap in reversed(history[:-1]):
+            if snap.prob_bucket == current_bucket:
+                streak += 1
             else:
-                logger.debug(f"Could not parse weather question: {market.question}")
+                break
 
-        if not cities_needed:
+        if streak >= 5:
+            return 1.5
+        elif streak >= 3:
+            return 1.25
+        elif streak >= 2:
+            return 1.1
+        return 1.0
+
+    # ── Core strategy ──
+
+    async def evaluate(self, markets: list[Market]) -> list[Signal]:
+        """Discover weather events and find mispriced temperature buckets."""
+
+        # Build date list: today and tomorrow
+        now = datetime.utcnow()
+        dates = [now, now + timedelta(days=1)]
+
+        # Determine cities to scan
+        cities = list(CITY_SLUG_MAP.keys())
+
+        # A) Discover weather events from Gamma API
+        logger.info(f"Discovering weather events for {len(cities)} cities, {len(dates)} dates...")
+        events = await self.polymarket.get_weather_events(cities, dates)
+
+        if not events:
+            logger.info("No weather events found")
             return []
 
-        logger.info(f"Fetching ensemble forecasts for {len(cities_needed)} cities...")
-        forecasts = await self.weather.get_forecasts_for_cities(list(cities_needed))
+        logger.info(f"Found {len(events)} weather events with sub-markets")
 
-        # 3. Compare ensemble probabilities vs market prices
+        # Collect all cities we need forecasts for, with their target dates
+        forecast_requests: dict[str, datetime] = {}  # city -> target_date
+        for event in events:
+            city = event["city"]
+            target_date = event["target_date"]
+            # Use the latest date if multiple
+            if city not in forecast_requests or target_date > forecast_requests[city]:
+                forecast_requests[city] = target_date
+
+        # B/C) Fetch ensemble forecasts
+        forecasts = {}
+        for city, target_date in forecast_requests.items():
+            forecast = await self.weather.get_ensemble_forecast(city, target_date)
+            if forecast:
+                forecasts[city] = forecast
+
+        logger.info(f"Got ensemble forecasts for {len(forecasts)} cities")
+
+        # D/E) Compare ensemble vs market for each bucket
         signals = []
-        for market, city, threshold, direction in parsed_markets:
+        for event in events:
+            city = event["city"]
             forecast = forecasts.get(city)
             if not forecast:
                 continue
 
-            # Calculate ensemble probability
-            if direction == "above":
-                ensemble_prob = forecast.prob_above(threshold)
-            else:
-                ensemble_prob = forecast.prob_below(threshold)
+            for bucket in event["buckets"]:
+                if not bucket.tradeable:
+                    continue
 
-            market_prob = market.yes_price
-            edge = ensemble_prob - market_prob
+                # Calculate ensemble probability for this bucket
+                ensemble_prob = ensemble_prob_for_bucket(
+                    forecast.member_temps, bucket.low, bucket.high,
+                )
 
-            # Record snapshot for trend tracking
-            self._record_snapshot(city, threshold, direction, ensemble_prob)
-            trend_multiplier = self._get_trend_multiplier(city, threshold, direction)
+                market_yes = bucket.yes_price
+                edge = ensemble_prob - market_yes
 
-            # Build ensemble context for Claude
-            bucket_dist = forecast.prob_per_bucket()
-            ensemble_summary = (
-                f"City: {city}\n"
-                f"Ensemble members: {forecast.num_members}\n"
-                f"Mean temp: {forecast.mean_temp:.1f}°F\n"
-                f"Range: [{forecast.min_temp:.1f}, {forecast.max_temp:.1f}]°F\n"
-                f"Ensemble P(temp {direction} {threshold}°F): {ensemble_prob:.2%}\n"
-                f"Distribution: {bucket_dist}\n"
-            )
+                # Record for trend tracking
+                self._record_snapshot(city, bucket.label, ensemble_prob)
+                trend_mult = self._get_trend_multiplier(city, bucket.label)
 
-            # Use Claude to refine the estimate (adds model uncertainty, checks for edge cases)
-            claude_estimate = self.claude.estimate_weather_market(
-                question=market.question,
-                description=market.description,
-                current_yes_price=market_prob,
-                ensemble_summary=ensemble_summary,
-            )
+                # Confidence based on ensemble size and trend
+                confidence = min(0.9, (forecast.num_members / 21) * trend_mult)
 
-            # Weight ensemble data heavily (it's the real edge), Claude for refinement
-            # 70% ensemble, 30% Claude
-            blended_prob = 0.7 * ensemble_prob + 0.3 * claude_estimate.probability
-            final_edge = blended_prob - market_prob
+                abs_edge = abs(edge)
+                if abs_edge < self.min_edge:
+                    continue
 
-            # Determine trade direction
-            if final_edge > 0:
-                # Market underprices YES → buy YES
-                outcome = Outcome.YES
-                side = Side.BUY
-                signal_price = market_prob
-                signal_edge = final_edge
-                signal_fair = blended_prob
-            else:
-                # Market overprices YES → buy NO
-                outcome = Outcome.NO
-                side = Side.BUY
-                # Edge for NO = our NO probability - market NO price
-                signal_price = market.no_price
-                signal_fair = 1.0 - blended_prob
-                signal_edge = signal_fair - signal_price
+                if edge > 0:
+                    # Ensemble says higher prob than market → BUY YES
+                    outcome = Outcome.YES
+                    signal_price = market_yes
+                    signal_fair = ensemble_prob
+                    signal_edge = edge
+                else:
+                    # Ensemble says lower prob than market → BUY NO
+                    outcome = Outcome.NO
+                    signal_price = bucket.no_price
+                    signal_fair = 1.0 - ensemble_prob
+                    signal_edge = signal_fair - signal_price
 
-            signal = Signal(
-                market_id=market.id,
-                market_question=market.question,
-                outcome=outcome,
-                side=side,
-                source=SignalSource.WEATHER,
-                fair_value=signal_fair,
-                market_price=signal_price,
-                edge=signal_edge,
-                confidence=min(claude_estimate.confidence * trend_multiplier, forecast.num_members / 21),
-                reasoning=(
-                    f"Ensemble: {ensemble_prob:.2%} | Claude: {claude_estimate.probability:.2%} | "
-                    f"Blended: {blended_prob:.2%} | Market: {market_prob:.2%} | "
-                    f"Edge: {final_edge:.2%}\n"
-                    f"{claude_estimate.reasoning}"
-                ),
-            )
+                signal = Signal(
+                    market_id=bucket.market_id,
+                    market_question=bucket.question,
+                    outcome=outcome,
+                    side=Side.BUY,
+                    source=SignalSource.WEATHER,
+                    fair_value=signal_fair,
+                    market_price=signal_price,
+                    edge=signal_edge,
+                    confidence=confidence,
+                    reasoning=(
+                        f"City: {city} | Bucket: {bucket.label} | "
+                        f"Ensemble: {ensemble_prob:.2%} vs Market YES: {market_yes:.2%} | "
+                        f"Edge: {edge:+.2%} | "
+                        f"Forecast range: [{forecast.min_temp:.0f}, {forecast.max_temp:.0f}]°F | "
+                        f"Mean: {forecast.mean_temp:.1f}°F | "
+                        f"Members: {forecast.num_members}"
+                    ),
+                )
 
-            logger.info(
-                f"Weather signal: {city} {direction} {threshold}°F | "
-                f"Ensemble: {ensemble_prob:.2%} vs Market: {market_prob:.2%} | "
-                f"Edge: {final_edge:+.2%} | Trade: {side.value} {outcome.value}"
-            )
-            signals.append(signal)
+                logger.info(
+                    f"Signal: {city} {bucket.label} | "
+                    f"Ensemble: {ensemble_prob:.2%} vs Market: {market_yes:.2%} | "
+                    f"Edge: {edge:+.2%} | {Side.BUY.value} {outcome.value}"
+                )
+                signals.append(signal)
 
+        logger.info(f"Generated {len(signals)} weather signals")
         return signals
