@@ -136,19 +136,19 @@ def ensemble_prob_for_bucket(
 
     count = 0
     for t in member_temps:
-        # Round to nearest integer to match Polymarket's integer °F buckets
-        t_rounded = round(t)
+        # Bucket bounds are already expanded by ±0.5 in the conversion step,
+        # so we compare continuous values directly (no rounding needed).
         if low is None and high is not None:
-            # "X or below": temp <= high
-            if t_rounded <= high:
+            # "X or below": temp < high (high already includes +0.5)
+            if t < high:
                 count += 1
         elif low is not None and high is None:
-            # "X or higher": temp >= low
-            if t_rounded >= low:
+            # "X or higher": temp >= low (low already includes -0.5)
+            if t >= low:
                 count += 1
         elif low is not None and high is not None:
-            # "X-Y": low <= temp <= high
-            if low <= t_rounded <= high:
+            # "X-Y": low <= temp < high
+            if low <= t < high:
                 count += 1
     return count / len(member_temps)
 
