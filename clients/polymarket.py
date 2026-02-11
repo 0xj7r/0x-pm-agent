@@ -444,7 +444,7 @@ class PolymarketClient:
             return None
 
         except Exception as e:
-            logger.warning(f"Failed to check resolution for {condition_id}: {e}")
+            logger.warning(f"Failed to check resolution for {market_id}: {e}")
             return None
 
     async def close(self):

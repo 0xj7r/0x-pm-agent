@@ -1,0 +1,101 @@
+"""Tests for RiskManager."""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from config import Config
+from core.risk import RiskManager
+from models.market import Outcome
+from models.trade import Side, Signal, SignalSource
+
+
+def _make_signal(edge: float = 0.20, confidence: float = 0.7, market_price: float = 0.5) -> Signal:
+    return Signal(
+        market_id="m1",
+        market_question="Test?",
+        outcome=Outcome.YES,
+        side=Side.BUY,
+        source=SignalSource.WEATHER,
+        fair_value=market_price + edge,
+        market_price=market_price,
+        edge=edge,
+        confidence=confidence,
+    )
+
+
+class TestPassesFilters:
+    def test_accepts_good_signal(self):
+        rm = RiskManager(Config())
+        assert rm.passes_filters(_make_signal(edge=0.20)) is True
+
+    def test_rejects_low_edge(self):
+        rm = RiskManager(Config())
+        assert rm.passes_filters(_make_signal(edge=0.05)) is False
+
+    def test_rejects_low_confidence(self):
+        rm = RiskManager(Config())
+        assert rm.passes_filters(_make_signal(confidence=0.2)) is False
+
+    def test_rejects_max_positions(self):
+        rm = RiskManager(Config())
+        rm.set_open_positions(10)
+        assert rm.passes_filters(_make_signal()) is False
+
+    def test_daily_loss_limit(self):
+        rm = RiskManager(Config())
+        rm.set_bankroll(100.0)
+        # Lose more than 20% of bankroll
+        rm.record_trade_result(-25.0)
+        assert rm.passes_filters(_make_signal()) is False
+
+    def test_cooldown_after_consecutive_losses(self):
+        rm = RiskManager(Config())
+        rm.set_bankroll(1000.0)  # large bankroll so daily limit isn't hit
+        for _ in range(3):
+            rm.record_trade_result(-1.0)
+        assert rm.passes_filters(_make_signal()) is False
+
+
+class TestKellySize:
+    def test_basic_sizing(self):
+        rm = RiskManager(Config())
+        size = rm.kelly_size(edge=0.20, odds=0.40, confidence=0.5, bankroll=100.0)
+        assert size > 0
+        assert size <= 2.0  # MAX_POSITION_USD default
+
+    def test_zero_bankroll(self):
+        rm = RiskManager(Config())
+        assert rm.kelly_size(edge=0.2, odds=0.4, confidence=0.5, bankroll=0) == 0.0
+
+    def test_zero_edge(self):
+        rm = RiskManager(Config())
+        # With 0 edge at odds=0.5, kelly = (1*0.5 - 0.5)/1 = 0
+        assert rm.kelly_size(edge=0.0, odds=0.5, confidence=0.5, bankroll=100.0) == 0.0
+
+    def test_negative_kelly_returns_zero(self):
+        rm = RiskManager(Config())
+        # Negative edge means kelly < 0
+        assert rm.kelly_size(edge=-0.3, odds=0.5, confidence=0.5, bankroll=100.0) == 0.0
+
+    def test_caps_at_max_position(self):
+        rm = RiskManager(Config())
+        size = rm.kelly_size(edge=0.5, odds=0.3, confidence=0.5, bankroll=10000.0)
+        assert size <= 2.0  # MAX_POSITION_USD
+
+    def test_dust_trade_returns_zero(self):
+        rm = RiskManager(Config())
+        # Very small bankroll → size < $1 → returns 0
+        assert rm.kelly_size(edge=0.2, odds=0.4, confidence=0.5, bankroll=5.0) == 0.0
+
+
+class TestShouldDie:
+    def test_kills_at_low_balance(self):
+        rm = RiskManager(Config())
+        assert rm.should_die(4.0) is True
+
+    def test_survives_above_kill(self):
+        rm = RiskManager(Config())
+        assert rm.should_die(10.0) is False
