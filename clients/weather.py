@@ -7,6 +7,7 @@ for temperature forecasts, then compares against Polymarket prices.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -130,6 +131,8 @@ class EnsembleForecast:
 class WeatherClient:
     def __init__(self):
         self._http = httpx.AsyncClient(timeout=30.0)
+        self._cache: dict[str, tuple[float, EnsembleForecast]] = {}  # key -> (timestamp, forecast)
+        self._cache_ttl = 1800  # 30 minutes — NOAA updates every 6 hours so no need to refetch often
 
     async def get_ensemble_forecast(
         self,
@@ -150,6 +153,14 @@ class WeatherClient:
             target_date = datetime.utcnow() + timedelta(days=1)
 
         date_str = target_date.strftime("%Y-%m-%d")
+
+        # Check cache — NOAA data doesn't change often
+        cache_key = f"{city}:{date_str}"
+        if cache_key in self._cache:
+            cached_time, cached_forecast = self._cache[cache_key]
+            if time.time() - cached_time < self._cache_ttl:
+                logger.debug(f"Using cached forecast for {city} {date_str}")
+                return cached_forecast
 
         params = {
             "latitude": lat,
@@ -207,6 +218,9 @@ class WeatherClient:
             f"mean={forecast.mean_temp:.1f}°F, "
             f"range=[{forecast.min_temp:.1f}, {forecast.max_temp:.1f}]"
         )
+
+        # Cache the result
+        self._cache[cache_key] = (time.time(), forecast)
 
         return forecast
 

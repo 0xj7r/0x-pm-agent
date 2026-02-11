@@ -226,7 +226,8 @@ class TradingEngine:
         await self._check_exits()
 
         # 1c. Check if any paper trades have resolved
-        await self._check_resolutions()
+        # TODO: re-enable after batching API calls — currently kills process
+        # await self._check_resolutions()
 
         # 2. Evaluate with each strategy
         all_signals: list[Signal] = []

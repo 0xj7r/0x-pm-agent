@@ -32,7 +32,7 @@ class Config:
     MAX_POSITION_PCT: float = float(os.getenv("MAX_POSITION_PCT", "0.06"))
     MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.15"))
     KILL_BALANCE_USD: float = float(os.getenv("KILL_BALANCE_USD", "5.0"))
-    SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
+    SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
     EXIT_THRESHOLD: float = float(os.getenv("EXIT_THRESHOLD", "0.45"))
     MAX_POSITION_USD: float = float(os.getenv("MAX_POSITION_USD", "2.0"))
     DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.20"))
