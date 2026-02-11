@@ -1,10 +1,20 @@
+"""Application configuration loaded from environment variables."""
+
+from __future__ import annotations
+
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
 class Config:
+    """Central configuration for the Polymarket trading agent.
+
+    All values are read from environment variables with sensible defaults.
+    """
+
     # Polymarket
     PRIVATE_KEY: str = os.getenv("POLYMARKET_PRIVATE_KEY", "")
     API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
@@ -47,6 +57,12 @@ class Config:
 
     # Mode
     PAPER_TRADE: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
+
+    # Paper trading
+    PAPER_STARTING_BALANCE: float = float(os.getenv("PAPER_STARTING_BALANCE", "100.0"))
+
+    # Copy trading: comma-separated wallet addresses to track
+    COPY_TRADING_WALLETS: str = os.getenv("COPY_TRADING_WALLETS", "")
 
     # Database
     DB_PATH: str = os.getenv("DB_PATH", "trades.db")

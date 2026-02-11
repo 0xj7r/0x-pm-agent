@@ -130,7 +130,10 @@ class CopyTradingStrategy(Strategy):
             )
 
         except Exception as e:
-            logger.error(f"Failed to discover whales: {e}")
+            logger.warning(
+                f"Whale auto-discovery unavailable (leaderboard API may be down): {e}. "
+                "Configure COPY_TRADING_WALLETS in .env to manually specify wallet addresses."
+            )
 
     async def get_recent_trades(self, wallet: str) -> list[WalletTrade]:
         """Get recent trades for a specific wallet."""
@@ -263,7 +266,7 @@ class CopyTradingStrategy(Strategy):
             await self.discover_whales()
 
         if not self.tracked_wallets:
-            logger.warning("No wallets to track")
+            logger.debug("No wallets to track — skipping copy trading this cycle")
             return []
 
         signals = []

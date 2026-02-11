@@ -1,3 +1,5 @@
+"""Market data models: markets, order books, and price points."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

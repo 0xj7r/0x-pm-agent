@@ -15,16 +15,19 @@ from clients.polymarket import PolymarketClient
 from clients.weather import WeatherClient
 from config import Config
 from core.memory import MemoryStore
-from core.portfolio import Portfolio
+from core.portfolio import Portfolio, PortfolioSnapshot
 from core.risk import RiskManager
-from models.market import Outcome
+from models.market import Market, Outcome
 from models.trade import Side, Signal, Trade
+from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
 
 
 class TradingEngine:
-    def __init__(self, config: Config):
+    """Core engine that orchestrates scanning, evaluation, and execution."""
+
+    def __init__(self, config: Config) -> None:
         self.config = config
         self.polymarket = PolymarketClient(config)
         self.weather = WeatherClient()
@@ -32,20 +35,20 @@ class TradingEngine:
         self.risk = RiskManager(config)
         self.memory = MemoryStore(config.DB_PATH)
         self.portfolio = Portfolio()
-        self.strategies: list = []
-        self._running = False
-        self._market_cache: dict[str, object] = {}
+        self.strategies: list[Strategy] = []
+        self._running: bool = False
+        self._market_cache: dict[str, Market] = {}
 
-    def register_strategy(self, strategy):
-        """Register a trading strategy."""
+    def register_strategy(self, strategy: Strategy) -> None:
+        """Register a trading strategy for evaluation each cycle."""
         self.strategies.append(strategy)
         logger.info(f"Registered strategy: {strategy.name}")
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         """Set up the agent: fetch balance, load state."""
         balance = await self.polymarket.get_balance()
         if balance <= 0 and self.config.PAPER_TRADE:
-            balance = 100.0
+            balance = self.config.PAPER_STARTING_BALANCE
             logger.info(f"Paper mode: using starting balance of ${balance:.2f}")
         elif balance <= 0:
             logger.warning("No balance detected. Ensure wallet is funded with USDC on Polygon.")
@@ -62,7 +65,7 @@ class TradingEngine:
             f"Min edge: {self.config.MIN_EDGE_THRESHOLD * 100:.0f}%"
         )
 
-    async def run(self):
+    async def run(self) -> None:
         """Main loop: scan, evaluate, trade. Repeat until dead."""
         await self.initialize()
         self._running = True
@@ -96,7 +99,7 @@ class TradingEngine:
             logger.info(f"Sleeping {self.config.SCAN_INTERVAL_SECONDS}s until next cycle...")
             await asyncio.sleep(self.config.SCAN_INTERVAL_SECONDS)
 
-    async def _check_exits(self):
+    async def _check_exits(self) -> None:
         """Check existing positions for exit signals.
 
         If a position's current fair value exceeds EXIT_THRESHOLD,
@@ -146,8 +149,8 @@ class TradingEngine:
         for signal in exit_signals:
             await self._execute_signal(signal)
 
-    async def _run_cycle(self):
-        """Single scan → evaluate → trade cycle."""
+    async def _run_cycle(self) -> None:
+        """Execute a single scan → evaluate → trade cycle."""
         # 0. Refresh market cache and check exits on existing positions
         logger.info("Scanning markets...")
         markets = await self.polymarket.get_all_active_markets()
@@ -185,11 +188,11 @@ class TradingEngine:
         for signal in approved:
             await self._execute_signal(signal)
 
-    async def _execute_signal(self, signal: Signal):
-        """Size and execute a single signal."""
+    async def _execute_signal(self, signal: Signal) -> None:
+        """Size and execute a single trading signal."""
         bankroll = self.portfolio.balance_usd
         if self.config.PAPER_TRADE:
-            bankroll = max(bankroll, 100.0)  # paper trading starts with $100 minimum
+            bankroll = max(bankroll, self.config.PAPER_STARTING_BALANCE)
 
         size_usd = self.risk.size_position(signal, bankroll)
         if size_usd <= 0:
@@ -207,7 +210,7 @@ class TradingEngine:
             return
 
         if not token_id:
-            logger.error(f"No token ID for {signal.outcome.value} on {market.id}")
+            logger.error(f"No token ID for {signal.outcome.value} on {signal.market_id}")
             return
 
         price = signal.market_price
@@ -257,7 +260,8 @@ class TradingEngine:
         self.portfolio.record_api_cost(self.claude.total_cost_usd)
         self.memory.save_trade(trade)
 
-    def _log_snapshot(self, snapshot):
+    def _log_snapshot(self, snapshot: PortfolioSnapshot) -> None:
+        """Log current portfolio state."""
         logger.info(
             f"Portfolio: ${snapshot.balance_usd:.2f} balance | "
             f"{snapshot.num_open_positions} positions | "
@@ -267,8 +271,8 @@ class TradingEngine:
             f"Net PnL: ${snapshot.net_pnl:+.2f}"
         )
 
-    def _sync_learnings(self):
-        """Sync trading performance to MEMORY.md."""
+    def _sync_learnings(self) -> None:
+        """Sync trading performance to MEMORY.md for cross-session learning."""
         if not self.config.MEMORY_PATH:
             logger.debug("MEMORY_PATH not set; skipping MEMORY.md sync")
             return
@@ -278,8 +282,8 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Failed to sync learnings: {e}")
 
-    async def stop(self):
-        """Graceful shutdown."""
+    async def stop(self) -> None:
+        """Graceful shutdown of all resources."""
         self._running = False
         logger.info("Shutting down trading engine...")
         await self.polymarket.close()
