@@ -50,8 +50,8 @@ SLUG_TO_CITY["nyc"] = "New York"
 class TemperatureBucket:
     """A parsed temperature bucket from a Polymarket sub-market."""
     label: str           # raw groupItemTitle e.g. "36-37°F"
-    low: float | None    # None for "X or below" buckets
-    high: float | None   # None for "X or higher" buckets
+    low: float | None    # None for "X or below" buckets (in native unit)
+    high: float | None   # None for "X or higher" buckets (in native unit)
     yes_price: float
     no_price: float
     market_id: str
@@ -62,6 +62,7 @@ class TemperatureBucket:
     active: bool
     closed: bool
     accepting_orders: bool
+    temp_unit: str = "F" # native unit: "C" or "F"
 
     @property
     def tradeable(self) -> bool:
@@ -126,29 +127,41 @@ def ensemble_prob_for_bucket(
     member_temps: list[float],
     low: float | None,
     high: float | None,
+    native_unit: str = "F",
 ) -> float:
     """Calculate fraction of ensemble members whose high temp falls in bucket.
 
-    Polymarket buckets are inclusive on both ends based on question wording.
+    member_temps are in °F (from NOAA).
+    low/high are the ORIGINAL integer bounds in the bucket's native unit (°C or °F).
+    We convert each member to the native unit, round to integer, then compare.
+
+    This matches Polymarket's resolution: Weather Underground reports integer temps.
     """
     if not member_temps:
         return 0.0
 
     count = 0
     for t in member_temps:
-        # Bucket bounds are already expanded by ±0.5 in the conversion step,
-        # so we compare continuous values directly (no rounding needed).
+        # Convert member temp to the bucket's native unit
+        if native_unit == "C":
+            t_native = (t - 32) * 5 / 9  # °F → °C
+        else:
+            t_native = t  # Already °F
+
+        # Round to integer — matches how Weather Underground reports
+        t_rounded = round(t_native)
+
         if low is None and high is not None:
-            # "X or below": temp < high (high already includes +0.5)
-            if t < high:
+            # "X or below": temp <= X
+            if t_rounded <= high:
                 count += 1
         elif low is not None and high is None:
-            # "X or higher": temp >= low (low already includes -0.5)
-            if t >= low:
+            # "X or higher": temp >= X
+            if t_rounded >= low:
                 count += 1
         elif low is not None and high is not None:
-            # "X-Y": low <= temp < high
-            if low <= t < high:
+            # "X-Y" or single "X": low <= temp <= high
+            if low <= t_rounded <= high:
                 count += 1
     return count / len(member_temps)
 
@@ -274,6 +287,7 @@ class WeatherStrategy(Strategy):
                 # Calculate ensemble probability for this bucket
                 ensemble_prob = ensemble_prob_for_bucket(
                     forecast.member_temps, bucket.low, bucket.high,
+                    native_unit=bucket.temp_unit,
                 )
 
                 market_yes = bucket.yes_price

@@ -41,32 +41,38 @@ class TestEnsembleProbForBucket:
         assert ensemble_prob_for_bucket([], 30.0, 40.0) == 0.0
 
     def test_all_in_range(self):
-        # Bounds are pre-expanded by ±0.5 from polymarket client
-        # So "35-39°F" becomes low=34.5, high=39.5
+        # "35-39°F": member temps in °F, round to int, check 35 <= t <= 39
         temps = [35.0, 36.0, 37.0, 38.0, 39.0]
-        assert ensemble_prob_for_bucket(temps, 34.5, 39.5) == 1.0
+        assert ensemble_prob_for_bucket(temps, 35, 39, native_unit="F") == 1.0
 
     def test_none_in_range(self):
         temps = [50.0, 51.0, 52.0]
-        assert ensemble_prob_for_bucket(temps, 29.5, 40.5) == 0.0
+        assert ensemble_prob_for_bucket(temps, 30, 40, native_unit="F") == 0.0
 
     def test_or_below(self):
         temps = [30.0, 35.0, 40.0, 45.0]
-        # "35 or below" → high=35.5: 30 and 35 match → 2/4
-        assert ensemble_prob_for_bucket(temps, None, 35.5) == 0.5
+        # "35 or below": round(30)=30 ✓, round(35)=35 ✓ → 2/4
+        assert ensemble_prob_for_bucket(temps, None, 35, native_unit="F") == 0.5
 
     def test_or_higher(self):
         temps = [30.0, 35.0, 40.0, 45.0]
-        # "40 or higher" → low=39.5: 40 and 45 match → 2/4
-        assert ensemble_prob_for_bucket(temps, 39.5, None) == 0.5
+        # "40 or higher": round(40)=40 ✓, round(45)=45 ✓ → 2/4
+        assert ensemble_prob_for_bucket(temps, 40, None, native_unit="F") == 0.5
 
-    def test_continuous_comparison(self):
-        # With expanded bounds, 35.4 and 35.6 both fall in [34.5, 35.5)
-        # 35.4 is in range, 35.6 is NOT (35.6 >= 35.5)
+    def test_rounding(self):
+        # 35.4°F rounds to 35, 35.6°F rounds to 36
         temps = [35.4, 35.6]
-        assert ensemble_prob_for_bucket(temps, 34.5, 35.5) == 0.5
+        # bucket "35°F": only 35.4 rounds to 35 → 1/2
+        assert ensemble_prob_for_bucket(temps, 35, 35, native_unit="F") == 0.5
 
     def test_partial_range(self):
         temps = [36.0, 37.0, 38.0, 39.0, 40.0]
-        # "37-38°F" → low=36.5, high=38.5: 37 and 38 → 2/5
-        assert ensemble_prob_for_bucket(temps, 36.5, 38.5) == pytest.approx(0.4)
+        # "37-38°F": 37 and 38 → 2/5
+        assert ensemble_prob_for_bucket(temps, 37, 38, native_unit="F") == pytest.approx(0.4)
+
+    def test_celsius_bucket(self):
+        # Seoul "4°C": member temps in °F [38.0, 39.5, 40.0]
+        # Convert to °C: [3.3, 3.9, 4.4] → round to [3, 4, 4]
+        # Bucket "4°C": 2 of 3 match
+        temps = [38.0, 39.5, 40.0]
+        assert ensemble_prob_for_bucket(temps, 4, 4, native_unit="C") == pytest.approx(2/3)

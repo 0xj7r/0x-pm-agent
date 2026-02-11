@@ -54,10 +54,10 @@ class TestEnsembleProbDistribution:
         assert prob == pytest.approx(0.90)
 
     def test_uniform_distribution(self) -> None:
-        """21 members from 30-50 → bucket 35-40°F (expanded to 34.5-40.5) gets 6/21."""
+        """21 members from 30-50 → bucket 35-40°F gets 6/21."""
         temps = [float(t) for t in range(30, 51)]  # 30,31,...,50 = 21 members
-        # bucket "35-40°F" pre-expanded: [34.5, 40.5) → 35,36,37,38,39,40 = 6 members
-        prob = ensemble_prob_for_bucket(temps, 34.5, 40.5)
+        # bucket "35-40°F": 35,36,37,38,39,40 = 6 members
+        prob = ensemble_prob_for_bucket(temps, 35, 40, native_unit="F")
         assert prob == pytest.approx(6 / 21)
 
 

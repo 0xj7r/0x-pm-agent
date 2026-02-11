@@ -322,23 +322,9 @@ class PolymarketClient:
                         if low is None and high is None:
                             continue
 
-                        # Convert °C to °F for NOAA comparison
-                        # Single-degree °C buckets like "4°C" mean the high temp
-                        # rounds to 4°C, so the actual range is [3.5, 4.5)°C.
-                        # For ranges like "3-4°C", it means [3, 4]°C → [2.5, 4.5)°C.
-                        # For "X or below" → (..., X+0.5)°C.
-                        # For "X or higher" → [X-0.5, ...)°C.
-                        if temp_unit == 'C':
-                            if low is not None:
-                                low = (low - 0.5) * 9 / 5 + 32
-                            if high is not None:
-                                high = (high + 0.5) * 9 / 5 + 32
-                        else:
-                            # °F buckets: "36-37°F" means temp rounds to 36-37
-                            if low is not None:
-                                low = low - 0.5
-                            if high is not None:
-                                high = high + 0.5
+                        # Keep bounds in native unit (°C or °F) — no conversion needed.
+                        # ensemble_prob_for_bucket handles the conversion internally
+                        # by rounding each member temp to the native unit's integer.
 
                         # Parse outcome prices: JSON string '["0.33", "0.67"]'
                         outcome_prices_raw = mkt.get("outcomePrices", "[]")
@@ -376,6 +362,7 @@ class PolymarketClient:
                             label=group_title,
                             low=low,
                             high=high,
+                            temp_unit=temp_unit,
                             yes_price=yes_price,
                             no_price=no_price,
                             market_id=str(mkt.get("id", "")),
