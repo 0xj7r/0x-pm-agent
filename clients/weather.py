@@ -172,12 +172,27 @@ class WeatherClient:
             "models": "gfs_seamless",
         }
 
-        try:
-            resp = await self._http.get(ENSEMBLE_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch ensemble for {city}: {e}")
+        import asyncio
+        data = None
+        for attempt in range(3):
+            try:
+                resp = await self._http.get(ENSEMBLE_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                    logger.warning(f"Rate limited for {city}, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(f"Failed to fetch ensemble for {city}: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Failed to fetch ensemble for {city}: {e}")
+                return None
+        if data is None:
+            logger.error(f"All retries exhausted for {city}")
             return None
 
         # Parse ensemble members
@@ -229,20 +244,15 @@ class WeatherClient:
         cities: list[str],
         target_date: datetime | None = None,
     ) -> dict[str, EnsembleForecast]:
-        """Fetch ensemble forecasts for multiple cities in parallel."""
+        """Fetch ensemble forecasts for multiple cities sequentially with rate limiting."""
         import asyncio
 
-        tasks = [
-            self.get_ensemble_forecast(city, target_date) for city in cities
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
         forecasts = {}
-        for city, result in zip(cities, results):
-            if isinstance(result, EnsembleForecast):
+        for city in cities:
+            result = await self.get_ensemble_forecast(city, target_date)
+            if result is not None:
                 forecasts[city] = result
-            elif isinstance(result, Exception):
-                logger.error(f"Error fetching {city}: {result}")
+            await asyncio.sleep(0.5)  # 500ms between requests to avoid 429s
 
         return forecasts
 
