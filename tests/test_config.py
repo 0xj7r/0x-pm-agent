@@ -8,7 +8,7 @@ from config import Config
 def test_defaults():
     c = Config()
     assert c.MIN_EDGE_THRESHOLD == 0.15
-    assert c.SCAN_INTERVAL_SECONDS == 120
+    assert c.SCAN_INTERVAL_SECONDS == 600
     assert c.EXIT_THRESHOLD == 0.45
     assert c.PAPER_TRADE is True
     assert c.PAPER_STARTING_BALANCE == 100.0
