@@ -196,16 +196,15 @@ class TradingEngine:
             logger.debug(f"Position size $0 for {signal.market_question[:50]}")
             return
 
-        # Look up token ID from cached markets
+        # Look up token ID from cached markets, or from signal itself
         market = self._market_cache.get(signal.market_id)
-        if not market:
-            logger.error(f"Market {signal.market_id} not found in cache")
-            return
-
-        if signal.outcome == Outcome.YES:
-            token_id = market.yes_token_id
+        if market:
+            token_id = market.yes_token_id if signal.outcome == Outcome.YES else market.no_token_id
+        elif signal.yes_token_id or signal.no_token_id:
+            token_id = signal.yes_token_id if signal.outcome == Outcome.YES else signal.no_token_id
         else:
-            token_id = market.no_token_id
+            logger.error(f"Market {signal.market_id} not found in cache and no token IDs on signal")
+            return
 
         if not token_id:
             logger.error(f"No token ID for {signal.outcome.value} on {market.id}")

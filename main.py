@@ -43,7 +43,7 @@ def build_strategies(config: Config, engine: TradingEngine) -> list:
         weather_strategy = WeatherStrategy(
             config=config,
             weather_client=engine.weather,
-            claude_client=engine.claude,
+            polymarket_client=engine.polymarket,
         )
         strategies.append(weather_strategy)
 

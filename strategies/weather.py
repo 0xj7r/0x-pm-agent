@@ -78,36 +78,48 @@ class ForecastSnapshot:
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
-def parse_bucket_label(label: str) -> tuple[float | None, float | None]:
-    """Parse groupItemTitle to extract (low, high) temperature bounds.
+def parse_bucket_label(label: str) -> tuple[float | None, float | None, str]:
+    """Parse groupItemTitle to extract (low, high, unit) temperature bounds.
 
     Returns:
-        (low, high) where None means unbounded on that side.
+        (low, high, unit) where None means unbounded on that side.
+        unit is 'C' or 'F'.
 
     Examples:
-        "35°F or below"  → (None, 35.0)
-        "36-37°F"        → (36.0, 37.0)
-        "46°F or higher" → (46.0, None)
+        "35°F or below"  → (None, 35.0, 'F')
+        "36-37°F"        → (36.0, 37.0, 'F')
+        "46°F or higher" → (46.0, None, 'F')
+        "6°C or below"   → (None, 6.0, 'C')
+        "10°C"           → (10.0, 10.0, 'C')
+        "12°C or higher" → (12.0, None, 'C')
     """
     label = label.strip()
 
-    # "X°F or below" / "X°F or less"
-    m = re.match(r"(\d+)°?F?\s+or\s+(?:below|less)", label, re.IGNORECASE)
-    if m:
-        return (None, float(m.group(1)))
+    # Detect unit
+    unit = 'C' if '°C' in label or 'C' in label.split()[-1:] else 'F'
 
-    # "X°F or higher" / "X°F or more" / "X°F or above"
-    m = re.match(r"(\d+)°?F?\s+or\s+(?:higher|more|above)", label, re.IGNORECASE)
+    # "X°F/C or below" / "X°F/C or less" (handles negative temps)
+    m = re.match(r"(-?\d+)°?[FC]?\s+or\s+(?:below|less)", label, re.IGNORECASE)
     if m:
-        return (float(m.group(1)), None)
+        return (None, float(m.group(1)), unit)
 
-    # "X-Y°F" range
-    m = re.match(r"(\d+)\s*[-–]\s*(\d+)°?F?", label, re.IGNORECASE)
+    # "X°F/C or higher" / "X°F/C or more" / "X°F/C or above"
+    m = re.match(r"(-?\d+)°?[FC]?\s+or\s+(?:higher|more|above)", label, re.IGNORECASE)
     if m:
-        return (float(m.group(1)), float(m.group(2)))
+        return (float(m.group(1)), None, unit)
+
+    # "X-Y°F/C" range (handles negatives)
+    m = re.match(r"(-?\d+)\s*[-–]\s*(-?\d+)°?[FC]?", label, re.IGNORECASE)
+    if m:
+        return (float(m.group(1)), float(m.group(2)), unit)
+
+    # Single value "X°C" or "-3°C" (no range, no qualifier)
+    m = re.match(r"(-?\d+)°?[FC]?$", label, re.IGNORECASE)
+    if m:
+        return (float(m.group(1)), float(m.group(1)), unit)
 
     logger.warning(f"Could not parse bucket label: {label}")
-    return (None, None)
+    return (None, None, unit)
 
 
 def ensemble_prob_for_bucket(
@@ -309,6 +321,8 @@ class WeatherStrategy(Strategy):
                         f"Mean: {forecast.mean_temp:.1f}°F | "
                         f"Members: {forecast.num_members}"
                     ),
+                    yes_token_id=bucket.yes_token_id,
+                    no_token_id=bucket.no_token_id,
                 )
 
                 logger.info(

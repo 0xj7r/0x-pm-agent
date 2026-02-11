@@ -36,6 +36,9 @@ class Signal:
     # Reasoning
     reasoning: str = ""
     timestamp: datetime = field(default_factory=datetime.utcnow)
+    # Optional token IDs (for weather/event markets not in standard cache)
+    yes_token_id: str = ""
+    no_token_id: str = ""
 
     @property
     def edge_pct(self) -> float:

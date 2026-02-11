@@ -288,7 +288,7 @@ class PolymarketClient:
             for date in dates:
                 month_name = date.strftime("%B").lower()
                 day = date.day  # no leading zero
-                slug = f"highest-temperature-in-{slug_city}-on-{month_name}-{day}"
+                slug = f"highest-temperature-in-{slug_city}-on-{month_name}-{day}-{date.year}"
 
                 try:
                     resp = await self._http.get(
@@ -318,9 +318,14 @@ class PolymarketClient:
                         if not group_title:
                             continue
 
-                        low, high = parse_bucket_label(group_title)
+                        low, high, temp_unit = parse_bucket_label(group_title)
                         if low is None and high is None:
                             continue
+
+                        # Convert °C to °F for NOAA comparison
+                        if temp_unit == 'C':
+                            low = low * 9 / 5 + 32 if low is not None else None
+                            high = high * 9 / 5 + 32 if high is not None else None
 
                         # Parse outcome prices: JSON string '["0.33", "0.67"]'
                         outcome_prices_raw = mkt.get("outcomePrices", "[]")
