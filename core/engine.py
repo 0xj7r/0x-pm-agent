@@ -49,6 +49,7 @@ class TradingEngine:
             balance = 0.0
 
         self.portfolio.balance_usd = balance
+        self.risk.set_bankroll(balance)
         mode = "PAPER" if self.config.PAPER_TRADE else "LIVE"
         logger.info(
             f"Agent initialized in {mode} mode | "
@@ -92,15 +93,68 @@ class TradingEngine:
             logger.info(f"Sleeping {self.config.SCAN_INTERVAL_SECONDS}s until next cycle...")
             await asyncio.sleep(self.config.SCAN_INTERVAL_SECONDS)
 
+    async def _check_exits(self):
+        """Check existing positions for exit signals.
+
+        If a position's current fair value exceeds EXIT_THRESHOLD,
+        generate a sell signal to close it out.
+        """
+        exit_signals: list[Signal] = []
+        threshold = self.config.EXIT_THRESHOLD
+
+        for pos_key, position in list(self.portfolio.positions.items()):
+            # Update current price from market data
+            market = self._market_cache.get(position.market_id)
+            if not market:
+                continue
+
+            if position.outcome == Outcome.YES:
+                current_price = market.yes_price
+            else:
+                current_price = market.no_price
+
+            position.current_price = current_price
+
+            # If fair value (current price) exceeds exit threshold, sell
+            if current_price >= threshold:
+                signal = Signal(
+                    market_id=position.market_id,
+                    market_question=position.market_question,
+                    outcome=position.outcome,
+                    side=Side.SELL,
+                    source=position.source,
+                    fair_value=current_price,
+                    market_price=current_price,
+                    edge=current_price - position.avg_price,
+                    confidence=0.8,
+                    reasoning=(
+                        f"EXIT: price {current_price:.3f} >= threshold {threshold:.3f} | "
+                        f"Entry: {position.avg_price:.3f} | "
+                        f"Unrealized PnL: ${position.unrealized_pnl:+.2f}"
+                    ),
+                )
+                logger.info(
+                    f"Exit signal: {position.market_question[:50]} | "
+                    f"Price {current_price:.3f} >= {threshold:.3f}"
+                )
+                exit_signals.append(signal)
+
+        # Execute exit signals
+        for signal in exit_signals:
+            await self._execute_signal(signal)
+
     async def _run_cycle(self):
         """Single scan → evaluate → trade cycle."""
-        # 1. Scan markets
+        # 0. Refresh market cache and check exits on existing positions
         logger.info("Scanning markets...")
         markets = await self.polymarket.get_all_active_markets()
         logger.info(f"Found {len(markets)} active markets")
 
         # Cache market lookup for token ID resolution
         self._market_cache = {m.id: m for m in markets}
+
+        # 1b. Check existing positions for exits
+        await self._check_exits()
 
         # 2. Evaluate with each strategy
         all_signals: list[Signal] = []
@@ -116,7 +170,8 @@ class TradingEngine:
             logger.info("No signals this cycle")
             return
 
-        # 3. Filter through risk manager
+        # 3. Filter through risk manager (update position count first)
+        self.risk.set_open_positions(len(self.portfolio.positions))
         approved = [s for s in all_signals if self.risk.passes_filters(s)]
         logger.info(f"{len(approved)}/{len(all_signals)} signals passed risk filters")
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
 
 from clients.claude_client import ClaudeClient
 from clients.weather import CITY_COORDS, WeatherClient
@@ -19,6 +22,18 @@ from models.trade import Side, Signal, SignalSource
 from strategies.base import Strategy
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ForecastSnapshot:
+    """A single forecast observation for trend tracking."""
+
+    city: str
+    threshold: float
+    direction: str
+    ensemble_prob: float
+    bucket: str  # rounded to nearest 5% for agreement detection
+    timestamp: datetime = field(default_factory=datetime.utcnow)
 
 # Common patterns in Polymarket weather questions.
 QUESTION_PATTERNS = [
@@ -84,6 +99,74 @@ class WeatherStrategy(Strategy):
         self.weather = weather_client
         self.claude = claude_client
         self.cities = config.WEATHER_CITIES
+        self.enable_trend = config.ENABLE_TREND_DETECTION
+        # Trend detection: track forecast history per (city, threshold, direction)
+        self._forecast_history: dict[str, list[ForecastSnapshot]] = defaultdict(list)
+        self._max_history = 20  # keep last N snapshots per key
+
+    def _trend_key(self, city: str, threshold: float, direction: str) -> str:
+        return f"{city}:{threshold}:{direction}"
+
+    def _bucket_prob(self, prob: float) -> str:
+        """Round probability to nearest 5% bucket for agreement detection."""
+        return f"{round(prob * 20) * 5}"
+
+    def _record_snapshot(self, city: str, threshold: float, direction: str, ensemble_prob: float):
+        """Store a forecast snapshot for trend tracking."""
+        key = self._trend_key(city, threshold, direction)
+        snapshot = ForecastSnapshot(
+            city=city,
+            threshold=threshold,
+            direction=direction,
+            ensemble_prob=ensemble_prob,
+            bucket=self._bucket_prob(ensemble_prob),
+        )
+        history = self._forecast_history[key]
+        history.append(snapshot)
+        if len(history) > self._max_history:
+            self._forecast_history[key] = history[-self._max_history :]
+
+    def _get_trend_multiplier(self, city: str, threshold: float, direction: str) -> float:
+        """Calculate confidence multiplier based on consecutive ensemble agreement.
+
+        If the ensemble has agreed on the same bucket for N consecutive snapshots,
+        boost confidence: 1.0 (no trend), up to 1.5 (5+ consecutive agreements).
+        """
+        if not self.enable_trend:
+            return 1.0
+
+        key = self._trend_key(city, threshold, direction)
+        history = self._forecast_history.get(key, [])
+
+        if len(history) < 2:
+            return 1.0
+
+        # Count consecutive agreements from most recent backward
+        current_bucket = history[-1].bucket
+        streak = 1
+        for snap in reversed(history[:-1]):
+            if snap.bucket == current_bucket:
+                streak += 1
+            else:
+                break
+
+        if streak >= 5:
+            multiplier = 1.5
+        elif streak >= 3:
+            multiplier = 1.25
+        elif streak >= 2:
+            multiplier = 1.1
+        else:
+            multiplier = 1.0
+
+        if multiplier > 1.0:
+            logger.info(
+                f"Trend detected: {city} {direction} {threshold}°F | "
+                f"Bucket {current_bucket}% agreed {streak}x | "
+                f"Confidence multiplier: {multiplier:.2f}"
+            )
+
+        return multiplier
 
     @property
     def name(self) -> str:
@@ -136,6 +219,10 @@ class WeatherStrategy(Strategy):
             market_prob = market.yes_price
             edge = ensemble_prob - market_prob
 
+            # Record snapshot for trend tracking
+            self._record_snapshot(city, threshold, direction, ensemble_prob)
+            trend_multiplier = self._get_trend_multiplier(city, threshold, direction)
+
             # Build ensemble context for Claude
             bucket_dist = forecast.prob_per_bucket()
             ensemble_summary = (
@@ -186,7 +273,7 @@ class WeatherStrategy(Strategy):
                 fair_value=signal_fair,
                 market_price=signal_price,
                 edge=signal_edge,
-                confidence=min(claude_estimate.confidence, forecast.num_members / 21),
+                confidence=min(claude_estimate.confidence * trend_multiplier, forecast.num_members / 21),
                 reasoning=(
                     f"Ensemble: {ensemble_prob:.2%} | Claude: {claude_estimate.probability:.2%} | "
                     f"Blended: {blended_prob:.2%} | Market: {market_prob:.2%} | "

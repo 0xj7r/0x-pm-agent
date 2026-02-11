@@ -20,14 +20,21 @@ class Config:
 
     # Risk
     MAX_POSITION_PCT: float = float(os.getenv("MAX_POSITION_PCT", "0.06"))
-    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.08"))
+    MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.15"))
     KILL_BALANCE_USD: float = float(os.getenv("KILL_BALANCE_USD", "5.0"))
-    SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
+    SCAN_INTERVAL_SECONDS: int = int(os.getenv("SCAN_INTERVAL_SECONDS", "120"))
+    EXIT_THRESHOLD: float = float(os.getenv("EXIT_THRESHOLD", "0.45"))
+    MAX_POSITION_USD: float = float(os.getenv("MAX_POSITION_USD", "2.0"))
+    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.20"))
+    MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "10"))
+    LOSS_COOLDOWN_TRADES: int = int(os.getenv("LOSS_COOLDOWN_TRADES", "3"))
+    LOSS_COOLDOWN_SECONDS: int = int(os.getenv("LOSS_COOLDOWN_SECONDS", "1800"))
 
     # Strategy toggles
     ENABLE_WEATHER: bool = os.getenv("ENABLE_WEATHER", "true").lower() == "true"
     ENABLE_ARBITRAGE: bool = os.getenv("ENABLE_ARBITRAGE", "true").lower() == "true"
     ENABLE_COPY_TRADING: bool = os.getenv("ENABLE_COPY_TRADING", "true").lower() == "true"
+    ENABLE_TREND_DETECTION: bool = os.getenv("ENABLE_TREND_DETECTION", "true").lower() == "true"
 
     # Weather
     WEATHER_CITIES: list[str] = [
