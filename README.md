@@ -1,288 +1,178 @@
 # Polymarket Trading Agent
 
-Autonomous trading agent that scans Polymarket prediction markets, finds mispricings using data-driven strategies, and executes trades.
-
-The agent pays for its own Claude API inference from trading profits. If the balance hits zero, the agent dies.
+Autonomous trading agent that finds mispricings on [Polymarket](https://polymarket.com) prediction markets using data-driven strategies. Currently focused on weather temperature markets with ensemble forecast models.
 
 ## Architecture
 
 ```
-                        +------------------+
-                        |     main.py      |
-                        |   CLI entry      |
-                        | --live/--paper/  |
-                        |   --backtest     |
-                        +--------+---------+
-                                 |
-                        +--------v---------+
-                        |   TradingEngine  |
-                        |   core/engine.py |
-                        +--------+---------+
-                                 |
-              +------------------+------------------+
-              |                  |                  |
-     +--------v-------+ +-------v--------+ +-------v--------+
-     |  Market Scan   | |   Strategies   | |  Risk Manager  |
-     |  (Gamma API)   | |  (evaluate)    | |  (Kelly + kill)|
-     +----------------+ +-------+--------+ +-------+--------+
-                                |                   |
-                    +-----------+-----------+       |
-                    |           |           |       |
-              +-----v---+ +----v----+ +----v----+  |
-              | Weather | |  Arb    | |  Copy   |  |
-              | NOAA +  | | YES+NO | | Whale   |  |
-              | Claude  | | < $1   | | Mirror  |  |
-              +---------+ +---------+ +---------+  |
-                                                    |
-                        +---------------------------v--+
-                        |        Execute Trade         |
-                        |     (CLOB API / Paper)       |
-                        +-------------+----------------+
-                                      |
-                        +-------------v----------------+
-                        |     SQLite + MEMORY.md       |
-                        |   Trade log + AI learning    |
-                        +------------------------------+
+main.py                     # Entry point, PID file management, signal handling
+├── core/
+│   ├── engine.py           # Main trading loop — scan → evaluate → execute → sleep
+│   ├── portfolio.py        # Position tracking, balance management
+│   ├── risk.py             # Kelly sizing, daily loss limits, cooldowns, kill switch
+│   ├── analysis.py         # Post-trade analysis and P&L reporting
+│   └── memory.py           # Learning storage (what worked, what didn't)
+├── strategies/
+│   ├── base.py             # Abstract Strategy interface
+│   ├── weather.py          # NOAA ensemble vs Polymarket temperature buckets
+│   ├── arbitrage.py        # Cross-market price discrepancy detection
+│   └── copy_trading.py     # Follow known profitable wallets
+├── clients/
+│   ├── polymarket.py       # Gamma API: event discovery, bucket parsing, order execution
+│   ├── weather.py          # Open-Meteo GEFS ensemble forecasts (30 members)
+│   └── claude_client.py    # LLM reasoning for complex signals
+├── backtesting/
+│   ├── engine.py           # Historical replay engine
+│   ├── paper.py            # Paper trade execution and P&L tracking
+│   └── data.py             # Historical data fetching
+├── models/
+│   └── trade.py            # Trade, Signal, Outcome dataclasses
+└── tests/                  # 101 tests — see Testing section
 ```
 
-### Main Loop (every 10 minutes)
+## How It Works
 
-1. **Scan** - Fetch 500-1000 active markets from Polymarket Gamma API
-2. **Evaluate** - Each strategy analyses markets and produces `Signal` objects
-3. **Filter** - Risk manager checks minimum edge threshold (8%) and confidence
-4. **Size** - Kelly Criterion calculates position size (max 6% of bankroll)
-5. **Execute** - Place orders via CLOB API (or simulate in paper mode)
-6. **Record** - Log trades to SQLite, sync learnings to MEMORY.md
-7. **Check** - If balance < kill threshold, agent shuts down
+### Weather Strategy (primary)
 
-## Project Structure
+The core edge: NOAA's Global Ensemble Forecast System (GEFS) has 30 independent weather model runs. We compare their probability distribution against Polymarket's crowd-sourced prices.
 
-```
-polymarket-agent/
-├── main.py                  # CLI entry point
-├── config.py                # Settings from .env
-├── requirements.txt
-├── .env.example
-│
-├── core/                    # Engine + business logic
-│   ├── engine.py            # Main trading loop
-│   ├── portfolio.py         # Balance, positions, P&L tracking
-│   ├── risk.py              # Kelly Criterion, exposure limits, kill switch
-│   └── memory.py            # SQLite persistence + MEMORY.md sync
-│
-├── clients/                 # External API integrations
-│   ├── polymarket.py        # CLOB (trading) + Gamma (market discovery)
-│   ├── weather.py           # NOAA GEFS ensemble via Open-Meteo
-│   └── claude_client.py     # Claude Opus for fair value estimation
-│
-├── strategies/              # Alpha generators (pluggable)
-│   ├── base.py              # Abstract Strategy interface
-│   ├── weather.py           # NOAA ensemble probability vs market price
-│   ├── arbitrage.py         # Binary complement (YES+NO < $1)
-│   └── copy_trading.py      # Mirror high win-rate wallets
-│
-├── backtesting/             # Strategy validation
-│   ├── engine.py            # Replay resolved markets
-│   ├── data.py              # PolyBackTest + Gamma historical data
-│   └── paper.py             # Simulated fills with slippage model
-│
-└── models/                  # Data structures
-    ├── market.py             # Market, OrderBook, PricePoint
-    └── trade.py              # Signal, Trade, Position, TradeResult
-```
+**Flow:**
+1. **Discover** — Scan Gamma API for active weather temperature markets (13 cities, today + tomorrow)
+2. **Forecast** — Fetch 30-member GEFS ensemble from Open-Meteo for each city's target date
+3. **Compare** — For each temperature bucket (e.g. "4°C", "36-37°F", "46°F or higher"):
+   - Calculate what fraction of ensemble members predict a high temp in that bucket
+   - Compare against the market's YES price
+   - If `|ensemble_prob - market_price| > MIN_EDGE_THRESHOLD` → signal
+4. **Size** — Kelly criterion with configurable max position and portfolio limits
+5. **Execute** — Place trade (paper or live), deduplicate by market_id + outcome
+6. **Track** — Log to SQLite with full rationale, monitor resolution
 
-## Strategies
+**Bucket probability calculation:**
+- Polymarket buckets are integer degrees ("4°C", "36-37°F", "6°C or higher")
+- Each ensemble member's max temp is converted to the bucket's native unit (°C or °F)
+- Rounded to nearest integer (matches Weather Underground resolution source)
+- Counted: `probability = members_in_bucket / total_members`
 
-### 1. Weather (highest conviction)
+**Cities:** Seoul, London, Toronto, NYC, Atlanta, Ankara, Chicago, Dallas, Miami, Seattle, Auckland, Buenos Aires + configurable US cities
 
-The edge: NOAA runs 21 independent weather model simulations (GEFS ensemble). Most Polymarket traders bet on weather based on gut feeling. The bot has government satellites.
+### Arbitrage Strategy
 
-```
-NOAA GEFS (21 ensemble members)
-    → Open-Meteo API (clean JSON, no GRIB parsing)
-    → Probability distribution per temperature bucket
-    → Compare against Polymarket price
-    → Blend: 70% ensemble data + 30% Claude refinement
-    → Trade when edge > threshold
-```
+Scans for price discrepancies across related markets. Currently finds few signals — markets are efficient.
 
-Example: 18/21 ensemble members predict NYC > 80F. That's 86% probability. Polymarket prices it at 62%. Edge = 24%. Buy YES.
+### Copy Trading Strategy
 
-### 2. Binary Complement Arbitrage (risk-free)
-
-If the best ask for YES + best ask for NO on the same market totals less than $1.00, buying both guarantees a profit. One side must resolve to $1.00.
-
-The bot scans all markets and emits paired signals (buy YES + buy NO) when the complement cost is below $1.00.
-
-### 3. Whale Copy Trading (smart money)
-
-Discovers wallets with high win rates from the Polymarket leaderboard, monitors their trades, and mirrors BUY positions with position sizing scaled by the whale's historical win rate.
+Follows profitable wallets on Polymarket. Requires manual wallet addresses via `COPY_TRADING_WALLETS` env var (Gamma API leaderboard endpoint returns 405).
 
 ## Risk Management
 
-- **Kelly Criterion**: Position size = f(edge, odds, confidence). Fractional Kelly (never more than half Kelly) for safety
-- **Max position**: 6% of bankroll per trade (configurable)
-- **Minimum edge**: 8% mispricing required before trading (configurable)
-- **Minimum confidence**: 30% model confidence floor
-- **Kill switch**: Agent shuts down if balance drops below threshold (default $5)
-- **API cost tracking**: Claude inference costs are deducted from P&L
+- **Kelly sizing** — position size based on edge magnitude and confidence
+- **Max position** — per-trade cap (`MAX_POSITION_USD`, default $2)
+- **Portfolio limits** — max concurrent positions, max % of balance per trade
+- **Daily loss limit** — stops trading if daily losses exceed threshold
+- **Cooldown** — pauses after N consecutive losses
+- **Kill switch** — halts all trading if balance drops below `KILL_BALANCE_USD`
+- **Trade deduplication** — same market_id + outcome can only be traded once
 
-## Prerequisites
+## Data Flow
 
-- **Python 3.11+** (uses `match` statements, `|` union types)
-- **An Anthropic API key** for Claude Opus (the agent's brain)
-- **A Polymarket account** with API credentials (for live trading)
-- **USDC on Polygon** (for live trading - not needed for paper trading or backtesting)
-
-## Setup
-
-### 1. Clone and install
-
-```bash
-git clone https://github.com/0xj7r/polymarket-agent.git
-cd polymarket-agent
-
-# Create virtual environment (recommended)
-python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-
-# Install dependencies
-pip install -r requirements.txt
 ```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your credentials:
-
-```bash
-# Required for all modes
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Required for live trading only
-POLYMARKET_PRIVATE_KEY=0x...
-```
-
-### 3. Wallet setup (for live trading)
-
-Polymarket is a decentralized exchange on the Polygon network. To trade with real money:
-
-1. **Create a wallet** - Use MetaMask or any Ethereum wallet. Export the private key and put it in `.env`
-2. **Get USDC on Polygon** - You can:
-   - Bridge USDC from Ethereum mainnet to Polygon via [Polygon Bridge](https://portal.polygon.technology/bridge)
-   - Buy USDC directly on Polygon via an exchange (Coinbase, Binance) and withdraw to your wallet address
-   - Use a fiat onramp like MoonPay or Transak
-3. **Get POL for gas** - You need a small amount of POL (Polygon's native token) for transaction fees. ~$1 worth is plenty. Most exchanges let you withdraw POL directly to Polygon
-4. **Polymarket API credentials** - Visit [Polymarket](https://polymarket.com), connect your wallet, and the bot will derive API credentials from your private key automatically
-
-### 4. Verify setup
-
-```bash
-# Paper trading mode (no wallet needed, uses real market data)
-python main.py --log-level DEBUG
-```
-
-You should see the agent scanning markets and producing signals without placing real orders.
-
-## Usage
-
-```bash
-# Paper trading (default - no real money, real market data)
-python main.py
-
-# Backtest against historical resolved markets
-python main.py --backtest
-
-# Live trading (real money - requires funded wallet)
-python main.py --live
-
-# Debug logging
-python main.py --log-level DEBUG
-```
-
-### Recommended workflow
-
-1. **Backtest first** - Run `python main.py --backtest` to validate strategy edge on historical data
-2. **Paper trade** - Run `python main.py` for a few days to verify real-time signal quality. Check `trades.db` for results
-3. **Go live small** - Start with $50-100: `python main.py --live`. The kill switch will shut down the agent if balance drops below $5
-4. **Monitor** - Watch logs for trade execution, check portfolio snapshots in SQLite
-5. **Tune** - Adjust `MIN_EDGE_THRESHOLD`, `MAX_POSITION_PCT`, and strategy toggles based on what's working
-
-### Running on a VPS
-
-For 24/7 operation on a cheap VPS ($4-5/month):
-
-```bash
-# Using screen or tmux
-screen -S polymarket
-python main.py --live
-# Ctrl+A, D to detach
-
-# Or using systemd (create /etc/systemd/system/polymarket-agent.service)
-# Or using nohup
-nohup python main.py --live > agent.log 2>&1 &
+Open-Meteo (GEFS ensemble, 30 members)
+    ↓ sequential requests, 500ms delay, exponential backoff retry
+Weather Strategy
+    ↓ ensemble probability vs market price
+Gamma API (Polymarket event/market data)
+    ↓ bucket parsing, price extraction
+Trading Engine
+    ↓ risk checks, Kelly sizing
+SQLite (trades.db)
+    ├── trades        — 18 columns incl. reasoning, market_id, condition_id
+    ├── results       — resolution tracking (trade_id, resolved, won, pnl_usd)
+    ├── portfolio_snapshots — balance over time
+    └── learnings     — strategy lessons
 ```
 
 ## Configuration
 
-All settings are in `.env`. Key parameters:
+Key `.env` variables:
 
-| Variable                | Default                    | Description                                     |
-| ----------------------- | -------------------------- | ----------------------------------------------- |
-| `PAPER_TRADE`           | `true`                     | Paper trading mode (no real execution)          |
-| `MAX_POSITION_PCT`      | `0.06`                     | Max position size as fraction of bankroll       |
-| `MIN_EDGE_THRESHOLD`    | `0.08`                     | Minimum mispricing to trade                     |
-| `KILL_BALANCE_USD`      | `5.0`                      | Shut down if balance drops below this           |
-| `SCAN_INTERVAL_SECONDS` | `600`                      | Time between market scans (10 min)              |
-| `ENABLE_WEATHER`        | `true`                     | Enable weather strategy                         |
-| `ENABLE_ARBITRAGE`      | `true`                     | Enable arbitrage strategy                       |
-| `ENABLE_COPY_TRADING`   | `true`                     | Enable copy trading strategy                    |
-| `WEATHER_CITIES`        | `New York,Los Angeles,...` | Comma-separated cities for weather strategy     |
-| `CLAUDE_MODEL`          | `claude-opus-4-5-20250514` | Claude model for fair value estimation          |
-| `DB_PATH`               | `trades.db`                | SQLite database path for trades/results         |
-| `MEMORY_PATH`           | ``                         | Optional `MEMORY.md` path (empty disables sync) |
+```bash
+# Mode
+PAPER_TRADE=true                    # Paper mode (no real money)
 
-## Learning System
+# Risk
+MIN_EDGE_THRESHOLD=0.15            # 15% minimum edge to trade
+MAX_POSITION_PCT=0.06              # Max 6% of balance per trade
+MAX_POSITION_USD=2.0               # Hard cap per trade
+KILL_BALANCE_USD=5.0               # Stop-loss kill switch
+DAILY_LOSS_LIMIT_PCT=0.20          # Max 20% daily drawdown
+MAX_CONCURRENT_POSITIONS=10
+LOSS_COOLDOWN_TRADES=3             # Pause after 3 consecutive losses
+LOSS_COOLDOWN_SECONDS=1800         # 30min cooldown
 
-The agent learns from its trades across sessions:
+# Scanning
+SCAN_INTERVAL_SECONDS=600          # 10 min between cycles
+EXIT_THRESHOLD=0.45                # Sell above this price
 
-- **SQLite** (`trades.db`) stores all trades, results, and portfolio snapshots
-- **MEMORY.md** gets synced every 10 cycles with per-strategy win rates, PnL, and key learnings
-- Future Claude Code sessions can read MEMORY.md to understand what worked and what didn't
+# Strategies
+ENABLE_WEATHER=true
+ENABLE_ARBITRAGE=true
+ENABLE_COPY_TRADING=true
+ENABLE_TREND_DETECTION=true
 
-## Adding New Strategies
-
-Create a new file in `strategies/` implementing the `Strategy` interface:
-
-```python
-from strategies.base import Strategy
-from models.market import Market
-from models.trade import Signal
-
-class MyStrategy(Strategy):
-    @property
-    def name(self) -> str:
-        return "my_strategy"
-
-    async def evaluate(self, markets: list[Market]) -> list[Signal]:
-        signals = []
-        # Your alpha logic here
-        # Return Signal objects for markets where you see an edge
-        return signals
+# Weather
+WEATHER_CITIES=New York,Chicago,Seoul,London,...
 ```
 
-Then register it in `main.py`:
+## Setup
 
-```python
-engine.register_strategy(MyStrategy())
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # Edit with your config
+
+# Paper trading (default)
+python main.py
+
+# Live trading (requires funded Polymarket wallet)
+python main.py --live
 ```
 
-## Planned Features
+The agent writes a PID file (`agent.pid`) for process management and cleans up on shutdown.
 
-- OpenClaw integration for Telegram trade alerts and remote control
-- Catalyst momentum strategy (fast repricing after breaking news)
-- Favorite compounder (grind high-probability outcomes)
-- Correlation hedging across linked markets
+## Testing
+
+101 tests covering:
+
+```bash
+python -m pytest tests/ -v
+
+# Test files:
+tests/test_weather_parsing.py    # Bucket parsing, °C/°F conversion, ensemble probability
+tests/test_weather_signals.py    # Signal generation, city support, distribution math
+tests/test_deduplication.py      # Trade dedup by market_id + outcome
+tests/test_resolution.py         # Market resolution and P&L calculation
+tests/test_portfolio.py          # Balance tracking, position management
+tests/test_portfolio_pnl.py      # P&L math, win/loss scenarios
+tests/test_risk.py               # Kelly sizing, loss limits, cooldowns, kill switch
+tests/test_api_resilience.py     # Rate limiting, retry logic, error handling
+tests/test_config.py             # Configuration validation
+tests/test_imports.py            # Module import checks
+```
+
+**TDD is enforced.** Write failing tests first, then implement. See `CLAUDE.md` for coding guidelines.
+
+## Monitoring
+
+The agent logs to `agent.log` and stores all trades in `trades.db`. A companion [dashboard](https://github.com/0xj7r/polymarket-dashboard) (Next.js) reads the database for visualization.
+
+## Known Limitations
+
+- **Rate limiting:** Open-Meteo free tier has daily limits. Sequential requests with 500ms delay + exponential backoff.
+- **Resolution checker:** Disabled pending reimplementation (needs to only check markets past close date).
+- **Copy trading:** Polymarket leaderboard API returns 405; requires manual wallet addresses.
+- **No 24/7 uptime:** Runs on local machine; dies when Mac sleeps.
+
+## License
+
+Private — not for redistribution.
