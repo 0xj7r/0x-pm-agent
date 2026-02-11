@@ -251,8 +251,23 @@ class TradingEngine:
         # 4. Sort by edge (best opportunities first)
         approved.sort(key=lambda s: abs(s.edge), reverse=True)
 
-        # 5. Execute trades
-        for signal in approved:
+        # 5. Deduplicate — skip markets we already have open trades on
+        traded_markets = set()
+        if hasattr(self, 'memory') and self.memory:
+            try:
+                existing = self.memory.get_open_trades()
+                traded_markets = {t['market_id'] for t in existing}
+            except Exception:
+                pass
+        # Also check in-memory positions
+        traded_markets.update(self.portfolio.positions.keys())
+
+        deduped = [s for s in approved if s.market_id not in traded_markets]
+        if len(deduped) < len(approved):
+            logger.info(f"Deduped: {len(approved) - len(deduped)} signals skipped (already traded)")
+
+        # 6. Execute trades
+        for signal in deduped:
             await self._execute_signal(signal)
 
     async def _execute_signal(self, signal: Signal) -> None:
