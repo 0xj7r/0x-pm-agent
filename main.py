@@ -14,8 +14,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
+
+PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.pid")
 
 from config import Config
 from core.engine import TradingEngine
@@ -81,8 +84,27 @@ async def run_live(config: Config):
             # Windows event loops may not implement add_signal_handler.
             signal.signal(sig, lambda *_: asyncio.create_task(engine.stop()))
 
+    # PID file — write on start, clean up on stop
+    def _check_existing_pid():
+        """Kill stale process if PID file exists."""
+        if os.path.exists(PID_FILE):
+            try:
+                old_pid = int(open(PID_FILE).read().strip())
+                os.kill(old_pid, 0)  # Check if alive
+                logging.warning(f"Agent already running (PID {old_pid}), killing it...")
+                os.kill(old_pid, signal.SIGTERM)
+                import time
+                time.sleep(2)
+            except (ProcessLookupError, ValueError):
+                pass  # Stale PID file
+            os.remove(PID_FILE)
+
+    _check_existing_pid()
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     mode = "PAPER" if config.PAPER_TRADE else "LIVE"
-    logging.info(f"Starting Polymarket Agent in {mode} mode...")
+    logging.info(f"Starting Polymarket Agent in {mode} mode (PID {os.getpid()})...")
     logging.info(f"Strategies: {[s.name for s in strategies]}")
     logging.info(f"Scan interval: {config.SCAN_INTERVAL_SECONDS}s")
 
@@ -94,6 +116,8 @@ async def run_live(config: Config):
         await engine.run()
     finally:
         await engine.stop()
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
 
 
 async def run_backtest(config: Config):
