@@ -1,5 +1,7 @@
 """Public model exports."""
 
+"""Domain models for markets, trades, signals, and positions."""
+
 from models.market import Market, OrderBook, PricePoint
 from models.trade import Signal, Trade, Position, TradeResult
 

@@ -1,1 +1,1 @@
-"""API clients for Polymarket, weather data, and Claude inference."""
+"""API clients for external services (Polymarket, Claude, weather)."""

@@ -1,1 +1,1 @@
-"""Backtesting framework for strategy validation against historical data."""
+"""Backtesting framework for validating strategies against historical data."""

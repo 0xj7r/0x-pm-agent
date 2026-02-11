@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
+from config import Config
 from models.market import Market, Outcome
 from models.trade import Side, Signal, SignalSource
 from strategies.base import Strategy
@@ -26,6 +27,8 @@ ACTIVITY_URL = "https://gamma-api.polymarket.com/activity"
 
 @dataclass
 class TrackedWallet:
+    """A wallet being tracked for copy-trading signals."""
+
     address: str
     alias: str = ""
     win_rate: float = 0.0
@@ -36,6 +39,8 @@ class TrackedWallet:
 
 @dataclass
 class WalletTrade:
+    """A single trade observed from a tracked wallet."""
+
     wallet: str
     market_id: str
     market_question: str
@@ -61,45 +66,64 @@ class ClusterSignal:
 
     @property
     def wallet_count(self) -> int:
+        """Number of unique wallets in this cluster."""
         return len(self.wallets)
 
     @property
     def conviction_score(self) -> float:
         """Score 0-100 based on wallet count, combined PnL, and volume."""
-        # Wallet count: 5 wallets = 40 pts, each additional +5 pts, cap at 60
         count_score = min(60, max(0, (self.wallet_count - 4) * 10 + 30))
-        # PnL: positive combined PnL adds up to 20 pts
         pnl_score = min(20, max(0, self.combined_pnl / 500 * 20))
-        # Volume: high volume adds up to 20 pts
         vol_score = min(20, max(0, self.combined_volume / 10000 * 20))
         return min(100, count_score + pnl_score + vol_score)
 
 
 class CopyTradingStrategy(Strategy):
-    # Minimum wallets entering same position within CLUSTER_WINDOW to trigger cluster signal
-    CLUSTER_MIN_WALLETS = 5
-    CLUSTER_WINDOW = timedelta(hours=1)
+    """Copy trades from high-performing wallets with cluster detection."""
 
-    def __init__(self, tracked_wallets: list[str] | None = None):
+    # Minimum wallets entering same position within CLUSTER_WINDOW to trigger cluster signal
+    CLUSTER_MIN_WALLETS: int = 5
+    CLUSTER_WINDOW: timedelta = timedelta(hours=1)
+
+    def __init__(self, tracked_wallets: list[str] | None = None) -> None:
         self._http = httpx.AsyncClient(timeout=30.0)
-        # Wallets to track - can be loaded from config or discovered
         self.tracked_wallets: dict[str, TrackedWallet] = {}
         if tracked_wallets:
             for addr in tracked_wallets:
                 self.tracked_wallets[addr] = TrackedWallet(address=addr)
-        self._seen_trades: set[str] = set()  # dedup
-        # Cluster detection: track recent trades by (market_id, outcome)
+        self._seen_trades: set[str] = set()
         self._recent_wallet_trades: dict[str, list[tuple[str, datetime, float]]] = defaultdict(list)
 
     @property
     def name(self) -> str:
+        """Human-readable strategy name."""
         return "copy_trading"
 
-    async def discover_whales(self, min_win_rate: float = 0.65, limit: int = 20):
+    def _load_wallets_from_config(self) -> None:
+        """Load wallet addresses from COPY_TRADING_WALLETS config var.
+
+        Expects a comma-separated string of Ethereum addresses.
+        """
+        config = Config()
+        raw = config.COPY_TRADING_WALLETS.strip()
+        if not raw:
+            return
+
+        addresses = [addr.strip() for addr in raw.split(",") if addr.strip()]
+        for addr in addresses:
+            if addr not in self.tracked_wallets:
+                self.tracked_wallets[addr] = TrackedWallet(
+                    address=addr,
+                    alias=addr[:8],
+                )
+        if addresses:
+            logger.info(f"Loaded {len(addresses)} wallets from COPY_TRADING_WALLETS config")
+
+    async def discover_whales(self, min_win_rate: float = 0.65, limit: int = 20) -> None:
         """Discover high-performing wallets from Polymarket leaderboard.
 
-        This queries the Gamma API for top traders by PnL and filters
-        by win rate.
+        Queries the Gamma API for top traders by PnL and filters by win rate.
+        Falls back gracefully if the leaderboard endpoint is unavailable.
         """
         try:
             resp = await self._http.get(
@@ -129,14 +153,16 @@ class CopyTradingStrategy(Strategy):
                 f"with >{min_win_rate:.0%} win rate"
             )
 
-        except Exception as e:
+        except httpx.HTTPStatusError as e:
             logger.warning(
-                f"Whale auto-discovery unavailable (leaderboard API may be down): {e}. "
-                "Configure COPY_TRADING_WALLETS in .env to manually specify wallet addresses."
+                f"Leaderboard API returned {e.response.status_code} — "
+                f"whale discovery unavailable, using configured wallets only"
             )
+        except Exception as e:
+            logger.warning(f"Whale discovery failed (non-fatal): {e}")
 
     async def get_recent_trades(self, wallet: str) -> list[WalletTrade]:
-        """Get recent trades for a specific wallet."""
+        """Get recent trades for a specific wallet from the activity API."""
         try:
             resp = await self._http.get(
                 ACTIVITY_URL,
@@ -145,7 +171,7 @@ class CopyTradingStrategy(Strategy):
             resp.raise_for_status()
             activities = resp.json()
 
-            trades = []
+            trades: list[WalletTrade] = []
             for activity in activities:
                 if activity.get("type") != "trade":
                     continue
@@ -168,13 +194,12 @@ class CopyTradingStrategy(Strategy):
             logger.error(f"Failed to get trades for {wallet[:8]}...: {e}")
             return []
 
-    def _record_for_clustering(self, wallet_addr: str, trade: WalletTrade):
+    def _record_for_clustering(self, wallet_addr: str, trade: WalletTrade) -> None:
         """Record a trade for cluster detection."""
         key = f"{trade.market_id}:{trade.outcome}"
         self._recent_wallet_trades[key].append(
             (wallet_addr, trade.timestamp, trade.size * trade.price)
         )
-        # Prune entries older than the cluster window
         cutoff = datetime.utcnow() - self.CLUSTER_WINDOW
         self._recent_wallet_trades[key] = [
             (w, t, v) for w, t, v in self._recent_wallet_trades[key] if t >= cutoff
@@ -182,12 +207,10 @@ class CopyTradingStrategy(Strategy):
 
     def _detect_clusters(self, market_lookup: dict[str, Market]) -> list[Signal]:
         """Detect wallet clusters and generate high-conviction signals."""
-        signals = []
-        now = datetime.utcnow()
-        cutoff = now - self.CLUSTER_WINDOW
+        signals: list[Signal] = []
+        cutoff = datetime.utcnow() - self.CLUSTER_WINDOW
 
         for key, entries in self._recent_wallet_trades.items():
-            # Filter to recent window
             recent = [(w, t, v) for w, t, v in entries if t >= cutoff]
             unique_wallets = list({w for w, _, _ in recent})
 
@@ -202,21 +225,18 @@ class CopyTradingStrategy(Strategy):
             outcome = Outcome.YES if outcome_str == "Yes" else Outcome.NO
             market_price = market.yes_price if outcome == Outcome.YES else market.no_price
 
-            # Build cluster info
             combined_pnl = sum(
                 self.tracked_wallets[w].total_pnl
                 for w in unique_wallets
                 if w in self.tracked_wallets
             )
             combined_volume = sum(v for _, _, v in recent)
-            avg_win_rate = 0.0
             rated = [
                 self.tracked_wallets[w].win_rate
                 for w in unique_wallets
                 if w in self.tracked_wallets
             ]
-            if rated:
-                avg_win_rate = sum(rated) / len(rated)
+            avg_win_rate = sum(rated) / len(rated) if rated else 0.0
 
             cluster = ClusterSignal(
                 market_id=market_id,
@@ -261,35 +281,35 @@ class CopyTradingStrategy(Strategy):
 
     async def evaluate(self, markets: list[Market]) -> list[Signal]:
         """Check tracked wallets for new trades and generate copy signals."""
-        # Auto-discover whales if none tracked
+        # Load configured wallets first
+        if not self.tracked_wallets:
+            self._load_wallets_from_config()
+
+        # Auto-discover whales if still none tracked
         if not self.tracked_wallets:
             await self.discover_whales()
 
         if not self.tracked_wallets:
-            logger.debug("No wallets to track — skipping copy trading this cycle")
+            logger.warning("No wallets to track (discovery failed and none configured)")
             return []
 
-        signals = []
-        market_lookup = {m.id: m for m in markets}
+        signals: list[Signal] = []
+        market_lookup: dict[str, Market] = {m.id: m for m in markets}
 
         for address, wallet_info in self.tracked_wallets.items():
             trades = await self.get_recent_trades(address)
 
             for trade in trades:
-                # Dedup: skip trades we've already seen
                 trade_key = f"{trade.wallet}:{trade.market_id}:{trade.timestamp.isoformat()}"
                 if trade_key in self._seen_trades:
                     continue
                 self._seen_trades.add(trade_key)
 
-                # Only copy BUY trades (not sells/exits)
                 if trade.side != "BUY":
                     continue
 
-                # Record for cluster detection
                 self._record_for_clustering(address, trade)
 
-                # Look up market data
                 market = market_lookup.get(trade.market_id)
                 if not market or not market.active:
                     continue
@@ -297,8 +317,7 @@ class CopyTradingStrategy(Strategy):
                 outcome = Outcome.YES if trade.outcome == "Yes" else Outcome.NO
                 market_price = market.yes_price if outcome == Outcome.YES else market.no_price
 
-                # Edge estimate based on whale's historical win rate
-                estimated_edge = wallet_info.win_rate - 0.5  # edge over random
+                estimated_edge = wallet_info.win_rate - 0.5
 
                 signal = Signal(
                     market_id=trade.market_id,
@@ -325,7 +344,6 @@ class CopyTradingStrategy(Strategy):
                 )
                 signals.append(signal)
 
-        # Check for wallet clusters
         cluster_signals = self._detect_clusters(market_lookup)
         signals.extend(cluster_signals)
 
@@ -333,6 +351,7 @@ class CopyTradingStrategy(Strategy):
 
     @staticmethod
     def _parse_activity_timestamp(raw_timestamp: str | None) -> datetime:
+        """Parse an ISO timestamp string, falling back to now."""
         if not raw_timestamp:
             return datetime.utcnow()
         try:
@@ -341,8 +360,9 @@ class CopyTradingStrategy(Strategy):
             return datetime.utcnow()
 
     @staticmethod
-    def _safe_float(value, default: float) -> float:
+    def _safe_float(value: object, default: float) -> float:
+        """Safely convert a value to float with a fallback."""
         try:
-            return float(value)
+            return float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return default

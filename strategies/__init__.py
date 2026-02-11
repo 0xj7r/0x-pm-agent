@@ -1,1 +1,1 @@
-"""Trading strategies for Polymarket signal generation."""
+"""Trading strategies: weather, arbitrage, copy-trading."""

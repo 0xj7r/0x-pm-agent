@@ -1,1 +1,1 @@
-"""Core trading engine components: engine, portfolio, risk management, and analysis."""
+"""Core engine components: trading loop, memory, portfolio, and risk management."""
