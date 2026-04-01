@@ -15,7 +15,7 @@ class SignalConfig:
     w2_microprice: float = 0.2
     w3_price_delta: float = 0.4
     w4_acceleration: float = 0.1
-    confidence_threshold: float = 0.85
+    confidence_threshold: float = 0.75
     prior: float = 0.5
 
 

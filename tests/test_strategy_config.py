@@ -15,7 +15,7 @@ def test_load_default_config():
     assert cfg.signal.w2_microprice == 0.2
     assert cfg.signal.w3_price_delta == 0.4
     assert cfg.signal.w4_acceleration == 0.1
-    assert cfg.signal.confidence_threshold == 0.85
+    assert cfg.signal.confidence_threshold == 0.75
     assert cfg.execution.max_entry_price == 0.05
     assert cfg.risk.kelly_multiplier == 0.25
     assert cfg.risk.cheap_token_multiplier == 2.0
@@ -68,4 +68,4 @@ def test_load_from_file():
 
 def test_load_missing_file_returns_defaults():
     cfg = load_strategy_config("/nonexistent/path.json")
-    assert cfg.signal.confidence_threshold == 0.85
+    assert cfg.signal.confidence_threshold == 0.75

@@ -6,7 +6,7 @@
         "w2_microprice": 0.2,
         "w3_price_delta": 0.4,
         "w4_acceleration": 0.1,
-        "confidence_threshold": 0.85,
+        "confidence_threshold": 0.75,
         "prior": 0.5
     },
     "execution": {
