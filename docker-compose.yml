@@ -1,0 +1,15 @@
+services:
+  btc-sniper:
+    build: .
+    container_name: polymarket-btc-sniper
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - PAPER_TRADE=true
+      - LOG_LEVEL=INFO
+      - BTC_DB_PATH=/data/btc_trades.db
+    volumes:
+      - ./data:/data
+      - ./strategy_config.json:/app/strategy_config.json:ro
+    command: ["python", "btc_main.py", "--config", "/app/strategy_config.json"]

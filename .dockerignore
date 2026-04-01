@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+trades.db
+btc_trades.db
+*.pid
+btc_heartbeat.txt
+.env
+data/
+docs/
+tests/
