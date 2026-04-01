@@ -1,7 +1,8 @@
 """BTC 5-minute sniper trading engine.
 
 Orchestrates: Binance WS → Signal Engine → Entry Check → Execution → Persistence.
-Runs as a continuous async loop, one iteration per 100ms tick.
+Delegates resolution to core.resolver, notifications to core.notifier,
+health reporting to core.health.
 """
 from __future__ import annotations
 
@@ -10,14 +11,12 @@ import logging
 import time as _time
 from datetime import datetime, timezone
 
-import httpx
-
 from clients.binance_ws import BinanceWSClient, TradeUpdate
 from clients.market_scanner import MarketWindowScanner
-from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
 from core.health import HealthServer
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
+from core.resolver import PaperTradeResolver
 from core.risk import RiskManager
 from config import Config
 from models.market import MarketWindow
@@ -25,8 +24,6 @@ from strategies.btc_sniper import BayesianSignalEngine
 from strategies.strategy_config import StrategyConfig
 
 logger = logging.getLogger(__name__)
-
-GAMMA_URL = "https://gamma-api.polymarket.com"
 
 
 class BTCTradingEngine:
@@ -36,16 +33,10 @@ class BTCTradingEngine:
         self.cfg = strategy_cfg
         self.signal_engine = BayesianSignalEngine(strategy_cfg.signal)
         self.memory = MemoryStore(db_path)
-
-        base_config = Config()
-        base_config.MAX_POSITION_USD = strategy_cfg.risk.max_position_usd
-        base_config.MAX_POSITION_PCT = strategy_cfg.risk.max_position_pct
-        base_config.DAILY_LOSS_LIMIT_PCT = strategy_cfg.risk.daily_loss_limit_pct
-        base_config.KILL_BALANCE_USD = strategy_cfg.risk.kill_balance_usd
-        base_config.MAX_CONCURRENT_POSITIONS = strategy_cfg.risk.max_concurrent_positions
-        base_config.LOSS_COOLDOWN_TRADES = strategy_cfg.risk.loss_cooldown_trades
-        base_config.LOSS_COOLDOWN_SECONDS = strategy_cfg.risk.loss_cooldown_seconds
-        self.risk = RiskManager(base_config)
+        self.risk = self._init_risk(strategy_cfg)
+        self.health = HealthServer()
+        self.slack = SlackNotifier()
+        self.resolver = PaperTradeResolver()
 
         self.balance: float = strategy_cfg.paper.starting_balance
         self.risk.set_bankroll(self.balance)
@@ -56,20 +47,26 @@ class BTCTradingEngine:
         self._prev_btc_price: float = 0.0
         self._already_traded_this_window: bool = False
         self._running: bool = False
-
         self._buy_volume: float = 0.0
         self._sell_volume: float = 0.0
         self._paper_trades: list[dict] = []
-        self._resolved_market_ids: set[str] = set()
         self._scanner: MarketWindowScanner | None = None
-        self._resolution_http: httpx.AsyncClient | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
-        self.health = HealthServer()
-        self.slack = SlackNotifier()
+
+    @staticmethod
+    def _init_risk(cfg: StrategyConfig) -> RiskManager:
+        base = Config()
+        base.MAX_POSITION_USD = cfg.risk.max_position_usd
+        base.MAX_POSITION_PCT = cfg.risk.max_position_pct
+        base.DAILY_LOSS_LIMIT_PCT = cfg.risk.daily_loss_limit_pct
+        base.KILL_BALANCE_USD = cfg.risk.kill_balance_usd
+        base.MAX_CONCURRENT_POSITIONS = cfg.risk.max_concurrent_positions
+        base.LOSS_COOLDOWN_TRADES = cfg.risk.loss_cooldown_trades
+        base.LOSS_COOLDOWN_SECONDS = cfg.risk.loss_cooldown_seconds
+        return RiskManager(base)
 
     def _on_new_window(self, window: MarketWindow) -> None:
-        """Reset state for a new 5-minute market window."""
         self.signal_engine.reset()
         self.current_window = window
         self._window_open_price = self._last_btc_price
@@ -83,7 +80,6 @@ class BTCTradingEngine:
         )
 
     async def _on_binance_trade(self, update: TradeUpdate) -> None:
-        """Process a single Binance trade and update the signal engine."""
         self._prev_btc_price = self._last_btc_price
         self._last_btc_price = update.price
 
@@ -95,13 +91,8 @@ class BTCTradingEngine:
         if not self.current_window or self._window_open_price == 0:
             return
 
-        # Compute current window state (not incremental — avoids runaway log_odds)
         total_vol = self._buy_volume + self._sell_volume
-        ofi = 0.0
-        if total_vol > 0:
-            ofi = (self._buy_volume - self._sell_volume) / total_vol
-
-        microprice_dev = 0.0
+        ofi = (self._buy_volume - self._sell_volume) / total_vol if total_vol > 0 else 0.0
 
         price_delta = (update.price - self._window_open_price) / self._window_open_price * 100
         accel = 0.0
@@ -109,46 +100,35 @@ class BTCTradingEngine:
             prev_delta = (self._prev_btc_price - self._window_open_price) / self._window_open_price * 100
             accel = price_delta - prev_delta
 
-        # set_state recomputes log_odds from scratch (not accumulated)
         self.signal_engine.set_state(
             order_flow_imbalance=ofi,
-            microprice_deviation=microprice_dev,
+            microprice_deviation=0.0,
             price_delta=price_delta,
             acceleration=accel,
         )
 
     def _in_entry_window(self) -> bool:
-        """Check if current time is within a configured entry window."""
         if not self.current_window:
             return False
-
         now = datetime.now(timezone.utc)
         elapsed = self.current_window.elapsed_seconds(now)
-
         early = self.cfg.execution.entry_window_early
         late = self.cfg.execution.entry_window_late
-
         if self.cfg.execution.enable_early_snipe and early[0] <= elapsed <= early[1]:
             return True
         if self.cfg.execution.enable_late_snipe and late[0] <= elapsed <= late[1]:
             return True
-
         return False
 
     def _check_entry(self) -> list[dict]:
-        """Check if entry conditions are met. Returns list of paper trades to execute."""
         if not self.current_window or self._already_traded_this_window:
             return []
-
         if not self.signal_engine.confident:
             return []
-
         if not self._in_entry_window():
             return []
 
         direction = self.signal_engine.direction
-        max_price = self.cfg.execution.max_entry_price
-
         if direction == "UP":
             token_price = self.current_window.up_price
             token_id = self.current_window.up_token_id
@@ -156,30 +136,25 @@ class BTCTradingEngine:
             token_price = self.current_window.down_price
             token_id = self.current_window.down_token_id
 
-        if token_price > max_price:
+        if token_price > self.cfg.execution.max_entry_price:
             return []
 
         p_win = self.signal_engine.p_up if direction == "UP" else self.signal_engine.p_down
         size_usd = self.risk.asymmetric_kelly_size(
-            p_win=p_win,
-            token_price=token_price,
-            bankroll=self.balance,
-            risk_cfg=self.cfg.risk,
+            p_win=p_win, token_price=token_price,
+            bankroll=self.balance, risk_cfg=self.cfg.risk,
         )
-
         if size_usd <= 0:
             return []
 
         self._already_traded_this_window = True
-        shares = size_usd / token_price
-
         trade = {
             "market_id": self.current_window.market_id,
             "direction": direction,
             "token_id": token_id,
             "token_price": token_price,
             "size_usd": size_usd,
-            "shares": shares,
+            "shares": size_usd / token_price,
             "p_win": p_win,
             "log_odds": self.signal_engine.log_odds,
             "btc_price": self._last_btc_price,
@@ -188,11 +163,9 @@ class BTCTradingEngine:
 
         logger.info(
             f"ENTRY: {direction} @ ${token_price:.3f} | "
-            f"${size_usd:.2f} ({shares:.0f} shares) | "
-            f"P({direction})={p_win:.3f} | "
-            f"BTC=${self._last_btc_price:,.2f}"
+            f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
+            f"P({direction})={p_win:.3f} | BTC=${self._last_btc_price:,.2f}"
         )
-
         self.memory.save_event(
             window_id=self.current_window.market_id,
             event_type="entry",
@@ -201,11 +174,9 @@ class BTCTradingEngine:
             btc_price=self._last_btc_price,
             details=trade,
         )
-
         return [trade]
 
     async def _scan_for_window(self) -> None:
-        """Poll Gamma API for the current active BTC market window."""
         now = _time.time()
         if now - self._last_scan_time < self._scan_interval:
             return
@@ -213,7 +184,6 @@ class BTCTradingEngine:
 
         if not self._scanner:
             self._scanner = MarketWindowScanner()
-
         try:
             window = await self._scanner.get_current_window()
             if window and (not self.current_window or window.market_id != self.current_window.market_id):
@@ -221,73 +191,10 @@ class BTCTradingEngine:
         except Exception as e:
             logger.warning(f"Market scan failed: {e}")
 
-    async def _check_resolution(self, market_id: str) -> dict | None:
-        """Check if a market has resolved via Gamma API directly."""
-        if not self._resolution_http:
-            self._resolution_http = httpx.AsyncClient(timeout=30.0)
-
-        try:
-            resp = await self._resolution_http.get(f"{GAMMA_URL}/markets/{market_id}")
-            if resp.status_code != 200:
-                return None
-
-            data = resp.json()
-            if isinstance(data, list):
-                data = data[0] if data else None
-            if not data or not data.get("closed", False):
-                return None
-
-            outcome_prices_raw = data.get("outcomePrices", "[]")
-            import json
-            prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
-            if len(prices) < 2:
-                return None
-
-            yes_price = float(prices[0])
-            if yes_price >= 0.99:
-                return {"resolved": True, "winning_outcome": "Yes"}
-            elif float(prices[1]) >= 0.99:
-                return {"resolved": True, "winning_outcome": "No"}
-            return None
-        except Exception as e:
-            logger.debug(f"Resolution check failed for {market_id}: {e}")
-            return None
-
-    async def _check_resolutions(self) -> None:
-        """Check if any paper trades have resolved and calculate P&L."""
-        unresolved = [
-            t for t in self._paper_trades
-            if t["market_id"] not in self._resolved_market_ids
-        ]
-        if not unresolved:
-            return
-
-        for trade in unresolved:
-            market_id = trade["market_id"]
-
-            result = await self._check_resolution(market_id)
-            if not result:
-                continue
-
-            winning = result["winning_outcome"]
-            resolved_dir = "UP" if winning == "Yes" else "DOWN"
-
-            record = PaperTradeRecord(
-                trade_id=trade.get("timestamp", market_id),
-                market_id=market_id,
-                direction=trade["direction"],
-                token_price=trade["token_price"],
-                size_usd=trade["size_usd"],
-                shares=trade["shares"],
-            )
-            res = resolve_paper_trade(record, resolved_dir)
-
-            # At entry: balance -= cost. At resolution: balance += cost + pnl.
-            # Win:  cost + (payout - cost - fee) = payout - fee
-            # Loss: cost + (-cost - fee) = -fee
+    async def _process_resolutions(self) -> None:
+        resolved = await self.resolver.resolve_trades(self._paper_trades)
+        for trade, res, resolved_dir in resolved:
             self.balance += trade["size_usd"] + res.pnl_usd
-
-            self._resolved_market_ids.add(market_id)
             self.risk.record_trade_result(res.pnl_usd)
 
             status = "WON" if res.won else "LOST"
@@ -296,7 +203,6 @@ class BTCTradingEngine:
                 f"{trade['direction']} @ {trade['token_price']:.3f} | "
                 f"Outcome: {resolved_dir} | Balance: ${self.balance:.2f}"
             )
-
             await self.slack.notify_resolution(
                 won=res.won, pnl=res.pnl_usd,
                 direction=trade["direction"],
@@ -304,31 +210,18 @@ class BTCTradingEngine:
                 resolved_direction=resolved_dir,
                 balance=self.balance,
             )
-
             self.memory.save_event(
-                window_id=market_id,
+                window_id=trade["market_id"],
                 event_type="resolution",
-                p_up=None,
-                log_odds=None,
-                btc_price=None,
-                details={
-                    "won": res.won,
-                    "pnl_usd": res.pnl_usd,
-                    "resolved_direction": resolved_dir,
-                    "trade": trade,
-                },
+                p_up=None, log_odds=None, btc_price=None,
+                details={"won": res.won, "pnl_usd": res.pnl_usd,
+                         "resolved_direction": resolved_dir, "trade": trade},
             )
 
-        # Prune resolved trades from the list (fix #10)
-        self._paper_trades = [
-            t for t in self._paper_trades
-            if t["market_id"] not in self._resolved_market_ids
-        ]
+        self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
 
     async def run(self) -> None:
-        """Main loop. Connects to Binance, scans markets, processes data, checks entries."""
         self._running = True
-
         await self.health.start()
 
         binance = BinanceWSClient(on_trade=self._on_binance_trade)
@@ -336,8 +229,7 @@ class BTCTradingEngine:
 
         logger.info(
             f"BTC Sniper started | Paper: {self.cfg.paper.enabled} | "
-            f"Balance: ${self.balance:.2f} | "
-            f"Threshold: {self.cfg.signal.confidence_threshold}"
+            f"Balance: ${self.balance:.2f} | Threshold: {self.cfg.signal.confidence_threshold}"
         )
         await self.slack.notify_startup(
             self.balance, self.cfg.signal.confidence_threshold, self.cfg.paper.enabled
@@ -350,55 +242,44 @@ class BTCTradingEngine:
                 try:
                     await self._scan_for_window()
 
-                    trades = self._check_entry()
-                    for t in trades:
+                    for t in self._check_entry():
                         self._paper_trades.append(t)
                         if self.cfg.paper.enabled:
                             self.balance -= t["size_usd"]
                             logger.info(f"[PAPER] Balance: ${self.balance:.2f}")
                         await self.slack.notify_trade(
-                            direction=t["direction"],
-                            token_price=t["token_price"],
-                            size_usd=t["size_usd"],
-                            shares=t["shares"],
-                            p_win=t["p_win"],
-                            btc_price=t["btc_price"],
+                            direction=t["direction"], token_price=t["token_price"],
+                            size_usd=t["size_usd"], shares=t["shares"],
+                            p_win=t["p_win"], btc_price=t["btc_price"],
                             balance=self.balance,
                         )
 
                     tick_count += 1
-                    if tick_count % 600 == 0:  # every ~60s
-                        await self._check_resolutions()
-
-                        total_trades = len(self._paper_trades) + len(self._resolved_market_ids)
+                    if tick_count % 600 == 0:
+                        await self._process_resolutions()
+                        total = len(self._paper_trades) + len(self.resolver.resolved_ids)
                         self.health.update(
-                            balance=self.balance,
-                            trades_total=total_trades,
-                            trades_resolved=len(self._resolved_market_ids),
+                            balance=self.balance, trades_total=total,
+                            trades_resolved=len(self.resolver.resolved_ids),
                             p_up=self.signal_engine.p_up,
                             binance_connected=binance.seconds_since_last_message < 10,
                             binance_last_msg_age_s=round(binance.seconds_since_last_message, 1),
                             current_window=self.current_window.question if self.current_window else None,
                         )
-
                         logger.info(
                             f"Status: P(UP)={self.signal_engine.p_up:.3f} | "
-                            f"Balance=${self.balance:.2f} | "
-                            f"Trades={len(self._paper_trades)} | "
-                            f"Resolved={len(self._resolved_market_ids)}"
+                            f"Balance=${self.balance:.2f} | Trades={len(self._paper_trades)} | "
+                            f"Resolved={len(self.resolver.resolved_ids)}"
                         )
 
-                    # Hourly Slack status update
-                    if tick_count % 36000 == 0:  # every ~3600s (1 hour)
+                    if tick_count % 36000 == 0:
                         uptime_h = (_time.time() - start_time) / 3600
+                        total = len(self._paper_trades) + len(self.resolver.resolved_ids)
                         await self.slack.notify_status(
-                            balance=self.balance,
-                            trades=total_trades,
-                            resolved=len(self._resolved_market_ids),
-                            p_up=self.signal_engine.p_up,
-                            uptime_hours=uptime_h,
+                            balance=self.balance, trades=total,
+                            resolved=len(self.resolver.resolved_ids),
+                            p_up=self.signal_engine.p_up, uptime_hours=uptime_h,
                         )
-
                 except Exception as e:
                     logger.error(f"Engine tick error: {e}", exc_info=True)
                     self.health.record_error(str(e))
@@ -411,8 +292,7 @@ class BTCTradingEngine:
             binance_task.cancel()
             if self._scanner:
                 await self._scanner.close()
-            if self._resolution_http:
-                await self._resolution_http.aclose()
+            await self.resolver.close()
             await self.slack.close()
 
     async def stop(self) -> None:
