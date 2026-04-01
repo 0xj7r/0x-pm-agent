@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS learnings (
     trade_ids TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id TEXT NOT NULL,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+    event_type TEXT NOT NULL,
+    log_odds REAL,
+    p_up REAL,
+    btc_price REAL,
+    details TEXT
+);
 """
 
 
@@ -258,5 +269,35 @@ class MemoryStore:
         path.write_text(content)
         logger.info(f"Synced trading stats to {memory_path}")
 
-    def close(self):
+    def save_event(
+        self,
+        window_id: str,
+        event_type: str,
+        log_odds: float | None = None,
+        p_up: float | None = None,
+        btc_price: float | None = None,
+        details: dict | None = None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO event_log (window_id, event_type, log_odds, p_up, btc_price, details)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                window_id,
+                event_type,
+                log_odds,
+                p_up,
+                btc_price,
+                json.dumps(details) if details else None,
+            ),
+        )
+        self.conn.commit()
+
+    def get_events_for_window(self, window_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM event_log WHERE window_id = ? ORDER BY id",
+            (window_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def close(self) -> None:
         self.conn.close()
