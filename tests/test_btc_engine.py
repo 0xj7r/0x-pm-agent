@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from clients.binance_ws import TradeUpdate
-from core.btc_engine import BTCTradingEngine
+from core.engine import BTCTradingEngine
 from models.market import MarketWindow
 from strategies.strategy_config import StrategyConfig
 
@@ -110,8 +110,9 @@ async def test_engine_generates_paper_trade():
 
 
 @pytest.mark.asyncio
-async def test_engine_no_trade_when_no_cheap_tokens():
+async def test_engine_no_trade_when_no_cheap_tokens_and_midrange_disabled():
     engine = make_engine()
+    engine.cfg.execution.enable_midrange = False
 
     now = datetime.now(timezone.utc)
     engine.current_window = MarketWindow(
@@ -130,6 +131,33 @@ async def test_engine_no_trade_when_no_cheap_tokens():
 
     trades = engine._check_entry()
     assert len(trades) == 0
+
+
+@pytest.mark.asyncio
+async def test_engine_midrange_trade_when_confident():
+    engine = make_engine()
+    engine.cfg.execution.enable_midrange = True
+    engine.cfg.execution.midrange_min_confidence = 0.80
+    engine.cfg.execution.midrange_max_price = 0.55
+
+    now = datetime.now(timezone.utc)
+    engine.current_window = MarketWindow(
+        market_id="m1",
+        question="BTC Up/Down",
+        start_time=now - timedelta(seconds=30),
+        end_time=now + timedelta(minutes=4, seconds=30),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        up_price=0.50,
+        down_price=0.50,
+    )
+    engine._window_open_price = 84000.0
+    engine._already_traded_this_window = False
+    engine.signal_engine.log_odds = 3.0  # P(UP) ~0.95
+
+    trades = engine._check_entry()
+    assert len(trades) == 1
+    assert trades[0]["strategy"] == "midrange"
 
 
 @pytest.mark.asyncio

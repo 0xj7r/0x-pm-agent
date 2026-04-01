@@ -1,6 +1,6 @@
 {
-    "version": 1,
-    "promoted_at": "2026-03-31T12:00:00Z",
+    "version": 2,
+    "promoted_at": "2026-04-01T15:00:00Z",
     "signal": {
         "w1_order_flow": 0.3,
         "w2_microprice": 0.2,
@@ -14,7 +14,11 @@
         "entry_window_early": [0, 60],
         "entry_window_late": [270, 295],
         "enable_early_snipe": true,
-        "enable_late_snipe": true
+        "enable_late_snipe": true,
+        "enable_midrange": true,
+        "midrange_max_price": 0.55,
+        "midrange_min_confidence": 0.80,
+        "midrange_taker_fee_rate": 0.04
     },
     "risk": {
         "max_position_usd": 50,

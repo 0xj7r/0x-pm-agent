@@ -26,6 +26,11 @@ class ExecutionConfig:
     entry_window_late: list[int] = field(default_factory=lambda: [270, 295])
     enable_early_snipe: bool = True
     enable_late_snipe: bool = True
+    # Strategy B: mid-range directional (0x8dxd style)
+    enable_midrange: bool = True
+    midrange_max_price: float = 0.55
+    midrange_min_confidence: float = 0.80
+    midrange_taker_fee_rate: float = 0.04
 
 
 @dataclass

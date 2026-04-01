@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
 from clients.market_scanner import MarketWindowScanner
 from clients.polymarket import PolymarketClient
+from clients.polymarket_ws import PolymarketWSClient
 from core.health import HealthServer
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
@@ -40,6 +41,7 @@ class BTCTradingEngine:
         self.health = HealthServer()
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
+        self.poly_ws = PolymarketWSClient()
 
         self._polymarket: PolymarketClient | None = None
         if not strategy_cfg.paper.enabled:
@@ -87,6 +89,13 @@ class BTCTradingEngine:
         self._already_traded_this_window = False
         self._buy_volume = 0.0
         self._sell_volume = 0.0
+        # Subscribe to real-time token prices for this window
+        token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
+        if token_ids:
+            try:
+                asyncio.create_task(self.poly_ws.subscribe(token_ids))
+            except RuntimeError:
+                pass  # No event loop yet (e.g. during tests)
         logger.info(
             f"New window: {window.question} | "
             f"BTC open: ${self._window_open_price:,.2f} | "
@@ -138,31 +147,56 @@ class BTCTradingEngine:
             return True
         return False
 
+    def _get_live_price(self, token_id: str, fallback: float) -> float:
+        """Get real-time price from CLOB WS, fall back to Gamma snapshot."""
+        live = self.poly_ws.get_price(token_id)
+        return live if live > 0 else fallback
+
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
-            return []
-        if not self.signal_engine.confident:
             return []
         if not self._in_entry_window():
             return []
 
         direction = self.signal_engine.direction
+        p_up = self.signal_engine.p_up
+        p_down = self.signal_engine.p_down
+
         if direction == "UP":
-            token_price = self.current_window.up_price
             token_id = self.current_window.up_token_id
+            token_price = self._get_live_price(token_id, self.current_window.up_price)
+            p_win = p_up
         else:
-            token_price = self.current_window.down_price
             token_id = self.current_window.down_token_id
+            token_price = self._get_live_price(token_id, self.current_window.down_price)
+            p_win = p_down
 
-        if token_price > self.cfg.execution.max_entry_price:
-            return []
+        # Strategy A: cheap token sniping (2-5c, asymmetric payoff)
+        strategy = None
+        size_usd = 0.0
 
-        p_win = self.signal_engine.p_up if direction == "UP" else self.signal_engine.p_down
-        size_usd = self.risk.asymmetric_kelly_size(
-            p_win=p_win, token_price=token_price,
-            bankroll=self.balance, risk_cfg=self.cfg.risk,
-        )
-        if size_usd <= 0:
+        if token_price <= self.cfg.execution.max_entry_price and self.signal_engine.confident:
+            strategy = "snipe"
+            size_usd = self.risk.asymmetric_kelly_size(
+                p_win=p_win, token_price=token_price,
+                bankroll=self.balance, risk_cfg=self.cfg.risk,
+            )
+
+        # Strategy B: mid-range directional (25-50c, fee-aware Kelly)
+        if (
+            strategy is None
+            and self.cfg.execution.enable_midrange
+            and token_price <= self.cfg.execution.midrange_max_price
+            and p_win >= self.cfg.execution.midrange_min_confidence
+        ):
+            strategy = "midrange"
+            size_usd = self.risk.fee_aware_kelly_size(
+                p_win=p_win, token_price=token_price,
+                bankroll=self.balance, risk_cfg=self.cfg.risk,
+                taker_fee_rate=self.cfg.execution.midrange_taker_fee_rate,
+            )
+
+        if not strategy or size_usd <= 0:
             return []
 
         self._already_traded_this_window = True
@@ -176,11 +210,12 @@ class BTCTradingEngine:
             "p_win": p_win,
             "log_odds": self.signal_engine.log_odds,
             "btc_price": self._last_btc_price,
+            "strategy": strategy,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.info(
-            f"ENTRY: {direction} @ ${token_price:.3f} | "
+            f"ENTRY [{strategy.upper()}]: {direction} @ ${token_price:.3f} | "
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
             f"P({direction})={p_win:.3f} | BTC=${self._last_btc_price:,.2f}"
         )
@@ -247,6 +282,7 @@ class BTCTradingEngine:
 
         binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book)
         binance_task = asyncio.create_task(binance.connect())
+        poly_ws_task = asyncio.create_task(self.poly_ws.connect())
 
         logger.info(
             f"BTC Sniper started | Paper: {self.cfg.paper.enabled} | "
@@ -311,6 +347,8 @@ class BTCTradingEngine:
             await self.health.stop()
             await binance.close()
             binance_task.cancel()
+            await self.poly_ws.close()
+            poly_ws_task.cancel()
             if self._scanner:
                 await self._scanner.close()
             await self.resolver.close()

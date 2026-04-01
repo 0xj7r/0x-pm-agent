@@ -48,7 +48,7 @@ def cleanup_pid() -> None:
 
 
 async def main(config_path: str, live: bool) -> None:
-    from core.btc_engine import BTCTradingEngine
+    from core.engine import BTCTradingEngine
     from strategies.btc_sniper import BayesianSignalEngine
     from strategies.strategy_config import load_strategy_config
 

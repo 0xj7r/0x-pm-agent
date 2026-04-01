@@ -14,4 +14,4 @@ ENV BTC_DB_PATH=/data/btc_trades.db
 EXPOSE 8080
 VOLUME ["/data"]
 
-ENTRYPOINT ["python", "btc_main.py"]
+ENTRYPOINT ["python", "main.py"]

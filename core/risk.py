@@ -241,3 +241,41 @@ class RiskManager:
             return 0.0
 
         return round(position, 2)
+
+    def fee_aware_kelly_size(
+        self,
+        p_win: float,
+        token_price: float,
+        bankroll: float,
+        risk_cfg: RiskConfig,
+        taker_fee_rate: float = 0.04,
+    ) -> float:
+        """Kelly sizing that accounts for Polymarket's dynamic taker fee.
+
+        Fee formula: fee_per_share = taker_fee_rate * price * (1 - price)
+        At 50c the fee is ~1c/share (2%), at 25c it's ~0.75c (3%).
+        We subtract the fee from expected profit before sizing.
+        """
+        if token_price <= 0 or token_price >= 1 or bankroll <= 0 or p_win <= 0:
+            return 0.0
+
+        fee_per_share = taker_fee_rate * token_price * (1.0 - token_price)
+        net_payout = 1.0 - token_price - fee_per_share
+        if net_payout <= 0:
+            return 0.0
+
+        edge = p_win - token_price - fee_per_share
+        if edge <= 0:
+            return 0.0
+
+        kelly_fraction = edge / net_payout
+        adjusted = kelly_fraction * risk_cfg.kelly_multiplier
+
+        max_by_pct = bankroll * risk_cfg.max_position_pct
+        max_size = min(max_by_pct, risk_cfg.max_position_usd)
+        position = min(adjusted * bankroll, max_size)
+
+        if position < 1.0:
+            return 0.0
+
+        return round(position, 2)

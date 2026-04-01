@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from clients.binance_ws import TradeUpdate
-from core.btc_engine import BTCTradingEngine
+from core.engine import BTCTradingEngine
 from models.market import MarketWindow
 from strategies.strategy_config import StrategyConfig
 
