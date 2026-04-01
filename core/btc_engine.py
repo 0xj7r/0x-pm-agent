@@ -17,6 +17,7 @@ from clients.market_scanner import MarketWindowScanner
 from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
 from core.health import HealthServer
 from core.memory import MemoryStore
+from core.notifier import SlackNotifier
 from core.risk import RiskManager
 from config import Config
 from models.market import MarketWindow
@@ -65,6 +66,7 @@ class BTCTradingEngine:
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
         self.health = HealthServer()
+        self.slack = SlackNotifier()
 
     def _on_new_window(self, window: MarketWindow) -> None:
         """Reset state for a new 5-minute market window."""
@@ -295,6 +297,14 @@ class BTCTradingEngine:
                 f"Outcome: {resolved_dir} | Balance: ${self.balance:.2f}"
             )
 
+            await self.slack.notify_resolution(
+                won=res.won, pnl=res.pnl_usd,
+                direction=trade["direction"],
+                token_price=trade["token_price"],
+                resolved_direction=resolved_dir,
+                balance=self.balance,
+            )
+
             self.memory.save_event(
                 window_id=market_id,
                 event_type="resolution",
@@ -329,8 +339,12 @@ class BTCTradingEngine:
             f"Balance: ${self.balance:.2f} | "
             f"Threshold: {self.cfg.signal.confidence_threshold}"
         )
+        await self.slack.notify_startup(
+            self.balance, self.cfg.signal.confidence_threshold, self.cfg.paper.enabled
+        )
 
         tick_count = 0
+        start_time = _time.time()
         try:
             while self._running:
                 try:
@@ -342,13 +356,21 @@ class BTCTradingEngine:
                         if self.cfg.paper.enabled:
                             self.balance -= t["size_usd"]
                             logger.info(f"[PAPER] Balance: ${self.balance:.2f}")
+                        await self.slack.notify_trade(
+                            direction=t["direction"],
+                            token_price=t["token_price"],
+                            size_usd=t["size_usd"],
+                            shares=t["shares"],
+                            p_win=t["p_win"],
+                            btc_price=t["btc_price"],
+                            balance=self.balance,
+                        )
 
                     tick_count += 1
                     if tick_count % 600 == 0:  # every ~60s
                         await self._check_resolutions()
 
                         total_trades = len(self._paper_trades) + len(self._resolved_market_ids)
-                        wins = sum(1 for t in self._paper_trades if t.get("won"))
                         self.health.update(
                             balance=self.balance,
                             trades_total=total_trades,
@@ -365,9 +387,22 @@ class BTCTradingEngine:
                             f"Trades={len(self._paper_trades)} | "
                             f"Resolved={len(self._resolved_market_ids)}"
                         )
+
+                    # Hourly Slack status update
+                    if tick_count % 36000 == 0:  # every ~3600s (1 hour)
+                        uptime_h = (_time.time() - start_time) / 3600
+                        await self.slack.notify_status(
+                            balance=self.balance,
+                            trades=total_trades,
+                            resolved=len(self._resolved_market_ids),
+                            p_up=self.signal_engine.p_up,
+                            uptime_hours=uptime_h,
+                        )
+
                 except Exception as e:
                     logger.error(f"Engine tick error: {e}", exc_info=True)
                     self.health.record_error(str(e))
+                    await self.slack.notify_error(str(e))
 
                 await asyncio.sleep(0.1)
         finally:
@@ -378,6 +413,7 @@ class BTCTradingEngine:
                 await self._scanner.close()
             if self._resolution_http:
                 await self._resolution_http.aclose()
+            await self.slack.close()
 
     async def stop(self) -> None:
         self._running = False
