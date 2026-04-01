@@ -19,6 +19,7 @@ class SignalSource(str, Enum):
     ARBITRAGE = "arbitrage"
     COPY_TRADING = "copy_trading"
     CLAUDE_FAIR_VALUE = "claude_fair_value"
+    CRYPTO_SNIPER = "crypto_sniper"
 
 
 @dataclass

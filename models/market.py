@@ -86,3 +86,26 @@ class Market:
         """Profit from buying YES + NO if complement < $1. Returns 0 if no arb."""
         cost = self.complement_cost
         return max(0.0, 1.0 - cost)
+
+
+@dataclass
+class MarketWindow:
+    """A single 5-minute Bitcoin Up/Down market window."""
+
+    market_id: str
+    question: str
+    start_time: datetime
+    end_time: datetime
+    up_token_id: str
+    down_token_id: str
+    up_price: float = 0.5
+    down_price: float = 0.5
+
+    def time_remaining(self, now: datetime) -> float:
+        return max(0.0, (self.end_time - now).total_seconds())
+
+    def elapsed_seconds(self, now: datetime) -> float:
+        return max(0.0, (now - self.start_time).total_seconds())
+
+    def is_active(self, now: datetime) -> bool:
+        return self.start_time <= now < self.end_time
