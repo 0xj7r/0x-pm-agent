@@ -15,6 +15,7 @@ import httpx
 from clients.binance_ws import BinanceWSClient, TradeUpdate
 from clients.market_scanner import MarketWindowScanner
 from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
+from core.health import HealthServer
 from core.memory import MemoryStore
 from core.risk import RiskManager
 from config import Config
@@ -63,6 +64,7 @@ class BTCTradingEngine:
         self._resolution_http: httpx.AsyncClient | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
+        self.health = HealthServer()
 
     def _on_new_window(self, window: MarketWindow) -> None:
         """Reset state for a new 5-minute market window."""
@@ -317,6 +319,8 @@ class BTCTradingEngine:
         """Main loop. Connects to Binance, scans markets, processes data, checks entries."""
         self._running = True
 
+        await self.health.start()
+
         binance = BinanceWSClient(on_trade=self._on_binance_trade)
         binance_task = asyncio.create_task(binance.connect())
 
@@ -342,6 +346,19 @@ class BTCTradingEngine:
                     tick_count += 1
                     if tick_count % 600 == 0:  # every ~60s
                         await self._check_resolutions()
+
+                        total_trades = len(self._paper_trades) + len(self._resolved_market_ids)
+                        wins = sum(1 for t in self._paper_trades if t.get("won"))
+                        self.health.update(
+                            balance=self.balance,
+                            trades_total=total_trades,
+                            trades_resolved=len(self._resolved_market_ids),
+                            p_up=self.signal_engine.p_up,
+                            binance_connected=binance.seconds_since_last_message < 10,
+                            binance_last_msg_age_s=round(binance.seconds_since_last_message, 1),
+                            current_window=self.current_window.question if self.current_window else None,
+                        )
+
                         logger.info(
                             f"Status: P(UP)={self.signal_engine.p_up:.3f} | "
                             f"Balance=${self.balance:.2f} | "
@@ -350,9 +367,11 @@ class BTCTradingEngine:
                         )
                 except Exception as e:
                     logger.error(f"Engine tick error: {e}", exc_info=True)
+                    self.health.record_error(str(e))
 
                 await asyncio.sleep(0.1)
         finally:
+            await self.health.stop()
             await binance.close()
             binance_task.cancel()
             if self._scanner:

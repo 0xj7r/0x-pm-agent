@@ -9,6 +9,8 @@ services:
       - PAPER_TRADE=true
       - LOG_LEVEL=INFO
       - BTC_DB_PATH=/data/btc_trades.db
+    ports:
+      - "8080:8080"
     volumes:
       - ./data:/data
       - ./strategy_config.json:/app/strategy_config.json:ro

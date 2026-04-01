@@ -11,6 +11,7 @@ ENV PAPER_TRADE=true
 ENV LOG_LEVEL=INFO
 ENV BTC_DB_PATH=/data/btc_trades.db
 
+EXPOSE 8080
 VOLUME ["/data"]
 
 ENTRYPOINT ["python", "btc_main.py"]
