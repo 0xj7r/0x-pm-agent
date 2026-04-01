@@ -1,113 +1,80 @@
-"""Tests for BTC Up/Down market window scanner."""
+"""Tests for BTC Up/Down 5-minute market window scanner."""
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from clients.market_scanner import MarketWindowScanner, parse_btc_market
+from clients.market_scanner import MarketWindowScanner, parse_btc_event, SLUG_PREFIX_5M
 
 
-def test_parse_btc_market_valid():
-    raw = {
-        "id": "market_123",
-        "question": "Bitcoin Up or Down - March 31, 3:20AM-3:25AM ET",
-        "description": "Will BTC go up between 3:20AM and 3:25AM ET?",
-        "active": True,
-        "closed": False,
-        "endDate": "2026-03-31T07:25:00Z",
-        "tokens": [
-            {"outcome": "Up", "token_id": "tok_up_1", "price": "0.48"},
-            {"outcome": "Down", "token_id": "tok_down_1", "price": "0.52"},
-        ],
+def _make_event(ts: int, active: bool = True, closed: bool = False) -> dict:
+    return {
+        "id": "330618",
+        "slug": f"btc-updown-5m-{ts}",
+        "title": f"Bitcoin Up or Down - Test {ts}",
+        "active": active,
+        "closed": closed,
+        "markets": [{
+            "id": "m1",
+            "tokens": [
+                {"outcome": "Up", "token_id": "tok_up", "price": "0.505"},
+                {"outcome": "Down", "token_id": "tok_down", "price": "0.495"},
+            ],
+        }],
     }
-    window = parse_btc_market(raw)
+
+
+def test_parse_valid_event():
+    ts = int(datetime(2026, 4, 1, 12, 30, tzinfo=timezone.utc).timestamp())
+    window = parse_btc_event(_make_event(ts))
     assert window is not None
-    assert window.market_id == "market_123"
-    assert window.up_token_id == "tok_up_1"
-    assert window.down_token_id == "tok_down_1"
-    assert window.up_price == 0.48
-    assert window.down_price == 0.52
+    assert window.up_token_id == "tok_up"
+    assert window.down_token_id == "tok_down"
+    assert window.up_price == 0.505
+    assert (window.end_time - window.start_time).total_seconds() == 300
 
 
-def test_parse_btc_market_with_yes_no_outcomes():
-    raw = {
-        "id": "market_456",
-        "question": "Bitcoin Up or Down - March 31, 3:20AM-3:25AM ET",
-        "active": True,
-        "closed": False,
-        "endDate": "2026-03-31T07:25:00Z",
-        "tokens": [
-            {"outcome": "Yes", "token_id": "tok_yes", "price": "0.50"},
-            {"outcome": "No", "token_id": "tok_no", "price": "0.50"},
-        ],
-    }
-    window = parse_btc_market(raw)
+def test_parse_rejects_non_5m_slug():
+    event = {"id": "1", "slug": "bitcoin-up-or-down-april-1-8am-et",
+             "title": "Bitcoin Up or Down", "active": True, "closed": False, "markets": []}
+    assert parse_btc_event(event) is None
+
+
+def test_parse_rejects_closed():
+    ts = int(datetime(2026, 4, 1, 12, 30, tzinfo=timezone.utc).timestamp())
+    assert parse_btc_event(_make_event(ts, active=False, closed=True)) is None
+
+
+def test_start_time_from_slug():
+    ts = 1775089800
+    window = parse_btc_event(_make_event(ts))
     assert window is not None
-    assert window.up_token_id == "tok_yes"
-    assert window.down_token_id == "tok_no"
+    assert window.start_time == datetime.fromtimestamp(ts, tz=timezone.utc)
 
 
-def test_parse_btc_market_not_btc():
-    raw = {
-        "id": "m1",
-        "question": "Will it rain in NYC tomorrow?",
-        "active": True,
-        "closed": False,
-        "endDate": "2026-04-01T00:00:00Z",
-        "tokens": [],
-    }
-    assert parse_btc_market(raw) is None
-
-
-def test_parse_btc_market_closed():
-    raw = {
-        "id": "m2",
-        "question": "Bitcoin Up or Down - March 30",
-        "active": False,
-        "closed": True,
-        "endDate": "2026-03-30T07:25:00Z",
-        "tokens": [
-            {"outcome": "Up", "token_id": "t1", "price": "1.0"},
-            {"outcome": "Down", "token_id": "t2", "price": "0.0"},
-        ],
-    }
-    assert parse_btc_market(raw) is None
+def test_generates_candidate_slugs():
+    scanner = MarketWindowScanner()
+    slugs = scanner._generate_candidate_slugs(count=6)
+    assert len(slugs) == 7
+    for s in slugs:
+        assert s.startswith(SLUG_PREFIX_5M)
 
 
 @pytest.mark.asyncio
-async def test_scanner_find_active_windows():
-    mock_markets = [
-        {
-            "id": "m_active",
-            "question": "Bitcoin Up or Down - March 31, 3:20AM-3:25AM ET",
-            "active": True,
-            "closed": False,
-            "endDate": "2099-12-31T23:59:00Z",
-            "tokens": [
-                {"outcome": "Up", "token_id": "up1", "price": "0.50"},
-                {"outcome": "Down", "token_id": "dn1", "price": "0.50"},
-            ],
-        },
-        {
-            "id": "m_closed",
-            "question": "Bitcoin Up or Down - old",
-            "active": False,
-            "closed": True,
-            "endDate": "2020-01-01T00:00:00Z",
-            "tokens": [
-                {"outcome": "Up", "token_id": "up2", "price": "1.0"},
-                {"outcome": "Down", "token_id": "dn2", "price": "0.0"},
-            ],
-        },
-    ]
+async def test_find_active_windows():
+    ts = int(datetime(2026, 4, 1, 12, 30, tzinfo=timezone.utc).timestamp())
+    event = _make_event(ts)
 
-    scanner = MarketWindowScanner(gamma_url="https://gamma-api.polymarket.com")
+    scanner = MarketWindowScanner()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [event]
+    scanner._http.get = AsyncMock(return_value=mock_resp)
 
-    with patch.object(scanner, "_fetch_btc_markets", return_value=mock_markets):
+    with patch.object(scanner, "_generate_candidate_slugs", return_value=[f"btc-updown-5m-{ts}"]):
         windows = await scanner.find_active_windows()
 
     assert len(windows) == 1
-    assert windows[0].market_id == "m_active"
+    assert windows[0].up_token_id == "tok_up"
