@@ -21,3 +21,6 @@ apscheduler>=3.10.0
 # Web3 (for wallet operations)
 web3>=6.0.0
 eth-account>=0.11.0
+
+# Real-time data
+websockets>=12.0
