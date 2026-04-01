@@ -1,12 +1,10 @@
 """Backtesting engine for BTC 5-minute sniper strategy.
 
-Replays historical market windows against the signal engine with a given
-strategy config. Outputs performance metrics used by the autoresearch
-loop to evaluate strategy mutations.
+Replays PolyBackTest snapshot timeseries through the signal engine.
+For each market, steps through sub-second snapshots computing signal
+strength and checking if entry conditions are met at each timestamp.
 
-Supports two modes:
-- synthetic: uses SimulatedWindow with proportional feature modeling
-- real: uses actual Binance kline data from historical.db
+Supports Strategy A (snipe at <=5c) and Strategy B (midrange at <=55c).
 """
 from __future__ import annotations
 
@@ -23,30 +21,6 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SimulatedWindow:
-    """A historical 5-minute window with known outcome."""
-
-    market_id: str
-    resolved_direction: str  # "UP" or "DOWN"
-    price_move_pct: float  # BTC % change during the window
-    up_price: float = 0.02  # price of UP token at entry time
-    down_price: float = 0.98  # price of DOWN token at entry time
-
-
-@dataclass
-class RealWindow:
-    """A historical window backed by actual Binance kline data."""
-
-    market_id: str
-    slug: str
-    resolved_direction: str
-    up_price: float
-    down_price: float
-    price_delta: float  # % change from kline open to close
-    order_flow_imbalance: float  # (taker_buy_vol / total_vol) * 2 - 1
-
-
-@dataclass
 class BacktestResult:
     num_trades: int = 0
     wins: int = 0
@@ -59,15 +33,11 @@ class BacktestResult:
 
     @property
     def win_rate(self) -> float:
-        if self.num_trades == 0:
-            return 0.0
-        return self.wins / self.num_trades
+        return self.wins / self.num_trades if self.num_trades else 0.0
 
     @property
     def ev_per_trade(self) -> float:
-        if self.num_trades == 0:
-            return 0.0
-        return self.total_pnl / self.num_trades
+        return self.total_pnl / self.num_trades if self.num_trades else 0.0
 
     @property
     def sharpe(self) -> float:
@@ -77,195 +47,187 @@ class BacktestResult:
         mean = sum(pnls) / len(pnls)
         variance = sum((p - mean) ** 2 for p in pnls) / (len(pnls) - 1)
         std = math.sqrt(variance) if variance > 0 else 0.0
-        if std == 0:
-            return 0.0
-        return mean / std
+        return mean / std if std > 0 else 0.0
 
 
-def _simulate_signal(cfg: StrategyConfig, price_move_pct: float) -> tuple[str | None, float]:
-    """Simulate the Bayesian signal engine for a window with a known price move.
-
-    In production, a strong BTC price move is accompanied by correlated order
-    flow imbalance and microprice deviation. We model these as proportional
-    to price_delta so the backtest produces realistic signal strength.
-    """
-    engine = BayesianSignalEngine(cfg.signal)
-
-    engine.set_state(
-        order_flow_imbalance=price_move_pct * 6.0,
-        microprice_deviation=price_move_pct * 4.0,
-        price_delta=price_move_pct,
-        acceleration=0.0,
-    )
-
-    if engine.confident:
-        p = engine.p_up if engine.direction == "UP" else engine.p_down
-        return engine.direction, p
-    return None, 0.5
-
-
-def _real_signal(cfg: StrategyConfig, window: RealWindow) -> tuple[str | None, float]:
-    """Run the signal engine against real kline-derived features."""
-    engine = BayesianSignalEngine(cfg.signal)
-
-    engine.set_state(
-        order_flow_imbalance=window.order_flow_imbalance,
-        microprice_deviation=0.0,
-        price_delta=window.price_delta,
-        acceleration=0.0,
-    )
-
-    if engine.confident:
-        p = engine.p_up if engine.direction == "UP" else engine.p_down
-        return engine.direction, p
-    return None, 0.5
-
-
-def _kelly_size(p_win: float, token_price: float, bankroll: float, risk_cfg: RiskConfig) -> float:
-    """Inline Kelly sizing matching core/risk.py logic."""
+def _kelly_size(p_win: float, token_price: float, bankroll: float,
+                risk_cfg: RiskConfig, use_fee: bool = False,
+                fee_rate: float = 0.04) -> float:
+    """Kelly sizing. When use_fee=True, accounts for taker fee (Strategy B)."""
     if token_price <= 0 or token_price >= 1 or bankroll <= 0 or p_win <= 0:
         return 0.0
-    edge = p_win - token_price
-    if edge <= 0:
+
+    if use_fee:
+        fee = fee_rate * token_price * (1.0 - token_price)
+        edge = p_win - token_price - fee
+        net_payout = 1.0 - token_price - fee
+    else:
+        edge = p_win - token_price
+        net_payout = 1.0 - token_price
+
+    if edge <= 0 or net_payout <= 0:
         return 0.0
-    kelly_fraction = edge / (1.0 - token_price)
+
+    kelly_fraction = edge / net_payout
     adjusted = kelly_fraction * risk_cfg.kelly_multiplier
-    if token_price <= 0.05:
+    if not use_fee and token_price <= 0.05:
         adjusted *= risk_cfg.cheap_token_multiplier
-    max_by_pct = bankroll * risk_cfg.max_position_pct
-    max_size = min(max_by_pct, risk_cfg.max_position_usd)
+
+    max_size = min(bankroll * risk_cfg.max_position_pct, risk_cfg.max_position_usd)
     position = min(adjusted * bankroll, max_size)
-    if position < 1.0:
-        return 0.0
-    return round(position, 2)
+    return round(position, 2) if position >= 1.0 else 0.0
 
 
-def _execute_trade(
+def replay_market(
     cfg: StrategyConfig,
-    direction: str,
-    p_win: float,
-    up_price: float,
-    down_price: float,
-    market_id: str,
-    resolved_direction: str,
+    market: dict,
+    snapshots: list[dict],
     balance: float,
-    result: BacktestResult,
-) -> float:
-    """Place a trade and update result. Returns new balance."""
-    token_price = up_price if direction == "UP" else down_price
+) -> tuple[dict | None, float]:
+    """Replay one market's snapshots through the signal engine.
 
-    if token_price > cfg.execution.max_entry_price:
-        return balance
+    Returns (trade_dict, new_balance) or (None, balance) if no trade.
+    """
+    if not snapshots or not market.get("winner"):
+        return None, balance
 
-    size_usd = _kelly_size(p_win, token_price, balance, cfg.risk)
-    if size_usd <= 0:
-        return balance
+    btc_open = market.get("btc_price_start", 0)
+    if not btc_open:
+        btc_open = snapshots[0].get("btc_price", 0)
+    if not btc_open:
+        return None, balance
 
+    winner = market["winner"]  # "Up" or "Down"
+    resolved_dir = "UP" if winner.lower() == "up" else "DOWN"
+
+    engine = BayesianSignalEngine(cfg.signal)
+    prev_btc = btc_open
+    buy_vol = 0.0
+    sell_vol = 0.0
+
+    # Step through snapshots, simulating what the live engine would see
+    for i, snap in enumerate(snapshots):
+        btc = snap.get("btc_price") or prev_btc
+        price_up = snap.get("price_up")
+        price_down = snap.get("price_down")
+
+        if price_up is None or price_down is None:
+            prev_btc = btc
+            continue
+
+        price_delta = (btc - btc_open) / btc_open * 100 if btc_open else 0
+        # Approximate OFI from price direction between snapshots
+        if btc > prev_btc:
+            buy_vol += abs(btc - prev_btc)
+        else:
+            sell_vol += abs(btc - prev_btc)
+        total = buy_vol + sell_vol
+        ofi = (buy_vol - sell_vol) / total if total > 0 else 0.0
+
+        accel = 0.0
+        if i > 0 and prev_btc > 0:
+            prev_delta = (prev_btc - btc_open) / btc_open * 100
+            accel = price_delta - prev_delta
+
+        engine.set_state(
+            order_flow_imbalance=ofi,
+            microprice_deviation=0.0,
+            price_delta=price_delta,
+            acceleration=accel,
+        )
+
+        # Check entry conditions
+        direction = engine.direction
+        p_win = engine.p_up if direction == "UP" else engine.p_down
+        token_price = price_up if direction == "UP" else price_down
+
+        # Strategy A: cheap token snipe
+        if (token_price <= cfg.execution.max_entry_price
+                and engine.confident
+                and token_price > 0):
+            size = _kelly_size(p_win, token_price, balance, cfg.risk)
+            if size > 0:
+                return _resolve_trade(
+                    market["market_id"], direction, token_price, size, p_win,
+                    resolved_dir, balance, "snipe", btc,
+                )
+
+        # Strategy B: midrange directional
+        if (getattr(cfg.execution, "enable_midrange", False)
+                and token_price <= getattr(cfg.execution, "midrange_max_price", 0.55)
+                and p_win >= getattr(cfg.execution, "midrange_min_confidence", 0.80)
+                and token_price > 0):
+            fee_rate = getattr(cfg.execution, "midrange_taker_fee_rate", 0.04)
+            size = _kelly_size(p_win, token_price, balance, cfg.risk,
+                               use_fee=True, fee_rate=fee_rate)
+            if size > 0:
+                return _resolve_trade(
+                    market["market_id"], direction, token_price, size, p_win,
+                    resolved_dir, balance, "midrange", btc,
+                )
+
+        prev_btc = btc
+
+    return None, balance
+
+
+def _resolve_trade(
+    market_id: str, direction: str, token_price: float, size_usd: float,
+    p_win: float, resolved_dir: str, balance: float, strategy: str,
+    btc_price: float,
+) -> tuple[dict, float]:
+    """Execute a trade against the resolution and return (trade_dict, new_balance)."""
     shares = size_usd / token_price
     record = PaperTradeRecord(
-        trade_id=market_id,
-        market_id=market_id,
-        direction=direction,
-        token_price=token_price,
-        size_usd=size_usd,
-        shares=shares,
+        trade_id=market_id, market_id=market_id,
+        direction=direction, token_price=token_price,
+        size_usd=size_usd, shares=shares,
     )
-    res = resolve_paper_trade(record, resolved_direction)
+    res = resolve_paper_trade(record, resolved_dir)
+    new_balance = balance + res.pnl_usd
 
-    balance += res.pnl_usd
-    result.num_trades += 1
-    if res.won:
-        result.wins += 1
-    else:
-        result.losses += 1
-    result.total_pnl += res.pnl_usd
-    result.trades.append({
-        "market_id": market_id,
-        "direction": direction,
-        "resolved": resolved_direction,
-        "won": res.won,
-        "pnl": res.pnl_usd,
-        "size_usd": size_usd,
-        "token_price": token_price,
-        "p_win": p_win,
-        "balance_after": balance,
-    })
-    return balance
+    trade = {
+        "market_id": market_id, "direction": direction,
+        "resolved": resolved_dir, "won": res.won,
+        "pnl": res.pnl_usd, "size_usd": size_usd,
+        "token_price": token_price, "p_win": p_win,
+        "strategy": strategy, "btc_price": btc_price,
+        "balance_after": new_balance,
+    }
+    return trade, new_balance
 
 
-def run_backtest(
+def run_backtest_snapshots(
     cfg: StrategyConfig,
-    windows: list[SimulatedWindow],
+    db_path: Path | None = None,
     starting_balance: float = 100.0,
 ) -> BacktestResult:
-    """Run the strategy against a list of synthetic windows."""
-    result = BacktestResult(starting_balance=starting_balance, ending_balance=starting_balance)
-    balance = starting_balance
-    peak_balance = starting_balance
-
-    for window in windows:
-        direction, p_win = _simulate_signal(cfg, window.price_move_pct)
-        if direction is None:
-            continue
-
-        balance = _execute_trade(
-            cfg, direction, p_win,
-            window.up_price, window.down_price,
-            window.market_id, window.resolved_direction,
-            balance, result,
-        )
-        peak_balance = max(peak_balance, balance)
-        drawdown = (peak_balance - balance) / peak_balance if peak_balance > 0 else 0
-        result.max_drawdown = max(result.max_drawdown, drawdown)
-
-    result.ending_balance = balance
-    return result
-
-
-def run_backtest_real(
-    cfg: StrategyConfig,
-    windows: list[RealWindow],
-    starting_balance: float = 100.0,
-) -> BacktestResult:
-    """Run the strategy against real historical windows from Binance kline data."""
-    result = BacktestResult(starting_balance=starting_balance, ending_balance=starting_balance)
-    balance = starting_balance
-    peak_balance = starting_balance
-
-    for window in windows:
-        direction, p_win = _real_signal(cfg, window)
-        if direction is None:
-            continue
-
-        balance = _execute_trade(
-            cfg, direction, p_win,
-            window.up_price, window.down_price,
-            window.market_id, window.resolved_direction,
-            balance, result,
-        )
-        peak_balance = max(peak_balance, balance)
-        drawdown = (peak_balance - balance) / peak_balance if peak_balance > 0 else 0
-        result.max_drawdown = max(result.max_drawdown, drawdown)
-
-    result.ending_balance = balance
-    return result
-
-
-def load_real_windows(db_path: Path | None = None) -> list[RealWindow]:
-    """Load RealWindow objects from historical.db."""
-    from backtesting.historical_data import load_windows, DB_PATH
+    """Run backtest against real PolyBackTest snapshot data."""
+    from backtesting.historical_data import load_markets, load_snapshots, DB_PATH
 
     path = db_path or DB_PATH
-    raw = load_windows(path)
-    return [
-        RealWindow(
-            market_id=w["market_id"],
-            slug=w["slug"],
-            resolved_direction=w["resolved_direction"],
-            up_price=w["up_price"],
-            down_price=w["down_price"],
-            price_delta=w["price_delta"],
-            order_flow_imbalance=w["order_flow_imbalance"],
-        )
-        for w in raw
-    ]
+    markets = load_markets(path)
+
+    result = BacktestResult(starting_balance=starting_balance, ending_balance=starting_balance)
+    balance = starting_balance
+    peak = starting_balance
+
+    for m in markets:
+        snaps = load_snapshots(m["market_id"], path)
+        trade, balance = replay_market(cfg, m, snaps, balance)
+
+        if trade:
+            result.num_trades += 1
+            if trade["won"]:
+                result.wins += 1
+            else:
+                result.losses += 1
+            result.total_pnl += trade["pnl"]
+            result.trades.append(trade)
+
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak if peak > 0 else 0
+        result.max_drawdown = max(result.max_drawdown, dd)
+
+    result.ending_balance = balance
+    return result

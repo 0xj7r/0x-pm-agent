@@ -315,6 +315,22 @@ class BTCTradingEngine:
                     if tick_count % 600 == 0:
                         await self._process_resolutions()
                         total = len(self._paper_trades) + len(self.resolver.resolved_ids)
+
+                        # Log signal data every 60s for backtesting/autoresearch
+                        up_live = self.poly_ws.get_price(self.current_window.up_token_id) if self.current_window else 0
+                        down_live = self.poly_ws.get_price(self.current_window.down_token_id) if self.current_window else 0
+                        self.memory.save_event(
+                            window_id=self.current_window.market_id if self.current_window else "none",
+                            event_type="status_tick",
+                            log_odds=self.signal_engine.log_odds,
+                            p_up=self.signal_engine.p_up,
+                            btc_price=self._last_btc_price,
+                            details={
+                                "balance": self.balance, "trades": total,
+                                "up_price": up_live, "down_price": down_live,
+                            },
+                        )
+
                         self.health.update(
                             balance=self.balance, trades_total=total,
                             trades_resolved=len(self.resolver.resolved_ids),

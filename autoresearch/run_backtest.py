@@ -1,12 +1,11 @@
 """CLI for running backtests against strategy_config.json.
 
 Used by the autoresearch loop to evaluate strategy mutations.
-Supports both synthetic and real (historical.db) data modes.
+Supports real (PolyBackTest snapshots) and synthetic modes.
 
 Usage:
     python autoresearch/run_backtest.py --config strategy_config.json
-    python autoresearch/run_backtest.py --config strategy_config.json --mode real
-    python autoresearch/run_backtest.py --config strategy_config.json --windows 100
+    python autoresearch/run_backtest.py --config strategy_config.json --mode synthetic --windows 200
 """
 from __future__ import annotations
 
@@ -18,96 +17,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtesting.btc_backtest import (
-    BacktestResult,
-    SimulatedWindow,
-    run_backtest,
-    run_backtest_real,
-    load_real_windows,
-)
+from backtesting.btc_backtest import BacktestResult, run_backtest_snapshots
 from backtesting.historical_data import DB_PATH
 from strategies.strategy_config import load_strategy_config
 
 
-def generate_synthetic_windows(n: int = 200, seed: int = 42) -> list[SimulatedWindow]:
-    """Generate synthetic historical windows from realistic BTC 5-min distributions.
-
-    Real BTC 5-minute returns are approximately normally distributed with:
-    - Mean: ~0 (slight positive drift in bull markets)
-    - Std: ~0.15% to 0.30% depending on volatility regime
-
-    We model this as N(0, 0.2) for price_move_pct, with occasional
-    larger moves (fat tails) at +/- 0.5-1.0%.
-    """
-    rng = random.Random(seed)
-    windows = []
-
-    for i in range(n):
-        move = rng.gauss(0, 0.2)
-
-        if rng.random() < 0.05:
-            move = rng.choice([-1, 1]) * rng.uniform(0.5, 1.5)
-
-        direction = "UP" if move >= 0 else "DOWN"
-        abs_move = abs(move)
-
-        scenario = rng.random()
-
-        if abs_move > 0.3 and scenario < 0.40:
-            stale_price = max(0.01, 0.05 - abs_move * 0.02)
-            if direction == "UP":
-                up_price = stale_price
-                down_price = 1.0 - stale_price
-            else:
-                down_price = stale_price
-                up_price = 1.0 - stale_price
-
-        elif abs_move > 0.3 and scenario < 0.65:
-            if direction == "UP":
-                up_price = 0.80 + rng.uniform(0, 0.15)
-                down_price = 1.0 - up_price
-            else:
-                down_price = 0.80 + rng.uniform(0, 0.15)
-                up_price = 1.0 - down_price
-
-        elif abs_move > 0.3 and scenario < 0.80:
-            reversed_dir = "DOWN" if direction == "UP" else "UP"
-            stale_price = max(0.01, 0.04)
-            if direction == "UP":
-                up_price = stale_price
-                down_price = 1.0 - stale_price
-            else:
-                down_price = stale_price
-                up_price = 1.0 - down_price
-            direction = reversed_dir
-
-        else:
-            up_price = 0.45 + rng.uniform(0, 0.10)
-            down_price = 1.0 - up_price
-
-        windows.append(SimulatedWindow(
-            market_id=f"synthetic_{i:04d}",
-            resolved_direction=direction,
-            price_move_pct=move,
-            up_price=round(max(0.01, up_price), 3),
-            down_price=round(max(0.01, down_price), 3),
-        ))
-
-    return windows
-
-
-def _resolve_mode(explicit: str | None) -> str:
-    """Pick mode: use explicit flag, else 'real' if DB exists, else 'synthetic'."""
-    if explicit:
-        return explicit
-    if DB_PATH.exists():
-        return "real"
-    return "synthetic"
-
-
 def _print_result(result: BacktestResult, label: str, as_json: bool) -> None:
     if as_json:
-        print(json.dumps({
+        data = {
             "mode": label,
             "num_trades": result.num_trades,
             "wins": result.wins,
@@ -119,7 +36,19 @@ def _print_result(result: BacktestResult, label: str, as_json: bool) -> None:
             "max_drawdown": round(result.max_drawdown, 4),
             "starting_balance": result.starting_balance,
             "ending_balance": round(result.ending_balance, 2),
-        }))
+        }
+        if result.trades:
+            strategies = {}
+            for t in result.trades:
+                s = t.get("strategy", "unknown")
+                if s not in strategies:
+                    strategies[s] = {"trades": 0, "wins": 0, "pnl": 0.0}
+                strategies[s]["trades"] += 1
+                if t["won"]:
+                    strategies[s]["wins"] += 1
+                strategies[s]["pnl"] += t["pnl"]
+            data["by_strategy"] = strategies
+        print(json.dumps(data))
     else:
         print(f"{'='*50}")
         print(f"BACKTEST RESULTS [{label}]")
@@ -135,36 +64,36 @@ def _print_result(result: BacktestResult, label: str, as_json: bool) -> None:
         print(f"Starting Balance:${result.starting_balance:.2f}")
         print(f"Ending Balance:  ${result.ending_balance:.2f}")
         print(f"{'='*50}")
+        if result.trades:
+            strategies: dict[str, list] = {}
+            for t in result.trades:
+                s = t.get("strategy", "unknown")
+                strategies.setdefault(s, []).append(t)
+            for s, trades in strategies.items():
+                wins = sum(1 for t in trades if t["won"])
+                pnl = sum(t["pnl"] for t in trades)
+                print(f"  {s.upper()}: {len(trades)} trades, "
+                      f"{wins}/{len(trades)} wins, ${pnl:+.2f}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run BTC sniper backtest")
     parser.add_argument("--config", required=True, help="Path to strategy_config.json")
-    parser.add_argument("--mode", choices=["real", "synthetic"], default=None,
-                        help="Data mode (default: real if historical.db exists)")
-    parser.add_argument("--windows", type=int, default=200, help="Number of synthetic windows")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--balance", type=float, default=100.0, help="Starting balance")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--db", type=str, default=None, help="Path to historical.db")
     args = parser.parse_args()
 
     cfg = load_strategy_config(args.config)
-    mode = _resolve_mode(args.mode)
+    db_path = Path(args.db) if args.db else DB_PATH
 
-    if mode == "real":
-        real_windows = load_real_windows()
-        if not real_windows:
-            print("No real data found in historical.db, falling back to synthetic",
-                  file=sys.stderr)
-            mode = "synthetic"
-        else:
-            result = run_backtest_real(cfg, real_windows, starting_balance=args.balance)
-            _print_result(result, f"real, {len(real_windows)} windows", args.json)
-            return
+    if not db_path.exists():
+        print(f"No data at {db_path}. Run: python backtesting/historical_data.py --limit 50",
+              file=sys.stderr)
+        sys.exit(1)
 
-    windows = generate_synthetic_windows(args.windows, args.seed)
-    result = run_backtest(cfg, windows, starting_balance=args.balance)
-    _print_result(result, f"synthetic, {args.windows} windows", args.json)
+    result = run_backtest_snapshots(cfg, db_path=db_path, starting_balance=args.balance)
+    _print_result(result, "real snapshots", args.json)
 
 
 if __name__ == "__main__":
