@@ -18,6 +18,9 @@ from typing import Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+BINANCE_COMBINED_URL = (
+    "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker"
+)
 
 
 @dataclass
@@ -67,15 +70,23 @@ class BinanceWSClient:
     def __init__(
         self,
         on_trade: Callable[[TradeUpdate], Awaitable[None]] | None = None,
-        url: str = BINANCE_WS_URL,
+        on_book_update: Callable[[OrderBookSnapshot], Awaitable[None]] | None = None,
+        url: str | None = None,
     ) -> None:
         self._on_trade = on_trade
-        self._url = url
+        self._on_book_update = on_book_update
+        if url is not None:
+            self._url = url
+        elif on_book_update is not None:
+            self._url = BINANCE_COMBINED_URL
+        else:
+            self._url = BINANCE_WS_URL
         self._ws = None
         self._running = False
         self._last_message_time: float = 0.0
         self._reconnect_delay: float = 1.0
         self._max_reconnect_delay: float = 30.0
+        self.latest_book: OrderBookSnapshot | None = None
 
     async def connect(self) -> None:
         """Connect and start receiving messages. Reconnects on failure."""
@@ -106,14 +117,36 @@ class BinanceWSClient:
 
     async def _handle_message(self, raw_msg: str) -> None:
         try:
-            data = json.loads(raw_msg)
+            msg = json.loads(raw_msg)
         except json.JSONDecodeError:
             return
 
+        # Combined stream wraps payload in {"stream": ..., "data": ...}
+        if "stream" in msg and "data" in msg:
+            stream = msg["stream"]
+            data = msg["data"]
+        else:
+            stream = None
+            data = msg
+
         event_type = data.get("e")
-        if event_type == "trade" and self._on_trade:
-            update = TradeUpdate.from_raw(data)
-            await self._on_trade(update)
+
+        if (stream is None or stream.endswith("@trade")) and event_type == "trade":
+            if self._on_trade:
+                update = TradeUpdate.from_raw(data)
+                await self._on_trade(update)
+
+        elif stream is not None and stream.endswith("@bookTicker"):
+            snap = OrderBookSnapshot(
+                best_bid=float(data["b"]),
+                best_ask=float(data["a"]),
+                bid_size=float(data["B"]),
+                ask_size=float(data["A"]),
+                timestamp_ms=data.get("T", data.get("u", 0)),
+            )
+            self.latest_book = snap
+            if self._on_book_update:
+                await self._on_book_update(snap)
 
     @property
     def seconds_since_last_message(self) -> float:

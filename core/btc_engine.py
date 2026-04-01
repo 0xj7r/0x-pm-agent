@@ -11,8 +11,9 @@ import logging
 import time as _time
 from datetime import datetime, timezone
 
-from clients.binance_ws import BinanceWSClient, TradeUpdate
+from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
 from clients.market_scanner import MarketWindowScanner
+from clients.polymarket import PolymarketClient
 from core.health import HealthServer
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
@@ -24,6 +25,8 @@ from strategies.btc_sniper import BayesianSignalEngine
 from strategies.strategy_config import StrategyConfig
 
 logger = logging.getLogger(__name__)
+
+MAX_SINGLE_ORDER_USD = 100.0
 
 
 class BTCTradingEngine:
@@ -37,6 +40,16 @@ class BTCTradingEngine:
         self.health = HealthServer()
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
+
+        self._polymarket: PolymarketClient | None = None
+        if not strategy_cfg.paper.enabled:
+            private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+            if not private_key:
+                raise RuntimeError(
+                    "POLYMARKET_PRIVATE_KEY must be set for live trading"
+                )
+            self._polymarket = PolymarketClient(Config())
+            logger.warning("LIVE TRADING ENABLED — real orders will be placed")
 
         self.balance: float = strategy_cfg.paper.starting_balance
         self.risk.set_bankroll(self.balance)
@@ -53,6 +66,7 @@ class BTCTradingEngine:
         self._scanner: MarketWindowScanner | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
+        self._latest_book: OrderBookSnapshot | None = None
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -100,9 +114,13 @@ class BTCTradingEngine:
             prev_delta = (self._prev_btc_price - self._window_open_price) / self._window_open_price * 100
             accel = price_delta - prev_delta
 
+        microprice_dev = 0.0
+        if self._latest_book and self._latest_book.mid > 0:
+            microprice_dev = (self._latest_book.microprice - self._latest_book.mid) / self._latest_book.mid * 100
+
         self.signal_engine.set_state(
             order_flow_imbalance=ofi,
-            microprice_deviation=0.0,
+            microprice_deviation=microprice_dev,
             price_delta=price_delta,
             acceleration=accel,
         )
@@ -224,7 +242,10 @@ class BTCTradingEngine:
         self._running = True
         await self.health.start()
 
-        binance = BinanceWSClient(on_trade=self._on_binance_trade)
+        async def on_book(snap: OrderBookSnapshot) -> None:
+            self._latest_book = snap
+
+        binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book)
         binance_task = asyncio.create_task(binance.connect())
 
         logger.info(
