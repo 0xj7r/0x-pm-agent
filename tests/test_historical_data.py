@@ -80,9 +80,9 @@ class TestParseResolution:
     def test_resolved_up(self) -> None:
         event = {
             "markets": [{
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": ["1.0", "0.0"],
-                "resolved": True,
+                "outcomes": "[\"Up\", \"Down\"]",
+                "outcomePrices": "[\"1.0\", \"0.0\"]",
+                "closed": True,
             }]
         }
         direction, up_p, down_p = _parse_resolution(event)
@@ -93,9 +93,9 @@ class TestParseResolution:
     def test_resolved_down(self) -> None:
         event = {
             "markets": [{
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": ["0.0", "1.0"],
-                "resolved": True,
+                "outcomes": "[\"Up\", \"Down\"]",
+                "outcomePrices": "[\"0.0\", \"1.0\"]",
+                "closed": True,
             }]
         }
         direction, up_p, down_p = _parse_resolution(event)
@@ -105,9 +105,9 @@ class TestParseResolution:
     def test_unresolved_returns_none(self) -> None:
         event = {
             "markets": [{
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": ["0.5", "0.5"],
-                "resolved": False,
+                "outcomes": "[\"Up\", \"Down\"]",
+                "outcomePrices": "[\"0.5\", \"0.5\"]",
+                "closed": False,
             }]
         }
         direction, _, _ = _parse_resolution(event)
@@ -132,9 +132,9 @@ class TestFetchGammaMarket:
             "endDate": "2025-04-01T12:05:00Z",
             "markets": [{
                 "id": "market-123",
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": ["1.0", "0.0"],
-                "resolved": True,
+                "outcomes": "[\"Up\", \"Down\"]",
+                "outcomePrices": "[\"1.0\", \"0.0\"]",
+                "closed": True,
             }],
         }]
         mock_response.raise_for_status = MagicMock()
@@ -355,9 +355,9 @@ class TestFetchAll:
             "endDate": "2025-04-01",
             "markets": [{
                 "id": "mkt-1",
-                "outcomes": ["Up", "Down"],
-                "outcomePrices": ["1.0", "0.0"],
-                "resolved": True,
+                "outcomes": "[\"Up\", \"Down\"]",
+                "outcomePrices": "[\"1.0\", \"0.0\"]",
+                "closed": True,
             }],
         }]
         gamma_resp.raise_for_status = MagicMock()

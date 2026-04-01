@@ -74,28 +74,35 @@ def generate_slugs(days: int, now: datetime | None = None) -> list[str]:
 
 def _parse_resolution(event_data: dict) -> tuple[str | None, float, float]:
     """Extract resolved direction and token prices from Gamma event response."""
+    import json as _json
+
     markets = event_data.get("markets", [])
     if not markets:
         return None, 0.0, 0.0
 
     market = markets[0]
-    outcomes = market.get("outcomes", [])
-    outcome_prices = market.get("outcomePrices", [])
 
-    if not outcomes or not outcome_prices:
+    if not market.get("closed", False):
         return None, 0.0, 0.0
 
+    outcomes_raw = market.get("outcomes", "[]")
+    prices_raw = market.get("outcomePrices", "[]")
+
     try:
-        prices = [float(p) for p in outcome_prices]
-    except (ValueError, TypeError):
+        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        prices = [float(p) for p in (_json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw)]
+    except (ValueError, TypeError, _json.JSONDecodeError):
+        return None, 0.0, 0.0
+
+    if len(outcomes) < 2 or len(prices) < 2:
         return None, 0.0, 0.0
 
     up_idx = None
     down_idx = None
     for i, name in enumerate(outcomes):
-        if name.upper() == "UP":
+        if name.lower() == "up":
             up_idx = i
-        elif name.upper() == "DOWN":
+        elif name.lower() == "down":
             down_idx = i
 
     if up_idx is None or down_idx is None:
@@ -104,11 +111,6 @@ def _parse_resolution(event_data: dict) -> tuple[str | None, float, float]:
     up_price = prices[up_idx]
     down_price = prices[down_idx]
 
-    resolved = market.get("resolved", False)
-    if not resolved:
-        return None, up_price, down_price
-
-    # Winner has price ~1.0, loser ~0.0
     if up_price > down_price:
         return "UP", up_price, down_price
     return "DOWN", up_price, down_price
