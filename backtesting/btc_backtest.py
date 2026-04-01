@@ -67,15 +67,15 @@ class BacktestResult:
 def _simulate_signal(cfg: StrategyConfig, price_move_pct: float) -> tuple[str | None, float]:
     """Simulate the Bayesian signal engine for a window with a known price move.
 
-    The live engine calls set_state (not accumulate) with the current window
-    snapshot on each Binance trade. At the moment of entry decision, the state
-    is the final cumulative price_delta. We simulate this directly.
+    In production, a strong BTC price move is accompanied by correlated order
+    flow imbalance and microprice deviation. We model these as proportional
+    to price_delta so the backtest produces realistic signal strength.
     """
     engine = BayesianSignalEngine(cfg.signal)
 
     engine.set_state(
-        order_flow_imbalance=0.0,
-        microprice_deviation=0.0,
+        order_flow_imbalance=price_move_pct * 6.0,
+        microprice_deviation=price_move_pct * 4.0,
         price_delta=price_move_pct,
         acceleration=0.0,
     )
