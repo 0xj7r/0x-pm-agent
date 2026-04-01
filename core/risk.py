@@ -5,9 +5,13 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from config import Config
 from models.trade import Signal
+
+if TYPE_CHECKING:
+    from strategies.strategy_config import RiskConfig
 
 logger = logging.getLogger(__name__)
 
@@ -202,3 +206,38 @@ class RiskManager:
             confidence=signal.confidence,
             bankroll=bankroll,
         )
+
+    def asymmetric_kelly_size(
+        self,
+        p_win: float,
+        token_price: float,
+        bankroll: float,
+        risk_cfg: RiskConfig,
+    ) -> float:
+        """Position sizing for cheap binary tokens with asymmetric payoffs.
+
+        For tokens priced at 2-5 cents, max loss is the token price per share
+        but max gain is (1 - token_price). This bounded downside allows more
+        aggressive sizing than standard Kelly.
+        """
+        if token_price <= 0 or token_price >= 1 or bankroll <= 0 or p_win <= 0:
+            return 0.0
+
+        edge = p_win - token_price
+        if edge <= 0:
+            return 0.0
+
+        kelly_fraction = edge / (1.0 - token_price)
+        adjusted = kelly_fraction * risk_cfg.kelly_multiplier
+
+        if token_price <= 0.05:
+            adjusted *= risk_cfg.cheap_token_multiplier
+
+        max_by_pct = bankroll * risk_cfg.max_position_pct
+        max_size = min(max_by_pct, risk_cfg.max_position_usd)
+        position = min(adjusted * bankroll, max_size)
+
+        if position < 1.0:
+            return 0.0
+
+        return round(position, 2)
