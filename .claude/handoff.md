@@ -1,77 +1,73 @@
-# Handoff: Polymarket BTC Sniper — Phase 2B
+# Handoff: Polymarket BTC Sniper — Strategy Rebuild
 
-## Current State
-- Branch: `feat/btc-sniper-phase1` (pushed to `main` on `0xj7r/polymarket-btc-sniper`)
-- Last commit: `fc2d8e0 feat: Strategy B (midrange directional), Polymarket CLOB WebSocket, rename engine`
-- Tests: 89 passing
-- Paper trading: LIVE on Hetzner 188.34.177.202 but ZERO trades executed (signal never confident enough)
-- Bot DB is empty — not logging signal data between trades
+## Critical Insight
 
-## Critical Discovery: PolyBackTest API
+The current signal engine (weighted Bayesian log-odds) does NOT work. 50 autoresearch iterations, zero positive configs. The fundamental problem: **cheap tokens are on the LOSING side** (market already repriced), and our signal agrees with the market (both say UP), so we'd buy UP at 95c not DOWN at 5c.
 
-We found the missing data source: `api.polybacktest.com` provides sub-second snapshots of BTC price + token prices (price_up, price_down) throughout live 5-minute windows. This is the data we need for proper backtesting.
+The profitable wallets (0x8dxd, 0xd9e0aa...) use a simpler approach:
 
-API key: `***POLYBACKTEST_KEY_REMOVED***` (free tier, 50 markets)
-Auth: `X-API-Key` header
-Docs: https://docs.polybacktest.com/api-reference/endpoint/get-market-by-slug
-Base: `https://api.polybacktest.com`
-
-Key endpoints:
-- `GET /v2/markets?coin=btc&market_type=5m` — list resolved markets
-- `GET /v2/markets/{market_id}/snapshots?coin=btc` — sub-second token price history
-- Snapshot fields: `time`, `btc_price`, `price_up`, `price_down`
-- Free tier: 50 most recent 5m markets, ~2500 snapshots each
-
-## URGENT Tasks (do these first)
-
-### 1. Log signal data every tick
-The bot runs but logs NOTHING to the DB between trades. Add periodic logging (every 60s) of: P(UP), log_odds, btc_price, up_token_price, down_token_price, window_id. This is essential for autoresearch.
-- File: `core/engine.py` — in the `tick_count % 600` block, add `self.memory.save_event()`
-
-### 2. Rebuild backtester on PolyBackTest data
-Replace `backtesting/historical_data.py` to pull from PolyBackTest API instead of Gamma + Binance klines separately. The snapshot data includes BOTH btc_price and token prices at each moment — exactly what we need.
-
-New flow:
 ```
-PolyBackTest /v2/markets → list of resolved 5m markets
-PolyBackTest /v2/markets/{id}/snapshots → sub-second price history
-For each market: replay signal engine against snapshot timeseries
-Compare signal direction vs actual outcome
-Also check: were cheap tokens available? At what timestamp?
+1. BTC moves on Binance
+2. Buy the WINNING side on Polymarket before the book fully reprices
+3. Collect $1 per share on resolution
 ```
 
-### 3. Two strategies running in parallel
-Strategy A (snipe): entry at <= 5c tokens, needs strong move
-Strategy B (midrange): entry at <= 55c tokens, needs 80% confidence, fee-aware Kelly
-Both are wired into `core/engine.py._check_entry()`. Strategy A fires first, Strategy B is fallback.
+No complex signal. Pure latency arbitrage. They enter at 25-55c (mid-range, reasonable prices) BEFORE the Polymarket book reflects the Binance move. The edge is SPEED, not prediction.
 
-## What's Running
-- Hetzner: 188.34.177.202, SSH key `~/.ssh/polymarket_hetzner`
-- Docker: both Binance WS (trades + bookTicker) and Polymarket CLOB WS connected
-- Health: :8080 endpoint
+## What To Build
+
+Replace the signal engine with:
+```python
+btc_move = (current_btc - window_open_btc) / window_open_btc * 100
+if abs(btc_move) > MOVE_THRESHOLD:  # e.g., 0.03%
+    direction = "UP" if btc_move > 0 else "DOWN"
+    token_price = get_live_price(direction_token)
+    if token_price < MAX_ENTRY_PRICE:  # e.g., 0.55
+        buy(direction_token, kelly_size(token_price))
+```
+
+One parameter to tune (MOVE_THRESHOLD). Entry price determines payoff. Speed determines what price you get.
+
+## Backtest Validation Needed
+
+Using PolyBackTest snapshot data (10 markets in DB, can fetch 50 on free tier):
+- For each market, find the moment BTC first moved >0.03% from open
+- What was the winning token price at that moment?
+- Would buying it have been profitable after fees?
+
+This is the core validation. If the winning token is still at 50-55c when we detect the move, the strategy works (buy at 55c, collect $1, minus fees).
+
+## Infrastructure (all working)
+- Hetzner: 188.34.177.202, SSH key ~/.ssh/polymarket_hetzner
+- Bot: Docker, Binance WS (trades + bookTicker), Polymarket CLOB WS, health :8080
+- Data: 10 markets + 25,868 snapshots in backtesting/historical.db
+- Repo: https://github.com/0xj7r/polymarket-btc-sniper
 - Monitoring: hourly Claude trigger with Slack
-- Autoresearch cron: Tuesdays 2am UTC (needs real data first)
+- PolyBackTest API key: ***POLYBACKTEST_KEY_REMOVED***
+- Anthropic API key on Hetzner: ***ANTHROPIC_KEY_REMOVED***
 
 ## Key Files
 ```
-core/engine.py              — main orchestrator (both strategies)
-strategies/btc_sniper.py    — signal engine
-strategies/strategy_config.py — config with Strategy B params
-clients/polymarket_ws.py    — CLOB WebSocket (real-time token prices)
-clients/binance_ws.py       — combined trade + bookTicker stream
-backtesting/historical_data.py — needs rewrite for PolyBackTest
-backtesting/btc_backtest.py — needs rewrite for real snapshot data
-autoresearch/program.md     — needs --strategy A|B flag
+core/engine.py              — main loop (keep, replace entry logic)
+strategies/btc_sniper.py    — signal engine (rewrite to simple threshold)
+clients/binance_ws.py       — Binance WS with bookTicker (keep)
+clients/polymarket_ws.py    — CLOB WS real-time prices (keep)
+clients/market_scanner.py   — slug-based discovery (keep)
+backtesting/historical_data.py — PolyBackTest fetcher (keep)
+backtesting/btc_backtest.py — snapshot replayer (rewrite for new strategy)
+strategy_config.json        — simplify to just move_threshold + max_entry_price
 ```
 
-## Infrastructure
-- Hetzner skill: `~/.claude/skills/hetzner/config.json`
-- Repo: https://github.com/0xj7r/polymarket-btc-sniper
-- PolyBackTest key stored at: needs adding to .env on Hetzner
+## Reference Wallets
+- 0x8dxd: https://polymarket.com/profile/%400x8dxd — $313 to $2.38M, 98% win rate
+- 0xd9e0aa: https://polydata.org/portfolio/0xd9e0aaca471f489be338fd0f91a26e8669a805f2 — $62 to $721K, 100% win rate
+- Both use latency arb on BTC 5m/15m markets, entering at 25-55c
 
 ## How to Continue
-1. Add signal logging to the live bot (task 1 above), deploy
-2. Rewrite backtester to use PolyBackTest API (task 2)
-3. Run the real backtester against 50 markets
-4. If signal accuracy > 55%, the strategy has edge
-5. Then let autoresearch optimize weights
+1. Fetch 50 markets from PolyBackTest: `python backtesting/historical_data.py --limit 50`
+2. Validate: for each market, when BTC first moves >0.03%, what's the winning token price?
+3. If profitable: rewrite signal engine to simple move threshold
+4. Backtest the new strategy
+5. Deploy to Hetzner
+6. Paper trade for 48h
+7. Go live
