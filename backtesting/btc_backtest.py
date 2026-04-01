@@ -105,6 +105,12 @@ def replay_market(
     buy_vol = 0.0
     sell_vol = 0.0
 
+    # Compute elapsed time boundaries for entry windows
+    total_snaps = len(snapshots)
+    window_duration = 300.0  # 5 minutes
+    early = cfg.execution.entry_window_early
+    late = cfg.execution.entry_window_late
+
     # Step through snapshots, simulating what the live engine would see
     for i, snap in enumerate(snapshots):
         btc = snap.get("btc_price") or prev_btc
@@ -135,6 +141,14 @@ def replay_market(
             price_delta=price_delta,
             acceleration=accel,
         )
+
+        # Check entry window timing
+        elapsed = (i / total_snaps) * window_duration
+        in_early = cfg.execution.enable_early_snipe and early[0] <= elapsed <= early[1]
+        in_late = cfg.execution.enable_late_snipe and late[0] <= elapsed <= late[1]
+        if not in_early and not in_late:
+            prev_btc = btc
+            continue
 
         # Check entry conditions
         direction = engine.direction
