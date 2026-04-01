@@ -67,19 +67,31 @@ class BacktestResult:
 def _simulate_signal(cfg: StrategyConfig, price_move_pct: float) -> tuple[str | None, float]:
     """Simulate the Bayesian signal engine for a window with a known price move.
 
-    Returns (direction, p_confident_side) or (None, 0.5) if no signal.
+    In the live engine, price_delta is the CUMULATIVE % change from window open,
+    recomputed on each Binance trade. So each update sees a growing delta, not
+    an incremental step. We simulate this: 20 trades where price moves linearly
+    from 0 to price_move_pct, and each trade feeds the cumulative delta.
     """
     engine = BayesianSignalEngine(cfg.signal)
 
-    # Simulate 20 incremental price updates during the window
-    step = price_move_pct / 20.0
-    for _ in range(20):
+    num_steps = 20
+    prev_delta = 0.0
+    for i in range(1, num_steps + 1):
+        cumulative_delta = price_move_pct * (i / num_steps)
+        # The engine receives the cumulative delta each time (like the live engine)
+        # But log_odds is additive, so we need the INCREMENTAL contribution
+        # In the live engine, each trade calls update() with the cumulative delta
+        # which adds w3 * cumulative_delta to log_odds every time.
+        # This means after N trades: log_odds = w3 * sum(cumulative_deltas)
+        # = w3 * price_move_pct * sum(i/N for i=1..N)
+        # = w3 * price_move_pct * (N+1)/2
         engine.update(
             order_flow_imbalance=0.0,
             microprice_deviation=0.0,
-            price_delta=step,
-            acceleration=0.0,
+            price_delta=cumulative_delta,
+            acceleration=cumulative_delta - prev_delta,
         )
+        prev_delta = cumulative_delta
 
     if engine.confident:
         p = engine.p_up if engine.direction == "UP" else engine.p_down
