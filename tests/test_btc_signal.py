@@ -50,12 +50,12 @@ def test_strong_down_signal():
     assert engine.confident is True
 
 
-def test_cumulative_updates():
-    engine = make_engine(w3=0.5, w1=0.0, w2=0.0, w4=0.0, threshold=0.90)
-    for _ in range(10):
-        engine.update(order_flow_imbalance=0.0, microprice_deviation=0.0,
-                      price_delta=0.3, acceleration=0.0)
-    assert engine.p_up > 0.80
+def test_set_state_replaces_not_accumulates():
+    engine = make_engine(w3=1.0, w1=0.0, w2=0.0, w4=0.0, threshold=0.90)
+    engine.update(0.0, 0.0, 5.0, 0.0)  # p_up very high
+    engine.update(0.0, 0.0, 0.1, 0.0)  # back to low delta
+    # set_state replaces, so log_odds = 1.0 * 0.1 = 0.1, p_up ≈ 0.525
+    assert engine.p_up < 0.60
 
 
 def test_reset():

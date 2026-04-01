@@ -41,25 +41,15 @@ def generate_synthetic_windows(n: int = 200, seed: int = 42) -> list[SimulatedWi
             move = rng.choice([-1, 1]) * rng.uniform(0.5, 1.5)
 
         direction = "UP" if move >= 0 else "DOWN"
-
-        # Token prices: when BTC moves strongly, the winning side gets expensive
-        # and the losing side gets cheap. Simulate this.
         abs_move = abs(move)
-        if abs_move > 0.3:
-            cheap_price = max(0.01, 0.05 - abs_move * 0.03)
-            expensive_price = 1.0 - cheap_price
-        else:
-            cheap_price = 0.50 - abs_move * 0.5
-            expensive_price = 0.50 + abs_move * 0.5
 
-        # Model token prices at the moment of entry.
-        # When BTC has moved strongly, the LOSING side's token becomes cheap.
-        # Our bot detects this from Binance and buys the WINNING side's token
-        # which is still cheap because Polymarket hasn't fully repriced yet.
-        # The lag is 2-12 seconds — during which the winning token stays at
-        # the stale low price before market makers update.
-        if abs_move > 0.3:
-            # Large move: winner's token still stale-priced at 2-5c
+        # Model realistic token pricing at time of potential entry.
+        # Three scenarios with different frequencies:
+        scenario = rng.random()
+
+        if abs_move > 0.3 and scenario < 0.40:
+            # 40% of large moves: stale pricing — winning token still cheap.
+            # This is the ideal scenario for our strategy.
             stale_price = max(0.01, 0.05 - abs_move * 0.02)
             if direction == "UP":
                 up_price = stale_price
@@ -67,10 +57,36 @@ def generate_synthetic_windows(n: int = 200, seed: int = 42) -> list[SimulatedWi
             else:
                 down_price = stale_price
                 up_price = 1.0 - stale_price
+
+        elif abs_move > 0.3 and scenario < 0.65:
+            # 25% of large moves: book already repriced. No cheap tokens.
+            # We detect the move but can't find a good entry.
+            if direction == "UP":
+                up_price = 0.80 + rng.uniform(0, 0.15)
+                down_price = 1.0 - up_price
+            else:
+                down_price = 0.80 + rng.uniform(0, 0.15)
+                up_price = 1.0 - down_price
+
+        elif abs_move > 0.3 and scenario < 0.80:
+            # 15% of large moves: reversal. BTC moved strongly during the window
+            # but reversed at the end. The signal pointed one way based on
+            # mid-window data, but the resolution went the other way.
+            reversed_dir = "DOWN" if direction == "UP" else "UP"
+            stale_price = max(0.01, 0.04)
+            if direction == "UP":
+                up_price = stale_price  # we'd buy UP cheap
+                down_price = 1.0 - stale_price
+            else:
+                down_price = stale_price  # we'd buy DOWN cheap
+                up_price = 1.0 - down_price
+            # Override direction to the reversal outcome
+            direction = reversed_dir
+
         else:
-            # Small move: both tokens near 50/50, no cheap opportunity
-            up_price = 0.50
-            down_price = 0.50
+            # All other cases: tokens near 50/50, no cheap opportunity
+            up_price = 0.45 + rng.uniform(0, 0.10)
+            down_price = 1.0 - up_price
 
         windows.append(SimulatedWindow(
             market_id=f"synthetic_{i:04d}",

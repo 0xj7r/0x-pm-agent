@@ -1,9 +1,9 @@
 """Bayesian signal engine for BTC 5-minute Up/Down markets.
 
-Maintains a posterior probability P(UP) in log-odds space,
-updated additively from real-time Binance data. When confidence
-exceeds threshold, produces a directional signal for sniping
-cheap tokens on Polymarket.
+Computes P(UP) from the current state of a 5-minute window using
+weighted features in log-odds space. The log_odds value is recomputed
+from scratch on each update (not accumulated), preventing runaway
+values from thousands of Binance trades per window.
 """
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 class BayesianSignalEngine:
-    """Real-time Bayesian probability estimator for BTC direction."""
+    """Real-time Bayesian probability estimator for BTC direction.
+
+    Unlike an accumulating model, this recomputes log_odds from the
+    current window state on each update. This prevents unbounded growth
+    from thousands of trades per window.
+    """
 
     def __init__(self, config: SignalConfig) -> None:
         self._w1 = config.w1_order_flow
@@ -46,6 +51,21 @@ class BayesianSignalEngine:
     def confident(self) -> bool:
         return self.direction is not None
 
+    def set_state(
+        self,
+        order_flow_imbalance: float,
+        microprice_deviation: float,
+        price_delta: float,
+        acceleration: float,
+    ) -> None:
+        """Recompute log_odds from current window state (not accumulated)."""
+        self.log_odds = (
+            self._w1 * order_flow_imbalance
+            + self._w2 * microprice_deviation
+            + self._w3 * price_delta
+            + self._w4 * acceleration
+        )
+
     def update(
         self,
         order_flow_imbalance: float,
@@ -53,13 +73,8 @@ class BayesianSignalEngine:
         price_delta: float,
         acceleration: float,
     ) -> None:
-        delta = (
-            self._w1 * order_flow_imbalance
-            + self._w2 * microprice_deviation
-            + self._w3 * price_delta
-            + self._w4 * acceleration
-        )
-        self.log_odds += delta
+        """Backward-compatible alias for set_state."""
+        self.set_state(order_flow_imbalance, microprice_deviation, price_delta, acceleration)
 
     def reset(self) -> None:
         self.log_odds = 0.0

@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time as _time
 from datetime import datetime, timezone
+
+import httpx
 
 from clients.binance_ws import BinanceWSClient, TradeUpdate
 from clients.market_scanner import MarketWindowScanner
@@ -20,6 +23,8 @@ from strategies.btc_sniper import BayesianSignalEngine
 from strategies.strategy_config import StrategyConfig
 
 logger = logging.getLogger(__name__)
+
+GAMMA_URL = "https://gamma-api.polymarket.com"
 
 
 class BTCTradingEngine:
@@ -55,6 +60,7 @@ class BTCTradingEngine:
         self._paper_trades: list[dict] = []
         self._resolved_market_ids: set[str] = set()
         self._scanner: MarketWindowScanner | None = None
+        self._resolution_http: httpx.AsyncClient | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
 
@@ -85,6 +91,7 @@ class BTCTradingEngine:
         if not self.current_window or self._window_open_price == 0:
             return
 
+        # Compute current window state (not incremental — avoids runaway log_odds)
         total_vol = self._buy_volume + self._sell_volume
         ofi = 0.0
         if total_vol > 0:
@@ -98,12 +105,31 @@ class BTCTradingEngine:
             prev_delta = (self._prev_btc_price - self._window_open_price) / self._window_open_price * 100
             accel = price_delta - prev_delta
 
-        self.signal_engine.update(
+        # set_state recomputes log_odds from scratch (not accumulated)
+        self.signal_engine.set_state(
             order_flow_imbalance=ofi,
             microprice_deviation=microprice_dev,
             price_delta=price_delta,
             acceleration=accel,
         )
+
+    def _in_entry_window(self) -> bool:
+        """Check if current time is within a configured entry window."""
+        if not self.current_window:
+            return False
+
+        now = datetime.now(timezone.utc)
+        elapsed = self.current_window.elapsed_seconds(now)
+
+        early = self.cfg.execution.entry_window_early
+        late = self.cfg.execution.entry_window_late
+
+        if self.cfg.execution.enable_early_snipe and early[0] <= elapsed <= early[1]:
+            return True
+        if self.cfg.execution.enable_late_snipe and late[0] <= elapsed <= late[1]:
+            return True
+
+        return False
 
     def _check_entry(self) -> list[dict]:
         """Check if entry conditions are met. Returns list of paper trades to execute."""
@@ -111,6 +137,9 @@ class BTCTradingEngine:
             return []
 
         if not self.signal_engine.confident:
+            return []
+
+        if not self._in_entry_window():
             return []
 
         direction = self.signal_engine.direction
@@ -173,8 +202,6 @@ class BTCTradingEngine:
 
     async def _scan_for_window(self) -> None:
         """Poll Gamma API for the current active BTC market window."""
-        import time as _time
-
         now = _time.time()
         if now - self._last_scan_time < self._scan_interval:
             return
@@ -190,61 +217,101 @@ class BTCTradingEngine:
         except Exception as e:
             logger.warning(f"Market scan failed: {e}")
 
+    async def _check_resolution(self, market_id: str) -> dict | None:
+        """Check if a market has resolved via Gamma API directly."""
+        if not self._resolution_http:
+            self._resolution_http = httpx.AsyncClient(timeout=30.0)
+
+        try:
+            resp = await self._resolution_http.get(f"{GAMMA_URL}/markets/{market_id}")
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if not data or not data.get("closed", False):
+                return None
+
+            outcome_prices_raw = data.get("outcomePrices", "[]")
+            import json
+            prices = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+            if len(prices) < 2:
+                return None
+
+            yes_price = float(prices[0])
+            if yes_price >= 0.99:
+                return {"resolved": True, "winning_outcome": "Yes"}
+            elif float(prices[1]) >= 0.99:
+                return {"resolved": True, "winning_outcome": "No"}
+            return None
+        except Exception as e:
+            logger.debug(f"Resolution check failed for {market_id}: {e}")
+            return None
+
     async def _check_resolutions(self) -> None:
         """Check if any paper trades have resolved and calculate P&L."""
-        if not self._scanner or not self._paper_trades:
+        unresolved = [
+            t for t in self._paper_trades
+            if t["market_id"] not in self._resolved_market_ids
+        ]
+        if not unresolved:
             return
 
-        for trade in list(self._paper_trades):
+        for trade in unresolved:
             market_id = trade["market_id"]
-            if market_id in self._resolved_market_ids:
+
+            result = await self._check_resolution(market_id)
+            if not result:
                 continue
 
-            try:
-                from clients.polymarket import PolymarketClient
-                result = await PolymarketClient(Config()).check_market_resolution(market_id)
-                if not result:
-                    continue
+            winning = result["winning_outcome"]
+            resolved_dir = "UP" if winning == "Yes" else "DOWN"
 
-                winning = result["winning_outcome"]
-                resolved_dir = "UP" if winning == "Yes" else "DOWN"
+            record = PaperTradeRecord(
+                trade_id=trade.get("timestamp", market_id),
+                market_id=market_id,
+                direction=trade["direction"],
+                token_price=trade["token_price"],
+                size_usd=trade["size_usd"],
+                shares=trade["shares"],
+            )
+            res = resolve_paper_trade(record, resolved_dir)
 
-                record = PaperTradeRecord(
-                    trade_id=trade.get("timestamp", market_id),
-                    market_id=market_id,
-                    direction=trade["direction"],
-                    token_price=trade["token_price"],
-                    size_usd=trade["size_usd"],
-                    shares=trade["shares"],
-                )
-                res = resolve_paper_trade(record, resolved_dir)
+            # At entry: balance -= cost. At resolution: balance += cost + pnl.
+            # Win:  cost + (payout - cost - fee) = payout - fee
+            # Loss: cost + (-cost - fee) = -fee
+            self.balance += trade["size_usd"] + res.pnl_usd
 
-                self.balance += trade["size_usd"] + res.pnl_usd
-                self._resolved_market_ids.add(market_id)
-                self.risk.record_trade_result(res.pnl_usd)
+            self._resolved_market_ids.add(market_id)
+            self.risk.record_trade_result(res.pnl_usd)
 
-                status = "WON" if res.won else "LOST"
-                logger.info(
-                    f"RESOLVED: {status} ${res.pnl_usd:+.2f} | "
-                    f"{trade['direction']} @ {trade['token_price']:.3f} | "
-                    f"Outcome: {resolved_dir} | Balance: ${self.balance:.2f}"
-                )
+            status = "WON" if res.won else "LOST"
+            logger.info(
+                f"RESOLVED: {status} ${res.pnl_usd:+.2f} | "
+                f"{trade['direction']} @ {trade['token_price']:.3f} | "
+                f"Outcome: {resolved_dir} | Balance: ${self.balance:.2f}"
+            )
 
-                self.memory.save_event(
-                    window_id=market_id,
-                    event_type="resolution",
-                    p_up=None,
-                    log_odds=None,
-                    btc_price=None,
-                    details={
-                        "won": res.won,
-                        "pnl_usd": res.pnl_usd,
-                        "resolved_direction": resolved_dir,
-                        "trade": trade,
-                    },
-                )
-            except Exception as e:
-                logger.debug(f"Resolution check failed for {market_id}: {e}")
+            self.memory.save_event(
+                window_id=market_id,
+                event_type="resolution",
+                p_up=None,
+                log_odds=None,
+                btc_price=None,
+                details={
+                    "won": res.won,
+                    "pnl_usd": res.pnl_usd,
+                    "resolved_direction": resolved_dir,
+                    "trade": trade,
+                },
+            )
+
+        # Prune resolved trades from the list (fix #10)
+        self._paper_trades = [
+            t for t in self._paper_trades
+            if t["market_id"] not in self._resolved_market_ids
+        ]
 
     async def run(self) -> None:
         """Main loop. Connects to Binance, scans markets, processes data, checks entries."""
@@ -290,6 +357,8 @@ class BTCTradingEngine:
             binance_task.cancel()
             if self._scanner:
                 await self._scanner.close()
+            if self._resolution_http:
+                await self._resolution_http.aclose()
 
     async def stop(self) -> None:
         self._running = False

@@ -18,7 +18,7 @@ async def test_full_pipeline_paper_trade():
     cfg = StrategyConfig()
     cfg.paper.enabled = True
     cfg.paper.starting_balance = 100.0
-    cfg.signal.confidence_threshold = 0.80
+    cfg.signal.confidence_threshold = 0.70
     cfg.signal.w3_price_delta = 1.0
     cfg.signal.w1_order_flow = 0.0
     cfg.signal.w2_microprice = 0.0
@@ -48,16 +48,19 @@ async def test_full_pipeline_paper_trade():
     engine._window_open_price = 84000.0
     engine._last_btc_price = 84000.0
 
+    # Simulate a strong 1% BTC move ($840) over 20 trades
     for i in range(20):
         update = TradeUpdate(
-            price=84000.0 + (i + 1) * 10,
+            price=84000.0 + (i + 1) * 42,  # +$840 total = 1% move
             quantity=0.5,
             is_buyer_maker=False,
             timestamp_ms=int((now + timedelta(seconds=i)).timestamp() * 1000),
         )
         await engine._on_binance_trade(update)
 
-    assert engine.signal_engine.p_up > 0.80, f"p_up={engine.signal_engine.p_up}"
+    # With w3=1.0, price_delta=1.0%, log_odds=1.0, p_up=sigmoid(1.0)=0.731
+    # Need threshold <= 0.73 for this to fire
+    assert engine.signal_engine.p_up > 0.70, f"p_up={engine.signal_engine.p_up}"
 
     trades = engine._check_entry()
     assert len(trades) == 1

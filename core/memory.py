@@ -82,8 +82,10 @@ CREATE TABLE IF NOT EXISTS event_log (
 class MemoryStore:
     def __init__(self, db_path: str = "trades.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_schema()
 
     def _init_schema(self):

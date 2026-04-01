@@ -32,19 +32,28 @@ class ResolutionResult:
     resolved_at: datetime | None = None
 
 
-def resolve_paper_trade(trade: PaperTradeRecord, resolved_direction: str) -> ResolutionResult:
-    """Calculate P&L for a resolved paper trade.
+TAKER_FEE_RATE = 0.072
 
-    If direction matches, payout = shares * $1.00 (each share resolves to $1).
-    If direction doesn't match, payout = $0 (total loss of cost basis).
+
+def _taker_fee(price: float, size_usd: float) -> float:
+    """Polymarket dynamic taker fee: C * 0.072 * p * (1-p)."""
+    return size_usd * TAKER_FEE_RATE * price * (1.0 - price)
+
+
+def resolve_paper_trade(trade: PaperTradeRecord, resolved_direction: str) -> ResolutionResult:
+    """Calculate P&L for a resolved paper trade, including taker fees.
+
+    If direction matches, payout = shares * $1.00 minus entry fee.
+    If direction doesn't match, payout = $0, loss = cost + entry fee.
     """
     won = trade.direction == resolved_direction
+    entry_fee = _taker_fee(trade.token_price, trade.size_usd)
 
     if won:
         payout = trade.shares * 1.0
-        pnl = payout - trade.size_usd
+        pnl = payout - trade.size_usd - entry_fee
     else:
-        pnl = -trade.size_usd
+        pnl = -trade.size_usd - entry_fee
 
     return ResolutionResult(
         trade_id=trade.trade_id,

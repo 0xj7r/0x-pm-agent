@@ -71,12 +71,15 @@ def load_strategy_config(path: str) -> StrategyConfig:
         version=data.get("version", 1),
         promoted_at=data.get("promoted_at", ""),
     )
+    def _filter_fields(cls: type, d: dict) -> dict:
+        return {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+
     if "signal" in data:
-        cfg.signal = SignalConfig(**data["signal"])
+        cfg.signal = SignalConfig(**_filter_fields(SignalConfig, data["signal"]))
     if "execution" in data:
-        cfg.execution = ExecutionConfig(**data["execution"])
+        cfg.execution = ExecutionConfig(**_filter_fields(ExecutionConfig, data["execution"]))
     if "risk" in data:
-        cfg.risk = RiskConfig(**data["risk"])
+        cfg.risk = RiskConfig(**_filter_fields(RiskConfig, data["risk"]))
     if "paper" in data:
-        cfg.paper = PaperConfig(**data["paper"])
+        cfg.paper = PaperConfig(**_filter_fields(PaperConfig, data["paper"]))
     return cfg
