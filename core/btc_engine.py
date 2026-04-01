@@ -10,6 +10,8 @@ import logging
 from datetime import datetime, timezone
 
 from clients.binance_ws import BinanceWSClient, TradeUpdate
+from clients.market_scanner import MarketWindowScanner
+from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
 from core.memory import MemoryStore
 from core.risk import RiskManager
 from config import Config
@@ -50,6 +52,11 @@ class BTCTradingEngine:
 
         self._buy_volume: float = 0.0
         self._sell_volume: float = 0.0
+        self._paper_trades: list[dict] = []
+        self._resolved_market_ids: set[str] = set()
+        self._scanner: MarketWindowScanner | None = None
+        self._scan_interval: float = 30.0
+        self._last_scan_time: float = 0.0
 
     def _on_new_window(self, window: MarketWindow) -> None:
         """Reset state for a new 5-minute market window."""
@@ -164,8 +171,83 @@ class BTCTradingEngine:
 
         return [trade]
 
+    async def _scan_for_window(self) -> None:
+        """Poll Gamma API for the current active BTC market window."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._last_scan_time < self._scan_interval:
+            return
+        self._last_scan_time = now
+
+        if not self._scanner:
+            self._scanner = MarketWindowScanner()
+
+        try:
+            window = await self._scanner.get_current_window()
+            if window and (not self.current_window or window.market_id != self.current_window.market_id):
+                self._on_new_window(window)
+        except Exception as e:
+            logger.warning(f"Market scan failed: {e}")
+
+    async def _check_resolutions(self) -> None:
+        """Check if any paper trades have resolved and calculate P&L."""
+        if not self._scanner or not self._paper_trades:
+            return
+
+        for trade in list(self._paper_trades):
+            market_id = trade["market_id"]
+            if market_id in self._resolved_market_ids:
+                continue
+
+            try:
+                from clients.polymarket import PolymarketClient
+                result = await PolymarketClient(Config()).check_market_resolution(market_id)
+                if not result:
+                    continue
+
+                winning = result["winning_outcome"]
+                resolved_dir = "UP" if winning == "Yes" else "DOWN"
+
+                record = PaperTradeRecord(
+                    trade_id=trade.get("timestamp", market_id),
+                    market_id=market_id,
+                    direction=trade["direction"],
+                    token_price=trade["token_price"],
+                    size_usd=trade["size_usd"],
+                    shares=trade["shares"],
+                )
+                res = resolve_paper_trade(record, resolved_dir)
+
+                self.balance += trade["size_usd"] + res.pnl_usd
+                self._resolved_market_ids.add(market_id)
+                self.risk.record_trade_result(res.pnl_usd)
+
+                status = "WON" if res.won else "LOST"
+                logger.info(
+                    f"RESOLVED: {status} ${res.pnl_usd:+.2f} | "
+                    f"{trade['direction']} @ {trade['token_price']:.3f} | "
+                    f"Outcome: {resolved_dir} | Balance: ${self.balance:.2f}"
+                )
+
+                self.memory.save_event(
+                    window_id=market_id,
+                    event_type="resolution",
+                    p_up=None,
+                    log_odds=None,
+                    btc_price=None,
+                    details={
+                        "won": res.won,
+                        "pnl_usd": res.pnl_usd,
+                        "resolved_direction": resolved_dir,
+                        "trade": trade,
+                    },
+                )
+            except Exception as e:
+                logger.debug(f"Resolution check failed for {market_id}: {e}")
+
     async def run(self) -> None:
-        """Main loop. Connects to Binance, processes data, checks entries."""
+        """Main loop. Connects to Binance, scans markets, processes data, checks entries."""
         self._running = True
 
         binance = BinanceWSClient(on_trade=self._on_binance_trade)
@@ -177,14 +259,28 @@ class BTCTradingEngine:
             f"Threshold: {self.cfg.signal.confidence_threshold}"
         )
 
+        tick_count = 0
         try:
             while self._running:
                 try:
+                    await self._scan_for_window()
+
                     trades = self._check_entry()
                     for t in trades:
+                        self._paper_trades.append(t)
                         if self.cfg.paper.enabled:
                             self.balance -= t["size_usd"]
                             logger.info(f"[PAPER] Balance: ${self.balance:.2f}")
+
+                    tick_count += 1
+                    if tick_count % 600 == 0:  # every ~60s
+                        await self._check_resolutions()
+                        logger.info(
+                            f"Status: P(UP)={self.signal_engine.p_up:.3f} | "
+                            f"Balance=${self.balance:.2f} | "
+                            f"Trades={len(self._paper_trades)} | "
+                            f"Resolved={len(self._resolved_market_ids)}"
+                        )
                 except Exception as e:
                     logger.error(f"Engine tick error: {e}", exc_info=True)
 
@@ -192,6 +288,8 @@ class BTCTradingEngine:
         finally:
             await binance.close()
             binance_task.cancel()
+            if self._scanner:
+                await self._scanner.close()
 
     async def stop(self) -> None:
         self._running = False
