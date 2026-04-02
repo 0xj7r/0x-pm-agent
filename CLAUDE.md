@@ -1,30 +1,49 @@
-# CLAUDE.md - Polymarket BTC Sniper
+# CLAUDE.md - Polymarket Multi-Coin Latency Arb
 
-## Core Principle: Test-Driven Development (TDD)
+## Strategy
 
-Write tests FIRST, code SECOND. Failing test → minimal code → refactor → full suite green.
+Simple threshold detection per coin. When price moves > X% on Binance and the Polymarket token is still <= $0.55, buy the directional side.
+
+| Coin | Threshold | Max Entry | Win Rate |
+|------|-----------|-----------|----------|
+| BTC  | 0.08%     | $0.55     | 88%      |
+| ETH  | 0.15%     | $0.55     | 98%      |
+| SOL  | 0.08%     | $0.55     | 100%     |
 
 ## Rules
 
-1. **Tests first, then code.** Every commit must pass `python -m pytest tests/ -v`.
-2. **Syntax check changed files.**
-3. **`from __future__ import annotations` on line 1** or after a single docstring.
-4. **Type hints on all function signatures.**
-5. **Mock ALL external APIs in tests.**
-6. **Do NOT `git push` unless explicitly told to.**
-7. **Files under 400 lines.** Split by responsibility if growing.
+1. **Tests first, then code.** `python -m pytest tests/ -v` must pass.
+2. **`from __future__ import annotations`** on line 1 or after docstring.
+3. **Type hints** on all function signatures.
+4. **Mock ALL external APIs** in tests.
+5. **Do NOT `git push`** unless explicitly told to.
+6. **Files under 400 lines.** Split by responsibility.
+7. **OOP, modular, DRY.** No big if/else chains. Use dict dispatch.
+8. **Use shared/ modules.** `shared.fees`, `shared.db`, `shared.constants`.
+
+## Architecture
+
+```
+shared/          fees, db, constants (single source of truth)
+strategies/      ThresholdStrategy (core strategy logic)
+clients/         Binance WS, Polymarket CLOB, market scanner
+core/            engine, resolution, risk, health, notifications
+backtesting/     precompute, simulator, research, fetcher, projection
+collector/       live snapshot recorder
+```
+
+## Key Patterns
+
+- **ThresholdStrategy.check_signal()** returns "Up", "Down", "SKIP", or None
+- **Fee model**: `shared.fees.taker_fee(price)` = 0.072 * p * (1-p)
+- **Per-coin config**: `strategy_config.json` has `coins.{btc,eth,sol}` with thresholds
+- **Health endpoint** on :8080
+- **Slack notifications** on trades, resolutions, errors
 
 ## Testing
 
 ```bash
 python -m pytest tests/ -v
-python -m pytest tests/test_btc_engine.py -v
+python -m pytest tests/test_threshold.py -v
+python tests/test_order_pipeline.py
 ```
-
-## Key Patterns
-
-- **Signal engine uses `set_state` (snapshot)** — not accumulate
-- **Asymmetric Kelly** for cheap tokens (2-5c) with capped downside
-- **Balance accounting**: `cost + pnl` at resolution
-- **Health endpoint** on :8080 for remote monitoring
-- **Slack notifications** on trades, resolutions, errors
