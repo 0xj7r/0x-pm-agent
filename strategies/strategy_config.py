@@ -10,27 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class SignalConfig:
-    w1_order_flow: float = 0.3
-    w2_microprice: float = 0.2
-    w3_price_delta: float = 0.4
-    w4_acceleration: float = 0.1
-    confidence_threshold: float = 0.75
-    prior: float = 0.5
-
-
-@dataclass
-class ExecutionConfig:
-    max_entry_price: float = 0.05
-    entry_window_early: list[int] = field(default_factory=lambda: [0, 60])
-    entry_window_late: list[int] = field(default_factory=lambda: [270, 295])
-    enable_early_snipe: bool = True
-    enable_late_snipe: bool = True
-    # Strategy B: mid-range directional (0x8dxd style)
-    enable_midrange: bool = True
-    midrange_max_price: float = 0.55
-    midrange_min_confidence: float = 0.80
-    midrange_taker_fee_rate: float = 0.04
+class ThresholdConfig:
+    move_threshold: float = 0.08
+    max_entry: float = 0.55
 
 
 @dataclass
@@ -43,7 +25,6 @@ class RiskConfig:
     loss_cooldown_trades: int = 5
     loss_cooldown_seconds: int = 300
     kelly_multiplier: float = 0.25
-    cheap_token_multiplier: float = 2.0
 
 
 @dataclass
@@ -55,9 +36,11 @@ class PaperConfig:
 @dataclass
 class StrategyConfig:
     version: int = 1
-    promoted_at: str = ""
-    signal: SignalConfig = field(default_factory=SignalConfig)
-    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    coins: dict[str, ThresholdConfig] = field(default_factory=lambda: {
+        "btc": ThresholdConfig(0.08, 0.55),
+        "eth": ThresholdConfig(0.15, 0.55),
+        "sol": ThresholdConfig(0.08, 0.55),
+    })
     risk: RiskConfig = field(default_factory=RiskConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
 
@@ -72,19 +55,20 @@ def load_strategy_config(path: str) -> StrategyConfig:
     with open(p) as f:
         data = json.load(f)
 
-    cfg = StrategyConfig(
-        version=data.get("version", 1),
-        promoted_at=data.get("promoted_at", ""),
-    )
     def _filter_fields(cls: type, d: dict) -> dict:
         return {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
 
-    if "signal" in data:
-        cfg.signal = SignalConfig(**_filter_fields(SignalConfig, data["signal"]))
-    if "execution" in data:
-        cfg.execution = ExecutionConfig(**_filter_fields(ExecutionConfig, data["execution"]))
+    cfg = StrategyConfig(version=data.get("version", 1))
+
+    if "coins" in data:
+        cfg.coins = {
+            coin: ThresholdConfig(**_filter_fields(ThresholdConfig, params))
+            for coin, params in data["coins"].items()
+        }
+
     if "risk" in data:
         cfg.risk = RiskConfig(**_filter_fields(RiskConfig, data["risk"]))
     if "paper" in data:
         cfg.paper = PaperConfig(**_filter_fields(PaperConfig, data["paper"]))
+
     return cfg
