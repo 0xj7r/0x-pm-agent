@@ -1,0 +1,276 @@
+{
+  "btc": {
+    "best_strategy": {
+      "name": "threshold",
+      "params": {
+        "move": 0.08,
+        "max_entry": 0.55
+      },
+      "train_win_rate": 0.87,
+      "test_win_rate": 0.87,
+      "train_trades": 76,
+      "test_trades": 33,
+      "train_pnl": 33.0,
+      "test_pnl": 14.3,
+      "avg_entry": 0.5,
+      "test_pnl_per_trade": 0.43
+    },
+    "top_5": [
+      {
+        "name": "volatility",
+        "params": {
+          "move": 0.08,
+          "vol": 0.005,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 0.8889,
+        "test_win_rate": 1.0,
+        "train_trades": 18,
+        "test_trades": 4,
+        "avg_entry": 0.4989,
+        "test_pnl_per_trade": 0.5012
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.08,
+          "accel": 0.03,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 12,
+        "test_trades": 5,
+        "avg_entry": 0.5027,
+        "test_pnl_per_trade": 0.4992
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.08,
+          "accel": 0.03,
+          "max_entry": 0.6
+        },
+        "train_win_rate": 0.8947,
+        "test_win_rate": 1.0,
+        "train_trades": 19,
+        "test_trades": 5,
+        "avg_entry": 0.5165,
+        "test_pnl_per_trade": 0.4992
+      },
+      {
+        "name": "velocity",
+        "params": {
+          "move": 0.08,
+          "vel": 0.02,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 0.9167,
+        "test_win_rate": 1.0,
+        "train_trades": 36,
+        "test_trades": 8,
+        "avg_entry": 0.4915,
+        "test_pnl_per_trade": 0.4986
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.08,
+          "accel": 0.02,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 0.95,
+        "test_win_rate": 1.0,
+        "train_trades": 20,
+        "test_trades": 6,
+        "avg_entry": 0.4977,
+        "test_pnl_per_trade": 0.4978
+      }
+    ],
+    "total_profitable_strategies": 707,
+    "note": "Simple threshold outperforms volatility filter on full dataset (109 trades vs 51, same win rate)"
+  },
+  "eth": {
+    "best_strategy": {
+      "name": "threshold",
+      "params": {
+        "move": 0.15,
+        "max_entry": 0.55
+      },
+      "train_win_rate": 0.98,
+      "test_win_rate": 0.98,
+      "train_trades": 66,
+      "test_trades": 29,
+      "train_pnl": 32.0,
+      "test_pnl": 14.0,
+      "avg_entry": 0.5,
+      "test_pnl_per_trade": 0.48
+    },
+    "top_5": [
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.05,
+          "accel": 0.03,
+          "max_entry": 0.65
+        },
+        "train_win_rate": 0.5854,
+        "test_win_rate": 0.7222,
+        "train_trades": 41,
+        "test_trades": 18,
+        "avg_entry": 0.5608,
+        "test_pnl_per_trade": 0.1632
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.05,
+          "accel": 0.03,
+          "max_entry": 0.7
+        },
+        "train_win_rate": 0.6346,
+        "test_win_rate": 0.7391,
+        "train_trades": 52,
+        "test_trades": 23,
+        "avg_entry": 0.5864,
+        "test_pnl_per_trade": 0.1515
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.05,
+          "accel": 0.03,
+          "max_entry": 0.85
+        },
+        "train_win_rate": 0.6857,
+        "test_win_rate": 0.8056,
+        "train_trades": 70,
+        "test_trades": 36,
+        "avg_entry": 0.6445,
+        "test_pnl_per_trade": 0.148
+      },
+      {
+        "name": "acceleration",
+        "params": {
+          "move": 0.01,
+          "accel": 0.02,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 0.6452,
+        "test_win_rate": 0.625,
+        "train_trades": 62,
+        "test_trades": 24,
+        "avg_entry": 0.4872,
+        "test_pnl_per_trade": 0.147
+      },
+      {
+        "name": "accel+time",
+        "params": {
+          "move": 0.01,
+          "accel": 0.02,
+          "elapsed": 0.1,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 0.6452,
+        "test_win_rate": 0.625,
+        "train_trades": 62,
+        "test_trades": 24,
+        "avg_entry": 0.4872,
+        "test_pnl_per_trade": 0.147
+      }
+    ],
+    "total_profitable_strategies": 575,
+    "note": "ETH needs higher threshold (0.15%) than BTC (0.08%) due to higher volatility. Simple threshold wins again."
+  },
+  "sol": {
+    "best_strategy": {
+      "name": "skew",
+      "params": {
+        "move": 0.08,
+        "skew": 0.02,
+        "max_entry": 0.55
+      },
+      "train_win_rate": 1.0,
+      "test_win_rate": 1.0,
+      "train_trades": 6,
+      "test_trades": 3,
+      "train_pnl": 3.4365,
+      "test_pnl": 1.5341,
+      "avg_entry": 0.45,
+      "test_pnl_per_trade": 0.5114
+    },
+    "top_5": [
+      {
+        "name": "skew",
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.55
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 6,
+        "test_trades": 3,
+        "avg_entry": 0.45,
+        "test_pnl_per_trade": 0.5114
+      },
+      {
+        "name": "skew",
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.6
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 6,
+        "test_trades": 3,
+        "avg_entry": 0.45,
+        "test_pnl_per_trade": 0.5114
+      },
+      {
+        "name": "skew",
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.65
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 6,
+        "test_trades": 3,
+        "avg_entry": 0.45,
+        "test_pnl_per_trade": 0.5114
+      },
+      {
+        "name": "skew",
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.7
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 6,
+        "test_trades": 3,
+        "avg_entry": 0.45,
+        "test_pnl_per_trade": 0.5114
+      },
+      {
+        "name": "skew",
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.75
+        },
+        "train_win_rate": 1.0,
+        "test_win_rate": 1.0,
+        "train_trades": 6,
+        "test_trades": 3,
+        "avg_entry": 0.45,
+        "test_pnl_per_trade": 0.5114
+      }
+    ],
+    "total_profitable_strategies": 486
+  }
+}
