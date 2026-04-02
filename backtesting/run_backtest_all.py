@@ -18,7 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtesting.precompute import load_and_precompute
-from backtesting.stochastic_projection import polymarket_fee, slippage
+from backtesting.projection import slippage
+from shared.fees import taker_fee
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
@@ -121,7 +122,7 @@ def run_monte_carlo(
         for t in range(total_trades):
             entry = rng.choice(entries)
             liq = rng.choice(liqs)
-            fee = polymarket_fee(entry)
+            fee = taker_fee(entry)
 
             bet = min(balance * bet_pct, liq * liquidity_fill)
             if bet < 1.0:

@@ -18,9 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtesting.stochastic_projection import (
-    extract_observed_trades, polymarket_fee, slippage,
-)
+from backtesting.projection import MonteCarloSimulator, slippage
+from shared.fees import taker_fee
 
 logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent / "historical.db"
@@ -52,7 +51,7 @@ def run_simulation_paths(
 
         for trade_num in range(total_trades):
             entry = rng.choice(entry_prices)
-            fee_rate = polymarket_fee(entry)
+            fee_rate = taker_fee(entry)
             liq = rng.choice(liquidities)
 
             bet = min(balance * bet_pct, liq * liquidity_fill_pct)
@@ -297,7 +296,8 @@ def main():
     args = parser.parse_args()
 
     logger.info("Extracting observed trades...")
-    trades = extract_observed_trades(Path(args.db), args.move, args.max_entry)
+    simulator = MonteCarloSimulator(Path(args.db))
+    trades = simulator.extract_trades(args.move, args.max_entry)
     win_rate = sum(1 for t in trades if t.won) / len(trades) if trades else 0
     logger.info(f"Found {len(trades)} trades, WR={win_rate:.1%}")
 
