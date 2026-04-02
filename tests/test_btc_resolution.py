@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import pytest
 
-from core.btc_resolution import resolve_paper_trade, PaperTradeRecord, _taker_fee
+from core.btc_resolution import resolve_paper_trade, PaperTradeRecord
+from shared.fees import taker_fee_usd
 
 
-def test_taker_fee_at_2_cents():
+def test_taker_fee_usd_at_2_cents():
     # fee = size * 0.072 * 0.02 * 0.98 = size * 0.0014
-    fee = _taker_fee(0.02, 10.0)
+    fee = taker_fee_usd(0.02, 10.0)
     assert abs(fee - 10.0 * 0.072 * 0.02 * 0.98) < 0.001
 
 
-def test_taker_fee_at_50_cents():
+def test_taker_fee_usd_at_50_cents():
     # fee = size * 0.072 * 0.50 * 0.50 = size * 0.018
-    fee = _taker_fee(0.50, 100.0)
+    fee = taker_fee_usd(0.50, 100.0)
     assert abs(fee - 100.0 * 0.072 * 0.25) < 0.001
 
 
@@ -68,5 +69,5 @@ def test_resolve_buy_down_loses():
 
 def test_fee_is_negligible_at_cheap_prices():
     """At 2c tokens, the fee should be < 0.2% of position size."""
-    fee = _taker_fee(0.02, 100.0)
+    fee = taker_fee_usd(0.02, 100.0)
     assert fee < 0.20  # less than 20 cents on a $100 position

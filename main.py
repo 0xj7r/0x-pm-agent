@@ -49,8 +49,8 @@ def cleanup_pid() -> None:
 
 async def main(config_path: str, live: bool) -> None:
     from core.engine import BTCTradingEngine
-    from strategies.btc_sniper import BayesianSignalEngine
-    from strategies.strategy_config import load_strategy_config
+    from strategies.threshold import ThresholdStrategy
+    from strategies.strategy_config import load_strategy_config, ThresholdConfig
 
     cfg = load_strategy_config(config_path)
     if live:
@@ -72,7 +72,9 @@ async def main(config_path: str, live: bool) -> None:
         logging.info("SIGHUP received, reloading strategy config...")
         new_cfg = load_strategy_config(config_path)
         engine.cfg = new_cfg
-        engine.signal_engine = BayesianSignalEngine(new_cfg.signal)
+        from dataclasses import asdict
+        btc_conf = new_cfg.coins.get("btc", ThresholdConfig())
+        engine._strategy = ThresholdStrategy.from_config("btc", asdict(btc_conf))
         logging.info("Config reloaded")
 
     signal.signal(signal.SIGHUP, handle_reload)
