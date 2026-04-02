@@ -17,10 +17,12 @@ from typing import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-BINANCE_COMBINED_URL = (
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker"
-)
+def _ws_trade_url(symbol: str) -> str:
+    return f"wss://stream.binance.com:9443/ws/{symbol}@trade"
+
+
+def _ws_combined_url(symbol: str) -> str:
+    return f"wss://stream.binance.com:9443/stream?streams={symbol}@trade/{symbol}@bookTicker"
 
 
 @dataclass
@@ -72,15 +74,17 @@ class BinanceWSClient:
         on_trade: Callable[[TradeUpdate], Awaitable[None]] | None = None,
         on_book_update: Callable[[OrderBookSnapshot], Awaitable[None]] | None = None,
         url: str | None = None,
+        symbol: str = "btcusdt",
     ) -> None:
         self._on_trade = on_trade
         self._on_book_update = on_book_update
+        self.symbol = symbol.lower()
         if url is not None:
             self._url = url
         elif on_book_update is not None:
-            self._url = BINANCE_COMBINED_URL
+            self._url = _ws_combined_url(self.symbol)
         else:
-            self._url = BINANCE_WS_URL
+            self._url = _ws_trade_url(self.symbol)
         self._ws = None
         self._running = False
         self._last_message_time: float = 0.0

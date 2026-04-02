@@ -1,0 +1,818 @@
+{
+  "btc": {
+    "strategy": {
+      "name": "volatility",
+      "params": {
+        "move": 0.08,
+        "vol": 0.01,
+        "max_entry": 0.55
+      }
+    },
+    "markets": 3911,
+    "validation": {
+      "folds": [
+        {
+          "train_markets": 1329,
+          "test_markets": 498,
+          "train": {
+            "trades": 14,
+            "wins": 11,
+            "win_rate": 0.7857142857142857,
+            "pnl": 3.925328472,
+            "pnl_per_trade": 0.2803806051428571,
+            "avg_entry": 0.4964285714285714
+          },
+          "test": {
+            "trades": 6,
+            "wins": 5,
+            "win_rate": 0.8333333333333334,
+            "pnl": 1.9665244480000001,
+            "pnl_per_trade": 0.3277540746666667,
+            "avg_entry": 0.49666666666666676
+          }
+        },
+        {
+          "train_markets": 1827,
+          "test_markets": 498,
+          "train": {
+            "trades": 20,
+            "wins": 16,
+            "win_rate": 0.8,
+            "pnl": 5.891852919999999,
+            "pnl_per_trade": 0.29459264599999996,
+            "avg_entry": 0.4964999999999999
+          },
+          "test": {
+            "trades": 7,
+            "wins": 6,
+            "win_rate": 0.8571428571428571,
+            "pnl": 2.26421036,
+            "pnl_per_trade": 0.32345862285714283,
+            "avg_entry": 0.5242857142857144
+          }
+        },
+        {
+          "train_markets": 2325,
+          "test_markets": 498,
+          "train": {
+            "trades": 27,
+            "wins": 22,
+            "win_rate": 0.8148148148148148,
+            "pnl": 8.156063279999998,
+            "pnl_per_trade": 0.3020764177777777,
+            "avg_entry": 0.5037037037037037
+          },
+          "test": {
+            "trades": 5,
+            "wins": 3,
+            "win_rate": 0.6,
+            "pnl": 0.30250613599999987,
+            "pnl_per_trade": 0.06050122719999997,
+            "avg_entry": 0.53
+          }
+        },
+        {
+          "train_markets": 2823,
+          "test_markets": 498,
+          "train": {
+            "trades": 32,
+            "wins": 25,
+            "win_rate": 0.78125,
+            "pnl": 8.458569415999998,
+            "pnl_per_trade": 0.26433029424999993,
+            "avg_entry": 0.5078124999999999
+          },
+          "test": {
+            "trades": 3,
+            "wins": 3,
+            "win_rate": 1.0,
+            "pnl": 1.5239442800000003,
+            "pnl_per_trade": 0.5079814266666668,
+            "avg_entry": 0.48333333333333334
+          }
+        }
+      ],
+      "aggregate_oos": {
+        "trades": 21,
+        "wins": 17,
+        "win_rate": 0.8095238095238095,
+        "pnl": 6.057185224,
+        "pnl_per_trade": 0.28843739161904763,
+        "profitable_folds": 4,
+        "num_folds": 4,
+        "min_fold_pnl_per_trade": 0.06050122719999997,
+        "max_fold_pnl_per_trade": 0.5079814266666668
+      },
+      "final_holdout": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.943831232,
+        "pnl_per_trade": 0.485957808,
+        "avg_entry": 0.505
+      },
+      "final_holdout_markets": 587
+    },
+    "robustness": {
+      "baseline": {
+        "params": {
+          "move": 0.08,
+          "vol": 0.01,
+          "max_entry": 0.55
+        },
+        "oos_trades": 21,
+        "oos_win_rate": 0.8095238095238095,
+        "oos_pnl_per_trade": 0.28843739161904763,
+        "profitable_folds": 4,
+        "holdout_pnl_per_trade": 0.485957808
+      },
+      "neighbors": [
+        {
+          "params": {
+            "move": 0.07,
+            "vol": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 22,
+          "oos_win_rate": 0.6818181818181818,
+          "oos_pnl_per_trade": 0.1612856170909091,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.1390620733333333
+        },
+        {
+          "params": {
+            "move": 0.09,
+            "vol": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 21,
+          "oos_win_rate": 0.7619047619047619,
+          "oos_pnl_per_trade": 0.24130509104761905,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.49451450933333335
+        },
+        {
+          "params": {
+            "move": 0.06,
+            "vol": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 26,
+          "oos_win_rate": 0.5,
+          "oos_pnl_per_trade": -0.012485982461538437,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.2706800896
+        },
+        {
+          "params": {
+            "move": 0.1,
+            "vol": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 21,
+          "oos_win_rate": 0.7619047619047619,
+          "oos_pnl_per_trade": 0.23743329066666666,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.49451450933333335
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "vol": 0.01,
+            "max_entry": 0.5
+          },
+          "oos_trades": 8,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.507561967,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.5215734080000001
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "vol": 0.01,
+            "max_entry": 0.6
+          },
+          "oos_trades": 34,
+          "oos_win_rate": 0.7352941176470589,
+          "oos_pnl_per_trade": 0.18987708423529412,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.2727544656
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "vol": 0.008,
+            "max_entry": 0.55
+          },
+          "oos_trades": 35,
+          "oos_win_rate": 0.7428571428571429,
+          "oos_pnl_per_trade": 0.22488180685714287,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.2828972416
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "vol": 0.012,
+            "max_entry": 0.55
+          },
+          "oos_trades": 11,
+          "oos_win_rate": 0.8181818181818182,
+          "oos_pnl_per_trade": 0.30643791345454546,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.4774858026666666
+        }
+      ],
+      "stable_neighbor_count": 6,
+      "total_neighbors": 8
+    },
+    "stress": {
+      "base": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.943831232,
+        "pnl_per_trade": 0.485957808,
+        "avg_entry": 0.505
+      },
+      "higher_fees": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.925746848,
+        "pnl_per_trade": 0.481436712,
+        "avg_entry": 0.505
+      },
+      "entry_slippage_1c": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.903151984,
+        "pnl_per_trade": 0.475787996,
+        "avg_entry": 0.515
+      },
+      "entry_delay_1": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.802632432,
+        "pnl_per_trade": 0.450658108,
+        "avg_entry": 0.54
+      },
+      "delay_and_slip": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 1.7526473999999999,
+        "pnl_per_trade": 0.43816184999999996,
+        "avg_entry": 0.55
+      }
+    },
+    "readiness": "reject_for_now"
+  },
+  "eth": {
+    "strategy": {
+      "name": "skew",
+      "params": {
+        "move": 0.08,
+        "skew": 0.02,
+        "max_entry": 0.55
+      }
+    },
+    "markets": 2627,
+    "validation": {
+      "folds": [
+        {
+          "train_markets": 892,
+          "test_markets": 335,
+          "train": {
+            "trades": 7,
+            "wins": 7,
+            "win_rate": 1.0,
+            "pnl": 3.5899847600000006,
+            "pnl_per_trade": 0.5128549657142858,
+            "avg_entry": 0.47857142857142854
+          },
+          "test": {
+            "trades": 12,
+            "wins": 12,
+            "win_rate": 1.0,
+            "pnl": 5.9736335359999995,
+            "pnl_per_trade": 0.4978027946666666,
+            "avg_entry": 0.49333333333333335
+          }
+        },
+        {
+          "train_markets": 1227,
+          "test_markets": 335,
+          "train": {
+            "trades": 19,
+            "wins": 19,
+            "win_rate": 1.0,
+            "pnl": 9.563618295999998,
+            "pnl_per_trade": 0.5033483313684209,
+            "avg_entry": 0.4878947368421052
+          },
+          "test": {
+            "trades": 8,
+            "wins": 4,
+            "win_rate": 0.5,
+            "pnl": 0.04009239200000014,
+            "pnl_per_trade": 0.005011549000000018,
+            "avg_entry": 0.48624999999999996
+          }
+        },
+        {
+          "train_markets": 1562,
+          "test_markets": 335,
+          "train": {
+            "trades": 27,
+            "wins": 23,
+            "win_rate": 0.8518518518518519,
+            "pnl": 9.603710687999996,
+            "pnl_per_trade": 0.3556929884444443,
+            "avg_entry": 0.48740740740740746
+          },
+          "test": {
+            "trades": 14,
+            "wins": 9,
+            "win_rate": 0.6428571428571429,
+            "pnl": 2.0778671200000005,
+            "pnl_per_trade": 0.14841908000000004,
+            "avg_entry": 0.4857142857142857
+          }
+        },
+        {
+          "train_markets": 1897,
+          "test_markets": 335,
+          "train": {
+            "trades": 41,
+            "wins": 32,
+            "win_rate": 0.7804878048780488,
+            "pnl": 11.681577807999995,
+            "pnl_per_trade": 0.2849165319024389,
+            "avg_entry": 0.486829268292683
+          },
+          "test": {
+            "trades": 5,
+            "wins": 5,
+            "win_rate": 1.0,
+            "pnl": 2.465183528,
+            "pnl_per_trade": 0.49303670559999996,
+            "avg_entry": 0.49800000000000005
+          }
+        }
+      ],
+      "aggregate_oos": {
+        "trades": 39,
+        "wins": 30,
+        "win_rate": 0.7692307692307693,
+        "pnl": 10.556776576,
+        "pnl_per_trade": 0.27068657887179487,
+        "profitable_folds": 4,
+        "num_folds": 4,
+        "min_fold_pnl_per_trade": 0.005011549000000018,
+        "max_fold_pnl_per_trade": 0.4978027946666666
+      },
+      "final_holdout": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 1.0652252400000002,
+        "pnl_per_trade": 0.08876877000000001,
+        "avg_entry": 0.48583333333333334
+      },
+      "final_holdout_markets": 395
+    },
+    "robustness": {
+      "baseline": {
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.55
+        },
+        "oos_trades": 39,
+        "oos_win_rate": 0.7692307692307693,
+        "oos_pnl_per_trade": 0.27068657887179487,
+        "profitable_folds": 4,
+        "holdout_pnl_per_trade": 0.08876877000000001
+      },
+      "neighbors": [
+        {
+          "params": {
+            "move": 0.07,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 40,
+          "oos_win_rate": 0.7,
+          "oos_pnl_per_trade": 0.20450654140000002,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.1100235370666667
+        },
+        {
+          "params": {
+            "move": 0.09,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 34,
+          "oos_win_rate": 0.8823529411764706,
+          "oos_pnl_per_trade": 0.38144974564705886,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.2477928226666667
+        },
+        {
+          "params": {
+            "move": 0.06,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 42,
+          "oos_win_rate": 0.5714285714285714,
+          "oos_pnl_per_trade": 0.0816089963809524,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.09301402821052634
+        },
+        {
+          "params": {
+            "move": 0.1,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 41,
+          "oos_win_rate": 0.9024390243902439,
+          "oos_pnl_per_trade": 0.39891078126829266,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.3672738139999999
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.02,
+            "max_entry": 0.5
+          },
+          "oos_trades": 36,
+          "oos_win_rate": 0.8055555555555556,
+          "oos_pnl_per_trade": 0.30873071,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.08876877000000001
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.02,
+            "max_entry": 0.6
+          },
+          "oos_trades": 39,
+          "oos_win_rate": 0.7692307692307693,
+          "oos_pnl_per_trade": 0.27068657887179487,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.08876877000000001
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 36,
+          "oos_win_rate": 0.8055555555555556,
+          "oos_pnl_per_trade": 0.30873071,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.08876877000000001
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.03,
+            "max_entry": 0.55
+          },
+          "oos_trades": 41,
+          "oos_win_rate": 0.7317073170731707,
+          "oos_pnl_per_trade": 0.23166064702439024,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.11814463200000001
+        }
+      ],
+      "stable_neighbor_count": 8,
+      "total_neighbors": 8
+    },
+    "stress": {
+      "base": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 1.0652252400000002,
+        "pnl_per_trade": 0.08876877000000001,
+        "avg_entry": 0.48583333333333334
+      },
+      "higher_fees": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 1.0128378599999999,
+        "pnl_per_trade": 0.084403155,
+        "avg_entry": 0.48583333333333334
+      },
+      "entry_slippage_1c": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 0.942993816,
+        "pnl_per_trade": 0.078582818,
+        "avg_entry": 0.4958333333333332
+      },
+      "entry_delay_1": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 0.9840525040000001,
+        "pnl_per_trade": 0.08200437533333334,
+        "avg_entry": 0.4925
+      },
+      "delay_and_slip": {
+        "trades": 12,
+        "wins": 7,
+        "win_rate": 0.5833333333333334,
+        "pnl": 0.8348677900000002,
+        "pnl_per_trade": 0.06957231583333336,
+        "avg_entry": 0.5024999999999998
+      }
+    },
+    "readiness": "ready_for_paper"
+  },
+  "sol": {
+    "strategy": {
+      "name": "skew",
+      "params": {
+        "move": 0.08,
+        "skew": 0.02,
+        "max_entry": 0.55
+      }
+    },
+    "markets": 308,
+    "validation": {
+      "folds": [
+        {
+          "train_markets": 104,
+          "test_markets": 39,
+          "train": {
+            "trades": 4,
+            "wins": 4,
+            "win_rate": 1.0,
+            "pnl": 2.454539936,
+            "pnl_per_trade": 0.613634984,
+            "avg_entry": 0.38
+          },
+          "test": {
+            "trades": 0,
+            "wins": 0,
+            "win_rate": 0.0,
+            "pnl": 0.0,
+            "pnl_per_trade": 0.0,
+            "avg_entry": 0.0
+          }
+        },
+        {
+          "train_markets": 143,
+          "test_markets": 39,
+          "train": {
+            "trades": 4,
+            "wins": 4,
+            "win_rate": 1.0,
+            "pnl": 2.454539936,
+            "pnl_per_trade": 0.613634984,
+            "avg_entry": 0.38
+          },
+          "test": {
+            "trades": 2,
+            "wins": 2,
+            "win_rate": 1.0,
+            "pnl": 0.982,
+            "pnl_per_trade": 0.491,
+            "avg_entry": 0.5
+          }
+        },
+        {
+          "train_markets": 182,
+          "test_markets": 39,
+          "train": {
+            "trades": 6,
+            "wins": 6,
+            "win_rate": 1.0,
+            "pnl": 3.4365399360000004,
+            "pnl_per_trade": 0.572756656,
+            "avg_entry": 0.42
+          },
+          "test": {
+            "trades": 0,
+            "wins": 0,
+            "win_rate": 0.0,
+            "pnl": 0.0,
+            "pnl_per_trade": 0.0,
+            "avg_entry": 0.0
+          }
+        },
+        {
+          "train_markets": 221,
+          "test_markets": 39,
+          "train": {
+            "trades": 6,
+            "wins": 6,
+            "win_rate": 1.0,
+            "pnl": 3.4365399360000004,
+            "pnl_per_trade": 0.572756656,
+            "avg_entry": 0.42
+          },
+          "test": {
+            "trades": 2,
+            "wins": 2,
+            "win_rate": 1.0,
+            "pnl": 1.0227729920000002,
+            "pnl_per_trade": 0.5113864960000001,
+            "avg_entry": 0.48
+          }
+        }
+      ],
+      "aggregate_oos": {
+        "trades": 4,
+        "wins": 4,
+        "win_rate": 1.0,
+        "pnl": 2.0047729920000004,
+        "pnl_per_trade": 0.5011932480000001,
+        "profitable_folds": 2,
+        "num_folds": 4,
+        "min_fold_pnl_per_trade": 0.491,
+        "max_fold_pnl_per_trade": 0.5113864960000001
+      },
+      "final_holdout": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.511373824,
+        "pnl_per_trade": 0.511373824,
+        "avg_entry": 0.48
+      },
+      "final_holdout_markets": 47
+    },
+    "robustness": {
+      "baseline": {
+        "params": {
+          "move": 0.08,
+          "skew": 0.02,
+          "max_entry": 0.55
+        },
+        "oos_trades": 4,
+        "oos_win_rate": 1.0,
+        "oos_pnl_per_trade": 0.5011932480000001,
+        "profitable_folds": 2,
+        "holdout_pnl_per_trade": 0.511373824
+      },
+      "neighbors": [
+        {
+          "params": {
+            "move": 0.07,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 6,
+          "oos_win_rate": 0.6666666666666666,
+          "oos_pnl_per_trade": 0.18317408666666668,
+          "profitable_folds": 2,
+          "holdout_pnl_per_trade": 0.501186912
+        },
+        {
+          "params": {
+            "move": 0.09,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 5,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.4991545984,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.501186912
+        },
+        {
+          "params": {
+            "move": 0.06,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 10,
+          "oos_win_rate": 0.8,
+          "oos_pnl_per_trade": 0.311402552,
+          "profitable_folds": 4,
+          "holdout_pnl_per_trade": 0.501186912
+        },
+        {
+          "params": {
+            "move": 0.1,
+            "skew": 0.02,
+            "max_entry": 0.55
+          },
+          "oos_trades": 7,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.4968247131428572,
+          "profitable_folds": 3,
+          "holdout_pnl_per_trade": 0.501186912
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.02,
+            "max_entry": 0.5
+          },
+          "oos_trades": 4,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.5011932480000001,
+          "profitable_folds": 2,
+          "holdout_pnl_per_trade": 0.511373824
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.02,
+            "max_entry": 0.6
+          },
+          "oos_trades": 4,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.5011932480000001,
+          "profitable_folds": 2,
+          "holdout_pnl_per_trade": 0.511373824
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.01,
+            "max_entry": 0.55
+          },
+          "oos_trades": 4,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.5011932480000001,
+          "profitable_folds": 2,
+          "holdout_pnl_per_trade": 0.511373824
+        },
+        {
+          "params": {
+            "move": 0.08,
+            "skew": 0.03,
+            "max_entry": 0.55
+          },
+          "oos_trades": 4,
+          "oos_win_rate": 1.0,
+          "oos_pnl_per_trade": 0.5011932480000001,
+          "profitable_folds": 2,
+          "holdout_pnl_per_trade": 0.511373824
+        }
+      ],
+      "stable_neighbor_count": 1,
+      "total_neighbors": 8
+    },
+    "stress": {
+      "base": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.511373824,
+        "pnl_per_trade": 0.511373824,
+        "avg_entry": 0.48
+      },
+      "higher_fees": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.507060736,
+        "pnl_per_trade": 0.507060736,
+        "avg_entry": 0.48
+      },
+      "entry_slippage_1c": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.501183528,
+        "pnl_per_trade": 0.501183528,
+        "avg_entry": 0.49
+      },
+      "entry_delay_1": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.511373824,
+        "pnl_per_trade": 0.511373824,
+        "avg_entry": 0.48
+      },
+      "delay_and_slip": {
+        "trades": 1,
+        "wins": 1,
+        "win_rate": 1.0,
+        "pnl": 0.49897941,
+        "pnl_per_trade": 0.49897941,
+        "avg_entry": 0.49
+      }
+    },
+    "readiness": "reject_for_now"
+  }
+}

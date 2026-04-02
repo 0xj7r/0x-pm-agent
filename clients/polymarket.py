@@ -8,15 +8,30 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import httpx
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
 
 from config import Config
 from models.market import Market, MarketCategory, OrderBook, Outcome, PricePoint
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs
+
+
+def _load_clob_dependencies() -> tuple[type[Any], type[Any], Any]:
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import OrderArgs, OrderType
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "py_clob_client is required for Polymarket CLOB access. "
+            "Install dependencies from requirements.txt to enable trading."
+        ) from exc
+    return ClobClient, OrderArgs, OrderType
 
 def categorize_market(question: str, description: str) -> MarketCategory:
     text = f"{question} {description}".lower()
@@ -46,6 +61,7 @@ class PolymarketClient:
         self.config = config
         self.gamma_url = config.GAMMA_URL
         self._http = httpx.AsyncClient(timeout=30.0)
+        ClobClient, _, _ = _load_clob_dependencies()
 
         # Initialize CLOB client for trading
         if config.PRIVATE_KEY:
@@ -149,6 +165,7 @@ class PolymarketClient:
             price: Limit price (0-1)
             size: Number of shares
         """
+        _, OrderArgs, OrderType = _load_clob_dependencies()
         order_args = OrderArgs(
             price=price,
             size=size,

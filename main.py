@@ -47,17 +47,17 @@ def cleanup_pid() -> None:
         pid_file.unlink()
 
 
-async def main(config_path: str, live: bool) -> None:
+async def main(config_path: str, live: bool, coin: str) -> None:
     from core.engine import BTCTradingEngine
-    from strategies.btc_sniper import BayesianSignalEngine
-    from strategies.strategy_config import load_strategy_config
+    from strategies.threshold import ThresholdStrategy
+    from strategies.strategy_config import load_strategy_config, ThresholdConfig
 
     cfg = load_strategy_config(config_path)
     if live:
         cfg.paper.enabled = False
 
-    db_path = os.getenv("BTC_DB_PATH", "btc_trades.db")
-    engine = BTCTradingEngine(cfg, db_path=db_path)
+    db_path = os.getenv("BTC_DB_PATH", f"{coin}_trades.db")
+    engine = BTCTradingEngine(cfg, db_path=db_path, coin=coin)
 
     loop = asyncio.get_event_loop()
 
@@ -72,7 +72,9 @@ async def main(config_path: str, live: bool) -> None:
         logging.info("SIGHUP received, reloading strategy config...")
         new_cfg = load_strategy_config(config_path)
         engine.cfg = new_cfg
-        engine.signal_engine = BayesianSignalEngine(new_cfg.signal)
+        from dataclasses import asdict
+        coin_conf = new_cfg.coins.get(coin, ThresholdConfig())
+        engine._strategy = ThresholdStrategy.from_config(coin, asdict(coin_conf))
         logging.info("Config reloaded")
 
     signal.signal(signal.SIGHUP, handle_reload)
@@ -94,9 +96,10 @@ async def main(config_path: str, live: bool) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 5-Minute Sniper Agent")
+    parser = argparse.ArgumentParser(description="Polymarket 5-Minute Sniper Agent")
     parser.add_argument("--config", default="strategy_config.json", help="Path to strategy config JSON")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: paper)")
+    parser.add_argument("--coin", default="btc", choices=["btc", "eth", "sol"], help="Coin to trade (default: btc)")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     args = parser.parse_args()
 
@@ -104,6 +107,6 @@ if __name__ == "__main__":
     write_pid()
 
     try:
-        asyncio.run(main(args.config, args.live))
+        asyncio.run(main(args.config, args.live, args.coin))
     finally:
         cleanup_pid()

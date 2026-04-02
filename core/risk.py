@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from config import Config
@@ -29,7 +29,7 @@ class RiskManager:
 
         # State tracking for safeguards
         self._daily_pnl: float = 0.0
-        self._daily_reset_date: str = datetime.utcnow().strftime("%Y-%m-%d")
+        self._daily_reset_date: str = datetime.now(UTC).strftime("%Y-%m-%d")
         self._consecutive_losses: int = 0
         self._cooldown_until: float = 0.0  # unix timestamp
         self._open_position_count: int = 0
@@ -46,7 +46,7 @@ class RiskManager:
     def record_trade_result(self, pnl: float):
         """Record a resolved trade result for safeguard tracking."""
         # Reset daily PnL if it's a new day
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         if today != self._daily_reset_date:
             self._daily_pnl = 0.0
             self._daily_reset_date = today
@@ -79,7 +79,7 @@ class RiskManager:
         if self._starting_bankroll <= 0:
             return True
 
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
         if today != self._daily_reset_date:
             self._daily_pnl = 0.0
             self._daily_reset_date = today
@@ -248,18 +248,13 @@ class RiskManager:
         token_price: float,
         bankroll: float,
         risk_cfg: RiskConfig,
-        taker_fee_rate: float = 0.04,
     ) -> float:
-        """Kelly sizing that accounts for Polymarket's dynamic taker fee.
-
-        Fee formula: fee_per_share = taker_fee_rate * price * (1 - price)
-        At 50c the fee is ~1c/share (2%), at 25c it's ~0.75c (3%).
-        We subtract the fee from expected profit before sizing.
-        """
+        """Kelly sizing that accounts for Polymarket's dynamic taker fee."""
+        from shared.fees import taker_fee
         if token_price <= 0 or token_price >= 1 or bankroll <= 0 or p_win <= 0:
             return 0.0
 
-        fee_per_share = taker_fee_rate * token_price * (1.0 - token_price)
+        fee_per_share = taker_fee(token_price) * token_price
         net_payout = 1.0 - token_price - fee_per_share
         if net_payout <= 0:
             return 0.0
