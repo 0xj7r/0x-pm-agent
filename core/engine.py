@@ -25,8 +25,8 @@ from core.risk import RiskManager
 from config import Config
 from models.market import MarketWindow
 from shared.constants import COIN_CONFIGS
-from strategies.threshold import ThresholdStrategy
-from strategies.strategy_config import StrategyConfig, ThresholdConfig
+from strategies.live_runtime import LiveRuntimeStrategy
+from strategies.strategy_config import CoinStrategyConfig, StrategyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,8 @@ class BTCTradingEngine:
     def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc") -> None:
         self.cfg = strategy_cfg
         self._coin = coin.lower()
-        coin_conf = strategy_cfg.coins.get(self._coin, ThresholdConfig())
-        self._strategy = ThresholdStrategy.from_config(self._coin, asdict(coin_conf))
+        coin_conf = strategy_cfg.coins.get(self._coin, CoinStrategyConfig())
+        self._strategy = LiveRuntimeStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
         self.health = HealthServer()
@@ -71,6 +71,7 @@ class BTCTradingEngine:
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
         self._latest_book: OrderBookSnapshot | None = None
+        self._window_snaps: list[tuple[float, float, float]] = []
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -88,6 +89,7 @@ class BTCTradingEngine:
         self.current_window = window
         self._window_open_price = self._current_btc_price
         self._already_traded_this_window = False
+        self._window_snaps = []
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
@@ -125,7 +127,15 @@ class BTCTradingEngine:
             self.current_window.down_token_id, self.current_window.down_price
         )
 
-        signal = self._strategy.check_signal(move_pct, price_up, price_down)
+        current_snap = (self._current_btc_price, price_up, price_down)
+        if not self._window_snaps or self._window_snaps[-1] != current_snap:
+            self._window_snaps.append(current_snap)
+
+        signal = self._strategy.check_signal(
+            self.current_window.market_id,
+            self._window_open_price,
+            self._window_snaps,
+        )
         if signal is None or signal == "SKIP":
             return []
 
@@ -159,12 +169,12 @@ class BTCTradingEngine:
             "p_win": p_win,
             "btc_price": self._current_btc_price,
             "move_pct": move_pct,
-            "strategy": "threshold",
+            "strategy": self._strategy.name,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.info(
-            f"ENTRY [THRESHOLD]: {direction} @ ${token_price:.3f} | "
+            f"ENTRY [{self._strategy.name.upper()}]: {direction} @ ${token_price:.3f} | "
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
             f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
         )
@@ -237,10 +247,10 @@ class BTCTradingEngine:
         logger.info(
             f"BTC Sniper started | Paper: {self.cfg.paper.enabled} | "
             f"Balance: ${self.balance:.2f} | "
-            f"Threshold: {self._strategy.move_threshold}%"
+            f"Strategy: {self._strategy.name} {self._strategy.params}"
         )
         await self.slack.notify_startup(
-            self.balance, self._strategy.move_threshold, self.cfg.paper.enabled
+            self.balance, self._strategy.params.get("move", 0.08), self.cfg.paper.enabled
         )
 
         tick_count = 0

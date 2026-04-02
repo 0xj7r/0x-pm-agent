@@ -58,7 +58,8 @@ def test_engine_initializes():
     assert engine.balance == 100.0
     assert engine.current_window is None
     assert engine._strategy.coin == "btc"
-    assert engine._strategy.move_threshold == 0.08
+    assert engine._strategy.name == "threshold"
+    assert engine._strategy.params["move"] == 0.08
     engine.memory.close()
 
 

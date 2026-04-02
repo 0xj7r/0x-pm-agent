@@ -49,8 +49,8 @@ def cleanup_pid() -> None:
 
 async def main(config_path: str, live: bool, coin: str) -> None:
     from core.engine import BTCTradingEngine
-    from strategies.threshold import ThresholdStrategy
-    from strategies.strategy_config import load_strategy_config, ThresholdConfig
+    from strategies.live_runtime import LiveRuntimeStrategy
+    from strategies.strategy_config import CoinStrategyConfig, load_strategy_config
 
     cfg = load_strategy_config(config_path)
     if live:
@@ -73,8 +73,8 @@ async def main(config_path: str, live: bool, coin: str) -> None:
         new_cfg = load_strategy_config(config_path)
         engine.cfg = new_cfg
         from dataclasses import asdict
-        coin_conf = new_cfg.coins.get(coin, ThresholdConfig())
-        engine._strategy = ThresholdStrategy.from_config(coin, asdict(coin_conf))
+        coin_conf = new_cfg.coins.get(coin, CoinStrategyConfig())
+        engine._strategy = LiveRuntimeStrategy.from_config(coin, asdict(coin_conf))
         logging.info("Config reloaded")
 
     signal.signal(signal.SIGHUP, handle_reload)
