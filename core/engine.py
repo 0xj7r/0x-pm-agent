@@ -43,7 +43,7 @@ class BTCTradingEngine:
         self._strategy = LiveRuntimeStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
-        self.health = HealthServer()
+        self.health = HealthServer(db_path=db_path)
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
         self.poly_ws = PolymarketWSClient()
