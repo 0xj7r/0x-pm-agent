@@ -136,6 +136,13 @@ class BTCTradingEngine:
             self._window_open_price,
             self._window_snaps,
         )
+
+        if abs(move_pct) >= 0.05 and len(self._window_snaps) % 50 == 0:
+            logger.info(
+                f"Signal check: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
+                f"signal={signal} | snaps={len(self._window_snaps)}"
+            )
+
         if signal is None or signal == "SKIP":
             return []
 
@@ -147,7 +154,7 @@ class BTCTradingEngine:
             token_id = self.current_window.down_token_id
             token_price = price_down
 
-        p_win = abs(move_pct) / 100.0
+        p_win = 0.85  # conservative estimate from backtesting (observed 87-98%)
         size_usd = self.risk.asymmetric_kelly_size(
             p_win=p_win,
             token_price=token_price,
