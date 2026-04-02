@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent / "historical.db"
 API_BASE = "https://api.polybacktest.com"
 API_KEY = "pdm_CSreRRkeODfhuBa7rbTqZmnyTliLtixT"
-RATE_LIMIT_DELAY = 1.1  # free tier: 1 req/sec
+RATE_LIMIT_DELAY = 0.25  # paid tier
 
 
 def init_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
@@ -78,6 +78,9 @@ def fetch_markets(
             params={"coin": "btc", "market_type": market_type, "limit": batch_size, "offset": offset},
             timeout=15,
         )
+        if resp.status_code == 402:
+            logger.warning("Hit free tier limit at offset %d, returning %d markets", offset, len(all_markets))
+            break
         resp.raise_for_status()
         data = resp.json()
         batch = data.get("markets", [])
