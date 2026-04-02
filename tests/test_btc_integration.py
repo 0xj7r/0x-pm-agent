@@ -1,4 +1,4 @@
-"""Integration test: full pipeline from Binance trade to paper trade."""
+"""Integration tests for threshold-based paper trading."""
 from __future__ import annotations
 
 import tempfile
@@ -9,21 +9,17 @@ import pytest
 from clients.binance_ws import TradeUpdate
 from core.engine import BTCTradingEngine
 from models.market import MarketWindow
-from strategies.strategy_config import StrategyConfig
+from strategies.strategy_config import StrategyConfig, ThresholdConfig
 
 
-@pytest.mark.asyncio
-async def test_full_pipeline_paper_trade():
-    """Simulate: BTC moves up strongly -> signal fires -> paper trade executed."""
+def make_engine(move_threshold: float = 0.08) -> BTCTradingEngine:
     cfg = StrategyConfig()
     cfg.paper.enabled = True
     cfg.paper.starting_balance = 100.0
-    cfg.signal.confidence_threshold = 0.70
-    cfg.signal.w3_price_delta = 1.0
-    cfg.signal.w1_order_flow = 0.0
-    cfg.signal.w2_microprice = 0.0
-    cfg.signal.w4_acceleration = 0.0
-    cfg.execution.max_entry_price = 0.05
+    cfg.coins["btc"] = ThresholdConfig(
+        move_threshold=move_threshold,
+        max_entry=0.55,
+    )
     cfg.risk.max_position_usd = 10.0
     cfg.risk.max_position_pct = 0.10
     cfg.risk.kelly_multiplier = 0.25
@@ -32,37 +28,39 @@ async def test_full_pipeline_paper_trade():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
-    engine = BTCTradingEngine(cfg, db_path=db_path)
+    return BTCTradingEngine(cfg, db_path=db_path)
 
+
+def make_window(up_price: float = 0.02, down_price: float = 0.98) -> MarketWindow:
     now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
+    return MarketWindow(
         market_id="integration_test_001",
         question="Bitcoin Up or Down - Test",
         start_time=now - timedelta(seconds=30),
         end_time=now + timedelta(minutes=4, seconds=30),
         up_token_id="tok_up_001",
         down_token_id="tok_down_001",
-        up_price=0.02,
-        down_price=0.98,
+        up_price=up_price,
+        down_price=down_price,
     )
+
+
+@pytest.mark.asyncio
+async def test_full_pipeline_paper_trade():
+    engine = make_engine()
+    engine.current_window = make_window()
     engine._window_open_price = 84000.0
-    engine._last_btc_price = 84000.0
 
-    # Simulate a strong 1% BTC move ($840) over 20 trades
-    for i in range(20):
-        update = TradeUpdate(
-            price=84000.0 + (i + 1) * 42,  # +$840 total = 1% move
-            quantity=0.5,
-            is_buyer_maker=False,
-            timestamp_ms=int((now + timedelta(seconds=i)).timestamp() * 1000),
-        )
-        await engine._on_binance_trade(update)
-
-    # With w3=1.0, price_delta=1.0%, log_odds=1.0, p_up=sigmoid(1.0)=0.731
-    # Need threshold <= 0.73 for this to fire
-    assert engine.signal_engine.p_up > 0.70, f"p_up={engine.signal_engine.p_up}"
+    update = TradeUpdate(
+        price=92400.0,
+        quantity=0.5,
+        is_buyer_maker=False,
+        timestamp_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+    )
+    await engine._on_binance_trade(update)
 
     trades = engine._check_entry()
+
     assert len(trades) == 1
     trade = trades[0]
     assert trade["direction"] == "UP"
@@ -74,55 +72,26 @@ async def test_full_pipeline_paper_trade():
     assert events[-1]["event_type"] == "entry"
 
     trades2 = engine._check_entry()
-    assert len(trades2) == 0
-
+    assert trades2 == []
     engine.memory.close()
 
 
 @pytest.mark.asyncio
-async def test_full_pipeline_no_trade_when_uncertain():
-    """Simulate: BTC moves sideways -> no signal -> no trade."""
-    cfg = StrategyConfig()
-    cfg.paper.enabled = True
-    cfg.signal.confidence_threshold = 0.90
-    cfg.signal.w3_price_delta = 0.5
-    cfg.signal.w1_order_flow = 0.0
-    cfg.signal.w2_microprice = 0.0
-    cfg.signal.w4_acceleration = 0.0
-    cfg.execution.max_entry_price = 0.05
-
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        db_path = f.name
-
-    engine = BTCTradingEngine(cfg, db_path=db_path)
-
-    now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="integration_test_002",
-        question="Bitcoin Up or Down - Test Sideways",
-        start_time=now - timedelta(seconds=30),
-        end_time=now + timedelta(minutes=4, seconds=30),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-        up_price=0.02,
-        down_price=0.98,
-    )
+async def test_full_pipeline_no_trade_when_move_below_threshold():
+    engine = make_engine(move_threshold=15.0)
+    engine.current_window = make_window()
     engine._window_open_price = 84000.0
-    engine._last_btc_price = 84000.0
 
-    for i in range(20):
-        direction = 1 if i % 2 == 0 else -1
-        update = TradeUpdate(
-            price=84000.0 + direction * 5,
-            quantity=0.3,
-            is_buyer_maker=(i % 2 == 1),
-            timestamp_ms=int((now + timedelta(seconds=i)).timestamp() * 1000),
-        )
-        await engine._on_binance_trade(update)
-
-    assert not engine.signal_engine.confident
+    update = TradeUpdate(
+        price=84840.0,
+        quantity=0.3,
+        is_buyer_maker=False,
+        timestamp_ms=int(datetime.now(timezone.utc).timestamp() * 1000),
+    )
+    await engine._on_binance_trade(update)
 
     trades = engine._check_entry()
-    assert len(trades) == 0
 
+    assert trades == []
+    assert engine.memory.get_events_for_window("integration_test_001") == []
     engine.memory.close()

@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from backtesting.precompute import load_and_precompute
 from backtesting.projection import slippage
 from shared.fees import taker_fee
+from strategies.registry import build_check_fn
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
@@ -32,49 +33,25 @@ def extract_trades(coin: str, params: dict, strategy_name: str) -> list[dict]:
         return []
 
     markets = load_and_precompute(db_path, coin=coin)
-    move_thresh = params.get("move", 0.08)
-    max_entry = params.get("max_entry", 0.55)
-    vol_thresh = params.get("vol", 0)
-    accel_thresh = params.get("accel", 0)
-    skew_thresh = params.get("skew", 999)
-    vel_thresh = params.get("vel", 0)
+    check_fn = build_check_fn(strategy_name, params)
 
-    import sqlite3
-    conn = sqlite3.connect(str(db_path))
+    from shared.db import get_connection
+    conn = get_connection(db_path)
     liq_map = {}
     for r in conn.execute("SELECT market_id, final_liquidity FROM markets").fetchall():
-        liq_map[r[0]] = r[1] or 15000
+        liq_map[r["market_id"]] = r["final_liquidity"] or 15000
     conn.close()
 
     trades = []
     for pm in markets:
         for i in range(10, pm.num_snaps):
-            if pm.abs_move[i] < move_thresh:
+            d = check_fn(pm, i)
+            if d is None:
                 continue
-
-            # Apply strategy-specific filter
-            skip = False
-            if strategy_name == "volatility" and pm.volatility[i] < vol_thresh:
-                skip = True
-            elif strategy_name == "acceleration":
-                d = "Up" if pm.move_pct[i] > 0 else "Down"
-                if d == "Up" and pm.acceleration[i] < accel_thresh:
-                    skip = True
-                if d == "Down" and pm.acceleration[i] > -accel_thresh:
-                    skip = True
-            elif strategy_name == "skew" and pm.token_skew[i] > skew_thresh:
-                skip = True
-            elif strategy_name == "velocity" and abs(pm.velocity[i]) < vel_thresh:
-                skip = True
-
-            if skip:
+            if d == "SKIP":
                 break
 
-            d = "Up" if pm.move_pct[i] > 0 else "Down"
             entry = pm.price_up[i] if d == "Up" else pm.price_down[i]
-
-            if entry <= 0 or entry > max_entry:
-                break
 
             trades.append({
                 "market_id": pm.market_id,
@@ -197,6 +174,7 @@ def main():
     print(f"{'='*80}")
 
     combined_trades = []
+    coin_tpd = {}
 
     for coin, data in strategies.items():
         best = data["best_strategy"]
@@ -212,8 +190,8 @@ def main():
         wr = wins / len(trades)
 
         # Estimate trades per day from data
-        import sqlite3
-        conn = sqlite3.connect(str(BASE_DIR / f"{coin}.db"))
+        from shared.db import get_connection
+        conn = get_connection(BASE_DIR / f"{coin}.db")
         row = conn.execute("""
             SELECT MIN(start_time), MAX(end_time) FROM markets
             WHERE market_id IN (SELECT DISTINCT market_id FROM snapshots)
@@ -225,6 +203,7 @@ def main():
         t1 = datetime.fromisoformat(row[1].replace("Z", ""))
         days = max((t1 - t0).total_seconds() / 86400, 0.1)
         tpd = len(trades) / days
+        coin_tpd[coin] = tpd
 
         logger.info(f"[{coin.upper()}] {len(trades)} trades over {days:.1f} days = {tpd:.1f}/day")
         logger.info(f"[{coin.upper()}] Running Monte Carlo...")
@@ -255,11 +234,8 @@ def main():
         print(f"COMBINED: {len(combined_trades)} trades across all coins, "
               f"{total_wins}/{len(combined_trades)} wins ({total_wr:.0%})")
 
-        # Rough combined trades per day
-        combined_tpd = sum(
-            len([t for t in combined_trades if t["coin"] == c])
-            for c in strategies.keys()
-        ) / max(days, 1)
+        # Sum per-coin trades/day (each coin has its own date range)
+        combined_tpd = sum(coin_tpd.values()) if coin_tpd else 1.0
 
         mc_combined = run_monte_carlo(
             combined_trades, args.start, args.bet_pct,

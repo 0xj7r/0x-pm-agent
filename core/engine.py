@@ -1,4 +1,4 @@
-"""BTC 5-minute sniper trading engine.
+"""5-minute sniper trading engine (multi-coin).
 
 Orchestrates: Binance WS -> Signal Check -> Entry -> Execution -> Persistence.
 Delegates resolution to core.resolver, notifications to core.notifier,
@@ -24,6 +24,7 @@ from core.resolver import PaperTradeResolver
 from core.risk import RiskManager
 from config import Config
 from models.market import MarketWindow
+from shared.constants import COIN_CONFIGS
 from strategies.threshold import ThresholdStrategy
 from strategies.strategy_config import StrategyConfig, ThresholdConfig
 
@@ -35,10 +36,11 @@ MAX_SINGLE_ORDER_USD = 100.0
 class BTCTradingEngine:
     """Core engine for sniping cheap tokens on BTC Up/Down markets."""
 
-    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db") -> None:
+    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc") -> None:
         self.cfg = strategy_cfg
-        btc_conf = strategy_cfg.coins.get("btc", ThresholdConfig())
-        self._strategy = ThresholdStrategy.from_config("btc", asdict(btc_conf))
+        self._coin = coin.lower()
+        coin_conf = strategy_cfg.coins.get(self._coin, ThresholdConfig())
+        self._strategy = ThresholdStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
         self.health = HealthServer()
@@ -89,9 +91,11 @@ class BTCTradingEngine:
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
-                asyncio.create_task(self.poly_ws.subscribe(token_ids))
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                pass
+                loop = None
+            if loop is not None:
+                loop.create_task(self.poly_ws.subscribe(token_ids))
         logger.info(
             f"New window: {window.question} | "
             f"BTC open: ${self._window_open_price:,.2f} | "
@@ -181,7 +185,7 @@ class BTCTradingEngine:
         self._last_scan_time = now
 
         if not self._scanner:
-            self._scanner = MarketWindowScanner()
+            self._scanner = MarketWindowScanner(coin=self._coin)
         try:
             window = await self._scanner.get_current_window()
             if window and (not self.current_window or window.market_id != self.current_window.market_id):
@@ -225,7 +229,8 @@ class BTCTradingEngine:
         async def on_book(snap: OrderBookSnapshot) -> None:
             self._latest_book = snap
 
-        binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book)
+        binance_symbol = COIN_CONFIGS.get(self._coin, COIN_CONFIGS["btc"])["binance_symbol"]
+        binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book, symbol=binance_symbol)
         binance_task = asyncio.create_task(binance.connect())
         poly_ws_task = asyncio.create_task(self.poly_ws.connect())
 

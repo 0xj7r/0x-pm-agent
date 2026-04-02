@@ -25,6 +25,7 @@ class RiskConfig:
     loss_cooldown_trades: int = 5
     loss_cooldown_seconds: int = 300
     kelly_multiplier: float = 0.25
+    cheap_token_multiplier: float = 2.0
 
 
 @dataclass

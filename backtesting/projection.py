@@ -26,7 +26,7 @@ from shared.fees import taker_fee
 logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent / "historical.db"
 
-KELLY_TAKER_FEE = 0.02
+from shared.fees import taker_fee as _taker_fee
 
 
 def slippage(bet_size: float, available_liquidity: float) -> float:
@@ -67,8 +67,10 @@ class KellyTrade:
     total_snaps: int
 
 
-def kelly_fraction(win_rate: float, entry_price: float, fee: float = KELLY_TAKER_FEE) -> float:
+def kelly_fraction(win_rate: float, entry_price: float, fee: float | None = None) -> float:
     """Compute Kelly fraction for a binary outcome bet."""
+    if fee is None:
+        fee = _taker_fee(entry_price)
     cost = entry_price + fee * entry_price
     net_win = 1.0 - cost
     net_loss = cost
@@ -277,7 +279,7 @@ class MonteCarloSimulator:
 
                 shares = bet_size / entry
                 won = direction == pm.winner
-                fee = KELLY_TAKER_FEE * entry
+                fee = _taker_fee(entry) * entry
                 pnl = shares * (1.0 - entry - fee) if won else -(shares * (entry + fee))
 
                 balance_before = balance
@@ -304,7 +306,6 @@ class MonteCarloSimulator:
 
 
 # Backward-compatible aliases
-extract_observed_trades = MonteCarloSimulator().extract_trades
 
 
 if __name__ == "__main__":
