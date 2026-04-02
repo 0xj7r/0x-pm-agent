@@ -154,15 +154,11 @@ class BTCTradingEngine:
             token_id = self.current_window.down_token_id
             token_price = price_down
 
-        p_win = 0.85  # conservative estimate from backtesting (observed 87-98%)
-        size_usd = self.risk.asymmetric_kelly_size(
-            p_win=p_win,
-            token_price=token_price,
-            bankroll=self.balance,
-            risk_cfg=self.cfg.risk,
+        size_usd = min(
+            self.balance * self.cfg.risk.max_position_pct,
+            self.cfg.risk.max_position_usd,
         )
-
-        if size_usd <= 0:
+        if size_usd < 1.0:
             return []
 
         self._already_traded_this_window = True
