@@ -15,3 +15,4 @@ EXPOSE 8080
 VOLUME ["/data"]
 
 ENTRYPOINT ["python", "main.py"]
+CMD ["--config", "/app/strategy_config.json", "--coin", "btc"]
