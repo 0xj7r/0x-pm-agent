@@ -1,9 +1,18 @@
 {
-    "version": 3,
+    "version": 4,
     "coins": {
-        "btc": {"move_threshold": 0.08, "max_entry": 0.55},
-        "eth": {"move_threshold": 0.15, "max_entry": 0.55},
-        "sol": {"move_threshold": 0.08, "max_entry": 0.55}
+        "btc": {
+            "strategy": "skew",
+            "params": {"move": 0.08, "skew": 0.02, "max_entry": 0.55}
+        },
+        "eth": {
+            "strategy": "skew",
+            "params": {"move": 0.08, "skew": 0.02, "max_entry": 0.55}
+        },
+        "sol": {
+            "strategy": "disabled",
+            "params": {}
+        }
     },
     "risk": {
         "max_position_usd": 50,

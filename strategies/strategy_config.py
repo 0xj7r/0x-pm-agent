@@ -5,6 +5,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,37 @@ class PaperConfig:
 
 
 @dataclass
+class CoinStrategyConfig:
+    strategy: str = "threshold"
+    params: dict[str, Any] = field(default_factory=lambda: {
+        "move": 0.08,
+        "max_entry": 0.55,
+    })
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CoinStrategyConfig":
+        if "strategy" in data or "params" in data:
+            strategy = data.get("strategy", "threshold")
+            params = data.get("params", {})
+            if strategy == "threshold" and not params:
+                params = {
+                    "move": data.get("move_threshold", 0.08),
+                    "max_entry": data.get("max_entry", 0.55),
+                }
+            return cls(strategy=strategy, params=params)
+        return cls(strategy="threshold", params={
+            "move": data.get("move_threshold", 0.08),
+            "max_entry": data.get("max_entry", 0.55),
+        })
+
+
+@dataclass
 class StrategyConfig:
     version: int = 1
-    coins: dict[str, ThresholdConfig] = field(default_factory=lambda: {
-        "btc": ThresholdConfig(0.08, 0.55),
-        "eth": ThresholdConfig(0.15, 0.55),
-        "sol": ThresholdConfig(0.08, 0.55),
+    coins: dict[str, CoinStrategyConfig] = field(default_factory=lambda: {
+        "btc": CoinStrategyConfig("threshold", {"move": 0.08, "max_entry": 0.55}),
+        "eth": CoinStrategyConfig("threshold", {"move": 0.15, "max_entry": 0.55}),
+        "sol": CoinStrategyConfig("threshold", {"move": 0.08, "max_entry": 0.55}),
     })
     risk: RiskConfig = field(default_factory=RiskConfig)
     paper: PaperConfig = field(default_factory=PaperConfig)
@@ -63,7 +89,7 @@ def load_strategy_config(path: str) -> StrategyConfig:
 
     if "coins" in data:
         cfg.coins = {
-            coin: ThresholdConfig(**_filter_fields(ThresholdConfig, params))
+            coin: CoinStrategyConfig.from_dict(params)
             for coin, params in data["coins"].items()
         }
 
