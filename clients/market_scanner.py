@@ -1,6 +1,6 @@
-"""Discover active Bitcoin Up/Down 5-minute markets from the Gamma API.
+"""Discover active coin Up/Down 5-minute markets from the Gamma API.
 
-The 5-minute BTC markets use slug pattern: btc-updown-5m-{unix_timestamp}
+The 5-minute markets use slug pattern: {coin}-updown-5m-{unix_timestamp}
 where the timestamp is the window's start time. We generate candidate slugs
 for the current and upcoming windows and query the /events endpoint directly.
 """
@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from models.market import MarketWindow
+from shared.constants import SLUG_PATTERNS
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,12 @@ def _parse_iso(raw: str | None) -> datetime | None:
         return None
 
 
-def parse_btc_event(event: dict) -> MarketWindow | None:
+def parse_coin_event(event: dict, slug_prefix: str) -> MarketWindow | None:
     """Parse a Gamma API event into a MarketWindow."""
     title = event.get("title", "")
     slug = event.get("slug", "")
 
-    if not slug.startswith(SLUG_PREFIX_5M):
+    if not slug.startswith(slug_prefix):
         return None
 
     if event.get("closed", False) or not event.get("active", True):
@@ -48,7 +49,7 @@ def parse_btc_event(event: dict) -> MarketWindow | None:
 
     # Extract start timestamp from slug
     try:
-        start_ts = int(slug.replace(SLUG_PREFIX_5M, ""))
+        start_ts = int(slug.replace(slug_prefix, ""))
         start_time = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         end_time = start_time + timedelta(minutes=5)
     except (ValueError, OSError):
@@ -104,6 +105,7 @@ def parse_btc_event(event: dict) -> MarketWindow | None:
 
     return MarketWindow(
         market_id=str(market.get("id", event.get("id", ""))),
+        slug=slug,
         question=title,
         start_time=start_time,
         end_time=end_time,
@@ -114,15 +116,27 @@ def parse_btc_event(event: dict) -> MarketWindow | None:
     )
 
 
+def parse_btc_event(event: dict) -> MarketWindow | None:
+    """Backward-compatible wrapper for BTC events."""
+    return parse_coin_event(event, SLUG_PREFIX_5M)
+
+
 # Backward compatibility
 parse_btc_market = parse_btc_event
 
 
 class MarketWindowScanner:
-    """Finds active BTC Up/Down 5-minute markets by generating slug candidates."""
+    """Finds active Up/Down 5-minute markets by generating slug candidates."""
 
-    def __init__(self, gamma_url: str = "https://gamma-api.polymarket.com") -> None:
+    def __init__(
+        self,
+        gamma_url: str = "https://gamma-api.polymarket.com",
+        coin: str = "btc",
+    ) -> None:
         self._gamma_url = gamma_url
+        self._coin = coin.lower()
+        pattern = SLUG_PATTERNS.get(self._coin, SLUG_PATTERNS["btc"])
+        self._slug_prefix = pattern.replace("{ts}", "")
         self._http = httpx.AsyncClient(timeout=30.0)
 
     def _generate_candidate_slugs(self, count: int = 24) -> list[str]:
@@ -135,7 +149,7 @@ class MarketWindowScanner:
         slugs = []
         for i in range(-1, count):
             ts = base + timedelta(minutes=5 * i)
-            slugs.append(f"{SLUG_PREFIX_5M}{int(ts.timestamp())}")
+            slugs.append(f"{self._slug_prefix}{int(ts.timestamp())}")
         return slugs
 
     async def find_active_windows(self) -> list[MarketWindow]:
@@ -154,7 +168,7 @@ class MarketWindowScanner:
                 data = resp.json()
                 if not isinstance(data, list) or not data:
                     continue
-                window = parse_btc_event(data[0])
+                window = parse_coin_event(data[0], self._slug_prefix)
                 if window:
                     windows.append(window)
                     logger.debug(f"Found window: {window.question}")

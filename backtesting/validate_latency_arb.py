@@ -12,12 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared.db import get_connection, market_start_col, snapshot_price_col
+from shared.fees import taker_fee
+
 DB_PATH = Path(__file__).parent / "historical.db"
-TAKER_FEE_RATE = 0.02
 
 
 @dataclass
@@ -41,8 +42,9 @@ def validate(
     max_entry: float = 0.55,
     db_path: Path = DB_PATH,
 ) -> list[TradeOpportunity]:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    conn = get_connection(db_path)
+    start_col = market_start_col(db_path)
+    price_col = snapshot_price_col(db_path)
 
     markets = conn.execute(
         "SELECT * FROM markets WHERE winner IS NOT NULL ORDER BY start_time"
@@ -53,7 +55,7 @@ def validate(
     for m in markets:
         market_id = m["market_id"]
         winner = m["winner"]
-        btc_open = m["btc_price_start"]
+        btc_open = m[start_col]
 
         if not btc_open:
             continue
@@ -67,7 +69,7 @@ def validate(
             continue
 
         for i, snap in enumerate(snaps):
-            btc = snap["btc_price"]
+            btc = snap[price_col]
             if not btc:
                 continue
 
@@ -82,7 +84,7 @@ def validate(
                 if winning_price is None or winning_price <= 0:
                     continue
 
-                fee = TAKER_FEE_RATE * winning_price
+                fee = winning_price * taker_fee(winning_price)
                 cost = winning_price + fee
                 payout = 1.0
                 profit = payout - cost
@@ -113,8 +115,9 @@ def validate_latency_arb_strategy(
     db_path: Path = DB_PATH,
 ) -> list[dict]:
     """Simulate the actual latency arb: buy whichever direction BTC is moving."""
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    conn = get_connection(db_path)
+    start_col = market_start_col(db_path)
+    price_col = snapshot_price_col(db_path)
 
     markets = conn.execute(
         "SELECT * FROM markets WHERE winner IS NOT NULL ORDER BY start_time"
@@ -125,7 +128,7 @@ def validate_latency_arb_strategy(
     for m in markets:
         market_id = m["market_id"]
         winner = m["winner"]
-        btc_open = m["btc_price_start"]
+        btc_open = m[start_col]
         if not btc_open:
             continue
 
@@ -138,7 +141,7 @@ def validate_latency_arb_strategy(
             continue
 
         for snap in snaps:
-            btc = snap["btc_price"]
+            btc = snap[price_col]
             if not btc:
                 continue
 
@@ -153,7 +156,7 @@ def validate_latency_arb_strategy(
                 break
 
             won = btc_dir == winner
-            fee = TAKER_FEE_RATE * entry_price
+            fee = entry_price * taker_fee(entry_price)
             if won:
                 pnl = 1.0 - entry_price - fee
             else:
@@ -194,7 +197,7 @@ def main() -> None:
     print(f"\n{'='*80}")
     print(f"LATENCY ARB VALIDATION: {len(results)} markets analyzed")
     print(f"Threshold: {args.threshold}% BTC move | Max entry: {args.max_entry}")
-    print(f"Taker fee: {TAKER_FEE_RATE*100}%")
+    print("Taker fee: dynamic Polymarket fee")
     print(f"{'='*80}\n")
 
     print(f"Profitable: {len(profitable)}/{len(results)} "

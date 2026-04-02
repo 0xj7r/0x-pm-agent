@@ -1,4 +1,4 @@
-"""Tests for the BTC sniper trading engine."""
+"""Tests for the threshold-based trading engine."""
 from __future__ import annotations
 
 import tempfile
@@ -9,53 +9,71 @@ import pytest
 from clients.binance_ws import TradeUpdate
 from core.engine import BTCTradingEngine
 from models.market import MarketWindow
-from strategies.strategy_config import StrategyConfig
+from strategies.strategy_config import StrategyConfig, ThresholdConfig
 
 
-def make_engine(paper: bool = True) -> BTCTradingEngine:
+def make_engine(
+    move_threshold: float = 0.08,
+    max_entry: float = 0.55,
+    coin: str = "btc",
+) -> BTCTradingEngine:
     cfg = StrategyConfig()
-    cfg.paper.enabled = paper
+    cfg.paper.enabled = True
     cfg.paper.starting_balance = 100.0
-    cfg.signal.confidence_threshold = 0.80
-    cfg.signal.w3_price_delta = 1.0
-    cfg.signal.w1_order_flow = 0.0
-    cfg.signal.w2_microprice = 0.0
-    cfg.signal.w4_acceleration = 0.0
-    cfg.execution.max_entry_price = 0.05
+    cfg.coins[coin] = ThresholdConfig(
+        move_threshold=move_threshold,
+        max_entry=max_entry,
+    )
     cfg.risk.max_position_usd = 10.0
     cfg.risk.max_position_pct = 0.10
+    cfg.risk.kelly_multiplier = 0.25
+    cfg.risk.cheap_token_multiplier = 2.0
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
-    engine = BTCTradingEngine(cfg, db_path=db_path)
-    return engine
+    return BTCTradingEngine(cfg, db_path=db_path, coin=coin)
+
+
+def make_window(
+    *,
+    up_price: float = 0.02,
+    down_price: float = 0.98,
+) -> MarketWindow:
+    now = datetime.now(timezone.utc)
+    return MarketWindow(
+        market_id="m1",
+        question="BTC Up/Down",
+        start_time=now - timedelta(seconds=30),
+        end_time=now + timedelta(minutes=4, seconds=30),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        up_price=up_price,
+        down_price=down_price,
+    )
 
 
 def test_engine_initializes():
     engine = make_engine()
     assert engine.balance == 100.0
-    assert engine.signal_engine.p_up == 0.5
     assert engine.current_window is None
+    assert engine._strategy.coin == "btc"
+    assert engine._strategy.move_threshold == 0.08
+    engine.memory.close()
 
 
-def test_engine_resets_signal_on_new_window():
+def test_engine_resets_window_state_on_new_window():
     engine = make_engine()
-    engine.signal_engine.update(0, 0, 5.0, 0)
-    assert engine.signal_engine.p_up != 0.5
+    engine._current_btc_price = 84250.0
+    engine._already_traded_this_window = True
 
-    now = datetime.now(timezone.utc)
-    window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now,
-        end_time=now + timedelta(minutes=5),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-    )
+    window = make_window()
     engine._on_new_window(window)
-    assert engine.signal_engine.p_up == 0.5
+
     assert engine.current_window == window
+    assert engine._window_open_price == 84250.0
+    assert engine._already_traded_this_window is False
+    engine.memory.close()
 
 
 @pytest.mark.asyncio
@@ -63,16 +81,6 @@ async def test_engine_processes_trade_updates():
     engine = make_engine()
 
     now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now - timedelta(seconds=10),
-        end_time=now + timedelta(minutes=4, seconds=50),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-    )
-    engine._window_open_price = 84000.0
-
     update = TradeUpdate(
         price=84100.0,
         quantity=1.0,
@@ -80,104 +88,53 @@ async def test_engine_processes_trade_updates():
         timestamp_ms=int(now.timestamp() * 1000),
     )
     await engine._on_binance_trade(update)
-    assert engine.signal_engine.p_up > 0.5
+
+    assert engine._current_btc_price == 84100.0
+    engine.memory.close()
 
 
-@pytest.mark.asyncio
-async def test_engine_generates_paper_trade():
+def test_engine_generates_threshold_trade():
     engine = make_engine()
-
-    now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now - timedelta(seconds=30),
-        end_time=now + timedelta(minutes=4, seconds=30),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-        up_price=0.02,
-        down_price=0.98,
-    )
-    engine._window_open_price = 84000.0
+    engine.current_window = make_window(up_price=0.02, down_price=0.98)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
     engine._already_traded_this_window = False
 
-    engine.signal_engine.log_odds = 3.0  # p_up ~ 0.953
-
     trades = engine._check_entry()
+
     assert len(trades) == 1
     assert trades[0]["direction"] == "UP"
-    assert trades[0]["token_price"] <= 0.05
+    assert trades[0]["token_price"] == 0.02
+    assert trades[0]["strategy"] == "threshold"
+    assert trades[0]["size_usd"] > 0
+
+    events = engine.memory.get_events_for_window("m1")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "entry"
+    engine.memory.close()
 
 
-@pytest.mark.asyncio
-async def test_engine_no_trade_when_no_cheap_tokens_and_midrange_disabled():
-    engine = make_engine()
-    engine.cfg.execution.enable_midrange = False
-
-    now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now - timedelta(seconds=30),
-        end_time=now + timedelta(minutes=4, seconds=30),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-        up_price=0.50,
-        down_price=0.50,
-    )
-    engine._window_open_price = 84000.0
-    engine._already_traded_this_window = False
-    engine.signal_engine.log_odds = 3.0
+def test_engine_skips_expensive_entry():
+    engine = make_engine(max_entry=0.55)
+    engine.current_window = make_window(up_price=0.70, down_price=0.30)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
 
     trades = engine._check_entry()
-    assert len(trades) == 0
+
+    assert trades == []
+    assert engine._already_traded_this_window is False
+    engine.memory.close()
 
 
-@pytest.mark.asyncio
-async def test_engine_midrange_trade_when_confident():
+def test_engine_no_double_trade():
     engine = make_engine()
-    engine.cfg.execution.enable_midrange = True
-    engine.cfg.execution.midrange_min_confidence = 0.80
-    engine.cfg.execution.midrange_max_price = 0.55
-
-    now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now - timedelta(seconds=30),
-        end_time=now + timedelta(minutes=4, seconds=30),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-        up_price=0.50,
-        down_price=0.50,
-    )
-    engine._window_open_price = 84000.0
-    engine._already_traded_this_window = False
-    engine.signal_engine.log_odds = 3.0  # P(UP) ~0.95
-
-    trades = engine._check_entry()
-    assert len(trades) == 1
-    assert trades[0]["strategy"] == "midrange"
-
-
-@pytest.mark.asyncio
-async def test_engine_no_double_trade():
-    engine = make_engine()
-
-    now = datetime.now(timezone.utc)
-    engine.current_window = MarketWindow(
-        market_id="m1",
-        question="BTC Up/Down",
-        start_time=now - timedelta(seconds=30),
-        end_time=now + timedelta(minutes=4, seconds=30),
-        up_token_id="tok_up",
-        down_token_id="tok_down",
-        up_price=0.02,
-        down_price=0.98,
-    )
-    engine._window_open_price = 84000.0
+    engine.current_window = make_window(up_price=0.02, down_price=0.98)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
     engine._already_traded_this_window = True
-    engine.signal_engine.log_odds = 3.0
 
     trades = engine._check_entry()
-    assert len(trades) == 0
+
+    assert trades == []
+    engine.memory.close()

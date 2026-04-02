@@ -6,12 +6,71 @@ services:
     env_file:
       - .env
     environment:
-      - PAPER_TRADE=true
-      - LOG_LEVEL=INFO
-      - BTC_DB_PATH=/data/btc_trades.db
+      PAPER_TRADE: "true"
+      LOG_LEVEL: INFO
+      BTC_DB_PATH: /data/btc_trades.db
     ports:
       - "8080:8080"
     volumes:
       - ./data:/data
       - ./strategy_config.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json"]
+    command: ["--config", "/app/strategy_config.json", "--coin", "btc"]
+
+  eth-sniper:
+    build: .
+    container_name: polymarket-eth-sniper
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PAPER_TRADE: "true"
+      LOG_LEVEL: INFO
+      BTC_DB_PATH: /data/eth_trades.db
+    volumes:
+      - ./data:/data
+      - ./strategy_config.json:/app/strategy_config.json:ro
+    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+
+  sol-sniper:
+    build: .
+    container_name: polymarket-sol-sniper
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PAPER_TRADE: "true"
+      LOG_LEVEL: INFO
+      BTC_DB_PATH: /data/sol_trades.db
+    volumes:
+      - ./data:/data
+      - ./strategy_config.json:/app/strategy_config.json:ro
+    command: ["--config", "/app/strategy_config.json", "--coin", "sol"]
+
+  snapshot-collector:
+    build: .
+    container_name: polymarket-snapshot-collector
+    restart: always
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/data
+      - ./strategy_config.json:/app/strategy_config.json:ro
+    entrypoint: ["python", "collector/snapshot_recorder.py"]
+    command: ["--coin", "btc", "--coin", "eth", "--coin", "sol", "--interval", "1.0"]
+
+  autoresearch:
+    build: .
+    container_name: polymarket-autoresearch
+    restart: always
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/data
+      - ./strategy_config.json:/app/strategy_config.json:ro
+      - ./autoresearch:/app/autoresearch
+    entrypoint: ["python", "autoresearch/runner.py"]
+    command: []

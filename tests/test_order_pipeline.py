@@ -24,7 +24,7 @@ from clients.market_scanner import MarketWindowScanner
 logger = logging.getLogger(__name__)
 
 
-async def test_pipeline(live: bool = False):
+async def run_pipeline_check(live: bool = False):
     config = Config()
     results = {"passed": 0, "failed": 0, "skipped": 0}
 
@@ -155,7 +155,7 @@ def main():
     parser.add_argument("--live", action="store_true",
                         help="Actually place and cancel a test order")
     args = parser.parse_args()
-    asyncio.run(test_pipeline(args.live))
+    asyncio.run(run_pipeline_check(args.live))
 
 
 if __name__ == "__main__":
