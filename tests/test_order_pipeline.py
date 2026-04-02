@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import Config
 from clients.polymarket import PolymarketClient
-from clients.market_scanner import MarketScanner
+from clients.market_scanner import MarketWindowScanner
 
 logger = logging.getLogger(__name__)
 
@@ -58,18 +58,19 @@ async def test_pipeline(live: bool = False):
     # 3. Market discovery
     print("\n3. Market discovery (Gamma API)")
     try:
-        scanner = MarketScanner(config)
-        btc_markets = await scanner.find_btc_5m_markets()
+        scanner = MarketWindowScanner(coin="btc")
+        windows = await scanner.find_active_windows()
         check("Gamma API reachable", True)
-        check("BTC 5m markets found", len(btc_markets) > 0, f"{len(btc_markets)} markets")
+        check("BTC 5m markets found", len(windows) > 0, f"{len(windows)} markets")
 
-        if btc_markets:
-            market = btc_markets[0]
-            print(f"    Sample: {market.slug}")
-            print(f"    Tokens: UP={market.clob_token_up[:16]}... DOWN={market.clob_token_down[:16]}...")
+        if windows:
+            market = windows[0]
+            print(f"    Sample: {market.question}")
+            print(f"    Tokens: UP={market.up_token_id[:16]}... DOWN={market.down_token_id[:16]}...")
         else:
             skip("Order book test", "no markets found")
             print(f"\nResults: {results}")
+            await scanner.close()
             return results
     except Exception as e:
         check("Gamma API reachable", False, str(e))
@@ -79,8 +80,8 @@ async def test_pipeline(live: bool = False):
     # 4. Order book
     print("\n4. Order book (CLOB)")
     try:
-        market = btc_markets[0]
-        book = await client.get_order_book(market.clob_token_up)
+        market = windows[0]
+        book = await client.get_order_book(market.up_token_id)
         check("Order book fetched", True)
 
         if book.bids:
@@ -115,7 +116,7 @@ async def test_pipeline(live: bool = False):
         try:
             # Place a limit order far from market (won't fill)
             # Buy 1 share at $0.01 (will never fill)
-            token_id = market.clob_token_up
+            token_id = market.up_token_id
             test_price = 0.01
             test_size = 1.0
 
