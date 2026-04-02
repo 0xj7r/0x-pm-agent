@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtesting.autoresearch import load_and_precompute
+from backtesting.precompute import load_and_precompute
 
 logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).parent / "historical.db"

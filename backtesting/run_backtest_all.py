@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from backtesting.autoresearch import load_and_precompute
+from backtesting.precompute import load_and_precompute
 from backtesting.stochastic_projection import polymarket_fee, slippage
 
 logger = logging.getLogger(__name__)
