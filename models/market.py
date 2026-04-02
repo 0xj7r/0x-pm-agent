@@ -100,6 +100,7 @@ class MarketWindow:
     down_token_id: str
     up_price: float = 0.5
     down_price: float = 0.5
+    slug: str = ""
 
     def time_remaining(self, now: datetime) -> float:
         return max(0.0, (self.end_time - now).total_seconds())

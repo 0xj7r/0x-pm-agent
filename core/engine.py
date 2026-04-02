@@ -1,6 +1,6 @@
-"""BTC 5-minute sniper trading engine.
+"""5-minute sniper trading engine (multi-coin).
 
-Orchestrates: Binance WS → Signal Engine → Entry Check → Execution → Persistence.
+Orchestrates: Binance WS -> Signal Check -> Entry -> Execution -> Persistence.
 Delegates resolution to core.resolver, notifications to core.notifier,
 health reporting to core.health.
 """
@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time as _time
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
@@ -22,8 +24,9 @@ from core.resolver import PaperTradeResolver
 from core.risk import RiskManager
 from config import Config
 from models.market import MarketWindow
-from strategies.btc_sniper import BayesianSignalEngine
-from strategies.strategy_config import StrategyConfig
+from shared.constants import COIN_CONFIGS
+from strategies.threshold import ThresholdStrategy
+from strategies.strategy_config import StrategyConfig, ThresholdConfig
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +36,11 @@ MAX_SINGLE_ORDER_USD = 100.0
 class BTCTradingEngine:
     """Core engine for sniping cheap tokens on BTC Up/Down markets."""
 
-    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db") -> None:
+    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc") -> None:
         self.cfg = strategy_cfg
-        self.signal_engine = BayesianSignalEngine(strategy_cfg.signal)
+        self._coin = coin.lower()
+        coin_conf = strategy_cfg.coins.get(self._coin, ThresholdConfig())
+        self._strategy = ThresholdStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
         self.health = HealthServer()
@@ -51,19 +56,16 @@ class BTCTradingEngine:
                     "POLYMARKET_PRIVATE_KEY must be set for live trading"
                 )
             self._polymarket = PolymarketClient(Config())
-            logger.warning("LIVE TRADING ENABLED — real orders will be placed")
+            logger.warning("LIVE TRADING ENABLED: real orders will be placed")
 
         self.balance: float = strategy_cfg.paper.starting_balance
         self.risk.set_bankroll(self.balance)
 
         self.current_window: MarketWindow | None = None
         self._window_open_price: float = 0.0
-        self._last_btc_price: float = 0.0
-        self._prev_btc_price: float = 0.0
+        self._current_btc_price: float = 0.0
         self._already_traded_this_window: bool = False
         self._running: bool = False
-        self._buy_volume: float = 0.0
-        self._sell_volume: float = 0.0
         self._paper_trades: list[dict] = []
         self._scanner: MarketWindowScanner | None = None
         self._scan_interval: float = 30.0
@@ -83,19 +85,17 @@ class BTCTradingEngine:
         return RiskManager(base)
 
     def _on_new_window(self, window: MarketWindow) -> None:
-        self.signal_engine.reset()
         self.current_window = window
-        self._window_open_price = self._last_btc_price
+        self._window_open_price = self._current_btc_price
         self._already_traded_this_window = False
-        self._buy_volume = 0.0
-        self._sell_volume = 0.0
-        # Subscribe to real-time token prices for this window
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
-                asyncio.create_task(self.poly_ws.subscribe(token_ids))
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                pass  # No event loop yet (e.g. during tests)
+                loop = None
+            if loop is not None:
+                loop.create_task(self.poly_ws.subscribe(token_ids))
         logger.info(
             f"New window: {window.question} | "
             f"BTC open: ${self._window_open_price:,.2f} | "
@@ -103,49 +103,7 @@ class BTCTradingEngine:
         )
 
     async def _on_binance_trade(self, update: TradeUpdate) -> None:
-        self._prev_btc_price = self._last_btc_price
-        self._last_btc_price = update.price
-
-        if update.is_buy:
-            self._buy_volume += update.quantity
-        else:
-            self._sell_volume += update.quantity
-
-        if not self.current_window or self._window_open_price == 0:
-            return
-
-        total_vol = self._buy_volume + self._sell_volume
-        ofi = (self._buy_volume - self._sell_volume) / total_vol if total_vol > 0 else 0.0
-
-        price_delta = (update.price - self._window_open_price) / self._window_open_price * 100
-        accel = 0.0
-        if self._prev_btc_price > 0:
-            prev_delta = (self._prev_btc_price - self._window_open_price) / self._window_open_price * 100
-            accel = price_delta - prev_delta
-
-        microprice_dev = 0.0
-        if self._latest_book and self._latest_book.mid > 0:
-            microprice_dev = (self._latest_book.microprice - self._latest_book.mid) / self._latest_book.mid * 100
-
-        self.signal_engine.set_state(
-            order_flow_imbalance=ofi,
-            microprice_deviation=microprice_dev,
-            price_delta=price_delta,
-            acceleration=accel,
-        )
-
-    def _in_entry_window(self) -> bool:
-        if not self.current_window:
-            return False
-        now = datetime.now(timezone.utc)
-        elapsed = self.current_window.elapsed_seconds(now)
-        early = self.cfg.execution.entry_window_early
-        late = self.cfg.execution.entry_window_late
-        if self.cfg.execution.enable_early_snipe and early[0] <= elapsed <= early[1]:
-            return True
-        if self.cfg.execution.enable_late_snipe and late[0] <= elapsed <= late[1]:
-            return True
-        return False
+        self._current_btc_price = update.price
 
     def _get_live_price(self, token_id: str, fallback: float) -> float:
         """Get real-time price from CLOB WS, fall back to Gamma snapshot."""
@@ -155,48 +113,39 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
-        if not self._in_entry_window():
+        if self._window_open_price == 0 or self._current_btc_price == 0:
             return []
 
-        direction = self.signal_engine.direction
-        p_up = self.signal_engine.p_up
-        p_down = self.signal_engine.p_down
+        move_pct = (self._current_btc_price - self._window_open_price) / self._window_open_price * 100
 
+        price_up = self._get_live_price(
+            self.current_window.up_token_id, self.current_window.up_price
+        )
+        price_down = self._get_live_price(
+            self.current_window.down_token_id, self.current_window.down_price
+        )
+
+        signal = self._strategy.check_signal(move_pct, price_up, price_down)
+        if signal is None or signal == "SKIP":
+            return []
+
+        direction = signal.upper()
         if direction == "UP":
             token_id = self.current_window.up_token_id
-            token_price = self._get_live_price(token_id, self.current_window.up_price)
-            p_win = p_up
+            token_price = price_up
         else:
             token_id = self.current_window.down_token_id
-            token_price = self._get_live_price(token_id, self.current_window.down_price)
-            p_win = p_down
+            token_price = price_down
 
-        # Strategy A: cheap token sniping (2-5c, asymmetric payoff)
-        strategy = None
-        size_usd = 0.0
+        p_win = abs(move_pct) / 100.0
+        size_usd = self.risk.asymmetric_kelly_size(
+            p_win=p_win,
+            token_price=token_price,
+            bankroll=self.balance,
+            risk_cfg=self.cfg.risk,
+        )
 
-        if token_price <= self.cfg.execution.max_entry_price and self.signal_engine.confident:
-            strategy = "snipe"
-            size_usd = self.risk.asymmetric_kelly_size(
-                p_win=p_win, token_price=token_price,
-                bankroll=self.balance, risk_cfg=self.cfg.risk,
-            )
-
-        # Strategy B: mid-range directional (25-50c, fee-aware Kelly)
-        if (
-            strategy is None
-            and self.cfg.execution.enable_midrange
-            and token_price <= self.cfg.execution.midrange_max_price
-            and p_win >= self.cfg.execution.midrange_min_confidence
-        ):
-            strategy = "midrange"
-            size_usd = self.risk.fee_aware_kelly_size(
-                p_win=p_win, token_price=token_price,
-                bankroll=self.balance, risk_cfg=self.cfg.risk,
-                taker_fee_rate=self.cfg.execution.midrange_taker_fee_rate,
-            )
-
-        if not strategy or size_usd <= 0:
+        if size_usd <= 0:
             return []
 
         self._already_traded_this_window = True
@@ -208,23 +157,23 @@ class BTCTradingEngine:
             "size_usd": size_usd,
             "shares": size_usd / token_price,
             "p_win": p_win,
-            "log_odds": self.signal_engine.log_odds,
-            "btc_price": self._last_btc_price,
-            "strategy": strategy,
+            "btc_price": self._current_btc_price,
+            "move_pct": move_pct,
+            "strategy": "threshold",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         logger.info(
-            f"ENTRY [{strategy.upper()}]: {direction} @ ${token_price:.3f} | "
+            f"ENTRY [THRESHOLD]: {direction} @ ${token_price:.3f} | "
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
-            f"P({direction})={p_win:.3f} | BTC=${self._last_btc_price:,.2f}"
+            f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
         )
         self.memory.save_event(
             window_id=self.current_window.market_id,
             event_type="entry",
-            log_odds=self.signal_engine.log_odds,
-            p_up=self.signal_engine.p_up,
-            btc_price=self._last_btc_price,
+            log_odds=None,
+            p_up=None,
+            btc_price=self._current_btc_price,
             details=trade,
         )
         return [trade]
@@ -236,7 +185,7 @@ class BTCTradingEngine:
         self._last_scan_time = now
 
         if not self._scanner:
-            self._scanner = MarketWindowScanner()
+            self._scanner = MarketWindowScanner(coin=self._coin)
         try:
             window = await self._scanner.get_current_window()
             if window and (not self.current_window or window.market_id != self.current_window.market_id):
@@ -280,16 +229,18 @@ class BTCTradingEngine:
         async def on_book(snap: OrderBookSnapshot) -> None:
             self._latest_book = snap
 
-        binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book)
+        binance_symbol = COIN_CONFIGS.get(self._coin, COIN_CONFIGS["btc"])["binance_symbol"]
+        binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book, symbol=binance_symbol)
         binance_task = asyncio.create_task(binance.connect())
         poly_ws_task = asyncio.create_task(self.poly_ws.connect())
 
         logger.info(
             f"BTC Sniper started | Paper: {self.cfg.paper.enabled} | "
-            f"Balance: ${self.balance:.2f} | Threshold: {self.cfg.signal.confidence_threshold}"
+            f"Balance: ${self.balance:.2f} | "
+            f"Threshold: {self._strategy.move_threshold}%"
         )
         await self.slack.notify_startup(
-            self.balance, self.cfg.signal.confidence_threshold, self.cfg.paper.enabled
+            self.balance, self._strategy.move_threshold, self.cfg.paper.enabled
         )
 
         tick_count = 0
@@ -316,15 +267,14 @@ class BTCTradingEngine:
                         await self._process_resolutions()
                         total = len(self._paper_trades) + len(self.resolver.resolved_ids)
 
-                        # Log signal data every 60s for backtesting/autoresearch
                         up_live = self.poly_ws.get_price(self.current_window.up_token_id) if self.current_window else 0
                         down_live = self.poly_ws.get_price(self.current_window.down_token_id) if self.current_window else 0
                         self.memory.save_event(
                             window_id=self.current_window.market_id if self.current_window else "none",
                             event_type="status_tick",
-                            log_odds=self.signal_engine.log_odds,
-                            p_up=self.signal_engine.p_up,
-                            btc_price=self._last_btc_price,
+                            log_odds=None,
+                            p_up=None,
+                            btc_price=self._current_btc_price,
                             details={
                                 "balance": self.balance, "trades": total,
                                 "up_price": up_live, "down_price": down_live,
@@ -334,14 +284,14 @@ class BTCTradingEngine:
                         self.health.update(
                             balance=self.balance, trades_total=total,
                             trades_resolved=len(self.resolver.resolved_ids),
-                            p_up=self.signal_engine.p_up,
+                            p_up=None,
                             binance_connected=binance.seconds_since_last_message < 10,
                             binance_last_msg_age_s=round(binance.seconds_since_last_message, 1),
                             current_window=self.current_window.question if self.current_window else None,
                         )
                         logger.info(
-                            f"Status: P(UP)={self.signal_engine.p_up:.3f} | "
-                            f"Balance=${self.balance:.2f} | Trades={len(self._paper_trades)} | "
+                            f"Status: Balance=${self.balance:.2f} | "
+                            f"Trades={len(self._paper_trades)} | "
                             f"Resolved={len(self.resolver.resolved_ids)}"
                         )
 
@@ -351,7 +301,7 @@ class BTCTradingEngine:
                         await self.slack.notify_status(
                             balance=self.balance, trades=total,
                             resolved=len(self.resolver.resolved_ids),
-                            p_up=self.signal_engine.p_up, uptime_hours=uptime_h,
+                            p_up=None, uptime_hours=uptime_h,
                         )
                 except Exception as e:
                     logger.error(f"Engine tick error: {e}", exc_info=True)
