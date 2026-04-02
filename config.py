@@ -40,29 +40,11 @@ class Config:
     LOSS_COOLDOWN_TRADES: int = int(os.getenv("LOSS_COOLDOWN_TRADES", "3"))
     LOSS_COOLDOWN_SECONDS: int = int(os.getenv("LOSS_COOLDOWN_SECONDS", "1800"))
 
-    # Strategy toggles
-    ENABLE_WEATHER: bool = os.getenv("ENABLE_WEATHER", "true").lower() == "true"
-    ENABLE_ARBITRAGE: bool = os.getenv("ENABLE_ARBITRAGE", "true").lower() == "true"
-    ENABLE_COPY_TRADING: bool = os.getenv("ENABLE_COPY_TRADING", "true").lower() == "true"
-    ENABLE_TREND_DETECTION: bool = os.getenv("ENABLE_TREND_DETECTION", "true").lower() == "true"
-
-    # Weather
-    WEATHER_CITIES: list[str] = [
-        c.strip()
-        for c in os.getenv(
-            "WEATHER_CITIES",
-            "New York,Los Angeles,Chicago,Houston,Phoenix",
-        ).split(",")
-    ]
-
     # Mode
     PAPER_TRADE: bool = os.getenv("PAPER_TRADE", "true").lower() == "true"
 
     # Paper trading
     PAPER_STARTING_BALANCE: float = float(os.getenv("PAPER_STARTING_BALANCE", "100.0"))
-
-    # Copy trading: comma-separated wallet addresses to track
-    COPY_TRADING_WALLETS: str = os.getenv("COPY_TRADING_WALLETS", "")
 
     # Database
     DB_PATH: str = os.getenv("DB_PATH", "trades.db")
