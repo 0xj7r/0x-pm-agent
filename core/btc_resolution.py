@@ -9,6 +9,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from shared.fees import taker_fee_usd
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,14 +34,6 @@ class ResolutionResult:
     resolved_at: datetime | None = None
 
 
-TAKER_FEE_RATE = 0.072
-
-
-def _taker_fee(price: float, size_usd: float) -> float:
-    """Polymarket dynamic taker fee: C * 0.072 * p * (1-p)."""
-    return size_usd * TAKER_FEE_RATE * price * (1.0 - price)
-
-
 def resolve_paper_trade(trade: PaperTradeRecord, resolved_direction: str) -> ResolutionResult:
     """Calculate P&L for a resolved paper trade, including taker fees.
 
@@ -47,7 +41,7 @@ def resolve_paper_trade(trade: PaperTradeRecord, resolved_direction: str) -> Res
     If direction doesn't match, payout = $0, loss = cost + entry fee.
     """
     won = trade.direction == resolved_direction
-    entry_fee = _taker_fee(trade.token_price, trade.size_usd)
+    entry_fee = taker_fee_usd(trade.token_price, trade.size_usd)
 
     if won:
         payout = trade.shares * 1.0
