@@ -12,9 +12,12 @@ Weather markets are the clear winner. Polymarket hosts 490+ active weather marke
 
 **Recommendation priority:**
 1. **Weather markets** (HIGH priority, build immediately)
-2. **Cross-market arb** (MEDIUM priority, research further)
-3. **Copy trading** (LOW priority, tools exist but edge is crowded)
-4. **Other strategies** (LOW priority, most are well-known)
+2. **Equity/commodity latency arb** (HIGH priority, new markets launched April 2026)
+3. **Cross-market arb** (MEDIUM priority, research further)
+4. **Copy trading** (LOW priority, tools exist but edge is crowded)
+5. **Other strategies** (LOW priority, most are well-known)
+
+**Important context:** 92.4% of Polymarket traders lose money. Only 0.51% of wallets achieve PnL > $1,000. Pure latency arb windows have compressed to ~2.7 seconds (down from 12.3s in 2024), and Polymarket has introduced dynamic taker fees on 15-min crypto markets. Diversifying into weather is strategically critical.
 
 ---
 
@@ -158,13 +161,18 @@ When YES + NO prices sum to less than $1.00, buying both sides guarantees profit
 
 ### 3.3 AI Agent Strategies
 
-[Polymarket/agents](https://github.com/Polymarket/agents) is the official developer framework for building AI agents on Polymarket. Uses LLMs to evaluate market questions and generate probability estimates.
+[Polymarket/agents](https://github.com/Polymarket/agents) (2,715 stars) is the official developer framework for building AI agents on Polymarket. Other notable agent repos:
+- [alsk1992/CloddsBot](https://github.com/alsk1992/CloddsBot) (133 stars): Claude-powered AI trading agent across 1000+ markets
+- [YichengYang-Ethan/oracle3](https://github.com/YichengYang-Ethan/oracle3) (118 stars): Wang Transform pricing across Kalshi and Polymarket
+- [pmxt-dev/pmxt](https://github.com/pmxt-dev/pmxt) (1,327 stars): "CCXT for prediction markets," unified API for Polymarket, Kalshi, and more
 
 **Assessment:** Interesting for long-horizon markets (politics, events) but not well-suited for high-frequency trading. LLM inference latency (seconds) makes this inappropriate for time-sensitive markets.
 
 ### 3.4 Sports Markets
 
-Kalshi dominates sports betting with 90% of its volume from NFL, NBA, MLB. Polymarket has some sports markets but much lower liquidity.
+Kalshi dominates sports betting with 90% of its volume from NFL, NBA, MLB. Polymarket offers moneyline, spread, and total markets for NBA, NHL, UFC, MLB, soccer, and 20+ sports. Cross-book comparison against traditional bookmakers (bet365, etc.) is a known edge.
+
+- [bitman09/Rust-Politics-Sports-Polymarket-Trading-Bot](https://github.com/bitman09/Rust-Politics-Sports-Polymarket-Trading-Bot) (37 stars): Rust, trailing stop strategy
 
 **Assessment:** Sports analytics is a mature, competitive field. Building a competitive sports model requires deep domain expertise and extensive data pipelines. Not our comparative advantage.
 
@@ -190,9 +198,23 @@ Using NLP/LLMs to parse news and trade on sentiment shifts. Theoretically promis
 ### 3.7 Multi-Strategy Bots
 
 Notable multi-strategy implementations:
+- [txbabaxyz/4coinsbot](https://github.com/txbabaxyz/4coinsbot) (79 stars): Multi-coin (BTC/ETH/SOL/XRP) 15-min market bot with Late Entry V3, Telegram control, auto-redeem. Most similar to our codebase.
 - [MrFadiAi/Polymarket-bot](https://github.com/MrFadiAi/Polymarket-bot): 4 strategies in one bot (v3.1, Jan 2026)
 - [discountry/polymarket-trading-bot](https://github.com/discountry/polymarket-trading-bot): Monitors 15-min Up/Down markets for probability drops
+- [guzus/dr-manhattan](https://github.com/guzus/dr-manhattan) (182 stars): Market-making, trading, data analysis across Polymarket, Kalshi, Limitless
 - [echandsome/Polymarket-betting-bot](https://github.com/echandsome/Polymarket-betting-bot): TypeScript, copy trading + strategy bots
+
+### 3.8 Competitive Landscape Warning
+
+Research analyzing 95M on-chain transactions identified six core profit models on Polymarket:
+1. **Information arbitrage** (trading on faster information)
+2. **Cross-platform arbitrage** ($40M cumulative profits Apr 2024-Apr 2025)
+3. **High-probability bonds** (buying >$0.95 contracts, ~1800% annualized but black swan risk)
+4. **Market making** ($20M+ earned in 2024, ~0.2% of volume as profit)
+5. **Domain specialization** (deep knowledge in narrow fields)
+6. **Speed/latency trading** (our current approach)
+
+Key risk: pure latency arb is degrading. Arb windows compressed from 12.3s (2024) to 2.7s (2026). 73% of profits go to sub-100ms bots. Polymarket introduced dynamic taker fees on 15-min crypto markets specifically to curb this strategy.
 
 ---
 
