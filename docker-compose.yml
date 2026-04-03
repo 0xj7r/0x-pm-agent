@@ -103,7 +103,8 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - ./data:/data
+      - ./data/snapshots:/app/backtesting
       - ./strategy_config.json:/app/strategy_config.json:ro
       - ./autoresearch:/app/autoresearch
     entrypoint: ["python", "autoresearch/runner.py"]
-    command: []
+    command: ["--loop", "--interval", "3600"]
