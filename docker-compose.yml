@@ -105,8 +105,5 @@ services:
       - ./data:/data
       - ./data/snapshots:/data/snapshots
       - ./strategy_config.json:/app/strategy_config.json:ro
-    environment:
-      LOG_LEVEL: INFO
-      SNAPSHOT_DB_DIR: /data/snapshots
     entrypoint: ["python", "autoresearch/runner.py"]
     command: ["--loop", "--interval", "86400", "--db-dir", "/data/snapshots"]
