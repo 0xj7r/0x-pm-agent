@@ -224,12 +224,31 @@ Notable multi-strategy implementations:
 ### 4.2 Longer Duration Crypto Markets
 
 - 15-min Up/Down markets exist ([discountry/polymarket-trading-bot](https://github.com/discountry/polymarket-trading-bot) targets these)
-- Longer crypto markets (hourly, daily) have different dynamics
+- Hourly crypto direction markets at polymarket.com/crypto/hourly
+- Daily direction and closing price brackets
 - Less latency-sensitive but requires different signal generation
 
 **Assessment:** Worth exploring as an extension of our existing crypto strategy. The hcharper/polyBot-Weather repo specifically targets "12hr-30 day markets" using Black-Scholes modeling for crypto prices.
 
-### 4.3 Assessment
+### 4.3 NEW: Equity and Commodity Daily Markets (Launched April 2026)
+
+Polymarket just launched equity and commodity markets powered by **Pyth Network** oracle price feeds:
+
+- **Equities:** Tesla, Coinbase, Palantir, Nvidia, Apple (daily up-or-down and closing price contracts)
+- **Commodities:** Gold, Silver, WTI Crude, Natural Gas
+- **Indices:** Major equity indices (daily direction)
+- Contracts reset at end of each trading session, settled automatically via Pyth real-time feeds
+- ICE (parent of NYSE) invested $600M in Polymarket
+
+**This is a major opportunity for latency arb.** The same Binance-vs-Polymarket approach could extend to equity/commodity markets using real-time feeds from traditional exchanges vs Polymarket's CLOB. These markets are brand new, meaning less competition and wider inefficiencies during the early period.
+
+| Source | URL |
+|--------|-----|
+| Cointelegraph | https://cointelegraph.com/news/polymarket-expands-into-equities-and-commodities-with-pyth-price-feeds |
+| The Block | https://www.theblock.co/post/396200/polymarket-taps-pyth-network-to-resolve-new-us-equity-and-commodity-markets |
+| CryptoBriefing | https://cryptobriefing.com/polymarket-pyth-integration/ |
+
+### 4.4 Assessment
 
 | Dimension | Rating | Notes |
 |-----------|--------|-------|
@@ -256,6 +275,13 @@ Notable multi-strategy implementations:
 - Start with London, NYC, Miami, Buenos Aires (highest liquidity)
 
 ### Tier 2: Build After Weather Is Validated
+
+**Equity/Commodity Latency Arb (NEW, April 2026)**
+- Polymarket just launched daily equity/commodity markets (TSLA, NVDA, Gold, etc.)
+- Same latency-arb approach: real-time exchange data vs Polymarket CLOB pricing
+- Brand new markets = less competition, wider inefficiencies
+- Pyth Network oracle provides settlement prices
+- Natural extension of existing 5-min crypto infrastructure
 
 **Kalshi Weather Cross-Market Arb**
 - Same ensemble model, applied to Kalshi KXHIGH series
@@ -352,6 +378,20 @@ backtesting/
 - [AhaSignals: Cross-Platform Arb Strategies](https://ahasignals.com/research/prediction-market-arbitrage-strategies/)
 - [Prediction Market Arb Guide 2026](https://newyorkcityservers.com/blog/prediction-market-arbitrage-guide)
 - [Monad: Prediction Markets Cannot Agree](https://blog.monad.xyz/blog/prediction-market-arbitrage)
+- [EventArb: Real-time cross-platform scanner](https://www.eventarb.com/)
+- [CarlosIbCu/polymarket-kalshi-btc-arbitrage-bot](https://github.com/CarlosIbCu/polymarket-kalshi-btc-arbitrage-bot)
+- [IMDEA Arbitrage Research Paper](https://suarez-tangil.networks.imdea.org/papers/2025aft-arbitrage.pdf)
+
+### Market Microstructure
+- [Polymarket CLOB Documentation](https://docs.polymarket.com/developers/CLOB/introduction)
+- [Polymarket/poly-market-maker](https://github.com/Polymarket/poly-market-maker)
+- [Anatomy of Polymarket (arXiv)](https://arxiv.org/html/2603.03136v1)
+- [Polymarket Order Book Data](https://www.polymarketdata.co/polymarket-order-book-data)
+
+### Equity/Commodity Markets (New)
+- [Polymarket expands into equities/commodities (Cointelegraph)](https://cointelegraph.com/news/polymarket-expands-into-equities-and-commodities-with-pyth-price-feeds)
+- [The Block: Polymarket Pyth integration](https://www.theblock.co/post/396200/polymarket-taps-pyth-network-to-resolve-new-us-equity-and-commodity-markets)
+- [Kalshi API Documentation](https://docs.kalshi.com/welcome)
 
 ### Weather API Providers
 - [Open-Meteo](https://open-meteo.com/)
