@@ -37,12 +37,18 @@ logger = logging.getLogger(__name__)
 class SnapshotWrite:
     market_id: str
     slug: str
+    question: str
     start_time: str
     end_time: str
     snapshot_time: str
     underlying_price: float | None
     up_price: float
     down_price: float
+    bid_price: float | None
+    ask_price: float | None
+    bid_size: float | None
+    ask_size: float | None
+    elapsed_s: float
 
 
 class SnapshotRecorder:
@@ -67,6 +73,10 @@ class SnapshotRecorder:
         self._queue: asyncio.Queue[SnapshotWrite] = asyncio.Queue(maxsize=queue_size)
         self._stop = asyncio.Event()
         self._current_price: float = 0.0
+        self._bid_price: float | None = None
+        self._ask_price: float | None = None
+        self._bid_size: float | None = None
+        self._ask_size: float | None = None
         self._active_windows: dict[str, MarketWindow] = {}
         self._windows_seen: set[str] = set()
         try:
@@ -79,7 +89,10 @@ class SnapshotRecorder:
         self._current_price = update.price
 
     async def _on_book(self, snap: OrderBookSnapshot) -> None:
-        return None
+        self._bid_price = snap.best_bid
+        self._ask_price = snap.best_ask
+        self._bid_size = snap.bid_size
+        self._ask_size = snap.ask_size
 
     def _live_token_price(self, token_id: str, fallback: float) -> float:
         live = self._poly_ws.get_price(token_id)
@@ -123,15 +136,24 @@ class SnapshotRecorder:
                 now = datetime.now(timezone.utc)
                 produced = 0
                 for window in list(self._active_windows.values()):
+                    elapsed = (now - window.start_time).total_seconds()
+                    up = self._live_token_price(window.up_token_id, window.up_price)
+                    down = self._live_token_price(window.down_token_id, window.down_price)
                     write = SnapshotWrite(
                         market_id=window.market_id,
                         slug=window.slug,
+                        question=getattr(window, 'question', '') or window.slug,
                         start_time=window.start_time.isoformat(),
                         end_time=window.end_time.isoformat(),
                         snapshot_time=now.isoformat(),
                         underlying_price=self._current_price or None,
-                        up_price=self._live_token_price(window.up_token_id, window.up_price),
-                        down_price=self._live_token_price(window.down_token_id, window.down_price),
+                        up_price=up,
+                        down_price=down,
+                        bid_price=self._bid_price,
+                        ask_price=self._ask_price,
+                        bid_size=self._bid_size,
+                        ask_size=self._ask_size,
+                        elapsed_s=round(elapsed, 2),
                     )
                     try:
                         self._queue.put_nowait(write)
@@ -223,6 +245,12 @@ class SnapshotRecorder:
                     "price": item.underlying_price,
                     "price_up": item.up_price,
                     "price_down": item.down_price,
+                    "bid_price": item.bid_price,
+                    "ask_price": item.ask_price,
+                    "bid_size": item.bid_size,
+                    "ask_size": item.ask_size,
+                    "spread": round(item.up_price + item.down_price - 1.0, 4),
+                    "elapsed_s": item.elapsed_s,
                 } for item in batch]
                 self._supa.insert_snapshots_batch(supa_rows)
             except Exception as exc:
