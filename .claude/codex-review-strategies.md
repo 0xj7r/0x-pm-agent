@@ -74,11 +74,22 @@ Evaluate which of these alternative strategies should be trialled alongside our 
 - We have autoresearch running daily to discover new strategies
 - Market structure: 5-minute binary options on BTC/ETH/SOL, tokens cost $0-$1, winner gets $1
 
+### 7. 15-Minute / 1-Hour Market Extension
+**Idea**: Apply the same latency arb strategy to 15-min and 1-hour BTC/ETH/SOL markets. Longer windows = larger BTC moves = more opportunities that clear the threshold.
+
+**Entry**: Same threshold logic but calibrated for longer windows (threshold might be higher, e.g. 0.15% for 15-min).
+**Edge thesis**: Same structural edge (Polymarket book lags Binance), just on longer timeframes. Potentially more liquidity in these markets, allowing larger position sizes.
+**Risk**: Longer windows mean more time for the book to reprice. The latency edge may be weaker.
+**Data needed**: PolyBackTest has 15-min market data (3,032 BTC markets available). We already fetched some. Our collector could also record 15-min markets.
+**Implementation**: Minimal. Just add slug patterns for 15m markets (`btc-updown-15m-{ts}`) and calibrate thresholds.
+**Key question**: Does the book lag persist in 15-min markets, or do market makers reprice faster when the window is longer?
+
 ## Questions for Codex
-1. Which of these 6 strategies has the best risk-adjusted edge?
+1. Which of these 7 strategies has the best risk-adjusted edge?
 2. Which can be backtested with the data we already have?
 3. Which should we trial first as a parallel paper trade?
 4. Are there strategies we haven't considered?
 5. For strategy #3 (resolution sniping), what win rate do we need at $0.90 entry to be profitable after fees?
 6. For strategy #4 (cross-market arb), how often does price_up + price_down < 0.98 occur in our historical data?
-7. Should we be considering entirely different market types (15-min, 1-hour) or different assets?
+7. For strategy #7 (15-min markets), should we calibrate thresholds differently? What does the PolyBackTest data show for 15-min BTC markets?
+8. All strategies should be evaluated for BTC, ETH, AND SOL independently. ETH/SOL may have different optimal strategies due to higher volatility and thinner books.
