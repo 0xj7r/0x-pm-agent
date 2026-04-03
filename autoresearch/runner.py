@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtesting.feature_store import build_feature_store, load_feature_store, FEATURE_NAMES
 from shared.fees import taker_fee
-from shared.constants import COINS, db_path
+from shared.constants import COINS, db_path as default_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -46,12 +46,12 @@ def _save_candidate(coin: str, candidate: dict) -> Path:
     return path
 
 
-def run_grid_search(coin: str) -> list[dict]:
+def run_grid_search(coin: str, db_dir: Path | None = None) -> list[dict]:
     """Fast grid search using the feature store."""
     try:
         manifest, f = load_feature_store(coin)
     except FileNotFoundError:
-        db = db_path(coin)
+        db = Path(db_dir) / f"{coin}.db" if db_dir else default_db_path(coin)
         if not db.exists():
             logger.warning(f"[{coin.upper()}] No DB found")
             return []
@@ -137,14 +137,14 @@ def run_grid_search(coin: str) -> list[dict]:
     return results
 
 
-def run_once(coins: list[str]) -> list[Path]:
+def run_once(coins: list[str], db_dir: Path | None = None) -> list[Path]:
     current = _current_best()
     saved: list[Path] = []
 
     for coin in coins:
         logger.info(f"[{coin.upper()}] Running autoresearch...")
         t0 = time.time()
-        results = run_grid_search(coin)
+        results = run_grid_search(coin, db_dir=db_dir)
         elapsed = time.time() - t0
 
         if not results:
@@ -185,16 +185,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", action="append", choices=COINS)
     parser.add_argument("--loop", action="store_true")
-    parser.add_argument("--interval", type=int, default=3600, help="Seconds between runs in loop mode")
+    parser.add_argument("--interval", type=int, default=86400, help="Seconds between runs in loop mode")
+    parser.add_argument("--db-dir", type=str, default=None, help="Directory containing coin DBs")
     args = parser.parse_args()
 
     coins = args.coin or COINS
+    db_dir = Path(args.db_dir) if args.db_dir else None
 
     if args.loop:
         logger.info(f"Starting autoresearch loop (interval={args.interval}s, coins={coins})")
         while True:
             try:
-                saved = run_once(coins)
+                saved = run_once(coins, db_dir=db_dir)
                 for p in saved:
                     logger.info(f"Candidate: {p}")
             except Exception as e:
@@ -202,7 +204,7 @@ def main():
             logger.info(f"Sleeping {args.interval}s...")
             time.sleep(args.interval)
     else:
-        saved = run_once(coins)
+        saved = run_once(coins, db_dir=db_dir)
         for p in saved:
             print(f"Candidate: {p}")
         if not saved:

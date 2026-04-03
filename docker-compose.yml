@@ -103,8 +103,10 @@ services:
       LOG_LEVEL: INFO
     volumes:
       - ./data:/data
-      - ./data/snapshots:/app/backtesting
+      - ./data/snapshots:/data/snapshots
       - ./strategy_config.json:/app/strategy_config.json:ro
-      - ./autoresearch:/app/autoresearch
+    environment:
+      LOG_LEVEL: INFO
+      SNAPSHOT_DB_DIR: /data/snapshots
     entrypoint: ["python", "autoresearch/runner.py"]
-    command: ["--loop", "--interval", "3600"]
+    command: ["--loop", "--interval", "86400", "--db-dir", "/data/snapshots"]
