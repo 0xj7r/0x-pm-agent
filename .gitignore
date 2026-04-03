@@ -11,3 +11,4 @@ venv/
 .cook/
 backtesting/features/
 backtesting/*.html
+autoresearch/candidates/
