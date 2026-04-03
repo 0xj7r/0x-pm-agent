@@ -57,8 +57,18 @@ class SupabaseClient:
     def upsert_snapshots(self, rows: list[dict[str, Any]]) -> None:
         self._upsert("snapshots", rows, "market_id,time")
 
+    def upsert_trade(self, row: dict[str, Any]) -> None:
+        self._upsert("trades", [row], "id")
+
     def upsert_strategy_result(self, row: dict[str, Any]) -> None:
         self._upsert("strategy_results", [row], "coin")
+
+    def insert_snapshots_batch(self, rows: list[dict[str, Any]]) -> None:
+        """Insert snapshots without upsert (faster for collector)."""
+        if not rows:
+            return
+        resp = self._http.post("/snapshots", json=rows)
+        resp.raise_for_status()
 
     def load_markets(self, coin: str) -> list[dict[str, Any]]:
         resp = self._http.get(

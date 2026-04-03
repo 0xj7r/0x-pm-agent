@@ -84,6 +84,8 @@ services:
       - .env
     environment:
       LOG_LEVEL: INFO
+      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
+      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
     volumes:
       - ./data:/data
       - ./data/snapshots:/app/backtesting
