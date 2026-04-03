@@ -28,6 +28,7 @@ from clients.polymarket_ws import PolymarketWSClient
 from models.market import MarketWindow
 from shared.constants import COIN_CONFIGS, db_path
 from shared.db import init_coin_db
+from shared.supabase_client import SupabaseClient, SupabaseConfig
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,11 @@ class SnapshotRecorder:
         self._current_price: float = 0.0
         self._active_windows: dict[str, MarketWindow] = {}
         self._windows_seen: set[str] = set()
+        try:
+            self._supa = SupabaseClient()
+        except Exception:
+            self._supa = None
+            logger.warning("[%s] Supabase not configured, local-only mode", coin.upper())
 
     async def _on_trade(self, update: TradeUpdate) -> None:
         self._current_price = update.price
@@ -207,6 +213,20 @@ class SnapshotRecorder:
                 ),
             )
         self._conn.commit()
+
+        if self._supa:
+            try:
+                supa_rows = [{
+                    "coin": self._coin,
+                    "market_id": item.market_id,
+                    "time": item.snapshot_time,
+                    "price": item.underlying_price,
+                    "price_up": item.up_price,
+                    "price_down": item.down_price,
+                } for item in batch]
+                self._supa.insert_snapshots_batch(supa_rows)
+            except Exception as exc:
+                logger.warning("[%s] Supabase write failed: %s", self._coin.upper(), exc)
 
     async def _writer_loop(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
