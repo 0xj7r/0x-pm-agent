@@ -1,14 +1,31 @@
-"""Continuous autoresearch runner for threshold strategy candidates."""
+"""Continuous autoresearch runner.
+
+Pulls latest data, builds feature store, grid-searches strategies,
+saves candidates for human review. Does NOT auto-deploy.
+
+Usage:
+    python autoresearch/runner.py                    # one-shot, all coins
+    python autoresearch/runner.py --coin btc          # one coin
+    python autoresearch/runner.py --loop --interval 3600  # continuous, hourly
+"""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import logging
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from backtesting.research import run_autoresearch
-from core.notifier import SlackNotifier
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from backtesting.feature_store import build_feature_store, load_feature_store, FEATURE_NAMES
+from shared.fees import taker_fee
+from shared.constants import COINS, db_path
+
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 RESULTS_PATH = BASE_DIR / "backtesting" / "strategy_results.json"
@@ -21,7 +38,7 @@ def _current_best() -> dict:
     return json.loads(RESULTS_PATH.read_text())
 
 
-def _write_candidate(coin: str, candidate: dict) -> Path:
+def _save_candidate(coin: str, candidate: dict) -> Path:
     CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = CANDIDATES_DIR / f"{stamp}-{coin}.json"
@@ -29,71 +46,167 @@ def _write_candidate(coin: str, candidate: dict) -> Path:
     return path
 
 
-async def run_once(coins: list[str], min_markets: int = 50) -> list[Path]:
+def run_grid_search(coin: str) -> list[dict]:
+    """Fast grid search using the feature store."""
+    try:
+        manifest, f = load_feature_store(coin)
+    except FileNotFoundError:
+        db = db_path(coin)
+        if not db.exists():
+            logger.warning(f"[{coin.upper()}] No DB found")
+            return []
+        logger.info(f"[{coin.upper()}] Building feature store...")
+        build_feature_store(db, coin)
+        manifest, f = load_feature_store(coin)
+
+    if len(manifest) < 30:
+        logger.warning(f"[{coin.upper()}] Only {len(manifest)} markets, skipping")
+        return []
+
+    split = int(len(manifest) * 0.7)
+    train, test = manifest[:split], manifest[split:]
+
+    import numpy as np
+
+    results = []
+    configs_tested = 0
+
+    for thresh in [0.03, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]:
+        for max_e in [0.50, 0.55, 0.60, 0.65, 0.75]:
+            for min_skew in [None, 0.02, 0.05, 0.10]:
+                for min_vol in [0, 0.002, 0.005]:
+                    configs_tested += 1
+
+                    scores = {}
+                    for label, subset in [("train", train), ("test", test)]:
+                        trades = wins = 0
+                        pnl = 0.0
+
+                        for m in subset:
+                            o, n = m.offset, m.length
+                            am = f["abs_move"][o:o+n]
+
+                            above = np.where(am[10:] >= thresh)[0]
+                            if len(above) == 0:
+                                continue
+                            idx = above[0] + 10
+
+                            if min_vol > 0 and f["volatility"][o+idx] < min_vol:
+                                continue
+                            if min_skew is not None and f["token_skew"][o+idx] > min_skew:
+                                continue
+
+                            mp = f["move_pct"][o+idx]
+                            d_up = mp > 0
+                            entry = float(f["price_up"][o+idx] if d_up else f["price_down"][o+idx])
+
+                            if entry <= 0 or entry > max_e:
+                                continue
+
+                            trades += 1
+                            won = (d_up and m.winner == "Up") or (not d_up and m.winner == "Down")
+                            fee = entry * taker_fee(entry)
+                            pnl += (1.0 - entry - fee) if won else -(entry + fee)
+                            if won:
+                                wins += 1
+
+                        scores[label] = (trades, wins, pnl)
+
+                    tr_t, tr_w, tr_p = scores["train"]
+                    te_t, te_w, te_p = scores["test"]
+
+                    if tr_t < 5 or te_t < 3 or tr_p <= 0 or te_p <= 0:
+                        continue
+
+                    results.append({
+                        "name": "skew" if min_skew is not None else ("volatility" if min_vol > 0 else "threshold"),
+                        "params": {"move": thresh, "max_entry": max_e, "skew": min_skew, "vol": min_vol},
+                        "train_trades": tr_t,
+                        "train_wins": tr_w,
+                        "train_wr": round(tr_w / tr_t, 4),
+                        "test_trades": te_t,
+                        "test_wins": te_w,
+                        "test_wr": round(te_w / te_t, 4),
+                        "test_pnl": round(te_p, 4),
+                        "test_pnl_per_trade": round(te_p / te_t, 4),
+                    })
+
+    results.sort(key=lambda r: r["test_pnl_per_trade"], reverse=True)
+    logger.info(f"[{coin.upper()}] Tested {configs_tested} configs, "
+                f"{len(results)} profitable on both sets")
+    return results
+
+
+def run_once(coins: list[str]) -> list[Path]:
     current = _current_best()
-    notifier = SlackNotifier()
     saved: list[Path] = []
 
-    try:
-        for coin in coins:
-            db_path = BASE_DIR / "backtesting" / f"{coin}.db"
-            if not db_path.exists():
-                continue
+    for coin in coins:
+        logger.info(f"[{coin.upper()}] Running autoresearch...")
+        t0 = time.time()
+        results = run_grid_search(coin)
+        elapsed = time.time() - t0
 
-            results = run_autoresearch(db_path, test_pct=0.3, min_markets=min_markets, coin=coin)
-            if not results:
-                continue
+        if not results:
+            logger.info(f"[{coin.upper()}] No profitable strategies found ({elapsed:.1f}s)")
+            continue
 
-            best = results[0]
-            previous = current.get(coin, {}).get("best_strategy", {})
-            previous_score = previous.get("test_pnl_per_trade", float("-inf"))
+        best = results[0]
+        logger.info(
+            f"[{coin.upper()}] Best: {best['name']} {best['params']} "
+            f"test={best['test_wins']}/{best['test_trades']} ({best['test_wr']:.0%}) "
+            f"${best['test_pnl_per_trade']:+.4f}/trade ({elapsed:.1f}s)"
+        )
 
-            if best.test_pnl_per_trade <= previous_score:
-                continue
+        previous = current.get(coin, {}).get("best_strategy", {})
+        prev_score = previous.get("test_pnl_per_trade", float("-inf"))
 
+        if best["test_pnl_per_trade"] > prev_score:
             candidate = {
                 "coin": coin,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "current_best": previous,
-                "candidate_best": {
-                    "name": best.name,
-                    "params": best.params,
-                    "train_win_rate": best.train_win_rate,
-                    "test_win_rate": best.test_win_rate,
-                    "train_trades": best.train_trades,
-                    "test_trades": best.test_trades,
-                    "train_pnl": best.train_pnl,
-                    "test_pnl": best.test_pnl,
-                    "avg_entry": best.avg_entry,
-                    "test_pnl_per_trade": best.test_pnl_per_trade,
-                },
+                "proposed": best,
+                "top_5": results[:5],
+                "total_profitable": len(results),
+                "search_time_s": round(elapsed, 1),
             }
-            path = _write_candidate(coin, candidate)
+            path = _save_candidate(coin, candidate)
             saved.append(path)
-
-            await notifier._send(
-                f"*Autoresearch candidate found*\n"
-                f"Coin: {coin.upper()}\n"
-                f"Current: {previous.get('name', 'none')} {previous.get('params', {})}\n"
-                f"Candidate: {best.name} {best.params}\n"
-                f"Test $/trade: {best.test_pnl_per_trade:+.4f}\n"
-                f"Saved: {path.name}"
-            )
-    finally:
-        await notifier.close()
+            logger.info(f"[{coin.upper()}] Candidate saved: {path.name}")
+        else:
+            logger.info(f"[{coin.upper()}] No improvement over current best")
 
     return saved
 
 
-def main() -> None:
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--coin", action="append", choices=["btc", "eth", "sol"])
-    parser.add_argument("--min-markets", type=int, default=50)
+    parser.add_argument("--coin", action="append", choices=COINS)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval", type=int, default=3600, help="Seconds between runs in loop mode")
     args = parser.parse_args()
-    coins = args.coin or ["btc", "eth", "sol"]
-    saved = asyncio.run(run_once(coins, min_markets=args.min_markets))
-    for path in saved:
-        print(path)
+
+    coins = args.coin or COINS
+
+    if args.loop:
+        logger.info(f"Starting autoresearch loop (interval={args.interval}s, coins={coins})")
+        while True:
+            try:
+                saved = run_once(coins)
+                for p in saved:
+                    logger.info(f"Candidate: {p}")
+            except Exception as e:
+                logger.error(f"Autoresearch failed: {e}", exc_info=True)
+            logger.info(f"Sleeping {args.interval}s...")
+            time.sleep(args.interval)
+    else:
+        saved = run_once(coins)
+        for p in saved:
+            print(f"Candidate: {p}")
+        if not saved:
+            print("No new candidates found")
 
 
 if __name__ == "__main__":
