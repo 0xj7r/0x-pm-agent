@@ -47,6 +47,11 @@ class BTCTradingEngine:
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
         self.poly_ws = PolymarketWSClient()
+        try:
+            from shared.supabase_client import SupabaseClient
+            self._supa = SupabaseClient()
+        except Exception:
+            self._supa = None
 
         self._polymarket: PolymarketClient | None = None
         if not strategy_cfg.paper.enabled:
@@ -200,6 +205,24 @@ class BTCTradingEngine:
             btc_price=self._current_btc_price,
             details=trade,
         )
+        if self._supa:
+            try:
+                self._supa.upsert_trade({
+                    "id": f"{self._coin}-{trade['market_id']}-{trade['timestamp']}",
+                    "coin": self._coin,
+                    "strategy": self._strategy.name,
+                    "market_id": trade["market_id"],
+                    "direction": direction,
+                    "token_price": token_price,
+                    "size_usd": size_usd,
+                    "shares": trade["shares"],
+                    "paper": True,
+                    "btc_price": self._current_btc_price,
+                    "move_pct": move_pct,
+                    "created_at": trade["timestamp"],
+                })
+            except Exception as e:
+                logger.warning(f"Supabase trade write failed: {e}")
         return [trade]
 
     async def _scan_for_window(self) -> None:
@@ -243,6 +266,27 @@ class BTCTradingEngine:
                 details={"won": res.won, "pnl_usd": res.pnl_usd,
                          "resolved_direction": resolved_dir, "trade": trade},
             )
+            if self._supa:
+                try:
+                    trade_id = f"{self._coin}-{trade['market_id']}-{trade.get('timestamp', '')}"
+                    self._supa.upsert_trade({
+                        "id": trade_id,
+                        "coin": self._coin,
+                        "strategy": trade.get("strategy", self._strategy.name),
+                        "market_id": trade["market_id"],
+                        "direction": trade["direction"],
+                        "token_price": trade["token_price"],
+                        "size_usd": trade["size_usd"],
+                        "shares": trade.get("shares", 0),
+                        "won": res.won,
+                        "pnl_usd": res.pnl_usd,
+                        "paper": True,
+                        "btc_price": trade.get("btc_price"),
+                        "move_pct": trade.get("move_pct"),
+                        "resolved_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                except Exception as e:
+                    logger.warning(f"Supabase resolution write failed: {e}")
 
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
 
