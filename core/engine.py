@@ -169,7 +169,7 @@ class BTCTradingEngine:
             "token_price": token_price,
             "size_usd": size_usd,
             "shares": size_usd / token_price,
-            "p_win": p_win,
+            "p_win": None,
             "btc_price": self._current_btc_price,
             "move_pct": move_pct,
             "strategy": self._strategy.name,
