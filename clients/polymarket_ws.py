@@ -40,12 +40,20 @@ class PolymarketWSClient:
         return self._books.get(token_id)
 
     def get_price(self, token_id: str) -> float:
+        """Get best ask price (what we'd pay to buy). Falls back to last trade."""
         book = self._books.get(token_id)
         if not book:
             return 0.0
-        if book.best_bid > 0 and book.best_ask > 0:
-            return (book.best_bid + book.best_ask) / 2
-        return book.last_trade_price
+        if book.best_ask > 0:
+            return book.best_ask
+        if book.last_trade_price > 0:
+            return book.last_trade_price
+        return 0.0
+
+    def has_live_book(self, token_id: str) -> bool:
+        """Check if we have a live order book (not stale fallback)."""
+        book = self._books.get(token_id)
+        return book is not None and book.best_ask > 0
 
     async def subscribe(self, token_ids: list[str]) -> None:
         """Subscribe to new token IDs (can be called while connected)."""
