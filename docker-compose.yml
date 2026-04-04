@@ -61,6 +61,36 @@ services:
       - ./strategy_config_relaxed.json:/app/strategy_config.json:ro
     command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
 
+  btc-low-thresh:
+    build: .
+    container_name: polymarket-btc-low-thresh
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PAPER_TRADE: "true"
+      LOG_LEVEL: INFO
+      BTC_DB_PATH: /data/btc_low_thresh_trades.db
+    volumes:
+      - ./data:/data
+      - ./strategy_config_low_thresh.json:/app/strategy_config.json:ro
+    command: ["--config", "/app/strategy_config.json", "--coin", "btc"]
+
+  eth-low-thresh:
+    build: .
+    container_name: polymarket-eth-low-thresh
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PAPER_TRADE: "true"
+      LOG_LEVEL: INFO
+      BTC_DB_PATH: /data/eth_low_thresh_trades.db
+    volumes:
+      - ./data:/data
+      - ./strategy_config_low_thresh.json:/app/strategy_config.json:ro
+    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+
   sol-sniper:
     build: .
     container_name: polymarket-sol-sniper

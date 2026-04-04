@@ -1,0 +1,31 @@
+{
+    "version": 4,
+    "coins": {
+        "btc": {
+            "strategy": "threshold",
+            "params": {"move": 0.05, "max_entry": 0.55}
+        },
+        "eth": {
+            "strategy": "threshold",
+            "params": {"move": 0.05, "max_entry": 0.55}
+        },
+        "sol": {
+            "strategy": "disabled",
+            "params": {}
+        }
+    },
+    "risk": {
+        "max_position_usd": 50,
+        "max_position_pct": 0.10,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 10,
+        "max_concurrent_positions": 20,
+        "loss_cooldown_trades": 5,
+        "loss_cooldown_seconds": 300,
+        "kelly_multiplier": 0.25
+    },
+    "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+    }
+}
