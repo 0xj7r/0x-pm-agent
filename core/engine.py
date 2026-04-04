@@ -113,11 +113,6 @@ class BTCTradingEngine:
     async def _on_binance_trade(self, update: TradeUpdate) -> None:
         self._current_btc_price = update.price
 
-    def _get_live_price(self, token_id: str, fallback: float) -> float:
-        """Get real-time price from CLOB WS, fall back to Gamma snapshot."""
-        live = self.poly_ws.get_price(token_id)
-        return live if live > 0 else fallback
-
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
@@ -129,14 +124,16 @@ class BTCTradingEngine:
             logger.info(f"Backfilled open price: ${self._window_open_price:,.2f}")
             return []
 
+        # Only trade with live book data, never stale fallbacks
+        has_live_up = self.poly_ws.has_live_book(self.current_window.up_token_id)
+        has_live_down = self.poly_ws.has_live_book(self.current_window.down_token_id)
+        if not has_live_up or not has_live_down:
+            return []
+
         move_pct = (self._current_btc_price - self._window_open_price) / self._window_open_price * 100
 
-        price_up = self._get_live_price(
-            self.current_window.up_token_id, self.current_window.up_price
-        )
-        price_down = self._get_live_price(
-            self.current_window.down_token_id, self.current_window.down_price
-        )
+        price_up = self.poly_ws.get_price(self.current_window.up_token_id)
+        price_down = self.poly_ws.get_price(self.current_window.down_token_id)
 
         current_snap = (self._current_btc_price, price_up, price_down)
         if not self._window_snaps or self._window_snaps[-1] != current_snap:
