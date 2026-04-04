@@ -90,6 +90,7 @@ class BTCTradingEngine:
         self._window_open_price = self._current_btc_price
         self._already_traded_this_window = False
         self._window_snaps = []
+        self._open_price_backfilled = self._window_open_price > 0
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
@@ -115,7 +116,12 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
-        if self._window_open_price == 0 or self._current_btc_price == 0:
+        if self._current_btc_price == 0:
+            return []
+        if self._window_open_price == 0:
+            self._window_open_price = self._current_btc_price
+            self._open_price_backfilled = True
+            logger.info(f"Backfilled open price: ${self._window_open_price:,.2f}")
             return []
 
         move_pct = (self._current_btc_price - self._window_open_price) / self._window_open_price * 100
@@ -137,9 +143,14 @@ class BTCTradingEngine:
             self._window_snaps,
         )
 
-        if abs(move_pct) >= 0.05 and len(self._window_snaps) % 50 == 0:
+        if signal is not None and signal != "SKIP":
             logger.info(
-                f"Signal check: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
+                f"SIGNAL: {signal} | move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
+                f"snaps={len(self._window_snaps)}"
+            )
+        elif abs(move_pct) >= 0.04 and len(self._window_snaps) % 20 == 0:
+            logger.info(
+                f"Checking: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
                 f"signal={signal} | snaps={len(self._window_snaps)}"
             )
 
