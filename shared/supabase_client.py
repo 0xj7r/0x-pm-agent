@@ -78,6 +78,36 @@ class SupabaseClient:
         resp.raise_for_status()
         return resp.json()
 
+    def load_trades(self, coin: str | None = None) -> list[dict[str, Any]]:
+        """Fetch all trades, optionally filtered by coin."""
+        params: dict[str, str] = {"order": "created_at.desc"}
+        if coin:
+            params["coin"] = f"eq.{coin}"
+        resp = self._http.get("/trades", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def load_trade_stats(self, coin: str | None = None) -> dict[str, Any]:
+        """Compute aggregate trade stats from Supabase."""
+        trades = self.load_trades(coin)
+        total = len(trades)
+        resolved = [t for t in trades if t.get("resolved_at")]
+        wins = [t for t in resolved if t.get("won")]
+        losses = [t for t in resolved if t.get("won") is False]
+        total_pnl = sum(t.get("pnl_usd", 0) or 0 for t in resolved)
+        total_wagered = sum(t.get("size_usd", 0) or 0 for t in trades)
+        win_rate = len(wins) / len(resolved) * 100 if resolved else 0.0
+        return {
+            "trades_total": total,
+            "trades_resolved": len(resolved),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 1),
+            "total_pnl": round(total_pnl, 2),
+            "total_wagered": round(total_wagered, 2),
+            "trades": trades,
+        }
+
     def load_snapshots(self, market_id: str) -> list[dict[str, Any]]:
         resp = self._http.get(
             "/snapshots",
