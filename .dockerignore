@@ -10,3 +10,6 @@ btc_heartbeat.txt
 data/
 docs/
 tests/
+*.pkl
+.cook/
+.claude/

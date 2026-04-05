@@ -43,15 +43,15 @@ class BTCTradingEngine:
         self._strategy = LiveRuntimeStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
-        self.health = HealthServer(db_path=db_path)
-        self.slack = SlackNotifier()
-        self.resolver = PaperTradeResolver()
-        self.poly_ws = PolymarketWSClient()
         try:
             from shared.supabase_client import SupabaseClient
             self._supa = SupabaseClient()
         except Exception:
             self._supa = None
+        self.health = HealthServer(db_path=db_path, supa=self._supa)
+        self.slack = SlackNotifier()
+        self.resolver = PaperTradeResolver()
+        self.poly_ws = PolymarketWSClient()
 
         self._polymarket: PolymarketClient | None = None
         if not strategy_cfg.paper.enabled:
@@ -214,12 +214,12 @@ class BTCTradingEngine:
                     "size_usd": size_usd,
                     "shares": trade["shares"],
                     "paper": True,
-                    "btc_price": self._current_btc_price,
+                    "underlying_price": self._current_btc_price,
                     "move_pct": move_pct,
                     "created_at": trade["timestamp"],
                 })
             except Exception as e:
-                logger.warning(f"Supabase trade write failed: {e}")
+                logger.error(f"Supabase trade write failed: {e}")
         return [trade]
 
     async def _scan_for_window(self) -> None:
@@ -278,12 +278,12 @@ class BTCTradingEngine:
                         "won": res.won,
                         "pnl_usd": res.pnl_usd,
                         "paper": True,
-                        "btc_price": trade.get("btc_price"),
+                        "underlying_price": trade.get("btc_price"),
                         "move_pct": trade.get("move_pct"),
                         "resolved_at": datetime.now(timezone.utc).isoformat(),
                     })
                 except Exception as e:
-                    logger.warning(f"Supabase resolution write failed: {e}")
+                    logger.error(f"Supabase resolution write failed: {e}")
 
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
 
