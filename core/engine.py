@@ -116,6 +116,8 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
+        if self._supa is None:
+            return []
         if self._current_btc_price == 0:
             return []
         if self._window_open_price == 0:
