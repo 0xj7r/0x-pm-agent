@@ -23,9 +23,13 @@ DASHBOARD_HTML = Path(__file__).parent.parent / "dashboard.html"
 class HealthServer:
     """Serves health status and trading dashboard over HTTP."""
 
-    def __init__(self, port: int = 8080, db_path: str = "") -> None:
+    def __init__(self, port: int = 8080, db_path: str = "", supa: object | None = None) -> None:
         self._port = port
         self._db_path = db_path
+        self._supa = supa
+        self._last_supa_refresh: float = 0.0
+        self._supa_refresh_interval: float = 60.0
+        self._supa_stats: dict = {}
         self._status: dict = {
             "started_at": time.time(),
             "container": "running",
@@ -66,17 +70,38 @@ class HealthServer:
         self._status["errors_last_hour"] = len(self._error_timestamps)
         self._status["last_error"] = error_msg
 
+    def _refresh_supa_stats(self) -> None:
+        """Pull trade stats from Supabase (cached for 60s)."""
+        now = time.time()
+        if now - self._last_supa_refresh < self._supa_refresh_interval:
+            return
+        if not self._supa:
+            return
+        try:
+            self._supa_stats = self._supa.load_trade_stats()
+            self._last_supa_refresh = now
+            self._status["trades_total"] = self._supa_stats["trades_total"]
+            self._status["trades_resolved"] = self._supa_stats["trades_resolved"]
+            self._status["wins"] = self._supa_stats["wins"]
+            self._status["losses"] = self._supa_stats["losses"]
+            self._status["win_rate"] = self._supa_stats["win_rate"]
+            self._status["total_pnl"] = self._supa_stats["total_pnl"]
+        except Exception as e:
+            logger.warning(f"Supabase stats refresh failed: {e}")
+
     async def _handle_health(self, request: web.Request) -> web.Response:
         self._status["uptime_seconds"] = round(time.time() - self._status["started_at"], 1)
+        self._refresh_supa_stats()
         return web.json_response(self._status)
 
     async def _handle_dashboard(self, request: web.Request) -> web.Response:
         """Return full dashboard data: status + trades + events."""
         self._status["uptime_seconds"] = round(time.time() - self._status["started_at"], 1)
+        self._refresh_supa_stats()
 
         data = {
             "status": dict(self._status),
-            "trades": [],
+            "trades": self._supa_stats.get("trades", []),
             "events": [],
             "balance_history": [],
         }
@@ -86,18 +111,6 @@ class HealthServer:
                 conn = sqlite3.connect(self._db_path)
                 conn.row_factory = sqlite3.Row
 
-                # Recent trades with results
-                trades = conn.execute("""
-                    SELECT t.id, t.market_id, t.market_question, t.outcome, t.side,
-                           t.size_usd, t.price, t.paper, t.created_at,
-                           r.won, r.pnl_usd, r.resolved_at
-                    FROM trades t
-                    LEFT JOIN results r ON t.id = r.trade_id
-                    ORDER BY t.created_at DESC LIMIT 100
-                """).fetchall()
-                data["trades"] = [dict(t) for t in trades]
-
-                # Recent events
                 events = conn.execute("""
                     SELECT window_id, timestamp, event_type, btc_price, details
                     FROM event_log
@@ -105,7 +118,6 @@ class HealthServer:
                 """).fetchall()
                 data["events"] = [dict(e) for e in events]
 
-                # Balance history from portfolio snapshots
                 snapshots = conn.execute("""
                     SELECT balance_usd, realized_pnl, num_trades, win_rate, created_at
                     FROM portfolio_snapshots
