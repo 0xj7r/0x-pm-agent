@@ -27,13 +27,18 @@ class RiskManager:
         self.loss_cooldown_trades = config.LOSS_COOLDOWN_TRADES
         self.loss_cooldown_seconds = config.LOSS_COOLDOWN_SECONDS
 
+        self._drawdown_pct: float = 0.25
+        self._max_trades_per_hour: int = 20
+
         # State tracking for safeguards
         self._daily_pnl: float = 0.0
         self._daily_reset_date: str = datetime.now(UTC).strftime("%Y-%m-%d")
         self._consecutive_losses: int = 0
-        self._cooldown_until: float = 0.0  # unix timestamp
+        self._cooldown_until: float = 0.0
         self._open_position_count: int = 0
         self._starting_bankroll: float = 0.0
+        self._peak_balance: float = 0.0
+        self._trade_timestamps: list[float] = []
 
     def set_bankroll(self, bankroll: float):
         """Set the starting bankroll for daily loss tracking."""
@@ -42,6 +47,50 @@ class RiskManager:
     def set_open_positions(self, count: int):
         """Update current open position count."""
         self._open_position_count = count
+
+    def set_peak_balance(self, balance: float) -> None:
+        self._peak_balance = balance
+
+    def update_peak_balance(self, balance: float) -> None:
+        if balance > self._peak_balance:
+            self._peak_balance = balance
+
+    def is_drawdown_breaker_tripped(self, current_balance: float) -> bool:
+        """True if balance has dropped more than _drawdown_pct from peak."""
+        if self._peak_balance <= 0:
+            return False
+        drawdown = (self._peak_balance - current_balance) / self._peak_balance
+        if drawdown >= self._drawdown_pct:
+            logger.warning(
+                f"CIRCUIT BREAKER: drawdown {drawdown:.1%} from peak "
+                f"${self._peak_balance:.2f} (current ${current_balance:.2f})"
+            )
+            return True
+        return False
+
+    def record_trade_entry(self) -> None:
+        self._trade_timestamps.append(time.time())
+
+    def is_rate_limited(self) -> bool:
+        """True if more than _max_trades_per_hour entries in the last hour."""
+        cutoff = time.time() - 3600
+        self._trade_timestamps = [t for t in self._trade_timestamps if t > cutoff]
+        if len(self._trade_timestamps) >= self._max_trades_per_hour:
+            logger.warning(
+                f"RATE LIMIT: {len(self._trade_timestamps)} trades in last hour "
+                f"(limit: {self._max_trades_per_hour})"
+            )
+            return True
+        return False
+
+    def should_stop_loss(
+        self, entry_price: float, current_price: float, stop_loss_pct: float
+    ) -> bool:
+        """True if token price has dropped stop_loss_pct from entry."""
+        if entry_price <= 0:
+            return False
+        drop = (entry_price - current_price) / entry_price
+        return drop >= stop_loss_pct
 
     def record_trade_result(self, pnl: float):
         """Record a resolved trade result for safeguard tracking."""
