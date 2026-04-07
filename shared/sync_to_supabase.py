@@ -5,12 +5,16 @@ import argparse
 import json
 from pathlib import Path
 
-from shared.constants import db_path
+from shared.constants import COINS, db_path
 from shared.db import get_connection
 from shared.supabase_client import SupabaseClient
 
 
-def sync_coin(coin: str, upload_results: bool = True) -> None:
+def sync_coin(
+    coin: str,
+    upload_results: bool = True,
+    markets_only: bool = False,
+) -> None:
     client = SupabaseClient()
     conn = get_connection(db_path(coin))
 
@@ -32,19 +36,20 @@ def sync_coin(coin: str, upload_results: bool = True) -> None:
     ]
     client.upsert_markets(markets)
 
-    offset = 0
-    batch_size = 1000
-    while True:
-        rows = conn.execute(
-            "SELECT * FROM snapshots ORDER BY market_id, time LIMIT ? OFFSET ?",
-            (batch_size, offset),
-        ).fetchall()
-        if not rows:
-            break
-        client.upsert_snapshots([dict(row) for row in rows])
-        offset += batch_size
+    if not markets_only:
+        offset = 0
+        batch_size = 1000
+        while True:
+            rows = conn.execute(
+                "SELECT * FROM snapshots ORDER BY market_id, time LIMIT ? OFFSET ?",
+                (batch_size, offset),
+            ).fetchall()
+            if not rows:
+                break
+            client.upsert_snapshots([dict(row) for row in rows])
+            offset += batch_size
 
-    if upload_results:
+    if upload_results and not markets_only:
         results_path = Path("backtesting/strategy_results.json")
         if results_path.exists():
             data = json.loads(results_path.read_text())
@@ -67,10 +72,16 @@ def sync_coin(coin: str, upload_results: bool = True) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--coin", required=True, choices=["btc", "eth", "sol"])
+    parser.add_argument("--coin", action="append", choices=COINS, required=True)
     parser.add_argument("--skip-results", action="store_true")
+    parser.add_argument("--markets-only", action="store_true")
     args = parser.parse_args()
-    sync_coin(args.coin, upload_results=not args.skip_results)
+    for coin in args.coin:
+        sync_coin(
+            coin,
+            upload_results=not args.skip_results,
+            markets_only=args.markets_only,
+        )
 
 
 if __name__ == "__main__":

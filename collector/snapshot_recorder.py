@@ -98,6 +98,21 @@ class SnapshotRecorder:
         live = self._poly_ws.get_price(token_id)
         return live if live > 0 else fallback
 
+    def _market_row(self, item: SnapshotWrite) -> dict[str, object]:
+        return {
+            "coin": self._coin,
+            "market_id": item.market_id,
+            "slug": item.slug,
+            "market_type": "5m",
+            "start_time": item.start_time,
+            "end_time": item.end_time,
+            "price_start": item.underlying_price,
+            "price_end": item.underlying_price,
+            "winner": None,
+            "final_volume": None,
+            "final_liquidity": None,
+        }
+
     async def _scan_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -238,6 +253,14 @@ class SnapshotRecorder:
 
         if self._supa:
             try:
+                market_rows = []
+                seen_market_ids: set[str] = set()
+                for item in batch:
+                    if item.market_id in seen_market_ids:
+                        continue
+                    seen_market_ids.add(item.market_id)
+                    market_rows.append(self._market_row(item))
+                self._supa.upsert_markets(market_rows)
                 supa_rows = [{
                     "coin": self._coin,
                     "market_id": item.market_id,

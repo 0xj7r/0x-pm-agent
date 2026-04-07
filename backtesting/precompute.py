@@ -24,7 +24,6 @@ class PrecomputedMarket:
     market_id: str
     winner: str
     num_snaps: int
-    # Arrays indexed by snapshot position
     move_pct: list[float]
     abs_move: list[float]
     velocity: list[float]
@@ -44,7 +43,9 @@ _THREAD_LOCAL = threading.local()
 
 
 def _cache_path(db_path: Path, coin: str) -> Path:
-    return db_path.with_name(f"{db_path.stem}.{coin}.precomputed.v{PRECOMPUTE_CACHE_VERSION}.pkl")
+    return db_path.with_name(
+        f"{db_path.stem}.{coin}.precomputed.v{PRECOMPUTE_CACHE_VERSION}.pkl"
+    )
 
 
 def _load_cached_precompute(db_path: Path, coin: str) -> list[PrecomputedMarket] | None:
@@ -67,7 +68,9 @@ def _load_cached_precompute(db_path: Path, coin: str) -> list[PrecomputedMarket]
     return payload.get("markets")
 
 
-def _write_cached_precompute(db_path: Path, coin: str, markets: list[PrecomputedMarket]) -> None:
+def _write_cached_precompute(
+    db_path: Path, coin: str, markets: list[PrecomputedMarket]
+) -> None:
     source_stat = db_path.stat()
     payload = {
         "version": PRECOMPUTE_CACHE_VERSION,
@@ -95,7 +98,9 @@ def _get_thread_connection(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _load_market_precompute(task: tuple[Path, str, str, float, str]) -> PrecomputedMarket | None:
+def _load_market_precompute(
+    task: tuple[Path, str, str, float, str],
+) -> PrecomputedMarket | None:
     db_path, market_id, winner, open_price, price_col = task
     conn = _get_thread_connection(db_path)
     rows = conn.execute(
@@ -111,12 +116,26 @@ def _load_market_precompute(task: tuple[Path, str, str, float, str]) -> Precompu
     return precompute_market(market_id, winner, effective_open, snaps)
 
 
-def precompute_market(market_id: str, winner: str, btc_open: float,
-                      snaps: list[tuple[float, float | None, float | None]]) -> PrecomputedMarket:
+def precompute_market(
+    market_id: str,
+    winner: str,
+    btc_open: float,
+    snaps: list[tuple[float, float | None, float | None]],
+) -> PrecomputedMarket:
     n = len(snaps)
-    prices = np.fromiter(((price or btc_open) for price, _, _ in snaps), dtype=np.float64, count=n)
-    price_up_arr = np.fromiter(((up if up is not None else 0.5) for _, up, _ in snaps), dtype=np.float64, count=n)
-    price_down_arr = np.fromiter(((down if down is not None else 0.5) for _, _, down in snaps), dtype=np.float64, count=n)
+    prices = np.fromiter(
+        ((price or btc_open) for price, _, _ in snaps), dtype=np.float64, count=n
+    )
+    price_up_arr = np.fromiter(
+        ((up if up is not None else 0.5) for _, up, _ in snaps),
+        dtype=np.float64,
+        count=n,
+    )
+    price_down_arr = np.fromiter(
+        ((down if down is not None else 0.5) for _, _, down in snaps),
+        dtype=np.float64,
+        count=n,
+    )
 
     idx = np.arange(n, dtype=np.int32)
 
@@ -131,24 +150,30 @@ def precompute_market(market_id: str, winner: str, btc_open: float,
     prev_prices = prices[prev_idx]
     velocity_arr = np.zeros(n, dtype=np.float64)
     velocity_mask = idx > 0
-    velocity_arr[velocity_mask] = np.divide(
-        prices[velocity_mask] - prev_prices[velocity_mask],
-        prev_prices[velocity_mask],
-        out=np.zeros_like(prices[velocity_mask]),
-        where=prev_prices[velocity_mask] != 0,
-    ) * 100.0
+    velocity_arr[velocity_mask] = (
+        np.divide(
+            prices[velocity_mask] - prev_prices[velocity_mask],
+            prev_prices[velocity_mask],
+            out=np.zeros_like(prices[velocity_mask]),
+            where=prev_prices[velocity_mask] != 0,
+        )
+        * 100.0
+    )
 
     price_deltas = np.diff(prices, prepend=prices[0])
     tick_dirs = np.sign(price_deltas).astype(np.int8)
 
     tick_changes = np.zeros(n, dtype=np.float64)
     prev_tick_prices = prices[:-1]
-    tick_changes[1:] = np.divide(
-        prices[1:] - prev_tick_prices,
-        prev_tick_prices,
-        out=np.zeros(n - 1, dtype=np.float64),
-        where=prev_tick_prices != 0,
-    ) * 100.0
+    tick_changes[1:] = (
+        np.divide(
+            prices[1:] - prev_tick_prices,
+            prev_tick_prices,
+            out=np.zeros(n - 1, dtype=np.float64),
+            where=prev_tick_prices != 0,
+        )
+        * 100.0
+    )
 
     pos_prefix = np.zeros(n + 1, dtype=np.int32)
     neg_prefix = np.zeros(n + 1, dtype=np.int32)
@@ -184,7 +209,9 @@ def precompute_market(market_id: str, winner: str, btc_open: float,
         out=np.zeros_like(totals),
         where=(counts - 1) != 0,
     )
-    volatility_arr[volatility_mask] = np.sqrt(np.maximum(sample_var[volatility_mask], 0.0))
+    volatility_arr[volatility_mask] = np.sqrt(
+        np.maximum(sample_var[volatility_mask], 0.0)
+    )
 
     token_skew_arr = np.zeros(n, dtype=np.float64)
     up_mask = move_pct_arr > 0
@@ -201,22 +228,30 @@ def precompute_market(market_id: str, winner: str, btc_open: float,
     early_idx = accel_idx - accel_al
     early_prices = prices[early_idx]
     mid_prices = prices[mid_idx]
-    v1 = np.divide(
-        mid_prices - early_prices,
-        early_prices,
-        out=np.zeros_like(early_prices),
-        where=early_prices != 0,
-    ) * 100.0
-    v2 = np.divide(
-        prices[accel_idx] - mid_prices,
-        mid_prices,
-        out=np.zeros_like(mid_prices),
-        where=mid_prices != 0,
-    ) * 100.0
+    v1 = (
+        np.divide(
+            mid_prices - early_prices,
+            early_prices,
+            out=np.zeros_like(early_prices),
+            where=early_prices != 0,
+        )
+        * 100.0
+    )
+    v2 = (
+        np.divide(
+            prices[accel_idx] - mid_prices,
+            mid_prices,
+            out=np.zeros_like(mid_prices),
+            where=mid_prices != 0,
+        )
+        * 100.0
+    )
     acceleration_arr[accel_mask] = v2 - v1
 
     return PrecomputedMarket(
-        market_id=market_id, winner=winner, num_snaps=n,
+        market_id=market_id,
+        winner=winner,
+        num_snaps=n,
         move_pct=move_pct_arr.tolist(),
         abs_move=abs_move_arr.tolist(),
         velocity=velocity_arr.tolist(),
@@ -265,7 +300,9 @@ def _load_and_precompute_serial(db_path: Path, coin: str) -> list[PrecomputedMar
         "FROM snapshots ORDER BY market_id, time"
     )
 
-    def flush_market(market_id: str | None, snaps: list[tuple[float, float | None, float | None]]) -> None:
+    def flush_market(
+        market_id: str | None, snaps: list[tuple[float, float | None, float | None]]
+    ) -> None:
         if not market_id or market_id not in market_map or len(snaps) < 50:
             return
         market = market_map[market_id]

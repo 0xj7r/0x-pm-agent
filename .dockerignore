@@ -11,5 +11,11 @@ data/
 docs/
 tests/
 *.pkl
+*.npy
+backtesting/features/
+backtesting/btc.db
+backtesting/eth.db
+backtesting/sol.db
+backtesting/historical.db*
 .cook/
 .claude/

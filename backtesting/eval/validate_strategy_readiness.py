@@ -7,8 +7,8 @@ Runs validation on top of the materialized feature store using:
 - execution stress scenarios
 
 Usage:
-    python backtesting/validate_strategy_readiness.py
-    python backtesting/validate_strategy_readiness.py --coin btc --folds 5
+    python backtesting/eval/validate_strategy_readiness.py
+    python backtesting/eval/validate_strategy_readiness.py --coin btc --folds 5
 """
 from __future__ import annotations
 
@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from backtesting.feature_store import MarketMeta, load_feature_store
-from shared.fees import taker_fee
+from autoresearch.metrics import compute_max_drawdown, compute_sharpe
+from backtesting.eval.feature_store import MarketMeta, load_feature_store
+from backtesting.eval.evaluator import find_first_trade
 from strategies.registry import build_check_fn
 
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).parent.parent
 STRATEGY_RESULTS = BASE_DIR / "strategy_results.json"
 OUTPUT = BASE_DIR / "validation_report.json"
 
@@ -70,34 +71,24 @@ def simulate_manifest(
     trades = wins = 0
     total_pnl = 0.0
     entry_sum = 0.0
+    pnls: list[float] = []
 
     for meta in manifest:
         pm = _slice_market(meta, features)
-        for i in range(10, pm.num_snaps):
-            direction = check_fn(pm, i)
-            if direction is None:
-                continue
-            if direction == "SKIP":
-                break
-
-            entry_idx = i + stress.entry_delay
-            if entry_idx >= pm.num_snaps:
-                break
-
-            entry = pm.price_up[entry_idx] if direction == "Up" else pm.price_down[entry_idx]
-            entry = min(float(entry) + stress.entry_slippage, 0.999)
-            if entry <= 0 or entry >= 0.99:
-                break
-
-            won = direction == pm.winner
-            fee = taker_fee(entry) * entry * stress.fee_multiplier
-            pnl = (1.0 - entry - fee) if won else -(entry + fee)
-
-            trades += 1
-            wins += int(won)
-            total_pnl += pnl
-            entry_sum += entry
-            break
+        trade = find_first_trade(
+            pm,
+            check_fn,
+            entry_delay=stress.entry_delay,
+            entry_slippage=stress.entry_slippage,
+            fee_multiplier=stress.fee_multiplier,
+        )
+        if trade is None:
+            continue
+        trades += 1
+        wins += int(trade.won)
+        total_pnl += trade.pnl
+        entry_sum += trade.entry_price
+        pnls.append(trade.pnl)
 
     return {
         "trades": trades,
@@ -106,6 +97,8 @@ def simulate_manifest(
         "pnl": total_pnl,
         "pnl_per_trade": total_pnl / trades if trades else 0.0,
         "avg_entry": entry_sum / trades if trades else 0.0,
+        "sharpe": compute_sharpe(pnls),
+        "max_drawdown": compute_max_drawdown(pnls),
     }
 
 
