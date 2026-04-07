@@ -1,11 +1,14 @@
-"""Weather market ingestion pipeline for Polymarket + Open-Meteo."""
+"""Weather market ingestion pipeline aligned to Gamma weather events."""
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import logging
 import re
-from datetime import date, datetime, timedelta, timezone
+from collections import defaultdict
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -21,20 +24,9 @@ from shared.constants import WEATHER_CITIES, WEATHER_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-GAMMA_URL = "https://gamma-api.polymarket.com/markets"
-MARKET_KEYWORDS = ("temperature", "weather", "precipitation")
+EVENTS_URL = "https://gamma-api.polymarket.com/events"
 DEFAULT_MODELS = ("gfs_seamless", "ecmwf_ifs", "icon_seamless")
-MONTH_RE = (
-    r"january|february|march|april|may|june|july|august|"
-    r"september|october|november|december"
-)
-RANGE_PATTERNS = (
-    re.compile(rf"(?P<low>-?\d+(?:\.\d+)?)\s*-\s*(?P<high>-?\d+(?:\.\d+)?)\s*(?P<unit>[cf])", re.I),
-    re.compile(rf"between\s+(?P<low>-?\d+(?:\.\d+)?)\s*(?P<unit>[cf])?\s+and\s+(?P<high>-?\d+(?:\.\d+)?)\s*(?P=unit)", re.I),
-    re.compile(rf"(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>[cf])\s*(?:or above|or higher|and above)", re.I),
-    re.compile(rf"(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>[cf])\+", re.I),
-    re.compile(rf"(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>[cf])\s*(?:or below|or lower|and below)", re.I),
-)
+LIMIT = 50
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -44,216 +36,210 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
-def _extract_yes_no_prices(raw: dict) -> tuple[float, float]:
-    yes_price = 0.5
-    no_price = 0.5
-    for token in raw.get("tokens", []):
-        outcome = str(token.get("outcome", "")).strip().lower()
-        if outcome == "yes":
-            yes_price = _safe_float(token.get("price"), 0.5)
-        elif outcome == "no":
-            no_price = _safe_float(token.get("price"), 0.5)
-    return yes_price, no_price
+def _parse_band(text: str) -> tuple[TemperatureBand, str] | None:
+    normalized = text.lower()
+    value_match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*°?\s*([cf])?", normalized)
+    if not value_match:
+        return None
+    val = float(value_match.group(1))
+    unit = (value_match.group(2) or "c").lower()
+    if "or below" in normalized or "or lower" in normalized:
+        return TemperatureBand.from_unit(None, val, unit), unit
+    if "or above" in normalized or "or higher" in normalized:
+        return TemperatureBand.from_unit(val, None, unit), unit
+    return TemperatureBand.from_unit(val, val, unit), unit
 
 
-def _match_city(text: str) -> WeatherLocation | None:
-    text_norm = text.lower()
+def _match_event_city(event: dict) -> WeatherLocation | None:
+    def build_location(key: str) -> WeatherLocation:
+        cfg = WEATHER_CITIES[key]
+        return WeatherLocation(
+            key=key,
+            label=cfg["label"],
+            latitude=cfg["latitude"],
+            longitude=cfg["longitude"],
+            timezone=cfg["timezone"],
+            aliases=tuple(cfg["aliases"]),
+        )
+
+    for tag in event.get("tags") or []:
+        slug = str(tag.get("slug", "")).lower()
+        if slug in WEATHER_CITIES:
+            return build_location(slug)
+
+    text = str(event.get("title", ""))
     for key, cfg in WEATHER_CITIES.items():
-        aliases = cfg["aliases"]
-        if any(alias in text_norm for alias in aliases):
-            return WeatherLocation(
-                key=key,
-                label=cfg["label"],
-                latitude=cfg["latitude"],
-                longitude=cfg["longitude"],
-                timezone=cfg["timezone"],
-                aliases=tuple(aliases),
-            )
+        if any(alias in text.lower() for alias in cfg["aliases"]):
+            return build_location(key)
     return None
 
 
-def _infer_target_date(text: str) -> date | None:
-    match = re.search(rf"\b(?:on|for)\s+({MONTH_RE})\s+(\d{{1,2}})\b", text, re.I)
-    if not match:
-        return None
-    month = datetime.strptime(match.group(1), "%B").month
-    day = int(match.group(2))
-    year = datetime.now(timezone.utc).year
-    candidate = date(year, month, day)
-    if candidate < date.today() - timedelta(days=180):
-        candidate = date(year + 1, month, day)
-    return candidate
+def _band_from_market(market: dict) -> tuple[TemperatureBand, str] | None:
+    title = market.get("groupItemTitle") or market.get("question", "")
+    return _parse_band(str(title))
 
 
-def _infer_band(text: str) -> tuple[TemperatureBand, str] | None:
-    lowered = text.lower()
-    for pattern in RANGE_PATTERNS:
-        match = pattern.search(lowered)
-        if not match:
+def parse_weather_event(event: dict) -> list[tuple[WeatherMarket, WeatherLocation]]:
+    city = _match_event_city(event)
+    if not city:
+        return []
+
+    event_date_str = event.get("eventDate") or event.get("startTime")
+    if not event_date_str:
+        return []
+
+    try:
+        event_date = date.fromisoformat(event_date_str[:10])
+    except ValueError:
+        return []
+
+    markets = []
+    for market in event.get("markets", []):
+        band_info = _band_from_market(market)
+        if not band_info:
             continue
-        groups = match.groupdict()
-        unit = (groups.get("unit") or "c").lower()
-        if "low" in groups and "high" in groups:
-            return TemperatureBand.from_unit(
-                float(groups["low"]),
-                float(groups["high"]),
-                unit,
-            ), unit
-        value = float(groups["value"])
-        if "above" in match.group(0) or "+" in match.group(0):
-            return TemperatureBand.from_unit(value, None, unit), unit
-        return TemperatureBand.from_unit(None, value, unit), unit
-    return None
+        band, unit = band_info
+        outcomes = market.get("outcomePrices") or []
+        yes_price = _safe_float(outcomes[0]) if len(outcomes) >= 1 else 0.5
+        no_price = _safe_float(outcomes[1]) if len(outcomes) >= 2 else 0.5
+        markets.append(
+            (
+                WeatherMarket(
+                    market_id=str(market.get("id", "")),
+                    slug=str(market.get("slug", "")),
+                    question=str(market.get("question", "")),
+                    city_key=city.key,
+                    target_date=event_date,
+                    band=band,
+                    unit=unit,
+                    yes_price=yes_price,
+                    no_price=no_price,
+                    volume=_safe_float(market.get("volume"), 0.0),
+                    liquidity=_safe_float(market.get("liquidity"), 0.0),
+                    active=bool(market.get("active", True)),
+                    raw=market,
+                ),
+                city,
+            )
+        )
+    return markets
 
 
-def parse_weather_market(raw: dict) -> tuple[WeatherMarket, WeatherLocation] | None:
-    question = str(raw.get("question", ""))
-    description = str(raw.get("description", ""))
-    text = f"{question} {description}".strip()
-    text_norm = text.lower()
-    if not any(keyword in text_norm for keyword in MARKET_KEYWORDS):
-        return None
-
-    location = _match_city(text)
-    target_date = _infer_target_date(text)
-    band_match = _infer_band(text)
-    if not location or not target_date or not band_match:
-        return None
-
-    band, unit = band_match
-    yes_price, no_price = _extract_yes_no_prices(raw)
-    return (
-        WeatherMarket(
-            market_id=str(raw.get("id", "")),
-            slug=str(raw.get("slug", "")),
-            question=question,
-            city_key=location.key,
-            target_date=target_date,
-            band=band,
-            unit=unit,
-            yes_price=yes_price,
-            no_price=no_price,
-            volume=_safe_float(raw.get("volume"), 0.0),
-            liquidity=_safe_float(raw.get("liquidity"), 0.0),
-            active=bool(raw.get("active", True)),
-            raw=raw,
-        ),
-        location,
-    )
-
-
-async def fetch_weather_markets(limit: int, pages: int, active: str) -> list[tuple[WeatherMarket, WeatherLocation]]:
+async def fetch_weather_events(limit: int, pages: int, active: str) -> list[dict]:
     params_active = {"true": "true", "false": "false"}.get(active.lower())
-    results: list[tuple[WeatherMarket, WeatherLocation]] = []
+    params = {"category": "weather", "limit": limit}
+    if params_active is not None:
+        params["active"] = params_active
+    events: list[dict] = []
+    offset = 0
     async with httpx.AsyncClient(timeout=30.0) as http:
-        offset = 0
         for _ in range(pages):
-            params = {"limit": limit, "offset": offset}
-            if params_active is not None:
-                params["active"] = params_active
-                params["closed"] = "false" if params_active == "true" else "true"
-            response = await http.get(GAMMA_URL, params=params)
-            response.raise_for_status()
-            markets = response.json()
-            if not markets:
+            params["offset"] = offset
+            resp = await http.get(EVENTS_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
                 break
-            for raw in markets:
-                parsed = parse_weather_market(raw)
-                if parsed:
-                    results.append(parsed)
+            events.extend(data)
             offset += limit
-    return results
+    return events
 
 
-def _probability_from_models(forecasts: dict[str, float], band: TemperatureBand) -> tuple[float, float, float]:
+def _probability_from_forecasts(forecasts: dict[str, float], band: TemperatureBand) -> float:
     temps = list(forecasts.values())
     if not temps:
-        raise ValueError("No forecast temperatures available")
-    votes = sum(1 for temp in temps if band.contains(temp))
-    probability_yes = votes / len(temps)
-    spread = max(temps) - min(temps) if len(temps) > 1 else 0.0
-    confidence = max(probability_yes, 1.0 - probability_yes)
-    return probability_yes, confidence, spread if spread > 0 else 0.1
+        return 0.0
+    hits = sum(1 for temp in temps if band.contains(temp))
+    return hits / len(temps)
 
 
-async def enrich_market(
-    market: WeatherMarket,
-    location: WeatherLocation,
-    client: OpenMeteoClient,
+async def run_fetch(
+    db_path: Path,
+    limit: int,
+    pages: int,
+    active: str,
     models: tuple[str, ...],
-    as_of: str,
-) -> tuple[list[ForecastSnapshot], float | None]:
-    today = date.today()
-    if market.target_date >= today:
-        forecasts = await client.forecast_daily_max(location, market.target_date, market.target_date, models)
-    else:
-        forecasts = await client.historical_forecast_daily_max(location, market.target_date, market.target_date, models)
-
-    probability_yes, confidence, _ = _probability_from_models(forecasts, market.band)
-    snapshots = [
-        ForecastSnapshot(
-            market_id=market.market_id,
-            as_of=as_of,
-            source="open-meteo",
-            model=model,
-            target_date=market.target_date,
-            forecast_temp_c=temp_c,
-            probability_yes=probability_yes,
-            confidence=confidence,
-            raw={"city_key": market.city_key},
-        )
-        for model, temp_c in forecasts.items()
-    ]
-
-    actual = None
-    if market.target_date < today:
-        actual = await client.actual_daily_max(location, market.target_date)
-    return snapshots, actual
-
-
-async def run_fetch(db_path: Path, limit: int, pages: int, active: str, models: tuple[str, ...]) -> None:
-    parsed = await fetch_weather_markets(limit=limit, pages=pages, active=active)
-    if not parsed:
-        logger.warning("No parseable weather markets found")
+) -> None:
+    events = await fetch_weather_events(limit, pages, active)
+    if not events:
+        logger.warning("No weather events found")
         return
 
-    markets = [market for market, _ in parsed]
-    upsert_weather_markets(markets, db_path=db_path)
+    parsed: list[tuple[WeatherMarket, WeatherLocation]] = []
+    for event in events:
+        parsed.extend(parse_weather_event(event))
 
-    as_of = datetime.now(timezone.utc).isoformat()
+    if not parsed:
+        logger.warning("No parseable weather markets")
+        return
+
+    upsert_weather_markets([market for market, _ in parsed], db_path=db_path)
+
+    groups: dict[tuple[str, date], list[tuple[WeatherMarket, WeatherLocation]]] = defaultdict(list)
+    for market, location in parsed:
+        groups[(market.city_key, market.target_date)].append((market, location))
+
     client = OpenMeteoClient()
+    all_snapshots: list[ForecastSnapshot] = []
+    today = date.today()
+
     try:
-        all_snapshots: list[ForecastSnapshot] = []
-        for market, location in parsed:
-            snapshots, actual = await enrich_market(market, location, client, models, as_of)
-            all_snapshots.extend(snapshots)
-            if actual is not None:
-                upsert_actual(
-                    market.market_id,
-                    market.target_date.isoformat(),
-                    actual,
-                    raw={"city_key": market.city_key},
-                    db_path=db_path,
+        for (city_key, target_date), entries in groups.items():
+            location = entries[0][1]
+            if target_date >= today:
+                forecasts = await client.forecast_daily_max(location, target_date, target_date, models)
+            else:
+                forecasts = await client.historical_forecast_daily_max(location, target_date, target_date, models)
+
+            actual = None
+            if target_date < today:
+                actual = await client.actual_daily_max(location, target_date)
+
+            for market, _ in entries:
+                prob = _probability_from_forecasts(forecasts, market.band)
+                confidence = max(prob, 1.0 - prob)
+                snapshot = ForecastSnapshot(
+                    market_id=market.market_id,
+                    as_of=datetime.now(timezone.utc).isoformat(),
+                    source="open-meteo",
+                    model="ensemble",
+                    target_date=target_date,
+                    forecast_temp_c=sum(forecasts.values()) / len(forecasts),
+                    probability_yes=prob,
+                    confidence=confidence,
+                    raw={
+                        "forecasts": forecasts,
+                        "band": {
+                            "low": market.band.low_c,
+                            "high": market.band.high_c,
+                        },
+                    },
                 )
-        insert_forecast_snapshots(all_snapshots, db_path=db_path)
+                all_snapshots.append(snapshot)
+                if actual is not None:
+                    upsert_actual(
+                        market.market_id,
+                        target_date.isoformat(),
+                        actual,
+                        raw={"api": "open-meteo", "location": location.key},
+                        db_path=db_path,
+                    )
     finally:
         await client.close()
 
-    logger.info("Stored %s weather markets and %s forecast snapshots", len(markets), len(all_snapshots))
+    insert_forecast_snapshots(all_snapshots, db_path=db_path)
+    logger.info("Stored %s weather markets and %s forecast snapshots", len(parsed), len(all_snapshots))
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=WEATHER_DB_PATH)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--limit", type=int, default=LIMIT)
     parser.add_argument("--pages", type=int, default=10)
-    parser.add_argument("--active", choices=("true", "false", "all"), default="all")
+    parser.add_argument("--active", choices=("true", "false", "all"), default="true")
     parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
     args = parser.parse_args()
-
-    import asyncio
-
     asyncio.run(run_fetch(args.db, args.limit, args.pages, args.active, tuple(args.models)))
 
 
