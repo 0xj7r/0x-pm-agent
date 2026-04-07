@@ -10,5 +10,6 @@ __pycache__/
 venv/
 .cook/
 backtesting/features/
+backtesting/eval/features/
 backtesting/*.html
 autoresearch/candidates/

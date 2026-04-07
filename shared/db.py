@@ -30,6 +30,11 @@ def init_coin_db(db_path: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS snapshots (
             market_id TEXT, time TEXT,
             price REAL, price_up REAL, price_down REAL,
+            best_bid_up REAL, best_ask_up REAL,
+            bid_size_up REAL, ask_size_up REAL,
+            best_bid_down REAL, best_ask_down REAL,
+            bid_size_down REAL, ask_size_down REAL,
+            orderbook_up_json TEXT, orderbook_down_json TEXT,
             PRIMARY KEY (market_id, time)
         )
     """)
