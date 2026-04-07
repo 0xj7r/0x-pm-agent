@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import sys
 import time
@@ -33,12 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 class CoinDataFetcher:
-    def __init__(self, coin: str, market_type: str = "5m"):
+    def __init__(
+        self,
+        coin: str,
+        market_type: str = "5m",
+        snapshot_workers: int = 6,
+    ):
         self.coin = coin
         self.market_type = market_type
         self.api_base = POLYBACKTEST_API_BASE
         self.api_key = POLYBACKTEST_API_KEYS.get(coin, POLYBACKTEST_API_KEYS["btc"])
         self.rate_limit = RATE_LIMIT_DELAY
+        self.snapshot_workers = max(1, snapshot_workers)
 
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self.api_key}
@@ -129,6 +136,25 @@ class CoinDataFetcher:
             time.sleep(self.rate_limit)
         return all_snaps
 
+    def fetch_snapshot_rows(self, market: dict) -> tuple[str, list[tuple]]:
+        """Fetch and transform all snapshots for a single market."""
+        with httpx.Client(timeout=15) as client:
+            snaps = self.fetch_snapshots(client, market["market_id"])
+
+        rows = []
+        for s in snaps:
+            p = s.get("btc_price") or s.get(f"{self.coin}_price", 0)
+            rows.append(
+                (
+                    market["market_id"],
+                    s.get("time", ""),
+                    p,
+                    s.get("price_up"),
+                    s.get("price_down"),
+                )
+            )
+        return market["market_id"], rows
+
     def fetch_all(
         self, limit: int = 9000, move_threshold: float = 0.05
     ) -> tuple[int, int]:
@@ -163,7 +189,7 @@ class CoinDataFetcher:
             ]
             need_snaps: list[dict] = []
 
-            for m in new_markets:
+            for m in all_markets:
                 ps = (
                     m.get("btc_price_start")
                     or m.get(f"{self.coin}_price_start", 0)
@@ -172,21 +198,22 @@ class CoinDataFetcher:
                     m.get("btc_price_end")
                     or m.get(f"{self.coin}_price_end", 0)
                 )
-                conn.execute(
-                    "INSERT OR IGNORE INTO markets VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        m["market_id"],
-                        m.get("slug", ""),
-                        m.get("market_type", ""),
-                        m.get("start_time", ""),
-                        m.get("end_time", ""),
-                        ps,
-                        pe,
-                        m.get("winner"),
-                        m.get("final_volume"),
-                        m.get("final_liquidity"),
-                    ),
-                )
+                if m["market_id"] not in existing:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO markets VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            m["market_id"],
+                            m.get("slug", ""),
+                            m.get("market_type", ""),
+                            m.get("start_time", ""),
+                            m.get("end_time", ""),
+                            ps,
+                            pe,
+                            m.get("winner"),
+                            m.get("final_volume"),
+                            m.get("final_liquidity"),
+                        ),
+                    )
                 if (
                     ps
                     and pe
@@ -203,34 +230,31 @@ class CoinDataFetcher:
             )
 
             total_snaps = 0
-            for i, m in enumerate(need_snaps):
-                snaps = self.fetch_snapshots(client, m["market_id"])
-                rows = []
-                for s in snaps:
-                    p = s.get("btc_price") or s.get(
-                        f"{self.coin}_price", 0
+            completed = 0
+            logger.info(
+                f"[{self.coin.upper()}] Fetching snapshots with "
+                f"{self.snapshot_workers} workers"
+            )
+            with ThreadPoolExecutor(max_workers=self.snapshot_workers) as executor:
+                futures = {
+                    executor.submit(self.fetch_snapshot_rows, market): market["market_id"]
+                    for market in need_snaps
+                }
+                for future in as_completed(futures):
+                    market_id = futures[future]
+                    rows = future.result()[1]
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO snapshots VALUES (?,?,?,?,?)", rows
                     )
-                    rows.append(
-                        (
-                            m["market_id"],
-                            s.get("time", ""),
-                            p,
-                            s.get("price_up"),
-                            s.get("price_down"),
-                        )
-                    )
-                conn.executemany(
-                    "INSERT OR IGNORE INTO snapshots VALUES (?,?,?,?,?)", rows
-                )
-                total_snaps += len(rows)
+                    total_snaps += len(rows)
+                    completed += 1
 
-                if (i + 1) % 20 == 0:
-                    conn.commit()
-                    logger.info(
-                        f"[{self.coin.upper()}] Snapshots: [{i+1}/{len(need_snaps)}] "
-                        f"{total_snaps:,} total"
-                    )
-                time.sleep(self.rate_limit)
+                    if completed % 20 == 0 or completed == len(need_snaps):
+                        conn.commit()
+                        logger.info(
+                            f"[{self.coin.upper()}] Snapshots: "
+                            f"[{completed}/{len(need_snaps)}] {total_snaps:,} total"
+                        )
 
         conn.commit()
 
@@ -259,13 +283,19 @@ def main():
     parser.add_argument("--limit", type=int, default=9000)
     parser.add_argument("--type", type=str, default="5m")
     parser.add_argument(
+        "--snapshot-workers",
+        type=int,
+        default=6,
+        help="Concurrent workers for per-market snapshot fetching",
+    )
+    parser.add_argument(
         "--move-threshold",
         type=float,
         default=0.05,
         help="Min price move %% to fetch snapshots",
     )
     args = parser.parse_args()
-    fetcher = CoinDataFetcher(args.coin, args.type)
+    fetcher = CoinDataFetcher(args.coin, args.type, args.snapshot_workers)
     fetcher.fetch_all(args.limit, args.move_threshold)
 
 
