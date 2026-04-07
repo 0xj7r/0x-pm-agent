@@ -29,6 +29,7 @@ class LiveRuntimeStrategy:
         market_id: str,
         btc_open: float,
         snaps: list[tuple[float, float, float]],
+        current_hour: int | None = None,
     ) -> str | None:
         if self.name == "disabled" or not snaps or btc_open <= 0:
             return None
@@ -36,4 +37,4 @@ class LiveRuntimeStrategy:
         if pm.num_snaps <= 0:
             return None
         check_fn = build_check_fn(self.name, self.params)
-        return check_fn(pm, pm.num_snaps - 1)
+        return check_fn(pm, pm.num_snaps - 1, current_hour=current_hour)

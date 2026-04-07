@@ -27,12 +27,15 @@ class RiskManager:
         self.loss_cooldown_trades = config.LOSS_COOLDOWN_TRADES
         self.loss_cooldown_seconds = config.LOSS_COOLDOWN_SECONDS
 
-        self._drawdown_pct: float = 0.25
+        self._drawdown_pct: float = 0.40
+        self._breaker_auto_reset_seconds: int = 6 * 3600
         self._max_trades_per_hour: int = 20
 
         # State tracking for safeguards
         self._daily_pnl: float = 0.0
         self._daily_reset_date: str = datetime.now(UTC).strftime("%Y-%m-%d")
+        self._peak_reset_date: str = datetime.now(UTC).strftime("%Y-%m-%d")
+        self._breaker_tripped_at: float = 0.0
         self._consecutive_losses: int = 0
         self._cooldown_until: float = 0.0
         self._open_position_count: int = 0
@@ -52,21 +55,53 @@ class RiskManager:
         self._peak_balance = balance
 
     def update_peak_balance(self, balance: float) -> None:
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        if today != self._peak_reset_date:
+            self._peak_balance = balance
+            self._peak_reset_date = today
+            self._breaker_tripped_at = 0.0
+            logger.info(f"Peak balance reset for new day: ${balance:.2f}")
+            return
         if balance > self._peak_balance:
             self._peak_balance = balance
 
     def is_drawdown_breaker_tripped(self, current_balance: float) -> bool:
-        """True if balance has dropped more than _drawdown_pct from peak."""
+        """True if balance has dropped more than _drawdown_pct from peak.
+
+        Auto-resets after _breaker_auto_reset_seconds of continuous trip state.
+        Peak balance resets daily to prevent yesterday's peak from haunting today.
+        """
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        if today != self._peak_reset_date:
+            self._peak_balance = current_balance
+            self._peak_reset_date = today
+            self._breaker_tripped_at = 0.0
+
         if self._peak_balance <= 0:
             return False
+
         drawdown = (self._peak_balance - current_balance) / self._peak_balance
-        if drawdown >= self._drawdown_pct:
+        if drawdown < self._drawdown_pct:
+            self._breaker_tripped_at = 0.0
+            return False
+
+        if self._breaker_tripped_at == 0.0:
+            self._breaker_tripped_at = time.time()
             logger.warning(
-                f"CIRCUIT BREAKER: drawdown {drawdown:.1%} from peak "
+                f"CIRCUIT BREAKER TRIPPED: drawdown {drawdown:.1%} from peak "
                 f"${self._peak_balance:.2f} (current ${current_balance:.2f})"
             )
             return True
-        return False
+
+        elapsed = time.time() - self._breaker_tripped_at
+        if elapsed >= self._breaker_auto_reset_seconds:
+            self._peak_balance = current_balance
+            self._breaker_tripped_at = 0.0
+            logger.info(
+                f"Breaker auto-reset after {elapsed/3600:.1f}h, new peak ${current_balance:.2f}"
+            )
+            return False
+        return True
 
     def record_trade_entry(self) -> None:
         self._trade_timestamps.append(time.time())

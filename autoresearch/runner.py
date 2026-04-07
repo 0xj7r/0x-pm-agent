@@ -31,6 +31,83 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 RESULTS_PATH = BASE_DIR / "backtesting" / "strategy_results.json"
 CANDIDATES_DIR = BASE_DIR / "autoresearch" / "candidates"
 
+MIN_TRAIN_TRADES = 100
+MIN_TEST_TRADES = 30
+MIN_SHARPE = 0.5
+
+
+def compute_sharpe(pnls: list[float]) -> float:
+    """Sharpe ratio: mean / std of per-trade PnL. Returns 0 if undefined."""
+    if len(pnls) < 2:
+        return 0.0
+    mean = sum(pnls) / len(pnls)
+    variance = sum((p - mean) ** 2 for p in pnls) / (len(pnls) - 1)
+    if variance <= 0:
+        return 0.0
+    std = variance ** 0.5
+    return mean / std
+
+
+def compute_max_drawdown(pnls: list[float]) -> float:
+    """Max drawdown from cumulative PnL series. Returns positive number."""
+    if not pnls:
+        return 0.0
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for p in pnls:
+        cumulative += p
+        if cumulative > peak:
+            peak = cumulative
+        dd = peak - cumulative
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd
+
+
+def score_trades(pnls: list[float]) -> dict:
+    """Compute full summary stats for a list of trade PnLs."""
+    trades = len(pnls)
+    if trades == 0:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0,
+            "win_rate": 0.0, "pnl_per_trade": 0.0,
+            "sharpe": 0.0, "max_drawdown": 0.0,
+        }
+    wins = sum(1 for p in pnls if p > 0)
+    losses = trades - wins
+    pnl = sum(pnls)
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "pnl": round(pnl, 4),
+        "win_rate": round(wins / trades, 4),
+        "pnl_per_trade": round(pnl / trades, 4),
+        "sharpe": round(compute_sharpe(pnls), 4),
+        "max_drawdown": round(compute_max_drawdown(pnls), 4),
+    }
+
+
+def is_result_significant(result: dict) -> bool:
+    """True if the result has enough data and strong enough stats to trust."""
+    if result.get("train_trades", 0) < MIN_TRAIN_TRADES:
+        return False
+    if result.get("test_trades", 0) < MIN_TEST_TRADES:
+        return False
+    if result.get("train_pnl", 0) <= 0:
+        return False
+    if result.get("test_pnl", 0) <= 0:
+        return False
+    if result.get("test_sharpe", 0) < MIN_SHARPE:
+        return False
+    return True
+
+
+def sort_results(results: list[dict]) -> list[dict]:
+    """Sort results by test Sharpe ratio (descending)."""
+    return sorted(results, key=lambda r: r.get("test_sharpe", 0), reverse=True)
+
 
 def _current_best() -> dict:
     if not RESULTS_PATH.exists():
@@ -73,67 +150,75 @@ def run_grid_search(coin: str, db_dir: Path | None = None) -> list[dict]:
 
     for thresh in [0.03, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]:
         for max_e in [0.50, 0.55, 0.60, 0.65, 0.75]:
-            for min_skew in [None, 0.02, 0.05, 0.10]:
-                for min_vol in [0, 0.002, 0.005]:
-                    configs_tested += 1
+            for min_e in [0.0, 0.40, 0.48]:
+                for min_skew in [None, 0.02, 0.05, 0.10]:
+                    for min_vol in [0, 0.002, 0.005]:
+                        configs_tested += 1
 
-                    scores = {}
-                    for label, subset in [("train", train), ("test", test)]:
-                        trades = wins = 0
-                        pnl = 0.0
+                        scores = {}
+                        for label, subset in [("train", train), ("test", test)]:
+                            pnls: list[float] = []
 
-                        for m in subset:
-                            o, n = m.offset, m.length
-                            am = f["abs_move"][o:o+n]
+                            for m in subset:
+                                o, n = m.offset, m.length
+                                am = f["abs_move"][o:o+n]
 
-                            above = np.where(am[10:] >= thresh)[0]
-                            if len(above) == 0:
-                                continue
-                            idx = above[0] + 10
+                                above = np.where(am[10:] >= thresh)[0]
+                                if len(above) == 0:
+                                    continue
+                                idx = above[0] + 10
 
-                            if min_vol > 0 and f["volatility"][o+idx] < min_vol:
-                                continue
-                            if min_skew is not None and f["token_skew"][o+idx] > min_skew:
-                                continue
+                                if min_vol > 0 and f["volatility"][o+idx] < min_vol:
+                                    continue
+                                if min_skew is not None and f["token_skew"][o+idx] > min_skew:
+                                    continue
 
-                            mp = f["move_pct"][o+idx]
-                            d_up = mp > 0
-                            entry = float(f["price_up"][o+idx] if d_up else f["price_down"][o+idx])
+                                mp = f["move_pct"][o+idx]
+                                d_up = mp > 0
+                                entry = float(f["price_up"][o+idx] if d_up else f["price_down"][o+idx])
 
-                            if entry <= 0 or entry > max_e:
-                                continue
+                                if entry <= 0 or entry > max_e:
+                                    continue
+                                if entry < min_e:
+                                    continue
 
-                            trades += 1
-                            won = (d_up and m.winner == "Up") or (not d_up and m.winner == "Down")
-                            fee = entry * taker_fee(entry)
-                            pnl += (1.0 - entry - fee) if won else -(entry + fee)
-                            if won:
-                                wins += 1
+                                won = (d_up and m.winner == "Up") or (not d_up and m.winner == "Down")
+                                fee = entry * taker_fee(entry)
+                                pnl_trade = (1.0 - entry - fee) if won else -(entry + fee)
+                                pnls.append(pnl_trade)
 
-                        scores[label] = (trades, wins, pnl)
+                            scores[label] = score_trades(pnls)
 
-                    tr_t, tr_w, tr_p = scores["train"]
-                    te_t, te_w, te_p = scores["test"]
+                        train_s = scores["train"]
+                        test_s = scores["test"]
 
-                    if tr_t < 5 or te_t < 3 or tr_p <= 0 or te_p <= 0:
-                        continue
+                        result = {
+                            "name": "skew" if min_skew is not None else ("volatility" if min_vol > 0 else "threshold"),
+                            "params": {"move": thresh, "max_entry": max_e, "min_entry": min_e, "skew": min_skew, "vol": min_vol},
+                            "train_trades": train_s["trades"],
+                            "train_wins": train_s["wins"],
+                            "train_wr": train_s["win_rate"],
+                            "train_pnl": train_s["pnl"],
+                            "train_sharpe": train_s["sharpe"],
+                            "train_max_drawdown": train_s["max_drawdown"],
+                            "test_trades": test_s["trades"],
+                            "test_wins": test_s["wins"],
+                            "test_wr": test_s["win_rate"],
+                            "test_pnl": test_s["pnl"],
+                            "test_pnl_per_trade": test_s["pnl_per_trade"],
+                            "test_sharpe": test_s["sharpe"],
+                            "test_max_drawdown": test_s["max_drawdown"],
+                        }
 
-                    results.append({
-                        "name": "skew" if min_skew is not None else ("volatility" if min_vol > 0 else "threshold"),
-                        "params": {"move": thresh, "max_entry": max_e, "skew": min_skew, "vol": min_vol},
-                        "train_trades": tr_t,
-                        "train_wins": tr_w,
-                        "train_wr": round(tr_w / tr_t, 4),
-                        "test_trades": te_t,
-                        "test_wins": te_w,
-                        "test_wr": round(te_w / te_t, 4),
-                        "test_pnl": round(te_p, 4),
-                        "test_pnl_per_trade": round(te_p / te_t, 4),
-                    })
+                        if not is_result_significant(result):
+                            continue
 
-    results.sort(key=lambda r: r["test_pnl_per_trade"], reverse=True)
+                        results.append(result)
+
+    results = sort_results(results)
     logger.info(f"[{coin.upper()}] Tested {configs_tested} configs, "
-                f"{len(results)} profitable on both sets")
+                f"{len(results)} passed significance filter "
+                f"(min {MIN_TRAIN_TRADES} train, {MIN_TEST_TRADES} test, Sharpe>{MIN_SHARPE})")
     return results
 
 
@@ -155,13 +240,14 @@ def run_once(coins: list[str], db_dir: Path | None = None) -> list[Path]:
         logger.info(
             f"[{coin.upper()}] Best: {best['name']} {best['params']} "
             f"test={best['test_wins']}/{best['test_trades']} ({best['test_wr']:.0%}) "
+            f"Sharpe={best['test_sharpe']:.2f} "
             f"${best['test_pnl_per_trade']:+.4f}/trade ({elapsed:.1f}s)"
         )
 
         previous = current.get(coin, {}).get("best_strategy", {})
-        prev_score = previous.get("test_pnl_per_trade", float("-inf"))
+        prev_score = previous.get("test_sharpe", float("-inf"))
 
-        if best["test_pnl_per_trade"] > prev_score:
+        if best["test_sharpe"] > prev_score:
             candidate = {
                 "coin": coin,
                 "created_at": datetime.now(timezone.utc).isoformat(),

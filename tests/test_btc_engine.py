@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import tempfile
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -32,7 +33,10 @@ def make_engine(
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
-    return BTCTradingEngine(cfg, db_path=db_path, coin=coin)
+    mock_supa = MagicMock()
+    mock_supa.health_check.return_value = True
+    with patch("shared.supabase_client.SupabaseClient", return_value=mock_supa):
+        return BTCTradingEngine(cfg, db_path=db_path, coin=coin)
 
 
 def make_window(
@@ -100,6 +104,12 @@ def test_engine_generates_threshold_trade():
     engine._window_open_price = 100.0
     engine._current_btc_price = 110.0
     engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.02 if tid == engine.current_window.up_token_id else 0.98
+    )
 
     trades = engine._check_entry()
 
