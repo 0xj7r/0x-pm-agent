@@ -27,17 +27,12 @@ def _make_engine(coin: str = "btc", supa_available: bool = True):
         mock_ws.get_price.return_value = 0.50
         mock_ws_cls.return_value = mock_ws
 
-        if supa_available:
-            mock_supa = MagicMock()
-            supa_patch = patch(
-                "shared.supabase_client.SupabaseClient",
-                return_value=mock_supa,
-            )
-        else:
-            supa_patch = patch(
-                "shared.supabase_client.SupabaseClient",
-                side_effect=RuntimeError("SUPABASE_URL not set"),
-            )
+        mock_supa = MagicMock()
+        mock_supa.health_check.return_value = True
+        supa_patch = patch(
+            "shared.supabase_client.SupabaseClient",
+            return_value=mock_supa,
+        )
 
         with supa_patch:
             from strategies.strategy_config import StrategyConfig
@@ -45,9 +40,11 @@ def _make_engine(coin: str = "btc", supa_available: bool = True):
             from core.engine import BTCTradingEngine
             engine = BTCTradingEngine(cfg, db_path=":memory:", coin=coin)
 
-        if supa_available:
-            engine._supa = mock_supa
+        engine._supa = mock_supa
         engine.poly_ws = mock_ws
+
+        if not supa_available:
+            engine._supa = None
 
         return engine
 
@@ -73,8 +70,45 @@ def _set_tradeable_window(engine):
 class TestPersistenceGuardrail:
     """Engine should not trade when persistence is broken."""
 
+    def test_engine_init_fails_loudly_when_supabase_missing(self):
+        """Engine should raise on startup if Supabase is unavailable, not silently run."""
+        with patch("core.engine.BinanceWSClient"), \
+             patch("core.engine.MarketWindowScanner"), \
+             patch("core.engine.PolymarketClient"), \
+             patch("core.engine.PolymarketWSClient"), \
+             patch("core.engine.MemoryStore"), \
+             patch("core.engine.SlackNotifier"), \
+             patch("core.engine.PaperTradeResolver"), \
+             patch("core.engine.HealthServer"), \
+             patch("shared.supabase_client.SupabaseClient",
+                   side_effect=RuntimeError("SUPABASE_URL not set")):
+            from strategies.strategy_config import StrategyConfig
+            from core.engine import BTCTradingEngine
+
+            with pytest.raises(RuntimeError):
+                BTCTradingEngine(StrategyConfig(), db_path=":memory:", coin="btc")
+
+    def test_engine_init_fails_when_health_check_fails(self):
+        """Engine should raise on startup if Supabase health check fails (schema mismatch)."""
+        with patch("core.engine.BinanceWSClient"), \
+             patch("core.engine.MarketWindowScanner"), \
+             patch("core.engine.PolymarketClient"), \
+             patch("core.engine.PolymarketWSClient"), \
+             patch("core.engine.MemoryStore"), \
+             patch("core.engine.SlackNotifier"), \
+             patch("core.engine.PaperTradeResolver"), \
+             patch("core.engine.HealthServer"):
+            mock_supa = MagicMock()
+            mock_supa.health_check.return_value = False
+            with patch("shared.supabase_client.SupabaseClient", return_value=mock_supa):
+                from strategies.strategy_config import StrategyConfig
+                from core.engine import BTCTradingEngine
+
+                with pytest.raises(RuntimeError, match="health check"):
+                    BTCTradingEngine(StrategyConfig(), db_path=":memory:", coin="btc")
+
     def test_no_trade_when_supabase_unavailable(self):
-        """If Supabase client failed to initialize, do not enter trades."""
+        """If Supabase client somehow becomes None after startup, do not enter trades."""
         engine = _make_engine(supa_available=False)
         _set_tradeable_window(engine)
 

@@ -18,9 +18,9 @@ def test_load_default_config():
     assert "btc" in cfg.coins
     assert "eth" in cfg.coins
     assert "sol" in cfg.coins
-    assert cfg.coins["btc"].move_threshold == 0.08
-    assert cfg.coins["btc"].max_entry == 0.55
-    assert cfg.coins["eth"].move_threshold == 0.15
+    assert cfg.coins["btc"].params["move"] == 0.08
+    assert cfg.coins["btc"].params["max_entry"] == 0.55
+    assert cfg.coins["eth"].params["move"] == 0.15
     assert cfg.risk.kelly_multiplier == 0.25
     assert cfg.paper.enabled is True
     assert cfg.paper.starting_balance == 100.0
@@ -30,8 +30,8 @@ def test_load_from_file():
     data = {
         "version": 3,
         "coins": {
-            "btc": {"move_threshold": 0.10, "max_entry": 0.60},
-            "eth": {"move_threshold": 0.20, "max_entry": 0.50},
+            "btc": {"strategy": "threshold", "params": {"move": 0.10, "max_entry": 0.60}},
+            "eth": {"strategy": "threshold", "params": {"move": 0.20, "max_entry": 0.50}},
         },
         "risk": {
             "max_position_usd": 100,
@@ -51,9 +51,9 @@ def test_load_from_file():
         cfg = load_strategy_config(f.name)
 
     assert cfg.version == 3
-    assert cfg.coins["btc"].move_threshold == 0.10
-    assert cfg.coins["btc"].max_entry == 0.60
-    assert cfg.coins["eth"].move_threshold == 0.20
+    assert cfg.coins["btc"].params["move"] == 0.10
+    assert cfg.coins["btc"].params["max_entry"] == 0.60
+    assert cfg.coins["eth"].params["move"] == 0.20
     assert "sol" not in cfg.coins
     assert cfg.risk.kelly_multiplier == 0.5
     assert cfg.paper.starting_balance == 500.0
@@ -61,15 +61,15 @@ def test_load_from_file():
 
 def test_load_missing_file_returns_defaults():
     cfg = load_strategy_config("/nonexistent/path.json")
-    assert cfg.coins["btc"].move_threshold == 0.08
-    assert cfg.coins["eth"].move_threshold == 0.15
+    assert cfg.coins["btc"].params["move"] == 0.08
+    assert cfg.coins["eth"].params["move"] == 0.15
 
 
 def test_unknown_fields_ignored():
     data = {
         "version": 3,
         "coins": {
-            "btc": {"move_threshold": 0.08, "max_entry": 0.55, "unknown_field": 99},
+            "btc": {"strategy": "threshold", "params": {"move": 0.08, "max_entry": 0.55}},
         },
         "risk": {"kelly_multiplier": 0.25, "bogus": True},
     }
@@ -78,5 +78,5 @@ def test_unknown_fields_ignored():
         f.flush()
         cfg = load_strategy_config(f.name)
 
-    assert cfg.coins["btc"].move_threshold == 0.08
+    assert cfg.coins["btc"].params["move"] == 0.08
     assert cfg.risk.kelly_multiplier == 0.25

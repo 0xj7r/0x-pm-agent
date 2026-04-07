@@ -36,13 +36,14 @@ class SlackNotifier:
             logger.warning(f"Slack notification failed: {e}")
 
     async def notify_trade(self, direction: str, token_price: float,
-                           size_usd: float, shares: float, p_win: float,
+                           size_usd: float, shares: float, p_win: float | None,
                            btc_price: float, balance: float) -> None:
+        p_win_str = f"{p_win:.3f}" if p_win is not None else "n/a"
         await self._send(
             f"*Paper Trade Executed*\n"
             f"Direction: {direction} @ ${token_price:.3f}\n"
             f"Size: ${size_usd:.2f} ({shares:.0f} shares)\n"
-            f"P({direction}): {p_win:.3f} | BTC: ${btc_price:,.2f}\n"
+            f"P({direction}): {p_win_str} | BTC: ${btc_price:,.2f}\n"
             f"Balance: ${balance:.2f}"
         )
 
@@ -71,12 +72,13 @@ class SlackNotifier:
         )
 
     async def notify_status(self, balance: float, trades: int,
-                            resolved: int, p_up: float,
+                            resolved: int, p_up: float | None,
                             uptime_hours: float) -> None:
+        p_up_str = f"{p_up:.3f}" if p_up is not None else "n/a"
         await self._send(
             f"*Hourly Status*\n"
             f"Balance: ${balance:.2f} | Trades: {trades} (resolved: {resolved})\n"
-            f"P(UP): {p_up:.3f} | Uptime: {uptime_hours:.1f}h"
+            f"P(UP): {p_up_str} | Uptime: {uptime_hours:.1f}h"
         )
 
     async def close(self) -> None:

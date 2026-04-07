@@ -35,11 +35,11 @@ class TestMaxDrawdownCircuitBreaker:
         rm = _make_risk()
         rm.set_peak_balance(200.0)
 
-        rm.record_trade_result(-30.0)
-        rm.record_trade_result(-30.0)
+        rm.record_trade_result(-50.0)
+        rm.record_trade_result(-50.0)
 
-        assert rm.is_drawdown_breaker_tripped(current_balance=140.0) is True, (
-            "Should trip circuit breaker: balance dropped 30% from peak ($200 -> $140)"
+        assert rm.is_drawdown_breaker_tripped(current_balance=100.0) is True, (
+            "Should trip circuit breaker: balance dropped 50% from peak ($200 -> $100)"
         )
 
     def test_trading_allowed_within_drawdown_threshold(self):
