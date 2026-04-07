@@ -15,8 +15,8 @@
         }
     },
     "risk": {
-        "max_position_usd": 50,
-        "max_position_pct": 0.10,
+        "max_position_usd": 12.5,
+        "max_position_pct": 0.025,
         "daily_loss_limit_pct": 0.25,
         "kill_balance_usd": 10,
         "max_concurrent_positions": 20,

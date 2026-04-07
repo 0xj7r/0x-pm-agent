@@ -9,11 +9,11 @@ from __future__ import annotations
 from typing import Callable
 
 
-def _base_check(pm, i: int, move: float, max_entry: float):
+def _base_check(pm, i: int, move: float, max_entry: float, min_entry: float = 0.0):
     """Shared logic: check move threshold, determine direction and entry.
 
     Returns (direction, entry) or ("NONE", 0) if below threshold,
-    or ("SKIP", 0) if entry too expensive.
+    or ("SKIP", 0) if entry too expensive or too cheap.
     """
     if pm.abs_move[i] < move:
         return "NONE", 0.0
@@ -21,7 +21,15 @@ def _base_check(pm, i: int, move: float, max_entry: float):
     entry = pm.price_up[i] if direction == "Up" else pm.price_down[i]
     if entry <= 0 or entry > max_entry:
         return "SKIP", 0.0
+    if entry < min_entry:
+        return "SKIP", 0.0
     return direction, entry
+
+
+def _in_trading_hours(current_hour: int, hour_start: int, hour_end: int) -> bool:
+    if hour_start <= hour_end:
+        return hour_start <= current_hour < hour_end
+    return current_hour >= hour_start or current_hour < hour_end
 
 
 # Filter functions: return True to trade, False to SKIP, None to defer to base
@@ -82,17 +90,24 @@ FILTER_MAP: dict[str, FilterFn] = {
 def build_check_fn(strategy_name: str, params: dict) -> Callable:
     """Build a check function for the given strategy and params.
 
-    Returns fn(pm, i) -> "Up" | "Down" | "SKIP" | None
+    Returns fn(pm, i, current_hour=None) -> "Up" | "Down" | "SKIP" | None
     """
     if strategy_name not in STRATEGY_FILTERS:
         raise ValueError(f"Unknown strategy: {strategy_name}")
 
     move = params.get("move", 0.08)
     max_entry = params.get("max_entry", 0.55)
+    min_entry = params.get("min_entry", 0.0)
+    hour_start = params.get("hour_start")
+    hour_end = params.get("hour_end")
     filters = [FILTER_MAP[f] for f in STRATEGY_FILTERS[strategy_name]]
 
-    def fn(pm, i: int) -> str | None:
-        direction, entry = _base_check(pm, i, move, max_entry)
+    def fn(pm, i: int, current_hour: int | None = None) -> str | None:
+        if hour_start is not None and hour_end is not None and current_hour is not None:
+            if not _in_trading_hours(current_hour, hour_start, hour_end):
+                return "SKIP"
+
+        direction, entry = _base_check(pm, i, move, max_entry, min_entry)
         if direction == "NONE":
             return None
         if direction == "SKIP":
@@ -105,7 +120,7 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
                     return "SKIP"
                 direction = result
                 entry = pm.price_up[i] if direction == "Up" else pm.price_down[i]
-                if entry <= 0 or entry > max_entry:
+                if entry <= 0 or entry > max_entry or entry < min_entry:
                     return "SKIP"
             elif not result:
                 return "SKIP"

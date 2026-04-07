@@ -46,8 +46,20 @@ class BTCTradingEngine:
         try:
             from shared.supabase_client import SupabaseClient
             self._supa = SupabaseClient()
-        except Exception:
-            self._supa = None
+            if not self._supa.health_check():
+                logger.critical(
+                    "FATAL: Supabase health check failed. Trading requires persistence. "
+                    "Check SUPABASE_URL/SUPABASE_KEY env vars and schema."
+                )
+                raise RuntimeError("Supabase health check failed")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.critical(
+                f"FATAL: Could not initialize Supabase client: {e}. "
+                "Trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY env vars."
+            )
+            raise RuntimeError(f"Supabase unavailable: {e}") from e
         self.health = HealthServer(db_path=db_path, supa=self._supa)
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
@@ -65,6 +77,7 @@ class BTCTradingEngine:
 
         self.balance: float = strategy_cfg.paper.starting_balance
         self.risk.set_bankroll(self.balance)
+        self.risk.set_peak_balance(self.balance)
 
         self.current_window: MarketWindow | None = None
         self._window_open_price: float = 0.0
@@ -117,8 +130,20 @@ class BTCTradingEngine:
         if not self.current_window or self._already_traded_this_window:
             return []
         if self._supa is None:
+            if not getattr(self, "_logged_no_supa", False):
+                logger.error(
+                    "BLOCKING ALL TRADES: Supabase client is None. "
+                    "This should never happen after startup health check."
+                )
+                self._logged_no_supa = True
             return []
         if self._current_btc_price == 0:
+            return []
+        if self.balance <= self.risk.kill_balance:
+            return []
+        if self.risk.is_drawdown_breaker_tripped(self.balance):
+            return []
+        if self.risk.is_rate_limited():
             return []
         if self._window_open_price == 0:
             self._window_open_price = self._current_btc_price
@@ -141,10 +166,12 @@ class BTCTradingEngine:
         if not self._window_snaps or self._window_snaps[-1] != current_snap:
             self._window_snaps.append(current_snap)
 
+        current_hour = datetime.now(timezone.utc).hour
         signal = self._strategy.check_signal(
             self.current_window.market_id,
             self._window_open_price,
             self._window_snaps,
+            current_hour=current_hour,
         )
 
         if signal is not None and signal != "SKIP":
@@ -177,6 +204,7 @@ class BTCTradingEngine:
             return []
 
         self._already_traded_this_window = True
+        self.risk.record_trade_entry()
         trade = {
             "market_id": self.current_window.market_id,
             "direction": direction,
@@ -205,23 +233,20 @@ class BTCTradingEngine:
             details=trade,
         )
         if self._supa:
-            try:
-                self._supa.upsert_trade({
-                    "id": f"{self._coin}-{trade['market_id']}-{trade['timestamp']}",
-                    "coin": self._coin,
-                    "strategy": self._strategy.name,
-                    "market_id": trade["market_id"],
-                    "direction": direction,
-                    "token_price": token_price,
-                    "size_usd": size_usd,
-                    "shares": trade["shares"],
-                    "paper": True,
-                    "underlying_price": self._current_btc_price,
-                    "move_pct": move_pct,
-                    "created_at": trade["timestamp"],
-                })
-            except Exception as e:
-                logger.error(f"Supabase trade write failed: {e}")
+            self._supa.upsert_trade_safe({
+                "id": f"{self._coin}-{trade['market_id']}-{trade['timestamp']}",
+                "coin": self._coin,
+                "strategy": self._strategy.name,
+                "market_id": trade["market_id"],
+                "direction": direction,
+                "token_price": token_price,
+                "size_usd": size_usd,
+                "shares": trade["shares"],
+                "paper": True,
+                "underlying_price": self._current_btc_price,
+                "move_pct": move_pct,
+                "created_at": trade["timestamp"],
+            })
         return [trade]
 
     async def _scan_for_window(self) -> None:
@@ -244,6 +269,7 @@ class BTCTradingEngine:
         for trade, res, resolved_dir in resolved:
             self.balance += trade["size_usd"] + res.pnl_usd
             self.risk.record_trade_result(res.pnl_usd)
+            self.risk.update_peak_balance(self.balance)
 
             status = "WON" if res.won else "LOST"
             logger.info(
@@ -266,26 +292,23 @@ class BTCTradingEngine:
                          "resolved_direction": resolved_dir, "trade": trade},
             )
             if self._supa:
-                try:
-                    trade_id = f"{self._coin}-{trade['market_id']}-{trade.get('timestamp', '')}"
-                    self._supa.upsert_trade({
-                        "id": trade_id,
-                        "coin": self._coin,
-                        "strategy": trade.get("strategy", self._strategy.name),
-                        "market_id": trade["market_id"],
-                        "direction": trade["direction"],
-                        "token_price": trade["token_price"],
-                        "size_usd": trade["size_usd"],
-                        "shares": trade.get("shares", 0),
-                        "won": res.won,
-                        "pnl_usd": res.pnl_usd,
-                        "paper": True,
-                        "underlying_price": trade.get("btc_price"),
-                        "move_pct": trade.get("move_pct"),
-                        "resolved_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as e:
-                    logger.error(f"Supabase resolution write failed: {e}")
+                trade_id = f"{self._coin}-{trade['market_id']}-{trade.get('timestamp', '')}"
+                self._supa.upsert_trade_safe({
+                    "id": trade_id,
+                    "coin": self._coin,
+                    "strategy": trade.get("strategy", self._strategy.name),
+                    "market_id": trade["market_id"],
+                    "direction": trade["direction"],
+                    "token_price": trade["token_price"],
+                    "size_usd": trade["size_usd"],
+                    "shares": trade.get("shares", 0),
+                    "won": res.won,
+                    "pnl_usd": res.pnl_usd,
+                    "paper": True,
+                    "underlying_price": trade.get("btc_price"),
+                    "move_pct": trade.get("move_pct"),
+                    "resolved_at": datetime.now(timezone.utc).isoformat(),
+                })
 
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
 
@@ -347,6 +370,9 @@ class BTCTradingEngine:
                                 "up_price": up_live, "down_price": down_live,
                             },
                         )
+
+                        if self._supa and self._supa._dlq:
+                            self._supa.flush_dlq()
 
                         self.health.update(
                             balance=self.balance, trades_total=total,

@@ -31,12 +31,15 @@ def setup_logging(level: str = "INFO") -> None:
 def write_pid() -> None:
     pid_file = Path("btc_agent.pid")
     if pid_file.exists():
-        old_pid = int(pid_file.read_text().strip())
         try:
-            os.kill(old_pid, 0)
-            print(f"Agent already running (PID {old_pid}). Exiting.")
-            sys.exit(1)
-        except OSError:
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid == os.getpid():
+                pid_file.unlink()
+            else:
+                os.kill(old_pid, 0)
+                print(f"Agent already running (PID {old_pid}). Exiting.")
+                sys.exit(1)
+        except (OSError, ValueError):
             pass
     pid_file.write_text(str(os.getpid()))
 

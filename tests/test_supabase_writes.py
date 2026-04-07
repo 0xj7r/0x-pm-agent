@@ -66,7 +66,7 @@ class TestTradeEntryPayload:
         trades = engine._check_entry()
 
         if trades:
-            call_args = mock_supa.upsert_trade.call_args
+            call_args = mock_supa.upsert_trade_safe.call_args
             payload = call_args[0][0] if call_args[0] else call_args[1].get("row", {})
             assert "underlying_price" in payload, (
                 f"Payload should use 'underlying_price', not 'btc_price'. Keys: {list(payload.keys())}"
@@ -97,7 +97,7 @@ class TestTradeEntryPayload:
         trades = engine._check_entry()
 
         if trades:
-            payload = mock_supa.upsert_trade.call_args[0][0]
+            payload = mock_supa.upsert_trade_safe.call_args[0][0]
             required = {
                 "id", "coin", "strategy", "market_id", "direction",
                 "token_price", "size_usd", "shares", "paper",
@@ -127,7 +127,7 @@ class TestTradeEntryPayload:
         trades = engine._check_entry()
 
         if trades:
-            payload = mock_supa.upsert_trade.call_args[0][0]
+            payload = mock_supa.upsert_trade_safe.call_args[0][0]
             assert payload["coin"] == "eth"
 
 
@@ -273,23 +273,26 @@ class TestHealthServerSupaRefresh:
 
 
 class TestSupabaseErrorLogging:
-    """Verify Supabase failures are logged at ERROR level."""
+    """Verify engine uses upsert_trade_safe (which logs errors internally)."""
 
-    def test_entry_write_failure_logs_error(self):
+    def test_entry_uses_safe_write(self):
         import inspect
         from core.engine import BTCTradingEngine
         source = inspect.getsource(BTCTradingEngine._check_entry)
-        assert "logger.error" in source, (
-            "Supabase trade write failure should log at ERROR, not WARNING"
-        )
-        assert 'logger.warning(f"Supabase trade write' not in source, (
-            "Should not use WARNING for Supabase failures"
+        assert "upsert_trade_safe" in source, (
+            "Engine should use upsert_trade_safe for entry writes (handles errors + DLQ)"
         )
 
-    def test_resolution_write_failure_logs_error(self):
+    def test_resolution_uses_safe_write(self):
         import inspect
         from core.engine import BTCTradingEngine
         source = inspect.getsource(BTCTradingEngine._process_resolutions)
-        assert "logger.error" in source, (
-            "Supabase resolution write failure should log at ERROR, not WARNING"
+        assert "upsert_trade_safe" in source, (
+            "Engine should use upsert_trade_safe for resolution writes"
         )
+
+    def test_safe_write_logs_at_error_level(self):
+        import inspect
+        from shared.supabase_client import SupabaseClient
+        source = inspect.getsource(SupabaseClient.upsert_trade_safe)
+        assert "logger.error" in source
