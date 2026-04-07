@@ -41,11 +41,26 @@ from shared.db import get_connection
 logger = logging.getLogger(__name__)
 
 FEATURES_DIR = Path(__file__).parent / "features"
-FEATURE_NAMES = [
+
+# Computed feature arrays (derived from raw snapshot prices)
+COMPUTED_FEATURE_NAMES = [
     "move_pct", "abs_move", "velocity", "consistency",
     "volatility", "token_skew", "elapsed_pct", "acceleration",
     "price_up", "price_down",
 ]
+
+# Raw orderbook passthroughs straight from snapshots, used by the
+# honest execution simulator. NaN indicates the snapshot had no
+# orderbook data (PolyBackTest returned the row without book, or
+# the row was written by the live recorder before the bid/ask
+# columns existed). The simulator must skip rows with NaN best_ask
+# rather than fall back to midpoint.
+ORDERBOOK_FEATURE_NAMES = [
+    "best_bid_up", "best_ask_up", "bid_size_up", "ask_size_up",
+    "best_bid_down", "best_ask_down", "bid_size_down", "ask_size_down",
+]
+
+FEATURE_NAMES = COMPUTED_FEATURE_NAMES + ORDERBOOK_FEATURE_NAMES
 
 
 @dataclass
@@ -188,8 +203,11 @@ def build_feature_store(db_path: Path, coin: str) -> int:
 
     for market_id, winner, open_price in market_rows:
         rows = conn.execute(
-            f"SELECT {price_col}, price_up, price_down FROM snapshots "
-            "WHERE market_id = ? ORDER BY time", (market_id,),
+            f"SELECT {price_col}, price_up, price_down, "
+            "best_bid_up, best_ask_up, bid_size_up, ask_size_up, "
+            "best_bid_down, best_ask_down, bid_size_down, ask_size_down "
+            "FROM snapshots WHERE market_id = ? ORDER BY time",
+            (market_id,),
         ).fetchall()
 
         if len(rows) < 50:
@@ -201,6 +219,17 @@ def build_feature_store(db_path: Path, coin: str) -> int:
 
         effective_open = open_price or prices[0]
         features = _compute_features(prices, effective_open, p_up, p_down)
+
+        # Pass through orderbook columns. None becomes NaN so the
+        # simulator can detect missing book data unambiguously.
+        ob_arrays = {
+            name: np.array(
+                [r[3 + i] if r[3 + i] is not None else np.nan for r in rows],
+                dtype=np.float64,
+            )
+            for i, name in enumerate(ORDERBOOK_FEATURE_NAMES)
+        }
+        features.update(ob_arrays)
 
         n = len(prices)
         for name in FEATURE_NAMES:
@@ -293,8 +322,11 @@ def append_new_markets(db_path: Path, coin: str) -> int:
 
     for market_id, winner, open_price in new_markets:
         rows = conn.execute(
-            f"SELECT {price_col}, price_up, price_down FROM snapshots "
-            "WHERE market_id = ? ORDER BY time", (market_id,),
+            f"SELECT {price_col}, price_up, price_down, "
+            "best_bid_up, best_ask_up, bid_size_up, ask_size_up, "
+            "best_bid_down, best_ask_down, bid_size_down, ask_size_down "
+            "FROM snapshots WHERE market_id = ? ORDER BY time",
+            (market_id,),
         ).fetchall()
 
         if len(rows) < 50:
@@ -305,6 +337,14 @@ def append_new_markets(db_path: Path, coin: str) -> int:
         p_down = np.array([r[2] if r[2] is not None else 0.5 for r in rows], dtype=np.float64)
 
         features = _compute_features(prices, open_price or prices[0], p_up, p_down)
+        ob_arrays = {
+            name: np.array(
+                [r[3 + i] if r[3 + i] is not None else np.nan for r in rows],
+                dtype=np.float64,
+            )
+            for i, name in enumerate(ORDERBOOK_FEATURE_NAMES)
+        }
+        features.update(ob_arrays)
         n = len(prices)
 
         for name in FEATURE_NAMES:
