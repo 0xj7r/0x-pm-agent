@@ -123,7 +123,15 @@ class CoinDataFetcher:
     def fetch_snapshots(
         self, client: httpx.Client, market_id: str
     ) -> list[dict]:
-        """Fetch all snapshots for a single market."""
+        """Fetch all snapshots for a single market.
+
+        Passes include_orderbook=true so the response carries
+        orderbook_up and orderbook_down with full bid/ask depth.
+        Without this flag, PolyBackTest returns midpoint-only
+        snapshots and any sized backtest built on the result is a
+        fiction. Default is false on the API side, so this must be
+        set explicitly.
+        """
         all_snaps: list[dict] = []
         offset = 0
         while True:
@@ -134,6 +142,7 @@ class CoinDataFetcher:
                     "coin": self.coin,
                     "limit": SNAPSHOT_PAGE_LIMIT,
                     "offset": offset,
+                    "include_orderbook": "true",
                 },
                 timeout=15,
             )
