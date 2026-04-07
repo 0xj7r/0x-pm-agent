@@ -168,11 +168,18 @@ class CoinDataFetcher:
         return market["market_id"], rows
 
     def fetch_all(
-        self, limit: int = 9000, move_threshold: float = 0.05
+        self, limit: int = 9000, move_threshold: float = 0.0
     ) -> tuple[int, int]:
         """Fetch headers and snapshots, store in per-coin DB.
 
         Returns (new_markets_stored, snapshot_rows_stored).
+
+        move_threshold defaults to 0.0 so the snapshot sample is unconditional
+        on the underlying's realized move. Filtering by realized move was an
+        API-call optimization that introduced an outcome-conditional sampling
+        bias: strategies trained on the filtered set only ever saw markets
+        where movement was guaranteed to exist, which inflated backtest edges
+        relative to live. Keep this at 0 for unbiased research backfills.
         """
         coin_db_path = db_path(self.coin)
         conn = init_coin_db(coin_db_path)
@@ -303,8 +310,11 @@ def main():
     parser.add_argument(
         "--move-threshold",
         type=float,
-        default=0.05,
-        help="Min price move %% to fetch snapshots",
+        default=0.0,
+        help="Min price move %% to fetch snapshots. Default 0 (no filter). "
+             "Setting >0 introduces outcome-conditional sampling bias and "
+             "should only be used for narrow exploratory pulls, never for "
+             "research backfills.",
     )
     args = parser.parse_args()
     fetcher = CoinDataFetcher(args.coin, args.type, args.snapshot_workers)
