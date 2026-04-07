@@ -6,14 +6,16 @@ with the shared move/direction/entry logic.
 """
 from __future__ import annotations
 
+import itertools
+from dataclasses import dataclass
 from typing import Callable
 
 
-def _base_check(pm, i: int, move: float, max_entry: float):
+def _base_check(pm, i: int, move: float, max_entry: float, min_entry: float = 0.0):
     """Shared logic: check move threshold, determine direction and entry.
 
     Returns (direction, entry) or ("NONE", 0) if below threshold,
-    or ("SKIP", 0) if entry too expensive.
+    or ("SKIP", 0) if entry too expensive or too cheap.
     """
     if pm.abs_move[i] < move:
         return "NONE", 0.0
@@ -21,11 +23,35 @@ def _base_check(pm, i: int, move: float, max_entry: float):
     entry = pm.price_up[i] if direction == "Up" else pm.price_down[i]
     if entry <= 0 or entry > max_entry:
         return "SKIP", 0.0
+    if entry < min_entry:
+        return "SKIP", 0.0
     return direction, entry
+
+
+def _in_trading_hours(current_hour: int, hour_start: int, hour_end: int) -> bool:
+    if hour_start <= hour_end:
+        return hour_start <= current_hour < hour_end
+    return current_hour >= hour_start or current_hour < hour_end
 
 
 # Filter functions: return True to trade, False to SKIP, None to defer to base
 FilterFn = Callable  # (pm, i, direction, params) -> bool | None
+
+
+@dataclass(frozen=True)
+class StrategyDefinition:
+    name: str
+    filters: tuple[str, ...]
+    grid: dict[str, tuple[float, ...]]
+
+    def iter_params(self) -> list[dict]:
+        keys = tuple(self.grid.keys())
+        values = tuple(self.grid[key] for key in keys)
+        return [
+            dict(zip(keys, combo))
+            for combo in itertools.product(*values)
+        ]
+
 
 def _filter_consistency(pm, i, direction, params) -> bool:
     return pm.consistency[i] >= params.get("cons", 0)
@@ -55,17 +81,100 @@ def _filter_acceleration(pm, i, direction, params) -> bool:
     return pm.acceleration[i] <= -accel
 
 
-STRATEGY_FILTERS: dict[str, list[str]] = {
-    "threshold": [],
-    "consistency": ["consistency"],
-    "velocity": ["velocity_dir"],
-    "skew": ["skew"],
-    "timing": ["timing"],
-    "volatility": ["volatility"],
-    "acceleration": ["acceleration"],
-    "combo": ["consistency", "skew", "timing"],
-    "vel+cons": ["velocity_dir", "consistency"],
-    "accel+time": ["timing", "acceleration"],
+STRATEGY_DEFINITIONS: dict[str, StrategyDefinition] = {
+    "threshold": StrategyDefinition(
+        name="threshold",
+        filters=(),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "consistency": StrategyDefinition(
+        name="consistency",
+        filters=("consistency",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "cons": (0.55, 0.60, 0.65, 0.70, 0.75),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "velocity": StrategyDefinition(
+        name="velocity",
+        filters=("velocity_dir",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "vel": (0.005, 0.01, 0.02, 0.03),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "skew": StrategyDefinition(
+        name="skew",
+        filters=("skew",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "skew": (0.02, 0.05, 0.10, 0.15, 0.20),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "timing": StrategyDefinition(
+        name="timing",
+        filters=("timing",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "elapsed": (0.05, 0.10, 0.20, 0.30, 0.50),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "volatility": StrategyDefinition(
+        name="volatility",
+        filters=("volatility",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "vol": (0.001, 0.002, 0.005, 0.01),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "acceleration": StrategyDefinition(
+        name="acceleration",
+        filters=("acceleration",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "accel": (0.005, 0.01, 0.02, 0.03),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "combo": StrategyDefinition(
+        name="combo",
+        filters=("consistency", "skew", "timing"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "cons": (0.55, 0.60, 0.65, 0.70, 0.75),
+            "skew": (0.02, 0.05, 0.10, 0.15),
+            "elapsed": (0.10, 0.20, 0.30, 0.50),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75),
+        },
+    ),
+    "vel+cons": StrategyDefinition(
+        name="vel+cons",
+        filters=("velocity_dir", "consistency"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "vel": (0.005, 0.01, 0.02),
+            "cons": (0.55, 0.65, 0.75),
+            "max_entry": (0.55, 0.65, 0.75),
+        },
+    ),
+    "accel+time": StrategyDefinition(
+        name="accel+time",
+        filters=("timing", "acceleration"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "accel": (0.005, 0.01, 0.02),
+            "elapsed": (0.10, 0.20, 0.30),
+            "max_entry": (0.55, 0.65, 0.75),
+        },
+    ),
 }
 
 FILTER_MAP: dict[str, FilterFn] = {
@@ -82,17 +191,25 @@ FILTER_MAP: dict[str, FilterFn] = {
 def build_check_fn(strategy_name: str, params: dict) -> Callable:
     """Build a check function for the given strategy and params.
 
-    Returns fn(pm, i) -> "Up" | "Down" | "SKIP" | None
+    Returns fn(pm, i, current_hour=None) -> "Up" | "Down" | "SKIP" | None
     """
-    if strategy_name not in STRATEGY_FILTERS:
+    definition = STRATEGY_DEFINITIONS.get(strategy_name)
+    if definition is None:
         raise ValueError(f"Unknown strategy: {strategy_name}")
 
     move = params.get("move", 0.08)
     max_entry = params.get("max_entry", 0.55)
-    filters = [FILTER_MAP[f] for f in STRATEGY_FILTERS[strategy_name]]
+    min_entry = params.get("min_entry", 0.0)
+    hour_start = params.get("hour_start")
+    hour_end = params.get("hour_end")
+    filters = [FILTER_MAP[name] for name in definition.filters]
 
-    def fn(pm, i: int) -> str | None:
-        direction, entry = _base_check(pm, i, move, max_entry)
+    def fn(pm, i: int, current_hour: int | None = None) -> str | None:
+        if hour_start is not None and hour_end is not None and current_hour is not None:
+            if not _in_trading_hours(current_hour, hour_start, hour_end):
+                return "SKIP"
+
+        direction, entry = _base_check(pm, i, move, max_entry, min_entry)
         if direction == "NONE":
             return None
         if direction == "SKIP":
@@ -105,7 +222,7 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
                     return "SKIP"
                 direction = result
                 entry = pm.price_up[i] if direction == "Up" else pm.price_down[i]
-                if entry <= 0 or entry > max_entry:
+                if entry <= 0 or entry > max_entry or entry < min_entry:
                     return "SKIP"
             elif not result:
                 return "SKIP"
@@ -113,3 +230,13 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
         return direction
 
     return fn
+
+
+def build_strategy_grid(strategy_names: list[str] | None = None) -> list[tuple[str, dict, Callable]]:
+    selected = strategy_names or list(STRATEGY_DEFINITIONS.keys())
+    grid: list[tuple[str, dict, Callable]] = []
+    for name in selected:
+        definition = STRATEGY_DEFINITIONS[name]
+        for params in definition.iter_params():
+            grid.append((name, params, build_check_fn(name, params)))
+    return grid

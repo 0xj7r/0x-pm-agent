@@ -4,9 +4,10 @@ Runs stochastic simulation and outputs an interactive HTML file
 with P5/P25/median/P75/P95 equity curves.
 
 Usage:
-    python backtesting/visualize.py
-    python backtesting/visualize.py --output chart.html --sims 3000
+    python backtesting/analysis/visualize.py
+    python backtesting/analysis/visualize.py --output chart.html --sims 3000
 """
+
 from __future__ import annotations
 
 import argparse
@@ -16,13 +17,16 @@ import random
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from backtesting.projection import MonteCarloSimulator, slippage
+from backtesting.analysis.projection import MonteCarloSimulator, slippage
 from shared.fees import taker_fee
 
-logger = logging.getLogger(__name__)
-DB_PATH = Path(__file__).parent / "historical.db"
+logger = logging.getL
+
+
+ogger(__name__)
+DB_PATH = Path(__file__).parent.parent / "historical.db"
 
 
 def run_simulation_paths(
@@ -104,7 +108,7 @@ def run_simulation_paths(
         percentiles["p75"].append(round(vals[int(n * 0.75)], 2))
         percentiles["p95"].append(round(vals[int(n * 0.95)], 2))
 
-    days_per_snapshot = (snapshot_interval / trades_per_day)
+    days_per_snapshot = snapshot_interval / trades_per_day
     x_labels = [round(i * days_per_snapshot, 1) for i in range(max_len)]
 
     return {
@@ -283,7 +287,9 @@ makeChart('logChart', true);
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=str, default=str(DB_PATH))
     parser.add_argument("--output", type=str, default="backtesting/monte_carlo.html")
@@ -311,7 +317,8 @@ def main():
     for label, wr in scenarios:
         logger.info(f"Simulating {label} (WR={wr:.0%})...")
         all_results[label] = run_simulation_paths(
-            trades, wr,
+            trades,
+            wr,
             starting_balance=args.start,
             num_sims=args.sims,
             months=args.months,
