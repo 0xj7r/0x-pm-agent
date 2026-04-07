@@ -1,8 +1,8 @@
 """Autoresearch orchestration: grid-search strategies, validate OOS.
 
 Usage:
-    python backtesting/research.py
-    python backtesting/research.py --min-markets 100 --test-pct 0.3
+    python backtesting/research/research.py
+    python backtesting/research/research.py --min-markets 100 --test-pct 0.3
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 from shared.fees import taker_fee
 
 from backtesting.precompute import load_and_precompute
-from backtesting.simulator import (
+from backtesting.research.simulator import (
     StrategyResult,
     build_strategy_grid,
     simulate_strategy,
@@ -21,7 +21,7 @@ from backtesting.simulator import (
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent / "historical.db"
+DB_PATH = Path(__file__).parent.parent / "historical.db"
 
 
 def run_autoresearch(

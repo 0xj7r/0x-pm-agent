@@ -5,18 +5,21 @@ stores them in per-coin SQLite databases. Supports 429 retry
 with exponential backoff.
 
 Usage:
-    python backtesting/fetcher.py --coin btc --limit 9000
-    python backtesting/fetcher.py --coin eth --limit 8000
-    python backtesting/fetcher.py --coin sol --limit 5000
+    python backtesting/data/fetcher.py --coin btc --limit 9000
+    python backtesting/data/fetcher.py --coin eth --limit 8000
+    python backtesting/data/fetcher.py --coin sol --limit 5000
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 from pathlib import Path
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from shared.constants import (
     POLYBACKTEST_API_BASE,
@@ -41,16 +44,25 @@ class CoinDataFetcher:
         return {"X-API-Key": self.api_key}
 
     def _api_get(self, client: httpx.Client, url: str, **kwargs) -> httpx.Response:
-        """GET with retry on 429."""
+        """GET with retry on 429 and transient network failures."""
         for attempt in range(5):
-            resp = client.get(url, headers=self._headers(), **kwargs)
+            try:
+                resp = client.get(url, headers=self._headers(), **kwargs)
+            except httpx.HTTPError as exc:
+                wait = 2 ** attempt
+                logger.warning(
+                    f"[{self.coin.upper()}] request failed ({exc.__class__.__name__}), "
+                    f"retrying in {wait}s"
+                )
+                time.sleep(wait)
+                continue
             if resp.status_code == 429:
                 wait = 2 ** attempt
                 logger.warning(f"[{self.coin.upper()}] 429, waiting {wait}s...")
                 time.sleep(wait)
                 continue
             return resp
-        return resp
+        raise RuntimeError(f"[{self.coin.upper()}] failed to fetch {url} after retries")
 
     def fetch_headers(
         self, client: httpx.Client, limit: int = 9000

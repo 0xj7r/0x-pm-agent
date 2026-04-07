@@ -1,20 +1,23 @@
 {
-    "version": 4,
-    "coins": {
+  "version": 5,
+  "default_profile": "default",
+  "profiles": {
+    "default": {
+      "coins": {
         "btc": {
-            "strategy": "skew",
-            "params": {"move": 0.08, "skew": 0.02, "max_entry": 0.55}
+          "strategy": "skew",
+          "params": { "move": 0.08, "skew": 0.02, "max_entry": 0.55 }
         },
         "eth": {
-            "strategy": "skew",
-            "params": {"move": 0.08, "skew": 0.02, "max_entry": 0.55}
+          "strategy": "skew",
+          "params": { "move": 0.08, "skew": 0.02, "max_entry": 0.55 }
         },
         "sol": {
-            "strategy": "disabled",
-            "params": {}
+          "strategy": "disabled",
+          "params": {}
         }
-    },
-    "risk": {
+      },
+      "risk": {
         "max_position_usd": 50,
         "max_position_pct": 0.10,
         "daily_loss_limit_pct": 0.25,
@@ -23,9 +26,101 @@
         "loss_cooldown_trades": 5,
         "loss_cooldown_seconds": 300,
         "kelly_multiplier": 0.25
-    },
-    "paper": {
+      },
+      "paper": {
         "enabled": true,
         "starting_balance": 100.0
+      }
+    },
+    "relaxed": {
+      "coins": {
+        "btc": {
+          "strategy": "threshold",
+          "params": { "move": 0.08, "max_entry": 0.75 }
+        },
+        "eth": {
+          "strategy": "threshold",
+          "params": { "move": 0.08, "max_entry": 0.75 }
+        },
+        "sol": {
+          "strategy": "disabled",
+          "params": {}
+        }
+      },
+      "risk": {
+        "max_position_usd": 12.5,
+        "max_position_pct": 0.025,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 10,
+        "max_concurrent_positions": 20,
+        "loss_cooldown_trades": 5,
+        "loss_cooldown_seconds": 300,
+        "kelly_multiplier": 0.25
+      },
+      "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+      }
+    },
+    "low_thresh": {
+      "coins": {
+        "btc": {
+          "strategy": "threshold",
+          "params": { "move": 0.05, "max_entry": 0.55 }
+        },
+        "eth": {
+          "strategy": "threshold",
+          "params": { "move": 0.05, "max_entry": 0.55 }
+        },
+        "sol": {
+          "strategy": "disabled",
+          "params": {}
+        }
+      },
+      "risk": {
+        "max_position_usd": 12.5,
+        "max_position_pct": 0.025,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 10,
+        "max_concurrent_positions": 20,
+        "loss_cooldown_trades": 5,
+        "loss_cooldown_seconds": 300,
+        "kelly_multiplier": 0.25
+      },
+      "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+      }
+    },
+    "realmoney": {
+      "coins": {
+        "eth": {
+          "strategy": "skew",
+          "params": { "move": 0.08, "skew": 0.02, "max_entry": 0.55 }
+        },
+        "btc": {
+          "strategy": "disabled",
+          "params": {}
+        },
+        "sol": {
+          "strategy": "disabled",
+          "params": {}
+        }
+      },
+      "risk": {
+        "max_position_usd": 5.0,
+        "max_position_pct": 0.05,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 5,
+        "max_concurrent_positions": 5,
+        "loss_cooldown_trades": 3,
+        "loss_cooldown_seconds": 600,
+        "kelly_multiplier": 0.25
+      },
+      "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+      }
     }
+  }
 }

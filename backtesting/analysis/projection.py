@@ -5,7 +5,7 @@ liquidity caps) and Kelly-optimized sequential projection into a single
 MonteCarloSimulator class.
 
 Usage:
-    python backtesting/projection.py
+    python backtesting/analysis/projection.py
 """
 from __future__ import annotations
 
@@ -18,13 +18,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backtesting.precompute import load_and_precompute, PrecomputedMarket
 from shared.fees import taker_fee
 
 logger = logging.getLogger(__name__)
-DB_PATH = Path(__file__).parent / "historical.db"
+DB_PATH = Path(__file__).parent.parent / "historical.db"
 
 from shared.fees import taker_fee as _taker_fee
 

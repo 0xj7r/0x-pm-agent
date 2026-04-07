@@ -1,9 +1,10 @@
-"""Entry point for the BTC 5-minute sniper agent.
+"""Entry point for the Polymarket sniper agent.
 
 Usage:
-    python btc_main.py                    # paper trading (default)
-    python btc_main.py --live             # live trading
-    python btc_main.py --config path.json # custom config
+    python main.py                              # paper trading, default profile
+    python main.py --profile relaxed            # alternate config profile
+    python main.py --live                       # live trading
+    python main.py --config path.json           # custom config
 """
 from __future__ import annotations
 
@@ -31,12 +32,15 @@ def setup_logging(level: str = "INFO") -> None:
 def write_pid() -> None:
     pid_file = Path("btc_agent.pid")
     if pid_file.exists():
-        old_pid = int(pid_file.read_text().strip())
         try:
-            os.kill(old_pid, 0)
-            print(f"Agent already running (PID {old_pid}). Exiting.")
-            sys.exit(1)
-        except OSError:
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid == os.getpid():
+                pid_file.unlink()
+            else:
+                os.kill(old_pid, 0)
+                print(f"Agent already running (PID {old_pid}). Exiting.")
+                sys.exit(1)
+        except (OSError, ValueError):
             pass
     pid_file.write_text(str(os.getpid()))
 
@@ -52,7 +56,8 @@ async def main(config_path: str, live: bool, coin: str) -> None:
     from strategies.live_runtime import LiveRuntimeStrategy
     from strategies.strategy_config import CoinStrategyConfig, load_strategy_config
 
-    cfg = load_strategy_config(config_path)
+    profile = os.getenv("STRATEGY_PROFILE")
+    cfg = load_strategy_config(config_path, profile=profile)
     if live:
         cfg.paper.enabled = False
 
@@ -70,11 +75,13 @@ async def main(config_path: str, live: bool, coin: str) -> None:
 
     def handle_reload(sig: int, frame: object) -> None:
         logging.info("SIGHUP received, reloading strategy config...")
-        new_cfg = load_strategy_config(config_path)
+        new_cfg = load_strategy_config(config_path, profile=profile)
         engine.cfg = new_cfg
-        from dataclasses import asdict
         coin_conf = new_cfg.coins.get(coin, CoinStrategyConfig())
-        engine._strategy = LiveRuntimeStrategy.from_config(coin, asdict(coin_conf))
+        engine.set_strategy(LiveRuntimeStrategy.from_config(coin, {
+            "strategy": coin_conf.strategy,
+            "params": dict(coin_conf.params),
+        }))
         logging.info("Config reloaded")
 
     signal.signal(signal.SIGHUP, handle_reload)
@@ -97,11 +104,15 @@ async def main(config_path: str, live: bool, coin: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Polymarket 5-Minute Sniper Agent")
-    parser.add_argument("--config", default="strategy_config.json", help="Path to strategy config JSON")
+    parser.add_argument("--config", default=os.getenv("STRATEGY_CONFIG", "strategy_config.json"), help="Path to strategy config JSON")
+    parser.add_argument("--profile", dest="profile", default=os.getenv("STRATEGY_PROFILE"), help="Named config profile from the canonical strategy config")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: paper)")
     parser.add_argument("--coin", default="btc", choices=["btc", "eth", "sol"], help="Coin to trade (default: btc)")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     args = parser.parse_args()
+
+    if args.profile:
+        os.environ["STRATEGY_PROFILE"] = args.profile
 
     setup_logging(args.log_level)
     write_pid()

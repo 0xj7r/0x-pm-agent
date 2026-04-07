@@ -6,19 +6,22 @@ price at that moment. If it's below MAX_ENTRY_PRICE, the trade
 would have been profitable (collect $1 per share at resolution).
 
 Usage:
-    python backtesting/validate_latency_arb.py
-    python backtesting/validate_latency_arb.py --threshold 0.03 --max-entry 0.55
+    python backtesting/eval/validate_latency_arb.py
+    python backtesting/eval/validate_latency_arb.py --threshold 0.03 --max-entry 0.55
 """
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from shared.db import get_connection, market_start_col, snapshot_price_col
 from shared.fees import taker_fee
 
-DB_PATH = Path(__file__).parent / "historical.db"
+DB_PATH = Path(__file__).parent.parent / "historical.db"
 
 
 @dataclass

@@ -10,7 +10,6 @@ import asyncio
 import logging
 import os
 import time as _time
-from dataclasses import asdict
 from datetime import datetime, timezone
 
 from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
@@ -22,11 +21,12 @@ from core.memory import MemoryStore
 from core.notifier import SlackNotifier
 from core.resolver import PaperTradeResolver
 from core.risk import RiskManager
+from core.trade_persistence import TradePersistence
 from config import Config
 from models.market import MarketWindow
 from shared.constants import COIN_CONFIGS
 from strategies.live_runtime import LiveRuntimeStrategy
-from strategies.strategy_config import CoinStrategyConfig, StrategyConfig
+from strategies.strategy_config import StrategyConfig, normalize_coin_config
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +39,36 @@ class BTCTradingEngine:
     def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc") -> None:
         self.cfg = strategy_cfg
         self._coin = coin.lower()
-        coin_conf = strategy_cfg.coins.get(self._coin, CoinStrategyConfig())
-        self._strategy = LiveRuntimeStrategy.from_config(self._coin, asdict(coin_conf))
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
         try:
             from shared.supabase_client import SupabaseClient
             self._supa = SupabaseClient()
-        except Exception:
-            self._supa = None
+            if not self._supa.health_check():
+                logger.critical(
+                    "FATAL: Supabase health check failed. Trading requires persistence. "
+                    "Check SUPABASE_URL/SUPABASE_KEY env vars and schema."
+                )
+                raise RuntimeError("Supabase health check failed")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.critical(
+                f"FATAL: Could not initialize Supabase client: {e}. "
+                "Trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY env vars."
+            )
+            raise RuntimeError(f"Supabase unavailable: {e}") from e
+        coin_conf = normalize_coin_config(strategy_cfg.coins.get(self._coin))
+        strategy_config = {
+            "strategy": coin_conf.strategy,
+            "params": dict(coin_conf.params),
+        }
+        self._strategy = LiveRuntimeStrategy.from_config(self._coin, strategy_config)
         self.health = HealthServer(db_path=db_path, supa=self._supa)
         self.slack = SlackNotifier()
         self.resolver = PaperTradeResolver()
         self.poly_ws = PolymarketWSClient()
+        self.persistence = TradePersistence(self._coin, self.memory, self._supa)
 
         self._polymarket: PolymarketClient | None = None
         if not strategy_cfg.paper.enabled:
@@ -65,6 +82,7 @@ class BTCTradingEngine:
 
         self.balance: float = strategy_cfg.paper.starting_balance
         self.risk.set_bankroll(self.balance)
+        self.risk.set_peak_balance(self.balance)
 
         self.current_window: MarketWindow | None = None
         self._window_open_price: float = 0.0
@@ -76,7 +94,7 @@ class BTCTradingEngine:
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
         self._latest_book: OrderBookSnapshot | None = None
-        self._window_snaps: list[tuple[float, float, float]] = []
+        self._last_processed_snap: tuple[float, float, float] | None = None
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -94,8 +112,9 @@ class BTCTradingEngine:
         self.current_window = window
         self._window_open_price = self._current_btc_price
         self._already_traded_this_window = False
-        self._window_snaps = []
-        self._open_price_backfilled = self._window_open_price > 0
+        self._last_processed_snap = None
+        if self._window_open_price > 0:
+            self._strategy.start_window(window.market_id, self._window_open_price)
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
@@ -116,11 +135,25 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
+        if self._supa is None:
+            if not getattr(self, "_logged_no_supa", False):
+                logger.error(
+                    "BLOCKING ALL TRADES: Supabase client is None. "
+                    "This should never happen after startup health check."
+                )
+                self._logged_no_supa = True
+            return []
         if self._current_btc_price == 0:
+            return []
+        if self.balance <= self.risk.kill_balance:
+            return []
+        if self.risk.is_drawdown_breaker_tripped(self.balance):
+            return []
+        if self.risk.is_rate_limited():
             return []
         if self._window_open_price == 0:
             self._window_open_price = self._current_btc_price
-            self._open_price_backfilled = True
+            self._strategy.start_window(self.current_window.market_id, self._window_open_price)
             logger.info(f"Backfilled open price: ${self._window_open_price:,.2f}")
             return []
 
@@ -136,24 +169,28 @@ class BTCTradingEngine:
         price_down = self.poly_ws.get_price(self.current_window.down_token_id)
 
         current_snap = (self._current_btc_price, price_up, price_down)
-        if not self._window_snaps or self._window_snaps[-1] != current_snap:
-            self._window_snaps.append(current_snap)
+        if self._last_processed_snap == current_snap:
+            return []
+        self._last_processed_snap = current_snap
 
+        current_hour = datetime.now(timezone.utc).hour
         signal = self._strategy.check_signal(
             self.current_window.market_id,
             self._window_open_price,
-            self._window_snaps,
+            current_snap,
+            current_hour=current_hour,
         )
+        snap_count = self._strategy.num_snaps
 
         if signal is not None and signal != "SKIP":
             logger.info(
                 f"SIGNAL: {signal} | move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
-                f"snaps={len(self._window_snaps)}"
+                f"snaps={snap_count}"
             )
-        elif abs(move_pct) >= 0.04 and len(self._window_snaps) % 20 == 0:
+        elif abs(move_pct) >= 0.04 and snap_count > 0 and snap_count % 20 == 0:
             logger.info(
                 f"Checking: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
-                f"signal={signal} | snaps={len(self._window_snaps)}"
+                f"signal={signal} | snaps={snap_count}"
             )
 
         if signal is None or signal == "SKIP":
@@ -175,6 +212,7 @@ class BTCTradingEngine:
             return []
 
         self._already_traded_this_window = True
+        self.risk.record_trade_entry()
         trade = {
             "market_id": self.current_window.market_id,
             "direction": direction,
@@ -194,32 +232,7 @@ class BTCTradingEngine:
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
             f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
         )
-        self.memory.save_event(
-            window_id=self.current_window.market_id,
-            event_type="entry",
-            log_odds=None,
-            p_up=None,
-            btc_price=self._current_btc_price,
-            details=trade,
-        )
-        if self._supa:
-            try:
-                self._supa.upsert_trade({
-                    "id": f"{self._coin}-{trade['market_id']}-{trade['timestamp']}",
-                    "coin": self._coin,
-                    "strategy": self._strategy.name,
-                    "market_id": trade["market_id"],
-                    "direction": direction,
-                    "token_price": token_price,
-                    "size_usd": size_usd,
-                    "shares": trade["shares"],
-                    "paper": True,
-                    "underlying_price": self._current_btc_price,
-                    "move_pct": move_pct,
-                    "created_at": trade["timestamp"],
-                })
-            except Exception as e:
-                logger.error(f"Supabase trade write failed: {e}")
+        self.persistence.record_entry(self._strategy.name, trade)
         return [trade]
 
     async def _scan_for_window(self) -> None:
@@ -242,6 +255,7 @@ class BTCTradingEngine:
         for trade, res, resolved_dir in resolved:
             self.balance += trade["size_usd"] + res.pnl_usd
             self.risk.record_trade_result(res.pnl_usd)
+            self.risk.update_peak_balance(self.balance)
 
             status = "WON" if res.won else "LOST"
             logger.info(
@@ -256,36 +270,14 @@ class BTCTradingEngine:
                 resolved_direction=resolved_dir,
                 balance=self.balance,
             )
-            self.memory.save_event(
-                window_id=trade["market_id"],
-                event_type="resolution",
-                p_up=None, log_odds=None, btc_price=None,
-                details={"won": res.won, "pnl_usd": res.pnl_usd,
-                         "resolved_direction": resolved_dir, "trade": trade},
-            )
-            if self._supa:
-                try:
-                    trade_id = f"{self._coin}-{trade['market_id']}-{trade.get('timestamp', '')}"
-                    self._supa.upsert_trade({
-                        "id": trade_id,
-                        "coin": self._coin,
-                        "strategy": trade.get("strategy", self._strategy.name),
-                        "market_id": trade["market_id"],
-                        "direction": trade["direction"],
-                        "token_price": trade["token_price"],
-                        "size_usd": trade["size_usd"],
-                        "shares": trade.get("shares", 0),
-                        "won": res.won,
-                        "pnl_usd": res.pnl_usd,
-                        "paper": True,
-                        "underlying_price": trade.get("btc_price"),
-                        "move_pct": trade.get("move_pct"),
-                        "resolved_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                except Exception as e:
-                    logger.error(f"Supabase resolution write failed: {e}")
+            self.persistence.record_resolution(self._strategy.name, trade, res, resolved_dir)
 
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
+
+    def set_strategy(self, strategy: LiveRuntimeStrategy) -> None:
+        self._strategy = strategy
+        if self.current_window and self._window_open_price > 0:
+            self._strategy.start_window(self.current_window.market_id, self._window_open_price)
 
     async def run(self) -> None:
         self._running = True
@@ -334,17 +326,17 @@ class BTCTradingEngine:
 
                         up_live = self.poly_ws.get_price(self.current_window.up_token_id) if self.current_window else 0
                         down_live = self.poly_ws.get_price(self.current_window.down_token_id) if self.current_window else 0
-                        self.memory.save_event(
+                        self.persistence.record_status(
                             window_id=self.current_window.market_id if self.current_window else "none",
-                            event_type="status_tick",
-                            log_odds=None,
-                            p_up=None,
                             btc_price=self._current_btc_price,
-                            details={
-                                "balance": self.balance, "trades": total,
-                                "up_price": up_live, "down_price": down_live,
-                            },
+                            balance=self.balance,
+                            trades_total=total,
+                            up_price=up_live,
+                            down_price=down_live,
                         )
+
+                        if self._supa and self._supa._dlq:
+                            self._supa.flush_dlq()
 
                         self.health.update(
                             balance=self.balance, trades_total=total,
@@ -387,4 +379,4 @@ class BTCTradingEngine:
 
     async def stop(self) -> None:
         self._running = False
-        self.memory.close()
+        self.persistence.close()

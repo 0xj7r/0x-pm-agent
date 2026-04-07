@@ -1,214 +1,188 @@
-"""Continuous autoresearch runner.
+"""Autoresearch orchestration with fixed evaluator and structured artifacts.
 
-Pulls latest data, builds feature store, grid-searches strategies,
-saves candidates for human review. Does NOT auto-deploy.
-
-Usage:
-    python autoresearch/runner.py                    # one-shot, all coins
-    python autoresearch/runner.py --coin btc          # one coin
-    python autoresearch/runner.py --loop --interval 3600  # continuous, hourly
+The agent may refine search directions and Python search code, but large-scale
+candidate evaluation always runs through deterministic Python and the canonical
+validator.
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
 import logging
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from backtesting.feature_store import build_feature_store, load_feature_store, FEATURE_NAMES
-from shared.fees import taker_fee
-from shared.constants import COINS, db_path as default_db_path
+from autoresearch.metrics import (
+    compute_max_drawdown,
+    compute_sharpe,
+    is_result_significant,
+    score_trades,
+    sort_results,
+)
+from autoresearch.models import CandidateArtifact, ExperimentRecord
+from autoresearch.search import shortlist_candidates
+from autoresearch.store import (
+    append_experiment,
+    fingerprint_dataset,
+    load_current_best,
+    save_candidate,
+    utc_now,
+)
+from backtesting.eval.validate_strategy_readiness import validate_coin
+from shared.constants import COINS
 
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-RESULTS_PATH = BASE_DIR / "backtesting" / "strategy_results.json"
-CANDIDATES_DIR = BASE_DIR / "autoresearch" / "candidates"
+
+def _candidate_is_better(candidate: dict, current_best: dict) -> bool:
+    previous = current_best.get("best_strategy", {})
+    prev_score = previous.get("test_sharpe", float("-inf"))
+    return candidate.get("test_sharpe", float("-inf")) > prev_score
 
 
-def _current_best() -> dict:
-    if not RESULTS_PATH.exists():
-        return {}
-    return json.loads(RESULTS_PATH.read_text())
+def _profile_patch(coin: str, candidate: dict) -> dict:
+    return {
+        "coins": {
+            coin: {
+                "strategy": candidate["name"],
+                "params": candidate["params"],
+            }
+        }
+    }
 
 
-def _save_candidate(coin: str, candidate: dict) -> Path:
-    CANDIDATES_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = CANDIDATES_DIR / f"{stamp}-{coin}.json"
-    path.write_text(json.dumps(candidate, indent=2))
-    return path
+def _acceptance_reason(best: dict, validation: dict, current_best: dict) -> tuple[bool, str]:
+    readiness = validation["readiness"]
+    if readiness == "reject_for_now":
+        return False, "validator_rejected"
+    if not _candidate_is_better(best, current_best):
+        return False, "no_improvement_over_current_best"
+    return True, "accepted_for_review"
 
 
-def run_grid_search(coin: str, db_dir: Path | None = None) -> list[dict]:
-    """Fast grid search using the feature store."""
-    try:
-        manifest, f = load_feature_store(coin)
-    except FileNotFoundError:
-        db = Path(db_dir) / f"{coin}.db" if db_dir else default_db_path(coin)
-        if not db.exists():
-            logger.warning(f"[{coin.upper()}] No DB found")
-            return []
-        logger.info(f"[{coin.upper()}] Building feature store...")
-        build_feature_store(db, coin)
-        manifest, f = load_feature_store(coin)
-
-    if len(manifest) < 30:
-        logger.warning(f"[{coin.upper()}] Only {len(manifest)} markets, skipping")
-        return []
-
-    split = int(len(manifest) * 0.7)
-    train, test = manifest[:split], manifest[split:]
-
-    import numpy as np
-
-    results = []
-    configs_tested = 0
-
-    for thresh in [0.03, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]:
-        for max_e in [0.50, 0.55, 0.60, 0.65, 0.75]:
-            for min_skew in [None, 0.02, 0.05, 0.10]:
-                for min_vol in [0, 0.002, 0.005]:
-                    configs_tested += 1
-
-                    scores = {}
-                    for label, subset in [("train", train), ("test", test)]:
-                        trades = wins = 0
-                        pnl = 0.0
-
-                        for m in subset:
-                            o, n = m.offset, m.length
-                            am = f["abs_move"][o:o+n]
-
-                            above = np.where(am[10:] >= thresh)[0]
-                            if len(above) == 0:
-                                continue
-                            idx = above[0] + 10
-
-                            if min_vol > 0 and f["volatility"][o+idx] < min_vol:
-                                continue
-                            if min_skew is not None and f["token_skew"][o+idx] > min_skew:
-                                continue
-
-                            mp = f["move_pct"][o+idx]
-                            d_up = mp > 0
-                            entry = float(f["price_up"][o+idx] if d_up else f["price_down"][o+idx])
-
-                            if entry <= 0 or entry > max_e:
-                                continue
-
-                            trades += 1
-                            won = (d_up and m.winner == "Up") or (not d_up and m.winner == "Down")
-                            fee = entry * taker_fee(entry)
-                            pnl += (1.0 - entry - fee) if won else -(entry + fee)
-                            if won:
-                                wins += 1
-
-                        scores[label] = (trades, wins, pnl)
-
-                    tr_t, tr_w, tr_p = scores["train"]
-                    te_t, te_w, te_p = scores["test"]
-
-                    if tr_t < 5 or te_t < 3 or tr_p <= 0 or te_p <= 0:
-                        continue
-
-                    results.append({
-                        "name": "skew" if min_skew is not None else ("volatility" if min_vol > 0 else "threshold"),
-                        "params": {"move": thresh, "max_entry": max_e, "skew": min_skew, "vol": min_vol},
-                        "train_trades": tr_t,
-                        "train_wins": tr_w,
-                        "train_wr": round(tr_w / tr_t, 4),
-                        "test_trades": te_t,
-                        "test_wins": te_w,
-                        "test_wr": round(te_w / te_t, 4),
-                        "test_pnl": round(te_p, 4),
-                        "test_pnl_per_trade": round(te_p / te_t, 4),
-                    })
-
-    results.sort(key=lambda r: r["test_pnl_per_trade"], reverse=True)
-    logger.info(f"[{coin.upper()}] Tested {configs_tested} configs, "
-                f"{len(results)} profitable on both sets")
-    return results
-
-
-def run_once(coins: list[str], db_dir: Path | None = None) -> list[Path]:
-    current = _current_best()
+def run_once(
+    coins: list[str],
+    db_dir: Path | None = None,
+    shortlist_size: int = 5,
+    strategy_names: list[str] | None = None,
+) -> list[Path]:
+    current = load_current_best()
     saved: list[Path] = []
 
     for coin in coins:
-        logger.info(f"[{coin.upper()}] Running autoresearch...")
-        t0 = time.time()
-        results = run_grid_search(coin, db_dir=db_dir)
-        elapsed = time.time() - t0
-
-        if not results:
-            logger.info(f"[{coin.upper()}] No profitable strategies found ({elapsed:.1f}s)")
+        logger.info("[%s] Starting autoresearch", coin.upper())
+        started = time.time()
+        try:
+            shortlist, total_profitable, manifest, _features, db_path = shortlist_candidates(
+                coin,
+                db_dir=db_dir,
+                limit=shortlist_size,
+                strategy_names=strategy_names,
+            )
+        except FileNotFoundError as exc:
+            logger.warning("[%s] %s", coin.upper(), exc)
             continue
 
-        best = results[0]
-        logger.info(
-            f"[{coin.upper()}] Best: {best['name']} {best['params']} "
-            f"test={best['test_wins']}/{best['test_trades']} ({best['test_wr']:.0%}) "
-            f"${best['test_pnl_per_trade']:+.4f}/trade ({elapsed:.1f}s)"
+        if not shortlist:
+            logger.info("[%s] No significant candidates", coin.upper())
+            continue
+
+        dataset = fingerprint_dataset(coin, db_path, len(manifest))
+        best = shortlist[0]
+        validation = validate_coin(
+            coin,
+            best["name"],
+            best["params"],
+            folds=5,
+            holdout_pct=0.2,
         )
+        current_best = current.get(coin, {})
+        accepted, reason = _acceptance_reason(best, validation, current_best)
+        elapsed = time.time() - started
 
-        previous = current.get(coin, {}).get("best_strategy", {})
-        prev_score = previous.get("test_pnl_per_trade", float("-inf"))
+        record = ExperimentRecord(
+            coin=coin,
+            created_at=utc_now(),
+            dataset=dataset,
+            current_best=current_best,
+            candidate=best,
+            validation=validation,
+            accepted=accepted,
+            reason=reason,
+            search_time_s=round(elapsed, 1),
+        )
+        append_experiment(record)
 
-        if best["test_pnl_per_trade"] > prev_score:
-            candidate = {
-                "coin": coin,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "current_best": previous,
-                "proposed": best,
-                "top_5": results[:5],
-                "total_profitable": len(results),
-                "search_time_s": round(elapsed, 1),
-            }
-            path = _save_candidate(coin, candidate)
-            saved.append(path)
-            logger.info(f"[{coin.upper()}] Candidate saved: {path.name}")
-        else:
-            logger.info(f"[{coin.upper()}] No improvement over current best")
+        if not accepted:
+            logger.info("[%s] Candidate rejected: %s", coin.upper(), reason)
+            continue
+
+        artifact = CandidateArtifact(
+            coin=coin,
+            created_at=record.created_at,
+            current_best=current_best.get("best_strategy", {}),
+            proposed=best,
+            top_5=shortlist[:5],
+            validation=validation,
+            total_profitable=total_profitable,
+            search_time_s=round(elapsed, 1),
+            profile_patch=_profile_patch(coin, best),
+        )
+        path = save_candidate(artifact)
+        saved.append(path)
+        logger.info("[%s] Candidate saved: %s", coin.upper(), path.name)
 
     return saved
 
 
-def main():
+def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--coin", action="append", choices=COINS)
+    parser.add_argument("--db-dir", type=str, default=None)
+    parser.add_argument("--shortlist-size", type=int, default=5)
+    parser.add_argument("--strategy", action="append", default=None, help="Optional strategy names to constrain search")
     parser.add_argument("--loop", action="store_true")
-    parser.add_argument("--interval", type=int, default=86400, help="Seconds between runs in loop mode")
-    parser.add_argument("--db-dir", type=str, default=None, help="Directory containing coin DBs")
+    parser.add_argument("--interval", type=int, default=86400)
     args = parser.parse_args()
 
     coins = args.coin or COINS
     db_dir = Path(args.db_dir) if args.db_dir else None
-
     if args.loop:
-        logger.info(f"Starting autoresearch loop (interval={args.interval}s, coins={coins})")
+        logger.info("Starting autoresearch loop interval=%ss coins=%s", args.interval, coins)
         while True:
-            try:
-                saved = run_once(coins, db_dir=db_dir)
-                for p in saved:
-                    logger.info(f"Candidate: {p}")
-            except Exception as e:
-                logger.error(f"Autoresearch failed: {e}", exc_info=True)
-            logger.info(f"Sleeping {args.interval}s...")
+            saved = run_once(
+                coins,
+                db_dir=db_dir,
+                shortlist_size=args.shortlist_size,
+                strategy_names=args.strategy,
+            )
+            for path in saved:
+                print(f"Candidate: {path}")
+            if not saved:
+                print("No new candidates found")
+            logger.info("Sleeping %ss", args.interval)
             time.sleep(args.interval)
     else:
-        saved = run_once(coins, db_dir=db_dir)
-        for p in saved:
-            print(f"Candidate: {p}")
+        saved = run_once(
+            coins,
+            db_dir=db_dir,
+            shortlist_size=args.shortlist_size,
+            strategy_names=args.strategy,
+        )
+        for path in saved:
+            print(f"Candidate: {path}")
         if not saved:
             print("No new candidates found")
+
+
+__all__ = [
+    "compute_max_drawdown",
+    "compute_sharpe",
+    "is_result_significant",
+    "run_once",
+    "score_trades",
+    "sort_results",
+]
 
 
 if __name__ == "__main__":

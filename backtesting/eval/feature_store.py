@@ -19,8 +19,8 @@ Layout:
         price_down.npy
 
 Usage:
-    python backtesting/feature_store.py build --coin btc
-    python backtesting/feature_store.py build --coin eth --coin sol
+    python backtesting/eval/feature_store.py build --coin btc
+    python backtesting/eval/feature_store.py build --coin eth --coin sol
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from shared.db import get_connection
 
