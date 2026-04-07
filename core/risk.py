@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -41,7 +42,7 @@ class RiskManager:
         self._open_position_count: int = 0
         self._starting_bankroll: float = 0.0
         self._peak_balance: float = 0.0
-        self._trade_timestamps: list[float] = []
+        self._trade_timestamps: deque[float] = deque()
 
     def set_bankroll(self, bankroll: float):
         """Set the starting bankroll for daily loss tracking."""
@@ -109,7 +110,8 @@ class RiskManager:
     def is_rate_limited(self) -> bool:
         """True if more than _max_trades_per_hour entries in the last hour."""
         cutoff = time.time() - 3600
-        self._trade_timestamps = [t for t in self._trade_timestamps if t > cutoff]
+        while self._trade_timestamps and self._trade_timestamps[0] <= cutoff:
+            self._trade_timestamps.popleft()
         if len(self._trade_timestamps) >= self._max_trades_per_hour:
             logger.warning(
                 f"RATE LIMIT: {len(self._trade_timestamps)} trades in last hour "

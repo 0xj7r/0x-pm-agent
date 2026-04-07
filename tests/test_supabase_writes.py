@@ -136,17 +136,16 @@ class TestResolutionPayload:
 
     def test_resolution_uses_underlying_price_not_btc_price(self):
         """The resolution upsert must use 'underlying_price' column."""
-        from core.engine import BTCTradingEngine
-        from core.resolver import ResolutionResult
+        from core.trade_persistence import TradePersistence
 
         # Read the source to verify the column name
         import inspect
-        source = inspect.getsource(BTCTradingEngine._process_resolutions)
+        source = inspect.getsource(TradePersistence.record_resolution)
         assert "underlying_price" in source, (
-            "_process_resolutions should use 'underlying_price' in Supabase payload"
+            "record_resolution should use 'underlying_price' in Supabase payload"
         )
         assert '"btc_price"' not in source.replace("trade.get(\"btc_price\")", ""), (
-            "_process_resolutions should not set 'btc_price' as a Supabase column key"
+            "record_resolution should not set 'btc_price' as a Supabase column key"
         )
 
 
@@ -273,22 +272,22 @@ class TestHealthServerSupaRefresh:
 
 
 class TestSupabaseErrorLogging:
-    """Verify engine uses upsert_trade_safe (which logs errors internally)."""
+    """Verify persistence helpers use upsert_trade_safe (which logs errors internally)."""
 
     def test_entry_uses_safe_write(self):
         import inspect
-        from core.engine import BTCTradingEngine
-        source = inspect.getsource(BTCTradingEngine._check_entry)
+        from core.trade_persistence import TradePersistence
+        source = inspect.getsource(TradePersistence.record_entry)
         assert "upsert_trade_safe" in source, (
-            "Engine should use upsert_trade_safe for entry writes (handles errors + DLQ)"
+            "TradePersistence should use upsert_trade_safe for entry writes"
         )
 
     def test_resolution_uses_safe_write(self):
         import inspect
-        from core.engine import BTCTradingEngine
-        source = inspect.getsource(BTCTradingEngine._process_resolutions)
+        from core.trade_persistence import TradePersistence
+        source = inspect.getsource(TradePersistence.record_resolution)
         assert "upsert_trade_safe" in source, (
-            "Engine should use upsert_trade_safe for resolution writes"
+            "TradePersistence should use upsert_trade_safe for resolution writes"
         )
 
     def test_safe_write_logs_at_error_level(self):
