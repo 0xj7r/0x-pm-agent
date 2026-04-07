@@ -16,6 +16,7 @@ x-agent-service: &agent-service
 services:
   btc-sniper:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-btc-sniper
     ports:
       - "8080:8080"
@@ -27,6 +28,7 @@ services:
 
   eth-sniper:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-eth-sniper
     environment:
       LOG_LEVEL: INFO
@@ -37,6 +39,7 @@ services:
 
   btc-sniper-relaxed:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-btc-relaxed
     environment:
       LOG_LEVEL: INFO
@@ -47,6 +50,7 @@ services:
 
   eth-sniper-relaxed:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-eth-relaxed
     environment:
       LOG_LEVEL: INFO
@@ -57,6 +61,7 @@ services:
 
   btc-low-thresh:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-btc-low-thresh
     environment:
       LOG_LEVEL: INFO
@@ -67,6 +72,7 @@ services:
 
   eth-low-thresh:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-eth-low-thresh
     environment:
       LOG_LEVEL: INFO
@@ -77,6 +83,7 @@ services:
 
   eth-realmoney:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-eth-realmoney
     environment:
       LOG_LEVEL: INFO
@@ -87,6 +94,7 @@ services:
 
   sol-sniper:
     <<: *agent-service
+    profiles: ["trading"]
     container_name: polymarket-sol-sniper
     environment:
       LOG_LEVEL: INFO
