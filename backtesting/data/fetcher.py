@@ -31,6 +31,7 @@ from shared.constants import (
 from shared.db import init_coin_db
 
 logger = logging.getLogger(__name__)
+SNAPSHOT_PAGE_LIMIT = 1000
 
 
 class CoinDataFetcher:
@@ -64,7 +65,14 @@ class CoinDataFetcher:
                 time.sleep(wait)
                 continue
             if resp.status_code == 429:
-                wait = 2 ** attempt
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after is not None:
+                    try:
+                        wait = max(float(retry_after), self.rate_limit)
+                    except ValueError:
+                        wait = 2 ** attempt
+                else:
+                    wait = 2 ** attempt
                 logger.warning(f"[{self.coin.upper()}] 429, waiting {wait}s...")
                 time.sleep(wait)
                 continue
@@ -121,7 +129,11 @@ class CoinDataFetcher:
             resp = self._api_get(
                 client,
                 f"{self.api_base}/v2/markets/{market_id}/snapshots",
-                params={"coin": self.coin, "limit": 500, "offset": offset},
+                params={
+                    "coin": self.coin,
+                    "limit": SNAPSHOT_PAGE_LIMIT,
+                    "offset": offset,
+                },
                 timeout=15,
             )
             if resp.status_code != 200:
@@ -130,9 +142,9 @@ class CoinDataFetcher:
             if not batch:
                 break
             all_snaps.extend(batch)
-            if len(batch) < 500:
+            if len(batch) < SNAPSHOT_PAGE_LIMIT:
                 break
-            offset += 500
+            offset += SNAPSHOT_PAGE_LIMIT
             time.sleep(self.rate_limit)
         return all_snaps
 
