@@ -6,8 +6,15 @@ BACKTESTING_DIR = PROJECT_ROOT / "backtesting"
 WEATHER_DB_PATH = BACKTESTING_DIR / "weather.db"
 
 POLYBACKTEST_API_BASE = "https://api.polybacktest.com"
+# PolyBackTest API keys are not coin-scoped at the API level despite the
+# per-coin layout below. The eth and sol keys both work for any coin's
+# data; the original btc key (pdm_CSreRRkeODfhuBa7rbTqZmnyTliLtixT) was
+# stale and returned 401 Invalid API key on every request, which the
+# fetcher silently swallowed before commit a3 hardened it. Until we get
+# a fresh per-coin key set, all coins use the eth key. The sol key is a
+# fallback if eth ever rate limits or revokes.
 POLYBACKTEST_API_KEYS = {
-    "btc": "pdm_CSreRRkeODfhuBa7rbTqZmnyTliLtixT",
+    "btc": "pdm_heNVotL45QU4bumqMO7MGx7OILU4xFrk",
     "eth": "pdm_heNVotL45QU4bumqMO7MGx7OILU4xFrk",
     "sol": "pdm_qQxtv2aGxgFj2CND74YvG6HVNx32n29Y",
 }

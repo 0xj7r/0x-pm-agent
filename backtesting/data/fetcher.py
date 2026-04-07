@@ -53,7 +53,14 @@ class CoinDataFetcher:
         return {"X-API-Key": self.api_key}
 
     def _api_get(self, client: httpx.Client, url: str, **kwargs) -> httpx.Response:
-        """GET with retry on 429 and transient network failures."""
+        """GET with retry on 429 and transient network failures.
+
+        Auth failures (401, 403) raise immediately rather than being
+        retried. The previous version returned the response and let the
+        caller proceed with an empty body, which silently produced
+        partial datasets when an API key went stale. A stale key must
+        fail loud and stop the run, never silently truncate the data.
+        """
         for attempt in range(5):
             try:
                 resp = client.get(url, headers=self._headers(), **kwargs)
@@ -65,6 +72,12 @@ class CoinDataFetcher:
                 )
                 time.sleep(wait)
                 continue
+            if resp.status_code in (401, 403):
+                raise RuntimeError(
+                    f"[{self.coin.upper()}] auth failure {resp.status_code} on {url}: "
+                    f"{resp.text[:200]}. The API key is stale or revoked. "
+                    f"Refusing to continue and produce a partial dataset."
+                )
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after is not None:
