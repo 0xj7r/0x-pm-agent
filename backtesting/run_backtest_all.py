@@ -18,7 +18,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtesting.precompute import load_and_precompute
-from backtesting.projection import slippage
+from backtesting.analysis.projection import slippage
+from backtesting.eval.evaluator import find_first_trade
 from shared.fees import taker_fee
 from strategies.registry import build_check_fn
 
@@ -44,25 +45,18 @@ def extract_trades(coin: str, params: dict, strategy_name: str) -> list[dict]:
 
     trades = []
     for pm in markets:
-        for i in range(10, pm.num_snaps):
-            d = check_fn(pm, i)
-            if d is None:
-                continue
-            if d == "SKIP":
-                break
-
-            entry = pm.price_up[i] if d == "Up" else pm.price_down[i]
-
-            trades.append({
-                "market_id": pm.market_id,
-                "coin": coin,
-                "direction": d,
-                "winner": pm.winner,
-                "won": d == pm.winner,
-                "entry_price": entry,
-                "liquidity": liq_map.get(pm.market_id, 15000),
-            })
-            break
+        trade = find_first_trade(pm, check_fn)
+        if trade is None:
+            continue
+        trades.append({
+            "market_id": pm.market_id,
+            "coin": coin,
+            "direction": trade.direction,
+            "winner": trade.winner,
+            "won": trade.won,
+            "entry_price": trade.entry_price,
+            "liquidity": liq_map.get(pm.market_id, 15000),
+        })
 
     return trades
 

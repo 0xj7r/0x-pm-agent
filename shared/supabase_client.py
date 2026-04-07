@@ -134,9 +134,30 @@ class SupabaseClient:
         resp.raise_for_status()
 
     def load_markets(self, coin: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        batch_size = 1000
+        while True:
+            batch = self.load_markets_page(coin, limit=batch_size, offset=offset)
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+        return rows
+
+    def load_markets_page(
+        self, coin: str, limit: int = 1000, offset: int = 0
+    ) -> list[dict[str, Any]]:
         resp = self._http.get(
             "/markets",
-            params={"coin": f"eq.{coin}", "order": "start_time.asc"},
+            params={
+                "coin": f"eq.{coin}",
+                "order": "start_time.asc,market_id.asc",
+                "limit": str(limit),
+                "offset": str(offset),
+            },
         )
         resp.raise_for_status()
         return resp.json()
@@ -172,9 +193,45 @@ class SupabaseClient:
         }
 
     def load_snapshots(self, market_id: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        batch_size = 1000
+        while True:
+            batch = self.load_snapshots_page(market_id, limit=batch_size, offset=offset)
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+        return rows
+
+    def load_snapshots_page(
+        self, market_id: str, limit: int = 1000, offset: int = 0
+    ) -> list[dict[str, Any]]:
         resp = self._http.get(
             "/snapshots",
-            params={"market_id": f"eq.{market_id}", "order": "time.asc"},
+            params={
+                "market_id": f"eq.{market_id}",
+                "order": "time.asc,id.asc",
+                "limit": str(limit),
+                "offset": str(offset),
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def load_coin_snapshots_page(
+        self, coin: str, limit: int = 1000, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        resp = self._http.get(
+            "/snapshots",
+            params={
+                "coin": f"eq.{coin}",
+                "order": "time.asc,id.asc",
+                "limit": str(limit),
+                "offset": str(offset),
+            },
         )
         resp.raise_for_status()
         return resp.json()
