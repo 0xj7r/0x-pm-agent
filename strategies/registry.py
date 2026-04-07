@@ -6,6 +6,8 @@ with the shared move/direction/entry logic.
 """
 from __future__ import annotations
 
+import itertools
+from dataclasses import dataclass
 from typing import Callable
 
 
@@ -35,6 +37,22 @@ def _in_trading_hours(current_hour: int, hour_start: int, hour_end: int) -> bool
 # Filter functions: return True to trade, False to SKIP, None to defer to base
 FilterFn = Callable  # (pm, i, direction, params) -> bool | None
 
+
+@dataclass(frozen=True)
+class StrategyDefinition:
+    name: str
+    filters: tuple[str, ...]
+    grid: dict[str, tuple[float, ...]]
+
+    def iter_params(self) -> list[dict]:
+        keys = tuple(self.grid.keys())
+        values = tuple(self.grid[key] for key in keys)
+        return [
+            dict(zip(keys, combo))
+            for combo in itertools.product(*values)
+        ]
+
+
 def _filter_consistency(pm, i, direction, params) -> bool:
     return pm.consistency[i] >= params.get("cons", 0)
 
@@ -63,17 +81,100 @@ def _filter_acceleration(pm, i, direction, params) -> bool:
     return pm.acceleration[i] <= -accel
 
 
-STRATEGY_FILTERS: dict[str, list[str]] = {
-    "threshold": [],
-    "consistency": ["consistency"],
-    "velocity": ["velocity_dir"],
-    "skew": ["skew"],
-    "timing": ["timing"],
-    "volatility": ["volatility"],
-    "acceleration": ["acceleration"],
-    "combo": ["consistency", "skew", "timing"],
-    "vel+cons": ["velocity_dir", "consistency"],
-    "accel+time": ["timing", "acceleration"],
+STRATEGY_DEFINITIONS: dict[str, StrategyDefinition] = {
+    "threshold": StrategyDefinition(
+        name="threshold",
+        filters=(),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "consistency": StrategyDefinition(
+        name="consistency",
+        filters=("consistency",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "cons": (0.55, 0.60, 0.65, 0.70, 0.75),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "velocity": StrategyDefinition(
+        name="velocity",
+        filters=("velocity_dir",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "vel": (0.005, 0.01, 0.02, 0.03),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "skew": StrategyDefinition(
+        name="skew",
+        filters=("skew",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "skew": (0.02, 0.05, 0.10, 0.15, 0.20),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "timing": StrategyDefinition(
+        name="timing",
+        filters=("timing",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "elapsed": (0.05, 0.10, 0.20, 0.30, 0.50),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "volatility": StrategyDefinition(
+        name="volatility",
+        filters=("volatility",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "vol": (0.001, 0.002, 0.005, 0.01),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "acceleration": StrategyDefinition(
+        name="acceleration",
+        filters=("acceleration",),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05, 0.08),
+            "accel": (0.005, 0.01, 0.02, 0.03),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75, 0.85),
+        },
+    ),
+    "combo": StrategyDefinition(
+        name="combo",
+        filters=("consistency", "skew", "timing"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "cons": (0.55, 0.60, 0.65, 0.70, 0.75),
+            "skew": (0.02, 0.05, 0.10, 0.15),
+            "elapsed": (0.10, 0.20, 0.30, 0.50),
+            "max_entry": (0.55, 0.60, 0.65, 0.70, 0.75),
+        },
+    ),
+    "vel+cons": StrategyDefinition(
+        name="vel+cons",
+        filters=("velocity_dir", "consistency"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "vel": (0.005, 0.01, 0.02),
+            "cons": (0.55, 0.65, 0.75),
+            "max_entry": (0.55, 0.65, 0.75),
+        },
+    ),
+    "accel+time": StrategyDefinition(
+        name="accel+time",
+        filters=("timing", "acceleration"),
+        grid={
+            "move": (0.01, 0.02, 0.03, 0.05),
+            "accel": (0.005, 0.01, 0.02),
+            "elapsed": (0.10, 0.20, 0.30),
+            "max_entry": (0.55, 0.65, 0.75),
+        },
+    ),
 }
 
 FILTER_MAP: dict[str, FilterFn] = {
@@ -92,7 +193,8 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
 
     Returns fn(pm, i, current_hour=None) -> "Up" | "Down" | "SKIP" | None
     """
-    if strategy_name not in STRATEGY_FILTERS:
+    definition = STRATEGY_DEFINITIONS.get(strategy_name)
+    if definition is None:
         raise ValueError(f"Unknown strategy: {strategy_name}")
 
     move = params.get("move", 0.08)
@@ -100,7 +202,7 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
     min_entry = params.get("min_entry", 0.0)
     hour_start = params.get("hour_start")
     hour_end = params.get("hour_end")
-    filters = [FILTER_MAP[f] for f in STRATEGY_FILTERS[strategy_name]]
+    filters = [FILTER_MAP[name] for name in definition.filters]
 
     def fn(pm, i: int, current_hour: int | None = None) -> str | None:
         if hour_start is not None and hour_end is not None and current_hour is not None:
@@ -128,3 +230,13 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
         return direction
 
     return fn
+
+
+def build_strategy_grid(strategy_names: list[str] | None = None) -> list[tuple[str, dict, Callable]]:
+    selected = strategy_names or list(STRATEGY_DEFINITIONS.keys())
+    grid: list[tuple[str, dict, Callable]] = []
+    for name in selected:
+        definition = STRATEGY_DEFINITIONS[name]
+        for params in definition.iter_params():
+            grid.append((name, params, build_check_fn(name, params)))
+    return grid

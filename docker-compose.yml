@@ -1,170 +1,120 @@
+x-agent-service: &agent-service
+  build:
+    context: .
+  image: polymarket-agent:latest
+  restart: always
+  env_file:
+    - .env
+  environment:
+    LOG_LEVEL: INFO
+    STRATEGY_CONFIG: /app/strategy_config.json
+    BTC_DB_PATH: /data/btc_trades.db
+  volumes:
+    - ./data:/data
+  command: ["--coin", "btc"]
+
 services:
   btc-sniper:
-    build: .
+    <<: *agent-service
     container_name: polymarket-btc-sniper
-    restart: always
-    env_file:
-      - .env
-    environment:
-      PAPER_TRADE: "true"
-      LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
-      BTC_DB_PATH: /data/btc_trades.db
     ports:
       - "8080:8080"
-    volumes:
-      - ./data:/data
-      - ./strategy_config.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "btc"]
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: default
+      BTC_DB_PATH: /data/btc_trades.db
 
   eth-sniper:
-    build: .
+    <<: *agent-service
     container_name: polymarket-eth-sniper
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: default
       BTC_DB_PATH: /data/eth_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+    command: ["--coin", "eth"]
 
   btc-sniper-relaxed:
-    build: .
+    <<: *agent-service
     container_name: polymarket-btc-relaxed
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: relaxed
       BTC_DB_PATH: /data/btc_relaxed_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config_relaxed.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "btc"]
+    command: ["--coin", "btc"]
 
   eth-sniper-relaxed:
-    build: .
+    <<: *agent-service
     container_name: polymarket-eth-relaxed
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: relaxed
       BTC_DB_PATH: /data/eth_relaxed_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config_relaxed.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+    command: ["--coin", "eth"]
 
   btc-low-thresh:
-    build: .
+    <<: *agent-service
     container_name: polymarket-btc-low-thresh
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: low_thresh
       BTC_DB_PATH: /data/btc_low_thresh_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config_low_thresh.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "btc"]
+    command: ["--coin", "btc"]
 
   eth-low-thresh:
-    build: .
+    <<: *agent-service
     container_name: polymarket-eth-low-thresh
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: low_thresh
       BTC_DB_PATH: /data/eth_low_thresh_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config_low_thresh.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+    command: ["--coin", "eth"]
 
   eth-realmoney:
-    build: .
+    <<: *agent-service
     container_name: polymarket-eth-realmoney
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: realmoney
       BTC_DB_PATH: /data/eth_realmoney_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config_realmoney.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "eth"]
+    command: ["--coin", "eth"]
 
   sol-sniper:
-    build: .
+    <<: *agent-service
     container_name: polymarket-sol-sniper
-    restart: always
-    env_file:
-      - .env
     environment:
-      PAPER_TRADE: "true"
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: default
       BTC_DB_PATH: /data/sol_trades.db
-    volumes:
-      - ./data:/data
-      - ./strategy_config.json:/app/strategy_config.json:ro
-    command: ["--config", "/app/strategy_config.json", "--coin", "sol"]
+    command: ["--coin", "sol"]
 
   snapshot-collector:
-    build: .
+    <<: *agent-service
     container_name: polymarket-snapshot-collector
-    restart: always
-    env_file:
-      - .env
     environment:
       LOG_LEVEL: INFO
-      SUPABASE_URL: https://vbvpaymtuozugylkuqmw.supabase.co
-      SUPABASE_KEY: sb_secret_PkF-TyRBjbsNHo3zNzFmdg_GkhpKMrE
+      STRATEGY_CONFIG: /app/strategy_config.json
     volumes:
       - ./data:/data
       - ./data/snapshots:/app/backtesting
-      - ./strategy_config.json:/app/strategy_config.json:ro
     entrypoint: ["python", "collector/snapshot_recorder.py"]
     command: ["--coin", "btc", "--coin", "eth", "--coin", "sol", "--interval", "1.0"]
 
   autoresearch:
-    build: .
+    <<: *agent-service
     container_name: polymarket-autoresearch
-    restart: always
-    env_file:
-      - .env
     environment:
       LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
     volumes:
       - ./data:/data
       - ./data/snapshots:/data/snapshots
-      - ./strategy_config.json:/app/strategy_config.json:ro
     entrypoint: ["python", "autoresearch/runner.py"]
     command: ["--loop", "--interval", "604800", "--db-dir", "/data/snapshots"]
