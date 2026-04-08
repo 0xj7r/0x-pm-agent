@@ -60,7 +60,23 @@ ORDERBOOK_FEATURE_NAMES = [
     "best_bid_down", "best_ask_down", "bid_size_down", "ask_size_down",
 ]
 
-FEATURE_NAMES = COMPUTED_FEATURE_NAMES + ORDERBOOK_FEATURE_NAMES
+# Regime features computed at the market level (constant within a
+# market's snapshots) using a rolling window of strictly preceding
+# markets. See autoresearch/methods/regime_features.py for the
+# look-ahead-safe computation. These are the features the direction-
+# asymmetric forecaster uses to detect regime changes.
+from autoresearch.methods.regime_features import (  # noqa: E402
+    REGIME_FEATURE_NAMES,
+    PastMarket,
+    RollingMarketWindow,
+)
+
+FEATURE_NAMES = COMPUTED_FEATURE_NAMES + ORDERBOOK_FEATURE_NAMES + REGIME_FEATURE_NAMES
+
+# Default lag window for regime features. ~1.5 hours of 5-min markets.
+# Configurable via env var FEATURE_STORE_LAG_N for experiments.
+import os  # noqa: E402
+DEFAULT_LAG_N = int(os.environ.get("FEATURE_STORE_LAG_N", "20"))
 
 
 @dataclass
@@ -173,25 +189,38 @@ def _compute_features(prices: np.ndarray, btc_open: float,
     }
 
 
-def build_feature_store(db_path: Path, coin: str) -> int:
-    """Build (or rebuild) the feature store for a coin. Returns market count."""
+def build_feature_store(db_path: Path, coin: str, lag_n: int | None = None) -> int:
+    """Build (or rebuild) the feature store for a coin. Returns market count.
+
+    The lag_n parameter controls the rolling window size for regime
+    features. Defaults to DEFAULT_LAG_N (env-overridable) if not given.
+    """
     price_col, start_col = _detect_columns(db_path)
+    if lag_n is None:
+        lag_n = DEFAULT_LAG_N
     conn = get_connection(db_path)
     conn.row_factory = None
 
+    # Need price_end too for the regime feature window
+    end_col = "price_end"
     try:
         market_rows = conn.execute(
-            "SELECT market_id, winner, " + start_col + " FROM markets "
-            "WHERE winner IS NOT NULL AND (coin = ? OR coin IS NULL) ORDER BY start_time",
+            "SELECT market_id, winner, " + start_col + ", " + end_col + ", start_time "
+            "FROM markets "
+            "WHERE winner IS NOT NULL AND " + start_col + " IS NOT NULL "
+            "AND " + end_col + " IS NOT NULL "
+            "AND (coin = ? OR coin IS NULL) ORDER BY start_time",
             (coin,),
         ).fetchall()
     except Exception:
         market_rows = conn.execute(
-            "SELECT market_id, winner, " + start_col + " FROM markets "
-            "WHERE winner IS NOT NULL ORDER BY start_time"
+            "SELECT market_id, winner, " + start_col + ", " + end_col + ", start_time "
+            "FROM markets "
+            "WHERE winner IS NOT NULL AND " + start_col + " IS NOT NULL "
+            "AND " + end_col + " IS NOT NULL ORDER BY start_time"
         ).fetchall()
 
-    logger.info(f"[{coin.upper()}] {len(market_rows)} resolved markets")
+    logger.info(f"[{coin.upper()}] {len(market_rows)} resolved markets, regime lag_n={lag_n}")
 
     # Collect all features into flat arrays
     all_features = {name: [] for name in FEATURE_NAMES}
@@ -201,7 +230,11 @@ def build_feature_store(db_path: Path, coin: str) -> int:
     t0 = time.time()
     processed = 0
 
-    for market_id, winner, open_price in market_rows:
+    # Rolling window for regime features. Look-ahead safety is enforced
+    # by computing features BEFORE appending the current market.
+    regime_window = RollingMarketWindow(lag_n=lag_n)
+
+    for market_id, winner, open_price, end_price, market_start_time in market_rows:
         rows = conn.execute(
             f"SELECT {price_col}, price_up, price_down, "
             "best_bid_up, best_ask_up, bid_size_up, ask_size_up, "
@@ -211,6 +244,15 @@ def build_feature_store(db_path: Path, coin: str) -> int:
         ).fetchall()
 
         if len(rows) < 50:
+            # Still update the regime window so we don't drop these
+            # markets from the past-state computation. They're
+            # genuine resolved markets even if we lack snapshots.
+            regime_window.append(PastMarket(
+                start_time=market_start_time or "",
+                price_start=float(open_price),
+                price_end=float(end_price),
+                winner=winner,
+            ))
             continue
 
         prices = np.array([r[0] or (open_price or 0) for r in rows], dtype=np.float64)
@@ -230,6 +272,29 @@ def build_feature_store(db_path: Path, coin: str) -> int:
             for i, name in enumerate(ORDERBOOK_FEATURE_NAMES)
         }
         features.update(ob_arrays)
+
+        # Compute regime features for THIS market using the window of
+        # strictly preceding markets. The append below happens AFTER
+        # this call, which is the look-ahead-safe order.
+        rf = regime_window.features_for_current(market_start_time or "")
+        rf_dict = rf.to_dict()
+        n = len(prices)
+        regime_arrays = {
+            name: np.full(n, rf_dict[name], dtype=np.float64)
+            for name in REGIME_FEATURE_NAMES
+        }
+        features.update(regime_arrays)
+
+        # Update the rolling window AFTER computing features for the
+        # current market. This is the line that enforces look-ahead
+        # safety: any future call to features_for_current will include
+        # this market in its window, but the current call did not.
+        regime_window.append(PastMarket(
+            start_time=market_start_time or "",
+            price_start=float(open_price),
+            price_end=float(end_price),
+            winner=winner,
+        ))
 
         n = len(prices)
         for name in FEATURE_NAMES:
@@ -283,44 +348,89 @@ def load_feature_store(coin: str) -> tuple[list[MarketMeta], dict[str, np.ndarra
     return manifest, features
 
 
-def append_new_markets(db_path: Path, coin: str) -> int:
-    """Append only markets not already in the store. Returns count of new markets."""
+def append_new_markets(db_path: Path, coin: str, lag_n: int | None = None) -> int:
+    """Append only markets not already in the store. Returns count of new markets.
+
+    Regime features are computed correctly across the boundary by
+    seeding the rolling window with all markets that come before the
+    first new market in chronological order, then processing new
+    markets in order. This gives identical results to a full
+    build_feature_store run for the new markets.
+    """
     sd = store_dir(coin)
     if not (sd / "manifest.json").exists():
-        return build_feature_store(db_path, coin)
+        return build_feature_store(db_path, coin, lag_n=lag_n)
 
+    if lag_n is None:
+        lag_n = DEFAULT_LAG_N
     manifest_raw = json.loads((sd / "manifest.json").read_text())
     existing_ids = {m["market_id"] for m in manifest_raw}
     current_offset = sum(m["length"] for m in manifest_raw)
 
     price_col, start_col = _detect_columns(db_path)
+    end_col = "price_end"
     conn = get_connection(db_path)
     conn.row_factory = None
 
     try:
         market_rows = conn.execute(
-            "SELECT market_id, winner, " + start_col + " FROM markets "
-            "WHERE winner IS NOT NULL AND (coin = ? OR coin IS NULL) ORDER BY start_time",
+            "SELECT market_id, winner, " + start_col + ", " + end_col + ", start_time "
+            "FROM markets WHERE winner IS NOT NULL AND " + start_col + " IS NOT NULL "
+            "AND " + end_col + " IS NOT NULL "
+            "AND (coin = ? OR coin IS NULL) ORDER BY start_time",
             (coin,),
         ).fetchall()
     except Exception:
         market_rows = conn.execute(
-            "SELECT market_id, winner, " + start_col + " FROM markets "
-            "WHERE winner IS NOT NULL ORDER BY start_time"
+            "SELECT market_id, winner, " + start_col + ", " + end_col + ", start_time "
+            "FROM markets WHERE winner IS NOT NULL AND " + start_col + " IS NOT NULL "
+            "AND " + end_col + " IS NOT NULL ORDER BY start_time"
         ).fetchall()
 
-    new_markets = [(mid, w, op) for mid, w, op in market_rows if mid not in existing_ids]
-    if not new_markets:
+    new_markets_idx = [
+        i for i, row in enumerate(market_rows) if row[0] not in existing_ids
+    ]
+    if not new_markets_idx:
         conn.close()
         return 0
 
-    logger.info(f"[{coin.upper()}] Appending {len(new_markets)} new markets")
+    logger.info(f"[{coin.upper()}] Appending {len(new_markets_idx)} new markets, regime lag_n={lag_n}")
+
+    # Seed the rolling window with existing markets (those before the
+    # first new market in chronological order). This ensures regime
+    # features for the first appended market see the correct history.
+    regime_window = RollingMarketWindow(lag_n=lag_n)
+    first_new_idx = new_markets_idx[0]
+    for i in range(first_new_idx):
+        mid, w, ps, pe, st = market_rows[i]
+        regime_window.append(PastMarket(
+            start_time=st or "",
+            price_start=float(ps),
+            price_end=float(pe),
+            winner=w,
+        ))
 
     new_features = {name: [] for name in FEATURE_NAMES}
     new_manifest = []
     offset = current_offset
 
-    for market_id, winner, open_price in new_markets:
+    # Walk through markets in chronological order from first_new_idx
+    # forward. For each one, if it's new, process it; otherwise just
+    # update the window so subsequent new markets see the correct
+    # history.
+    for i in range(first_new_idx, len(market_rows)):
+        market_id, winner, open_price, end_price, market_start_time = market_rows[i]
+        is_new = market_id not in existing_ids
+
+        if not is_new:
+            regime_window.append(PastMarket(
+                start_time=market_start_time or "",
+                price_start=float(open_price),
+                price_end=float(end_price),
+                winner=winner,
+            ))
+            continue
+
         rows = conn.execute(
             f"SELECT {price_col}, price_up, price_down, "
             "best_bid_up, best_ask_up, bid_size_up, ask_size_up, "
@@ -330,6 +440,12 @@ def append_new_markets(db_path: Path, coin: str) -> int:
         ).fetchall()
 
         if len(rows) < 50:
+            regime_window.append(PastMarket(
+                start_time=market_start_time or "",
+                price_start=float(open_price),
+                price_end=float(end_price),
+                winner=winner,
+            ))
             continue
 
         prices = np.array([r[0] or (open_price or 0) for r in rows], dtype=np.float64)
@@ -345,7 +461,26 @@ def append_new_markets(db_path: Path, coin: str) -> int:
             for i, name in enumerate(ORDERBOOK_FEATURE_NAMES)
         }
         features.update(ob_arrays)
+
+        # Regime features for this new market: window contains all
+        # markets strictly preceding it (whether they were in the
+        # original manifest or just appended in this run).
+        rf = regime_window.features_for_current(market_start_time or "")
+        rf_dict = rf.to_dict()
         n = len(prices)
+        regime_arrays = {
+            name: np.full(n, rf_dict[name], dtype=np.float64)
+            for name in REGIME_FEATURE_NAMES
+        }
+        features.update(regime_arrays)
+
+        # Append to window AFTER computing features for this market.
+        regime_window.append(PastMarket(
+            start_time=market_start_time or "",
+            price_start=float(open_price),
+            price_end=float(end_price),
+            winner=winner,
+        ))
 
         for name in FEATURE_NAMES:
             new_features[name].append(features[name])
