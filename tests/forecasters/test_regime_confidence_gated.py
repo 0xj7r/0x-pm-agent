@@ -124,16 +124,16 @@ class TestRegimeConfidenceGated:
 
     def test_returns_nan_when_model_low_conviction(self):
         regime = trained_regime()
-        # Set conviction threshold so high that no realistic q can clear it
+        # min_q_conviction = 0.6 is mathematically impossible to clear
+        # because |q - 0.5| can never exceed 0.5 for q in [0, 1]. This
+        # guarantees the gate fails for ANY model q, no matter how
+        # confident.
         gated = RegimeConfidenceGated(
             regime=regime,
             min_up_frac_distance=0.0,
-            min_q_conviction=0.49,
+            min_q_conviction=0.6,
         )
         callable_fn = gated.as_simulator_forecaster()
-        # |q - 0.5| < 0.49 means q must be in (0.01, 0.99) to fail.
-        # The trained logistic doesn't produce extreme values on synthetic
-        # data, so this gate should reject everything.
         s = make_slice(lag_n_up_frac=0.7)
         q = callable_fn(s, 10)
         assert math.isnan(q)
