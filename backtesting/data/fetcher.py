@@ -55,43 +55,92 @@ class CoinDataFetcher:
     def _api_get(self, client: httpx.Client, url: str, **kwargs) -> httpx.Response:
         """GET with retry on 429 and transient network failures.
 
-        Auth failures (401, 403) raise immediately rather than being
-        retried. The previous version returned the response and let the
-        caller proceed with an empty body, which silently produced
-        partial datasets when an API key went stale. A stale key must
-        fail loud and stop the run, never silently truncate the data.
+        Retry behaviour by error class:
+
+        - Auth failures (401, 403): raise immediately. The API key is
+          stale or revoked; continuing produces a silently partial
+          dataset, which was the bug in the pre-b13db25 version.
+
+        - Rate limit (429): honor Retry-After header if present, else
+          exponential backoff capped at 60s. No attempt cap on 429
+          because a rate limit is expected behaviour during a large
+          backfill; the server is telling us to slow down, not fail.
+
+        - Transient network errors (RemoteProtocolError, ConnectError,
+          ReadTimeout, WriteError, etc.): up to `max_transient_retries`
+          attempts with exponential backoff capped at 120s. Default
+          is 15 attempts which covers minutes of intermittent
+          connectivity loss. The previous limit of 5 with 16s max
+          backoff killed the backfill on minor network flakiness.
+
+        - Other 5xx server errors: retried like transient network
+          errors (same attempt budget).
+
+        - Other responses (2xx, 3xx, 4xx except 401/403/429): returned
+          to the caller as-is.
         """
-        for attempt in range(5):
+        max_transient_retries = 15
+        transient_attempt = 0
+        while True:
             try:
                 resp = client.get(url, headers=self._headers(), **kwargs)
             except httpx.HTTPError as exc:
-                wait = 2 ** attempt
+                transient_attempt += 1
+                if transient_attempt >= max_transient_retries:
+                    raise RuntimeError(
+                        f"[{self.coin.upper()}] exhausted {max_transient_retries} "
+                        f"transient retries on {url}: {exc.__class__.__name__}: {exc}"
+                    )
+                wait = min(2 ** min(transient_attempt, 7), 120)
                 logger.warning(
-                    f"[{self.coin.upper()}] request failed ({exc.__class__.__name__}), "
+                    f"[{self.coin.upper()}] {exc.__class__.__name__} "
+                    f"(attempt {transient_attempt}/{max_transient_retries}), "
                     f"retrying in {wait}s"
                 )
                 time.sleep(wait)
                 continue
+
             if resp.status_code in (401, 403):
                 raise RuntimeError(
                     f"[{self.coin.upper()}] auth failure {resp.status_code} on {url}: "
                     f"{resp.text[:200]}. The API key is stale or revoked. "
                     f"Refusing to continue and produce a partial dataset."
                 )
+
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after is not None:
                     try:
                         wait = max(float(retry_after), self.rate_limit)
                     except ValueError:
-                        wait = 2 ** attempt
+                        wait = min(2 ** min(transient_attempt + 1, 6), 60)
                 else:
-                    wait = 2 ** attempt
+                    wait = min(2 ** min(transient_attempt + 1, 6), 60)
                 logger.warning(f"[{self.coin.upper()}] 429, waiting {wait}s...")
                 time.sleep(wait)
+                # 429 does not count against transient retry budget
                 continue
+
+            if 500 <= resp.status_code < 600:
+                transient_attempt += 1
+                if transient_attempt >= max_transient_retries:
+                    raise RuntimeError(
+                        f"[{self.coin.upper()}] exhausted retries on 5xx "
+                        f"({resp.status_code}) for {url}"
+                    )
+                wait = min(2 ** min(transient_attempt, 7), 120)
+                logger.warning(
+                    f"[{self.coin.upper()}] HTTP {resp.status_code} "
+                    f"(attempt {transient_attempt}/{max_transient_retries}), "
+                    f"retrying in {wait}s"
+                )
+                time.sleep(wait)
+                continue
+
+            # Reset transient counter on any successful response so a
+            # long run with occasional blips doesn't eventually exhaust.
+            transient_attempt = 0
             return resp
-        raise RuntimeError(f"[{self.coin.upper()}] failed to fetch {url} after retries")
 
     def fetch_headers(
         self, client: httpx.Client, limit: int = 9000
