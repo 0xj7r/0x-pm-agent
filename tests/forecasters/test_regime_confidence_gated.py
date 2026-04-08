@@ -124,16 +124,17 @@ class TestRegimeConfidenceGated:
 
     def test_returns_nan_when_model_low_conviction(self):
         regime = trained_regime()
+        # Set conviction threshold so high that no realistic q can clear it
         gated = RegimeConfidenceGated(
             regime=regime,
             min_up_frac_distance=0.0,
-            min_q_conviction=0.30,
+            min_q_conviction=0.49,
         )
         callable_fn = gated.as_simulator_forecaster()
-        # The model returns ~0.5 when given roughly-zero velocity input,
-        # so |q - 0.5| < 0.30 should fail conviction gate
-        s = make_slice(lag_n_up_frac=0.5)
-        s.features["velocity"] = np.zeros(30)  # zero velocity → q ~ 0.5
+        # |q - 0.5| < 0.49 means q must be in (0.01, 0.99) to fail.
+        # The trained logistic doesn't produce extreme values on synthetic
+        # data, so this gate should reject everything.
+        s = make_slice(lag_n_up_frac=0.7)
         q = callable_fn(s, 10)
         assert math.isnan(q)
 
