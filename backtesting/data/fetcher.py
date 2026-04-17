@@ -241,12 +241,20 @@ class CoinDataFetcher:
         best_ask = asks[0].get("price") if asks else None
         bid_sz = bids[0].get("size") if bids else None
         ask_sz = asks[0].get("size") if asks else None
+        # NOTE: orderbook_up_json / orderbook_down_json are deliberately
+        # set to None here. The columns still exist in the schema for
+        # forward compatibility with a future slippage modelling layer,
+        # but storing the full depth as JSON was consuming ~85% of the
+        # on-disk db size (~20GB per coin) with no current reader. The
+        # simulator and feature store only use the scalar best_bid /
+        # best_ask / sizes extracted above. If a slippage model is ever
+        # built, refetch the depth via a one-off backfill run.
         return (
             best_bid,
             best_ask,
             bid_sz,
             ask_sz,
-            json.dumps(ob, separators=(",", ":")),
+            None,
         )
 
     def fetch_snapshot_rows(self, market: dict) -> tuple[str, list[tuple]]:
