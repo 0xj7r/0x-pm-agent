@@ -20,8 +20,11 @@ import time
 from pathlib import Path
 
 import httpx
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 from shared.constants import (
     POLYBACKTEST_API_BASE,
@@ -329,12 +332,18 @@ class CoinDataFetcher:
             ]
             need_snaps: list[dict] = []
 
+            def _as_float(v) -> float:
+                try:
+                    return float(v) if v not in (None, "") else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
             for m in all_markets:
-                ps = (
+                ps = _as_float(
                     m.get("btc_price_start")
                     or m.get(f"{self.coin}_price_start", 0)
                 )
-                pe = (
+                pe = _as_float(
                     m.get("btc_price_end")
                     or m.get(f"{self.coin}_price_end", 0)
                 )
