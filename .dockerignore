@@ -13,6 +13,7 @@ tests/
 *.pkl
 *.npy
 backtesting/features/
+backtesting/eval/features/
 backtesting/btc.db
 backtesting/eth.db
 backtesting/sol.db
