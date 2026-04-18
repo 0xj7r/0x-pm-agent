@@ -41,23 +41,28 @@ class BTCTradingEngine:
         self._coin = coin.lower()
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
+        self._supa = None
         try:
             from shared.supabase_client import SupabaseClient
             self._supa = SupabaseClient()
             if not self._supa.health_check():
-                logger.critical(
-                    "FATAL: Supabase health check failed. Trading requires persistence. "
-                    "Check SUPABASE_URL/SUPABASE_KEY env vars and schema."
-                )
                 raise RuntimeError("Supabase health check failed")
-        except RuntimeError:
-            raise
         except Exception as e:
-            logger.critical(
-                f"FATAL: Could not initialize Supabase client: {e}. "
-                "Trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY env vars."
-            )
-            raise RuntimeError(f"Supabase unavailable: {e}") from e
+            # Supabase mirroring is only required for live trading. Paper mode
+            # persists trades to local SQLite via MemoryStore, which is
+            # sufficient for research/validation runs.
+            if strategy_cfg.paper.enabled:
+                logger.warning(
+                    f"Supabase unavailable ({e}); continuing in paper mode with "
+                    "SQLite-only persistence."
+                )
+                self._supa = None
+            else:
+                logger.critical(
+                    f"FATAL: Could not initialize Supabase client: {e}. "
+                    "Live trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY."
+                )
+                raise RuntimeError(f"Supabase unavailable: {e}") from e
         coin_conf = normalize_coin_config(strategy_cfg.coins.get(self._coin))
         strategy_config = {
             "strategy": coin_conf.strategy,
@@ -135,11 +140,11 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
-        if self._supa is None:
+        if self._supa is None and not self.cfg.paper.enabled:
             if not getattr(self, "_logged_no_supa", False):
                 logger.error(
-                    "BLOCKING ALL TRADES: Supabase client is None. "
-                    "This should never happen after startup health check."
+                    "BLOCKING ALL TRADES: Supabase client is None in live mode. "
+                    "Check SUPABASE_URL/SUPABASE_KEY."
                 )
                 self._logged_no_supa = True
             return []
