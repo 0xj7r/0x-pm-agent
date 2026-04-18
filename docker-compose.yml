@@ -81,6 +81,17 @@ services:
       BTC_DB_PATH: /data/eth_low_thresh_trades.db
     command: ["--coin", "eth"]
 
+  btc-research-t10:
+    <<: *agent-service
+    profiles: ["trading"]
+    container_name: polymarket-btc-research-t10
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t10
+      BTC_DB_PATH: /data/btc_research_t10_trades.db
+    command: ["--coin", "btc"]
+
   eth-realmoney:
     <<: *agent-service
     profiles: ["trading"]
