@@ -29,11 +29,26 @@ COIN_CONFIGS = {
 COINS = ["btc", "eth", "sol", "doge"]
 
 SLUG_PATTERNS = {
-    "btc": "btc-updown-5m-{ts}",
-    "eth": "eth-updown-5m-{ts}",
-    "sol": "sol-updown-5m-{ts}",
-    "doge": "doge-updown-5m-{ts}",
+    "5m": {
+        "btc": "btc-updown-5m-{ts}",
+        "eth": "eth-updown-5m-{ts}",
+        "sol": "sol-updown-5m-{ts}",
+        "doge": "doge-updown-5m-{ts}",
+    },
+    "15m": {
+        "btc": "btc-updown-15m-{ts}",
+        "eth": "eth-updown-15m-{ts}",
+    },
 }
+
+# Map market_type string to its window length in minutes. Single source of
+# truth for boundary rounding, slug stepping, and end_time derivation.
+WINDOW_MINUTES = {"5m": 5, "15m": 15}
+
+
+def slug_pattern(coin: str, market_type: str = "5m") -> str:
+    return SLUG_PATTERNS[market_type][coin]
+
 
 def db_path(coin: str) -> Path:
     """Return the SQLite DB path for a given coin."""
