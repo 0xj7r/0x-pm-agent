@@ -36,20 +36,24 @@ class PrecomputedMarket:
     price_down: list[float]
 
 
-PRECOMPUTE_CACHE_VERSION = 5
+PRECOMPUTE_CACHE_VERSION = 6
 PARALLEL_MARKET_THRESHOLD = 1000
 MAX_PRECOMPUTE_WORKERS = 8
 _THREAD_LOCAL = threading.local()
 
+WINDOW_SNAPS = {"5m": 2500, "15m": 7500}
 
-def _cache_path(db_path: Path, coin: str) -> Path:
+
+def _cache_path(db_path: Path, coin: str, market_type: str) -> Path:
     return db_path.with_name(
-        f"{db_path.stem}.{coin}.precomputed.v{PRECOMPUTE_CACHE_VERSION}.pkl"
+        f"{db_path.stem}.{coin}.{market_type}.precomputed.v{PRECOMPUTE_CACHE_VERSION}.pkl"
     )
 
 
-def _load_cached_precompute(db_path: Path, coin: str) -> list[PrecomputedMarket] | None:
-    cache_path = _cache_path(db_path, coin)
+def _load_cached_precompute(
+    db_path: Path, coin: str, market_type: str
+) -> list[PrecomputedMarket] | None:
+    cache_path = _cache_path(db_path, coin, market_type)
     if not cache_path.exists():
         return None
 
@@ -61,6 +65,8 @@ def _load_cached_precompute(db_path: Path, coin: str) -> list[PrecomputedMarket]
         return None
     if payload.get("coin") != coin:
         return None
+    if payload.get("market_type") != market_type:
+        return None
     if payload.get("db_mtime_ns") != source_stat.st_mtime_ns:
         return None
     if payload.get("db_size") != source_stat.st_size:
@@ -69,17 +75,21 @@ def _load_cached_precompute(db_path: Path, coin: str) -> list[PrecomputedMarket]
 
 
 def _write_cached_precompute(
-    db_path: Path, coin: str, markets: list[PrecomputedMarket]
+    db_path: Path,
+    coin: str,
+    market_type: str,
+    markets: list[PrecomputedMarket],
 ) -> None:
     source_stat = db_path.stat()
     payload = {
         "version": PRECOMPUTE_CACHE_VERSION,
         "coin": coin,
+        "market_type": market_type,
         "db_mtime_ns": source_stat.st_mtime_ns,
         "db_size": source_stat.st_size,
         "markets": markets,
     }
-    with _cache_path(db_path, coin).open("wb") as f:
+    with _cache_path(db_path, coin, market_type).open("wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
@@ -99,9 +109,9 @@ def _get_thread_connection(db_path: Path) -> sqlite3.Connection:
 
 
 def _load_market_precompute(
-    task: tuple[Path, str, str, float, str],
+    task: tuple[Path, str, str, float, str, int],
 ) -> PrecomputedMarket | None:
-    db_path, market_id, winner, open_price, price_col = task
+    db_path, market_id, winner, open_price, price_col, window_snaps = task
     conn = _get_thread_connection(db_path)
     rows = conn.execute(
         f"SELECT {price_col} as price, price_up, price_down "
@@ -113,7 +123,7 @@ def _load_market_precompute(
 
     snaps = [(row[0], row[1], row[2]) for row in rows]
     effective_open = open_price or snaps[0][0]
-    return precompute_market(market_id, winner, effective_open, snaps)
+    return precompute_market(market_id, winner, effective_open, snaps, window_snaps)
 
 
 def precompute_market(
@@ -121,6 +131,7 @@ def precompute_market(
     winner: str,
     btc_open: float,
     snaps: list[tuple[float, float | None, float | None]],
+    window_snaps: int = 2500,
 ) -> PrecomputedMarket:
     n = len(snaps)
     prices = np.fromiter(
@@ -144,7 +155,7 @@ def precompute_market(
     else:
         move_pct_arr = np.zeros(n, dtype=np.float64)
     abs_move_arr = np.abs(move_pct_arr)
-    elapsed_pct_arr = idx.astype(np.float64) / 2500.0
+    elapsed_pct_arr = idx.astype(np.float64) / float(window_snaps)
 
     prev_idx = np.maximum(idx - 20, 0)
     prev_prices = prices[prev_idx]
@@ -265,22 +276,21 @@ def precompute_market(
     )
 
 
-def _load_and_precompute_serial(db_path: Path, coin: str) -> list[PrecomputedMarket]:
+def _load_and_precompute_serial(
+    db_path: Path, coin: str, market_type: str
+) -> list[PrecomputedMarket]:
     conn = get_connection(db_path)
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-200000")
     conn.execute("PRAGMA mmap_size=1073741824")
 
-    try:
-        markets = conn.execute(
-            "SELECT * FROM markets WHERE winner IS NOT NULL AND (coin = ? OR coin IS NULL) ORDER BY start_time",
-            (coin,),
-        ).fetchall()
-    except Exception:
-        markets = conn.execute(
-            "SELECT * FROM markets WHERE winner IS NOT NULL ORDER BY start_time"
-        ).fetchall()
+    window_snaps = WINDOW_SNAPS[market_type]
+    markets = conn.execute(
+        "SELECT * FROM markets WHERE winner IS NOT NULL AND market_type = ? "
+        "ORDER BY start_time",
+        (market_type,),
+    ).fetchall()
 
     snap_cols = [c[1] for c in conn.execute("PRAGMA table_info(snapshots)").fetchall()]
     price_col = "price" if "price" in snap_cols else "btc_price"
@@ -307,7 +317,9 @@ def _load_and_precompute_serial(db_path: Path, coin: str) -> list[PrecomputedMar
             return
         market = market_map[market_id]
         open_price = market[start_col] or snaps[0][0]
-        pm = precompute_market(market_id, market["winner"], open_price, snaps)
+        pm = precompute_market(
+            market_id, market["winner"], open_price, snaps, window_snaps
+        )
         result.append((market_order[market_id], pm))
 
     for row in snap_rows:
@@ -329,22 +341,21 @@ def _load_and_precompute_serial(db_path: Path, coin: str) -> list[PrecomputedMar
     return [pm for _, pm in result]
 
 
-def _load_and_precompute_parallel(db_path: Path, coin: str) -> list[PrecomputedMarket]:
+def _load_and_precompute_parallel(
+    db_path: Path, coin: str, market_type: str
+) -> list[PrecomputedMarket]:
     conn = get_connection(db_path)
     conn.execute("PRAGMA query_only=ON")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-200000")
     conn.execute("PRAGMA mmap_size=1073741824")
 
-    try:
-        markets = conn.execute(
-            "SELECT * FROM markets WHERE winner IS NOT NULL AND (coin = ? OR coin IS NULL) ORDER BY start_time",
-            (coin,),
-        ).fetchall()
-    except Exception:
-        markets = conn.execute(
-            "SELECT * FROM markets WHERE winner IS NOT NULL ORDER BY start_time"
-        ).fetchall()
+    window_snaps = WINDOW_SNAPS[market_type]
+    markets = conn.execute(
+        "SELECT * FROM markets WHERE winner IS NOT NULL AND market_type = ? "
+        "ORDER BY start_time",
+        (market_type,),
+    ).fetchall()
 
     snap_cols = [c[1] for c in conn.execute("PRAGMA table_info(snapshots)").fetchall()]
     price_col = "price" if "price" in snap_cols else "btc_price"
@@ -353,7 +364,8 @@ def _load_and_precompute_parallel(db_path: Path, coin: str) -> list[PrecomputedM
     conn.close()
 
     tasks = [
-        (db_path, market["market_id"], market["winner"], market[start_col], price_col)
+        (db_path, market["market_id"], market["winner"], market[start_col],
+         price_col, window_snaps)
         for market in markets
     ]
     workers = min(MAX_PRECOMPUTE_WORKERS, os.cpu_count() or 4)
@@ -362,27 +374,30 @@ def _load_and_precompute_parallel(db_path: Path, coin: str) -> list[PrecomputedM
     return [pm for pm in result if pm is not None]
 
 
-def load_and_precompute(db_path: Path, coin: str = "btc") -> list[PrecomputedMarket]:
-    cached = _load_cached_precompute(db_path, coin)
+def load_and_precompute(
+    db_path: Path, coin: str = "btc", market_type: str = "5m"
+) -> list[PrecomputedMarket]:
+    if market_type not in WINDOW_SNAPS:
+        raise ValueError(
+            f"Unknown market_type {market_type!r}. Expected one of: "
+            f"{list(WINDOW_SNAPS)}"
+        )
+
+    cached = _load_cached_precompute(db_path, coin, market_type)
     if cached is not None:
         return cached
 
     conn = get_connection(db_path)
-    try:
-        market_count = conn.execute(
-            "SELECT COUNT(*) FROM markets WHERE winner IS NOT NULL AND (coin = ? OR coin IS NULL)",
-            (coin,),
-        ).fetchone()[0]
-    except Exception:
-        market_count = conn.execute(
-            "SELECT COUNT(*) FROM markets WHERE winner IS NOT NULL"
-        ).fetchone()[0]
+    market_count = conn.execute(
+        "SELECT COUNT(*) FROM markets WHERE winner IS NOT NULL AND market_type = ?",
+        (market_type,),
+    ).fetchone()[0]
     conn.close()
 
     if market_count >= PARALLEL_MARKET_THRESHOLD:
-        markets_out = _load_and_precompute_parallel(db_path, coin)
+        markets_out = _load_and_precompute_parallel(db_path, coin, market_type)
     else:
-        markets_out = _load_and_precompute_serial(db_path, coin)
+        markets_out = _load_and_precompute_serial(db_path, coin, market_type)
 
-    _write_cached_precompute(db_path, coin, markets_out)
+    _write_cached_precompute(db_path, coin, market_type, markets_out)
     return markets_out

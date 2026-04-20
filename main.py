@@ -51,7 +51,7 @@ def cleanup_pid() -> None:
         pid_file.unlink()
 
 
-async def main(config_path: str, live: bool, coin: str) -> None:
+async def main(config_path: str, live: bool, coin: str, market_type: str) -> None:
     from core.engine import BTCTradingEngine
     from strategies.live_runtime import LiveRuntimeStrategy
     from strategies.strategy_config import CoinStrategyConfig, load_strategy_config
@@ -62,7 +62,7 @@ async def main(config_path: str, live: bool, coin: str) -> None:
         cfg.paper.enabled = False
 
     db_path = os.getenv("BTC_DB_PATH", f"{coin}_trades.db")
-    engine = BTCTradingEngine(cfg, db_path=db_path, coin=coin)
+    engine = BTCTradingEngine(cfg, db_path=db_path, coin=coin, market_type=market_type)
 
     loop = asyncio.get_event_loop()
 
@@ -108,6 +108,7 @@ if __name__ == "__main__":
     parser.add_argument("--profile", dest="profile", default=os.getenv("STRATEGY_PROFILE"), help="Named config profile from the canonical strategy config")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: paper)")
     parser.add_argument("--coin", default="btc", choices=["btc", "eth", "sol", "doge"], help="Coin to trade (default: btc)")
+    parser.add_argument("--market-type", default="5m", choices=["5m", "15m"], help="Market window length (default: 5m)")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     args = parser.parse_args()
 
@@ -118,6 +119,6 @@ if __name__ == "__main__":
     write_pid()
 
     try:
-        asyncio.run(main(args.config, args.live, args.coin))
+        asyncio.run(main(args.config, args.live, args.coin, args.market_type))
     finally:
         cleanup_pid()
