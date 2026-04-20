@@ -92,6 +92,61 @@
         "starting_balance": 100.0
       }
     },
+    "research_t10_doge": {
+      "coins": {
+        "btc": {"strategy": "disabled", "params": {}},
+        "eth": {"strategy": "disabled", "params": {}},
+        "sol": {"strategy": "disabled", "params": {}},
+        "doge": {
+          "strategy": "timing",
+          "params": {"move": 0.20, "elapsed": 0.5, "max_entry": 0.55}
+        }
+      },
+      "risk": {
+        "max_position_usd": 5.0,
+        "max_position_pct": 0.05,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 5,
+        "max_concurrent_positions": 10,
+        "loss_cooldown_trades": 5,
+        "loss_cooldown_seconds": 300,
+        "kelly_multiplier": 0.25
+      },
+      "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+      }
+    },
+    "research_t15_eth": {
+      "coins": {
+        "btc": {
+          "strategy": "disabled",
+          "params": {}
+        },
+        "eth": {
+          "strategy": "timing",
+          "params": { "move": 0.06, "elapsed": 0.5, "max_entry": 0.55 }
+        },
+        "sol": {
+          "strategy": "disabled",
+          "params": {}
+        }
+      },
+      "risk": {
+        "max_position_usd": 5.0,
+        "max_position_pct": 0.05,
+        "daily_loss_limit_pct": 0.25,
+        "kill_balance_usd": 5,
+        "max_concurrent_positions": 10,
+        "loss_cooldown_trades": 5,
+        "loss_cooldown_seconds": 300,
+        "kelly_multiplier": 0.25
+      },
+      "paper": {
+        "enabled": true,
+        "starting_balance": 100.0
+      }
+    },
     "research_t10": {
       "coins": {
         "btc": {

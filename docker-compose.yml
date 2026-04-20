@@ -92,6 +92,28 @@ services:
       BTC_DB_PATH: /data/btc_research_t10_trades.db
     command: ["--coin", "btc"]
 
+  eth-research-t15:
+    <<: *agent-service
+    profiles: ["trading"]
+    container_name: polymarket-eth-research-t15
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t15_eth
+      BTC_DB_PATH: /data/eth_research_t15_trades.db
+    command: ["--coin", "eth"]
+
+  doge-research-t10:
+    <<: *agent-service
+    profiles: ["trading"]
+    container_name: polymarket-doge-research-t10
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t10_doge
+      BTC_DB_PATH: /data/doge_research_t10_trades.db
+    command: ["--coin", "doge"]
+
   eth-realmoney:
     <<: *agent-service
     profiles: ["trading"]
