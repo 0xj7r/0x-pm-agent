@@ -92,6 +92,10 @@ class BTCTradingEngine:
         self.current_window: MarketWindow | None = None
         self._window_open_price: float = 0.0
         self._current_btc_price: float = 0.0
+        # Rolling 60-min price history for regime tagging on each trade.
+        # Deque of (timestamp_sec, price). Evicted on each tick.
+        from collections import deque
+        self._price_history: deque[tuple[float, float]] = deque()
         self._already_traded_this_window: bool = False
         self._running: bool = False
         self._paper_trades: list[dict] = []
@@ -136,6 +140,69 @@ class BTCTradingEngine:
 
     async def _on_binance_trade(self, update: TradeUpdate) -> None:
         self._current_btc_price = update.price
+        now = _time.time()
+        self._price_history.append((now, update.price))
+        cutoff = now - 3600
+        while self._price_history and self._price_history[0][0] < cutoff:
+            self._price_history.popleft()
+
+    def _compute_regime(self) -> dict:
+        """60-min vol + trend + categorical regime label at trigger time.
+
+        Returns a dict with:
+          vol_60m_bps: stddev of 1-min returns over last 60 min, in bps
+          trend_60m_pct: cumulative % move over last 60 min
+          regime_label: categorical bucket
+          regime_n_samples: how many 1-min price samples contributed
+        """
+        if len(self._price_history) < 10:
+            return {
+                "vol_60m_bps": None, "trend_60m_pct": None,
+                "regime_label": "insufficient_history",
+                "regime_n_samples": len(self._price_history),
+            }
+        # Downsample to 1-min buckets; keep the last price in each minute.
+        buckets: dict[int, float] = {}
+        for ts, p in self._price_history:
+            buckets[int(ts // 60)] = p
+        series = [buckets[k] for k in sorted(buckets.keys())]
+        if len(series) < 10:
+            return {
+                "vol_60m_bps": None, "trend_60m_pct": None,
+                "regime_label": "insufficient_history",
+                "regime_n_samples": len(series),
+            }
+        # 1-min log returns, scaled to bps.
+        import math
+        returns = [math.log(series[i] / series[i - 1]) * 10000
+                   for i in range(1, len(series))]
+        mean = sum(returns) / len(returns)
+        var = sum((r - mean) ** 2 for r in returns) / len(returns)
+        vol_bps = var ** 0.5
+        trend_pct = (series[-1] - series[0]) / series[0] * 100
+
+        # Regime buckets. Cutoffs are rough priors; refine from data later.
+        vol_hi = vol_bps > 8.0  # ~10bps/min = high intraday vol
+        trend_up = trend_pct > 0.2
+        trend_down = trend_pct < -0.2
+        if vol_hi and trend_up:
+            label = "high_vol_up"
+        elif vol_hi and trend_down:
+            label = "high_vol_down"
+        elif vol_hi:
+            label = "high_vol_flat"
+        elif trend_up:
+            label = "low_vol_up"
+        elif trend_down:
+            label = "low_vol_down"
+        else:
+            label = "low_vol_flat"
+        return {
+            "vol_60m_bps": vol_bps,
+            "trend_60m_pct": trend_pct,
+            "regime_label": label,
+            "regime_n_samples": len(series),
+        }
 
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
@@ -218,6 +285,7 @@ class BTCTradingEngine:
 
         self._already_traded_this_window = True
         self.risk.record_trade_entry()
+        regime = self._compute_regime()
         trade = {
             "market_id": self.current_window.market_id,
             "direction": direction,
@@ -230,6 +298,7 @@ class BTCTradingEngine:
             "move_pct": move_pct,
             "strategy": self._strategy.name,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "regime": regime,
         }
 
         logger.info(
