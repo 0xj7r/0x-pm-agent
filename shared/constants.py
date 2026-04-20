@@ -4,7 +4,6 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
 BACKTESTING_DIR = PROJECT_ROOT / "backtesting"
-WEATHER_DB_PATH = BACKTESTING_DIR / "weather.db"
 
 POLYBACKTEST_API_BASE = "https://api.polybacktest.com"
 # PolyBackTest keys are not coin-scoped at the API level; a single key
@@ -35,38 +34,6 @@ SLUG_PATTERNS = {
     "sol": "sol-updown-5m-{ts}",
     "doge": "doge-updown-5m-{ts}",
 }
-
-WEATHER_CITIES = {
-    "london": {
-        "label": "London",
-        "latitude": 51.5072,
-        "longitude": -0.1276,
-        "timezone": "Europe/London",
-        "aliases": ("london",),
-    },
-    "nyc": {
-        "label": "NYC",
-        "latitude": 40.7128,
-        "longitude": -74.0060,
-        "timezone": "America/New_York",
-        "aliases": ("nyc", "new york city", "new york"),
-    },
-    "miami": {
-        "label": "Miami",
-        "latitude": 25.7617,
-        "longitude": -80.1918,
-        "timezone": "America/New_York",
-        "aliases": ("miami",),
-    },
-    "buenos_aires": {
-        "label": "Buenos Aires",
-        "latitude": -34.6037,
-        "longitude": -58.3816,
-        "timezone": "America/Argentina/Buenos_Aires",
-        "aliases": ("buenos aires",),
-    },
-}
-
 
 def db_path(coin: str) -> Path:
     """Return the SQLite DB path for a given coin."""
