@@ -9,7 +9,9 @@ __pycache__/
 .venv/
 venv/
 .cook/
+.claude/
 backtesting/features/
 backtesting/eval/features/
 backtesting/*.html
+backtesting/weather/
 autoresearch/candidates/
