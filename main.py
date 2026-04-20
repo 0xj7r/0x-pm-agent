@@ -107,7 +107,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", default=os.getenv("STRATEGY_CONFIG", "strategy_config.json"), help="Path to strategy config JSON")
     parser.add_argument("--profile", dest="profile", default=os.getenv("STRATEGY_PROFILE"), help="Named config profile from the canonical strategy config")
     parser.add_argument("--live", action="store_true", help="Enable live trading (default: paper)")
-    parser.add_argument("--coin", default="btc", choices=["btc", "eth", "sol"], help="Coin to trade (default: btc)")
+    parser.add_argument("--coin", default="btc", choices=["btc", "eth", "sol", "doge"], help="Coin to trade (default: btc)")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     args = parser.parse_args()
 

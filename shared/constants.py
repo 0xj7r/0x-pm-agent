@@ -18,18 +18,22 @@ POLYBACKTEST_API_KEYS = {
 }
 RATE_LIMIT_DELAY = 0.20
 
-COINS = ["btc", "eth", "sol"]
-
 COIN_CONFIGS = {
     "btc": {"move_threshold": 0.08, "max_entry": 0.55, "binance_symbol": "btcusdt"},
     "eth": {"move_threshold": 0.15, "max_entry": 0.55, "binance_symbol": "ethusdt"},
     "sol": {"move_threshold": 0.08, "max_entry": 0.55, "binance_symbol": "solusdt"},
+    # DOGE has higher % intraday vol than BTC; default move_threshold is a
+    # rough starting point — refine after ~1 week of forward-collected data.
+    "doge": {"move_threshold": 0.20, "max_entry": 0.55, "binance_symbol": "dogeusdt"},
 }
+
+COINS = ["btc", "eth", "sol", "doge"]
 
 SLUG_PATTERNS = {
     "btc": "btc-updown-5m-{ts}",
     "eth": "eth-updown-5m-{ts}",
     "sol": "sol-updown-5m-{ts}",
+    "doge": "doge-updown-5m-{ts}",
 }
 
 WEATHER_CITIES = {
