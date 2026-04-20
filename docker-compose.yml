@@ -148,14 +148,3 @@ services:
     entrypoint: ["python", "collector/snapshot_recorder.py"]
     command: ["--coin", "btc", "--coin", "eth", "--coin", "sol", "--interval", "1.0"]
 
-  autoresearch:
-    <<: *agent-service
-    container_name: polymarket-autoresearch
-    environment:
-      LOG_LEVEL: INFO
-      STRATEGY_CONFIG: /app/strategy_config.json
-    volumes:
-      - ./data:/data
-      - ./data/snapshots:/data/snapshots
-    entrypoint: ["python", "autoresearch/runner.py"]
-    command: ["--loop", "--interval", "604800", "--db-dir", "/data/snapshots"]
