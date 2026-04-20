@@ -36,9 +36,10 @@ MAX_SINGLE_ORDER_USD = 100.0
 class BTCTradingEngine:
     """Core engine for sniping cheap tokens on BTC Up/Down markets."""
 
-    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc") -> None:
+    def __init__(self, strategy_cfg: StrategyConfig, db_path: str = "btc_trades.db", coin: str = "btc", market_type: str = "5m") -> None:
         self.cfg = strategy_cfg
         self._coin = coin.lower()
+        self._market_type = market_type
         self.memory = MemoryStore(db_path)
         self.risk = self._init_risk(strategy_cfg)
         self._supa = None
@@ -345,7 +346,7 @@ class BTCTradingEngine:
         self._last_scan_time = now
 
         if not self._scanner:
-            self._scanner = MarketWindowScanner(coin=self._coin)
+            self._scanner = MarketWindowScanner(coin=self._coin, market_type=self._market_type)
         try:
             window = await self._scanner.get_current_window()
             if window and (not self.current_window or window.market_id != self.current_window.market_id):
