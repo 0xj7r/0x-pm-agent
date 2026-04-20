@@ -85,7 +85,36 @@ class BTCTradingEngine:
             self._polymarket = PolymarketClient(Config())
             logger.warning("LIVE TRADING ENABLED: real orders will be placed")
 
+        # Reconstruct balance from event_log: starting_balance + sum of
+        # realized pnl_usd across all resolution events. Makes restart
+        # balance-persistent without schema changes.
         self.balance: float = strategy_cfg.paper.starting_balance
+        try:
+            import json as _json
+            rows = self.memory.conn.execute(
+                "SELECT details FROM event_log WHERE event_type = 'resolution'"
+            ).fetchall()
+            realized = 0.0
+            n = 0
+            for (details,) in rows:
+                try:
+                    d = _json.loads(details)
+                    pnl = d.get("pnl_usd")
+                    if pnl is not None:
+                        realized += float(pnl)
+                        n += 1
+                except Exception:
+                    continue
+            if n:
+                self.balance = strategy_cfg.paper.starting_balance + realized
+                logger.info(
+                    f"Restored balance from event_log: "
+                    f"${self.balance:,.2f} = "
+                    f"${strategy_cfg.paper.starting_balance:.2f} + "
+                    f"${realized:+,.2f} realized across {n} resolutions"
+                )
+        except Exception as e:
+            logger.warning(f"Could not restore balance from event_log: {e}")
         self.risk.set_bankroll(self.balance)
         self.risk.set_peak_balance(self.balance)
 
