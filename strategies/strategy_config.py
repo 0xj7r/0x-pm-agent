@@ -63,6 +63,13 @@ class RiskConfig:
     take_profit_min_unrealized_usd: float = 0.0
     take_profit_exit_slippage_usd: float = 0.005
     take_profit_order_timeout_seconds: int = 20
+    # Optional early-exit logic (SELL to cut losses before resolution).
+    stop_loss_enabled: bool = False
+    stop_loss_best_bid_threshold: float = 0.15
+    stop_loss_sell_fraction: float = 1.0
+    stop_loss_min_best_bid_size_shares: float = 0.0
+    stop_loss_exit_slippage_usd: float = 0.01
+    stop_loss_order_timeout_seconds: int = 20
 
 
 @dataclass
