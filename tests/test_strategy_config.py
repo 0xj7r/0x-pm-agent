@@ -27,6 +27,45 @@ def test_load_default_config():
     assert cfg.paper.starting_balance == 100.0
 
 
+def test_stop_loss_defaults():
+    cfg = StrategyConfig()
+    assert cfg.risk.stop_loss_enabled is False
+    assert cfg.risk.stop_loss_best_bid_threshold == 0.15
+    assert cfg.risk.stop_loss_sell_fraction == 1.0
+    assert cfg.risk.stop_loss_min_best_bid_size_shares == 0.0
+    assert cfg.risk.stop_loss_exit_slippage_usd == 0.01
+    assert cfg.risk.stop_loss_order_timeout_seconds == 20
+
+
+def test_stop_loss_config_loads_from_json():
+    data = {
+        "version": 5,
+        "default_profile": "test",
+        "profiles": {
+            "test": {
+                "coins": {"btc": {"strategy": "threshold", "params": {"move": 0.08, "max_entry": 0.55}}},
+                "risk": {
+                    "stop_loss_enabled": True,
+                    "stop_loss_best_bid_threshold": 0.10,
+                    "stop_loss_sell_fraction": 0.5,
+                    "stop_loss_exit_slippage_usd": 0.02,
+                    "stop_loss_order_timeout_seconds": 30,
+                },
+            },
+        },
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        f.flush()
+        cfg = load_strategy_config(f.name)
+
+    assert cfg.risk.stop_loss_enabled is True
+    assert cfg.risk.stop_loss_best_bid_threshold == 0.10
+    assert cfg.risk.stop_loss_sell_fraction == 0.5
+    assert cfg.risk.stop_loss_exit_slippage_usd == 0.02
+    assert cfg.risk.stop_loss_order_timeout_seconds == 30
+
+
 def test_load_from_file():
     data = {
         "version": 5,
