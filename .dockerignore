@@ -1,4 +1,5 @@
 .venv
+.git
 __pycache__
 *.pyc
 .pytest_cache
@@ -12,11 +13,8 @@ docs/
 tests/
 *.pkl
 *.npy
-backtesting/features/
-backtesting/eval/features/
-backtesting/btc.db
-backtesting/eth.db
-backtesting/sol.db
-backtesting/historical.db*
+backtesting/
+research/
+autoresearch/
 .cook/
 .claude/

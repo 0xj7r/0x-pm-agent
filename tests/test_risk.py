@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from config import Config
-from core.risk import RiskManager
+from core.risk import RejectReason, RiskManager
 from models.market import Outcome
 from models.trade import Side, Signal, SignalSource
 
@@ -146,9 +146,14 @@ class TestRejectStreak:
     def test_fires_at_n_consecutive(self):
         cfg = Config()
         cfg.REJECT_STREAK_LIMIT = 3
+        cfg.REJECT_COOLDOWN_SECONDS = 60
+        cfg.REJECT_STREAK_COOLDOWN_SECONDS = 60
         rm = RiskManager(cfg)
         rm.record_order_rejection()
         rm.record_order_rejection()
+        # Unknown rejects trigger a short cooldown by design; clear it to
+        # test the streak threshold behavior itself.
+        rm._reject_cooldown_until = time.time() - 1
         assert rm.is_reject_streak_tripped() is False
         rm.record_order_rejection()
         assert rm.is_reject_streak_tripped() is True
@@ -156,6 +161,8 @@ class TestRejectStreak:
     def test_resets_on_success(self):
         cfg = Config()
         cfg.REJECT_STREAK_LIMIT = 2
+        cfg.REJECT_COOLDOWN_SECONDS = 60
+        cfg.REJECT_STREAK_COOLDOWN_SECONDS = 60
         rm = RiskManager(cfg)
         rm.record_order_rejection()
         rm.record_order_rejection()
@@ -163,3 +170,22 @@ class TestRejectStreak:
         rm.record_order_success()
         assert rm.is_reject_streak_tripped() is False
         assert rm._reject_streak == 0
+
+    def test_benign_reject_does_not_count(self):
+        cfg = Config()
+        cfg.REJECT_STREAK_LIMIT = 2
+        rm = RiskManager(cfg)
+        rm.record_order_rejection(reason=RejectReason.UNKNOWN)
+        rm.record_order_rejection(reason=RejectReason.PRICE_CROSSED)
+        # Benign reject resets streak and should not trip
+        rm._reject_cooldown_until = time.time() - 1
+        assert rm.is_reject_streak_tripped() is False
+        assert rm._reject_streak == 0
+
+    def test_fatal_reject_halts_immediately(self):
+        rm = RiskManager(Config())
+        rm.record_order_rejection(
+            reason=RejectReason.INSUFFICIENT_FUNDS,
+            message="not enough balance",
+        )
+        assert rm.is_reject_streak_tripped() is True

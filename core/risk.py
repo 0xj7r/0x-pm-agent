@@ -6,6 +6,7 @@ import logging
 import time
 from collections import deque
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from config import Config
@@ -15,6 +16,15 @@ if TYPE_CHECKING:
     from strategies.strategy_config import RiskConfig
 
 logger = logging.getLogger(__name__)
+
+
+class RejectReason(str, Enum):
+    INSUFFICIENT_FUNDS = "insufficient_funds"  # fatal
+    AUTH_FAILURE = "auth_failure"  # fatal
+    PRICE_CROSSED = "price_crossed"  # benign (do not count)
+    MIN_SHARES = "min_shares"  # benign (do not count)
+    RATE_LIMITED = "rate_limited"  # cooldown
+    UNKNOWN = "unknown"  # cooldown / streak
 
 
 class RiskManager:
@@ -29,6 +39,12 @@ class RiskManager:
         self.loss_cooldown_seconds = config.LOSS_COOLDOWN_SECONDS
         self.max_daily_trades: int = int(getattr(config, "MAX_DAILY_TRADES", 0) or 0)
         self.reject_streak_limit: int = int(getattr(config, "REJECT_STREAK_LIMIT", 0) or 0)
+        self.reject_cooldown_seconds: int = int(
+            getattr(config, "REJECT_COOLDOWN_SECONDS", 60) or 60
+        )
+        self.reject_streak_cooldown_seconds: int = int(
+            getattr(config, "REJECT_STREAK_COOLDOWN_SECONDS", 10 * 60) or 10 * 60
+        )
 
         self._drawdown_pct: float = 0.40
         self._breaker_auto_reset_seconds: int = 6 * 3600
@@ -48,6 +64,10 @@ class RiskManager:
         self._entry_timestamps: deque[datetime] = deque()
         self._daily_cap_logged_date: str = ""
         self._reject_streak: int = 0
+        self._reject_cooldown_until: float = 0.0
+        self._fatal_reject_reason: RejectReason | None = None
+        self._last_reject_reason: RejectReason | None = None
+        self._last_reject_message: str = ""
 
     def set_bankroll(self, bankroll: float):
         """Set the starting bankroll for daily loss tracking."""
@@ -134,22 +154,72 @@ class RiskManager:
             return True
         return False
 
-    def record_order_rejection(self) -> None:
-        self._reject_streak += 1
+    def record_order_rejection(
+        self,
+        reason: RejectReason = RejectReason.UNKNOWN,
+        message: str | None = None,
+    ) -> None:
+        self._last_reject_reason = reason
+        self._last_reject_message = message or ""
+
+        if reason in (RejectReason.INSUFFICIENT_FUNDS, RejectReason.AUTH_FAILURE):
+            self._fatal_reject_reason = reason
+            logger.critical(
+                "FATAL ORDER REJECT: reason=%s msg=%s",
+                reason.value,
+                (message or "")[:400],
+            )
+            return
+
+        if reason in (RejectReason.PRICE_CROSSED, RejectReason.MIN_SHARES):
+            # Benign: do not count toward streak, and reset the streak so
+            # transient conditions don't combine into a false halt.
+            self._reject_streak = 0
+            self._reject_cooldown_until = 0.0
+            return
+
+        # Cooldown-style rejects. We still track a streak (when enabled)
+        # so repeated unknown failures can back off more aggressively.
+        if self.reject_streak_limit:
+            self._reject_streak += 1
+            self._reject_cooldown_until = time.time() + self.reject_cooldown_seconds
 
     def record_order_success(self) -> None:
         self._reject_streak = 0
+        self._reject_cooldown_until = 0.0
 
     def is_reject_streak_tripped(self) -> bool:
+        if self._fatal_reject_reason is not None:
+            logger.warning(
+                "TRADING HALTED: fatal reject reason=%s",
+                self._fatal_reject_reason.value,
+            )
+            return True
+
         if not self.reject_streak_limit:
             return False
         if self._reject_streak >= self.reject_streak_limit:
-            logger.warning(
-                f"REJECT STREAK TRIPPED: {self._reject_streak} consecutive "
-                f"order failures, halting"
+            # Escalate from short backoff to a longer cool-down instead of
+            # halting permanently.
+            self._reject_cooldown_until = (
+                time.time() + self.reject_streak_cooldown_seconds
             )
+            reason = self._last_reject_reason.value if self._last_reject_reason else "unknown"
+            logger.warning(
+                "REJECT STREAK TRIPPED: %s consecutive failures "
+                "(last_reason=%s). Cooling down for %ss.",
+                self._reject_streak,
+                reason,
+                self.reject_streak_cooldown_seconds,
+            )
+            self._reject_streak = 0
+            return True
+        if time.time() < self._reject_cooldown_until:
             return True
         return False
+
+    def clear_fatal_reject(self) -> None:
+        self._fatal_reject_reason = None
 
     def is_rate_limited(self) -> bool:
         """True if more than _max_trades_per_hour entries in the last hour."""

@@ -287,6 +287,10 @@ class PolymarketClient:
         )
         signed_order = self.clob.create_order(order_args)
         result = self.clob.post_order(signed_order, OrderType.GTC)
+        # Attach the fee rate we used so downstream analytics can attribute
+        # execution costs without re-querying market metadata.
+        if isinstance(result, dict):
+            result = {**result, "fee_rate_bps": fee_rate_bps}
         logger.info(
             "Order placed: %s %s @ %s for token %s... (fee_bps=%s) -> %s",
             side,

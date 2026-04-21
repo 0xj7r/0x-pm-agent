@@ -28,8 +28,14 @@ class RiskConfig:
     loss_cooldown_seconds: int = 300
     kelly_multiplier: float = 0.25
     cheap_token_multiplier: float = 2.0
+    empirical_kelly_enabled: bool = False
+    empirical_kelly_prior_weight: float = 1.0
+    empirical_kelly_prior_edge: float = 0.05
+    empirical_kelly_min_size_usd: float = 1.0
     max_daily_trades: int = 0
     reject_streak_limit: int = 0
+    reject_cooldown_seconds: int = 60
+    reject_streak_cooldown_seconds: int = 600
     drift_threshold_usd: float = 2.0
     order_poll_interval_seconds: float = 3.0
     order_fill_deadline_buffer_seconds: float = 30.0
@@ -40,6 +46,23 @@ class RiskConfig:
     # Polymarket CLOB minimum shares per order. Orders below this are
     # rejected server-side; engine skips or upsizes to meet the floor.
     min_shares: float = 5.0
+    # Paper-mode realism: simulate live fill constraints (price can cross,
+    # partial fill at best-ask size). Disabled by default so historical
+    # paper stats remain comparable.
+    paper_livelike_enabled: bool = False
+    paper_livelike_latency_ms: int = 150
+    paper_livelike_use_best_ask_size: bool = True
+    # Live-mode redemption hygiene: periodically sweep for unredeemed wins.
+    redeem_sweep_interval_seconds: int = 300
+    redeem_blind_when_token_missing: bool = True
+    # Optional early-exit logic (SELL to take profit before resolution).
+    take_profit_enabled: bool = False
+    take_profit_best_bid_threshold: float = 0.95
+    take_profit_sell_fraction: float = 1.0
+    take_profit_min_best_bid_size_shares: float = 0.0
+    take_profit_min_unrealized_usd: float = 0.0
+    take_profit_exit_slippage_usd: float = 0.005
+    take_profit_order_timeout_seconds: int = 20
 
 
 @dataclass

@@ -61,9 +61,27 @@ def test_engine_initializes():
     engine = make_engine()
     assert engine.balance == 100.0
     assert engine.current_window is None
+    assert engine._push_order_events == {}
+    assert engine._live_entry_slippage_usd == pytest.approx(0.01)
     assert engine._strategy.coin == "btc"
     assert engine._strategy.name == "threshold"
     assert engine._strategy.params["move"] == 0.08
+    engine.memory.close()
+
+
+def test_engine_initializes_balance_when_supabase_unavailable():
+    cfg = StrategyConfig()
+    cfg.paper.enabled = True
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+
+    with patch("shared.supabase_client.SupabaseClient", side_effect=RuntimeError("SUPABASE_URL not set")):
+        engine = BTCTradingEngine(cfg, db_path=db_path, coin="btc")
+
+    assert engine.balance == 100.0
+    assert engine.current_window is None
+    assert engine._push_order_events == {}
     engine.memory.close()
 
 
@@ -132,6 +150,79 @@ def test_engine_generates_threshold_trade():
     events = engine.memory.get_events_for_window("m1")
     assert len(events) == 1
     assert events[0]["event_type"] == "entry"
+    engine.memory.close()
+
+
+def test_engine_uses_empirical_kelly_to_skip_bad_tail_bucket():
+    engine = make_engine()
+    engine.cfg.risk.empirical_kelly_enabled = True
+    engine.memory.save_event(
+        window_id="old-tail-1",
+        event_type="resolution",
+        details={
+            "won": False,
+            "pnl_usd": -5.0,
+            "trade": {"token_price": 0.03, "size_usd": 5.0},
+        },
+    )
+    engine.memory.save_event(
+        window_id="old-tail-2",
+        event_type="resolution",
+        details={
+            "won": False,
+            "pnl_usd": -5.0,
+            "trade": {"token_price": 0.02, "size_usd": 5.0},
+        },
+    )
+    engine.current_window = make_window(up_price=0.02, down_price=0.98)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.02 if tid == engine.current_window.up_token_id else 0.98
+    )
+
+    trades = engine._check_entry()
+
+    assert trades == []
+    assert engine._already_traded_this_window is False
+    engine.memory.close()
+
+
+def test_engine_uses_empirical_kelly_metadata_when_bucket_has_edge():
+    engine = make_engine()
+    engine.cfg.risk.empirical_kelly_enabled = True
+    for idx, won in enumerate([True, True, True, False]):
+        engine.memory.save_event(
+            window_id=f"old-mid-{idx}",
+            event_type="resolution",
+            details={
+                "won": won,
+                "pnl_usd": 4.0 if won else -5.0,
+                "trade": {"token_price": 0.40, "size_usd": 5.0},
+            },
+        )
+    engine.current_window = make_window(up_price=0.39, down_price=0.61)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.39 if tid == engine.current_window.up_token_id else 0.61
+    )
+
+    trades = engine._check_entry()
+
+    assert len(trades) == 1
+    assert trades[0]["p_win_bucket"] == "40-55¢"
+    assert trades[0]["p_win_samples"] == 4
+    assert trades[0]["p_win"] > trades[0]["token_price"]
+    assert trades[0]["size_usd"] <= engine.cfg.risk.max_position_usd
     engine.memory.close()
 
 
