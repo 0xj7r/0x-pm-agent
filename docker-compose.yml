@@ -92,6 +92,17 @@ services:
       BTC_DB_PATH: /data/btc_research_t10_trades.db
     command: ["--coin", "btc"]
 
+  btc-research-t10-livelike:
+    <<: *agent-service
+    profiles: ["trading"]
+    container_name: polymarket-btc-research-t10-livelike
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t10_paper_livelike
+      BTC_DB_PATH: /data/btc_research_t10_livelike_trades.db
+    command: ["--coin", "btc"]
+
   eth-research-t15:
     <<: *agent-service
     profiles: ["trading"]
@@ -195,4 +206,3 @@ services:
       - ./data/snapshots:/app/backtesting
     entrypoint: ["python", "collector/snapshot_recorder.py"]
     command: ["--coin", "btc", "--coin", "eth", "--coin", "sol", "--interval", "1.0"]
-

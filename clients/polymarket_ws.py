@@ -20,7 +20,9 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class TokenBook:
     token_id: str
     best_bid: float = 0.0
+    best_bid_size: float = 0.0
     best_ask: float = 0.0
+    best_ask_size: float = 0.0
     spread: float = 0.0
     last_trade_price: float = 0.0
     last_update: float = 0.0
@@ -158,8 +160,10 @@ class PolymarketWSClient:
         asks = data.get("asks", [])
         if bids:
             book.best_bid = float(bids[0].get("price", 0))
+            book.best_bid_size = float(bids[0].get("size", bids[0].get("s", 0)) or 0)
         if asks:
             book.best_ask = float(asks[0].get("price", 0))
+            book.best_ask_size = float(asks[0].get("size", asks[0].get("s", 0)) or 0)
         if book.best_bid > 0 and book.best_ask > 0:
             book.spread = book.best_ask - book.best_bid
         book.last_update = time.time()

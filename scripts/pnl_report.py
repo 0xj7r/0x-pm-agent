@@ -283,6 +283,7 @@ def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[Clos
                 "title": a.get("title") or "",
                 "cost": Decimal("0"),
                 "payout": Decimal("0"),
+                "redeem_seen": False,
             },
         )
         t = (a.get("type") or "").upper()
@@ -294,13 +295,15 @@ def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[Clos
             if side == "BUY":
                 rec["cost"] += _d(a.get("usdcSize"))
         elif t == "REDEEM":
+            rec["redeem_seen"] = True
             rec["payout"] += _d(a.get("usdcSize"))
 
     out: list[ClosedRow] = []
     for cid, rec in by_cid.items():
         cost = rec["cost"]
         payout = rec["payout"]
-        if payout > 0 and cost > 0:
+        # Include redeemed losers too: REDEEM event exists but payout can be 0.
+        if cost > 0 and (payout > 0 or bool(rec.get("redeem_seen"))):
             out.append(
                 ClosedRow(
                     condition_id=cid,
@@ -401,10 +404,13 @@ def main(argv: list[str]) -> int:
     realized_total = realized_closed + realized_losses_unredeemed
     unrealized_total = unrealized_open + unrealized_wins_unredeemed
 
-    # Resolved hit-rate: wins are redeemed payouts >0 plus unredeemed winners with value>0.
+    # Resolved hit-rate:
+    # - wins: redeemed payouts > 0, plus unredeemed winners with value > 0
+    # - losses: redeemed payouts == 0 (redeemed loser), plus unredeemed losses with value == 0
     wins = sum(1 for r in closed_rows if r.payout_usdc > 0)
     wins += sum(1 for r in position_rows if r.redeemable and r.value_usdc > 0)
-    losses = sum(1 for r in position_rows if r.redeemable and r.value_usdc == 0)
+    losses = sum(1 for r in closed_rows if r.payout_usdc == 0 and r.cost_usdc > 0)
+    losses += sum(1 for r in position_rows if r.redeemable and r.value_usdc == 0)
     resolved_total = wins + losses
     hit_rate = (Decimal(wins) / Decimal(resolved_total)) if resolved_total else Decimal("0")
 
@@ -499,4 +505,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-
