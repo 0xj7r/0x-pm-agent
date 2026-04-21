@@ -126,6 +126,9 @@ def test_engine_generates_threshold_trade():
     assert trades[0]["strategy"] == "threshold"
     assert trades[0]["size_usd"] > 0
 
+    # Entry persistence moved to after fill confirmation. Simulate the
+    # paper fill path (append + record_entry) to cover the post-fix flow.
+    engine.persistence.record_entry(engine._strategy.name, trades[0])
     events = engine.memory.get_events_for_window("m1")
     assert len(events) == 1
     assert events[0]["event_type"] == "entry"
