@@ -290,6 +290,109 @@ class CTFRedeemer:
 
         return await asyncio.to_thread(_call)
 
+    async def sweep_wallet(
+        self,
+        positions: list[dict[str, Any]],
+        index_sets: list[int] = [1, 2],
+    ) -> list[dict[str, Any]]:
+        """Redeem every winning position with a non-zero ERC-1155 balance.
+
+        `positions` is a list of {"condition_id": str, "token_id": str|int}
+        dicts, typically derived from event_log resolution events where
+        `won=True`. For each, we check `balanceOf(owner, token_id)` on the
+        CTF; if > 0 we call `redeemPositions`. Each `condition_id` is
+        redeemed at most once per sweep even if both outcome tokens are
+        held (redeemPositions burns all winning positions in one call).
+
+        Returns a list of per-condition result dicts:
+          {
+            "condition_id": str,
+            "tx_hash": str,          # empty string if skipped/failed-precheck
+            "status": "success" | "failed" | "timeout" | "skipped" | "error",
+            "gas_used": int,
+            "reason": str,           # optional: why skipped/errored
+          }
+
+        A position is "skipped" when balanceOf returns 0 (already redeemed
+        or never held). An "error" status means the balanceOf precheck
+        itself raised; we do NOT attempt a blind redeem in that case
+        because it would waste gas on an empty position.
+        """
+        results: list[dict[str, Any]] = []
+        seen_conditions: set[str] = set()
+        for pos in positions:
+            condition_id = pos.get("condition_id")
+            token_id = pos.get("token_id")
+            if not condition_id:
+                continue
+            cid_norm = condition_id.lower()
+            if cid_norm in seen_conditions:
+                continue
+            seen_conditions.add(cid_norm)
+
+            if token_id is None:
+                # No token to probe: skip rather than redeem blindly.
+                results.append({
+                    "condition_id": condition_id,
+                    "tx_hash": "",
+                    "status": "skipped",
+                    "gas_used": 0,
+                    "reason": "no token_id to probe balance",
+                })
+                continue
+
+            try:
+                bal = await self.get_position_balance(token_id)
+            except Exception as e:
+                logger.warning(
+                    "[SWEEP] balanceOf failed for condition=%s token=%s: %s",
+                    condition_id,
+                    str(token_id)[:16],
+                    e,
+                )
+                results.append({
+                    "condition_id": condition_id,
+                    "tx_hash": "",
+                    "status": "error",
+                    "gas_used": 0,
+                    "reason": f"balanceOf failed: {e}",
+                })
+                continue
+
+            if bal == 0:
+                results.append({
+                    "condition_id": condition_id,
+                    "tx_hash": "",
+                    "status": "skipped",
+                    "gas_used": 0,
+                    "reason": "zero balance (already redeemed)",
+                })
+                continue
+
+            try:
+                res = await self.redeem(condition_id, index_sets=index_sets)
+            except Exception as e:
+                logger.error(
+                    "[SWEEP] redeem threw for condition=%s: %s",
+                    condition_id,
+                    e,
+                )
+                results.append({
+                    "condition_id": condition_id,
+                    "tx_hash": "",
+                    "status": "error",
+                    "gas_used": 0,
+                    "reason": f"redeem raised: {e}",
+                })
+                continue
+            results.append({
+                "condition_id": condition_id,
+                "tx_hash": res.get("tx_hash", ""),
+                "status": res.get("status", "failed"),
+                "gas_used": int(res.get("gas_used", 0)),
+            })
+        return results
+
     async def redeem(
         self,
         condition_id: str,

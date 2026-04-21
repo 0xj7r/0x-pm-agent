@@ -79,6 +79,9 @@ async def test_full_pipeline_paper_trade():
     assert trade["token_price"] == pytest.approx(0.02 + 0.01)
     assert trade["size_usd"] > 0
 
+    # Simulate the post-fill persistence step (run() writes the entry
+    # AFTER the paper simulator / live order confirms).
+    engine.persistence.record_entry(engine._strategy.name, trade)
     events = engine.memory.get_events_for_window("integration_test_001")
     assert len(events) >= 1
     assert events[-1]["event_type"] == "entry"
