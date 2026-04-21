@@ -31,6 +31,8 @@ class RiskConfig:
     max_daily_trades: int = 0
     reject_streak_limit: int = 0
     drift_threshold_usd: float = 2.0
+    order_poll_interval_seconds: float = 3.0
+    order_fill_deadline_buffer_seconds: float = 30.0
 
 
 @dataclass
