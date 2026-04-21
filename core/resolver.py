@@ -24,7 +24,11 @@ class PaperTradeResolver:
         self.resolved_ids: set[str] = set()
 
     async def check_resolution(self, market_id: str) -> dict | None:
-        """Check if a single market has resolved via Gamma API."""
+        """Check if a single market has resolved via Gamma API.
+
+        When resolved, includes the on-chain `conditionId` so the caller
+        can redeem winning positions via the CTF contract.
+        """
         try:
             resp = await self._http.get(f"{GAMMA_URL}/markets/{market_id}")
             if resp.status_code != 200:
@@ -41,11 +45,21 @@ class PaperTradeResolver:
             if len(prices) < 2:
                 return None
 
+            condition_id = data.get("conditionId")
+
             yes_price = float(prices[0])
             if yes_price >= 0.99:
-                return {"resolved": True, "winning_outcome": "Yes"}
+                return {
+                    "resolved": True,
+                    "winning_outcome": "Yes",
+                    "condition_id": condition_id,
+                }
             elif float(prices[1]) >= 0.99:
-                return {"resolved": True, "winning_outcome": "No"}
+                return {
+                    "resolved": True,
+                    "winning_outcome": "No",
+                    "condition_id": condition_id,
+                }
             return None
         except Exception as e:
             logger.debug(f"Resolution check failed for {market_id}: {e}")
@@ -65,6 +79,11 @@ class PaperTradeResolver:
 
             winning = result["winning_outcome"]
             resolved_dir = "UP" if winning == "Yes" else "DOWN"
+
+            # Stamp the on-chain conditionId onto the trade so the live
+            # redemption path can call redeemPositions without a re-lookup.
+            if result.get("condition_id") and not trade.get("condition_id"):
+                trade["condition_id"] = result["condition_id"]
 
             record = PaperTradeRecord(
                 trade_id=trade.get("timestamp", market_id),

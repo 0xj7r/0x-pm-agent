@@ -49,6 +49,17 @@ class Config:
     GAMMA_URL: str = "https://gamma-api.polymarket.com"
     CHAIN_ID: int = 137  # Polygon
 
+    # On-chain redemption via Polymarket's Gnosis ConditionalTokens (CTF).
+    # redeemPositions() converts winning ERC-1155 outcome tokens to USDC.e.
+    CTF_ADDRESS: str = os.getenv(
+        "CTF_ADDRESS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+    )
+    COLLATERAL_TOKEN_ADDRESS: str = os.getenv(
+        "COLLATERAL_TOKEN_ADDRESS",
+        "0x2791Bca1F2de4661ED88A30C99A7a9449Aa84174",  # USDC.e on Polygon
+    )
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+
     # Claude
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-opus-4-5-20250514")
