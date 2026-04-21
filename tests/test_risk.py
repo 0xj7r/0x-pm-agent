@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -99,3 +100,66 @@ class TestShouldDie:
     def test_survives_above_kill(self):
         rm = RiskManager(Config())
         assert rm.should_die(10.0) is False
+
+
+class TestDailyTradeCap:
+    def test_disabled_by_default(self):
+        rm = RiskManager(Config())
+        for _ in range(100):
+            rm.record_trade_entry()
+        assert rm.is_daily_trade_cap_reached() is False
+
+    def test_fires_at_n_plus_one(self):
+        cfg = Config()
+        cfg.MAX_DAILY_TRADES = 3
+        rm = RiskManager(cfg)
+        for _ in range(3):
+            rm.record_trade_entry()
+        assert rm.is_daily_trade_cap_reached() is True
+
+    def test_under_limit_allows_trades(self):
+        cfg = Config()
+        cfg.MAX_DAILY_TRADES = 3
+        rm = RiskManager(cfg)
+        rm.record_trade_entry()
+        rm.record_trade_entry()
+        assert rm.is_daily_trade_cap_reached() is False
+
+    def test_resets_after_24h(self):
+        cfg = Config()
+        cfg.MAX_DAILY_TRADES = 2
+        rm = RiskManager(cfg)
+        old = datetime.now(UTC) - timedelta(hours=25)
+        rm._entry_timestamps.append(old)
+        rm._entry_timestamps.append(old)
+        assert rm.is_daily_trade_cap_reached() is False
+        assert len(rm._entry_timestamps) == 0
+
+
+class TestRejectStreak:
+    def test_disabled_by_default(self):
+        rm = RiskManager(Config())
+        for _ in range(10):
+            rm.record_order_rejection()
+        assert rm.is_reject_streak_tripped() is False
+
+    def test_fires_at_n_consecutive(self):
+        cfg = Config()
+        cfg.REJECT_STREAK_LIMIT = 3
+        rm = RiskManager(cfg)
+        rm.record_order_rejection()
+        rm.record_order_rejection()
+        assert rm.is_reject_streak_tripped() is False
+        rm.record_order_rejection()
+        assert rm.is_reject_streak_tripped() is True
+
+    def test_resets_on_success(self):
+        cfg = Config()
+        cfg.REJECT_STREAK_LIMIT = 2
+        rm = RiskManager(cfg)
+        rm.record_order_rejection()
+        rm.record_order_rejection()
+        assert rm.is_reject_streak_tripped() is True
+        rm.record_order_success()
+        assert rm.is_reject_streak_tripped() is False
+        assert rm._reject_streak == 0

@@ -27,6 +27,8 @@ class RiskManager:
         self.max_concurrent_positions = config.MAX_CONCURRENT_POSITIONS
         self.loss_cooldown_trades = config.LOSS_COOLDOWN_TRADES
         self.loss_cooldown_seconds = config.LOSS_COOLDOWN_SECONDS
+        self.max_daily_trades: int = int(getattr(config, "MAX_DAILY_TRADES", 0) or 0)
+        self.reject_streak_limit: int = int(getattr(config, "REJECT_STREAK_LIMIT", 0) or 0)
 
         self._drawdown_pct: float = 0.40
         self._breaker_auto_reset_seconds: int = 6 * 3600
@@ -43,6 +45,9 @@ class RiskManager:
         self._starting_bankroll: float = 0.0
         self._peak_balance: float = 0.0
         self._trade_timestamps: deque[float] = deque()
+        self._entry_timestamps: deque[datetime] = deque()
+        self._daily_cap_logged_date: str = ""
+        self._reject_streak: int = 0
 
     def set_bankroll(self, bankroll: float):
         """Set the starting bankroll for daily loss tracking."""
@@ -106,6 +111,45 @@ class RiskManager:
 
     def record_trade_entry(self) -> None:
         self._trade_timestamps.append(time.time())
+        now = datetime.now(UTC)
+        self._entry_timestamps.append(now)
+        cutoff = now - timedelta(hours=24)
+        while self._entry_timestamps and self._entry_timestamps[0] < cutoff:
+            self._entry_timestamps.popleft()
+
+    def is_daily_trade_cap_reached(self) -> bool:
+        if not self.max_daily_trades:
+            return False
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
+        while self._entry_timestamps and self._entry_timestamps[0] < cutoff:
+            self._entry_timestamps.popleft()
+        if len(self._entry_timestamps) >= self.max_daily_trades:
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            if self._daily_cap_logged_date != today:
+                logger.warning(
+                    f"DAILY TRADE CAP reached ({len(self._entry_timestamps)} "
+                    f"trades in 24h), trading halted until oldest entry ages out"
+                )
+                self._daily_cap_logged_date = today
+            return True
+        return False
+
+    def record_order_rejection(self) -> None:
+        self._reject_streak += 1
+
+    def record_order_success(self) -> None:
+        self._reject_streak = 0
+
+    def is_reject_streak_tripped(self) -> bool:
+        if not self.reject_streak_limit:
+            return False
+        if self._reject_streak >= self.reject_streak_limit:
+            logger.warning(
+                f"REJECT STREAK TRIPPED: {self._reject_streak} consecutive "
+                f"order failures, halting"
+            )
+            return True
+        return False
 
     def is_rate_limited(self) -> bool:
         """True if more than _max_trades_per_hour entries in the last hour."""
