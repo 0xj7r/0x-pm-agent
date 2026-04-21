@@ -135,6 +135,15 @@ class CTFRedeemer:
             raise ValueError("web3_provider_url is required for CTFRedeemer")
 
         self._w3 = Web3(Web3.HTTPProvider(web3_provider_url))
+        # Polygon is a Proof-of-Authority chain with non-standard block
+        # extraData. Without this middleware, web3.py validation fails on
+        # recent blocks and send_raw_transaction raises.
+        try:
+            from web3.middleware import ExtraDataToPOAMiddleware
+            self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        except ImportError:
+            from web3.middleware import geth_poa_middleware
+            self._w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         self._account = Account.from_key(private_key)
         self._address = self._account.address
         self._chain_id = chain_id
