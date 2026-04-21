@@ -58,7 +58,11 @@ class Config:
         "COLLATERAL_TOKEN_ADDRESS",
         "0x2791Bca1F2de4661ED88A30C99A7a9449Aa84174",  # USDC.e on Polygon
     )
-    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+    POLYGON_RPC_URL: str = os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+    # Optional Polygon WebSocket RPC endpoint for on-chain resolution
+    # subscription (eth_subscribe). Empty disables the push path; engine
+    # falls back to Gamma polling. Example: wss://polygon-bor-rpc.publicnode.com
+    POLYGON_WS_URL: str = os.getenv("POLYGON_WS_URL", "")
 
     # Claude
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
