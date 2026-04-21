@@ -88,11 +88,24 @@ class PolymarketClient:
         deps = _load_clob_dependencies()
         ClobClient = deps["ClobClient"]
 
+        sig_type = getattr(config, "POLYMARKET_SIGNATURE_TYPE", None)
+        funder = getattr(config, "POLYMARKET_FUNDER", None)
+
         if config.PRIVATE_KEY:
             self.clob = ClobClient(
                 config.CLOB_URL,
                 key=config.PRIVATE_KEY,
                 chain_id=config.CHAIN_ID,
+                signature_type=sig_type,
+                funder=funder,
+            )
+            funder_display = (
+                f"{funder[:8]}...{funder[-4:]}" if funder else "signer default"
+            )
+            logger.info(
+                "CLOB client sig_type=%s funder=%s",
+                sig_type if sig_type is not None else "default(EOA)",
+                funder_display,
             )
             # Prefer deriving existing L2 creds for this wallet. Only create
             # fresh creds when derivation fails (raises or returns None),
