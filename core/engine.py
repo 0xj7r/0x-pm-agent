@@ -272,11 +272,13 @@ class BTCTradingEngine:
     def _check_entry(self) -> list[dict]:
         if not self.current_window or self._already_traded_this_window:
             return []
-        if self._supa is None and not self.cfg.paper.enabled:
+        if (self._supa is None and not self.cfg.paper.enabled
+                and os.environ.get("ALLOW_LIVE_WITHOUT_SUPABASE") != "1"):
             if not getattr(self, "_logged_no_supa", False):
                 logger.error(
                     "BLOCKING ALL TRADES: Supabase client is None in live mode. "
-                    "Check SUPABASE_URL/SUPABASE_KEY."
+                    "Check SUPABASE_URL/SUPABASE_KEY or set "
+                    "ALLOW_LIVE_WITHOUT_SUPABASE=1 to bypass."
                 )
                 self._logged_no_supa = True
             return []
