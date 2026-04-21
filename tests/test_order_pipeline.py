@@ -99,8 +99,13 @@ async def run_pipeline_check(live: bool = False):
     # 5. Balance
     print("\n5. Account balance")
     try:
-        balance = await client.get_balance()
-        check("Balance fetched", True, f"${balance:.2f}")
+        ba = await client.get_balance_allowance()
+        check(
+            "Balance fetched",
+            True,
+            f"balance=${ba['balance_usdc']:.2f} "
+            f"allowance=${ba['allowance_usdc']:.2f}",
+        )
     except Exception as e:
         check("Balance fetched", False, str(e))
 
