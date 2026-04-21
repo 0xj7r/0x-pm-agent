@@ -447,10 +447,40 @@ class BTCTradingEngine:
                     await self._scan_for_window()
 
                     for t in self._check_entry():
+                        if not self.cfg.paper.enabled:
+                            # Real CLOB order. On any failure we do not
+                            # record the trade locally so we don't think
+                            # we have a position that doesn't exist.
+                            # Release the window so the next snap can retry.
+                            try:
+                                result = await self._polymarket.place_order(
+                                    token_id=t["token_id"],
+                                    side="BUY",
+                                    price=t["token_price"],
+                                    size=t["shares"],
+                                )
+                                t["order_id"] = (
+                                    result.get("orderID")
+                                    or result.get("orderId")
+                                    or result.get("id")
+                                )
+                                t["order_status"] = result.get("status", "posted")
+                                self.risk.record_order_success()
+                                logger.warning(
+                                    f"[LIVE] Order placed: id={t['order_id']} "
+                                    f"status={t['order_status']}"
+                                )
+                            except Exception as e:
+                                self.risk.record_order_rejection()
+                                self._already_traded_this_window = False
+                                logger.error(
+                                    f"[LIVE] Order placement FAILED: {e}"
+                                )
+                                continue
                         self._paper_trades.append(t)
-                        if self.cfg.paper.enabled:
-                            self.balance -= t["size_usd"]
-                            logger.info(f"[PAPER] Balance: ${self.balance:.2f}")
+                        self.balance -= t["size_usd"]
+                        tag = "[PAPER]" if self.cfg.paper.enabled else "[LIVE] "
+                        logger.info(f"{tag} Balance: ${self.balance:.2f}")
                         await self.slack.notify_trade(
                             direction=t["direction"], token_price=t["token_price"],
                             size_usd=t["size_usd"], shares=t["shares"],
