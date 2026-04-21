@@ -28,6 +28,9 @@ class RiskConfig:
     loss_cooldown_seconds: int = 300
     kelly_multiplier: float = 0.25
     cheap_token_multiplier: float = 2.0
+    max_daily_trades: int = 0
+    reject_streak_limit: int = 0
+    drift_threshold_usd: float = 2.0
 
 
 @dataclass
