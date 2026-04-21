@@ -496,28 +496,28 @@ class BTCTradingEngine:
             raw_token_price + self._live_entry_slippage_usd, MAX_BUY_PRICE
         )
 
-        # Polymarket CLOB rejects orders with share count below the market's
-        # minimum (typically 5). Auto-scale size_usd UP to meet the minimum
-        # if the current size would fall short — capped at 1.5x the
-        # configured max_position_usd to avoid silent runaway. If even the
-        # scaled amount would exceed the cap, skip the signal entirely.
-        min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
-        shares_at_size = size_usd / effective_token_price
-        if shares_at_size < min_shares:
-            needed_usd = min_shares * effective_token_price
-            cap_usd = self.cfg.risk.max_position_usd * 1.5
-            if needed_usd <= cap_usd and needed_usd <= self.balance * self.cfg.risk.max_position_pct * 1.5:
-                logger.info(
-                    f"Scaling size ${size_usd:.2f} -> ${needed_usd:.2f} to meet "
-                    f"min_shares={min_shares} at price ${effective_token_price:.3f}"
-                )
-                size_usd = needed_usd
-            else:
-                logger.info(
-                    f"SKIP: shares {shares_at_size:.2f} < min {min_shares} "
-                    f"and needed ${needed_usd:.2f} exceeds 1.5x cap"
-                )
-                return []
+        # Polymarket CLOB rejects live orders below its per-market minimum
+        # share count (typically 5). Paper mode has no such constraint —
+        # keep paper behavior unchanged so historical paper stats remain
+        # apples-to-apples with prior sessions.
+        if not self.cfg.paper.enabled:
+            min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
+            shares_at_size = size_usd / effective_token_price
+            if shares_at_size < min_shares:
+                needed_usd = min_shares * effective_token_price
+                cap_usd = self.cfg.risk.max_position_usd * 1.5
+                if needed_usd <= cap_usd and needed_usd <= self.balance * self.cfg.risk.max_position_pct * 1.5:
+                    logger.info(
+                        f"Scaling size ${size_usd:.2f} -> ${needed_usd:.2f} to meet "
+                        f"min_shares={min_shares} at price ${effective_token_price:.3f}"
+                    )
+                    size_usd = needed_usd
+                else:
+                    logger.info(
+                        f"SKIP: shares {shares_at_size:.2f} < min {min_shares} "
+                        f"and needed ${needed_usd:.2f} exceeds 1.5x cap"
+                    )
+                    return []
 
         self._already_traded_this_window = True
         self.risk.record_trade_entry()
