@@ -303,6 +303,7 @@ class CTFRedeemer:
         self,
         positions: list[dict[str, Any]],
         index_sets: list[int] = [1, 2],
+        allow_blind_redeem_without_balance_check: bool = False,
     ) -> list[dict[str, Any]]:
         """Redeem every winning position with a non-zero ERC-1155 balance.
 
@@ -324,8 +325,13 @@ class CTFRedeemer:
 
         A position is "skipped" when balanceOf returns 0 (already redeemed
         or never held). An "error" status means the balanceOf precheck
-        itself raised; we do NOT attempt a blind redeem in that case
-        because it would waste gas on an empty position.
+        itself raised; we do NOT attempt a blind redeem in that case by
+        default because it would waste gas on an empty position.
+
+        When `allow_blind_redeem_without_balance_check=True`, positions
+        missing a token_id (or any balanceOf precheck) may still attempt
+        a redeem. This is useful when upstream data lacks token ids; the
+        CTF redeem is idempotent but burns gas when nothing is redeemable.
         """
         results: list[dict[str, Any]] = []
         seen_conditions: set[str] = set()
@@ -340,14 +346,32 @@ class CTFRedeemer:
             seen_conditions.add(cid_norm)
 
             if token_id is None:
-                # No token to probe: skip rather than redeem blindly.
-                results.append({
-                    "condition_id": condition_id,
-                    "tx_hash": "",
-                    "status": "skipped",
-                    "gas_used": 0,
-                    "reason": "no token_id to probe balance",
-                })
+                if not allow_blind_redeem_without_balance_check:
+                    results.append({
+                        "condition_id": condition_id,
+                        "tx_hash": "",
+                        "status": "skipped",
+                        "gas_used": 0,
+                        "reason": "no token_id to probe balance",
+                    })
+                    continue
+                try:
+                    res = await self.redeem(condition_id, index_sets=index_sets)
+                    results.append({
+                        "condition_id": condition_id,
+                        "tx_hash": res.get("tx_hash", ""),
+                        "status": res.get("status", "failed"),
+                        "gas_used": int(res.get("gas_used", 0)),
+                        "reason": "blind redeem (token_id missing)",
+                    })
+                except Exception as e:
+                    results.append({
+                        "condition_id": condition_id,
+                        "tx_hash": "",
+                        "status": "error",
+                        "gas_used": 0,
+                        "reason": f"blind redeem raised: {e}",
+                    })
                 continue
 
             try:

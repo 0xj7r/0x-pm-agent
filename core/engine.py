@@ -11,6 +11,7 @@ import logging
 import os
 import time as _time
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
 from clients.ctf_redeemer import CTFRedeemer
@@ -21,14 +22,20 @@ from clients.polymarket_ws import PolymarketWSClient
 from clients.resolution_watcher import ResolutionWatcher, derive_winner
 from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
 from core.health import HealthServer
+from core.kelly import (
+    empirical_kelly_size,
+    estimate_price_bucket_p_win,
+    smoothed_bucket_estimate,
+)
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
 from core.resolver import PaperTradeResolver
-from core.risk import RiskManager
+from core.risk import RejectReason, RiskManager
 from core.trade_persistence import TradePersistence
 from config import Config
 from models.market import MarketWindow
 from shared.constants import COIN_CONFIGS
+from shared.fees import taker_fee_usd
 from strategies.live_runtime import LiveRuntimeStrategy
 from strategies.strategy_config import StrategyConfig, normalize_coin_config
 
@@ -43,6 +50,41 @@ LIVE_ENTRY_SLIPPAGE_USD = 0.01
 
 # Hard cap: never quote a BUY above 0.99 even after slippage.
 MAX_BUY_PRICE = 0.99
+
+
+def _compact_dict(d: dict | None, keys: list[str]) -> dict:
+    if not isinstance(d, dict):
+        return {}
+    return {k: d.get(k) for k in keys if k in d}
+
+
+def _classify_reject_reason(text: str) -> RejectReason:
+    t = (text or "").lower()
+
+    if "not enough balance" in t:
+        return RejectReason.INSUFFICIENT_FUNDS
+    if "insufficient" in t and "balance" in t:
+        return RejectReason.INSUFFICIENT_FUNDS
+    if "insufficient funds" in t:
+        return RejectReason.INSUFFICIENT_FUNDS
+
+    if "unauthorized" in t:
+        return RejectReason.AUTH_FAILURE
+    if "signature" in t:
+        return RejectReason.AUTH_FAILURE
+
+    if "too many requests" in t or "rate limit" in t or "429" in t:
+        return RejectReason.RATE_LIMITED
+
+    if "lower than the minimum" in t:
+        return RejectReason.MIN_SHARES
+    if "minimum" in t and ("size" in t or "shares" in t):
+        return RejectReason.MIN_SHARES
+
+    if "price" in t and "cross" in t:
+        return RejectReason.PRICE_CROSSED
+
+    return RejectReason.UNKNOWN
 
 
 class BTCTradingEngine:
@@ -92,6 +134,14 @@ class BTCTradingEngine:
         self._polymarket: PolymarketClient | None = None
         self._redeemer: CTFRedeemer | None = None
         self._redeem_drift: bool = False
+        self._redeem_sweep_interval_s: int = int(
+            getattr(strategy_cfg.risk, "redeem_sweep_interval_seconds", 300) or 300
+        )
+        self._redeem_blind_when_token_missing: bool = bool(
+            getattr(strategy_cfg.risk, "redeem_blind_when_token_missing", True)
+        )
+        self._last_redeem_sweep_ts: float = 0.0
+        self._last_take_profit_ts_by_market: dict[str, float] = {}
 
         # Push-path state (parallel to polling). Keys are orderIDs; the
         # asyncio.Event fires as soon as a trade/order event on the user
@@ -199,6 +249,22 @@ class BTCTradingEngine:
             getattr(strategy_cfg.risk, "live_entry_slippage_usd", LIVE_ENTRY_SLIPPAGE_USD)
         )
 
+    def _book_snapshot(self, token_id: str) -> dict:
+        book = self.poly_ws.get_book(token_id)
+        if book is None:
+            return {"token_id": token_id, "ok": False}
+        age_ms = max(0, int((_time.time() - float(book.last_update or 0.0)) * 1000))
+        return {
+            "ok": True,
+            "token_id": token_id,
+            "best_bid": float(book.best_bid or 0.0),
+            "best_bid_size": float(getattr(book, "best_bid_size", 0.0) or 0.0),
+            "best_ask": float(book.best_ask or 0.0),
+            "best_ask_size": float(getattr(book, "best_ask_size", 0.0) or 0.0),
+            "spread": float(book.spread or 0.0),
+            "age_ms": age_ms,
+        }
+
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
         base = Config()
@@ -211,6 +277,10 @@ class BTCTradingEngine:
         base.LOSS_COOLDOWN_SECONDS = cfg.risk.loss_cooldown_seconds
         base.MAX_DAILY_TRADES = cfg.risk.max_daily_trades
         base.REJECT_STREAK_LIMIT = cfg.risk.reject_streak_limit
+        base.REJECT_COOLDOWN_SECONDS = getattr(cfg.risk, "reject_cooldown_seconds", 60)
+        base.REJECT_STREAK_COOLDOWN_SECONDS = getattr(
+            cfg.risk, "reject_streak_cooldown_seconds", 600
+        )
         return RiskManager(base)
 
     async def _on_user_ws_event(self, evt: dict) -> None:
@@ -485,28 +555,78 @@ class BTCTradingEngine:
             token_id = self.current_window.down_token_id
             raw_token_price = price_down
 
-        size_usd = min(
-            self.balance * self.cfg.risk.max_position_pct,
-            self.cfg.risk.max_position_usd,
-        )
-        if size_usd < 1.0:
-            return []
-
+        # Enforce max_entry on the *submit* price too. Otherwise slippage can
+        # bypass the strategy gate (raw <= max_entry, but raw+slip > max_entry),
+        # causing live to take the worst risk/reward corner that the config
+        # intended to exclude.
+        max_entry_price = float(self._strategy.params.get("max_entry", MAX_BUY_PRICE))
         effective_token_price = min(
-            raw_token_price + self._live_entry_slippage_usd, MAX_BUY_PRICE
+            raw_token_price + self._live_entry_slippage_usd,
+            max_entry_price,
+            MAX_BUY_PRICE,
         )
+        empirical_kelly_enabled = bool(getattr(self.cfg.risk, "empirical_kelly_enabled", False))
+        p_win_estimate = None
+        if empirical_kelly_enabled:
+            p_win_estimate = estimate_price_bucket_p_win(self.memory, effective_token_price)
+            # Cold-start: no resolutions in this bucket yet. Synthesize an
+            # empty estimate so the prior still drives sizing instead of
+            # falling back to flat.
+            if p_win_estimate is None:
+                from core.kelly import PriceBucketEstimate, bucket_for_price
+                p_win_estimate = PriceBucketEstimate(
+                    bucket=bucket_for_price(effective_token_price),
+                    wins=0, losses=0, p_win=0.0,
+                )
+
+        if p_win_estimate is None:
+            size_usd = min(
+                self.balance * self.cfg.risk.max_position_pct,
+                self.cfg.risk.max_position_usd,
+            )
+        else:
+            p_win_estimate = smoothed_bucket_estimate(
+                p_win_estimate,
+                effective_token_price,
+                float(getattr(self.cfg.risk, "empirical_kelly_prior_weight", 1.0)),
+                float(getattr(self.cfg.risk, "empirical_kelly_prior_edge", 0.05)),
+            )
+            size_usd = empirical_kelly_size(
+                p_win=p_win_estimate.p_win,
+                token_price=effective_token_price,
+                bankroll=self.balance,
+                risk_cfg=self.cfg.risk,
+            )
+
+        if size_usd < 1.0:
+            if p_win_estimate is not None:
+                logger.info(
+                    "SKIP: empirical Kelly size is zero | bucket=%s p_win=%.3f samples=%d price=%.3f",
+                    p_win_estimate.bucket,
+                    p_win_estimate.p_win,
+                    p_win_estimate.samples,
+                    effective_token_price,
+                )
+            return []
 
         # Polymarket CLOB rejects live orders below its per-market minimum
         # share count (typically 5). Paper mode has no such constraint —
         # keep paper behavior unchanged so historical paper stats remain
         # apples-to-apples with prior sessions.
-        if not self.cfg.paper.enabled:
+        paper_livelike = bool(getattr(self.cfg.risk, "paper_livelike_enabled", False))
+        if (not self.cfg.paper.enabled) or paper_livelike:
             min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
             shares_at_size = size_usd / effective_token_price
             if shares_at_size < min_shares:
                 needed_usd = min_shares * effective_token_price
                 cap_usd = self.cfg.risk.max_position_usd * 1.5
-                if needed_usd <= cap_usd and needed_usd <= self.balance * self.cfg.risk.max_position_pct * 1.5:
+                if empirical_kelly_enabled:
+                    logger.info(
+                        f"SKIP: Kelly size ${size_usd:.2f} gives shares {shares_at_size:.2f} "
+                        f"< min_shares={min_shares}; not scaling beyond Kelly"
+                    )
+                    return []
+                elif needed_usd <= cap_usd and needed_usd <= self.balance * self.cfg.risk.max_position_pct * 1.5:
                     logger.info(
                         f"Scaling size ${size_usd:.2f} -> ${needed_usd:.2f} to meet "
                         f"min_shares={min_shares} at price ${effective_token_price:.3f}"
@@ -522,6 +642,12 @@ class BTCTradingEngine:
         self._already_traded_this_window = True
         self.risk.record_trade_entry()
         regime = self._compute_regime()
+        decision_ts = datetime.now(timezone.utc).isoformat()
+        book_snapshots = {
+            "up": self._book_snapshot(self.current_window.up_token_id),
+            "down": self._book_snapshot(self.current_window.down_token_id),
+            "selected": self._book_snapshot(token_id),
+        }
         trade = {
             "market_id": self.current_window.market_id,
             "direction": direction,
@@ -530,19 +656,23 @@ class BTCTradingEngine:
             "raw_token_price": raw_token_price,
             "size_usd": size_usd,
             "shares": size_usd / effective_token_price,
-            "p_win": None,
+            "p_win": p_win_estimate.p_win if p_win_estimate is not None else None,
+            "p_win_bucket": p_win_estimate.bucket if p_win_estimate is not None else None,
+            "p_win_samples": p_win_estimate.samples if p_win_estimate is not None else 0,
             "btc_price": self._current_btc_price,
             "move_pct": move_pct,
             "strategy": self._strategy.name,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": decision_ts,
             "regime": regime,
+            "book": book_snapshots,
         }
 
         logger.info(
             f"ENTRY [{self._strategy.name.upper()}]: {direction} @ ${effective_token_price:.3f} "
             f"(raw=${raw_token_price:.3f} +slip=${self._live_entry_slippage_usd:.3f}) | "
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
-            f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
+            f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f} | "
+            f"p_win={trade['p_win'] if trade['p_win'] is not None else 'n/a'}"
         )
         # NOTE: persistence.record_entry is deliberately NOT called here.
         # Moving the write to the async caller AFTER fill confirmation
@@ -550,6 +680,75 @@ class BTCTradingEngine:
         # (timeouts, cancels, rejections). The caller records on paper
         # append or after _submit_and_confirm_live_order returns non-None.
         return [trade]
+
+    async def _simulate_paper_live_like_fill(self, t: dict) -> dict | None:
+        """Paper-mode simulation of live fill constraints.
+
+        - Re-checks best ask after a small latency; if ask > submit price,
+          treat as price-cross (no fill).
+        - Optionally caps filled shares to best-ask size (partial fill).
+
+        Returns adjusted trade dict on fill, or None on no-fill.
+        """
+        latency_ms = int(getattr(self.cfg.risk, "paper_livelike_latency_ms", 150) or 0)
+        use_best_ask_size = bool(
+            getattr(self.cfg.risk, "paper_livelike_use_best_ask_size", True)
+        )
+        if latency_ms > 0:
+            await asyncio.sleep(latency_ms / 1000)
+
+        token_id = t.get("token_id") or ""
+        if not token_id:
+            self.risk.record_order_rejection(
+                reason=RejectReason.UNKNOWN,
+                message="paper livelike: missing token_id",
+            )
+            self._already_traded_this_window = False
+            return None
+
+        submit_price = float(t.get("token_price") or 0.0)
+        desired_shares = float(t.get("shares") or 0.0)
+        if submit_price <= 0 or desired_shares <= 0:
+            self.risk.record_order_rejection(
+                reason=RejectReason.UNKNOWN,
+                message="paper livelike: invalid submit price/size",
+            )
+            self._already_traded_this_window = False
+            return None
+
+        current_ask = float(self.poly_ws.get_price(token_id) or 0.0)
+        if current_ask <= 0:
+            self.risk.record_order_rejection(
+                reason=RejectReason.UNKNOWN,
+                message="paper livelike: no live ask",
+            )
+            self._already_traded_this_window = False
+            return None
+
+        if current_ask > submit_price + 1e-9:
+            self.risk.record_order_rejection(
+                reason=RejectReason.PRICE_CROSSED,
+                message=f"paper livelike: ask {current_ask:.4f} > submit {submit_price:.4f}",
+            )
+            self._already_traded_this_window = False
+            return None
+
+        filled_shares = desired_shares
+        if use_best_ask_size:
+            book = self.poly_ws.get_book(token_id)
+            ask_size = float(getattr(book, "best_ask_size", 0.0) or 0.0) if book else 0.0
+            if ask_size > 0 and ask_size + 1e-9 < desired_shares:
+                filled_shares = ask_size
+                fill_ratio = filled_shares / desired_shares
+                t["order_status"] = "partial_paper"
+                t["shares"] = filled_shares
+                t["size_usd"] = float(t["size_usd"]) * fill_ratio
+                self.risk.record_order_success()
+                return t
+
+        t["order_status"] = "matched_paper"
+        self.risk.record_order_success()
+        return t
 
     async def _sleep_or_push(self, push_event: asyncio.Event, seconds: float) -> None:
         """Sleep up to `seconds`, but return early if push_event fires.
@@ -740,10 +939,18 @@ class BTCTradingEngine:
         if self._polymarket is None:
             raise RuntimeError("live order requires polymarket client")
 
+        # Ensure a stable id for this execution attempt so order/exit/final
+        # events can be joined later even if no fill occurs.
+        self.persistence.ensure_trade_id(self._strategy.name, t)
+        order_attempt_id = uuid4().hex
+        t["order_attempt_id"] = order_attempt_id
+
         # t["token_price"] already includes the live-entry slippage bump
         # applied in _check_entry, capped at MAX_BUY_PRICE. We still
         # clamp defensively in case t was constructed elsewhere.
         submit_price = min(float(t["token_price"]), MAX_BUY_PRICE)
+        submit_started = _time.time()
+        submit_book = self._book_snapshot(str(t.get("token_id") or ""))
         try:
             result = await self._polymarket.place_order(
                 token_id=t["token_id"],
@@ -752,8 +959,28 @@ class BTCTradingEngine:
                 size=t["shares"],
             )
         except Exception as e:
-            self.risk.record_order_rejection()
+            msg = str(e)
+            self.risk.record_order_rejection(
+                reason=_classify_reject_reason(msg),
+                message=msg,
+            )
             self._already_traded_this_window = False
+            self.persistence.record_order_submit(
+                market_id=t.get("market_id", "unknown"),
+                payload={
+                    "trade_id": t.get("id"),
+                    "order_attempt_id": order_attempt_id,
+                    "side": "BUY",
+                    "token_id": t.get("token_id"),
+                    "submit_price": submit_price,
+                    "shares": t.get("shares"),
+                    "size_usd": t.get("size_usd"),
+                    "btc_price": t.get("btc_price"),
+                    "submit_book": submit_book,
+                    "error": msg[:800],
+                    "submit_ts": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             logger.error(f"[LIVE] Order placement FAILED: {e}")
             return None
 
@@ -763,8 +990,28 @@ class BTCTradingEngine:
             or result.get("id")
         )
         if not order_id:
-            self.risk.record_order_rejection()
+            msg = f"place_order returned no order id: {result}"
+            self.risk.record_order_rejection(
+                reason=_classify_reject_reason(msg),
+                message=msg,
+            )
             self._already_traded_this_window = False
+            self.persistence.record_order_submit(
+                market_id=t.get("market_id", "unknown"),
+                payload={
+                    "trade_id": t.get("id"),
+                    "order_attempt_id": order_attempt_id,
+                    "side": "BUY",
+                    "token_id": t.get("token_id"),
+                    "submit_price": submit_price,
+                    "shares": t.get("shares"),
+                    "size_usd": t.get("size_usd"),
+                    "btc_price": t.get("btc_price"),
+                    "submit_book": submit_book,
+                    "result": _compact_dict(result, ["status", "error", "message", "fee_rate_bps"]),
+                    "submit_ts": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             logger.error(
                 f"[LIVE] place_order returned no order id: {result}"
             )
@@ -773,13 +1020,49 @@ class BTCTradingEngine:
         immediate_status = (result.get("status") or "").strip().lower()
         t["order_id"] = order_id
         t["order_status"] = immediate_status or "posted"
+        t["fee_rate_bps"] = result.get("fee_rate_bps")
+        t["submit_price"] = submit_price
+        t["submit_book"] = submit_book
         original_size = float(t["shares"])
+        self.persistence.record_order_submit(
+            market_id=t.get("market_id", "unknown"),
+            payload={
+                "trade_id": t.get("id"),
+                "order_attempt_id": order_attempt_id,
+                "order_id": order_id,
+                "side": "BUY",
+                "token_id": t.get("token_id"),
+                "submit_price": submit_price,
+                "shares": original_size,
+                "size_usd": t.get("size_usd"),
+                "btc_price": t.get("btc_price"),
+                "submit_book": submit_book,
+                "result": _compact_dict(
+                    result,
+                    ["status", "fee_rate_bps", "orderID", "orderId", "id"],
+                ),
+                "submit_ts": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         # Fast path: order already fully matched on submit.
         if immediate_status == "matched":
             self.risk.record_order_success()
             logger.warning(
                 f"[LIVE] Order matched on submit: id={order_id}"
+            )
+            self.persistence.record_order_final(
+                market_id=t.get("market_id", "unknown"),
+                payload={
+                    "trade_id": t.get("id"),
+                    "order_attempt_id": order_attempt_id,
+                    "order_id": order_id,
+                    "final_status": "matched",
+                    "filled_shares": original_size,
+                    "btc_price": t.get("btc_price"),
+                    "final_ts": datetime.now(timezone.utc).isoformat(),
+                    "latency_ms": int((_time.time() - submit_started) * 1000),
+                },
             )
             return t
 
@@ -796,10 +1079,30 @@ class BTCTradingEngine:
         )
         status = outcome["status"]
         filled = float(outcome["size_matched"])
+        last_resp_compact = _compact_dict(
+            outcome.get("last_response") if isinstance(outcome, dict) else None,
+            ["status", "size_matched", "sizeMatched", "price", "avgPrice"],
+        )
 
         if status == "matched":
             self.risk.record_order_success()
             t["order_status"] = "matched"
+            t["filled_shares"] = filled
+            self.persistence.record_order_final(
+                market_id=t.get("market_id", "unknown"),
+                payload={
+                    "trade_id": t.get("id"),
+                    "order_attempt_id": order_attempt_id,
+                    "order_id": order_id,
+                    "final_status": status,
+                    "filled_shares": filled,
+                    "original_shares": original_size,
+                    "btc_price": t.get("btc_price"),
+                    "last_response": last_resp_compact,
+                    "final_ts": datetime.now(timezone.utc).isoformat(),
+                    "latency_ms": int((_time.time() - submit_started) * 1000),
+                },
+            )
             logger.warning(
                 f"[LIVE] Order filled: id={order_id} size={filled}"
             )
@@ -814,6 +1117,22 @@ class BTCTradingEngine:
             t["shares"] = filled
             t["size_usd"] = float(t["size_usd"]) * fill_ratio
             self.risk.record_order_success()
+            t["filled_shares"] = filled
+            self.persistence.record_order_final(
+                market_id=t.get("market_id", "unknown"),
+                payload={
+                    "trade_id": t.get("id"),
+                    "order_attempt_id": order_attempt_id,
+                    "order_id": order_id,
+                    "final_status": status,
+                    "filled_shares": filled,
+                    "original_shares": original_size,
+                    "btc_price": t.get("btc_price"),
+                    "last_response": last_resp_compact,
+                    "final_ts": datetime.now(timezone.utc).isoformat(),
+                    "latency_ms": int((_time.time() - submit_started) * 1000),
+                },
+            )
             logger.warning(
                 f"[LIVE] Order PARTIAL fill: id={order_id} "
                 f"filled={filled}/{original_size} "
@@ -822,13 +1141,257 @@ class BTCTradingEngine:
             return t
 
         # Any other terminal state: rejected, cancelled, or timeout.
-        self.risk.record_order_rejection()
+        last_resp = outcome.get("last_response")
+        if status in ("timeout", "cancelled"):
+            if not last_resp:
+                reason = RejectReason.UNKNOWN
+                msg = (
+                    f"order {status} with no status payload id={order_id} "
+                    "(network/CLOB error vs price-cross unknown)"
+                )
+            else:
+                reason = RejectReason.PRICE_CROSSED
+                msg = f"order {status} (likely price crossed) id={order_id}"
+        else:
+            msg = f"order {status} id={order_id} resp={last_resp}"
+            reason = _classify_reject_reason(msg)
+        self.risk.record_order_rejection(reason=reason, message=msg)
         self._already_traded_this_window = False
+        # Also persist the classified reject so we can analyze execution failure rates later.
+        self.persistence.record_order_final(
+            market_id=t.get("market_id", "unknown"),
+            payload={
+                "trade_id": t.get("id"),
+                "order_attempt_id": order_attempt_id,
+                "order_id": order_id,
+                "final_status": status,
+                "filled_shares": filled,
+                "original_shares": original_size,
+                "last_response": last_resp_compact,
+                "reject_reason": reason.value,
+                "reject_msg": msg[:800],
+                "btc_price": t.get("btc_price"),
+                "final_ts": datetime.now(timezone.utc).isoformat(),
+                "latency_ms": int((_time.time() - submit_started) * 1000),
+            },
+        )
         logger.warning(
             f"[LIVE] Order NOT filled (status={status}): id={order_id}. "
             f"No position recorded. Releasing window."
         )
         return None
+
+    async def _await_order_fill_hard_timeout(
+        self, order_id: str, original_size: float, timeout_seconds: float
+    ) -> dict:
+        """Poll order status with a hard wall-clock timeout (used for exits)."""
+        if self._polymarket is None:
+            raise RuntimeError("live polling requires polymarket client")
+
+        start = _time.time()
+        last_resp: dict | None = None
+        while True:
+            if _time.time() - start >= timeout_seconds:
+                try:
+                    await self._polymarket.cancel_order(order_id)
+                except Exception as e:
+                    logger.warning(f"[LIVE] cancel_order({order_id}) on timeout failed: {e}")
+                filled = 0.0
+                if isinstance(last_resp, dict):
+                    try:
+                        filled = float(last_resp.get("size_matched", last_resp.get("sizeMatched", 0)) or 0)
+                    except (TypeError, ValueError):
+                        filled = 0.0
+                if filled > 0 and filled + 1e-9 < original_size:
+                    return {"status": "partial", "size_matched": filled, "last_response": last_resp}
+                return {"status": "timeout", "size_matched": filled, "last_response": last_resp}
+
+            try:
+                resp = await self._polymarket.get_order_status(order_id)
+            except Exception as e:
+                logger.warning(f"[LIVE] get_order_status({order_id}) failed: {e}")
+                await asyncio.sleep(self._order_poll_interval_s)
+                continue
+
+            last_resp = resp if isinstance(resp, dict) else {}
+            status = (last_resp.get("status") or "").strip().lower()
+            try:
+                filled = float(last_resp.get("size_matched", last_resp.get("sizeMatched", 0)) or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+
+            if status == "matched":
+                if filled <= 0:
+                    filled = original_size
+                if filled + 1e-9 < original_size:
+                    try:
+                        await self._polymarket.cancel_order(order_id)
+                    except Exception as e:
+                        logger.warning(f"[LIVE] cancel_order({order_id}) on partial exit failed: {e}")
+                    return {"status": "partial", "size_matched": filled, "last_response": last_resp}
+                return {"status": "matched", "size_matched": filled, "last_response": last_resp}
+            if status in ("cancelled", "canceled"):
+                return {"status": "cancelled", "size_matched": filled, "last_response": last_resp}
+            if status in ("rejected", "failed"):
+                return {"status": "rejected", "size_matched": filled, "last_response": last_resp}
+
+            await asyncio.sleep(self._order_poll_interval_s)
+
+    async def _maybe_take_profit(self) -> None:
+        if self.cfg.paper.enabled:
+            return
+        if self._polymarket is None:
+            return
+        if not bool(getattr(self.cfg.risk, "take_profit_enabled", False)):
+            return
+
+        bid_threshold = float(getattr(self.cfg.risk, "take_profit_best_bid_threshold", 0.95))
+        sell_fraction = float(getattr(self.cfg.risk, "take_profit_sell_fraction", 1.0))
+        min_bid_size = float(getattr(self.cfg.risk, "take_profit_min_best_bid_size_shares", 0.0))
+        min_unrealized_usd = float(getattr(self.cfg.risk, "take_profit_min_unrealized_usd", 0.0))
+        exit_slip = float(getattr(self.cfg.risk, "take_profit_exit_slippage_usd", 0.005))
+        timeout_s = float(getattr(self.cfg.risk, "take_profit_order_timeout_seconds", 20))
+        min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
+
+        # We only ever have a handful of open positions; linear scan is fine.
+        for t in list(self._paper_trades):
+            if t.get("exited"):
+                continue
+            token_id = t.get("token_id")
+            if not token_id:
+                continue
+            book = self.poly_ws.get_book(token_id)
+            if book is None or book.best_bid <= 0:
+                continue
+            best_bid = float(book.best_bid)
+            best_bid_size = float(getattr(book, "best_bid_size", 0.0) or 0.0)
+            if best_bid < bid_threshold:
+                continue
+            if min_bid_size and best_bid_size < min_bid_size:
+                continue
+
+            shares = float(t.get("shares") or 0.0)
+            if shares <= 0:
+                continue
+
+            shares_to_sell = shares * sell_fraction
+            if best_bid_size > 0:
+                shares_to_sell = min(shares_to_sell, best_bid_size)
+            # Clamp to actual on-chain balance: Polymarket rejects SELL
+            # orders larger than the ERC-1155 balance we hold (which is
+            # often slightly less than intended size after partial fills).
+            if self._redeemer is not None:
+                try:
+                    onchain = await self._redeemer.get_position_balance(token_id)
+                    onchain_shares = float(onchain) / 1e6  # USDC decimals
+                    if onchain_shares > 0:
+                        shares_to_sell = min(shares_to_sell, onchain_shares)
+                except Exception as e:
+                    logger.warning("[TAKE_PROFIT] balance probe failed: %s", e)
+            if shares_to_sell + 1e-9 < min_shares:
+                continue
+
+            entry_px = float(t.get("token_price") or 0.0)
+            if entry_px <= 0:
+                continue
+            unrealized = shares_to_sell * (best_bid - entry_px)
+            if unrealized < min_unrealized_usd:
+                continue
+
+            sell_price = max(0.01, min(best_bid - exit_slip, 0.99))
+            if sell_price <= 0:
+                continue
+
+            market_id = str(t.get("market_id") or "")
+            now = _time.time()
+            if market_id and (now - self._last_take_profit_ts_by_market.get(market_id, 0.0) < 10.0):
+                continue
+
+            logger.warning(
+                "[TAKE_PROFIT] Trigger: market=%s token=%s bid=%.3f bid_sz=%.2f "
+                "entry_px=%.3f sell_px=%.3f shares=%.2f->%.2f unrealized≈$%.2f",
+                market_id,
+                str(token_id)[:16],
+                best_bid,
+                best_bid_size,
+                entry_px,
+                sell_price,
+                shares,
+                shares_to_sell,
+                unrealized,
+            )
+
+            try:
+                result = await self._polymarket.place_order(
+                    token_id=token_id,
+                    side="SELL",
+                    price=sell_price,
+                    size=shares_to_sell,
+                )
+            except Exception as e:
+                logger.error(f"[TAKE_PROFIT] SELL place_order failed: {e}")
+                continue
+
+            order_id = result.get("orderID") or result.get("orderId") or result.get("id")
+            if not order_id:
+                logger.error(f"[TAKE_PROFIT] SELL returned no order id: {result}")
+                continue
+
+            self._last_take_profit_ts_by_market[market_id] = now
+            outcome = await self._await_order_fill_hard_timeout(
+                order_id=str(order_id),
+                original_size=float(shares_to_sell),
+                timeout_seconds=timeout_s,
+            )
+            status = outcome["status"]
+            filled = float(outcome["size_matched"])
+            if filled <= 0:
+                logger.warning(f"[TAKE_PROFIT] SELL not filled status={status} id={order_id}")
+                continue
+
+            proceeds = filled * sell_price
+            fee = taker_fee_usd(sell_price, proceeds)
+            realized_pnl = filled * (sell_price - entry_px) - fee
+            self.balance += proceeds - fee
+
+            # Reduce or close the position.
+            remaining = shares - filled
+            if remaining <= 1e-6:
+                t["exited"] = True
+                # Prevent resolution/redeem bookkeeping for this market.
+                self.resolver.resolved_ids.add(market_id)
+                try:
+                    self._paper_trades.remove(t)
+                except ValueError:
+                    pass
+            else:
+                ratio = remaining / shares if shares > 0 else 0.0
+                t["shares"] = remaining
+                t["size_usd"] = float(t.get("size_usd") or 0.0) * ratio
+
+            self.persistence.record_exit(
+                self._strategy.name,
+                t,
+                exit_details={
+                    "order_id": str(order_id),
+                    "status": status,
+                    "filled_shares": filled,
+                    "sell_price": sell_price,
+                    "proceeds_usd": proceeds,
+                    "fee_usd": fee,
+                    "realized_pnl_usd": realized_pnl,
+                    "best_bid": best_bid,
+                    "best_bid_size": best_bid_size,
+                },
+            )
+            logger.warning(
+                "[TAKE_PROFIT] Realized on exit: filled=%.2f proceeds=$%.2f fee=$%.2f pnl≈$%.2f balance=$%.2f",
+                filled,
+                proceeds,
+                fee,
+                realized_pnl,
+                self.balance,
+            )
 
     async def _reconcile_live_balance(self) -> None:
         """Compare on-chain USDC vs our internal bookkeeping.
@@ -909,13 +1472,17 @@ class BTCTradingEngine:
             )
             self.persistence.record_resolution(self._strategy.name, trade, res, resolved_dir)
 
-            if res.won and self._redeemer is not None:
+            if self._redeemer is not None:
                 await self._redeem_winning_trade(trade)
 
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
 
     async def _redeem_winning_trade(self, trade: dict) -> None:
-        """Call CTF.redeemPositions for a resolved, winning live trade.
+        """Call CTF.redeemPositions for any resolved live trade (win or loss).
+
+        Losers are redeemed too so the UI + on-chain state stay tidy; the
+        balance precheck below short-circuits if there are no tokens held
+        (e.g. take-profit already sold the winning tokens pre-resolution).
 
         Logs loudly on failure and sets a drift flag for the next
         reconciliation loop to detect. Does not retry here.
@@ -1141,7 +1708,8 @@ class BTCTradingEngine:
 
         try:
             rows = self.memory.conn.execute(
-                "SELECT details FROM event_log WHERE event_type = 'resolution'"
+                "SELECT details FROM event_log WHERE event_type = 'resolution' "
+                "ORDER BY id DESC LIMIT 500"
             ).fetchall()
         except Exception as e:
             logger.warning(f"[SWEEP] event_log read failed: {e}")
@@ -1176,7 +1744,10 @@ class BTCTradingEngine:
             len(positions),
         )
         try:
-            results = await self._redeemer.sweep_wallet(positions)
+            results = await self._redeemer.sweep_wallet(
+                positions,
+                allow_blind_redeem_without_balance_check=self._redeem_blind_when_token_missing,
+            )
         except Exception as e:
             logger.error(f"[SWEEP] sweep_wallet threw: {e}")
             return []
@@ -1192,6 +1763,27 @@ class BTCTradingEngine:
             n_errored,
         )
         return results
+
+    async def _maybe_periodic_redemption_sweep(self) -> None:
+        if self.cfg.paper.enabled or self._redeemer is None:
+            return
+        if self._redeem_sweep_interval_s <= 0:
+            return
+        now = _time.time()
+        if self._last_redeem_sweep_ts and (
+            now - self._last_redeem_sweep_ts < self._redeem_sweep_interval_s
+        ):
+            return
+        self._last_redeem_sweep_ts = now
+        logger.info(
+            "[SWEEP] Periodic sweep tick (interval=%ss, blind_when_token_missing=%s)",
+            self._redeem_sweep_interval_s,
+            self._redeem_blind_when_token_missing,
+        )
+        try:
+            await self._startup_redemption_sweep([])
+        except Exception as e:
+            logger.warning(f"[SWEEP] periodic sweep failed: {e}")
 
     def set_strategy(self, strategy: LiveRuntimeStrategy) -> None:
         self._strategy = strategy
@@ -1298,6 +1890,12 @@ class BTCTradingEngine:
                                 # on-chain.
                                 continue
                             t = trade
+                        else:
+                            if bool(getattr(self.cfg.risk, "paper_livelike_enabled", False)):
+                                trade = await self._simulate_paper_live_like_fill(t)
+                                if trade is None:
+                                    continue
+                                t = trade
                         self._paper_trades.append(t)
                         # Fill-confirmed: persist the entry. Paper mode
                         # always "fills" on append; live mode only reaches
@@ -1315,6 +1913,10 @@ class BTCTradingEngine:
                         )
 
                     tick_count += 1
+                    # Lightweight periodic check; the sweep itself is time-gated.
+                    if tick_count % 20 == 0:
+                        await self._maybe_periodic_redemption_sweep()
+                        await self._maybe_take_profit()
                     if tick_count % 3000 == 0:
                         await self._reconcile_live_balance()
                     if tick_count % 600 == 0:

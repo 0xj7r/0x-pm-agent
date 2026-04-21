@@ -23,6 +23,32 @@ class TradePersistence:
         trade["id"] = trade_id
         return trade_id
 
+    def ensure_trade_id(self, strategy_name: str, trade: dict) -> str:
+        """Public wrapper so the engine can pre-assign an ID before order submit."""
+        return self._ensure_trade_id(strategy_name, trade)
+
+    def record_order_submit(self, market_id: str, payload: dict) -> None:
+        """Record an order submission attempt (live mode telemetry)."""
+        self._memory.save_event(
+            window_id=market_id,
+            event_type="order_submit",
+            log_odds=None,
+            p_up=None,
+            btc_price=payload.get("btc_price"),
+            details=payload,
+        )
+
+    def record_order_final(self, market_id: str, payload: dict) -> None:
+        """Record the final order outcome (filled/partial/rejected/etc)."""
+        self._memory.save_event(
+            window_id=market_id,
+            event_type="order_final",
+            log_odds=None,
+            p_up=None,
+            btc_price=payload.get("btc_price"),
+            details=payload,
+        )
+
     def record_entry(self, strategy_name: str, trade: dict) -> None:
         trade_id = self._ensure_trade_id(strategy_name, trade)
         self._memory.save_event(
@@ -80,6 +106,19 @@ class TradePersistence:
                 "move_pct": trade.get("move_pct"),
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
             })
+
+    def record_exit(self, strategy_name: str, trade: dict, exit_details: dict) -> None:
+        self._memory.save_event(
+            window_id=trade["market_id"],
+            event_type="exit",
+            p_up=None,
+            log_odds=None,
+            btc_price=None,
+            details={
+                "trade": trade,
+                **exit_details,
+            },
+        )
 
     def record_status(self, window_id: str, btc_price: float, balance: float, trades_total: int, up_price: float, down_price: float) -> None:
         self._memory.save_event(
