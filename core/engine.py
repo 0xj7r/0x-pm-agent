@@ -161,6 +161,7 @@ class BTCTradingEngine:
         self._drift_threshold_usd: float = float(
             getattr(strategy_cfg.risk, "drift_threshold_usd", 2.0)
         )
+        self._live_usdc_anchor: float | None = None
         self._order_poll_interval_s: float = float(
             getattr(strategy_cfg.risk, "order_poll_interval_seconds", 3.0)
         )
@@ -606,6 +607,12 @@ class BTCTradingEngine:
         return None
 
     async def _reconcile_live_balance(self) -> None:
+        """Compare on-chain USDC vs our internal bookkeeping.
+
+        Anchors to the on-chain balance captured at startup (+ cumulative
+        realized PnL), NOT to cfg starting_balance. This tolerates the
+        wallet being funded with a different amount than the config says.
+        """
         if self.cfg.paper.enabled:
             return
         if self._polymarket is None:
@@ -618,13 +625,26 @@ class BTCTradingEngine:
             logger.warning(f"Live balance reconciliation failed: {e}")
             return
         actual = float(result.get("balance_usdc", 0.0))
-        expected = float(self.balance)
+        # First call anchors the baseline. Subsequent calls expect
+        # anchor + realized_pnl_since_anchor (which equals internal
+        # `balance - starting_balance` delta).
+        if self._live_usdc_anchor is None:
+            self._live_usdc_anchor = actual
+            logger.info(
+                f"LIVE reconciliation anchor set: on-chain USDC=${actual:.2f}. "
+                f"Future drift checks measure deviations from this baseline."
+            )
+            return
+        realized_since_start = self.balance - self.cfg.paper.starting_balance
+        expected = self._live_usdc_anchor + realized_since_start
         diff = abs(actual - expected)
         if diff > self._drift_threshold_usd:
             logger.warning(
                 f"LIVE BALANCE DRIFT: actual=${actual:.2f} "
-                f"expected=${expected:.2f} diff=${diff:.2f} "
-                f"(threshold=${self._drift_threshold_usd:.2f}). Halting entries."
+                f"expected=${expected:.2f} (anchor=${self._live_usdc_anchor:.2f} "
+                f"+ realized=${realized_since_start:+.2f}) "
+                f"diff=${diff:.2f} (threshold=${self._drift_threshold_usd:.2f}). "
+                f"Halting entries."
             )
             self._reconcile_halt = True
 
