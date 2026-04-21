@@ -202,11 +202,25 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
     min_entry = params.get("min_entry", 0.0)
     hour_start = params.get("hour_start")
     hour_end = params.get("hour_end")
+    # Non-contiguous allow-list of UTC hours. Complements hour_start/end
+    # (which is a contiguous range). If both are set, both must pass.
+    _allowed_hours = params.get("allowed_hours")
+    allowed_hours = set(int(h) for h in _allowed_hours) if _allowed_hours is not None else None
+    # Optional deny-list of UTC hours (convenience; cleaner than listing
+    # 21 allowed hours when we want to block 3).
+    _skip_hours = params.get("skip_hours")
+    skip_hours = set(int(h) for h in _skip_hours) if _skip_hours is not None else None
     filters = [FILTER_MAP[name] for name in definition.filters]
 
     def fn(pm, i: int, current_hour: int | None = None) -> str | None:
         if hour_start is not None and hour_end is not None and current_hour is not None:
             if not _in_trading_hours(current_hour, hour_start, hour_end):
+                return "SKIP"
+        if allowed_hours is not None and current_hour is not None:
+            if current_hour not in allowed_hours:
+                return "SKIP"
+        if skip_hours is not None and current_hour is not None:
+            if current_hour in skip_hours:
                 return "SKIP"
 
         direction, entry = _base_check(pm, i, move, max_entry, min_entry)
