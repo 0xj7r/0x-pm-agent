@@ -58,6 +58,13 @@ def _make_engine(
     eng._already_traded_this_window = True
     eng._order_poll_interval_s = poll_interval
     eng._order_fill_deadline_buffer_s = deadline_buffer
+    # Push-path slots (normally initialized in __init__). Empty dicts so
+    # the legacy poll-only tests behave identically to before.
+    eng._push_order_events = {}
+    eng._push_order_snapshots = {}
+    eng._user_ws = None
+    eng._resolution_ws = None
+    eng._push_resolved_condition_ids = set()
     return eng
 
 

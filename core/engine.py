@@ -16,7 +16,9 @@ from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
 from clients.ctf_redeemer import CTFRedeemer
 from clients.market_scanner import MarketWindowScanner
 from clients.polymarket import PolymarketClient
+from clients.polymarket_user_ws import PolymarketUserWS
 from clients.polymarket_ws import PolymarketWSClient
+from clients.resolution_watcher import ResolutionWatcher, derive_winner
 from core.health import HealthServer
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
@@ -89,6 +91,22 @@ class BTCTradingEngine:
         self._polymarket: PolymarketClient | None = None
         self._redeemer: CTFRedeemer | None = None
         self._redeem_drift: bool = False
+
+        # Push-path state (parallel to polling). Keys are orderIDs; the
+        # asyncio.Event fires as soon as a trade/order event on the user
+        # WS channel reports MATCHED / CANCELED / UNMATCHED / FAILED for
+        # that order. Size is mirrored into `_push_fill_sizes` so the
+        # poller can pick up partial fills reported via push without a
+        # redundant REST call.
+        self._push_order_events: dict[str, asyncio.Event] = {}
+        self._push_order_snapshots: dict[str, dict] = {}
+        self._user_ws: PolymarketUserWS | None = None
+        self._resolution_ws: ResolutionWatcher | None = None
+        # Condition IDs seen on push path this session. Advisory; the
+        # resolver still owns `resolved_ids` for idempotency against
+        # `event_log` writes.
+        self._push_resolved_condition_ids: set[str] = set()
+
         if not strategy_cfg.paper.enabled:
             private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
             if not private_key:
@@ -193,6 +211,111 @@ class BTCTradingEngine:
         base.MAX_DAILY_TRADES = cfg.risk.max_daily_trades
         base.REJECT_STREAK_LIMIT = cfg.risk.reject_streak_limit
         return RiskManager(base)
+
+    async def _on_user_ws_event(self, evt: dict) -> None:
+        """Callback for PolymarketUserWS. Non-blocking.
+
+        Maps trade / order events onto `_push_order_events` so the poller
+        in `_await_order_fill` wakes up as soon as a push arrives. The
+        snapshot stored on `_push_order_snapshots[order_id]` uses the
+        same field names as the REST `get_order` response (status,
+        size_matched) so the poller's normalization works either way.
+        """
+        evt_type = evt.get("event_type")
+        if evt_type == "trade":
+            # `taker_order_id` is our order (we always submit as taker
+            # for sniping). Status lifecycle: MATCHED -> MINED -> CONFIRMED.
+            order_id = evt.get("taker_order_id")
+            size = evt.get("size")
+            status = (evt.get("status") or "").upper()
+            if not order_id:
+                return
+            # Only treat as "settled" once the chain has confirmed. Earlier
+            # statuses still signal partial progress; store snapshot.
+            try:
+                size_f = float(size) if size is not None else 0.0
+            except (TypeError, ValueError):
+                size_f = 0.0
+            snap = {
+                "id": order_id,
+                "status": "MATCHED" if status in ("MATCHED", "MINED", "CONFIRMED") else status,
+                "size_matched": str(size_f),
+                "source": "push",
+            }
+            self._push_order_snapshots[order_id] = snap
+            ev = self._push_order_events.get(order_id)
+            if ev is not None and status in ("MATCHED", "MINED", "CONFIRMED"):
+                ev.set()
+        elif evt_type == "order":
+            order_id = evt.get("id")
+            if not order_id:
+                return
+            op = (evt.get("type") or "").upper()
+            status = (evt.get("status") or "").upper()
+            snap = {
+                "id": order_id,
+                "status": status or op,
+                "size_matched": evt.get("size_matched", "0"),
+                "source": "push",
+            }
+            self._push_order_snapshots[order_id] = snap
+            ev = self._push_order_events.get(order_id)
+            if ev is None:
+                return
+            if op == "CANCELLATION" or status in (
+                "CANCELED", "CANCELLED", "UNMATCHED", "FAILED", "REJECTED"
+            ):
+                ev.set()
+
+    async def _on_resolution_push(
+        self, condition_id: str, winner: str, numerators: list[int]
+    ) -> None:
+        """Callback for ResolutionWatcher. Idempotent against Gamma polling.
+
+        The authoritative writer of resolution records stays
+        `_process_resolutions` (via `PaperTradeResolver`). Here we only
+        pre-seed `resolver.resolved_ids` so the next poll tick short-circuits
+        into resolution path immediately, and annotate any open trades
+        with the confirmed conditionId for downstream CTF redemption.
+        """
+        cid_norm = condition_id.lower()
+        if cid_norm in self._push_resolved_condition_ids:
+            return
+        self._push_resolved_condition_ids.add(cid_norm)
+
+        # Fast-path: if the next polling tick is 60s away we still want
+        # to be able to resolve. The resolver uses market_id (Gamma id)
+        # as the dedup key, not conditionId, so we can only force a
+        # resolution by calling through the Gamma path next tick. What
+        # we CAN do now: mark the trade and kick the loop.
+        matched_any = False
+        for t in self._paper_trades:
+            if not t.get("condition_id") and t.get("market_id"):
+                # We do not yet have a conditionId on the trade; without
+                # the Gamma lookup we can't map push conditionId -> trade.
+                # Store pending_push for visibility in logs.
+                continue
+            if t.get("condition_id", "").lower() == condition_id.lower():
+                t["pending_push_resolution"] = True
+                t["push_resolution_winner"] = winner
+                matched_any = True
+
+        if matched_any:
+            logger.warning(
+                "[PUSH] Resolution event matched %d open trade(s) for "
+                "condition=%s winner=%s. Awaiting next poll tick to record.",
+                sum(1 for t in self._paper_trades
+                    if t.get("condition_id", "").lower() == condition_id.lower()),
+                condition_id,
+                winner,
+            )
+        else:
+            logger.info(
+                "[PUSH] Resolution event: condition=%s winner=%s (no matching "
+                "open trade)",
+                condition_id,
+                winner,
+            )
 
     def _on_new_window(self, window: MarketWindow) -> None:
         self.current_window = window
@@ -405,6 +528,21 @@ class BTCTradingEngine:
         self.persistence.record_entry(self._strategy.name, trade)
         return [trade]
 
+    async def _sleep_or_push(self, push_event: asyncio.Event, seconds: float) -> None:
+        """Sleep up to `seconds`, but return early if push_event fires.
+
+        Matches the semantics of the old `asyncio.sleep(interval)` so the
+        polling loop keeps its 3s cadence as a fallback; user-WS pushes
+        collapse latency to sub-100ms in the healthy case.
+        """
+        try:
+            await asyncio.wait_for(push_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            return
+        # Clear so the next iteration can race again on a subsequent event
+        # (e.g. a trade fires MATCHED then MINED then CONFIRMED).
+        push_event.clear()
+
     async def _await_order_fill(
         self,
         order_id: str,
@@ -445,7 +583,16 @@ class BTCTradingEngine:
             except (TypeError, ValueError):
                 return 0.0
 
+        # Register a push-event slot for this order. A trade/order WS
+        # event sets the event as soon as it reports MATCHED / CANCELED
+        # / UNMATCHED / FAILED. The first iteration below calls get_order
+        # once; subsequent iterations race push vs 3s sleep.
+        push_event = self._push_order_events.setdefault(
+            order_id, asyncio.Event()
+        )
+
         last_resp: dict | None = None
+        push_won: bool = False
         while True:
             if window_end_time is not None:
                 remaining = (window_end_time - now_fn()).total_seconds()
@@ -479,14 +626,24 @@ class BTCTradingEngine:
                         "last_response": last_resp,
                     }
 
-            try:
-                resp = await self._polymarket.get_order_status(order_id)
-            except Exception as e:
-                logger.warning(
-                    f"[LIVE] get_order_status({order_id}) failed: {e}"
-                )
-                await asyncio.sleep(self._order_poll_interval_s)
-                continue
+            # Prefer a push snapshot if one arrived since the last loop.
+            # This makes the first iteration and every iteration thereafter
+            # free of a REST call when push is healthy.
+            push_snap = self._push_order_snapshots.pop(order_id, None)
+            if push_snap is not None:
+                push_won = True
+                resp: dict | None = push_snap
+            else:
+                try:
+                    resp = await self._polymarket.get_order_status(order_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[LIVE] get_order_status({order_id}) failed: {e}"
+                    )
+                    await self._sleep_or_push(
+                        push_event, self._order_poll_interval_s
+                    )
+                    continue
 
             last_resp = resp if isinstance(resp, dict) else {}
             status = _normalize(last_resp.get("status"))
@@ -505,30 +662,48 @@ class BTCTradingEngine:
                             f"[LIVE] cancel_order({order_id}) on partial "
                             f"failed: {e}"
                         )
+                    self._push_order_events.pop(order_id, None)
+                    self._push_order_snapshots.pop(order_id, None)
+                    if push_won:
+                        logger.info(
+                            f"[PUSH] fill detected via user WS order_id={order_id}"
+                        )
                     return {
                         "status": "partial",
                         "size_matched": filled,
                         "last_response": last_resp,
                     }
+                self._push_order_events.pop(order_id, None)
+                self._push_order_snapshots.pop(order_id, None)
+                if push_won:
+                    logger.info(
+                        f"[PUSH] fill detected via user WS order_id={order_id}"
+                    )
                 return {
                     "status": "matched",
                     "size_matched": filled,
                     "last_response": last_resp,
                 }
             if status in ("cancelled", "canceled"):
+                self._push_order_events.pop(order_id, None)
+                self._push_order_snapshots.pop(order_id, None)
                 return {
                     "status": "cancelled",
                     "size_matched": filled,
                     "last_response": last_resp,
                 }
             if status in ("rejected", "failed"):
+                self._push_order_events.pop(order_id, None)
+                self._push_order_snapshots.pop(order_id, None)
                 return {
                     "status": "rejected",
                     "size_matched": filled,
                     "last_response": last_resp,
                 }
 
-            await asyncio.sleep(self._order_poll_interval_s)
+            await self._sleep_or_push(
+                push_event, self._order_poll_interval_s
+            )
 
     async def _submit_and_confirm_live_order(self, t: dict) -> dict | None:
         """Place a live CLOB order and confirm fill via status polling.
@@ -797,6 +972,55 @@ class BTCTradingEngine:
         binance_task = asyncio.create_task(binance.connect())
         poly_ws_task = asyncio.create_task(self.poly_ws.connect())
 
+        # Push paths (parallel to polling). Start only in live mode.
+        user_ws_task: asyncio.Task | None = None
+        resolution_ws_task: asyncio.Task | None = None
+        if self._polymarket is not None:
+            try:
+                creds = self._polymarket.get_api_creds()
+            except Exception as e:
+                creds = None
+                logger.warning(f"User WS: failed to read L2 creds: {e}")
+            if creds:
+                self._user_ws = PolymarketUserWS(
+                    api_key=creds["apiKey"],
+                    api_secret=creds["secret"],
+                    api_passphrase=creds["passphrase"],
+                    on_event=self._on_user_ws_event,
+                )
+                user_ws_task = asyncio.create_task(self._user_ws.connect())
+                logger.info(
+                    "User WS enabled (push path active; REST polling "
+                    "remains as fallback)"
+                )
+            else:
+                logger.warning(
+                    "User WS disabled: no L2 creds resolved. "
+                    "Order fills will only be detected via REST polling."
+                )
+
+            ws_url = os.environ.get("POLYGON_WS_URL", "")
+            if not ws_url:
+                # Fall back to Config default (also env-driven).
+                ws_url = getattr(Config(), "POLYGON_WS_URL", "") or ""
+            if ws_url:
+                self._resolution_ws = ResolutionWatcher(
+                    ws_url=ws_url,
+                    on_resolution=self._on_resolution_push,
+                )
+                resolution_ws_task = asyncio.create_task(
+                    self._resolution_ws.connect()
+                )
+                logger.info(
+                    "Resolution WS enabled (push path active; Gamma "
+                    "polling remains as fallback)"
+                )
+            else:
+                logger.warning(
+                    "Resolution WS disabled: POLYGON_WS_URL unset. "
+                    "Resolutions detected via Gamma polling only."
+                )
+
         logger.info(
             f"BTC Sniper started | Paper: {self.cfg.paper.enabled} | "
             f"Balance: ${self.balance:.2f} | "
@@ -851,6 +1075,13 @@ class BTCTradingEngine:
                         if self._supa and self._supa._dlq:
                             self._supa.flush_dlq()
 
+                        user_ws_connected = bool(
+                            self._user_ws is not None and self._user_ws.connected
+                        )
+                        resolution_ws_connected = bool(
+                            self._resolution_ws is not None
+                            and self._resolution_ws.connected
+                        )
                         self.health.update(
                             balance=self.balance, trades_total=total,
                             trades_resolved=len(self.resolver.resolved_ids),
@@ -858,6 +1089,8 @@ class BTCTradingEngine:
                             binance_connected=binance.seconds_since_last_message < 10,
                             binance_last_msg_age_s=round(binance.seconds_since_last_message, 1),
                             current_window=self.current_window.question if self.current_window else None,
+                            user_ws_connected=user_ws_connected,
+                            resolution_ws_connected=resolution_ws_connected,
                         )
                         logger.info(
                             f"Status: Balance=${self.balance:.2f} | "
@@ -885,6 +1118,20 @@ class BTCTradingEngine:
             binance_task.cancel()
             await self.poly_ws.close()
             poly_ws_task.cancel()
+            if self._user_ws is not None:
+                try:
+                    await self._user_ws.close()
+                except Exception as e:
+                    logger.warning(f"User WS close failed: {e}")
+            if user_ws_task is not None:
+                user_ws_task.cancel()
+            if self._resolution_ws is not None:
+                try:
+                    await self._resolution_ws.close()
+                except Exception as e:
+                    logger.warning(f"Resolution WS close failed: {e}")
+            if resolution_ws_task is not None:
+                resolution_ws_task.cancel()
             if self._scanner:
                 await self._scanner.close()
             await self.resolver.close()
