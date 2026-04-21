@@ -241,7 +241,7 @@
         }
       },
       "risk": {
-        "max_position_usd": 2.0,
+        "max_position_usd": 5.0,
         "max_position_pct": 0.05,
         "daily_loss_limit_pct": 0.25,
         "kill_balance_usd": 70,
@@ -251,7 +251,8 @@
         "kelly_multiplier": 0.25,
         "max_daily_trades": 30,
         "reject_streak_limit": 3,
-        "drift_threshold_usd": 2.0
+        "drift_threshold_usd": 2.0,
+        "min_shares": 5.0
       },
       "paper": {
         "enabled": true,
