@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from web3 import Web3
+
 from clients import ctf_redeemer as ctf_mod
 from clients.ctf_redeemer import CTFRedeemer, _normalize_bytes32
 
@@ -280,3 +282,202 @@ async def test_redeem_falls_back_to_300k_gas_when_estimate_raises():
     assert result["status"] == "success"
     tx_kwargs = fake_call.build_transaction.call_args.args[0]
     assert tx_kwargs["gas"] == 300_000
+
+
+# Proxy-delegated mode (signature_type=1 / POLY_PROXY)
+
+FAKE_FUNDER = "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
+
+
+def _make_proxy_redeemer(
+    funder: str = FAKE_FUNDER, sig_type: int = 1
+) -> CTFRedeemer:
+    return CTFRedeemer(
+        web3_provider_url="https://polygon-rpc.invalid",
+        private_key=FAKE_KEY,
+        ctf_address=CTF_ADDR,
+        collateral_token_address=USDC_E,
+        chain_id=137,
+        signature_type=sig_type,
+        funder_address=funder,
+    )
+
+
+def test_init_proxy_mode_requires_funder():
+    with pytest.raises(ValueError, match="funder_address"):
+        CTFRedeemer(
+            web3_provider_url="https://polygon-rpc.invalid",
+            private_key=FAKE_KEY,
+            ctf_address=CTF_ADDR,
+            collateral_token_address=USDC_E,
+            signature_type=1,
+            funder_address=None,
+        )
+
+
+def test_init_proxy_mode_sets_position_owner_to_funder():
+    r = _make_proxy_redeemer()
+    assert r.funder_address == Web3.to_checksum_address(FAKE_FUNDER)
+    assert r.position_owner == Web3.to_checksum_address(FAKE_FUNDER)
+    # EOA signer address is unchanged and separate.
+    assert r.address != r.position_owner
+
+
+def test_init_eoa_mode_position_owner_is_signer():
+    r = _make_real_redeemer()
+    assert r.funder_address is None
+    assert r.position_owner == r.address
+
+
+def test_encode_proxy_redeem_calldata_wraps_ctf_selector():
+    """The outer calldata selector is ProxyWallet.proxy(...); the inner
+    bytes payload contains the CTF redeemPositions selector 0x01b7037c."""
+    # Need real Web3 ABI encoder; Web3 imported at top of ctf_redeemer is
+    # available transitively.
+    from web3 import Web3 as _Web3  # noqa: F401 (ensures module loaded)
+
+    r = _make_proxy_redeemer()
+    outer = r.encode_proxy_redeem_calldata(FAKE_CONDITION, [1, 2]).lower()
+
+    # proxy((uint8,address,uint256,bytes)[]) selector. Compute it instead
+    # of hardcoding so the test stays honest if ABI encoding lib changes.
+    from eth_utils import function_signature_to_4byte_selector
+
+    proxy_sel = function_signature_to_4byte_selector(
+        "proxy((uint8,address,uint256,bytes)[])"
+    ).hex()
+    assert outer.startswith("0x" + proxy_sel), (
+        f"expected proxy selector 0x{proxy_sel} at head, got {outer[:10]}"
+    )
+
+    # Inner CTF selector 0x01b7037c (redeemPositions) appears somewhere
+    # inside the wrapped `data` bytes field.
+    assert "01b7037c" in outer, "inner CTF redeemPositions selector missing"
+
+    # Funder/proxy address does NOT appear in outer calldata (it's the
+    # `to` of the tx, not an arg). CTF address DOES appear as the
+    # per-ProxyCall target.
+    assert CTF_ADDR.lower()[2:] in outer
+    # Collateral (USDC.e) is inside the nested CTF calldata.
+    assert USDC_E.lower()[2:] in outer
+
+
+@pytest.mark.asyncio
+async def test_redeem_proxy_mode_sends_to_funder_from_eoa():
+    r = _make_proxy_redeemer()
+
+    # Mock out proxy_contract.functions.proxy(...) so we can assert the
+    # ProxyCall args and inspect the built tx.
+    fake_call = MagicMock()
+    fake_call.estimate_gas.return_value = 250_000
+    fake_call.build_transaction.return_value = {
+        "from": r.address,
+        "to": r.funder_address,
+        "data": "0xabc123",
+        "nonce": 7,
+        "gas": 300_000,
+        "chainId": 137,
+    }
+    fake_proxy_functions = MagicMock()
+    fake_proxy_functions.proxy.return_value = fake_call
+    mock_proxy_contract = MagicMock()
+    mock_proxy_contract.functions = fake_proxy_functions
+
+    mock_w3 = MagicMock()
+    mock_w3.eth.get_transaction_count.return_value = 7
+    mock_w3.eth.send_raw_transaction.return_value = b"\x00" * 31 + b"\x02"
+    mock_w3.eth.wait_for_transaction_receipt.return_value = {
+        "status": 1,
+        "gasUsed": 220_000,
+    }
+
+    mock_signed = MagicMock()
+    mock_signed.raw_transaction = b"\xca\xfe\xba\xbe"
+    mock_account = MagicMock()
+    mock_account.sign_transaction.return_value = mock_signed
+
+    with patch.object(r, "_proxy_contract", mock_proxy_contract), \
+         patch.object(r, "_w3", mock_w3), \
+         patch.object(r, "_account", mock_account):
+        result = await r.redeem(FAKE_CONDITION, [1, 2])
+
+    assert result["status"] == "success"
+    assert result["gas_used"] == 220_000
+
+    # The proxy(...) call received exactly one ProxyCall tuple pointing
+    # at the CTF with the redeemPositions calldata as its `data`.
+    fake_proxy_functions.proxy.assert_called_once()
+    (calls_arg,), _ = fake_proxy_functions.proxy.call_args
+    assert len(calls_arg) == 1
+    type_code, to_addr, value, data_bytes = calls_arg[0]
+    assert type_code == 1  # CALL
+    assert to_addr == r.ctf_address
+    assert value == 0
+    assert isinstance(data_bytes, bytes)
+    # Inner CTF selector
+    assert data_bytes[:4].hex() == "01b7037c"
+
+    # Tx was built from the EOA signer, not the proxy.
+    tx_kwargs = fake_call.build_transaction.call_args.args[0]
+    assert tx_kwargs["from"] == r.address  # EOA
+    assert tx_kwargs["nonce"] == 7
+    assert tx_kwargs["chainId"] == 137
+    assert tx_kwargs["gas"] == 300_000  # 250_000 * 1.2
+
+    # The outgoing tx signs the EOA, raw_tx goes to RPC.
+    mock_account.sign_transaction.assert_called_once()
+    mock_w3.eth.send_raw_transaction.assert_called_once_with(b"\xca\xfe\xba\xbe")
+
+
+@pytest.mark.asyncio
+async def test_get_position_balance_queries_funder_in_proxy_mode():
+    r = _make_proxy_redeemer()
+    token_id_dec = "99999999999999999999"
+
+    fake_fn = MagicMock()
+    fake_fn.call.return_value = 1_234_567
+    fake_functions = MagicMock()
+    fake_functions.balanceOf.return_value = fake_fn
+
+    with patch.object(r, "_contract") as mock_contract:
+        mock_contract.functions = fake_functions
+        bal = await r.get_position_balance(token_id_dec)
+
+    assert bal == 1_234_567
+    # Called with the FUNDER (proxy) address, not the EOA signer.
+    fake_functions.balanceOf.assert_called_once_with(
+        r.funder_address, int(token_id_dec)
+    )
+    assert fake_functions.balanceOf.call_args.args[0] != r.address
+
+
+@pytest.mark.asyncio
+async def test_get_position_balance_queries_signer_in_eoa_mode():
+    """Regression: EOA-mode balance queries still use the signer."""
+    r = _make_real_redeemer()
+    fake_fn = MagicMock()
+    fake_fn.call.return_value = 42
+    fake_functions = MagicMock()
+    fake_functions.balanceOf.return_value = fake_fn
+
+    with patch.object(r, "_contract") as mock_contract:
+        mock_contract.functions = fake_functions
+        bal = await r.get_position_balance("0x10")
+
+    assert bal == 42
+    fake_functions.balanceOf.assert_called_once_with(r.address, 16)
+
+
+@pytest.mark.asyncio
+async def test_redeem_gnosis_safe_raises_not_implemented():
+    r = _make_proxy_redeemer(sig_type=2)  # Safe mode stores funder but no impl.
+    with pytest.raises(NotImplementedError, match="GNOSIS_SAFE"):
+        await r.redeem(FAKE_CONDITION, [1, 2])
+
+
+@pytest.mark.asyncio
+async def test_redeem_via_proxy_requires_proxy_mode():
+    """Calling redeem_via_proxy on an EOA-mode redeemer is a config error."""
+    r = _make_real_redeemer()
+    with pytest.raises(RuntimeError, match="signature_type=1"):
+        await r.redeem_via_proxy(FAKE_CONDITION, [1, 2])
