@@ -8,6 +8,20 @@ directly via web3.py.
 
 Contract: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045 (Polymarket CTF).
 Selector: redeemPositions(address,bytes32,bytes32,uint256[]) = 0x01b7037c.
+
+Proxy-delegated mode
+--------------------
+When trading via a Polymarket proxy wallet (POLYMARKET_SIGNATURE_TYPE=1,
+POLYMARKET_FUNDER=<proxy addr>), winning ERC-1155 tokens land on the
+proxy contract, not the EOA. The EOA owns the proxy, so to redeem we
+submit a transaction signed by the EOA that calls the proxy's
+`proxy((uint8,address,uint256,bytes)[])` entrypoint with a single
+CALL tuple wrapping the CTF redeemPositions calldata. CTF then
+transfers USDC to msg.sender = proxy, which is where trading capital
+lives. See Polymarket ProxyWalletFactory at
+0xaB45c5A4B0c941a2F231C04C3f49182e1A254052 (verified on Polygonscan)
+and the poly-web3 reference implementation
+(github.com/tosmart01/poly-web3, poly_web3/const.py).
 """
 
 from __future__ import annotations
@@ -21,6 +35,12 @@ from web3 import Web3
 from web3.types import TxReceipt
 
 logger = logging.getLogger(__name__)
+
+SIG_TYPE_EOA = 0
+SIG_TYPE_POLY_PROXY = 1
+SIG_TYPE_GNOSIS_SAFE = 2
+
+PROXY_CALL_TYPE_CALL = 1
 
 
 _REDEEM_POSITIONS_ABI: list[dict[str, Any]] = [
@@ -46,6 +66,34 @@ _REDEEM_POSITIONS_ABI: list[dict[str, Any]] = [
         "stateMutability": "view",
         "type": "function",
     },
+]
+
+
+# Polymarket ProxyWallet entrypoint (verified on Polygonscan at
+# 0xaB45c5A4B0c941a2F231C04C3f49182e1A254052, the ProxyWalletFactory; the
+# cloned ProxyWallet inherits the same `proxy` function).
+# Struct ProxyCall { uint8 typeCode; address to; uint256 value; bytes data; }
+# typeCode: 1 = CALL, 2 = DELEGATECALL. We always use CALL for redemption.
+_PROXY_WALLET_ABI: list[dict[str, Any]] = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "uint8", "name": "typeCode", "type": "uint8"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "uint256", "name": "value", "type": "uint256"},
+                    {"internalType": "bytes", "name": "data", "type": "bytes"},
+                ],
+                "internalType": "struct ProxyWalletLib.ProxyCall[]",
+                "name": "calls",
+                "type": "tuple[]",
+            }
+        ],
+        "name": "proxy",
+        "outputs": [{"internalType": "bytes[]", "name": "returnValues", "type": "bytes[]"}],
+        "stateMutability": "payable",
+        "type": "function",
+    }
 ]
 
 
@@ -78,6 +126,8 @@ class CTFRedeemer:
         ctf_address: str,
         collateral_token_address: str,
         chain_id: int = 137,
+        signature_type: int | None = None,
+        funder_address: str | None = None,
     ) -> None:
         if not private_key:
             raise ValueError("private_key is required for CTFRedeemer")
@@ -94,21 +144,67 @@ class CTFRedeemer:
         self._contract = self._w3.eth.contract(
             address=self._ctf_address, abi=_REDEEM_POSITIONS_ABI
         )
+
+        # Proxy-delegated mode: winning ERC-1155 tokens land on the proxy,
+        # not the EOA. We still sign with the EOA but wrap the redeem
+        # calldata in a proxy.proxy([...]) call so the proxy is msg.sender
+        # to CTF.redeemPositions and therefore the USDC recipient.
+        self._signature_type = signature_type
+        self._funder_address: str | None = None
+        self._proxy_contract = None
+        if signature_type == SIG_TYPE_POLY_PROXY:
+            if not funder_address:
+                raise ValueError(
+                    "funder_address is required when signature_type=1 (POLY_PROXY)"
+                )
+            self._funder_address = Web3.to_checksum_address(funder_address)
+            self._proxy_contract = self._w3.eth.contract(
+                address=self._funder_address, abi=_PROXY_WALLET_ABI
+            )
+        elif signature_type == SIG_TYPE_GNOSIS_SAFE:
+            if not funder_address:
+                raise ValueError(
+                    "funder_address is required when signature_type=2 (GNOSIS_SAFE)"
+                )
+            self._funder_address = Web3.to_checksum_address(funder_address)
+        # sig_type 0 / None: direct EOA path; funder_address is ignored.
+
         logger.info(
-            "CTFRedeemer initialized: ctf=%s wallet=%s collateral=%s chain_id=%s",
+            "CTFRedeemer initialized: ctf=%s eoa=%s collateral=%s chain_id=%s "
+            "sig_type=%s funder=%s",
             self._ctf_address,
             self._address,
             self._collateral,
             self._chain_id,
+            self._signature_type if self._signature_type is not None else "default(EOA)",
+            self._funder_address if self._funder_address else "n/a",
         )
 
     @property
     def address(self) -> str:
+        """EOA signer address (always, regardless of mode)."""
         return self._address
 
     @property
     def ctf_address(self) -> str:
         return self._ctf_address
+
+    @property
+    def funder_address(self) -> str | None:
+        """Proxy/Safe address holding the outcome tokens, if proxy-delegated."""
+        return self._funder_address
+
+    @property
+    def signature_type(self) -> int | None:
+        return self._signature_type
+
+    @property
+    def position_owner(self) -> str:
+        """Address that actually holds ERC-1155 outcome tokens.
+
+        In EOA mode this is the signer; in proxy mode it's the funder.
+        """
+        return self._funder_address or self._address
 
     def _build_call(self, condition_id: str, index_sets: list[int]):
         cid = _normalize_bytes32(condition_id)
@@ -119,10 +215,11 @@ class CTFRedeemer:
             list(index_sets),
         )
 
-    def encode_redeem_calldata(
-        self, condition_id: str, index_sets: list[int] = [1, 2]
+    def _build_redeem_calldata(
+        self, condition_id: str, index_sets: list[int]
     ) -> str:
-        """Return the ABI-encoded calldata for redeemPositions (for eyeballing)."""
+        """Raw hex calldata for CTF.redeemPositions(...). Used by both
+        direct-EOA and proxy-delegated send paths."""
         return self._contract.encode_abi(
             abi_element_identifier="redeemPositions",
             args=[
@@ -133,6 +230,35 @@ class CTFRedeemer:
             ],
         )
 
+    def _build_proxy_call(self, condition_id: str, index_sets: list[int]):
+        """Wrap redeem calldata in a single-item ProxyCall[] for
+        ProxyWallet.proxy(). typeCode=1 (CALL), value=0, to=CTF."""
+        if self._proxy_contract is None:
+            raise RuntimeError(
+                "proxy contract not configured; signature_type must be 1 with "
+                "a funder_address to use proxy-delegated redemption"
+            )
+        redeem_data = self._build_redeem_calldata(condition_id, index_sets)
+        redeem_bytes = bytes.fromhex(redeem_data[2:] if redeem_data.startswith("0x") else redeem_data)
+        calls = [
+            (PROXY_CALL_TYPE_CALL, self._ctf_address, 0, redeem_bytes),
+        ]
+        return self._proxy_contract.functions.proxy(calls)
+
+    def encode_redeem_calldata(
+        self, condition_id: str, index_sets: list[int] = [1, 2]
+    ) -> str:
+        """Return the ABI-encoded calldata for redeemPositions (for eyeballing)."""
+        return self._build_redeem_calldata(condition_id, index_sets)
+
+    def encode_proxy_redeem_calldata(
+        self, condition_id: str, index_sets: list[int] = [1, 2]
+    ) -> str:
+        """Return the ABI-encoded calldata for ProxyWallet.proxy([...])
+        wrapping the CTF redeemPositions call. Useful for inspection."""
+        call = self._build_proxy_call(condition_id, index_sets)
+        return call._encode_transaction_data()
+
     async def estimate_gas(
         self, condition_id: str, index_sets: list[int] = [1, 2]
     ) -> int:
@@ -142,7 +268,11 @@ class CTFRedeemer:
         )
 
     async def get_position_balance(self, token_id: str | int) -> int:
-        """ERC-1155 `balanceOf(address, id)` on the CTF for our wallet.
+        """ERC-1155 `balanceOf(owner, id)` on the CTF.
+
+        In proxy-delegated mode the owner is the funder (proxy wallet),
+        which is where outcome tokens actually land. In direct-EOA mode
+        the owner is the signer.
 
         token_id: Polymarket outcome token id. Accepts decimal-string,
         0x-prefixed hex string, or int.
@@ -153,8 +283,10 @@ class CTFRedeemer:
         else:
             tid = int(token_id)
 
+        owner = self.position_owner
+
         def _call() -> int:
-            return self._contract.functions.balanceOf(self._address, tid).call()
+            return self._contract.functions.balanceOf(owner, tid).call()
 
         return await asyncio.to_thread(_call)
 
@@ -164,18 +296,89 @@ class CTFRedeemer:
         index_sets: list[int] = [1, 2],
         timeout_seconds: int = 180,
     ) -> dict[str, Any]:
-        """Build, sign, and send the redeemPositions tx. Waits for receipt.
+        """Build, sign, and send redemption. Dispatches by signature_type.
 
         Returns {"tx_hash": str, "status": "success"|"failed"|"timeout", "gas_used": int}.
         """
-        call = self._build_call(condition_id, index_sets)
+        if self._signature_type == SIG_TYPE_GNOSIS_SAFE:
+            raise NotImplementedError(
+                "GNOSIS_SAFE (signature_type=2) redemption is not implemented. "
+                "Safe execution requires execTransaction() with owner signatures; "
+                "redeem via the Polymarket UI or a Safe client until this path "
+                "is added."
+            )
+        if self._signature_type == SIG_TYPE_POLY_PROXY:
+            return await self.redeem_via_proxy(
+                condition_id, index_sets, timeout_seconds=timeout_seconds
+            )
+        return await self._redeem_direct(
+            condition_id, index_sets, timeout_seconds=timeout_seconds
+        )
 
-        def _send() -> tuple[str, int | None, str]:
+    async def _redeem_direct(
+        self,
+        condition_id: str,
+        index_sets: list[int],
+        timeout_seconds: int = 180,
+    ) -> dict[str, Any]:
+        """Direct EOA path: signer calls CTF.redeemPositions. USDC lands
+        on the EOA (same as msg.sender)."""
+        call = self._build_call(condition_id, index_sets)
+        return await self._send_and_wait(
+            call,
+            to_address=self._ctf_address,
+            timeout_seconds=timeout_seconds,
+            label="redeemPositions",
+            condition_id=condition_id,
+        )
+
+    async def redeem_via_proxy(
+        self,
+        condition_id: str,
+        index_sets: list[int] = [1, 2],
+        timeout_seconds: int = 180,
+    ) -> dict[str, Any]:
+        """Proxy-delegated path: EOA signs a tx to ProxyWallet.proxy([...]).
+
+        The proxy becomes msg.sender to CTF.redeemPositions, so the
+        outcome tokens it holds are burned and USDC is transferred back
+        to the proxy (where trading capital lives)."""
+        if self._signature_type != SIG_TYPE_POLY_PROXY:
+            raise RuntimeError(
+                "redeem_via_proxy requires signature_type=1 (POLY_PROXY); "
+                f"got {self._signature_type}"
+            )
+        if self._proxy_contract is None or self._funder_address is None:
+            raise RuntimeError("proxy contract not configured")
+        call = self._build_proxy_call(condition_id, index_sets)
+        return await self._send_and_wait(
+            call,
+            to_address=self._funder_address,
+            timeout_seconds=timeout_seconds,
+            label="ProxyWallet.proxy(redeemPositions)",
+            condition_id=condition_id,
+        )
+
+    async def _send_and_wait(
+        self,
+        call,
+        to_address: str,
+        timeout_seconds: int,
+        label: str,
+        condition_id: str,
+    ) -> dict[str, Any]:
+        """Shared send/sign/wait loop. `call` is a web3 ContractFunction
+        already bound to its args; `to_address` is the tx recipient used
+        only for logging (build_transaction derives it from `call`)."""
+
+        def _send() -> str:
             try:
                 gas_est = call.estimate_gas({"from": self._address})
                 gas_limit = int(gas_est * 12 // 10)  # 20% buffer
             except Exception as e:
-                logger.warning("redeem gas estimate failed, falling back to 300k: %s", e)
+                logger.warning(
+                    "%s gas estimate failed, falling back to 300k: %s", label, e
+                )
                 gas_limit = 300_000
 
             nonce = self._w3.eth.get_transaction_count(self._address)
@@ -193,7 +396,7 @@ class CTFRedeemer:
             tx_hash = tx_hash_bytes.hex()
             if not tx_hash.startswith("0x"):
                 tx_hash = "0x" + tx_hash
-            return tx_hash, gas_limit, tx_hash  # dummy placeholder
+            return tx_hash
 
         def _wait(tx_hash: str) -> TxReceipt:
             return self._w3.eth.wait_for_transaction_receipt(
@@ -202,25 +405,26 @@ class CTFRedeemer:
 
         tx_hash: str = ""
         try:
-            tx_hash, _, _ = await asyncio.to_thread(_send)
-            logger.info("redeemPositions sent: tx=%s condition=%s", tx_hash, condition_id)
+            tx_hash = await asyncio.to_thread(_send)
+            logger.info(
+                "%s sent: tx=%s to=%s from=%s condition=%s",
+                label, tx_hash, to_address, self._address, condition_id,
+            )
         except Exception as e:
-            logger.error("redeemPositions send failed for %s: %s", condition_id, e)
+            logger.error("%s send failed for %s: %s", label, condition_id, e)
             return {"tx_hash": tx_hash, "status": "failed", "gas_used": 0}
 
         try:
             receipt = await asyncio.to_thread(_wait, tx_hash)
         except Exception as e:
-            logger.error("redeemPositions receipt wait timed out for %s: %s", tx_hash, e)
+            logger.error("%s receipt wait timed out for %s: %s", label, tx_hash, e)
             return {"tx_hash": tx_hash, "status": "timeout", "gas_used": 0}
 
         status_code = int(receipt.get("status", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "status", 0))
         gas_used = int(receipt.get("gasUsed", 0)) if isinstance(receipt, dict) else int(getattr(receipt, "gasUsed", 0))
         status = "success" if status_code == 1 else "failed"
         logger.info(
-            "redeemPositions receipt: tx=%s status=%s gas_used=%s",
-            tx_hash,
-            status,
-            gas_used,
+            "%s receipt: tx=%s status=%s gas_used=%s",
+            label, tx_hash, status, gas_used,
         )
         return {"tx_hash": tx_hash, "status": status, "gas_used": gas_used}

@@ -95,6 +95,8 @@ class BTCTradingEngine:
                     ctf_address=base_cfg.CTF_ADDRESS,
                     collateral_token_address=base_cfg.COLLATERAL_TOKEN_ADDRESS,
                     chain_id=base_cfg.CHAIN_ID,
+                    signature_type=base_cfg.POLYMARKET_SIGNATURE_TYPE,
+                    funder_address=base_cfg.POLYMARKET_FUNDER,
                 )
             except Exception as e:
                 logger.critical(
