@@ -13,6 +13,7 @@ import time as _time
 from datetime import datetime, timezone
 
 from clients.binance_ws import BinanceWSClient, OrderBookSnapshot, TradeUpdate
+from clients.ctf_redeemer import CTFRedeemer
 from clients.market_scanner import MarketWindowScanner
 from clients.polymarket import PolymarketClient
 from clients.polymarket_ws import PolymarketWSClient
@@ -77,13 +78,32 @@ class BTCTradingEngine:
         self.persistence = TradePersistence(self._coin, self.memory, self._supa)
 
         self._polymarket: PolymarketClient | None = None
+        self._redeemer: CTFRedeemer | None = None
+        self._redeem_drift: bool = False
         if not strategy_cfg.paper.enabled:
             private_key = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
             if not private_key:
                 raise RuntimeError(
                     "POLYMARKET_PRIVATE_KEY must be set for live trading"
                 )
-            self._polymarket = PolymarketClient(Config())
+            base_cfg = Config()
+            self._polymarket = PolymarketClient(base_cfg)
+            try:
+                self._redeemer = CTFRedeemer(
+                    web3_provider_url=base_cfg.POLYGON_RPC_URL,
+                    private_key=private_key,
+                    ctf_address=base_cfg.CTF_ADDRESS,
+                    collateral_token_address=base_cfg.COLLATERAL_TOKEN_ADDRESS,
+                    chain_id=base_cfg.CHAIN_ID,
+                )
+            except Exception as e:
+                logger.critical(
+                    "Failed to initialize CTFRedeemer: %s. Winning positions "
+                    "will NOT be auto-redeemed; balance reconciliation will "
+                    "drift after market resolution.",
+                    e,
+                )
+                self._redeemer = None
             logger.warning("LIVE TRADING ENABLED: real orders will be placed")
 
         # Reconstruct balance from event_log: starting_balance + sum of
@@ -640,7 +660,74 @@ class BTCTradingEngine:
             )
             self.persistence.record_resolution(self._strategy.name, trade, res, resolved_dir)
 
+            if res.won and self._redeemer is not None:
+                await self._redeem_winning_trade(trade)
+
         self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
+
+    async def _redeem_winning_trade(self, trade: dict) -> None:
+        """Call CTF.redeemPositions for a resolved, winning live trade.
+
+        Logs loudly on failure and sets a drift flag for the next
+        reconciliation loop to detect. Does not retry here.
+        """
+        condition_id = trade.get("condition_id")
+        if not condition_id:
+            logger.error(
+                "[REDEEM] No condition_id on won trade market=%s; cannot redeem. "
+                "Winning outcome tokens remain as ERC-1155 positions until "
+                "manually redeemed.",
+                trade.get("market_id"),
+            )
+            self._redeem_drift = True
+            return
+        token_id = trade.get("token_id")
+        try:
+            if token_id:
+                bal = await self._redeemer.get_position_balance(token_id)
+                if bal == 0:
+                    logger.info(
+                        "[REDEEM] No on-chain position for token %s... "
+                        "(balance=0), skipping redeem for condition %s",
+                        str(token_id)[:16],
+                        condition_id,
+                    )
+                    return
+        except Exception as e:
+            logger.warning(
+                "[REDEEM] balanceOf precheck failed for token %s: %s; "
+                "proceeding with redeem anyway.",
+                str(token_id)[:16] if token_id else "?",
+                e,
+            )
+
+        try:
+            result = await self._redeemer.redeem(condition_id)
+        except Exception as e:
+            logger.error(
+                "[REDEEM] redeemPositions threw for condition %s: %s",
+                condition_id,
+                e,
+            )
+            self._redeem_drift = True
+            return
+
+        if result.get("status") == "success":
+            logger.warning(
+                "[REDEEM] success condition=%s tx=%s gas_used=%s",
+                condition_id,
+                result.get("tx_hash"),
+                result.get("gas_used"),
+            )
+        else:
+            logger.error(
+                "[REDEEM] FAILED status=%s condition=%s tx=%s. "
+                "USDC balance will drift from expected until resolved.",
+                result.get("status"),
+                condition_id,
+                result.get("tx_hash"),
+            )
+            self._redeem_drift = True
 
     def set_strategy(self, strategy: LiveRuntimeStrategy) -> None:
         self._strategy = strategy
