@@ -125,6 +125,27 @@ class PolymarketClient:
                 "CLOB client initialized in read-only mode (no private key)"
             )
 
+    def get_api_creds(self) -> dict[str, str] | None:
+        """Return the active L2 credentials as a plain dict, or None.
+
+        Exposed for the user-channel WebSocket, which authenticates via
+        JSON body rather than HMAC headers. Returns None when the client
+        is running in read-only mode (no private key or creds resolved).
+        """
+        creds = getattr(self.clob, "creds", None)
+        if creds is None:
+            return None
+        api_key = getattr(creds, "api_key", None)
+        api_secret = getattr(creds, "api_secret", None)
+        api_passphrase = getattr(creds, "api_passphrase", None)
+        if not (api_key and api_secret and api_passphrase):
+            return None
+        return {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "passphrase": api_passphrase,
+        }
+
     def _resolve_api_creds(self) -> "_ApiCreds | None":
         """Derive existing API creds; fall back to creating them on failure.
 
