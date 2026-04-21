@@ -37,6 +37,9 @@ class RiskConfig:
     # that don't cross the ask often sit unfilled inside a 5-min window;
     # paper uses the same constant so live/paper PnL are comparable.
     live_entry_slippage_usd: float = 0.01
+    # Polymarket CLOB minimum shares per order. Orders below this are
+    # rejected server-side; engine skips or upsizes to meet the floor.
+    min_shares: float = 5.0
 
 
 @dataclass
