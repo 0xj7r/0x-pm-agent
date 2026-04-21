@@ -181,10 +181,18 @@ async def test_sweep_redeem_failure_recorded_per_position():
 
 
 @pytest.mark.asyncio
-async def test_sweep_handles_missing_token_id_by_skipping():
-    """No token_id to probe → skip rather than redeem blindly."""
+async def test_sweep_blind_redeems_when_token_id_missing():
+    """No token_id to probe: fire a blind redeemPositions (idempotent).
+
+    Regression guard for issue #7: resolver recorded a win in event_log
+    but token_id was not persisted, leaving the position unredeemed.
+    redeemPositions is idempotent (empty position costs ~30k gas), so
+    we prefer a blind call over skipping.
+    """
     r = _make_real_redeemer()
-    fake_redeem = AsyncMock()
+    fake_redeem = AsyncMock(return_value={
+        "tx_hash": "0xblind", "status": "success", "gas_used": 30_000,
+    })
     balances = {}
     with _patch_balances(r, balances), \
          patch.object(r, "redeem", fake_redeem):
@@ -192,9 +200,29 @@ async def test_sweep_handles_missing_token_id_by_skipping():
             {"condition_id": COND_A},  # no token_id
         ])
     assert len(results) == 1
-    assert results[0]["status"] == "skipped"
-    assert "no token_id" in results[0]["reason"]
-    fake_redeem.assert_not_called()
+    assert results[0]["status"] == "success"
+    assert results[0]["condition_id"] == COND_A
+    assert results[0]["tx_hash"] == "0xblind"
+    assert results[0]["gas_used"] == 30_000
+    assert "blind redeem" in results[0]["reason"]
+    fake_redeem.assert_awaited_once()
+    assert fake_redeem.await_args.args[0] == COND_A
+
+
+@pytest.mark.asyncio
+async def test_sweep_blind_redeem_failure_is_recorded():
+    """If blind redeem raises, record error and do not abort the sweep."""
+    r = _make_real_redeemer()
+    fake_redeem = AsyncMock(side_effect=RuntimeError("rpc down"))
+    balances = {}
+    with _patch_balances(r, balances), \
+         patch.object(r, "redeem", fake_redeem):
+        results = await r.sweep_wallet([
+            {"condition_id": COND_A},  # no token_id
+        ])
+    assert len(results) == 1
+    assert results[0]["status"] == "error"
+    assert "blind redeem raised" in results[0]["reason"]
 
 
 @pytest.mark.asyncio
