@@ -147,6 +147,21 @@ services:
       BTC_DB_PATH: /data/eth_realmoney_trades.db
     command: ["--coin", "eth"]
 
+  btc-live-polymtrade-test:
+    <<: *agent-service
+    profiles: ["live-test"]
+    container_name: polymarket-btc-live-polymtrade-test
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t10_live
+      BTC_DB_PATH: /data/btc_live_polymtrade_trades.db
+      POLYMARKET_PRIVATE_KEY: ${POLYMARKET_POLYMTRADE_PRIVATE_KEY}
+      POLYMARKET_SIGNATURE_TYPE: "1"
+      POLYMARKET_FUNDER: "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
+      ALLOW_LIVE_WITHOUT_SUPABASE: "1"
+    command: ["--coin", "btc", "--live"]
+
   btc-live-t10:
     <<: *agent-service
     profiles: ["live"]
