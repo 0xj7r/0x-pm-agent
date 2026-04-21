@@ -147,6 +147,17 @@ services:
       BTC_DB_PATH: /data/eth_realmoney_trades.db
     command: ["--coin", "eth"]
 
+  btc-live-t10:
+    <<: *agent-service
+    profiles: ["live"]
+    container_name: polymarket-btc-live-t10
+    environment:
+      LOG_LEVEL: INFO
+      STRATEGY_CONFIG: /app/strategy_config.json
+      STRATEGY_PROFILE: research_t10_live
+      BTC_DB_PATH: /data/btc_live_t10_trades.db
+    command: ["--coin", "btc", "--live"]
+
   sol-sniper:
     <<: *agent-service
     profiles: ["trading"]
