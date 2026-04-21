@@ -74,7 +74,9 @@ async def test_full_pipeline_paper_trade():
     assert len(trades) == 1
     trade = trades[0]
     assert trade["direction"] == "UP"
-    assert trade["token_price"] == 0.02
+    # token_price is now the effective fill price (raw + live_entry_slippage_usd).
+    assert trade["raw_token_price"] == 0.02
+    assert trade["token_price"] == pytest.approx(0.02 + 0.01)
     assert trade["size_usd"] > 0
 
     events = engine.memory.get_events_for_window("integration_test_001")
