@@ -49,6 +49,8 @@ class HealthServer:
             "current_window": None,
             "errors_last_hour": 0,
             "last_error": None,
+            "user_ws_connected": False,
+            "resolution_ws_connected": False,
         }
         self._error_timestamps: list[float] = []
         self._app = web.Application()
