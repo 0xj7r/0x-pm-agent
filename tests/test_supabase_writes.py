@@ -64,6 +64,12 @@ class TestTradeEntryPayload:
         engine.balance = 100.0
 
         trades = engine._check_entry()
+        # After the phantom-entry fix, _check_entry no longer writes to
+        # persistence; the caller records entries only after fill
+        # confirmation. Simulate a paper-mode fill so the Supabase payload
+        # is produced for inspection.
+        for t in trades:
+            engine.persistence.record_entry(engine._strategy.name, t)
 
         if trades:
             call_args = mock_supa.upsert_trade_safe.call_args
@@ -95,6 +101,8 @@ class TestTradeEntryPayload:
         engine.balance = 100.0
 
         trades = engine._check_entry()
+        for t in trades:
+            engine.persistence.record_entry(engine._strategy.name, t)
 
         if trades:
             payload = mock_supa.upsert_trade_safe.call_args[0][0]
@@ -125,6 +133,8 @@ class TestTradeEntryPayload:
         engine.balance = 100.0
 
         trades = engine._check_entry()
+        for t in trades:
+            engine.persistence.record_entry(engine._strategy.name, t)
 
         if trades:
             payload = mock_supa.upsert_trade_safe.call_args[0][0]

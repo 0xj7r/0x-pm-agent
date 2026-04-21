@@ -19,6 +19,7 @@ from clients.polymarket import PolymarketClient
 from clients.polymarket_user_ws import PolymarketUserWS
 from clients.polymarket_ws import PolymarketWSClient
 from clients.resolution_watcher import ResolutionWatcher, derive_winner
+from core.btc_resolution import PaperTradeRecord, resolve_paper_trade
 from core.health import HealthServer
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
@@ -525,7 +526,11 @@ class BTCTradingEngine:
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
             f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
         )
-        self.persistence.record_entry(self._strategy.name, trade)
+        # NOTE: persistence.record_entry is deliberately NOT called here.
+        # Moving the write to the async caller AFTER fill confirmation
+        # prevents phantom event_log entries for orders that never fill
+        # (timeouts, cancels, rejections). The caller records on paper
+        # append or after _submit_and_confirm_live_order returns non-None.
         return [trade]
 
     async def _sleep_or_push(self, push_event: asyncio.Event, seconds: float) -> None:
@@ -955,6 +960,221 @@ class BTCTradingEngine:
             )
             self._redeem_drift = True
 
+    def _query_open_entries(self) -> list[dict]:
+        """Read event_log for entries without a matching resolution.
+
+        An "open entry" is any `entry` event whose `market_id` (window_id)
+        does not appear in a `resolution` event. Returns a list of the
+        decoded entry-event `details` payloads (one dict per open entry).
+        """
+        import json as _json
+        try:
+            rows = self.memory.conn.execute(
+                """
+                SELECT e.window_id, e.details
+                FROM event_log e
+                WHERE e.event_type = 'entry'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM event_log r
+                      WHERE r.event_type = 'resolution'
+                        AND r.window_id = e.window_id
+                  )
+                ORDER BY e.id
+                """
+            ).fetchall()
+        except Exception as exc:
+            logger.warning(f"_query_open_entries: SQL failed: {exc}")
+            return []
+        out: list[dict] = []
+        for window_id, details in rows:
+            if not details:
+                continue
+            try:
+                d = _json.loads(details)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            d.setdefault("market_id", window_id)
+            out.append(d)
+        return out
+
+    async def _startup_reconciliation(self) -> list[dict]:
+        """Catch up on resolutions the bot may have missed while offline.
+
+        Walks every `entry` in event_log with no matching `resolution`,
+        asks Gamma whether the market is resolved, and if so writes the
+        resolution event (and queues a CTF redeem for winners). Leaves
+        still-active markets alone.
+
+        Returns a list of trades that were newly marked resolved AND won
+        (so the caller can sweep their token balances). Resolution
+        records are written in-place to event_log; this method never
+        mutates or deletes existing records.
+        """
+        if self.cfg.paper.enabled:
+            return []
+
+        open_entries = self._query_open_entries()
+        if not open_entries:
+            logger.info("[RECONCILE] No open entries in event_log; nothing to reconcile.")
+            return []
+
+        logger.info(
+            "[RECONCILE] Scanning %d open entries from event_log for "
+            "missed resolutions...",
+            len(open_entries),
+        )
+
+        won_trades: list[dict] = []
+        n_checked = 0
+        n_marked = 0
+        n_won = 0
+        n_lost = 0
+        for trade in open_entries:
+            market_id = trade.get("market_id")
+            if not market_id:
+                continue
+            n_checked += 1
+            try:
+                result = await self.resolver.check_resolution(market_id)
+            except Exception as e:
+                logger.warning(
+                    "[RECONCILE] check_resolution(%s) failed: %s",
+                    market_id,
+                    e,
+                )
+                continue
+            if not result:
+                continue
+
+            winning = result["winning_outcome"]
+            resolved_dir = "UP" if winning == "Yes" else "DOWN"
+
+            # Stamp conditionId onto trade dict for downstream sweep.
+            if result.get("condition_id") and not trade.get("condition_id"):
+                trade["condition_id"] = result["condition_id"]
+
+            record = PaperTradeRecord(
+                trade_id=trade.get("id", trade.get("timestamp", market_id)),
+                market_id=market_id,
+                direction=trade["direction"],
+                token_price=float(trade["token_price"]),
+                size_usd=float(trade["size_usd"]),
+                shares=float(trade["shares"]),
+            )
+            res = resolve_paper_trade(record, resolved_dir)
+            self.persistence.record_resolution(
+                self._strategy.name, trade, res, resolved_dir
+            )
+            self.resolver.resolved_ids.add(market_id)
+            self.balance += float(trade["size_usd"]) + res.pnl_usd
+            self.risk.record_trade_result(res.pnl_usd)
+            self.risk.update_peak_balance(self.balance)
+            n_marked += 1
+            if res.won:
+                n_won += 1
+                won_trades.append(trade)
+            else:
+                n_lost += 1
+
+        logger.info(
+            "[RECONCILE] Reconciled %d entries. %d marked resolved "
+            "(%d won, %d lost). %d redemptions queued.",
+            n_checked,
+            n_marked,
+            n_won,
+            n_lost,
+            len(won_trades),
+        )
+        return won_trades
+
+    async def _startup_redemption_sweep(
+        self, won_trades: list[dict]
+    ) -> list[dict]:
+        """Sweep the wallet for un-redeemed winning positions on startup.
+
+        Combines:
+          1. Positions just marked won by `_startup_reconciliation`.
+          2. All historical `resolution` events in event_log where won=True
+             (so earlier sessions that failed to redeem get another shot).
+
+        For each (condition_id, token_id) with a non-zero ERC-1155
+        balance, calls `redeemPositions`. Paper mode is a no-op.
+
+        Returns the list of per-condition sweep results from CTFRedeemer.
+        """
+        if self.cfg.paper.enabled or self._redeemer is None:
+            return []
+
+        import json as _json
+        positions: list[dict] = []
+        seen_conditions: set[str] = set()
+
+        for t in won_trades:
+            cid = t.get("condition_id")
+            if not cid:
+                continue
+            cid_norm = cid.lower()
+            if cid_norm in seen_conditions:
+                continue
+            seen_conditions.add(cid_norm)
+            positions.append({"condition_id": cid, "token_id": t.get("token_id")})
+
+        try:
+            rows = self.memory.conn.execute(
+                "SELECT details FROM event_log WHERE event_type = 'resolution'"
+            ).fetchall()
+        except Exception as e:
+            logger.warning(f"[SWEEP] event_log read failed: {e}")
+            rows = []
+        for (details,) in rows:
+            if not details:
+                continue
+            try:
+                d = _json.loads(details)
+            except Exception:
+                continue
+            if not isinstance(d, dict) or not d.get("won"):
+                continue
+            inner = d.get("trade") or {}
+            cid = inner.get("condition_id")
+            if not cid:
+                continue
+            cid_norm = cid.lower()
+            if cid_norm in seen_conditions:
+                continue
+            seen_conditions.add(cid_norm)
+            positions.append(
+                {"condition_id": cid, "token_id": inner.get("token_id")}
+            )
+
+        if not positions:
+            logger.info("[SWEEP] No winning condition ids found; nothing to sweep.")
+            return []
+
+        logger.info(
+            "[SWEEP] Probing %d candidate winning positions for un-redeemed balances...",
+            len(positions),
+        )
+        try:
+            results = await self._redeemer.sweep_wallet(positions)
+        except Exception as e:
+            logger.error(f"[SWEEP] sweep_wallet threw: {e}")
+            return []
+
+        n_success = sum(1 for r in results if r.get("status") == "success")
+        n_skipped = sum(1 for r in results if r.get("status") == "skipped")
+        n_errored = sum(1 for r in results if r.get("status") in ("failed", "timeout", "error"))
+        logger.info(
+            "[SWEEP] Sweep complete: %d redeemed, %d skipped (zero balance), "
+            "%d errored.",
+            n_success,
+            n_skipped,
+            n_errored,
+        )
+        return results
+
     def set_strategy(self, strategy: LiveRuntimeStrategy) -> None:
         self._strategy = strategy
         if self.current_window and self._window_open_price > 0:
@@ -1030,6 +1250,19 @@ class BTCTradingEngine:
             self.balance, self._strategy.params.get("move", 0.08), self.cfg.paper.enabled
         )
 
+        # Startup catch-up (live mode only). Paper mode skips: there is
+        # no on-chain reality to reconcile against.
+        if not self.cfg.paper.enabled:
+            try:
+                newly_won = await self._startup_reconciliation()
+            except Exception as e:
+                logger.error(f"[RECONCILE] startup reconciliation failed: {e}")
+                newly_won = []
+            try:
+                await self._startup_redemption_sweep(newly_won)
+            except Exception as e:
+                logger.error(f"[SWEEP] startup redemption sweep failed: {e}")
+
         tick_count = 0
         start_time = _time.time()
         try:
@@ -1041,9 +1274,18 @@ class BTCTradingEngine:
                         if not self.cfg.paper.enabled:
                             trade = await self._submit_and_confirm_live_order(t)
                             if trade is None:
+                                # Order never filled (timeout / cancel / reject).
+                                # Do NOT record the entry: event_log must
+                                # only contain trades that actually filled
+                                # on-chain.
                                 continue
                             t = trade
                         self._paper_trades.append(t)
+                        # Fill-confirmed: persist the entry. Paper mode
+                        # always "fills" on append; live mode only reaches
+                        # here after _submit_and_confirm_live_order reported
+                        # matched or partial.
+                        self.persistence.record_entry(self._strategy.name, t)
                         self.balance -= t["size_usd"]
                         tag = "[PAPER]" if self.cfg.paper.enabled else "[LIVE] "
                         logger.info(f"{tag} Balance: ${self.balance:.2f}")
