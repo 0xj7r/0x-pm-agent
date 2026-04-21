@@ -270,8 +270,15 @@ def _filter_activity_day(activity: list[dict[str, Any]], day_utc: str | None) ->
     return out
 
 
-def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[ClosedRow]:
-    # Group BUY cost and REDEEM payout per conditionId.
+def aggregate_activity_by_condition(
+    activity: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Group /activity rows by conditionId, summing BUY cost and REDEEM payout.
+
+    Tracks ``redeem_seen`` explicitly because redeemed losers emit a REDEEM
+    event with ``usdcSize == 0``. Without this flag those markets would be
+    indistinguishable from "never redeemed" markets in downstream logic.
+    """
     by_cid: dict[str, dict[str, Any]] = {}
     for a in activity:
         cid = (a.get("conditionId") or "").lower()
@@ -287,7 +294,7 @@ def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[Clos
             },
         )
         t = (a.get("type") or "").upper()
-        if rec["title"] == "" and a.get("title"):
+        if not rec["title"] and a.get("title"):
             rec["title"] = a.get("title")
         if t == "TRADE":
             # usdcSize is spend (positive number); side indicates BUY/SELL.
@@ -297,13 +304,24 @@ def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[Clos
         elif t == "REDEEM":
             rec["redeem_seen"] = True
             rec["payout"] += _d(a.get("usdcSize"))
+    return by_cid
 
+
+def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[ClosedRow]:
+    """Return closed-trade rows for every market with a REDEEM event.
+
+    A redeemed loser has ``cost > 0`` (we bought shares) and
+    ``payout == 0`` (the worthless token was burned). The old filter
+    ``payout > 0 and cost > 0`` silently dropped these, so the report
+    under-counted losses once the redemption sweep ran. The correct
+    condition is "we bought AND the market was redeemed in any form".
+    """
+    by_cid = aggregate_activity_by_condition(activity)
     out: list[ClosedRow] = []
     for cid, rec in by_cid.items():
         cost = rec["cost"]
         payout = rec["payout"]
-        # Include redeemed losers too: REDEEM event exists but payout can be 0.
-        if cost > 0 and (payout > 0 or bool(rec.get("redeem_seen"))):
+        if cost > 0 and (payout > 0 or rec.get("redeem_seen")):
             out.append(
                 ClosedRow(
                     condition_id=cid,
@@ -316,12 +334,32 @@ def build_closed_rows_from_activity(activity: list[dict[str, Any]]) -> list[Clos
     return sorted(out, key=lambda r: r.title, reverse=True)
 
 
-def build_position_rows(positions: list[dict[str, Any]]) -> list[PositionRow]:
+def build_position_rows(
+    positions: list[dict[str, Any]],
+    activity_by_cid: dict[str, dict[str, Any]] | None = None,
+) -> list[PositionRow]:
+    """Build position rows; prefer activity BUY totals for cost basis.
+
+    ``/positions.initialValue`` is ``shares * avgPrice`` rounded to the
+    API's precision and can drift from true deployed capital by a cent
+    or two per fill. When activity data is available, sum the BUY
+    ``usdcSize`` rows (real on-chain dollars) for an exact match.
+    """
     out: list[PositionRow] = []
     for p in positions:
         cid = (p.get("conditionId") or "").lower()
         if not cid:
             continue
+        cost = _d(p.get("initialValue"))
+        value = _d(p.get("currentValue"))
+        pnl = _d(p.get("cashPnl"))
+        if activity_by_cid is not None:
+            rec = activity_by_cid.get(cid)
+            if rec is not None and rec.get("cost", Decimal("0")) > 0:
+                cost = rec["cost"]
+                # Re-derive pnl against the activity-sourced cost so the
+                # cost basis and P&L shown in the same row agree.
+                pnl = value - cost
         out.append(
             PositionRow(
                 condition_id=cid,
@@ -329,10 +367,10 @@ def build_position_rows(positions: list[dict[str, Any]]) -> list[PositionRow]:
                 outcome=str(p.get("outcome") or ""),
                 shares=_d(p.get("size")),
                 avg_price=_d(p.get("avgPrice")),
-                cost_usdc=_d(p.get("initialValue")),
+                cost_usdc=cost,
                 cur_price=_d(p.get("curPrice")),
-                value_usdc=_d(p.get("currentValue")),
-                pnl_usdc=_d(p.get("cashPnl")),
+                value_usdc=value,
+                pnl_usdc=pnl,
                 redeemable=bool(p.get("redeemable")),
             )
         )
@@ -371,7 +409,8 @@ def main(argv: list[str]) -> int:
         return 2
 
     onchain_usdc: Decimal = data["usdc"]
-    position_rows = build_position_rows(data["positions"])
+    activity_by_cid = aggregate_activity_by_condition(data["activity"])
+    position_rows = build_position_rows(data["positions"], activity_by_cid)
     closed_rows = build_closed_rows_from_activity(data["activity"])
 
     # Equity
@@ -380,10 +419,16 @@ def main(argv: list[str]) -> int:
     net_pnl = total_equity - starting_usdc
     net_pnl_pct = (net_pnl / starting_usdc) if starting_usdc > 0 else Decimal("0")
 
-    # Deployed (cash spent on buys in activity for this day), plus cost basis of positions.
-    gross_deployed = sum((r.cost_usdc for r in position_rows), Decimal("0")) + sum(
-        (r.cost_usdc for r in closed_rows), Decimal("0")
-    )
+    # Gross deployed = BUY cost on every conditionId we bought. closed_rows
+    # already covers anything with a REDEEM event (losers + redeemed winners).
+    # Open positions (no REDEEM yet) contribute from position_rows. A market
+    # can theoretically appear in both if a redeemed position still lingers
+    # in /positions — guard against double-counting by conditionId.
+    closed_cids = {r.condition_id for r in closed_rows}
+    gross_deployed = sum(
+        (r.cost_usdc for r in position_rows if r.condition_id not in closed_cids),
+        Decimal("0"),
+    ) + sum((r.cost_usdc for r in closed_rows), Decimal("0"))
 
     # Split open positions P&L buckets.
     realized_losses_unredeemed = sum(
@@ -404,9 +449,11 @@ def main(argv: list[str]) -> int:
     realized_total = realized_closed + realized_losses_unredeemed
     unrealized_total = unrealized_open + unrealized_wins_unredeemed
 
-    # Resolved hit-rate:
-    # - wins: redeemed payouts > 0, plus unredeemed winners with value > 0
-    # - losses: redeemed payouts == 0 (redeemed loser), plus unredeemed losses with value == 0
+    # Resolved hit-rate (ground truth: /activity REDEEM rows, NOT /positions).
+    # /positions drops resolved losers once their tokens are burned on
+    # redemption, so counting losses from /positions alone misses them.
+    # - wins: redeemed with payout > 0, plus unredeemed winners still in /positions
+    # - losses: redeemed with payout == 0, plus unredeemed losses still in /positions
     wins = sum(1 for r in closed_rows if r.payout_usdc > 0)
     wins += sum(1 for r in position_rows if r.redeemable and r.value_usdc > 0)
     losses = sum(1 for r in closed_rows if r.payout_usdc == 0 and r.cost_usdc > 0)
@@ -505,3 +552,4 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
+
