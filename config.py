@@ -9,6 +9,29 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _load_signature_type() -> int | None:
+    raw = os.getenv("POLYMARKET_SIGNATURE_TYPE")
+    if raw is None or raw.strip() == "":
+        return None
+    value = int(raw)
+    if value not in (0, 1, 2):
+        raise ValueError(
+            f"POLYMARKET_SIGNATURE_TYPE must be 0 (EOA), 1 (POLY_PROXY), "
+            f"or 2 (GNOSIS_SAFE); got {value}"
+        )
+    return value
+
+
+def _load_funder() -> str | None:
+    raw = os.getenv("POLYMARKET_FUNDER")
+    if raw is None or raw.strip() == "":
+        return None
+    value = raw.strip().lower()
+    if not value.startswith("0x"):
+        value = "0x" + value
+    return value
+
+
 class Config:
     """Central configuration for the Polymarket trading agent.
 
@@ -20,6 +43,8 @@ class Config:
     API_KEY: str = os.getenv("POLYMARKET_API_KEY", "")
     API_SECRET: str = os.getenv("POLYMARKET_API_SECRET", "")
     API_PASSPHRASE: str = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+    POLYMARKET_SIGNATURE_TYPE: int | None = _load_signature_type()
+    POLYMARKET_FUNDER: str | None = _load_funder()
     CLOB_URL: str = "https://clob.polymarket.com"
     GAMMA_URL: str = "https://gamma-api.polymarket.com"
     CHAIN_ID: int = 137  # Polygon
