@@ -33,6 +33,10 @@ class RiskConfig:
     drift_threshold_usd: float = 2.0
     order_poll_interval_seconds: float = 3.0
     order_fill_deadline_buffer_seconds: float = 30.0
+    # Cross-the-spread slippage added to token_price on BUY. Live orders
+    # that don't cross the ask often sit unfilled inside a 5-min window;
+    # paper uses the same constant so live/paper PnL are comparable.
+    live_entry_slippage_usd: float = 0.01
 
 
 @dataclass

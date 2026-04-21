@@ -262,6 +262,41 @@ async def test_timeout_with_partial_fill_records_filled_portion():
 
 
 @pytest.mark.asyncio
+async def test_place_order_submits_effective_price_with_cap():
+    """place_order must receive the trade's effective token_price (already
+    slippage-adjusted by _check_entry), clamped at MAX_BUY_PRICE."""
+    from core.engine import MAX_BUY_PRICE
+
+    poly = MagicMock()
+    poly.place_order = AsyncMock(
+        return_value={"orderID": "ord-slip", "status": "matched"}
+    )
+    poly.get_order_status = AsyncMock()
+    poly.cancel_order = AsyncMock()
+
+    eng = _make_engine(poly)
+    t = _new_trade()
+    # Simulate what _check_entry produces: raw 0.38 + 0.01 slippage = 0.39.
+    t["token_price"] = 0.39
+    t["raw_token_price"] = 0.38
+    await eng._submit_and_confirm_live_order(t)
+
+    poly.place_order.assert_awaited_once()
+    kwargs = poly.place_order.await_args.kwargs
+    assert kwargs["side"] == "BUY"
+    assert kwargs["price"] == pytest.approx(0.39)
+
+    # Price above the cap must be clamped.
+    poly.place_order.reset_mock()
+    poly.place_order.return_value = {"orderID": "ord-cap", "status": "matched"}
+    t2 = _new_trade()
+    t2["token_price"] = 1.05  # pathological pre-clamp value
+    await eng._submit_and_confirm_live_order(t2)
+    kwargs2 = poly.place_order.await_args.kwargs
+    assert kwargs2["price"] == pytest.approx(MAX_BUY_PRICE)
+
+
+@pytest.mark.asyncio
 async def test_place_order_missing_id_is_treated_as_rejection():
     """Response with no orderID / id → record_order_rejection, None."""
     poly = MagicMock()
