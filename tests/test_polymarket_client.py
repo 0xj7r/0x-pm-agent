@@ -32,6 +32,8 @@ class _CfgLike:
     API_KEY = ""
     API_SECRET = ""
     API_PASSPHRASE = ""
+    POLYMARKET_SIGNATURE_TYPE: int | None = None
+    POLYMARKET_FUNDER: str | None = None
     CLOB_URL = "https://clob.example"
     GAMMA_URL = "https://gamma.example"
     CHAIN_ID = 137
@@ -128,6 +130,109 @@ def test_init_readonly_when_no_private_key(mock_clob_class):
     mock_instance.derive_api_key.assert_not_called()
     mock_instance.create_api_key.assert_not_called()
     mock_instance.set_api_creds.assert_not_called()
+
+
+# signature_type + funder plumbing
+
+def test_init_passes_signature_type_and_funder_to_clob(mock_clob_class):
+    mock_class, _ = mock_clob_class
+
+    class _ProxyCfg(_CfgLike):
+        POLYMARKET_SIGNATURE_TYPE = 1
+        POLYMARKET_FUNDER = "0xa57189d5b2285a5e64083d3925687bdfce01fc83"
+
+    PolymarketClient(_ProxyCfg())
+
+    mock_class.assert_called_once()
+    kwargs = mock_class.call_args.kwargs
+    assert kwargs["signature_type"] == 1
+    assert kwargs["funder"] == "0xa57189d5b2285a5e64083d3925687bdfce01fc83"
+    assert kwargs["key"] == _ProxyCfg.PRIVATE_KEY
+    assert kwargs["chain_id"] == 137
+
+
+def test_init_passes_none_when_signature_type_and_funder_unset(mock_clob_class):
+    """Back-compat: when config has no sig_type/funder, library gets None."""
+    mock_class, _ = mock_clob_class
+
+    PolymarketClient(_CfgLike())
+
+    mock_class.assert_called_once()
+    kwargs = mock_class.call_args.kwargs
+    assert kwargs["signature_type"] is None
+    assert kwargs["funder"] is None
+
+
+def test_init_passes_gnosis_safe_signature_type(mock_clob_class):
+    mock_class, _ = mock_clob_class
+
+    class _SafeCfg(_CfgLike):
+        POLYMARKET_SIGNATURE_TYPE = 2
+        POLYMARKET_FUNDER = "0xdeadbeef00000000000000000000000000000001"
+
+    PolymarketClient(_SafeCfg())
+
+    kwargs = mock_class.call_args.kwargs
+    assert kwargs["signature_type"] == 2
+    assert kwargs["funder"] == "0xdeadbeef00000000000000000000000000000001"
+
+
+# Config-layer funder normalization
+
+def test_config_funder_normalizes_missing_0x_prefix(monkeypatch):
+    """Loading POLYMARKET_FUNDER without 0x prefix adds it, lowercased."""
+    from config import _load_funder
+
+    monkeypatch.setenv(
+        "POLYMARKET_FUNDER", "A57189D5B2285A5E64083D3925687BDFCE01FC83"
+    )
+    assert _load_funder() == "0xa57189d5b2285a5e64083d3925687bdfce01fc83"
+
+
+def test_config_funder_lowercases_with_0x_prefix(monkeypatch):
+    from config import _load_funder
+
+    monkeypatch.setenv(
+        "POLYMARKET_FUNDER", "0xA57189D5B2285A5E64083D3925687BDFCE01FC83"
+    )
+    assert _load_funder() == "0xa57189d5b2285a5e64083d3925687bdfce01fc83"
+
+
+def test_config_funder_none_when_unset(monkeypatch):
+    from config import _load_funder
+
+    monkeypatch.delenv("POLYMARKET_FUNDER", raising=False)
+    assert _load_funder() is None
+
+
+def test_config_funder_none_when_empty_string(monkeypatch):
+    from config import _load_funder
+
+    monkeypatch.setenv("POLYMARKET_FUNDER", "   ")
+    assert _load_funder() is None
+
+
+def test_config_signature_type_none_when_unset(monkeypatch):
+    from config import _load_signature_type
+
+    monkeypatch.delenv("POLYMARKET_SIGNATURE_TYPE", raising=False)
+    assert _load_signature_type() is None
+
+
+def test_config_signature_type_accepts_valid_values(monkeypatch):
+    from config import _load_signature_type
+
+    for val in (0, 1, 2):
+        monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", str(val))
+        assert _load_signature_type() == val
+
+
+def test_config_signature_type_rejects_invalid_values(monkeypatch):
+    from config import _load_signature_type
+
+    monkeypatch.setenv("POLYMARKET_SIGNATURE_TYPE", "3")
+    with pytest.raises(ValueError):
+        _load_signature_type()
 
 
 # place_order
