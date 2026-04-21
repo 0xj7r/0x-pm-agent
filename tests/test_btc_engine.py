@@ -115,13 +115,67 @@ def test_engine_generates_threshold_trade():
 
     assert len(trades) == 1
     assert trades[0]["direction"] == "UP"
-    assert trades[0]["token_price"] == 0.02
+    # token_price now reflects cross-the-spread slippage so paper and live
+    # PnL are comparable. Raw book price is preserved as raw_token_price.
+    assert trades[0]["raw_token_price"] == 0.02
+    assert trades[0]["token_price"] == pytest.approx(0.02 + 0.01)
+    # shares are computed against the effective (post-slippage) price.
+    assert trades[0]["shares"] == pytest.approx(
+        trades[0]["size_usd"] / trades[0]["token_price"]
+    )
     assert trades[0]["strategy"] == "threshold"
     assert trades[0]["size_usd"] > 0
 
     events = engine.memory.get_events_for_window("m1")
     assert len(events) == 1
     assert events[0]["event_type"] == "entry"
+    engine.memory.close()
+
+
+def test_engine_applies_configured_slippage_to_entry_price():
+    """Verify the paper entry price picks up a non-default RiskConfig slippage."""
+    engine = make_engine()
+    # Non-default slippage to prove the engine reads from RiskConfig.
+    engine._live_entry_slippage_usd = 0.02
+    engine.current_window = make_window(up_price=0.38, down_price=0.62)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.38 if tid == engine.current_window.up_token_id else 0.62
+    )
+
+    trades = engine._check_entry()
+
+    assert len(trades) == 1
+    assert trades[0]["raw_token_price"] == pytest.approx(0.38)
+    assert trades[0]["token_price"] == pytest.approx(0.38 + 0.02)
+    engine.memory.close()
+
+
+def test_engine_caps_buy_price_at_max():
+    """token_price + slippage must never exceed MAX_BUY_PRICE (0.99)."""
+    from core.engine import MAX_BUY_PRICE
+
+    engine = make_engine(max_entry=1.0)
+    engine.current_window = make_window(up_price=0.995, down_price=0.005)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.995 if tid == engine.current_window.up_token_id else 0.005
+    )
+
+    trades = engine._check_entry()
+
+    assert len(trades) == 1
+    assert trades[0]["token_price"] == pytest.approx(MAX_BUY_PRICE)
     engine.memory.close()
 
 

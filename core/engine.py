@@ -33,6 +33,14 @@ logger = logging.getLogger(__name__)
 
 MAX_SINGLE_ORDER_USD = 100.0
 
+# Default cross-the-spread slippage (USD per share) added to BUY price so
+# live orders actually fill. Single source of truth shared by paper and
+# live; overridable via RiskConfig.live_entry_slippage_usd.
+LIVE_ENTRY_SLIPPAGE_USD = 0.01
+
+# Hard cap: never quote a BUY above 0.99 even after slippage.
+MAX_BUY_PRICE = 0.99
+
 
 class BTCTradingEngine:
     """Core engine for sniping cheap tokens on BTC Up/Down markets."""
@@ -167,6 +175,9 @@ class BTCTradingEngine:
         )
         self._order_fill_deadline_buffer_s: float = float(
             getattr(strategy_cfg.risk, "order_fill_deadline_buffer_seconds", 30.0)
+        )
+        self._live_entry_slippage_usd: float = float(
+            getattr(strategy_cfg.risk, "live_entry_slippage_usd", LIVE_ENTRY_SLIPPAGE_USD)
         )
 
     @staticmethod
@@ -345,10 +356,10 @@ class BTCTradingEngine:
         direction = signal.upper()
         if direction == "UP":
             token_id = self.current_window.up_token_id
-            token_price = price_up
+            raw_token_price = price_up
         else:
             token_id = self.current_window.down_token_id
-            token_price = price_down
+            raw_token_price = price_down
 
         size_usd = min(
             self.balance * self.cfg.risk.max_position_pct,
@@ -357,6 +368,15 @@ class BTCTradingEngine:
         if size_usd < 1.0:
             return []
 
+        # Record the EFFECTIVE entry price (incl. cross-the-spread slippage)
+        # so paper PnL math matches live execution. The raw book price is
+        # kept on the trade dict for debugging / Slack display.
+        # FUTURE: model non-fills in paper when order posts below ask;
+        # requires book-depth data we don't always have.
+        effective_token_price = min(
+            raw_token_price + self._live_entry_slippage_usd, MAX_BUY_PRICE
+        )
+
         self._already_traded_this_window = True
         self.risk.record_trade_entry()
         regime = self._compute_regime()
@@ -364,9 +384,10 @@ class BTCTradingEngine:
             "market_id": self.current_window.market_id,
             "direction": direction,
             "token_id": token_id,
-            "token_price": token_price,
+            "token_price": effective_token_price,
+            "raw_token_price": raw_token_price,
             "size_usd": size_usd,
-            "shares": size_usd / token_price,
+            "shares": size_usd / effective_token_price,
             "p_win": None,
             "btc_price": self._current_btc_price,
             "move_pct": move_pct,
@@ -376,7 +397,8 @@ class BTCTradingEngine:
         }
 
         logger.info(
-            f"ENTRY [{self._strategy.name.upper()}]: {direction} @ ${token_price:.3f} | "
+            f"ENTRY [{self._strategy.name.upper()}]: {direction} @ ${effective_token_price:.3f} "
+            f"(raw=${raw_token_price:.3f} +slip=${self._live_entry_slippage_usd:.3f}) | "
             f"${size_usd:.2f} ({trade['shares']:.0f} shares) | "
             f"move={move_pct:+.3f}% | BTC=${self._current_btc_price:,.2f}"
         )
@@ -520,11 +542,15 @@ class BTCTradingEngine:
         if self._polymarket is None:
             raise RuntimeError("live order requires polymarket client")
 
+        # t["token_price"] already includes the live-entry slippage bump
+        # applied in _check_entry, capped at MAX_BUY_PRICE. We still
+        # clamp defensively in case t was constructed elsewhere.
+        submit_price = min(float(t["token_price"]), MAX_BUY_PRICE)
         try:
             result = await self._polymarket.place_order(
                 token_id=t["token_id"],
                 side="BUY",
-                price=t["token_price"],
+                price=submit_price,
                 size=t["shares"],
             )
         except Exception as e:
