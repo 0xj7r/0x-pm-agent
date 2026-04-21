@@ -138,6 +138,12 @@ class BTCTradingEngine:
         self._drift_threshold_usd: float = float(
             getattr(strategy_cfg.risk, "drift_threshold_usd", 2.0)
         )
+        self._order_poll_interval_s: float = float(
+            getattr(strategy_cfg.risk, "order_poll_interval_seconds", 3.0)
+        )
+        self._order_fill_deadline_buffer_s: float = float(
+            getattr(strategy_cfg.risk, "order_fill_deadline_buffer_seconds", 30.0)
+        )
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -351,6 +357,229 @@ class BTCTradingEngine:
         self.persistence.record_entry(self._strategy.name, trade)
         return [trade]
 
+    async def _await_order_fill(
+        self,
+        order_id: str,
+        original_size: float,
+        window_end_time: datetime | None,
+        now_fn=None,
+    ) -> dict:
+        """Poll the CLOB for order status until it settles or the window is about to close.
+
+        Returns a dict describing the outcome:
+          {
+            "status": "matched" | "partial" | "cancelled" | "rejected" | "timeout",
+            "size_matched": float,   # shares actually filled, 0 if none
+            "last_response": dict | None,
+          }
+
+        Polls every self._order_poll_interval_s. If the window end_time is
+        known, stops when time-remaining drops below
+        self._order_fill_deadline_buffer_s and cancels the order (a timeout).
+
+        The CLOB post_order immediate response uses lowercase status strings
+        (matched, live, delayed, unmatched). The GET /data/order/{id}
+        response uses uppercase (LIVE, MATCHED, CANCELED, FAILED). We
+        accept both, case-insensitively.
+        """
+        if self._polymarket is None:
+            raise RuntimeError("live polling requires polymarket client")
+
+        now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+
+        def _normalize(status: str | None) -> str:
+            return (status or "").strip().lower()
+
+        def _fill_size(resp: dict) -> float:
+            raw = resp.get("size_matched", resp.get("sizeMatched", 0))
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+
+        last_resp: dict | None = None
+        while True:
+            if window_end_time is not None:
+                remaining = (window_end_time - now_fn()).total_seconds()
+                if remaining < self._order_fill_deadline_buffer_s:
+                    # One last status read so we can record any partial fill
+                    # that landed between the previous poll and the deadline.
+                    try:
+                        final = await self._polymarket.get_order_status(order_id)
+                        if isinstance(final, dict):
+                            last_resp = final
+                    except Exception as e:
+                        logger.warning(
+                            f"[LIVE] final get_order_status({order_id}) failed: {e}"
+                        )
+                    try:
+                        await self._polymarket.cancel_order(order_id)
+                    except Exception as e:
+                        logger.warning(
+                            f"[LIVE] cancel_order({order_id}) failed: {e}"
+                        )
+                    filled = _fill_size(last_resp) if last_resp is not None else 0.0
+                    if filled > 0 and filled < original_size:
+                        return {
+                            "status": "partial",
+                            "size_matched": filled,
+                            "last_response": last_resp,
+                        }
+                    return {
+                        "status": "timeout",
+                        "size_matched": filled,
+                        "last_response": last_resp,
+                    }
+
+            try:
+                resp = await self._polymarket.get_order_status(order_id)
+            except Exception as e:
+                logger.warning(
+                    f"[LIVE] get_order_status({order_id}) failed: {e}"
+                )
+                await asyncio.sleep(self._order_poll_interval_s)
+                continue
+
+            last_resp = resp if isinstance(resp, dict) else {}
+            status = _normalize(last_resp.get("status"))
+            filled = _fill_size(last_resp)
+
+            if status == "matched":
+                if filled <= 0:
+                    filled = original_size
+                if filled + 1e-9 < original_size:
+                    # Partial fill on a matched order: cancel the rest
+                    # so we don't leave stray open size on book.
+                    try:
+                        await self._polymarket.cancel_order(order_id)
+                    except Exception as e:
+                        logger.warning(
+                            f"[LIVE] cancel_order({order_id}) on partial "
+                            f"failed: {e}"
+                        )
+                    return {
+                        "status": "partial",
+                        "size_matched": filled,
+                        "last_response": last_resp,
+                    }
+                return {
+                    "status": "matched",
+                    "size_matched": filled,
+                    "last_response": last_resp,
+                }
+            if status in ("cancelled", "canceled"):
+                return {
+                    "status": "cancelled",
+                    "size_matched": filled,
+                    "last_response": last_resp,
+                }
+            if status in ("rejected", "failed"):
+                return {
+                    "status": "rejected",
+                    "size_matched": filled,
+                    "last_response": last_resp,
+                }
+
+            await asyncio.sleep(self._order_poll_interval_s)
+
+    async def _submit_and_confirm_live_order(self, t: dict) -> dict | None:
+        """Place a live CLOB order and confirm fill via status polling.
+
+        Returns the (possibly adjusted for partial fill) trade dict on
+        successful fill, or None if the order was rejected, cancelled,
+        or timed out. On None the caller must NOT record a trade; this
+        method already releases the window and bumps reject/success
+        counters on risk.
+        """
+        if self._polymarket is None:
+            raise RuntimeError("live order requires polymarket client")
+
+        try:
+            result = await self._polymarket.place_order(
+                token_id=t["token_id"],
+                side="BUY",
+                price=t["token_price"],
+                size=t["shares"],
+            )
+        except Exception as e:
+            self.risk.record_order_rejection()
+            self._already_traded_this_window = False
+            logger.error(f"[LIVE] Order placement FAILED: {e}")
+            return None
+
+        order_id = (
+            result.get("orderID")
+            or result.get("orderId")
+            or result.get("id")
+        )
+        if not order_id:
+            self.risk.record_order_rejection()
+            self._already_traded_this_window = False
+            logger.error(
+                f"[LIVE] place_order returned no order id: {result}"
+            )
+            return None
+
+        immediate_status = (result.get("status") or "").strip().lower()
+        t["order_id"] = order_id
+        t["order_status"] = immediate_status or "posted"
+        original_size = float(t["shares"])
+
+        # Fast path: order already fully matched on submit.
+        if immediate_status == "matched":
+            self.risk.record_order_success()
+            logger.warning(
+                f"[LIVE] Order matched on submit: id={order_id}"
+            )
+            return t
+
+        # Slow path: poll until settled or window is about to close.
+        window_end = self.current_window.end_time if self.current_window else None
+        logger.warning(
+            f"[LIVE] Order posted, polling: id={order_id} "
+            f"status={immediate_status or 'unknown'}"
+        )
+        outcome = await self._await_order_fill(
+            order_id=order_id,
+            original_size=original_size,
+            window_end_time=window_end,
+        )
+        status = outcome["status"]
+        filled = float(outcome["size_matched"])
+
+        if status == "matched":
+            self.risk.record_order_success()
+            t["order_status"] = "matched"
+            logger.warning(
+                f"[LIVE] Order filled: id={order_id} size={filled}"
+            )
+            return t
+
+        if status == "partial" and filled > 0:
+            # Record only the filled portion. _await_order_fill already
+            # cancelled any remaining open size on both paths (matched
+            # with partial, and timeout with partial).
+            fill_ratio = filled / original_size if original_size > 0 else 0.0
+            t["order_status"] = "partial"
+            t["shares"] = filled
+            t["size_usd"] = float(t["size_usd"]) * fill_ratio
+            self.risk.record_order_success()
+            logger.warning(
+                f"[LIVE] Order PARTIAL fill: id={order_id} "
+                f"filled={filled}/{original_size} "
+                f"size_usd=${t['size_usd']:.2f}"
+            )
+            return t
+
+        # Any other terminal state: rejected, cancelled, or timeout.
+        self.risk.record_order_rejection()
+        self._already_traded_this_window = False
+        logger.warning(
+            f"[LIVE] Order NOT filled (status={status}): id={order_id}. "
+            f"No position recorded. Releasing window."
+        )
+        return None
+
     async def _reconcile_live_balance(self) -> None:
         if self.cfg.paper.enabled:
             return
@@ -448,35 +677,10 @@ class BTCTradingEngine:
 
                     for t in self._check_entry():
                         if not self.cfg.paper.enabled:
-                            # Real CLOB order. On any failure we do not
-                            # record the trade locally so we don't think
-                            # we have a position that doesn't exist.
-                            # Release the window so the next snap can retry.
-                            try:
-                                result = await self._polymarket.place_order(
-                                    token_id=t["token_id"],
-                                    side="BUY",
-                                    price=t["token_price"],
-                                    size=t["shares"],
-                                )
-                                t["order_id"] = (
-                                    result.get("orderID")
-                                    or result.get("orderId")
-                                    or result.get("id")
-                                )
-                                t["order_status"] = result.get("status", "posted")
-                                self.risk.record_order_success()
-                                logger.warning(
-                                    f"[LIVE] Order placed: id={t['order_id']} "
-                                    f"status={t['order_status']}"
-                                )
-                            except Exception as e:
-                                self.risk.record_order_rejection()
-                                self._already_traded_this_window = False
-                                logger.error(
-                                    f"[LIVE] Order placement FAILED: {e}"
-                                )
+                            trade = await self._submit_and_confirm_live_order(t)
+                            if trade is None:
                                 continue
+                            t = trade
                         self._paper_trades.append(t)
                         self.balance -= t["size_usd"]
                         tag = "[PAPER]" if self.cfg.paper.enabled else "[LIVE] "
