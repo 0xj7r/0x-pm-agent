@@ -53,16 +53,17 @@ class BTCTradingEngine:
             # Supabase mirroring is only required for live trading. Paper mode
             # persists trades to local SQLite via MemoryStore, which is
             # sufficient for research/validation runs.
-            if strategy_cfg.paper.enabled:
+            if strategy_cfg.paper.enabled or os.environ.get("ALLOW_LIVE_WITHOUT_SUPABASE") == "1":
                 logger.warning(
-                    f"Supabase unavailable ({e}); continuing in paper mode with "
-                    "SQLite-only persistence."
+                    f"Supabase unavailable ({e}); continuing with SQLite-only "
+                    "persistence. event_log is the source of truth."
                 )
                 self._supa = None
             else:
                 logger.critical(
                     f"FATAL: Could not initialize Supabase client: {e}. "
-                    "Live trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY."
+                    "Live trading requires persistence. Check SUPABASE_URL/SUPABASE_KEY "
+                    "or set ALLOW_LIVE_WITHOUT_SUPABASE=1 to bypass."
                 )
                 raise RuntimeError(f"Supabase unavailable: {e}") from e
         coin_conf = normalize_coin_config(strategy_cfg.coins.get(self._coin))
