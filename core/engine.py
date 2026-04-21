@@ -134,6 +134,10 @@ class BTCTradingEngine:
         self._last_scan_time: float = 0.0
         self._latest_book: OrderBookSnapshot | None = None
         self._last_processed_snap: tuple[float, float, float] | None = None
+        self._reconcile_halt: bool = False
+        self._drift_threshold_usd: float = float(
+            getattr(strategy_cfg.risk, "drift_threshold_usd", 2.0)
+        )
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -145,6 +149,8 @@ class BTCTradingEngine:
         base.MAX_CONCURRENT_POSITIONS = cfg.risk.max_concurrent_positions
         base.LOSS_COOLDOWN_TRADES = cfg.risk.loss_cooldown_trades
         base.LOSS_COOLDOWN_SECONDS = cfg.risk.loss_cooldown_seconds
+        base.MAX_DAILY_TRADES = cfg.risk.max_daily_trades
+        base.REJECT_STREAK_LIMIT = cfg.risk.reject_streak_limit
         return RiskManager(base)
 
     def _on_new_window(self, window: MarketWindow) -> None:
@@ -253,6 +259,12 @@ class BTCTradingEngine:
             return []
         if self.risk.is_rate_limited():
             return []
+        if self.risk.is_daily_trade_cap_reached():
+            return []
+        if self.risk.is_reject_streak_tripped():
+            return []
+        if self._reconcile_halt:
+            return []
         if self._window_open_price == 0:
             self._window_open_price = self._current_btc_price
             self._strategy.start_window(self.current_window.market_id, self._window_open_price)
@@ -339,6 +351,29 @@ class BTCTradingEngine:
         self.persistence.record_entry(self._strategy.name, trade)
         return [trade]
 
+    async def _reconcile_live_balance(self) -> None:
+        if self.cfg.paper.enabled:
+            return
+        if self._polymarket is None:
+            return
+        if len(self._paper_trades) > 0:
+            return
+        try:
+            result = await self._polymarket.get_balance_allowance()
+        except Exception as e:
+            logger.warning(f"Live balance reconciliation failed: {e}")
+            return
+        actual = float(result.get("balance_usdc", 0.0))
+        expected = float(self.balance)
+        diff = abs(actual - expected)
+        if diff > self._drift_threshold_usd:
+            logger.warning(
+                f"LIVE BALANCE DRIFT: actual=${actual:.2f} "
+                f"expected=${expected:.2f} diff=${diff:.2f} "
+                f"(threshold=${self._drift_threshold_usd:.2f}). Halting entries."
+            )
+            self._reconcile_halt = True
+
     async def _scan_for_window(self) -> None:
         now = _time.time()
         if now - self._last_scan_time < self._scan_interval:
@@ -424,6 +459,8 @@ class BTCTradingEngine:
                         )
 
                     tick_count += 1
+                    if tick_count % 3000 == 0:
+                        await self._reconcile_live_balance()
                     if tick_count % 600 == 0:
                         await self._process_resolutions()
                         total = len(self._paper_trades) + len(self.resolver.resolved_ids)
