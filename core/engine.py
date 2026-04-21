@@ -142,6 +142,7 @@ class BTCTradingEngine:
         )
         self._last_redeem_sweep_ts: float = 0.0
         self._last_take_profit_ts_by_market: dict[str, float] = {}
+        self._last_stop_loss_ts_by_market: dict[str, float] = {}
 
         # Push-path state (parallel to polling). Keys are orderIDs; the
         # asyncio.Event fires as soon as a trade/order event on the user
@@ -1393,6 +1394,157 @@ class BTCTradingEngine:
                 self.balance,
             )
 
+    async def _maybe_stop_loss(self) -> None:
+        if self.cfg.paper.enabled:
+            return
+        if self._polymarket is None:
+            return
+        if not bool(getattr(self.cfg.risk, "stop_loss_enabled", False)):
+            return
+
+        bid_threshold = float(getattr(self.cfg.risk, "stop_loss_best_bid_threshold", 0.15))
+        sell_fraction = float(getattr(self.cfg.risk, "stop_loss_sell_fraction", 1.0))
+        min_bid_size = float(getattr(self.cfg.risk, "stop_loss_min_best_bid_size_shares", 0.0))
+        exit_slip = float(getattr(self.cfg.risk, "stop_loss_exit_slippage_usd", 0.01))
+        timeout_s = float(getattr(self.cfg.risk, "stop_loss_order_timeout_seconds", 20))
+        min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
+
+        for t in list(self._paper_trades):
+            if t.get("exited"):
+                continue
+            token_id = t.get("token_id")
+            if not token_id:
+                continue
+            book = self.poly_ws.get_book(token_id)
+            if book is None or book.best_bid <= 0:
+                continue
+            best_bid = float(book.best_bid)
+            best_bid_size = float(getattr(book, "best_bid_size", 0.0) or 0.0)
+            if best_bid > bid_threshold:
+                continue
+            if min_bid_size and best_bid_size < min_bid_size:
+                continue
+
+            shares = float(t.get("shares") or 0.0)
+            if shares <= 0:
+                continue
+
+            shares_to_sell = shares * sell_fraction
+            if best_bid_size > 0:
+                shares_to_sell = min(shares_to_sell, best_bid_size)
+            # Clamp to actual on-chain balance: Polymarket rejects SELL
+            # orders larger than the ERC-1155 balance we hold.
+            if self._redeemer is not None:
+                try:
+                    onchain = await self._redeemer.get_position_balance(token_id)
+                    onchain_shares = float(onchain) / 1e6
+                    if onchain_shares > 0:
+                        shares_to_sell = min(shares_to_sell, onchain_shares)
+                except Exception as e:
+                    logger.warning("[STOP_LOSS] balance probe failed: %s", e)
+            if shares_to_sell + 1e-9 < min_shares:
+                continue
+
+            entry_px = float(t.get("token_price") or 0.0)
+            if entry_px <= 0:
+                continue
+
+            sell_price = max(0.01, min(best_bid - exit_slip, 0.99))
+            if sell_price <= 0:
+                continue
+
+            unrealized = shares_to_sell * (sell_price - entry_px)
+
+            market_id = str(t.get("market_id") or "")
+            now = _time.time()
+            if market_id and (now - self._last_stop_loss_ts_by_market.get(market_id, 0.0) < 10.0):
+                continue
+
+            logger.warning(
+                "[STOP_LOSS] Trigger: market=%s token=%s bid=%.3f bid_sz=%.2f "
+                "entry_px=%.3f sell_px=%.3f shares=%.2f->%.2f unrealized≈$%.2f",
+                market_id,
+                str(token_id)[:16],
+                best_bid,
+                best_bid_size,
+                entry_px,
+                sell_price,
+                shares,
+                shares_to_sell,
+                unrealized,
+            )
+
+            try:
+                result = await self._polymarket.place_order(
+                    token_id=token_id,
+                    side="SELL",
+                    price=sell_price,
+                    size=shares_to_sell,
+                )
+            except Exception as e:
+                logger.error(f"[STOP_LOSS] SELL place_order failed: {e}")
+                continue
+
+            order_id = result.get("orderID") or result.get("orderId") or result.get("id")
+            if not order_id:
+                logger.error(f"[STOP_LOSS] SELL returned no order id: {result}")
+                continue
+
+            self._last_stop_loss_ts_by_market[market_id] = now
+            outcome = await self._await_order_fill_hard_timeout(
+                order_id=str(order_id),
+                original_size=float(shares_to_sell),
+                timeout_seconds=timeout_s,
+            )
+            status = outcome["status"]
+            filled = float(outcome["size_matched"])
+            if filled <= 0:
+                logger.warning(f"[STOP_LOSS] SELL not filled status={status} id={order_id}")
+                continue
+
+            proceeds = filled * sell_price
+            fee = taker_fee_usd(sell_price, proceeds)
+            realized_pnl = filled * (sell_price - entry_px) - fee
+            self.balance += proceeds - fee
+
+            remaining = shares - filled
+            if remaining <= 1e-6:
+                t["exited"] = True
+                self.resolver.resolved_ids.add(market_id)
+                try:
+                    self._paper_trades.remove(t)
+                except ValueError:
+                    pass
+            else:
+                ratio = remaining / shares if shares > 0 else 0.0
+                t["shares"] = remaining
+                t["size_usd"] = float(t.get("size_usd") or 0.0) * ratio
+
+            self.persistence.record_exit(
+                self._strategy.name,
+                t,
+                exit_details={
+                    "order_id": str(order_id),
+                    "status": status,
+                    "filled_shares": filled,
+                    "sell_price": sell_price,
+                    "proceeds_usd": proceeds,
+                    "fee_usd": fee,
+                    "realized_pnl_usd": realized_pnl,
+                    "best_bid": best_bid,
+                    "best_bid_size": best_bid_size,
+                    "exit_reason": "stop_loss",
+                },
+            )
+            logger.warning(
+                "[STOP_LOSS] Realized on exit: filled=%.2f proceeds=$%.2f fee=$%.2f pnl≈$%.2f balance=$%.2f",
+                filled,
+                proceeds,
+                fee,
+                realized_pnl,
+                self.balance,
+            )
+
     async def _reconcile_live_balance(self) -> None:
         """Compare on-chain USDC vs our internal bookkeeping.
 
@@ -1917,6 +2069,7 @@ class BTCTradingEngine:
                     if tick_count % 20 == 0:
                         await self._maybe_periodic_redemption_sweep()
                         await self._maybe_take_profit()
+                        await self._maybe_stop_loss()
                     if tick_count % 3000 == 0:
                         await self._reconcile_live_balance()
                     if tick_count % 600 == 0:
