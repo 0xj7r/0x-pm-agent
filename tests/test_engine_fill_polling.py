@@ -87,6 +87,13 @@ def _new_trade(shares: float = 100.0, size_usd: float = 5.0) -> dict:
         "size_usd": size_usd,
         "book_snapshot": {"selected": {"token_id": "tok-abc"}},
         "btc_volume_60s": 12.5,
+        "market_anchor": {
+            "open_price": 77986.83151,
+            "open_ts": 1776846600.0,
+            "open_lag_ms": 0,
+            "source": "polymarket_price_to_beat",
+            "quality": "canonical",
+        },
     }
 
 
@@ -116,6 +123,10 @@ async def test_instant_match_skips_polling():
     poly.cancel_order.assert_not_called()
     eng.risk.record_order_success.assert_called_once()
     eng.risk.record_order_rejection.assert_not_called()
+    submit_payload = eng.persistence.record_order_submit.call_args.kwargs["payload"]
+    final_payload = eng.persistence.record_order_final.call_args.kwargs["payload"]
+    assert submit_payload["market_anchor"] == t["market_anchor"]
+    assert final_payload["market_anchor"] == t["market_anchor"]
 
 
 @pytest.mark.asyncio

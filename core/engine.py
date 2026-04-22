@@ -309,6 +309,30 @@ class BTCTradingEngine:
         self._entry_blocker = None
         self._last_logged_entry_blocker_key = None
 
+    def _market_anchor_payload(self) -> dict:
+        open_ts = self._window_open_ts
+        window_start_ts = (
+            self.current_window.start_time.timestamp()
+            if self.current_window is not None
+            else None
+        )
+        open_lag_ms = None
+        if open_ts is not None and window_start_ts is not None:
+            open_lag_ms = int(round((open_ts - window_start_ts) * 1000))
+        source = self._window_open_source or "unknown"
+        quality = (
+            "canonical"
+            if source == "polymarket_price_to_beat"
+            else "derived"
+        )
+        return {
+            "open_price": self._window_open_price,
+            "open_ts": open_ts,
+            "open_lag_ms": open_lag_ms,
+            "source": source,
+            "quality": quality,
+        }
+
     def _classify_signal_skip(
         self,
         signal: str | None,
@@ -984,6 +1008,7 @@ class BTCTradingEngine:
             "window_open_ts": self._window_open_ts,
             "window_open_source": self._window_open_source,
             "window_start_ts": self.current_window.start_time.timestamp(),
+            "market_anchor": self._market_anchor_payload(),
             "strategy": self._strategy.name,
             "timestamp": decision_ts,
             "regime": regime,
@@ -1300,6 +1325,7 @@ class BTCTradingEngine:
                 payload={
                     "trade_id": t.get("id"),
                     "decision_id": t.get("decision_id"),
+                    "market_anchor": t.get("market_anchor"),
                     "order_attempt_id": order_attempt_id,
                     "side": "BUY",
                     "token_id": t.get("token_id"),
@@ -1333,6 +1359,7 @@ class BTCTradingEngine:
                 payload={
                     "trade_id": t.get("id"),
                     "decision_id": t.get("decision_id"),
+                    "market_anchor": t.get("market_anchor"),
                     "order_attempt_id": order_attempt_id,
                     "side": "BUY",
                     "token_id": t.get("token_id"),
@@ -1363,6 +1390,7 @@ class BTCTradingEngine:
             payload={
                 "trade_id": t.get("id"),
                 "decision_id": t.get("decision_id"),
+                "market_anchor": t.get("market_anchor"),
                 "order_attempt_id": order_attempt_id,
                 "order_id": order_id,
                 "side": "BUY",
@@ -1416,6 +1444,7 @@ class BTCTradingEngine:
                 payload={
                     "trade_id": t.get("id"),
                     "decision_id": t.get("decision_id"),
+                    "market_anchor": t.get("market_anchor"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": "matched",
@@ -1479,6 +1508,7 @@ class BTCTradingEngine:
                 payload={
                     "trade_id": t.get("id"),
                     "decision_id": t.get("decision_id"),
+                    "market_anchor": t.get("market_anchor"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": status,
@@ -1535,6 +1565,7 @@ class BTCTradingEngine:
                 payload={
                     "trade_id": t.get("id"),
                     "decision_id": t.get("decision_id"),
+                    "market_anchor": t.get("market_anchor"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": status,
@@ -1579,6 +1610,7 @@ class BTCTradingEngine:
             payload={
                 "trade_id": t.get("id"),
                 "decision_id": t.get("decision_id"),
+                "market_anchor": t.get("market_anchor"),
                 "order_attempt_id": order_attempt_id,
                 "order_id": order_id,
                 "final_status": status,
