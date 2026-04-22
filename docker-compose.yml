@@ -206,3 +206,14 @@ services:
       - ./data/snapshots:/app/backtesting
     entrypoint: ["python", "collector/snapshot_recorder.py"]
     command: ["--coin", "btc", "--coin", "eth", "--coin", "sol", "--interval", "1.0"]
+
+  endgame-paper:
+    <<: *agent-service
+    profiles: ["endgame"]
+    container_name: polymarket-endgame-paper
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./data:/data
+    entrypoint: ["python", "-u", "scripts/endgame_paper_bot.py"]
+    command: ["--db", "/data/endgame_paper_trades.db", "--loop", "5"]
