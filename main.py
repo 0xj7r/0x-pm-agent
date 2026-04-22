@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -20,6 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_LOCK_FH = None
+
 
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
@@ -29,8 +32,40 @@ def setup_logging(level: str = "INFO") -> None:
     )
 
 
-def write_pid() -> None:
-    pid_file = Path("btc_agent.pid")
+def _instance_scope_name(
+    *,
+    live: bool,
+    coin: str,
+    market_type: str,
+    profile: str | None,
+) -> str:
+    parts = [coin.lower(), market_type, "live" if live else "paper"]
+    if profile:
+        parts.append(profile)
+    if live:
+        private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        if private_key:
+            wallet_hash = hashlib.sha256(private_key.encode("utf-8")).hexdigest()[:12]
+            parts.append(wallet_hash)
+    return "-".join(parts)
+
+
+def write_pid(scope_name: str = "btc_agent") -> None:
+    global _LOCK_FH
+    pid_file = Path(f"{scope_name}.pid")
+    lock_file = Path(f"{scope_name}.lock")
+
+    # Advisory file lock: survives stale PID files and blocks duplicate
+    # containers that share a mounted data/app volume.
+    import fcntl
+    lock_fh = open(lock_file, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"Agent lock already held ({lock_file}). Exiting.")
+        sys.exit(1)
+    _LOCK_FH = lock_fh
+
     if pid_file.exists():
         try:
             old_pid = int(pid_file.read_text().strip())
@@ -45,10 +80,19 @@ def write_pid() -> None:
     pid_file.write_text(str(os.getpid()))
 
 
-def cleanup_pid() -> None:
-    pid_file = Path("btc_agent.pid")
+def cleanup_pid(scope_name: str = "btc_agent") -> None:
+    global _LOCK_FH
+    pid_file = Path(f"{scope_name}.pid")
     if pid_file.exists():
         pid_file.unlink()
+    if _LOCK_FH is not None:
+        try:
+            import fcntl
+            fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        _LOCK_FH.close()
+        _LOCK_FH = None
 
 
 async def main(config_path: str, live: bool, coin: str, market_type: str) -> None:
@@ -86,9 +130,17 @@ async def main(config_path: str, live: bool, coin: str, market_type: str) -> Non
 
     signal.signal(signal.SIGHUP, handle_reload)
 
+    scope_name = _instance_scope_name(
+        live=live,
+        coin=coin,
+        market_type=market_type,
+        profile=profile,
+    )
+    heartbeat_file = Path(f"{scope_name}.heartbeat.txt")
+
     async def heartbeat() -> None:
         while engine._running:
-            Path("btc_heartbeat.txt").write_text(
+            heartbeat_file.write_text(
                 f"{__import__('datetime').datetime.now().isoformat()}"
             )
             await asyncio.sleep(30)
@@ -99,7 +151,7 @@ async def main(config_path: str, live: bool, coin: str, market_type: str) -> Non
         await engine.run()
     finally:
         await engine.stop()
-        cleanup_pid()
+        cleanup_pid(scope_name)
 
 
 if __name__ == "__main__":
@@ -116,9 +168,15 @@ if __name__ == "__main__":
         os.environ["STRATEGY_PROFILE"] = args.profile
 
     setup_logging(args.log_level)
-    write_pid()
+    scope_name = _instance_scope_name(
+        live=args.live,
+        coin=args.coin,
+        market_type=args.market_type,
+        profile=args.profile,
+    )
+    write_pid(scope_name)
 
     try:
         asyncio.run(main(args.config, args.live, args.coin, args.market_type))
     finally:
-        cleanup_pid()
+        cleanup_pid(scope_name)

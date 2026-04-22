@@ -165,3 +165,38 @@ class TestPIDLockWorksInContainers:
         import main
         with pytest.raises(SystemExit):
             main.write_pid()
+
+    def test_advisory_lock_blocks_when_already_held(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        import main
+
+        class _DummyFH:
+            def fileno(self):
+                return 1
+
+            def close(self):
+                return None
+
+        def _raise_lock(_fd, _flags):
+            raise BlockingIOError
+
+        monkeypatch.setattr("builtins.open", lambda *args, **kwargs: _DummyFH())
+        monkeypatch.setattr("fcntl.flock", _raise_lock)
+
+        with pytest.raises(SystemExit):
+            main.write_pid("btc-5m-live-test")
+
+    def test_instance_scope_includes_live_profile_and_wallet_hash(self):
+        import main
+
+        with patch.dict("os.environ", {"POLYMARKET_PRIVATE_KEY": "super-secret-key"}):
+            scope = main._instance_scope_name(
+                live=True,
+                coin="btc",
+                market_type="5m",
+                profile="research_t10_live",
+            )
+
+        assert scope.startswith("btc-5m-live-research_t10_live-")
+        assert len(scope.split("-")[-1]) == 12
