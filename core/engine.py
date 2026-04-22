@@ -228,6 +228,7 @@ class BTCTradingEngine:
 
         self.current_window: MarketWindow | None = None
         self._window_open_price: float = 0.0
+        self._window_open_source: str | None = None
         self._current_btc_price: float = 0.0
         # Rolling 60-min price history for regime tagging on each trade.
         # Deque of (timestamp_sec, price). Evicted on each tick.
@@ -411,6 +412,7 @@ class BTCTradingEngine:
     def _on_new_window(self, window: MarketWindow) -> None:
         self.current_window = window
         self._window_open_price = 0.0
+        self._window_open_source = None
         self._window_open_ts = None
         self._window_open_skip_logged_market_id = None
         self._already_traded_this_window = False
@@ -429,11 +431,12 @@ class BTCTradingEngine:
         open_label = (
             f"${self._window_open_price:,.2f}"
             if self._window_open_price > 0
-            else "pending Binance start anchor"
+            else "pending canonical reference"
         )
         logger.info(
             f"New window: {window.question} | "
-            f"BTC open: {open_label} | "
+            f"BTC open: {open_label}"
+            f"{f' ({self._window_open_source})' if self._window_open_source else ''} | "
             f"UP: {window.up_price:.2f} DOWN: {window.down_price:.2f}"
         )
 
@@ -457,6 +460,32 @@ class BTCTradingEngine:
     def _btc_volume_60s(self) -> float:
         return float(sum(qty for _, qty in self._trade_volume_history))
 
+    def _anchor_window_open_from_reference_price(self) -> bool:
+        """Set the current window open from Polymarket's canonical Price To Beat."""
+        if self.current_window is None:
+            return False
+        if self._window_open_price > 0:
+            return True
+
+        price_to_beat = getattr(self.current_window, "price_to_beat", None)
+        if price_to_beat is None or price_to_beat <= 0:
+            return False
+
+        self._window_open_price = float(price_to_beat)
+        self._window_open_ts = self.current_window.start_time.timestamp()
+        self._window_open_source = "polymarket_price_to_beat"
+        self._strategy.start_window(
+            self.current_window.market_id,
+            self._window_open_price,
+        )
+        logger.info(
+            "Anchored window open from canonical reference: market=%s open=$%.2f source=%s",
+            self.current_window.market_id,
+            self._window_open_price,
+            self._window_open_source,
+        )
+        return True
+
     def _anchor_window_open_from_history(self) -> bool:
         """Set the current window open from the first Binance trade at start.
 
@@ -467,6 +496,8 @@ class BTCTradingEngine:
         """
         if self.current_window is None:
             return False
+        if self._anchor_window_open_from_reference_price():
+            return True
         if self._window_open_price > 0:
             return True
 
@@ -494,15 +525,17 @@ class BTCTradingEngine:
                 return False
             self._window_open_price = float(price)
             self._window_open_ts = float(ts)
+            self._window_open_source = "binance_start_trade"
             self._strategy.start_window(
                 self.current_window.market_id,
                 self._window_open_price,
             )
             logger.info(
-                "Anchored window open: market=%s open=$%.2f lag_ms=%d",
+                "Anchored window open: market=%s open=$%.2f lag_ms=%d source=%s",
                 self.current_window.market_id,
                 self._window_open_price,
                 int(lag_s * 1000),
+                self._window_open_source,
             )
             return True
         return False
@@ -755,6 +788,7 @@ class BTCTradingEngine:
             "move_pct": move_pct,
             "window_open_price": self._window_open_price,
             "window_open_ts": self._window_open_ts,
+            "window_open_source": self._window_open_source,
             "window_start_ts": self.current_window.start_time.timestamp(),
             "strategy": self._strategy.name,
             "timestamp": decision_ts,

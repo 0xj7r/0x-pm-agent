@@ -1,12 +1,13 @@
 """Tests for BTC Up/Down 5-minute market window scanner."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from clients.market_scanner import MarketWindowScanner, parse_btc_event, SLUG_PREFIX_5M
+from models.market import MarketWindow
 
 
 def _make_event(ts: int, active: bool = True, closed: bool = False) -> dict:
@@ -34,6 +35,7 @@ def test_parse_valid_event():
     assert window.down_token_id == "tok_down"
     assert window.up_price == 0.505
     assert (window.end_time - window.start_time).total_seconds() == 300
+    assert window.price_to_beat is None
 
 
 def test_parse_rejects_non_5m_slug():
@@ -78,3 +80,50 @@ async def test_find_active_windows():
 
     assert len(windows) == 1
     assert windows[0].up_token_id == "tok_up"
+
+
+def test_parse_price_to_beat_from_page_html():
+    scanner = MarketWindowScanner()
+    html = (
+        '{"id":"402307","ticker":"btc-updown-5m-1776846600",'
+        '"slug":"btc-updown-5m-1776846600","title":"Bitcoin Up or Down",'
+        '"eventMetadata":{"priceToBeat":77986.83150999999}}'
+    )
+
+    price = scanner._parse_price_to_beat_from_html(html, "btc-updown-5m-1776846600")
+
+    assert price == pytest.approx(77986.83150999999)
+
+
+@pytest.mark.asyncio
+async def test_get_current_window_prefetches_current_and_next_price_to_beat():
+    now = datetime.now(timezone.utc)
+    current_window = MarketWindow(
+        market_id="m-current",
+        question="Current",
+        start_time=now.replace(second=0, microsecond=0) - timedelta(minutes=1),
+        end_time=now + timedelta(minutes=4),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        slug="btc-updown-5m-1776846600",
+    )
+    next_window = MarketWindow(
+        market_id="m-next",
+        question="Next",
+        start_time=now + timedelta(minutes=4),
+        end_time=now + timedelta(minutes=9),
+        up_token_id="tok_up_next",
+        down_token_id="tok_down_next",
+        slug="btc-updown-5m-1776846900",
+    )
+
+    scanner = MarketWindowScanner()
+    scanner.find_active_windows = AsyncMock(return_value=[current_window, next_window])
+    scanner._fetch_price_to_beat = AsyncMock(side_effect=[77986.83, 78010.12])
+
+    out = await scanner.get_current_window()
+
+    assert out is current_window
+    assert current_window.price_to_beat == pytest.approx(77986.83)
+    assert next_window.price_to_beat == pytest.approx(78010.12)
+    assert scanner._fetch_price_to_beat.await_count == 2
