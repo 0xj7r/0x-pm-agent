@@ -33,10 +33,11 @@ def _make_engine_stub(
     eng.cfg = _RootCfg(paper=_PaperCfg(enabled=paper))
     eng._polymarket = polymarket
     eng.balance = balance
-    eng._paper_trades = [{"placeholder": i} for i in range(open_positions)]
+    eng._open_trades = [{"placeholder": i} for i in range(open_positions)]
     eng._reconcile_halt = False
     eng._drift_threshold_usd = threshold
     eng._live_usdc_anchor = None
+    eng._live_internal_balance_anchor = None
     return eng
 
 
@@ -87,6 +88,7 @@ async def test_no_halt_under_threshold():
         threshold=2.0,
     )
     eng._live_usdc_anchor = 100.0
+    eng._live_internal_balance_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is False
 
@@ -101,6 +103,7 @@ async def test_halts_on_drift_over_threshold():
         threshold=2.0,
     )
     eng._live_usdc_anchor = 100.0
+    eng._live_internal_balance_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is True
 
@@ -115,8 +118,52 @@ async def test_halts_on_positive_drift():
         threshold=2.0,
     )
     eng._live_usdc_anchor = 100.0
+    eng._live_internal_balance_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is True
+
+
+@pytest.mark.asyncio
+async def test_anchor_uses_current_internal_balance_not_config_starting_balance():
+    """Historical event_log P&L restored into balance must not create drift.
+
+    This is the live outage case: on restart the wallet had $117.27, but
+    event_log restored internal balance to $89.97 because historical
+    resolutions summed to -$10.03. The first reconcile call must anchor
+    both ledgers and the second call must not compare against config
+    starting_balance.
+    """
+    eng = _make_engine_stub(
+        paper=False,
+        polymarket=_poly_with_balance(117.27),
+        balance=89.97,
+        open_positions=0,
+        threshold=2.0,
+    )
+
+    await eng._reconcile_live_balance()
+    await eng._reconcile_live_balance()
+
+    assert eng._live_usdc_anchor == pytest.approx(117.27)
+    assert eng._live_internal_balance_anchor == pytest.approx(89.97)
+    assert eng._reconcile_halt is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_compares_only_post_anchor_internal_delta():
+    eng = _make_engine_stub(
+        paper=False,
+        polymarket=_poly_with_balance(112.27),
+        balance=84.97,
+        open_positions=0,
+        threshold=2.0,
+    )
+    eng._live_usdc_anchor = 117.27
+    eng._live_internal_balance_anchor = 89.97
+
+    await eng._reconcile_live_balance()
+
+    assert eng._reconcile_halt is False
 
 
 @pytest.mark.asyncio

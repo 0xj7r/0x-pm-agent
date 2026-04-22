@@ -207,7 +207,7 @@ async def test_resolution_push_annotates_open_trade():
     on the matching open trade. No premature resolution record -- the
     authoritative writer stays Gamma polling."""
     eng = BTCTradingEngine.__new__(BTCTradingEngine)
-    eng._paper_trades = [
+    eng._open_trades = [
         {
             "market_id": "42",
             "condition_id": "0x" + "ab" * 32,
@@ -223,7 +223,7 @@ async def test_resolution_push_annotates_open_trade():
         "0x" + "AB" * 32, "YES", [1, 0]
     )
 
-    trade = eng._paper_trades[0]
+    trade = eng._open_trades[0]
     assert trade.get("pending_push_resolution") is True
     assert trade.get("push_resolution_winner") == "YES"
     # Idempotent on second fire.

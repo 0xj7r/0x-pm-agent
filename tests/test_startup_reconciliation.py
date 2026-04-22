@@ -16,14 +16,16 @@ existing event_log rows.
 from __future__ import annotations
 
 import tempfile
+import os
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from core.engine import BTCTradingEngine
 from core.memory import MemoryStore
 from core.trade_persistence import TradePersistence
+from strategies.strategy_config import StrategyConfig
 
 
 @dataclass
@@ -91,7 +93,50 @@ def _make_engine(
     eng._strategy = MagicMock()
     eng._strategy.name = "threshold"
     eng.balance = balance
+    eng._open_trades = []
     return eng, mem, tf
+
+
+def test_engine_rehydrates_unresolved_entries_on_startup():
+    tf = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tf.close()
+    mem = MemoryStore(tf.name)
+    mem.save_event(
+        window_id="m-open",
+        event_type="entry",
+        details=_mk_trade_details("m-open", direction="UP"),
+    )
+    mem.save_event(
+        window_id="m-closed",
+        event_type="entry",
+        details=_mk_trade_details("m-closed", direction="DOWN"),
+    )
+    mem.save_event(
+        window_id="m-closed",
+        event_type="resolution",
+        details={
+            "won": True,
+            "pnl_usd": 1.0,
+            "resolved_direction": "DOWN",
+            "trade": _mk_trade_details("m-closed", direction="DOWN"),
+        },
+    )
+    mem.close()
+
+    cfg = StrategyConfig()
+    cfg.paper.enabled = False
+    mock_supa = MagicMock()
+    mock_supa.health_check.return_value = True
+
+    with patch.dict(os.environ, {"POLYMARKET_PRIVATE_KEY": "0xabc"}), \
+         patch("shared.supabase_client.SupabaseClient", return_value=mock_supa), \
+         patch("core.engine.PolymarketClient"), \
+         patch("core.engine.CTFRedeemer"):
+        eng = BTCTradingEngine(cfg, db_path=tf.name, coin="btc")
+
+    assert [t["market_id"] for t in eng._open_trades] == ["m-open"]
+    assert eng._open_trades[0]["direction"] == "UP"
+    eng.memory.close()
 
 
 @pytest.mark.asyncio
