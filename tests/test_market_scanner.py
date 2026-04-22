@@ -141,3 +141,62 @@ async def test_get_current_window_prefetches_current_and_next_price_to_beat():
     assert current_window.price_to_beat == pytest.approx(77986.83)
     assert next_window.price_to_beat == pytest.approx(78010.12)
     assert scanner._fetch_price_to_beat.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_price_to_beat_from_past_results_uses_previous_close():
+    scanner = MarketWindowScanner()
+    window = MarketWindow(
+        market_id="m-current",
+        question="Current",
+        start_time=datetime(2026, 4, 22, 9, 0, 0, tzinfo=timezone.utc),
+        end_time=datetime(2026, 4, 22, 9, 5, 0, tzinfo=timezone.utc),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        slug="btc-updown-5m-1776848400",
+    )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "status": "success",
+        "data": {
+            "results": [
+                {
+                    "startTime": "2026-04-22T08:55:00.000Z",
+                    "endTime": "2026-04-22T09:00:00Z",
+                    "openPrice": 78060.37719961446,
+                    "closePrice": 78024.5748753997,
+                    "outcome": "down",
+                }
+            ]
+        },
+    }
+    scanner._http.get = AsyncMock(return_value=mock_resp)
+
+    price = await scanner._fetch_price_to_beat_from_past_results(window)
+
+    assert price == pytest.approx(78024.5748753997)
+
+
+@pytest.mark.asyncio
+async def test_fetch_price_to_beat_prefers_past_results_before_other_sources():
+    scanner = MarketWindowScanner()
+    window = MarketWindow(
+        market_id="m-current",
+        question="Current",
+        start_time=datetime(2026, 4, 22, 9, 0, 0, tzinfo=timezone.utc),
+        end_time=datetime(2026, 4, 22, 9, 5, 0, tzinfo=timezone.utc),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        slug="btc-updown-5m-1776848400",
+    )
+    scanner._fetch_price_to_beat_from_past_results = AsyncMock(return_value=78024.57)
+    scanner._fetch_price_to_beat_from_chainlink = AsyncMock(return_value=99999.99)
+    scanner._http.get = AsyncMock()
+
+    price = await scanner._fetch_price_to_beat(window)
+
+    assert price == pytest.approx(78024.57)
+    scanner._fetch_price_to_beat_from_past_results.assert_awaited_once_with(window)
+    scanner._fetch_price_to_beat_from_chainlink.assert_not_awaited()
+    scanner._http.get.assert_not_called()
