@@ -1,0 +1,3 @@
+[workspace]
+members = ["whale-pair-exec"]
+resolver = "2"

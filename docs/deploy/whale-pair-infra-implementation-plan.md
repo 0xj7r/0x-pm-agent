@@ -1,351 +1,260 @@
 # Whale-Pair Infra Implementation Plan
 
-Status: active  
-Primary region: `us-east-1`  
-Runtime split: Python for shadow/research now, Rust hot path before funded live
-Launch mode: shadow-only until CLOB V2 compatibility is complete
+Status: revised against current repo and CLOB V2 reality  
+Primary goal: produce a funded-live path that is venue-native, observable, and recoverable  
+Primary references:
 
-## Objective
+- `docs/architecture/current-runtime-and-v2-baseline.md`
+- `docs/architecture/venue-native-system-spec.md`
+- `docs/deploy/clob-v2-gap-analysis.md`
 
-Launch the whale-pair strategy with infrastructure that is:
+## Scope
 
-- low-latency enough for 5-minute crypto markets
-- correct and observable
-- resilient to venue/API failures
-- compatible with the Polymarket CLOB V2 cutover
+This plan is for the whale-pair strategy specifically, but it uses repo-wide facts:
 
-This plan optimizes for being consistently right and consistently available. It does not optimize for extreme HFT spend.
+- current live code is Python
+- whale-pair has its own dedicated runner and ledger
+- the repo still depends on V1 `py-clob-client`
+- CLOB V2 cutover is the forcing function
 
-## Hard launch gate
+This is a build plan, not a generic ops memo.
 
-Polymarket’s official docs now say:
+## Repo-grounded current state
 
-- **latest changelog says CLOB V2 goes live on April 28, 2026 at ~11:00 UTC**
-- **there is no backward compatibility after cutover**
-- **legacy `py-clob-client` / `clob-client` integrations must migrate**
-- **collateral changes from `USDC.e` to `pUSD`**
+### What is already in place
 
-That means the current Python deployment is a **shadow harness only**. It is useful for:
+- `scripts/whale_pair_live_bot.py`
+  - dedicated pair runner
+  - market WS first, HTTP `/book` fallback
+  - local SQLite pair ledger
+- `core/whale_pair_ledger.py`
+  - domain model for fills, open lots, matches, actions, redeems
+- `scripts/deploy/whale-pair/*.sh`
+  - provisioning, env check, start, kill, health
+- `scripts/deploy/whale-pair/docker-compose.whale-pair.yml`
+  - isolated deployment topology from root `docker-compose.yml`
 
-- live websocket telemetry
-- scanner/load testing
-- ledger behavior
-- host/ops validation
+### What is not in place
 
-It is **not** the thing we should fund live.
+- no Rust execution plane
+- no V2-compatible client path
+- no pUSD collateral workflow
+- no metrics-first monitoring
+- no control plane for standby promotion
+- no recovery drill that handles V2 order wipe cleanly
 
-References:
+## Design decision
 
-- Polymarket changelog, Apr 17 2026
-- Polymarket “Migrating to CLOB V2”
+Do not fund the existing Python whale-pair runner as the final production engine.
 
-Note: the migration guide and the latest changelog disagree on the exact go-live date. The changelog is newer, so treat **April 28, 2026** as canonical until Polymarket says otherwise.
+Use it only in these roles:
 
-## Principles
+- V2 shadow validation
+- strategy comparison harness
+- ledger semantics reference
+- incident replay input
 
-1. The hot path must stay simple:
-   - market websocket
-   - in-memory state
-   - strategy decision
-   - order/cancel submission
+The funded hot path should move to a Rust execution service, with Python retained for research and support workflows.
 
-2. The bot must degrade safely:
-   - stale book detection
-   - kill switch
-   - no blocking merge/redeem path in the quote loop
+## Target rollout
 
-3. Research and live execution stay separate:
-   - Python for backtests, replay, analytics
-   - Rust for the eventual execution engine
+### Phase 0: freeze unsafe assumptions
 
-4. We do not fund live capital until:
-   - the shadow system is stable
-   - telemetry says the environment is healthy
-   - V2 compatibility is verified
+Before any live funding:
 
-## Target Architecture
+- no new V1-only runtime work
+- no new USDC.e-only collateral assumptions in live docs
+- no new deployment steps that assume Python is the permanent hot path
 
-### Phase 0: Current state
+Exit:
 
-- `main` contains the whale-pair dry-run stack
-- us-east-1 primary host runs `scripts/whale_pair_live_bot.py` in dry-run
-- ledger is local SQLite
-- deployment is Docker Compose
-- current client stack still depends on legacy `py-clob-client`
+- docs/specs approved
 
-This is a shadow system, not a funded strategy.
+### Phase 1: Python shadow on CLOB V2
 
-### Phase 1: Lean production shadow stack
+Objective:
 
-One primary node in `us-east-1`:
+- prove the repo can observe and reason against V2 before rewriting the hot path
 
-- `whale-pair-live` container
-- local SQLite ledger
-- structured JSON-ish logs via Docker
-- health checks via `scripts/deploy/whale-pair/health.sh`
-- daily backup of `/opt/polymarket-agent/data`
+Required work:
 
-One passive standby node in the same region:
+- replace V1 SDK usage in the Python live path with a V2 adapter
+- validate:
+  - market WS subscription behavior
+  - user WS events
+  - `/book` fallback behavior
+  - order create/cancel/status semantics in shadow or smallest safe live test
+- keep `--execute` disabled for the whale-pair runner until collateral flow is reworked
 
-- same code
-- same dry-run mode
-- same market subscriptions
-- no trading
+Exit:
 
-### Phase 2: V2-compatible execution path
+- whale-pair shadow runs cleanly on `clob-v2.polymarket.com`
 
-Replace the legacy client surface with a V2-capable path:
+### Phase 2: collateral and settlement readiness
 
-1. **Client / API layer**
-   - move from `py-clob-client` to `py-clob-client-v2` or direct V2-compatible Rust client
-   - update auth/bootstrap flow if needed
-   - update order create/cancel/status calls to V2 semantics
+Objective:
 
-2. **Order model**
-   - remove V1-only assumptions around `nonce`, `feeRateBps`, `taker`
-   - handle V2 order fields: `timestamp`, `metadata`, `builder`
-   - treat fees as match-time state, not signed-order state
+- make funded trading possible in V2 terms, not V1 terms
 
-3. **Collateral / settlement**
-   - move collateral assumptions from `USDC.e` to `pUSD`
-   - audit merger/redeemer and any base-unit conversion helpers
-   - verify token ops against the new contracts before live capital
+Required work:
 
-4. **Venue cutover handling**
-   - all open orders get wiped at cutover
-   - no funded launch before this path is tested against V2
+- define pUSD funding procedure
+- implement wrap/approval flow for API-operated wallets
+- audit `clients/ctf_merger.py` and `clients/ctf_redeemer.py` against V2-era contracts and payout flow
+- update balance, funding, and P&L docs away from pure USDC.e thinking
 
-Exit criterion:
-- the shadow bot runs against V2 endpoints without legacy package assumptions
+Exit:
 
-### Phase 3: Production hot path split
+- operator can fund, wrap, verify, and reconcile pUSD-backed inventory on demand
 
-Separate components:
+### Phase 3: observability and recovery before funding
 
-1. **Execution engine**
-   - Rust
-   - Polymarket CLOB websocket + user channel
-   - in-memory order book
-   - quote/cancel/order loop
+Objective:
 
-2. **Inventory worker**
-   - handles merge/split/redeem operations
-   - cannot block the quoting loop
+- replace log-grep-only operations with a real operating surface
 
-3. **Risk daemon**
-   - independent process
-   - exposure caps
-   - stale feed protection
-   - dead-man switch
+Required work:
 
-4. **Research / replay plane**
-   - Python
-   - historical replay
-   - wallet clustering
-   - execution feature inference
+- structured logs for whale-pair order lifecycle
+- metrics endpoint for freshness, submissions, fills, reconciliation, and disk durability
+- alerting for disconnect, stale book, repeated rejects, journal failure
+- startup reconciliation flow documented and exercised
 
-## Implementation Order
+Exit:
 
-### 1. Stabilize the current us-east shadow
+- node restart and venue disconnect are both operator-visible and rehearseable
 
-- [ ] fix health checks against actual log format and pipefail behavior
-- [ ] reduce noisy Gamma rescans / resubscriptions
-- [ ] capture shadow telemetry for at least one session:
-  - `book_age_ms`
-  - HTTP fallback rate
-  - websocket reconnect count
-  - ledger write cadence
+### Phase 4: Rust execution plane
 
-Exit criterion:
-- shadow runs cleanly for multiple hours without stale-book failures
+Objective:
 
-### 2. Lock CLOB V2 migration path
+- move live order submission off Python
 
-- [ ] replace `py-clob-client` dependency in the live path
-- [ ] audit all V1 order-shape assumptions
-- [ ] audit all collateral assumptions (`USDC.e` -> `pUSD`)
-- [ ] validate base URL / hot-swap behavior against official V2 docs
-- [ ] test against `https://clob-v2.polymarket.com`
-- [ ] document exact cutover risks and rollback posture
+Required work:
 
-Exit criterion:
-- us-east shadow is running on a V2-compatible client path
-
-### 3. Add backups and operator safety
-
-- [ ] nightly tar/rsync snapshot of `/opt/polymarket-agent/data`
-- [ ] cloud volume snapshots for the primary node
-- [ ] documented restore test
-- [ ] hard kill and soft kill runbook validation
-
-Exit criterion:
-- ledger can be restored onto a fresh machine
-
-### 4. Add monitoring and alerting
-
-Minimum:
-
-- [ ] health script from cron every minute
-- [ ] alert on non-zero exit
-- [ ] alert on no recent logs
-- [ ] alert on stale ledger
-- [ ] alert on stale book or repeated HTTP fallback
-
-Preferred:
-
-- [ ] node exporter + Prometheus
-- [ ] Grafana dashboard
-- [ ] Telegram/Discord alert hook
-
-Exit criterion:
-- operator is notified on disconnect, stale feed, or failed container
-
-### 5. Stand up passive standby
-
-- [ ] duplicate the us-east primary
-- [ ] run dry-run only
-- [ ] validate shadow equivalence against the primary
-- [ ] document failover procedure
-
-Exit criterion:
-- standby can take over in one command
-
-### 6. Build Rust execution engine
-
-Scope:
-
-- market websocket ingestion
-- user websocket ingestion
-- in-memory per-market state
-- order/cancel/replace loop
-- heartbeat / stale-order protection
-- API auth lifecycle
+- Rust CLOB V2 client integration
+- in-memory book state
+- user WS-driven fill state
+- local durable execution journal
+- pair order lifecycle manager
 
 Python remains responsible for:
 
 - research
-- reporting
+- analytics
 - replay
-- non-hot-path analysis
+- shadow comparison
+- reporting
 
-Exit criterion:
-- Rust engine can shadow the Python dry-run decisions without trading
+Exit:
 
-### 7. Move merge/split/redeem off the hot path
+- Rust service can run in shadow and match Python decisions closely enough for promotion review
 
-- [ ] separate worker for token ops
-- [ ] queue intents from the execution engine
-- [ ] make merge/redeem idempotent and restart-safe
-- [ ] expose inventory state to the risk daemon
+### Phase 5: standby and promotion
 
-Exit criterion:
-- quoting continues even if token ops lag
+Objective:
 
-### 8. Re-validate strategy economics on actual shadow telemetry
+- tolerate host loss without improvisation
 
-- [ ] feed real `book_age_ms`, fallback rate, and reconnect data back into replay
-- [ ] re-run execution-realism scenarios with shadow-derived latency
-- [ ] verify edge survives V2 fee/collateral assumptions
-- [ ] confirm whether maker behavior is required
+Required work:
 
-Exit criterion:
-- paper/shadow economics are still positive under observed conditions
+- passive standby host in same metro/region class
+- remote lease/control state
+- promotion runbook
+- reconciliation gate on promotion
 
-### 9. Promote to tiny funded live
+Exit:
 
-Preconditions:
+- standby can be promoted without split-brain risk
 
-- [ ] us-east primary stable
-- [ ] standby stable
-- [ ] V2 compatibility acceptable
-- [ ] Rust or equivalent execution path ready
-- [ ] telemetry reviewed
-- [ ] separate funded wallet/proxy prepared
+## Monitoring specification for whale-pair
 
-Initial live constraints:
+The current `health.sh` is a starting point, not the final design.
 
-- very low gross cap
-- strict stale-book halt
-- strict order reject threshold
-- strict inventory drift threshold
+### Keep
 
-Exit criterion:
-- real fills and reconciliations match expectations before any scaling
+- container-up check
+- recent-log check
+- disk-free check
+- basic clock-drift check
 
-## Concrete Infra Deliverables
+### Add before funding
 
-### Host layer
+- machine-readable metrics endpoint
+- alert destination
+- per-order latency telemetry
+- explicit reconciliation state
+- standby role visibility
 
-- primary `us-east-1` node
-- passive standby `us-east-1` node
-- SSH keys isolated from Hetzner
-- chrony enabled
-- Docker + Compose
+Minimum whale-pair metrics:
 
-### Runtime layer
+- `whale_pair_book_age_ms{token}`
+- `whale_pair_ws_connected`
+- `whale_pair_http_fallback_total`
+- `whale_pair_decision_total{reason}`
+- `whale_pair_order_submit_total{status}`
+- `whale_pair_fill_confirm_latency_ms`
+- `whale_pair_merge_total{status}`
+- `whale_pair_reconcile_dirty`
+- `whale_pair_open_lots`
+- `whale_pair_role`
 
-- `whale-pair-live` compose stack
-- dry-run env
-- live env template
-- kill scripts
-- health scripts
-- V2-compatible client package / runtime
+## Standby specification
 
-### Data layer
+### Initial mode
 
-- local SQLite ledger
-- daily backup
-- snapshot retention policy
-- replayable market-state capture
-- cutover-safe migration notes for wiped open orders
+Passive standby only.
 
-### Monitoring layer
+Behavior:
 
-- health checks
-- alert transport
-- log retention
-- key metrics:
-  - websocket age
-  - HTTP fallback rate
-  - decision-to-submit time
-  - order reject rate
-  - inventory drift
+- runs subscriptions
+- computes shadow decisions
+- persists its own journal
+- never submits while passive
 
-## Budget
+### Promotion rules
 
-Target spend for the first serious version:
+Promotion must require:
 
-- primary us-east node
-- passive standby
-- storage/snapshots
-- lightweight monitoring
+1. primary declared unavailable
+2. leader lease transferred
+3. startup reconciliation completed
+4. operator acknowledgement
 
-Expected band:
+Automatic active/active is out of scope for this repo version.
 
-- roughly `$120–$220/month`
+## Recovery specification
 
-Do not add:
+Every restart must run:
 
-- managed Kubernetes
-- distributed databases in the hot path
-- GPU nodes
-- multi-region active/active
+1. local journal load
+2. venue auth/bootstrap
+3. balance/open-order/position fetch
+4. comparison with local ledger
+5. explicit clean/dirty status
+6. only then enable submissions
 
-until the strategy has proven itself.
+Special recovery cases that must be tested:
 
-## Known Open Risks
+- process kill during partial fill
+- host restart during open pair inventory
+- venue WS disconnect with HTTP fallback
+- CLOB V2 cutover with order wipe
 
-1. current deploy still uses legacy `py-clob-client` semantics
-2. CLOB V2 cutover wipes all open orders and changes collateral/order model
-3. current Python hot path is not the final production engine
-4. websocket telemetry is present, but operational dashboards are still thin
-5. current scanner/book subscription path is still noisier than it should be
+## Ordered blockers
 
-## Immediate Next Actions
+1. `clients/polymarket.py` is still V1-locked and blocks all live V2 execution.
+2. `config.py` and settlement helpers are still USDC.e-centric, while funded V2 trading is pUSD-centric.
+3. Whale-pair live deploy scripts assume container/process health but not venue reconciliation health.
+4. There is no Rust execution plane yet; Python still owns the hot path.
+5. There is no control plane or safe promotion mechanism for standby.
+6. Monitoring is not yet strong enough for unattended funded operation.
 
-1. get the us-east shadow green
-2. patch health/telemetry mismatches
-3. migrate the shadow path off legacy `py-clob-client`
-4. add backup + alerting
-5. provision passive standby
-6. start Rust execution implementation
+## Concrete next outputs
+
+1. V2 adapter design for `PolymarketClient`
+2. pUSD funding and settlement implementation spec
+3. Rust execution service skeleton and interface contract
+4. whale-pair metrics and alert schema
+5. standby promotion runbook
+

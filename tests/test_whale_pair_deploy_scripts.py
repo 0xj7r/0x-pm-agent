@@ -8,7 +8,9 @@ script ergonomics, and compose-file shape.
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -19,6 +21,10 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPLOY_DIR = REPO_ROOT / "scripts" / "deploy" / "whale-pair"
 DOC_PATH = REPO_ROOT / "docs" / "deploy" / "whale-pair-dublin.md"
+BACKUP_DOC_PATH = REPO_ROOT / "docs" / "deploy" / "whale-pair-backup-recovery.md"
+STANDBY_DOC_PATH = REPO_ROOT / "docs" / "deploy" / "whale-pair-standby.md"
+MONITOR_DOC_PATH = REPO_ROOT / "docs" / "deploy" / "whale-pair-monitoring.md"
+OPS_DIR = REPO_ROOT / "ops"
 
 EXPECTED_SCRIPTS = [
     "check_env.sh",
@@ -26,6 +32,18 @@ EXPECTED_SCRIPTS = [
     "start.sh",
     "health.sh",
     "kill.sh",
+    "backup_data.sh",
+    "restore_data.sh",
+    "standby_bootstrap.sh",
+    "standby_status.sh",
+]
+
+EXPECTED_MONITORING_SCRIPTS = [
+    "start_monitoring.sh",
+    "stop_monitoring.sh",
+    "refresh_monitoring_metrics.sh",
+    "install_monitoring_cron.sh",
+    "monitoring_health.sh",
 ]
 
 VALID_FUNDER = "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
@@ -67,6 +85,10 @@ class TestDeployDirectoryLayout:
         assert "rollback" in text.lower()
         assert "dry-run" in text.lower()
 
+    def test_backup_and_standby_docs_exist(self) -> None:
+        assert BACKUP_DOC_PATH.is_file(), f"missing backup doc: {BACKUP_DOC_PATH}"
+        assert STANDBY_DOC_PATH.is_file(), f"missing standby doc: {STANDBY_DOC_PATH}"
+
     @pytest.mark.parametrize("name", EXPECTED_SCRIPTS)
     def test_script_present_and_executable(self, name: str) -> None:
         path = DEPLOY_DIR / name
@@ -74,9 +96,25 @@ class TestDeployDirectoryLayout:
         mode = path.stat().st_mode
         assert mode & stat.S_IXUSR, f"{path} is not executable"
 
+    @pytest.mark.parametrize("name", EXPECTED_MONITORING_SCRIPTS)
+    def test_monitoring_script_present_and_executable(self, name: str) -> None:
+        path = DEPLOY_DIR / name
+        assert path.is_file(), f"missing monitoring script: {path}"
+        mode = path.stat().st_mode
+        assert mode & stat.S_IXUSR, f"{path} is not executable"
+
     def test_compose_file_present(self) -> None:
         compose = DEPLOY_DIR / "docker-compose.whale-pair.yml"
         assert compose.is_file()
+
+    def test_monitoring_doc_exists_and_mentions_stack(self) -> None:
+        assert MONITOR_DOC_PATH.is_file(), f"missing monitoring doc: {MONITOR_DOC_PATH}"
+        text = MONITOR_DOC_PATH.read_text()
+        assert "Prometheus" in text
+        assert "Grafana" in text
+        assert "cron" in text.lower()
+        assert "alert" in text.lower()
+        assert "start_monitoring.sh" in text
 
 
 class TestComposeFile:
@@ -134,6 +172,80 @@ class TestComposeFile:
         assert "whale-pair-live" not in services, (
             "whale-pair-live must stay out of the Hetzner root docker-compose.yml"
         )
+
+
+class TestMonitoringComposeFile:
+    def _load(self) -> dict:
+        compose = DEPLOY_DIR / "docker-compose.monitoring.whale-pair.yml"
+        assert compose.is_file(), f"missing monitoring compose file: {compose}"
+        with compose.open() as fh:
+            return yaml.safe_load(fh)
+
+    def test_contains_monitoring_services(self) -> None:
+        data = self._load()
+        services = data.get("services", {})
+        for name in ("prometheus", "grafana", "node-exporter", "cadvisor"):
+            assert name in services
+
+    def test_prometheus_mounts_repo_config_and_rules(self) -> None:
+        svc = self._load()["services"]["prometheus"]
+        volumes = svc.get("volumes", [])
+        assert any("ops/prometheus/prometheus.whale-pair.yml" in item for item in volumes)
+        assert any("ops/prometheus/rules" in item for item in volumes)
+
+    def test_grafana_mounts_provisioning_and_dashboards(self) -> None:
+        svc = self._load()["services"]["grafana"]
+        volumes = svc.get("volumes", [])
+        assert any("ops/grafana/provisioning" in item for item in volumes)
+        assert any("ops/grafana/dashboards" in item for item in volumes)
+
+    def test_binds_only_loopback_by_default(self) -> None:
+        data = self._load()
+        prom_ports = data["services"]["prometheus"].get("ports", [])
+        grafana_ports = data["services"]["grafana"].get("ports", [])
+        assert any("127.0.0.1" in port for port in prom_ports)
+        assert any("127.0.0.1" in port for port in grafana_ports)
+
+
+class TestMonitoringOpsFiles:
+    def test_prometheus_config_exists_and_scrapes_targets(self) -> None:
+        path = OPS_DIR / "prometheus" / "prometheus.whale-pair.yml"
+        assert path.is_file()
+        data = yaml.safe_load(path.read_text())
+        jobs = {job["job_name"] for job in data.get("scrape_configs", [])}
+        assert {"prometheus", "node-exporter", "cadvisor"} <= jobs
+        assert data.get("rule_files"), "prometheus config must load alert rules"
+
+    def test_alert_rules_exist_for_key_failures(self) -> None:
+        path = OPS_DIR / "prometheus" / "rules" / "whale-pair-alerts.yml"
+        assert path.is_file()
+        data = yaml.safe_load(path.read_text())
+        alerts = {
+            rule["alert"]
+            for group in data.get("groups", [])
+            for rule in group.get("rules", [])
+            if "alert" in rule
+        }
+        assert "WhalePairServiceDown" in alerts
+        assert "WhalePairBookAgeStale" in alerts
+        assert "WhalePairLedgerStale" in alerts
+
+    def test_grafana_datasource_and_dashboard_provisioning_exist(self) -> None:
+        ds = OPS_DIR / "grafana" / "provisioning" / "datasources" / "prometheus.yml"
+        dashboards = OPS_DIR / "grafana" / "provisioning" / "dashboards" / "dashboards.yml"
+        dashboard_json = OPS_DIR / "grafana" / "dashboards" / "whale-pair-overview.json"
+        assert ds.is_file()
+        assert dashboards.is_file()
+        assert dashboard_json.is_file()
+
+    def test_dashboard_json_mentions_core_metrics(self) -> None:
+        path = OPS_DIR / "grafana" / "dashboards" / "whale-pair-overview.json"
+        data = json.loads(path.read_text())
+        assert data["title"] == "Whale Pair Overview"
+        blob = path.read_text()
+        assert "whale_pair_service_up" in blob
+        assert "whale_pair_service_book_age_avg_ms" in blob
+        assert "whale_pair_service_ledger_age_seconds" in blob
 
 
 class TestCheckEnv:
@@ -224,6 +336,133 @@ class TestScriptUsage:
         )
         assert result.returncode != 0
 
+    @pytest.mark.parametrize("name", ["backup_data.sh", "restore_data.sh", "standby_bootstrap.sh"])
+    def test_usage_scripts_print_help(self, name: str) -> None:
+        result = subprocess.run(
+            ["bash", str(DEPLOY_DIR / name), "--help"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert "Usage" in result.stdout + result.stderr
+
+
+class TestBackupAndStandbyHelpers:
+    def test_backup_data_creates_archive_manifest_and_checksum(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "notes.txt").write_text("backup hello\n")
+        conn = sqlite3.connect(str(data_dir / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('row-1')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        result = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+                "--keep",
+                "2",
+                "--name",
+                "pytest",
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(data_dir)},
+        )
+        assert result.returncode == 0, result.stderr
+
+        archives = list(backups_dir.glob("whale-pair-data-*.tar.gz"))
+        manifests = list(backups_dir.glob("whale-pair-data-*.manifest.json"))
+        checksums = list(backups_dir.glob("whale-pair-data-*.sha256"))
+        assert len(archives) == len(manifests) == len(checksums) == 1
+        assert "db count: 1" in result.stdout
+
+    def test_restore_data_restores_latest_archive(self, tmp_path: Path) -> None:
+        source_data = tmp_path / "source-data"
+        source_data.mkdir()
+        (source_data / "notes.txt").write_text("restored hello\n")
+        conn = sqlite3.connect(str(source_data / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('restored-row')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        backup = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+                "--keep",
+                "2",
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(source_data)},
+        )
+        assert backup.returncode == 0, backup.stderr
+
+        target_data = tmp_path / "target-data"
+        target_data.mkdir()
+        (target_data / "old.txt").write_text("old\n")
+
+        restore = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "restore_data.sh"),
+                "--latest",
+                "--backup-dir",
+                str(backups_dir),
+                "--target",
+                str(target_data),
+                "--force",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert restore.returncode == 0, restore.stderr
+        assert (target_data / "notes.txt").read_text() == "restored hello\n"
+
+        conn = sqlite3.connect(str(target_data / "whale_pair_live.db"))
+        row = conn.execute("SELECT note FROM events").fetchone()
+        conn.close()
+        assert row == ("restored-row",)
+
+    def test_standby_bootstrap_writes_role_file_without_starting(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "standby-data"
+        data_dir.mkdir()
+        env_file = _write_env(tmp_path, POLYMARKET_SIGNATURE_TYPE="0", POLYMARKET_FUNDER="")
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "standby_bootstrap.sh"),
+                "--primary",
+                "pytest-primary",
+                "--no-start",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(data_dir),
+                "BACKUP_DIR": str(data_dir / "backups"),
+                "ENV_FILE": str(env_file),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        role_file = data_dir / "whale_pair_standby.role"
+        assert role_file.is_file()
+        text = role_file.read_text()
+        assert "role=passive-standby" in text
+        assert "primary=pytest-primary" in text
+
 
 class TestDocContract:
     """The spec doc is part of the deployment artifact. These assertions keep
@@ -255,3 +494,18 @@ class TestDocContract:
         # The spec must call out the still-unknown operator inputs.
         assert "still" in text or "unknown" in text
         assert "private key" in text or "wallet" in text
+
+    def test_backup_doc_mentions_restore_and_data_dir(self) -> None:
+        text = BACKUP_DOC_PATH.read_text().lower()
+        assert "/opt/polymarket-agent/data" in text
+        assert "backup_data.sh" in text
+        assert "restore_data.sh" in text
+        assert "--force" in text
+        assert "standby" in text
+
+    def test_standby_doc_mentions_bootstrap_status_and_promotion(self) -> None:
+        text = STANDBY_DOC_PATH.read_text().lower()
+        assert "standby_bootstrap.sh" in text
+        assert "standby_status.sh" in text
+        assert "dry-run" in text
+        assert "--live" in text

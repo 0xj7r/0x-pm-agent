@@ -82,6 +82,27 @@ async def test_find_active_windows():
     assert windows[0].up_token_id == "tok_up"
 
 
+@pytest.mark.asyncio
+async def test_find_active_windows_uses_short_lived_cache():
+    ts = int(datetime(2026, 4, 1, 12, 30, tzinfo=timezone.utc).timestamp())
+    event = _make_event(ts)
+
+    scanner = MarketWindowScanner(windows_cache_ttl_seconds=60.0)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = [event]
+    scanner._http.get = AsyncMock(return_value=mock_resp)
+
+    with patch.object(scanner, "_generate_candidate_slugs", return_value=[f"btc-updown-5m-{ts}"]):
+        first = await scanner.find_active_windows()
+        second = await scanner.find_active_windows()
+
+    assert len(first) == 1
+    assert len(second) == 1
+    scanner._http.get.assert_awaited_once()
+    assert scanner.last_scan_stats()["cache_hit"] is True
+
+
 def test_parse_price_to_beat_from_page_html():
     scanner = MarketWindowScanner()
     window = MarketWindow(
