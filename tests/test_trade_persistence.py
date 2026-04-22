@@ -18,6 +18,10 @@ def test_record_entry_assigns_stable_id_and_resolution_reuses_it():
         "shares": 23.809523,
         "btc_price": 68000.0,
         "move_pct": 0.08,
+        "book_snapshot": {"selected": {"token_id": "tok-1"}},
+        "btc_volume_60s": 15.0,
+        "fee_bps_ceiling": 10,
+        "fill_details": {"status": "matched", "filled_shares": 23.809523},
         "strategy": "threshold",
         "timestamp": "2026-04-07T12:00:00+00:00",
     }
@@ -48,6 +52,10 @@ def test_record_entry_respects_existing_trade_id():
         "shares": 9.090909,
         "btc_price": 2100.0,
         "move_pct": -0.07,
+        "book_snapshot": {"selected": {"token_id": "tok-2"}},
+        "btc_volume_60s": 9.0,
+        "fee_bps_ceiling": 0,
+        "fill_details": {"status": "matched", "filled_shares": 9.090909},
         "strategy": "threshold",
         "timestamp": "2026-04-07T12:05:00+00:00",
     }
