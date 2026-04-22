@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from shared.fees import taker_fee_usd
+
+WhalePairVariant = Literal["pair_recycler", "skewed_pair_builder", "passive_ladder"]
 
 
 @dataclass(frozen=True)
 class WhalePairConfig:
+    variant: WhalePairVariant = "pair_recycler"
     max_pair_cost: float = 0.99
     accumulate_price_max: float = 0.50
     aggressive_price_max: float = 0.10
     base_clip_usd: float = 10.0
     aggressive_clip_usd: float = 25.0
+    base_clip_shares: float | None = None
+    aggressive_clip_shares: float | None = None
     max_gross_cost_usd: float = 200.0
     min_seconds_from_start: int = 10
     max_seconds_from_start: int = 298
@@ -105,6 +111,22 @@ def choose_accumulate_clip_usd(price: float, cfg: WhalePairConfig) -> float | No
     return None
 
 
+def choose_clip_shares(price: float, cfg: WhalePairConfig) -> float | None:
+    if cfg.variant != "passive_ladder" or price <= 0:
+        return None
+    if price <= cfg.aggressive_price_max:
+        return cfg.aggressive_clip_shares or 100.0
+    if price <= cfg.accumulate_price_max:
+        return cfg.base_clip_shares or 25.0
+    return cfg.base_clip_shares or 25.0
+
+
+def choose_pair_clip_shares(cfg: WhalePairConfig) -> float | None:
+    if cfg.variant != "passive_ladder":
+        return None
+    return cfg.aggressive_clip_shares or 100.0
+
+
 def maybe_decide_pair_fill(
     *,
     up_top: BookTop,
@@ -120,13 +142,22 @@ def maybe_decide_pair_fill(
         return None
 
     cheaper = min(up_top.ask, down_top.ask)
-    clip_usd = choose_accumulate_clip_usd(cheaper, cfg) or cfg.base_clip_usd
-    target_pair_cost = min(clip_usd, remaining_budget)
-    shares = min(
-        up_top.ask_size,
-        down_top.ask_size,
-        target_pair_cost / pair_cost if pair_cost > 0 else 0.0,
-    )
+    pair_clip_shares = choose_pair_clip_shares(cfg)
+    if pair_clip_shares is not None:
+        shares = min(
+            up_top.ask_size,
+            down_top.ask_size,
+            pair_clip_shares,
+            remaining_budget / pair_cost if pair_cost > 0 else 0.0,
+        )
+    else:
+        clip_usd = choose_accumulate_clip_usd(cheaper, cfg) or cfg.base_clip_usd
+        target_pair_cost = min(clip_usd, remaining_budget)
+        shares = min(
+            up_top.ask_size,
+            down_top.ask_size,
+            target_pair_cost / pair_cost if pair_cost > 0 else 0.0,
+        )
     if shares <= 0:
         return None
 
@@ -167,6 +198,25 @@ def choose_fill_shares(price: float, ask_size: float, clip_usd: float, remaining
     return min(ask_size, clip_usd / price, remaining_budget_usd / price)
 
 
+def choose_fill_shares_variant(
+    *,
+    price: float,
+    ask_size: float,
+    clip_usd: float,
+    remaining_budget_usd: float,
+    clip_shares: float | None,
+) -> float:
+    shares = choose_fill_shares(
+        price=price,
+        ask_size=ask_size,
+        clip_usd=clip_usd,
+        remaining_budget_usd=remaining_budget_usd,
+    )
+    if clip_shares is None or shares <= 0:
+        return shares
+    return min(shares, ask_size, clip_shares)
+
+
 def maybe_decide_fill(
     *,
     side: str,
@@ -182,9 +232,11 @@ def maybe_decide_fill(
         return None
 
     clip_usd = choose_accumulate_clip_usd(top.ask, cfg)
+    clip_shares = choose_clip_shares(top.ask, cfg)
     reason = None
     if clip_usd is not None and allow_accumulate:
-        projected_same = same_inventory.shares_remaining + (clip_usd / max(top.ask, 1e-9))
+        projected_increment = clip_shares if clip_shares is not None else (clip_usd / max(top.ask, 1e-9))
+        projected_same = same_inventory.shares_remaining + projected_increment
         projected_opp = max(opposite_inventory.shares_remaining, 1e-9)
         if opposite_inventory.shares_remaining > 0 and projected_same / projected_opp > cfg.max_imbalance_ratio:
             return None
@@ -203,11 +255,12 @@ def maybe_decide_fill(
         else:
             return None
 
-    shares = choose_fill_shares(
+    shares = choose_fill_shares_variant(
         price=top.ask,
         ask_size=top.ask_size,
         clip_usd=clip_usd or 0.0,
         remaining_budget_usd=remaining_budget,
+        clip_shares=clip_shares,
     )
     if shares <= 0:
         return None
