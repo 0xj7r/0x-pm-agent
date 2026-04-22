@@ -19,11 +19,21 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 COMPOSE_FILE="$REPO_ROOT/scripts/deploy/whale-pair/docker-compose.whale-pair.yml"
-ENV_FILE="$REPO_ROOT/.env"
+ENV_FILE="${ENV_FILE:-$REPO_ROOT/.env}"
+DATA_DIR="${DATA_DIR:-$REPO_ROOT/data}"
+ROLE_FILE="${ROLE_FILE:-$DATA_DIR/whale_pair_standby.role}"
 
 if [ ! -f "$COMPOSE_FILE" ]; then
     echo "ERROR: compose file not found: $COMPOSE_FILE" >&2
     exit 2
+fi
+
+if [ "$MODE" = "--live" ] && [ -f "$ROLE_FILE" ]; then
+    ROLE_VALUE="$(grep -E '^role=' "$ROLE_FILE" | head -1 | cut -d= -f2-)"
+    if [ "$ROLE_VALUE" = "passive-standby" ] && [ "${WHALE_PAIR_ALLOW_STANDBY_PROMOTION:-0}" != "1" ]; then
+        echo "ERROR: $ROLE_FILE marks this host as passive-standby; use promote_standby.sh for live failover" >&2
+        exit 65
+    fi
 fi
 
 if [ ! -f "$ENV_FILE" ]; then

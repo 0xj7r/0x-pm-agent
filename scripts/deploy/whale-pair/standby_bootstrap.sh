@@ -29,6 +29,7 @@ RESTORE_LATEST=0
 NO_START=0
 SKIP_ENV_CHECK=0
 PRIMARY_LABEL="${PRIMARY_LABEL:-unknown-primary}"
+RESTORE_MODE="none"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -76,11 +77,13 @@ if [ "$SKIP_ENV_CHECK" -ne 1 ]; then
 fi
 
 if [ -n "$RESTORE_ARCHIVE" ]; then
+    RESTORE_MODE="archive"
     bash "$REPO_ROOT/scripts/deploy/whale-pair/restore_data.sh" \
         "$RESTORE_ARCHIVE" \
         --target "$DATA_DIR" \
         --force
 elif [ "$RESTORE_LATEST" -eq 1 ]; then
+    RESTORE_MODE="latest"
     bash "$REPO_ROOT/scripts/deploy/whale-pair/restore_data.sh" \
         --latest \
         --backup-dir "$BACKUP_DIR" \
@@ -89,16 +92,27 @@ elif [ "$RESTORE_LATEST" -eq 1 ]; then
 fi
 
 ROLE_FILE="$DATA_DIR/whale_pair_standby.role"
+RESTORE_META="$DATA_DIR/whale_pair_restore.meta"
+RESTORED_ARCHIVE=""
+if [ -f "$RESTORE_META" ]; then
+    RESTORED_ARCHIVE="$(grep -E '^archive_basename=' "$RESTORE_META" | head -1 | cut -d= -f2-)"
+fi
 cat >"$ROLE_FILE" <<EOF
 role=passive-standby
 primary=$PRIMARY_LABEL
 bootstrapped_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 repo_root=$REPO_ROOT
 data_dir=$DATA_DIR
+restore_mode=$RESTORE_MODE
+restore_meta=$RESTORE_META
+restored_archive=${RESTORED_ARCHIVE:-}
 EOF
 chmod 0640 "$ROLE_FILE" || true
 
 echo "Standby role marker written: $ROLE_FILE"
+if [ -f "$RESTORE_META" ]; then
+    echo "Restore metadata present: $RESTORE_META"
+fi
 
 if [ "$NO_START" -eq 0 ]; then
     bash "$REPO_ROOT/scripts/deploy/whale-pair/start.sh" --dry-run

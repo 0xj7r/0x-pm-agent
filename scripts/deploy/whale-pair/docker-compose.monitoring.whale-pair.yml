@@ -1,4 +1,17 @@
 services:
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    container_name: whale-pair-alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "${WHALE_PAIR_ALERTMANAGER_BIND:-127.0.0.1}:${WHALE_PAIR_ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - ../../../data/monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ../../../data/monitoring/alertmanager/data:/alertmanager
+
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: whale-pair-prometheus
@@ -14,6 +27,7 @@ services:
       - ../../../ops/prometheus/rules:/etc/prometheus/rules:ro
       - ../../../data/monitoring/prometheus:/prometheus
     depends_on:
+      - alertmanager
       - node-exporter
       - cadvisor
 

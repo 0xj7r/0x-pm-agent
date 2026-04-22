@@ -110,6 +110,7 @@ What is still unknown and must be supplied by the operator before deployment:
 5. **Starting capital and per-shift caps**. The defaults above (`--base-clip-usd=50`, `--max-gross-cost-usd=1000`) are from the script. Operator must confirm starting caps for the first live shift and override via flags.
 6. **Monitoring/alert destination**. Where do `docker logs` stream? Where do health-check failures page? Default in this spec is stdout + manual inspection; wire to Loki/Grafana or similar before the bot is left unattended.
 7. **Backup cadence for `data/whale_pair_live.db`**. Default proposal: nightly `rsync` to a second host. Operator must confirm.
+8. **Failover operator path**. Promotion should run through `promote_standby.sh`, not raw `start.sh --live`, so split-brain guardrails stay intact.
 
 ## 6. Runbook
 
@@ -158,6 +159,8 @@ Red flags that block promotion to `--execute`:
 ```
 
 Adds `--execute` to the bot command. Starts with reduced size flags for the first shift (edit `docker-compose.whale-pair.yml` or pass through the start script's `--base-clip-usd` arg, which defaults to a conservative `10.0` for the first live shift).
+
+On a passive standby host, direct `start.sh --live` is intentionally blocked. Use `promote_standby.sh --confirm-primary-stopped` after standby status and health checks pass.
 
 ### 6.4 Health checks
 
@@ -252,5 +255,8 @@ Do **not** attempt to run the whale-pair bot on the Hetzner host as a rollback. 
 - `scripts/deploy/whale-pair/start.sh`
 - `scripts/deploy/whale-pair/health.sh`
 - `scripts/deploy/whale-pair/kill.sh`
+- `scripts/deploy/whale-pair/replicate_backup.sh`
+- `scripts/deploy/whale-pair/install_backup_replication_cron.sh`
+- `scripts/deploy/whale-pair/promote_standby.sh`
 - `scripts/deploy/whale-pair/docker-compose.whale-pair.yml` (template, copied to host during provisioning)
 - `tests/test_whale_pair_deploy_scripts.py` (script-level sanity tests)

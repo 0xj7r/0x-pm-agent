@@ -140,11 +140,13 @@ impl UserWsClient {
         debug!(
             event_type,
             status,
-            order_id = event.get("id").and_then(Value::as_str),
-            taker_order_id = event.get("taker_order_id").and_then(Value::as_str),
-            market = event.get("market").and_then(Value::as_str),
-            asset_id = event.get("asset_id").and_then(Value::as_str),
-            side = event.get("side").and_then(Value::as_str),
+            order_id = event.get("id").and_then(|value| value.as_str()),
+            taker_order_id = event
+                .get("taker_order_id")
+                .and_then(|value| value.as_str()),
+            market = event.get("market").and_then(|value| value.as_str()),
+            asset_id = event.get("asset_id").and_then(|value| value.as_str()),
+            side = event.get("side").and_then(|value| value.as_str()),
             price = event.get("price").and_then(value_as_f64_opt),
             size = event
                 .get("size")

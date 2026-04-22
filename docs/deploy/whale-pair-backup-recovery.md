@@ -34,6 +34,8 @@ Those are rebuilt from the repo and operator secrets. Recovery is therefore:
 ## Backup Artifact
 
 Script: [scripts/deploy/whale-pair/backup_data.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/backup_data.sh)
+Replication helper: [scripts/deploy/whale-pair/replicate_backup.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/replicate_backup.sh)  
+Cron installer: [scripts/deploy/whale-pair/install_backup_replication_cron.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/install_backup_replication_cron.sh)
 
 Default output:
 
@@ -46,6 +48,7 @@ Behavior:
 - snapshots SQLite files with `sqlite3 .backup` when available
 - excludes `data/backups/` from the archive payload
 - keeps the newest 7 archives by default
+- can invoke a replication hook immediately after the local backup succeeds
 
 ## Primary Backup Commands
 
@@ -77,10 +80,26 @@ object storage.
 Example push to the standby:
 
 ```bash
-PRIMARY=/opt/polymarket-agent/data/backups
-STANDBY=deploy@us-east-standby:/opt/polymarket-agent/data/backups/
-LATEST="$(find "$PRIMARY" -maxdepth 1 -type f -name 'whale-pair-data-*.tar.gz' | sort | tail -1)"
-rsync -az "$LATEST" "$LATEST.sha256" "$LATEST.manifest.json" "$STANDBY"
+cd /opt/polymarket-agent
+bash scripts/deploy/whale-pair/replicate_backup.sh --latest --dest deploy@us-east-standby:/opt/polymarket-agent/data/backups/
+```
+
+To couple backup creation with immediate replication:
+
+```bash
+cd /opt/polymarket-agent
+BACKUP_REPLICA_DEST=deploy@us-east-standby:/opt/polymarket-agent/data/backups/ \
+  bash scripts/deploy/whale-pair/backup_data.sh \
+    --keep 14 \
+    --replicate-hook scripts/deploy/whale-pair/replicate_backup.sh
+```
+
+To install a recurring nightly backup + replication cron:
+
+```bash
+cd /opt/polymarket-agent
+bash scripts/deploy/whale-pair/install_backup_replication_cron.sh \
+  --dest deploy@us-east-standby:/opt/polymarket-agent/data/backups/
 ```
 
 ## Restore Script
@@ -106,6 +125,8 @@ Behavior:
 - refuses to overwrite a non-empty target unless `--force` is supplied
 - moves the existing target aside to `data.pre-restore.<utc>`
 - restores the archived `data/` tree into the target dir
+- verifies the sibling `.sha256` file when present
+- writes `whale_pair_restore.meta` into the restored target for standby status and failover guardrails
 
 ## Recovery Procedure: Fresh Host
 
@@ -167,7 +188,7 @@ bash scripts/deploy/whale-pair/health.sh
 4. Promote standby manually:
 
 ```bash
-bash scripts/deploy/whale-pair/start.sh --live
+bash scripts/deploy/whale-pair/promote_standby.sh --confirm-primary-stopped
 ```
 
 5. Record the promotion time in the incident log and take a fresh backup after the first stable cycle.
