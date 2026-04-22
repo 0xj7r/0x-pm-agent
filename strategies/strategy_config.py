@@ -63,6 +63,10 @@ class RiskConfig:
     take_profit_min_unrealized_usd: float = 0.0
     take_profit_exit_slippage_usd: float = 0.005
     take_profit_order_timeout_seconds: int = 20
+    # Skip take-profit trigger if the current window has < this many seconds
+    # remaining. Late-window sells give up 1-5¢/share vs holding to $1 at
+    # resolution, with no meaningful reversal risk to capture. 0 disables.
+    take_profit_min_seconds_remaining: float = 0.0
     # Optional early-exit logic (SELL to cut losses before resolution).
     stop_loss_enabled: bool = False
     stop_loss_best_bid_threshold: float = 0.15

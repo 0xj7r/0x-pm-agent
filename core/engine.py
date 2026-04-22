@@ -1253,6 +1253,12 @@ class BTCTradingEngine:
         exit_slip = float(getattr(self.cfg.risk, "take_profit_exit_slippage_usd", 0.005))
         timeout_s = float(getattr(self.cfg.risk, "take_profit_order_timeout_seconds", 20))
         min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
+        # Closes #23: don't fire in last N seconds before window close. When
+        # <60s remain, the winning side is already decided; selling at 95-99c
+        # costs us 1-5c/share vs holding to $1 at resolution with no real
+        # reversal risk. Effective only when >= 0; set to 0 to preserve
+        # previous behavior.
+        min_seconds_remaining = float(getattr(self.cfg.risk, "take_profit_min_seconds_remaining", 0.0))
 
         # We only ever have a handful of open positions; linear scan is fine.
         for t in list(self._paper_trades):
@@ -1261,6 +1267,16 @@ class BTCTradingEngine:
             token_id = t.get("token_id")
             if not token_id:
                 continue
+            # Window-timing gate: skip if too close to resolution.
+            if min_seconds_remaining > 0 and self.current_window is not None:
+                end = getattr(self.current_window, "end_time", None)
+                if end is not None:
+                    try:
+                        secs_remaining = (end - datetime.now(timezone.utc)).total_seconds()
+                    except Exception:
+                        secs_remaining = min_seconds_remaining
+                    if secs_remaining < min_seconds_remaining:
+                        continue
             book = self.poly_ws.get_book(token_id)
             if book is None or book.best_bid <= 0:
                 continue
