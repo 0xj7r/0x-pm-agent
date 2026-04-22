@@ -102,6 +102,8 @@ class MarketWindow:
     down_price: float = 0.5
     slug: str = ""
     price_to_beat: float | None = None
+    condition_id: str = ""
+    event_id: str = ""
 
     def time_remaining(self, now: datetime) -> float:
         return max(0.0, (self.end_time - now).total_seconds())
