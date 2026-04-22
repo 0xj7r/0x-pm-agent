@@ -195,10 +195,10 @@ async def test_sweep_blind_redeems_when_token_id_missing():
     })
     balances = {}
     with _patch_balances(r, balances), \
-         patch.object(r, "redeem", fake_redeem):
+        patch.object(r, "redeem", fake_redeem):
         results = await r.sweep_wallet([
             {"condition_id": COND_A},  # no token_id
-        ])
+        ], allow_blind_redeem_without_balance_check=True)
     assert len(results) == 1
     assert results[0]["status"] == "success"
     assert results[0]["condition_id"] == COND_A
@@ -216,10 +216,10 @@ async def test_sweep_blind_redeem_failure_is_recorded():
     fake_redeem = AsyncMock(side_effect=RuntimeError("rpc down"))
     balances = {}
     with _patch_balances(r, balances), \
-         patch.object(r, "redeem", fake_redeem):
+        patch.object(r, "redeem", fake_redeem):
         results = await r.sweep_wallet([
             {"condition_id": COND_A},  # no token_id
-        ])
+        ], allow_blind_redeem_without_balance_check=True)
     assert len(results) == 1
     assert results[0]["status"] == "error"
     assert "blind redeem raised" in results[0]["reason"]

@@ -83,10 +83,14 @@ def _engine_with_real_persistence(
     eng.memory = mem
     eng.persistence = persistence
     eng.risk = MagicMock()
+    eng.poly_ws = MagicMock()
+    eng.poly_ws.get_book.return_value = None
     eng._strategy = MagicMock()
     eng._strategy.name = "threshold"
     eng.current_window = _FakeWindow(window_secs_remaining)
     eng._already_traded_this_window = True
+    eng._window_submitted = True
+    eng._window_confirmed_fill = False
     eng._order_poll_interval_s = 0.01
     eng._order_fill_deadline_buffer_s = deadline_buffer
     eng._push_order_events = {}
@@ -153,11 +157,8 @@ async def test_live_order_timeout_produces_zero_entry_events():
         f"order timeout+cancel; got {len(entry_events)}"
     )
 
-    # And make sure nothing else was spuriously recorded either.
-    assert [e["event_type"] for e in events] == [], (
-        f"Unexpected events after order timeout: "
-        f"{[e['event_type'] for e in events]}"
-    )
+    # Execution telemetry is allowed; filled-position entries are not.
+    assert [e["event_type"] for e in events] == ["order_submit", "order_final"]
     mem.close()
 
 
@@ -204,7 +205,9 @@ async def test_live_order_rejection_produces_zero_entry_events():
     assert out is None
 
     events = mem.get_events_for_window("m1")
-    assert events == [], (
-        f"Rejection must not write an entry; got {len(events)} events"
+    entry_events = [e for e in events if e["event_type"] == "entry"]
+    assert entry_events == [], (
+        f"Rejection must not write an entry; got {len(entry_events)} entries"
     )
+    assert [e["event_type"] for e in events] == ["order_submit"]
     mem.close()

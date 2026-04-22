@@ -52,6 +52,9 @@ class RiskConfig:
     paper_livelike_enabled: bool = False
     paper_livelike_latency_ms: int = 150
     paper_livelike_use_best_ask_size: bool = True
+    # Live-mode attribution: record a paper shadow entry from the exact
+    # same decision context before submitting the live order.
+    paired_paper_enabled: bool = False
     # Live-mode redemption hygiene: periodically sweep for unredeemed wins.
     redeem_sweep_interval_seconds: int = 300
     redeem_blind_when_token_missing: bool = True

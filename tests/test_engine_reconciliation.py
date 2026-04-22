@@ -36,6 +36,7 @@ def _make_engine_stub(
     eng._paper_trades = [{"placeholder": i} for i in range(open_positions)]
     eng._reconcile_halt = False
     eng._drift_threshold_usd = threshold
+    eng._live_usdc_anchor = None
     return eng
 
 
@@ -85,6 +86,7 @@ async def test_no_halt_under_threshold():
         open_positions=0,
         threshold=2.0,
     )
+    eng._live_usdc_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is False
 
@@ -98,6 +100,7 @@ async def test_halts_on_drift_over_threshold():
         open_positions=0,
         threshold=2.0,
     )
+    eng._live_usdc_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is True
 
@@ -111,6 +114,7 @@ async def test_halts_on_positive_drift():
         open_positions=0,
         threshold=2.0,
     )
+    eng._live_usdc_anchor = 100.0
     await eng._reconcile_live_balance()
     assert eng._reconcile_halt is True
 

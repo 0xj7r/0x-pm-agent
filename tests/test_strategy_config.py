@@ -35,6 +35,28 @@ def test_stop_loss_defaults():
     assert cfg.risk.stop_loss_min_best_bid_size_shares == 0.0
     assert cfg.risk.stop_loss_exit_slippage_usd == 0.01
     assert cfg.risk.stop_loss_order_timeout_seconds == 20
+    assert cfg.risk.paired_paper_enabled is False
+
+
+def test_paired_paper_config_loads_from_json():
+    data = {
+        "version": 5,
+        "default_profile": "test",
+        "profiles": {
+            "test": {
+                "coins": {"btc": {"strategy": "threshold", "params": {"move": 0.08, "max_entry": 0.55}}},
+                "risk": {
+                    "paired_paper_enabled": True,
+                },
+            },
+        },
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(data, f)
+        f.flush()
+        cfg = load_strategy_config(f.name)
+
+    assert cfg.risk.paired_paper_enabled is True
 
 
 def test_stop_loss_config_loads_from_json():
