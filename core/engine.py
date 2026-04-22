@@ -232,6 +232,7 @@ class BTCTradingEngine:
         # Deque of (timestamp_sec, price). Evicted on each tick.
         from collections import deque
         self._price_history: deque[tuple[float, float]] = deque()
+        self._trade_volume_history: deque[tuple[float, float]] = deque()
         self._already_traded_this_window: bool = False
         self._window_submitted: bool = False
         self._window_confirmed_fill: bool = False
@@ -445,7 +446,14 @@ class BTCTradingEngine:
         cutoff = event_ts - 3600
         while self._price_history and self._price_history[0][0] < cutoff:
             self._price_history.popleft()
+        self._trade_volume_history.append((event_ts, update.quantity))
+        volume_cutoff = event_ts - 60
+        while self._trade_volume_history and self._trade_volume_history[0][0] < volume_cutoff:
+            self._trade_volume_history.popleft()
         self._anchor_window_open_from_history()
+
+    def _btc_volume_60s(self) -> float:
+        return float(sum(qty for _, qty in self._trade_volume_history))
 
     def _anchor_window_open_from_history(self) -> bool:
         """Set the current window open from the first Binance trade at start.
@@ -747,6 +755,8 @@ class BTCTradingEngine:
             "timestamp": decision_ts,
             "regime": regime,
             "book": book_snapshots,
+            "book_snapshot": book_snapshots,
+            "btc_volume_60s": self._btc_volume_60s(),
         }
 
         logger.info(
@@ -1111,6 +1121,7 @@ class BTCTradingEngine:
         t["order_id"] = order_id
         t["order_status"] = immediate_status or "posted"
         t["fee_rate_bps"] = result.get("fee_rate_bps")
+        t["fee_bps_ceiling"] = result.get("fee_rate_bps")
         t["submit_price"] = submit_price
         t["submit_book"] = submit_book
         original_size = float(t["shares"])
@@ -1140,6 +1151,30 @@ class BTCTradingEngine:
         if immediate_status == "matched":
             self.risk.record_order_success()
             self._window_confirmed_fill = True
+            t["fill_details"] = {
+                "order_id": order_id,
+                "status": "matched",
+                "filled_shares": original_size,
+                "original_shares": original_size,
+                "latency_ms": int((_time.time() - submit_started) * 1000),
+                "fee_bps_ceiling": t.get("fee_bps_ceiling"),
+                "submit_book": submit_book,
+                "submit_price": submit_price,
+                "response": _compact_dict(
+                    result,
+                    [
+                        "status",
+                        "fee_rate_bps",
+                        "orderID",
+                        "orderId",
+                        "id",
+                        "takingAmount",
+                        "makingAmount",
+                        "transactionHash",
+                        "transactionHashes",
+                    ],
+                ),
+            }
             logger.warning(
                 f"[LIVE] Order matched on submit: id={order_id}"
             )
@@ -1182,6 +1217,30 @@ class BTCTradingEngine:
             self._window_confirmed_fill = True
             t["order_status"] = "matched"
             t["filled_shares"] = filled
+            t["fill_details"] = {
+                "order_id": order_id,
+                "status": status,
+                "filled_shares": filled,
+                "original_shares": original_size,
+                "latency_ms": int((_time.time() - submit_started) * 1000),
+                "fee_bps_ceiling": t.get("fee_bps_ceiling"),
+                "submit_book": submit_book,
+                "submit_price": submit_price,
+                "response": _compact_dict(
+                    outcome.get("last_response") if isinstance(outcome, dict) else None,
+                    [
+                        "status",
+                        "size_matched",
+                        "sizeMatched",
+                        "price",
+                        "avgPrice",
+                        "takingAmount",
+                        "makingAmount",
+                        "transactionHash",
+                        "transactionHashes",
+                    ],
+                ),
+            }
             self.persistence.record_order_final(
                 market_id=t.get("market_id", "unknown"),
                 payload={
@@ -1214,6 +1273,30 @@ class BTCTradingEngine:
             self.risk.record_order_success()
             self._window_confirmed_fill = True
             t["filled_shares"] = filled
+            t["fill_details"] = {
+                "order_id": order_id,
+                "status": status,
+                "filled_shares": filled,
+                "original_shares": original_size,
+                "latency_ms": int((_time.time() - submit_started) * 1000),
+                "fee_bps_ceiling": t.get("fee_bps_ceiling"),
+                "submit_book": submit_book,
+                "submit_price": submit_price,
+                "response": _compact_dict(
+                    outcome.get("last_response") if isinstance(outcome, dict) else None,
+                    [
+                        "status",
+                        "size_matched",
+                        "sizeMatched",
+                        "price",
+                        "avgPrice",
+                        "takingAmount",
+                        "makingAmount",
+                        "transactionHash",
+                        "transactionHashes",
+                    ],
+                ),
+            }
             self.persistence.record_order_final(
                 market_id=t.get("market_id", "unknown"),
                 payload={
