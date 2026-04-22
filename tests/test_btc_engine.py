@@ -234,6 +234,34 @@ async def test_engine_fetches_canonical_anchor_for_active_window():
     engine.memory.close()
 
 
+def test_engine_trade_payload_includes_structured_market_anchor():
+    engine = make_engine(move_threshold=0.04, max_entry=0.55)
+    engine.current_window = make_window(up_price=0.23, down_price=0.50)
+    engine.current_window.price_to_beat = 77986.83151
+    engine._window_open_price = 77986.83151
+    engine._window_open_ts = engine.current_window.start_time.timestamp()
+    engine._window_open_source = "polymarket_price_to_beat"
+    engine._current_btc_price = 78040.0
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.23 if tid == engine.current_window.up_token_id else 0.50
+    )
+
+    trades = engine._check_entry()
+
+    assert len(trades) == 1
+    anchor = trades[0]["market_anchor"]
+    assert anchor["open_price"] == pytest.approx(77986.83151)
+    assert anchor["open_ts"] == pytest.approx(engine.current_window.start_time.timestamp())
+    assert anchor["open_lag_ms"] == 0
+    assert anchor["source"] == "polymarket_price_to_beat"
+    assert anchor["quality"] == "canonical"
+    engine.memory.close()
+
+
 def test_engine_records_entry_blocker_when_signal_side_is_above_max_entry():
     engine = make_engine(move_threshold=0.04, max_entry=0.55)
     engine.current_window = make_window(up_price=0.23, down_price=0.78)
