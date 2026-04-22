@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -44,6 +45,16 @@ class SnapshotWrite:
     underlying_price: float | None
     up_price: float
     down_price: float
+    best_bid_up: float | None
+    best_ask_up: float | None
+    bid_size_up: float | None
+    ask_size_up: float | None
+    best_bid_down: float | None
+    best_ask_down: float | None
+    bid_size_down: float | None
+    ask_size_down: float | None
+    orderbook_up_json: str | None
+    orderbook_down_json: str | None
     bid_price: float | None
     ask_price: float | None
     bid_size: float | None
@@ -61,11 +72,13 @@ class SnapshotRecorder:
         scan_interval: float = 5.0,
         queue_size: int = 5000,
         batch_size: int = 200,
+        orderbook_depth: int = 10,
     ) -> None:
         self._coin = coin.lower()
         self._interval = interval
         self._scan_interval = scan_interval
         self._batch_size = batch_size
+        self._orderbook_depth = max(0, orderbook_depth)
         self._scanner = MarketWindowScanner(coin=self._coin)
         self._poly_ws = PolymarketWSClient()
         self._db_path = db_path(self._coin)
@@ -97,6 +110,15 @@ class SnapshotRecorder:
     def _live_token_price(self, token_id: str, fallback: float) -> float:
         live = self._poly_ws.get_price(token_id)
         return live if live > 0 else fallback
+
+    def _book_json(self, token_id: str) -> str | None:
+        book = self._poly_ws.get_book(token_id)
+        if not book:
+            return None
+        orderbook = book.as_orderbook(depth=self._orderbook_depth)
+        if not orderbook["bids"] and not orderbook["asks"]:
+            return None
+        return json.dumps(orderbook, separators=(",", ":"))
 
     def _market_row(self, item: SnapshotWrite) -> dict[str, object]:
         return {
@@ -154,6 +176,8 @@ class SnapshotRecorder:
                     elapsed = (now - window.start_time).total_seconds()
                     up = self._live_token_price(window.up_token_id, window.up_price)
                     down = self._live_token_price(window.down_token_id, window.down_price)
+                    up_book = self._poly_ws.get_book(window.up_token_id)
+                    down_book = self._poly_ws.get_book(window.down_token_id)
                     write = SnapshotWrite(
                         market_id=window.market_id,
                         slug=window.slug,
@@ -164,6 +188,16 @@ class SnapshotRecorder:
                         underlying_price=self._current_price or None,
                         up_price=up,
                         down_price=down,
+                        best_bid_up=up_book.best_bid if up_book and up_book.best_bid > 0 else None,
+                        best_ask_up=up_book.best_ask if up_book and up_book.best_ask > 0 else None,
+                        bid_size_up=up_book.best_bid_size if up_book and up_book.best_bid_size > 0 else None,
+                        ask_size_up=up_book.best_ask_size if up_book and up_book.best_ask_size > 0 else None,
+                        best_bid_down=down_book.best_bid if down_book and down_book.best_bid > 0 else None,
+                        best_ask_down=down_book.best_ask if down_book and down_book.best_ask > 0 else None,
+                        bid_size_down=down_book.best_bid_size if down_book and down_book.best_bid_size > 0 else None,
+                        ask_size_down=down_book.best_ask_size if down_book and down_book.best_ask_size > 0 else None,
+                        orderbook_up_json=self._book_json(window.up_token_id),
+                        orderbook_down_json=self._book_json(window.down_token_id),
                         bid_price=self._bid_price,
                         ask_price=self._ask_price,
                         bid_size=self._bid_size,
@@ -238,8 +272,13 @@ class SnapshotRecorder:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO snapshots
-                (market_id, time, price, price_up, price_down)
-                VALUES (?, ?, ?, ?, ?)
+                (
+                    market_id, time, price, price_up, price_down,
+                    best_bid_up, best_ask_up, bid_size_up, ask_size_up,
+                    best_bid_down, best_ask_down, bid_size_down, ask_size_down,
+                    orderbook_up_json, orderbook_down_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.market_id,
@@ -247,6 +286,16 @@ class SnapshotRecorder:
                     item.underlying_price,
                     item.up_price,
                     item.down_price,
+                    item.best_bid_up,
+                    item.best_ask_up,
+                    item.bid_size_up,
+                    item.ask_size_up,
+                    item.best_bid_down,
+                    item.best_ask_down,
+                    item.bid_size_down,
+                    item.ask_size_down,
+                    item.orderbook_up_json,
+                    item.orderbook_down_json,
                 ),
             )
         self._conn.commit()
@@ -363,5 +412,24 @@ if __name__ == "__main__":
     parser.add_argument("--coin", action="append", choices=["btc", "eth", "sol"], help="Coin(s) to record")
     parser.add_argument("--interval", type=float, default=1.0, help="Seconds between snapshot production cycles")
     parser.add_argument("--scan-interval", type=float, default=5.0, help="Seconds between market discovery scans")
+    parser.add_argument("--orderbook-depth", type=int, default=10, help="Depth levels per side to retain in local orderbook JSON")
     args = parser.parse_args()
-    asyncio.run(main(args.coin or ["btc"], args.interval, args.scan_interval))
+    async def _run() -> None:
+        recorders = [
+            SnapshotRecorder(
+                coin=coin,
+                interval=args.interval,
+                scan_interval=args.scan_interval,
+                orderbook_depth=args.orderbook_depth,
+            )
+            for coin in (args.coin or ["btc"])
+        ]
+        tasks = [asyncio.create_task(recorder.run()) for recorder in recorders]
+        try:
+            await asyncio.gather(*tasks)
+        except KeyboardInterrupt:
+            for recorder in recorders:
+                await recorder.stop()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(_run())
