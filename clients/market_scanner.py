@@ -20,6 +20,8 @@ from shared.constants import SLUG_PATTERNS, WINDOW_MINUTES
 logger = logging.getLogger(__name__)
 
 SLUG_PREFIX_5M = "btc-updown-5m-"
+DEFAULT_SCAN_WINDOW_COUNT = 4
+DEFAULT_WINDOWS_CACHE_TTL_SECONDS = 2.0
 
 
 def _safe_float(value: str | float | None, default: float = 0.0) -> float:
@@ -148,11 +150,16 @@ class MarketWindowScanner:
         gamma_url: str = "https://gamma-api.polymarket.com",
         coin: str = "btc",
         market_type: str = "5m",
+        *,
+        scan_window_count: int = DEFAULT_SCAN_WINDOW_COUNT,
+        windows_cache_ttl_seconds: float = DEFAULT_WINDOWS_CACHE_TTL_SECONDS,
     ) -> None:
         self._gamma_url = gamma_url
         self._coin = coin.lower()
         self._market_type = market_type
         self._window_minutes = WINDOW_MINUTES[market_type]
+        self._scan_window_count = max(1, scan_window_count)
+        self._windows_cache_ttl_seconds = max(0.0, windows_cache_ttl_seconds)
         pattern = SLUG_PATTERNS[market_type].get(
             self._coin, SLUG_PATTERNS[market_type]["btc"]
         )
@@ -163,6 +170,13 @@ class MarketWindowScanner:
         self._past_results_url = "https://polymarket.com/api/past-results"
         self._price_to_beat_cache: dict[str, float] = {}
         self._price_to_beat_fetch_attempt_ts: dict[str, float] = {}
+        self._cached_windows: list[MarketWindow] = []
+        self._cached_windows_at = 0.0
+        self._last_scan_stats = {
+            "cache_hit": False,
+            "candidate_count": 0,
+            "found_count": 0,
+        }
 
     def _price_query_window_label(self) -> str | None:
         return {
@@ -206,9 +220,26 @@ class MarketWindowScanner:
             slugs.append(f"{self._slug_prefix}{int(ts.timestamp())}")
         return slugs
 
-    async def find_active_windows(self) -> list[MarketWindow]:
+    def _windows_cache_fresh(self) -> bool:
+        return (
+            self._cached_windows_at > 0
+            and (time() - self._cached_windows_at) < self._windows_cache_ttl_seconds
+        )
+
+    def last_scan_stats(self) -> dict[str, int | bool]:
+        return dict(self._last_scan_stats)
+
+    async def find_active_windows(self, *, force_refresh: bool = False) -> list[MarketWindow]:
         """Query Gamma API for each candidate slug, return found windows."""
-        slugs = self._generate_candidate_slugs()
+        if not force_refresh and self._windows_cache_fresh():
+            self._last_scan_stats = {
+                "cache_hit": True,
+                "candidate_count": self._last_scan_stats.get("candidate_count", 0),
+                "found_count": len(self._cached_windows),
+            }
+            return list(self._cached_windows)
+
+        slugs = self._generate_candidate_slugs(count=self._scan_window_count)
         windows = []
 
         for slug in slugs:
@@ -231,6 +262,13 @@ class MarketWindowScanner:
             except Exception as e:
                 logger.debug(f"Slug query failed for {slug}: {e}")
 
+        self._cached_windows = list(windows)
+        self._cached_windows_at = time()
+        self._last_scan_stats = {
+            "cache_hit": False,
+            "candidate_count": len(slugs),
+            "found_count": len(windows),
+        }
         return windows
 
     def _parse_price_to_beat_from_html(self, html: str, window: MarketWindow) -> float | None:

@@ -183,6 +183,7 @@ def test_get_book_snapshot_falls_back_to_http_when_ws_stale(monkeypatch):
     polymarket.get_order_book.assert_awaited_once_with(token)
     assert snap is not None
     assert snap.source == "http"
+    assert snap.detail == "ws_stale"
     assert snap.top.ask == pytest.approx(0.33)
     assert snap.top.ask_size == pytest.approx(77.0)
     assert snap.age_ms == 0.0
@@ -256,10 +257,14 @@ def test_record_book_tick_writes_action_with_latency(monkeypatch):
     assert len(actions) == 1
     payload = json.loads(actions[0]["payload_json"])
     assert payload["slug"] == "slug-1"
+    assert payload["execution_mode"] == "shadow"
     assert payload["seen_ts_ms"] == 12_345_000
     assert payload["up"]["source"] == "ws"
     assert payload["up"]["book_age_ms"] == 200.0
     assert payload["up"]["book_ts_ms"] == 12_344_800
+    assert payload["up"]["detail"] == "fresh"
+    assert payload["ws"]["connected"] is False
+    assert payload["ws"]["subscribed_tokens"] == 0
 
 
 def test_record_book_tick_logs_payload(monkeypatch, caplog):
@@ -341,6 +346,7 @@ def test_execute_fill_dry_run_logs_decision_with_timestamps(monkeypatch):
     assert submits == []  # dry run -> no submit
     payload = json.loads(decisions[0]["payload_json"])
     assert payload["slug"] == "slug-2"
+    assert payload["execution_mode"] == "shadow"
     assert payload["side"] == "Up"
     assert payload["reason"] == "pair_accumulate"
     assert payload["execute"] is False
@@ -354,6 +360,48 @@ def test_ws_client_connected_property():
     assert ws.connected is False
     ws._ws = object()
     assert ws.connected is True
+
+
+@pytest.mark.asyncio
+async def test_sync_window_subscriptions_tracks_current_and_next_window():
+    now = datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc)
+    polymarket = SimpleNamespace(close=AsyncMock())
+    ws = PolymarketWSClient()
+    ws.sync_subscriptions = AsyncMock()
+    with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+        bot = _build_bot(db_path=tmp.name, ws_client=ws, polymarket=polymarket)
+        try:
+            windows = [
+                SimpleNamespace(
+                    start_time=now - timedelta(minutes=1),
+                    end_time=now + timedelta(minutes=4),
+                    up_token_id="up-current",
+                    down_token_id="down-current",
+                    is_active=lambda current: True,
+                ),
+                SimpleNamespace(
+                    start_time=now + timedelta(minutes=4),
+                    end_time=now + timedelta(minutes=9),
+                    up_token_id="up-next",
+                    down_token_id="down-next",
+                    is_active=lambda current: False,
+                ),
+                SimpleNamespace(
+                    start_time=now + timedelta(minutes=9),
+                    end_time=now + timedelta(minutes=14),
+                    up_token_id="up-later",
+                    down_token_id="down-later",
+                    is_active=lambda current: False,
+                ),
+            ]
+            await bot._sync_window_subscriptions(windows, now)
+            await bot._sync_window_subscriptions(windows, now)
+        finally:
+            bot.conn.close()
+
+    ws.sync_subscriptions.assert_awaited_once_with(
+        ["down-current", "down-next", "up-current", "up-next"]
+    )
 
 
 def test_execute_fill_persists_token_and_order_identifiers():

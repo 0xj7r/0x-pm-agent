@@ -93,9 +93,13 @@ class BookSnapshot:
     source: str
     book_ts_ms: int
     age_ms: float
+    detail: str | None = None
 
     def telemetry(self) -> dict[str, Any]:
-        return {
+        detail = self.detail
+        if detail is None and self.source == "ws":
+            detail = "fresh"
+        payload = {
             "source": self.source,
             "book_ts_ms": self.book_ts_ms,
             "book_ts": _iso_utc_ms(self.book_ts_ms),
@@ -103,6 +107,9 @@ class BookSnapshot:
             "price": self.top.ask,
             "ask_size": self.top.ask_size,
         }
+        if detail:
+            payload["detail"] = detail
+        return payload
 
 
 @dataclass(frozen=True)
@@ -138,7 +145,7 @@ class WhalePairLiveBot:
         self.polymarket = polymarket or PolymarketClient(self.config)
         self.ws = ws_client if ws_client is not None else (PolymarketWSClient() if use_ws else None)
         self._ws_task: asyncio.Task[None] | None = None
-        self._subscribed: set[str] = set()
+        self._ws_target_tokens: set[str] = set()
         self.merger: CTFMerger | None = None
         if self.execute and self.config.PRIVATE_KEY:
             self.merger = CTFMerger(
@@ -171,15 +178,42 @@ class WhalePairLiveBot:
         if self._ws_task is None or self._ws_task.done():
             self._ws_task = asyncio.create_task(self.ws.connect())
 
-    async def _subscribe_window(self, up_token: str, down_token: str) -> None:
+    @property
+    def execution_mode(self) -> str:
+        return "live" if self.execute else "shadow"
+
+    async def _sync_window_subscriptions(self, windows: list[Any], now: datetime) -> None:
         if self.ws is None:
             return
-        new_tokens = [t for t in (up_token, down_token) if t and t not in self._subscribed]
-        if not new_tokens:
+        desired_tokens: list[str] = []
+        active = [w for w in windows if w.is_active(now)]
+        upcoming = sorted(
+            [w for w in windows if w.start_time >= now and not w.is_active(now)],
+            key=lambda w: w.start_time,
+        )
+        for window in active[:1] + upcoming[:1]:
+            desired_tokens.extend([window.up_token_id, window.down_token_id])
+        desired = {token for token in desired_tokens if token}
+        if desired == self._ws_target_tokens:
             return
-        await self.ws.subscribe(new_tokens)
-        for t in new_tokens:
-            self._subscribed.add(t)
+        await self.ws.sync_subscriptions(sorted(desired))
+        self._ws_target_tokens = desired
+
+    def _ws_telemetry(self) -> dict[str, Any]:
+        if self.ws is None:
+            return {
+                "enabled": False,
+                "connected": False,
+                "subscribed_tokens": 0,
+                "target_tokens": 0,
+            }
+        return {
+            "enabled": self.use_ws,
+            "connected": bool(self.ws.connected),
+            "subscribed_tokens": self.ws.subscribed_count,
+            "target_tokens": len(self._ws_target_tokens),
+            "stats": self.ws.stats(),
+        }
 
     async def get_book_snapshot(self, token_id: str) -> BookSnapshot | None:
         """Return top-of-book with provenance, trying WS first then HTTP.
@@ -188,10 +222,11 @@ class WhalePairLiveBot:
         """
         now_epoch = time.time()
         now_ms = now_epoch * 1000.0
+        fallback_detail = "ws_disabled"
 
         if self.ws is not None and self.use_ws:
+            book = self.ws.get_book(token_id)
             if self.ws.is_book_fresh(token_id, max_age_ms=self.ws_max_age_ms, now=now_epoch):
-                book = self.ws.get_book(token_id)
                 if book is not None and book.best_ask > 0:
                     age = self.ws.book_age_ms(token_id, now=now_epoch) or 0.0
                     return BookSnapshot(
@@ -199,7 +234,16 @@ class WhalePairLiveBot:
                         source="ws",
                         book_ts_ms=int(book.last_update * 1000),
                         age_ms=age,
+                        detail="fresh",
                     )
+            elif book is None:
+                fallback_detail = "ws_missing"
+            else:
+                fallback_detail = "ws_stale"
+                if not self.ws.connected:
+                    fallback_detail = "ws_stale"
+        elif self.ws is None:
+            fallback_detail = "ws_unavailable"
 
         # HTTP fallback: either WS disabled, not connected, missing, or stale.
         http_book = await self.polymarket.get_order_book(token_id)
@@ -211,6 +255,7 @@ class WhalePairLiveBot:
             source="http",
             book_ts_ms=int(now_ms),
             age_ms=0.0,
+            detail=fallback_detail,
         )
 
     async def run(self) -> None:
@@ -235,11 +280,7 @@ class WhalePairLiveBot:
         now = datetime.now(timezone.utc)
         await self._ensure_ws_running()
         windows = await self.scanner.find_active_windows()
-        # Subscribe the current and next window outcomes so the WS book is warm
-        # before we need it.
-        for window in windows:
-            if window.end_time >= now:
-                await self._subscribe_window(window.up_token_id, window.down_token_id)
+        await self._sync_window_subscriptions(windows, now)
 
         for window in windows:
             if not window.is_active(now):
@@ -303,10 +344,11 @@ class WhalePairLiveBot:
     ) -> None:
         payload = {
             "slug": window.slug,
+            "execution_mode": self.execution_mode,
             "seen_ts_ms": _now_epoch_ms(),
             "up": up.telemetry() if up else None,
             "down": down.telemetry() if down else None,
-            "ws_connected": bool(self.ws.connected) if self.ws is not None else False,
+            "ws": self._ws_telemetry(),
         }
         record_action(self.conn, window.market_id, "book_tick", compact(payload))
         logger.info("[BOOK] %s", compact(payload))
@@ -323,6 +365,7 @@ class WhalePairLiveBot:
         decision_ts_ms = _now_epoch_ms()
         decision_payload = {
             "slug": window.slug,
+            "execution_mode": self.execution_mode,
             "side": fill.side,
             "reason": fill.reason,
             "price": fill.price,
@@ -335,13 +378,14 @@ class WhalePairLiveBot:
         record_action(self.conn, window.market_id, "decision", compact(decision_payload))
         if not self.execute:
             logger.warning(
-                "[DRY] %s side=%s reason=%s px=%.4f shares=%.2f src=%s age=%.0fms",
+                "[SHADOW] %s side=%s reason=%s px=%.4f shares=%.2f src=%s detail=%s age=%.0fms",
                 window.slug,
                 fill.side,
                 fill.reason,
                 fill.price,
                 fill.shares,
                 snap.source,
+                snap.detail or "na",
                 snap.age_ms,
             )
             return
@@ -357,6 +401,7 @@ class WhalePairLiveBot:
         order_id = result.get("orderID") or result.get("orderId") or result.get("id")
         submit_payload = {
             "slug": window.slug,
+            "execution_mode": self.execution_mode,
             "side": fill.side,
             "token_id": token_id,
             "order_id": order_id,

@@ -53,6 +53,11 @@ class PolymarketWSClient:
         self._subscribed_ids: set[str] = set()
         self._books: dict[str, TokenBook] = {}
         self._reconnect_delay = 1.0
+        self._stats = {
+            "subscribe_calls": 0,
+            "unsubscribe_calls": 0,
+            "subscribed_tokens": 0,
+        }
 
     def get_book(self, token_id: str) -> TokenBook | None:
         return self._books.get(token_id)
@@ -105,11 +110,35 @@ class PolymarketWSClient:
         """True while a live WS connection is held."""
         return self._ws is not None
 
+    @property
+    def subscribed_count(self) -> int:
+        return len(self._subscribed_ids)
+
+    def stats(self) -> dict[str, int]:
+        stats = dict(self._stats)
+        stats["subscribed_tokens"] = len(self._subscribed_ids)
+        return stats
+
+    @staticmethod
+    def _build_subscribe_message(
+        token_ids: list[str],
+        *,
+        initial_dump: bool,
+    ) -> dict[str, object]:
+        return {
+            "assets_ids": token_ids,
+            "type": "market",
+            "initial_dump": initial_dump,
+            "level": 2,
+            "custom_feature_enabled": True,
+        }
+
     async def subscribe(self, token_ids: list[str]) -> None:
         """Subscribe to new token IDs (can be called while connected)."""
         new_ids = [t for t in token_ids if t and t not in self._subscribed_ids]
         if not new_ids:
             return
+        self._stats["subscribe_calls"] += 1
 
         for tid in new_ids:
             self._subscribed_ids.add(tid)
@@ -117,12 +146,39 @@ class PolymarketWSClient:
                 self._books[tid] = TokenBook(token_id=tid)
 
         if self._ws:
-            msg = {"operation": "subscribe", "assets_ids": new_ids, "level": 2}
             try:
-                await self._ws.send(json.dumps(msg))
-                logger.info(f"Subscribed to {len(new_ids)} tokens")
+                await self._ws.send(
+                    json.dumps(self._build_subscribe_message(new_ids, initial_dump=True))
+                )
+                logger.info("Subscribed to %s tokens", len(new_ids))
             except Exception as e:
                 logger.warning(f"Subscribe failed: {e}")
+
+    async def unsubscribe(self, token_ids: list[str]) -> None:
+        remove_ids = [t for t in token_ids if t and t in self._subscribed_ids]
+        if not remove_ids:
+            return
+        self._stats["unsubscribe_calls"] += 1
+
+        for tid in remove_ids:
+            self._subscribed_ids.discard(tid)
+
+        if self._ws:
+            msg = {"operation": "unsubscribe", "assets_ids": remove_ids, "level": 2}
+            try:
+                await self._ws.send(json.dumps(msg))
+                logger.info("Unsubscribed from %s tokens", len(remove_ids))
+            except Exception as e:
+                logger.warning(f"Unsubscribe failed: {e}")
+
+    async def sync_subscriptions(self, token_ids: list[str]) -> None:
+        desired = {t for t in token_ids if t}
+        to_unsubscribe = sorted(self._subscribed_ids - desired)
+        to_subscribe = sorted(desired - self._subscribed_ids)
+        if to_unsubscribe:
+            await self.unsubscribe(to_unsubscribe)
+        if to_subscribe:
+            await self.subscribe(to_subscribe)
 
     async def connect(self) -> None:
         """Connect and maintain WebSocket with auto-reconnect."""
@@ -137,13 +193,10 @@ class PolymarketWSClient:
                     self._reconnect_delay = 1.0
 
                     if self._subscribed_ids:
-                        sub = {
-                            "assets_ids": list(self._subscribed_ids),
-                            "type": "market",
-                            "initial_dump": True,
-                            "level": 2,
-                            "custom_feature_enabled": True,
-                        }
+                        sub = self._build_subscribe_message(
+                            sorted(self._subscribed_ids),
+                            initial_dump=True,
+                        )
                         await ws.send(json.dumps(sub))
 
                     ping_task = asyncio.create_task(self._ping_loop(ws))
@@ -156,6 +209,10 @@ class PolymarketWSClient:
                             self._handle_message(raw)
                     finally:
                         ping_task.cancel()
+                        try:
+                            await ping_task
+                        except asyncio.CancelledError:
+                            pass
 
             except Exception as e:
                 if not self._running:
@@ -164,9 +221,10 @@ class PolymarketWSClient:
                     f"Polymarket WS disconnected: {e}. "
                     f"Reconnecting in {self._reconnect_delay:.0f}s..."
                 )
-                self._ws = None
                 await asyncio.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+            finally:
+                self._ws = None
 
     async def _ping_loop(self, ws: object) -> None:
         while True:
@@ -267,3 +325,4 @@ class PolymarketWSClient:
         self._running = False
         if self._ws:
             await self._ws.close()
+        self._ws = None

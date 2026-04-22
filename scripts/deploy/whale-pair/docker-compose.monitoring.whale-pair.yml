@@ -1,0 +1,66 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: whale-pair-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    ports:
+      - "${WHALE_PAIR_PROMETHEUS_BIND:-127.0.0.1}:${WHALE_PAIR_PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ../../../ops/prometheus/prometheus.whale-pair.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../../ops/prometheus/rules:/etc/prometheus/rules:ro
+      - ../../../data/monitoring/prometheus:/prometheus
+    depends_on:
+      - node-exporter
+      - cadvisor
+
+  grafana:
+    image: grafana/grafana:11.1.5
+    container_name: whale-pair-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${WHALE_PAIR_GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${WHALE_PAIR_GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_ADDR: "0.0.0.0"
+      GF_SERVER_HTTP_PORT: "3000"
+    ports:
+      - "${WHALE_PAIR_GRAFANA_BIND:-127.0.0.1}:${WHALE_PAIR_GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ../../../ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../../ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ../../../data/monitoring/grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: whale-pair-node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+      - "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+      - ../../../data/monitoring/node-exporter:/var/lib/node_exporter/textfile_collector
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: whale-pair-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+
+networks:
+  default:
+    name: whale-pair-monitoring
