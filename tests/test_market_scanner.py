@@ -84,15 +84,27 @@ async def test_find_active_windows():
 
 def test_parse_price_to_beat_from_page_html():
     scanner = MarketWindowScanner()
+    window = MarketWindow(
+        market_id="m-current",
+        question="Current",
+        start_time=datetime(2026, 4, 22, 8, 30, 0, tzinfo=timezone.utc),
+        end_time=datetime(2026, 4, 22, 8, 35, 0, tzinfo=timezone.utc),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        slug="btc-updown-5m-1776846600",
+    )
     html = (
         '<html><body><script id="__NEXT_DATA__" type="application/json">'
-        '{"props":{"pageProps":{"dehydratedState":{"queries":[{"state":{"data":[{"id":"402307",'
-        '"ticker":"btc-updown-5m-1776846600","slug":"btc-updown-5m-1776846600",'
-        '"title":"Bitcoin Up or Down","eventMetadata":{"priceToBeat":77986.83150999999}}]}}]}}}}'
+        '{"props":{"pageProps":{"dehydratedState":{"queries":['
+        '{"queryKey":["crypto-prices","price","BTC","2026-04-22T08:30:00Z","fiveminute","2026-04-22T08:35:00Z"],'
+        '"state":{"data":{"openPrice":77986.83150999999,"closePrice":null}}},'
+        '{"state":{"data":[{"id":"402307","ticker":"btc-updown-5m-1776846600",'
+        '"slug":"btc-updown-5m-1776846600","title":"Bitcoin Up or Down",'
+        '"eventMetadata":{"priceToBeat":77986.83150999999}}]}}]}}}}'
         "</script></body></html>"
     )
 
-    price = scanner._parse_price_to_beat_from_html(html, "btc-updown-5m-1776846600")
+    price = scanner._parse_price_to_beat_from_html(html, window)
 
     assert price == pytest.approx(77986.83150999999)
 
