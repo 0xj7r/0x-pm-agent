@@ -161,7 +161,16 @@ class TradePersistence:
             },
         )
 
-    def record_status(self, window_id: str, btc_price: float, balance: float, trades_total: int, up_price: float, down_price: float) -> None:
+    def record_status(
+        self,
+        window_id: str,
+        btc_price: float,
+        balance: float,
+        trades_total: int,
+        up_price: float,
+        down_price: float,
+        entry_blocker: dict | None = None,
+    ) -> None:
         self._memory.save_event(
             window_id=window_id,
             event_type="status_tick",
@@ -173,6 +182,7 @@ class TradePersistence:
                 "trades": trades_total,
                 "up_price": up_price,
                 "down_price": down_price,
+                "entry_blocker": entry_blocker,
             },
         )
 

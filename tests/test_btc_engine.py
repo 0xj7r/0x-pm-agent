@@ -234,6 +234,53 @@ async def test_engine_fetches_canonical_anchor_for_active_window():
     engine.memory.close()
 
 
+def test_engine_records_entry_blocker_when_signal_side_is_above_max_entry():
+    engine = make_engine(move_threshold=0.04, max_entry=0.55)
+    engine.current_window = make_window(up_price=0.23, down_price=0.78)
+    engine.current_window.price_to_beat = 78056.05
+    engine._window_open_price = 78056.05
+    engine._window_open_source = "polymarket_price_to_beat"
+    engine._current_btc_price = 78010.92
+    engine._already_traded_this_window = False
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.23 if tid == engine.current_window.up_token_id else 0.78
+    )
+
+    trades = engine._check_entry()
+
+    assert trades == []
+    assert engine._entry_blocker is not None
+    assert engine._entry_blocker["reason"] == "entry_above_max"
+    assert engine._entry_blocker["direction"] == "DOWN"
+    assert engine._entry_blocker["candidate_price"] == pytest.approx(0.78)
+    assert engine._entry_blocker["max_entry"] == pytest.approx(0.55)
+    engine.memory.close()
+
+
+def test_engine_clears_entry_blocker_after_successful_trade():
+    engine = make_engine(move_threshold=0.04, max_entry=0.55)
+    engine.current_window = make_window(up_price=0.02, down_price=0.98)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+    engine._entry_blocker = {"reason": "below_move"}
+
+    engine.poly_ws = MagicMock()
+    engine.poly_ws.has_live_book.return_value = True
+    engine.poly_ws.get_price.side_effect = lambda tid: (
+        0.02 if tid == engine.current_window.up_token_id else 0.98
+    )
+
+    trades = engine._check_entry()
+
+    assert len(trades) == 1
+    assert engine._entry_blocker is None
+    engine.memory.close()
+
+
 def test_engine_generates_threshold_trade():
     engine = make_engine()
     engine.current_window = make_window(up_price=0.02, down_price=0.98)
