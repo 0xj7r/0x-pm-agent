@@ -305,6 +305,11 @@ class WhalePairLiveBot:
             if up_snap is None or down_snap is None:
                 continue
 
+            allow_single_leg_accumulate = self.cfg.variant in (
+                "skewed_pair_builder",
+                "passive_ladder",
+            )
+            pair_applied = False
             state = build_market_state(self.conn, window.market_id)
             pair_fill = maybe_decide_pair_fill(
                 up_top=up_snap.top,
@@ -313,8 +318,12 @@ class WhalePairLiveBot:
                 cfg=self.cfg,
             )
             if pair_fill is not None:
+                pair_applied = True
                 await self._execute_fill(window, window.up_token_id, pair_fill.up_fill, up_snap)
                 await self._execute_fill(window, window.down_token_id, pair_fill.down_fill, down_snap)
+
+            if pair_applied:
+                continue
 
             for side, token_id, snap in (
                 ("Up", window.up_token_id, up_snap),
@@ -326,7 +335,7 @@ class WhalePairLiveBot:
                     top=snap.top,
                     state=state,
                     cfg=self.cfg,
-                    allow_accumulate=False,
+                    allow_accumulate=allow_single_leg_accumulate,
                 )
                 if fill is not None:
                     await self._execute_fill(window, token_id, fill, snap)
@@ -681,8 +690,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--loop", type=int, default=15)
     ap.add_argument("--execute", action="store_true")
     ap.add_argument("--max-pair-cost", type=float, default=0.99)
+    ap.add_argument(
+        "--variant",
+        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder"),
+        default="pair_recycler",
+    )
     ap.add_argument("--base-clip-usd", type=float, default=50.0)
     ap.add_argument("--aggressive-clip-usd", type=float, default=250.0)
+    ap.add_argument("--base-clip-shares", type=float, default=0.0)
+    ap.add_argument("--aggressive-clip-shares", type=float, default=0.0)
     ap.add_argument("--max-gross-cost-usd", type=float, default=1000.0)
     ap.add_argument("--min-seconds-from-start", type=int, default=0)
     ap.add_argument("--max-seconds-from-start", type=int, default=298)
@@ -707,9 +723,12 @@ async def _main() -> int:
     bot = WhalePairLiveBot(
         db_path=args.db,
         cfg=WhalePairConfig(
+            variant=args.variant,
             max_pair_cost=args.max_pair_cost,
             base_clip_usd=args.base_clip_usd,
             aggressive_clip_usd=args.aggressive_clip_usd,
+            base_clip_shares=(args.base_clip_shares or None),
+            aggressive_clip_shares=(args.aggressive_clip_shares or None),
             max_gross_cost_usd=args.max_gross_cost_usd,
             min_seconds_from_start=args.min_seconds_from_start,
             max_seconds_from_start=args.max_seconds_from_start,
