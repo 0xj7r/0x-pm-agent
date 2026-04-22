@@ -580,17 +580,15 @@ mod tests {
 
         runtime.start(1);
 
-        let book = crate::book::BookState {
-            asset_id: "token-up".into(),
-            best_bid: 0.41,
-            best_bid_size: 12.0,
-            best_ask: 0.44,
-            best_ask_size: 7.0,
-            spread: 0.03,
-            last_trade_price: 0.43,
-            last_update_unix_ms: 25,
-            ..crate::book::BookState::default()
-        };
+        let book = crate::book::BookState::from_top_of_book(
+            "token-up",
+            0.41,
+            12.0,
+            0.44,
+            7.0,
+            0.43,
+            25,
+        );
 
         let outcome = runtime
             .on_book_state(
