@@ -147,6 +147,31 @@ def test_engine_does_not_anchor_mid_window_startup_to_current_price():
     engine.memory.close()
 
 
+def test_engine_logs_late_window_anchor_warning_once_per_window(caplog):
+    engine = make_engine()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    window = MarketWindow(
+        market_id="m-late",
+        question="BTC Up/Down",
+        start_time=now - timedelta(minutes=2),
+        end_time=now + timedelta(minutes=3),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+    )
+    engine._price_history.append((now.timestamp(), 84250.0))
+
+    with caplog.at_level("WARNING"):
+        engine._on_new_window(window)
+        engine._anchor_window_open_from_history()
+
+    warnings = [
+        r.message for r in caplog.records if "Skipping window m-late until next rollover" in r.message
+    ]
+    assert len(warnings) == 1
+    assert engine._window_open_skip_logged_market_id == "m-late"
+    engine.memory.close()
+
+
 @pytest.mark.asyncio
 async def test_engine_processes_trade_updates():
     engine = make_engine()

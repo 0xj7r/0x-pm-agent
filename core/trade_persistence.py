@@ -1,10 +1,13 @@
 """Persistence helpers for engine trade lifecycle events."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from core.memory import MemoryStore
+
+logger = logging.getLogger(__name__)
 
 
 class TradePersistence:
@@ -75,19 +78,36 @@ class TradePersistence:
                 "created_at": trade["timestamp"],
             })
 
-    def record_resolution(self, strategy_name: str, trade: dict, resolution, resolved_direction: str) -> None:
+    def record_resolution(
+        self,
+        strategy_name: str,
+        trade: dict,
+        resolution,
+        resolved_direction: str,
+        source: str = "poll",
+    ) -> None:
+        resolution_details = {
+            "won": resolution.won,
+            "pnl_usd": resolution.pnl_usd,
+            "resolved_direction": resolved_direction,
+            "source": source,
+            "trade": trade,
+        }
         self._memory.save_event(
             window_id=trade["market_id"],
             event_type="resolution",
             p_up=None,
             log_odds=None,
             btc_price=None,
-            details={
-                "won": resolution.won,
-                "pnl_usd": resolution.pnl_usd,
-                "resolved_direction": resolved_direction,
-                "trade": trade,
-            },
+            details=resolution_details,
+        )
+        logger.info(
+            "[RESOLUTION_WRITE] market=%s source=%s won=%s pnl=%+.2f direction=%s",
+            trade["market_id"],
+            source,
+            resolution.won,
+            resolution.pnl_usd,
+            resolved_direction,
         )
         if self._supabase:
             self._supabase.upsert_trade_safe({
