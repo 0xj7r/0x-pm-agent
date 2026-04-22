@@ -40,9 +40,19 @@ def _make_engine(polymarket: object, *, poll_interval: float = 2.0):
     eng = BTCTradingEngine.__new__(BTCTradingEngine)
     eng.cfg = _RootCfg(paper=_PaperCfg(enabled=False))
     eng._polymarket = polymarket
+    eng._strategy = MagicMock()
+    eng._strategy.name = "threshold"
+    eng.persistence = MagicMock()
+    eng.persistence.ensure_trade_id.side_effect = (
+        lambda _strategy, trade: trade.setdefault("id", "trade-1")
+    )
     eng.risk = MagicMock()
+    eng.poly_ws = MagicMock()
+    eng.poly_ws.get_book.return_value = None
     eng.current_window = _FakeWindow(300.0)
     eng._already_traded_this_window = True
+    eng._window_submitted = True
+    eng._window_confirmed_fill = False
     eng._order_poll_interval_s = poll_interval
     eng._order_fill_deadline_buffer_s = 30.0
     eng._push_order_events = {}
