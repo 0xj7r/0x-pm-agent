@@ -85,6 +85,8 @@ def _new_trade(shares: float = 100.0, size_usd: float = 5.0) -> dict:
         "direction": "UP",
         "shares": shares,
         "size_usd": size_usd,
+        "book_snapshot": {"selected": {"token_id": "tok-abc"}},
+        "btc_volume_60s": 12.5,
     }
 
 
@@ -107,6 +109,9 @@ async def test_instant_match_skips_polling():
     assert out["order_status"] == "matched"
     assert out["shares"] == 100.0
     assert out["size_usd"] == pytest.approx(5.0)
+    assert out["fee_bps_ceiling"] is None
+    assert out["fill_details"]["status"] == "matched"
+    assert out["fill_details"]["filled_shares"] == pytest.approx(100.0)
     poly.get_order_status.assert_not_called()
     poly.cancel_order.assert_not_called()
     eng.risk.record_order_success.assert_called_once()
@@ -138,6 +143,7 @@ async def test_delayed_match_records_after_polling():
     assert out["order_status"] == "matched"
     assert out["shares"] == 100.0
     assert out["size_usd"] == pytest.approx(5.0)
+    assert out["fill_details"]["status"] == "matched"
     assert poly.get_order_status.await_count == 3
     poly.cancel_order.assert_not_called()
     eng.risk.record_order_success.assert_called_once()
@@ -238,6 +244,8 @@ async def test_partial_fill_cancels_remainder_and_scales_trade():
     assert out["order_status"] == "partial"
     assert out["shares"] == pytest.approx(40.0)
     assert out["size_usd"] == pytest.approx(2.0)  # 5.0 * 40/100
+    assert out["fill_details"]["status"] == "partial"
+    assert out["fill_details"]["filled_shares"] == pytest.approx(40.0)
     poly.cancel_order.assert_awaited_once_with("ord-5")
     eng.risk.record_order_success.assert_called_once()
     eng.risk.record_order_rejection.assert_not_called()
@@ -276,6 +284,7 @@ async def test_timeout_with_partial_fill_records_filled_portion():
     assert out["order_status"] == "partial"
     assert out["shares"] == pytest.approx(25.0)
     assert out["size_usd"] == pytest.approx(1.25)  # 5.0 * 25/100
+    assert out["fill_details"]["status"] == "partial"
     poly.cancel_order.assert_awaited_once_with("ord-6")
     eng.risk.record_order_success.assert_called_once()
     eng.risk.record_order_rejection.assert_not_called()

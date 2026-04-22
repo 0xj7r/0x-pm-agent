@@ -161,6 +161,7 @@ async def test_engine_processes_trade_updates():
     await engine._on_binance_trade(update)
 
     assert engine._current_btc_price == 84100.0
+    assert engine._btc_volume_60s() == pytest.approx(1.0)
     engine.memory.close()
 
 
@@ -191,6 +192,9 @@ def test_engine_generates_threshold_trade():
     )
     assert trades[0]["strategy"] == "threshold"
     assert trades[0]["size_usd"] > 0
+    assert "book_snapshot" in trades[0]
+    assert trades[0]["book_snapshot"]["selected"]["token_id"] == engine.current_window.up_token_id
+    assert trades[0]["btc_volume_60s"] == pytest.approx(0.0)
 
     # Entry persistence moved to after fill confirmation. Simulate the
     # paper fill path (append + record_entry) to cover the post-fix flow.
