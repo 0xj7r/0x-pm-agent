@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import tempfile
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -104,7 +104,7 @@ def test_engine_resets_window_state_on_new_window():
     engine.memory.close()
 
 
-def test_engine_anchors_new_window_open_from_start_trade_history():
+def test_engine_does_not_anchor_btc_window_from_start_trade_history():
     engine = make_engine()
     now = datetime.now(timezone.utc).replace(microsecond=0)
     window = MarketWindow(
@@ -121,8 +121,8 @@ def test_engine_anchors_new_window_open_from_start_trade_history():
 
     engine._on_new_window(window)
 
-    assert engine._window_open_price == 84250.0
-    assert engine._window_open_ts == pytest.approx(now.timestamp() + 0.250)
+    assert engine._window_open_price == 0.0
+    assert engine._window_open_ts is None
     engine.memory.close()
 
 
@@ -168,7 +168,7 @@ def test_engine_does_not_anchor_mid_window_startup_to_current_price():
     engine.memory.close()
 
 
-def test_engine_logs_late_window_anchor_warning_once_per_window(caplog):
+def test_engine_does_not_log_binance_anchor_warning_for_canonical_btc_windows(caplog):
     engine = make_engine()
     now = datetime.now(timezone.utc).replace(microsecond=0)
     window = MarketWindow(
@@ -188,8 +188,7 @@ def test_engine_logs_late_window_anchor_warning_once_per_window(caplog):
     warnings = [
         r.message for r in caplog.records if "Skipping window m-late until next rollover" in r.message
     ]
-    assert len(warnings) == 1
-    assert engine._window_open_skip_logged_market_id == "m-late"
+    assert warnings == []
     engine.memory.close()
 
 
@@ -208,6 +207,30 @@ async def test_engine_processes_trade_updates():
 
     assert engine._current_btc_price == 84100.0
     assert engine._btc_volume_60s() == pytest.approx(1.0)
+    engine.memory.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_fetches_canonical_anchor_for_active_window():
+    engine = make_engine()
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    window = MarketWindow(
+        market_id="m-live",
+        question="BTC Up/Down",
+        start_time=now - timedelta(minutes=1),
+        end_time=now + timedelta(minutes=4),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+    )
+    engine.current_window = window
+    engine._scanner = MagicMock()
+    engine._scanner.ensure_price_to_beat = AsyncMock(side_effect=lambda w: setattr(w, "price_to_beat", 78072.65515197576) or 78072.65515197576)
+
+    price = await engine._ensure_current_window_price_to_beat()
+
+    assert price == pytest.approx(78072.65515197576)
+    assert engine._window_open_price == pytest.approx(78072.65515197576)
+    assert engine._window_open_source == "polymarket_price_to_beat"
     engine.memory.close()
 
 

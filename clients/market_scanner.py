@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from time import time
 
 import httpx
 
@@ -151,7 +152,10 @@ class MarketWindowScanner:
         self._slug_prefix = pattern.replace("{ts}", "")
         self._http = httpx.AsyncClient(timeout=30.0)
         self._polymarket_event_url = "https://polymarket.com/event"
+        self._chainlink_candles_url = "https://polymarket.com/api/chainlink-candles"
+        self._past_results_url = "https://polymarket.com/api/past-results"
         self._price_to_beat_cache: dict[str, float] = {}
+        self._price_to_beat_fetch_attempt_ts: dict[str, float] = {}
 
     def _price_query_window_label(self) -> str | None:
         return {
@@ -162,6 +166,25 @@ class MarketWindowScanner:
     @staticmethod
     def _payload_iso(ts: datetime) -> str:
         return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def _chainlink_interval(self) -> str | None:
+        return {
+            "5m": "5m",
+            "15m": "15m",
+        }.get(self._market_type)
+
+    def _past_results_variant(self) -> str | None:
+        return {
+            "5m": "fiveminute",
+        }.get(self._market_type)
+
+    @staticmethod
+    def _past_results_iso(ts: datetime) -> str:
+        return (
+            ts.astimezone(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
 
     def _generate_candidate_slugs(self, count: int = 24) -> list[str]:
         """Generate slug candidates for the next N window-aligned windows."""
@@ -255,6 +278,83 @@ class MarketWindowScanner:
                 stack.extend(node)
         return None
 
+    async def _fetch_price_to_beat_from_chainlink(self, window: MarketWindow) -> float | None:
+        interval = self._chainlink_interval()
+        if interval is None:
+            return None
+
+        now_ms = int(time() * 1000)
+        end_ms = int(window.end_time.timestamp() * 1000) - 1
+        query_end_ms = min(now_ms, end_ms)
+        if query_end_ms < int(window.start_time.timestamp() * 1000):
+            return None
+
+        try:
+            resp = await self._http.get(
+                self._chainlink_candles_url,
+                params={
+                    "symbol": self._coin.upper(),
+                    "interval": interval,
+                    "limit": 10,
+                    "endTime": query_end_ms,
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            candles = data.get("candles") if isinstance(data, dict) else None
+            if not isinstance(candles, list):
+                return None
+            target_time = int(window.start_time.timestamp())
+            for candle in candles:
+                if int(candle.get("time", -1)) != target_time:
+                    continue
+                open_price = _safe_float(candle.get("open"), default=0.0)
+                if open_price > 0:
+                    return open_price
+            return None
+        except Exception as e:
+            logger.debug("Chainlink candle fetch failed for %s: %s", window.slug, e)
+            return None
+
+    async def _fetch_price_to_beat_from_past_results(self, window: MarketWindow) -> float | None:
+        variant = self._past_results_variant()
+        if variant is None:
+            return None
+
+        try:
+            resp = await self._http.get(
+                self._past_results_url,
+                params={
+                    "symbol": self._coin.upper(),
+                    "variant": variant,
+                    "assetType": "crypto",
+                    "currentEventStartTime": self._past_results_iso(window.start_time),
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(results, list):
+                return None
+
+            target_start = window.start_time.astimezone(timezone.utc)
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                result_end = _parse_iso(result.get("endTime"))
+                if result_end is None or result_end.astimezone(timezone.utc) != target_start:
+                    continue
+                close_price = _safe_float(result.get("closePrice"), default=0.0)
+                if close_price > 0:
+                    return close_price
+            return None
+        except Exception as e:
+            logger.debug("Past-results fetch failed for %s: %s", window.slug, e)
+            return None
+
     async def _fetch_price_to_beat(self, window: MarketWindow) -> float | None:
         if not window.slug:
             return None
@@ -262,18 +362,34 @@ class MarketWindowScanner:
         cached = self._price_to_beat_cache.get(window.slug)
         if cached is not None:
             return cached
+        last_attempt = self._price_to_beat_fetch_attempt_ts.get(window.slug, 0.0)
+        now = time()
+        if now - last_attempt < 2.0:
+            return None
+        self._price_to_beat_fetch_attempt_ts[window.slug] = now
 
         try:
-            resp = await self._http.get(f"{self._polymarket_event_url}/{window.slug}")
-            if resp.status_code != 200:
-                return None
-            price_to_beat = self._parse_price_to_beat_from_html(resp.text, window)
+            price_to_beat = await self._fetch_price_to_beat_from_past_results(window)
+            if price_to_beat is None:
+                resp = await self._http.get(f"{self._polymarket_event_url}/{window.slug}")
+                if resp.status_code != 200:
+                    price_to_beat = None
+                else:
+                    price_to_beat = self._parse_price_to_beat_from_html(resp.text, window)
+            if price_to_beat is None:
+                price_to_beat = await self._fetch_price_to_beat_from_chainlink(window)
             if price_to_beat is not None:
                 self._price_to_beat_cache[window.slug] = price_to_beat
             return price_to_beat
         except Exception as e:
             logger.debug("Price To Beat fetch failed for %s: %s", window.slug, e)
             return None
+
+    async def ensure_price_to_beat(self, window: MarketWindow) -> float | None:
+        if window.price_to_beat is not None and window.price_to_beat > 0:
+            return window.price_to_beat
+        window.price_to_beat = await self._fetch_price_to_beat(window)
+        return window.price_to_beat
 
     async def _enrich_price_to_beat(self, windows: list[MarketWindow]) -> None:
         if not windows:
@@ -297,7 +413,7 @@ class MarketWindowScanner:
                 continue
             seen.add(window.slug)
             if window.price_to_beat is None:
-                window.price_to_beat = await self._fetch_price_to_beat(window)
+                window.price_to_beat = await self.ensure_price_to_beat(window)
 
     async def get_current_window(self) -> MarketWindow | None:
         now = datetime.now(timezone.utc)

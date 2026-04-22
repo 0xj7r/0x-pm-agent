@@ -246,6 +246,8 @@ class BTCTradingEngine:
                 len(self._open_trades),
             )
         self._scanner: MarketWindowScanner | None = None
+        self._price_to_beat_refresh_task: asyncio.Task | None = None
+        self._price_to_beat_refresh_market_id: str | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
         self._latest_book: OrderBookSnapshot | None = None
@@ -414,12 +416,14 @@ class BTCTradingEngine:
         self._window_open_price = 0.0
         self._window_open_source = None
         self._window_open_ts = None
+        self._price_to_beat_refresh_market_id = None
         self._window_open_skip_logged_market_id = None
         self._already_traded_this_window = False
         self._window_submitted = False
         self._window_confirmed_fill = False
         self._last_processed_snap = None
         self._anchor_window_open_from_history()
+        self._schedule_price_to_beat_refresh()
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
@@ -455,6 +459,7 @@ class BTCTradingEngine:
         volume_cutoff = event_ts - 60
         while self._trade_volume_history and self._trade_volume_history[0][0] < volume_cutoff:
             self._trade_volume_history.popleft()
+        self._schedule_price_to_beat_refresh()
         self._anchor_window_open_from_history()
 
     def _btc_volume_60s(self) -> float:
@@ -486,6 +491,53 @@ class BTCTradingEngine:
         )
         return True
 
+    def _canonical_window_open_required(self) -> bool:
+        return self._market_type in {"5m", "15m"}
+
+    async def _ensure_current_window_price_to_beat(self) -> float | None:
+        if self.current_window is None:
+            return None
+        if self.current_window.price_to_beat is not None and self.current_window.price_to_beat > 0:
+            return self.current_window.price_to_beat
+        if self._scanner is None:
+            self._scanner = MarketWindowScanner(coin=self._coin, market_type=self._market_type)
+
+        window = self.current_window
+        price_to_beat = await self._scanner.ensure_price_to_beat(window)
+        if (
+            price_to_beat is not None
+            and price_to_beat > 0
+            and self.current_window is not None
+            and self.current_window.market_id == window.market_id
+            and self._window_open_price == 0
+        ):
+            self._anchor_window_open_from_reference_price()
+        return price_to_beat
+
+    def _schedule_price_to_beat_refresh(self) -> None:
+        if not self._canonical_window_open_required():
+            return
+        if self.current_window is None:
+            return
+        if self.current_window.price_to_beat is not None and self.current_window.price_to_beat > 0:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        market_id = self.current_window.market_id
+        if (
+            self._price_to_beat_refresh_task is not None
+            and not self._price_to_beat_refresh_task.done()
+            and self._price_to_beat_refresh_market_id == market_id
+        ):
+            return
+
+        self._price_to_beat_refresh_market_id = market_id
+        self._price_to_beat_refresh_task = loop.create_task(self._ensure_current_window_price_to_beat())
+
     def _anchor_window_open_from_history(self) -> bool:
         """Set the current window open from the first Binance trade at start.
 
@@ -498,6 +550,8 @@ class BTCTradingEngine:
             return False
         if self._anchor_window_open_from_reference_price():
             return True
+        if self._canonical_window_open_required():
+            return False
         if self._window_open_price > 0:
             return True
 
