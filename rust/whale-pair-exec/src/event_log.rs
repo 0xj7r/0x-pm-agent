@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 
+use serde::Serialize;
+
 use crate::types::{
     ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, RuntimeStatus,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum EventCategory {
     Runtime,
     Strategy,
@@ -13,7 +15,7 @@ pub enum EventCategory {
     Execution,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct EventMetrics {
     pub price: Option<f64>,
     pub quantity: Option<f64>,
@@ -24,7 +26,7 @@ pub struct EventMetrics {
     pub gross_exposure_after_usd: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EventRecord {
     pub seq: u64,
     pub observed_at_ms: EpochMillis,

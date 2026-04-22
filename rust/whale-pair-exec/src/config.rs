@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +35,7 @@ pub struct AppConfig {
     pub summary_log_interval: Duration,
     pub book_stale_after: Duration,
     pub ping_interval: Duration,
+    pub journal_path: Option<PathBuf>,
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
@@ -72,6 +74,7 @@ impl AppConfig {
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
+        let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
         let starting_cash_usd =
             parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity =
@@ -124,6 +127,7 @@ impl AppConfig {
             summary_log_interval,
             book_stale_after,
             ping_interval,
+            journal_path,
             starting_cash_usd,
             event_log_capacity,
             market_id_by_asset,
@@ -164,6 +168,15 @@ fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
         .parse()
         .with_context(|| format!("failed to parse {key} as integer milliseconds"))?;
     Ok(Duration::from_millis(value))
+}
+
+fn parse_path_optional(key: &str) -> Option<PathBuf> {
+    let value = env::var(key).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 fn parse_f64(key: &str, default_value: f64) -> Result<f64> {

@@ -1,10 +1,12 @@
 use std::fmt;
 
+use serde::Serialize;
+
 pub type EpochMillis = u64;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         pub struct $name(String);
 
         impl $name {
@@ -46,7 +48,7 @@ id_type!(InstrumentId);
 id_type!(ClientOrderId);
 id_type!(OrderId);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum RuntimeStatus {
     #[default]
     Starting,
@@ -55,7 +57,7 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum TradeSide {
     Buy,
     Sell,
@@ -70,7 +72,7 @@ impl TradeSide {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum FillLiquidity {
     Maker,
     Taker,
@@ -78,7 +80,7 @@ pub enum FillLiquidity {
     Unknown,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BookLevel {
     pub price: f64,
     pub quantity: f64,
@@ -90,7 +92,7 @@ impl BookLevel {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct QuoteSnapshot {
     pub best_bid: Option<BookLevel>,
     pub best_ask: Option<BookLevel>,
@@ -114,7 +116,7 @@ impl QuoteSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MarketSnapshot {
     pub market_id: MarketId,
     pub instrument_id: InstrumentId,
@@ -130,7 +132,7 @@ impl MarketSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OrderIntent {
     pub client_order_id: ClientOrderId,
     pub market_id: MarketId,
@@ -153,7 +155,7 @@ impl OrderIntent {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FillReport {
     pub order_id: Option<OrderId>,
     pub client_order_id: Option<ClientOrderId>,
@@ -173,7 +175,7 @@ impl FillReport {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum RuntimeCommand {
     Submit(OrderIntent),
     Cancel {

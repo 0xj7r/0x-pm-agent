@@ -451,11 +451,11 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
-    fn strategy_context(&self, now_ms: EpochMillis) -> StrategyContext<'_> {
+    fn strategy_context(&self, now_ms: EpochMillis) -> StrategyContext {
         StrategyContext {
             now_ms,
             runtime_status: self.status,
-            inventory: &self.inventory,
+            inventory: self.inventory.snapshot(),
             open_orders_total: self.open_orders.len(),
         }
     }
@@ -489,7 +489,7 @@ mod tests {
 
         fn on_market_snapshot(
             &mut self,
-            context: &StrategyContext<'_>,
+            context: &StrategyContext,
             snapshot: &MarketSnapshot,
         ) -> StrategyDecision {
             if self.fired || context.runtime_status != RuntimeStatus::Running {
