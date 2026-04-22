@@ -1,4 +1,4 @@
-use crate::inventory::InventoryState;
+use crate::inventory::InventorySnapshot;
 use crate::types::{EpochMillis, FillReport, MarketSnapshot, OrderIntent, RuntimeStatus};
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -24,23 +24,23 @@ impl StrategyDecision {
     }
 }
 
-pub struct StrategyContext<'a> {
+pub struct StrategyContext {
     pub now_ms: EpochMillis,
     pub runtime_status: RuntimeStatus,
-    pub inventory: &'a InventoryState,
+    pub inventory: InventorySnapshot,
     pub open_orders_total: usize,
 }
 
 pub trait Strategy {
     fn name(&self) -> &str;
 
-    fn on_start(&mut self, _context: &StrategyContext<'_>) -> StrategyDecision {
+    fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
         StrategyDecision::none()
     }
 
     fn on_market_snapshot(
         &mut self,
-        _context: &StrategyContext<'_>,
+        _context: &StrategyContext,
         _snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
         StrategyDecision::none()
@@ -48,7 +48,7 @@ pub trait Strategy {
 
     fn on_fill(
         &mut self,
-        _context: &StrategyContext<'_>,
+        _context: &StrategyContext,
         _fill: &FillReport,
     ) -> StrategyDecision {
         StrategyDecision::none()

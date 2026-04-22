@@ -2,6 +2,7 @@ pub mod book;
 pub mod config;
 pub mod event_log;
 pub mod inventory;
+pub mod journal;
 pub mod logging;
 pub mod market_ws;
 pub mod metrics;

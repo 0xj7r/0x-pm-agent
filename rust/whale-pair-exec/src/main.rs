@@ -9,8 +9,10 @@ use tracing::{info, warn};
 
 use whale_pair_exec::book::BookStore;
 use whale_pair_exec::config::AppConfig;
+use whale_pair_exec::journal::JournalWriter;
 use whale_pair_exec::market_ws::MarketWsClient;
 use whale_pair_exec::metrics::{serve_http, AppMetrics};
+use whale_pair_exec::event_log::EventLog;
 use whale_pair_exec::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use whale_pair_exec::strategy::NoopStrategy;
 use whale_pair_exec::types::{InstrumentId, MarketId, RuntimeStatus};
@@ -33,8 +35,19 @@ async fn main() -> Result<()> {
         config.risk_limits.clone(),
         NoopStrategy,
     );
+    let mut journal = config
+        .journal_path
+        .clone()
+        .map(JournalWriter::open)
+        .transpose()?;
 
-    log_runtime_outcome("startup", runtime.start(now_unix_ms()));
+    let startup_outcome = runtime.start(now_unix_ms());
+    persist_runtime_outcome(
+        &mut journal,
+        runtime.event_log(),
+        "startup",
+        startup_outcome,
+    )?;
 
     info!(
         service = %config.service_name,
@@ -45,6 +58,7 @@ async fn main() -> Result<()> {
         book_stale_after_ms = config.book_stale_after.as_millis(),
         starting_cash_usd = config.starting_cash_usd,
         event_log_capacity = config.event_log_capacity,
+        journal_path = ?config.journal_path,
         "starting whale pair execution scaffold"
     );
 
@@ -59,6 +73,7 @@ async fn main() -> Result<()> {
         metrics.clone(),
         shutdown.clone(),
         &mut runtime,
+        &mut journal,
     )
     .await?;
 
@@ -134,6 +149,7 @@ async fn run_runtime_loop(
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
     runtime: &mut Runtime<NoopStrategy>,
+    journal: &mut Option<JournalWriter>,
 ) -> Result<()> {
     let mut ticks = interval(config.runtime_loop_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -162,7 +178,12 @@ async fn run_runtime_loop(
                                 InstrumentId::from(asset_id.as_str()),
                                 &book,
                             )?;
-                            log_runtime_outcome("book", outcome);
+                            persist_runtime_outcome(
+                                journal,
+                                runtime.event_log(),
+                                "book",
+                                outcome,
+                            )?;
                         }
                         _ => metrics.observe_missing_book(asset_id),
                     }
@@ -206,7 +227,12 @@ async fn join_task(name: &str, handle: JoinHandle<()>) {
     }
 }
 
-fn log_runtime_outcome(source: &str, outcome: RuntimeOutcome) {
+fn persist_runtime_outcome(
+    journal: &mut Option<JournalWriter>,
+    event_log: &EventLog,
+    source: &str,
+    outcome: RuntimeOutcome,
+) -> Result<()> {
     if !outcome.commands.is_empty() {
         warn!(
             source,
@@ -223,6 +249,24 @@ fn log_runtime_outcome(source: &str, outcome: RuntimeOutcome) {
             "runtime accepted hot-path update"
         );
     }
+
+    if let Some(writer) = journal.as_mut() {
+        let after_seq = outcome
+            .event_seqs
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .saturating_sub(1);
+        for record in event_log.snapshot_since(after_seq) {
+            writer.append_event(&record)?;
+        }
+        for command in &outcome.commands {
+            writer.append_command(command)?;
+        }
+        writer.flush()?;
+    }
+
+    Ok(())
 }
 
 fn now_unix_ms() -> u64 {
