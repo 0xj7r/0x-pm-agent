@@ -100,6 +100,7 @@ mkdir -p "$STAGE_DATA"
     cd "$DATA_DIR"
     tar \
         --exclude='./backups' \
+        --exclude='./monitoring' \
         --exclude='*.db' \
         -cf - .
 ) | (
@@ -128,6 +129,8 @@ done < <(
     find "$DATA_DIR" \
         -path "$BACKUP_DIR" -prune -o \
         -path "$BACKUP_DIR/*" -prune -o \
+        -path "$DATA_DIR/monitoring" -prune -o \
+        -path "$DATA_DIR/monitoring/*" -prune -o \
         -type f -name '*.db' -print
 )
 
