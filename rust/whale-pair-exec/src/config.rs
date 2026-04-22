@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+
+use crate::risk::RiskLimits;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LogFormat {
@@ -31,6 +34,10 @@ pub struct AppConfig {
     pub summary_log_interval: Duration,
     pub book_stale_after: Duration,
     pub ping_interval: Duration,
+    pub starting_cash_usd: f64,
+    pub event_log_capacity: usize,
+    pub market_id_by_asset: HashMap<String, String>,
+    pub risk_limits: RiskLimits,
     pub user_auth: Option<UserWsAuth>,
 }
 
@@ -65,6 +72,43 @@ impl AppConfig {
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
+        let starting_cash_usd =
+            parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
+        let event_log_capacity =
+            parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
+        let market_id_by_asset = parse_asset_market_map(
+            &env::var("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default(),
+        )?;
+        let risk_limits = RiskLimits {
+            max_order_notional_usd: parse_f64(
+                "WHALE_PAIR_EXEC_MAX_ORDER_NOTIONAL_USD",
+                250.0,
+            )?,
+            max_gross_notional_usd: parse_f64(
+                "WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD",
+                1_000.0,
+            )?,
+            max_net_notional_per_market_usd: parse_f64(
+                "WHALE_PAIR_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
+                500.0,
+            )?,
+            max_position_quantity_per_instrument: parse_f64(
+                "WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
+                10_000.0,
+            )?,
+            min_free_cash_usd: parse_f64(
+                "WHALE_PAIR_EXEC_MIN_FREE_CASH_USD",
+                0.0,
+            )?,
+            max_open_orders_total: parse_usize(
+                "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL",
+                32,
+            )?,
+            max_open_orders_per_market: parse_usize(
+                "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+                8,
+            )?,
+        };
         let user_auth = load_user_auth();
 
         Ok(Self {
@@ -80,8 +124,19 @@ impl AppConfig {
             summary_log_interval,
             book_stale_after,
             ping_interval,
+            starting_cash_usd,
+            event_log_capacity,
+            market_id_by_asset,
+            risk_limits,
             user_auth,
         })
+    }
+
+    pub fn market_id_for_asset(&self, asset_id: &str) -> String {
+        self.market_id_by_asset
+            .get(asset_id)
+            .cloned()
+            .unwrap_or_else(|| asset_id.to_string())
     }
 }
 
@@ -109,6 +164,18 @@ fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
         .parse()
         .with_context(|| format!("failed to parse {key} as integer milliseconds"))?;
     Ok(Duration::from_millis(value))
+}
+
+fn parse_f64(key: &str, default_value: f64) -> Result<f64> {
+    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    raw.parse()
+        .with_context(|| format!("failed to parse {key} as floating point number"))
+}
+
+fn parse_usize(key: &str, default_value: usize) -> Result<usize> {
+    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    raw.parse()
+        .with_context(|| format!("failed to parse {key} as non-negative integer"))
 }
 
 fn split_csv_required(key: &str) -> Result<Vec<String>> {
@@ -143,9 +210,31 @@ fn load_user_auth() -> Option<UserWsAuth> {
     })
 }
 
+fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
+    let mut mapping = HashMap::new();
+    for pair in raw.split(',').map(str::trim).filter(|pair| !pair.is_empty()) {
+        let (asset_id, market_id) = pair
+            .split_once(':')
+            .with_context(|| {
+                format!(
+                    "failed to parse WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` as asset_id:market_id"
+                )
+            })?;
+        let asset_id = asset_id.trim();
+        let market_id = market_id.trim();
+        if asset_id.is_empty() || market_id.is_empty() {
+            bail!(
+                "WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` must have non-empty asset_id and market_id"
+            );
+        }
+        mapping.insert(asset_id.to_string(), market_id.to_string());
+    }
+    Ok(mapping)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_log_format, LogFormat};
+    use super::{parse_asset_market_map, parse_log_format, LogFormat};
 
     #[test]
     fn parses_json_log_format() {
@@ -155,5 +244,17 @@ mod tests {
     #[test]
     fn rejects_unknown_log_format() {
         assert!(parse_log_format("xml").is_err());
+    }
+
+    #[test]
+    fn parses_asset_market_mapping() {
+        let mapping = parse_asset_market_map("token-up:market-1,token-down:market-1").unwrap();
+        assert_eq!(mapping.get("token-up").unwrap(), "market-1");
+        assert_eq!(mapping.get("token-down").unwrap(), "market-1");
+    }
+
+    #[test]
+    fn rejects_bad_asset_market_mapping() {
+        assert!(parse_asset_market_map("token-up").is_err());
     }
 }

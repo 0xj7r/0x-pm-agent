@@ -13,12 +13,16 @@ set -euo pipefail
 usage() {
     cat >&2 <<'EOF'
 Usage: backup_data.sh [--dest DIR] [--keep N] [--name LABEL] [--no-prune]
+                      [--replicate-hook PATH]
 
 Options:
   --dest DIR     backup output directory (default: $DATA_DIR/backups)
   --keep N       keep the newest N archives after completion (default: 7)
   --name LABEL   append a label to the archive basename
   --no-prune     disable pruning of older archives
+  --replicate-hook PATH
+                 executable hook invoked as:
+                 PATH <archive> <checksum> <manifest>
 EOF
 }
 
@@ -29,6 +33,7 @@ BACKUP_DIR="$BACKUP_DIR_DEFAULT"
 KEEP="${KEEP:-7}"
 LABEL=""
 PRUNE=1
+REPLICATE_HOOK="${BACKUP_REPLICATE_HOOK:-}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -47,6 +52,10 @@ while [ $# -gt 0 ]; do
         --no-prune)
             PRUNE=0
             shift
+            ;;
+        --replicate-hook)
+            REPLICATE_HOOK="${2:?missing value for --replicate-hook}"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -71,6 +80,13 @@ case "$KEEP" in
         exit 64
         ;;
 esac
+
+if [ -n "$REPLICATE_HOOK" ]; then
+    if [ ! -x "$REPLICATE_HOOK" ]; then
+        echo "ERROR: replicate hook is not executable: $REPLICATE_HOOK" >&2
+        exit 64
+    fi
+fi
 
 mkdir -p "$BACKUP_DIR"
 
@@ -171,9 +187,20 @@ if [ "$PRUNE" -eq 1 ] && [ "$KEEP" -gt 0 ]; then
     fi
 fi
 
+if [ -n "$REPLICATE_HOOK" ]; then
+    echo "Running replication hook: $REPLICATE_HOOK"
+    BACKUP_ARCHIVE_PATH="$ARCHIVE_PATH" \
+    BACKUP_CHECKSUM_PATH="$CHECKSUM_PATH" \
+    BACKUP_MANIFEST_PATH="$MANIFEST_PATH" \
+        "$REPLICATE_HOOK" "$ARCHIVE_PATH" "$CHECKSUM_PATH" "$MANIFEST_PATH"
+fi
+
 echo "Backup created:"
 echo "  archive : $ARCHIVE_PATH"
 echo "  checksum: $CHECKSUM_PATH"
 echo "  manifest: $MANIFEST_PATH"
 echo "  db mode : $DB_MODE"
 echo "  db count: $DB_COUNT"
+if [ -n "$REPLICATE_HOOK" ]; then
+    echo "  replicated_via: $REPLICATE_HOOK"
+fi

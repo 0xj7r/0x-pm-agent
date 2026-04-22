@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Result};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{AppConfig, LogFormat};
@@ -16,11 +16,11 @@ pub fn init(config: &AppConfig) -> Result<()> {
         LogFormat::Pretty => builder
             .compact()
             .try_init()
-            .context("failed to initialize pretty tracing subscriber")?,
+            .map_err(|error| anyhow!("failed to initialize pretty tracing subscriber: {error}"))?,
         LogFormat::Json => builder
             .json()
             .try_init()
-            .context("failed to initialize json tracing subscriber")?,
+            .map_err(|error| anyhow!("failed to initialize json tracing subscriber: {error}"))?,
     }
 
     Ok(())
