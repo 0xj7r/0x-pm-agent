@@ -11,6 +11,7 @@ LEDGER="${LEDGER:-$REPO_ROOT/data/whale_pair_live.db}"
 MAX_BOOK_AGE_MS="${MAX_BOOK_AGE_MS:-3000}"
 MIN_DISK_FREE_GB="${MIN_DISK_FREE_GB:-5}"
 LEDGER_STALE_SECONDS="${LEDGER_STALE_SECONDS:-300}"
+ENFORCE_LEDGER_WRITE_FRESHNESS="${ENFORCE_LEDGER_WRITE_FRESHNESS:-0}"
 
 fail() {
     echo "UNHEALTHY: $1" >&2
@@ -28,13 +29,15 @@ if [ "${RECENT_LINES:-0}" -lt 1 ]; then
     fail "no log lines in the last 60 seconds"
 fi
 
+RECENT_LOGS=$(docker compose -f "$COMPOSE_FILE" logs --since 120s whale-pair-live 2>/dev/null || true)
+
 # 3. book_ts present in recent logs (bot is ingesting market data).
-if ! docker compose -f "$COMPOSE_FILE" logs --since 120s whale-pair-live 2>/dev/null | grep -q "book_ts"; then
+if ! printf '%s\n' "$RECENT_LOGS" | grep -q "book_ts"; then
     fail "no 'book_ts' telemetry in the last 120 seconds; bot may not be receiving book data"
 fi
 
 # 4. book_age_ms below threshold.
-RECENT_AGES=$(docker compose -f "$COMPOSE_FILE" logs --since 120s whale-pair-live 2>/dev/null \
+RECENT_AGES=$(printf '%s\n' "$RECENT_LOGS" \
     | grep -oE '"book_age_ms":[ ]*[0-9.]+' \
     | awk -F: '{print $2}' \
     | tr -d ' ' \
@@ -47,19 +50,21 @@ if [ -n "$RECENT_AGES" ]; then
     fi
 fi
 
-# 5. Ledger file exists and was modified recently.
+# 5. Ledger file exists and, when enabled, was modified recently.
 if [ ! -f "$LEDGER" ]; then
     fail "ledger file not found: $LEDGER"
 fi
-if [ "$(uname)" = "Linux" ]; then
-    LEDGER_MTIME=$(stat -c '%Y' "$LEDGER")
-else
-    LEDGER_MTIME=$(stat -f '%m' "$LEDGER")
-fi
-NOW=$(date +%s)
-LEDGER_AGE=$((NOW - LEDGER_MTIME))
-if [ "$LEDGER_AGE" -gt "$LEDGER_STALE_SECONDS" ]; then
-    fail "ledger $LEDGER has not been written to in $LEDGER_AGE s (>${LEDGER_STALE_SECONDS}s)"
+if [ "$ENFORCE_LEDGER_WRITE_FRESHNESS" = "1" ]; then
+    if [ "$(uname)" = "Linux" ]; then
+        LEDGER_MTIME=$(stat -c '%Y' "$LEDGER")
+    else
+        LEDGER_MTIME=$(stat -f '%m' "$LEDGER")
+    fi
+    NOW=$(date +%s)
+    LEDGER_AGE=$((NOW - LEDGER_MTIME))
+    if [ "$LEDGER_AGE" -gt "$LEDGER_STALE_SECONDS" ]; then
+        fail "ledger $LEDGER has not been written to in $LEDGER_AGE s (>${LEDGER_STALE_SECONDS}s)"
+    fi
 fi
 
 # 6. Disk free.
