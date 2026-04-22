@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -20,9 +19,6 @@ from shared.constants import SLUG_PATTERNS, WINDOW_MINUTES
 logger = logging.getLogger(__name__)
 
 SLUG_PREFIX_5M = "btc-updown-5m-"
-_PRICE_TO_BEAT_PATTERN_TEMPLATE = (
-    r'"ticker":"{slug}","slug":"{slug}".{{0,4000}}?"eventMetadata":{{"priceToBeat":([0-9.]+)'
-)
 
 
 def _safe_float(value: str | float | None, default: float = 0.0) -> float:
@@ -198,11 +194,39 @@ class MarketWindowScanner:
         return windows
 
     def _parse_price_to_beat_from_html(self, html: str, slug: str) -> float | None:
-        pattern = _PRICE_TO_BEAT_PATTERN_TEMPLATE.format(slug=re.escape(slug))
-        match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
+        script_prefix = '<script id="__NEXT_DATA__"'
+        script_start = html.find(script_prefix)
+        if script_start == -1:
             return None
-        return _safe_float(match.group(1), default=0.0) or None
+        json_start = html.find(">", script_start)
+        if json_start == -1:
+            return None
+        json_end = html.find("</script>", json_start)
+        if json_end == -1:
+            return None
+
+        try:
+            payload = json.loads(html[json_start + 1:json_end])
+        except json.JSONDecodeError:
+            return None
+
+        stack: list[object] = [payload]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if node.get("slug") == slug:
+                    event_metadata = node.get("eventMetadata")
+                    if isinstance(event_metadata, dict):
+                        price_to_beat = _safe_float(
+                            event_metadata.get("priceToBeat"),
+                            default=0.0,
+                        )
+                        if price_to_beat > 0:
+                            return price_to_beat
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+        return None
 
     async def _fetch_price_to_beat(self, slug: str) -> float | None:
         cached = self._price_to_beat_cache.get(slug)
