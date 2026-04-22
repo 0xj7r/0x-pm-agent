@@ -49,13 +49,23 @@ def _make_engine(
     eng = BTCTradingEngine.__new__(BTCTradingEngine)
     eng.cfg = _RootCfg(paper=_PaperCfg(enabled=False))
     eng._polymarket = polymarket
+    eng._strategy = MagicMock()
+    eng._strategy.name = "threshold"
+    eng.persistence = MagicMock()
+    eng.persistence.ensure_trade_id.side_effect = (
+        lambda _strategy, trade: trade.setdefault("id", "trade-1")
+    )
     eng.risk = MagicMock()
+    eng.poly_ws = MagicMock()
+    eng.poly_ws.get_book.return_value = None
     eng.current_window = (
         _FakeWindow(window_secs_remaining)
         if window_secs_remaining is not None
         else None
     )
     eng._already_traded_this_window = True
+    eng._window_submitted = True
+    eng._window_confirmed_fill = False
     eng._order_poll_interval_s = poll_interval
     eng._order_fill_deadline_buffer_s = deadline_buffer
     # Push-path slots (normally initialized in __init__). Empty dicts so
@@ -155,8 +165,10 @@ async def test_timeout_cancels_and_drops_trade():
     poly.cancel_order.assert_awaited_once_with("ord-3")
     eng.risk.record_order_rejection.assert_called_once()
     eng.risk.record_order_success.assert_not_called()
-    # Window released for retry on the next snap.
-    assert eng._already_traded_this_window is False
+    # Window stays closed after a submitted live order to prevent same-window
+    # straddles and duplicate paired paper decisions.
+    assert eng._already_traded_this_window is True
+    assert eng._window_submitted is True
 
 
 @pytest.mark.asyncio
@@ -177,6 +189,7 @@ async def test_rejection_on_submit_drops_trade():
     eng.risk.record_order_rejection.assert_called_once()
     eng.risk.record_order_success.assert_not_called()
     assert eng._already_traded_this_window is False
+    assert eng._window_submitted is False
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ def _make_engine(coin: str = "btc", supa_available: bool = True):
         with supa_patch:
             from strategies.strategy_config import StrategyConfig
             cfg = StrategyConfig()
+            cfg.paper.enabled = False
             from core.engine import BTCTradingEngine
             engine = BTCTradingEngine(cfg, db_path=":memory:", coin=coin)
 
@@ -84,9 +85,11 @@ class TestPersistenceGuardrail:
                    side_effect=RuntimeError("SUPABASE_URL not set")):
             from strategies.strategy_config import StrategyConfig
             from core.engine import BTCTradingEngine
+            cfg = StrategyConfig()
+            cfg.paper.enabled = False
 
             with pytest.raises(RuntimeError):
-                BTCTradingEngine(StrategyConfig(), db_path=":memory:", coin="btc")
+                BTCTradingEngine(cfg, db_path=":memory:", coin="btc")
 
     def test_engine_init_fails_when_health_check_fails(self):
         """Engine should raise on startup if Supabase health check fails (schema mismatch)."""
@@ -103,9 +106,11 @@ class TestPersistenceGuardrail:
             with patch("shared.supabase_client.SupabaseClient", return_value=mock_supa):
                 from strategies.strategy_config import StrategyConfig
                 from core.engine import BTCTradingEngine
+                cfg = StrategyConfig()
+                cfg.paper.enabled = False
 
                 with pytest.raises(RuntimeError, match="health check"):
-                    BTCTradingEngine(StrategyConfig(), db_path=":memory:", coin="btc")
+                    BTCTradingEngine(cfg, db_path=":memory:", coin="btc")
 
     def test_no_trade_when_supabase_unavailable(self):
         """If Supabase client somehow becomes None after startup, do not enter trades."""
@@ -235,6 +240,7 @@ class TestDuplicateTradeProtection:
         engine = _make_engine()
         _set_tradeable_window(engine)
         engine._already_traded_this_window = True
+        engine._window_submitted = True
 
         from models.market import MarketWindow
         new_window = MarketWindow(
@@ -252,6 +258,7 @@ class TestDuplicateTradeProtection:
         assert engine._already_traded_this_window is False, (
             "Trade flag should reset on new window"
         )
+        assert engine._window_submitted is False
 
 
 class TestLiveBookRequired:

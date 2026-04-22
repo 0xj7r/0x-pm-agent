@@ -56,3 +56,35 @@ def test_record_entry_respects_existing_trade_id():
     payload = supabase.upsert_trade_safe.call_args[0][0]
 
     assert payload["id"] == "eth-threshold-999-existing"
+
+
+def test_record_paper_shadow_entry_uses_same_trade_and_decision_ids():
+    memory = MagicMock()
+    supabase = MagicMock()
+    persistence = TradePersistence("btc", memory, supabase)
+
+    trade = {
+        "decision_id": "dec-123",
+        "market_id": "123",
+        "direction": "UP",
+        "token_price": 0.42,
+        "size_usd": 10.0,
+        "shares": 23.809523,
+        "btc_price": 68000.0,
+        "move_pct": 0.08,
+        "strategy": "timing",
+        "timestamp": "2026-04-07T12:00:00+00:00",
+    }
+
+    persistence.record_paper_shadow_entry("timing", trade)
+
+    memory.save_event.assert_called_once()
+    _, kwargs = memory.save_event.call_args
+    assert kwargs["window_id"] == "123"
+    assert kwargs["event_type"] == "paper_shadow_entry"
+    assert kwargs["btc_price"] == 68000.0
+    assert kwargs["details"]["decision_id"] == "dec-123"
+    assert kwargs["details"]["trade_id"] == trade["id"]
+    assert kwargs["details"]["execution_mode"] == "paper_shadow"
+    assert kwargs["details"]["live_paired"] is True
+    supabase.upsert_trade_safe.assert_not_called()

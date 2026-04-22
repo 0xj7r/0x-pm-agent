@@ -107,6 +107,27 @@ class TradePersistence:
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
             })
 
+    def record_paper_shadow_entry(self, strategy_name: str, trade: dict) -> None:
+        """Record the paper leg of a paired live decision.
+
+        This is attribution telemetry only. It does not mutate open live
+        positions or Supabase trade state; live fills still use `entry`.
+        """
+        trade_id = self._ensure_trade_id(strategy_name, trade)
+        shadow = dict(trade)
+        shadow["trade_id"] = trade_id
+        shadow["execution_mode"] = "paper_shadow"
+        shadow["paper"] = True
+        shadow["live_paired"] = True
+        self._memory.save_event(
+            window_id=trade["market_id"],
+            event_type="paper_shadow_entry",
+            log_odds=None,
+            p_up=None,
+            btc_price=trade.get("btc_price"),
+            details=shadow,
+        )
+
     def record_exit(self, strategy_name: str, trade: dict, exit_details: dict) -> None:
         self._memory.save_event(
             window_id=trade["market_id"],

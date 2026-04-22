@@ -89,13 +89,61 @@ def test_engine_resets_window_state_on_new_window():
     engine = make_engine()
     engine._current_btc_price = 84250.0
     engine._already_traded_this_window = True
+    engine._window_submitted = True
+    engine._window_confirmed_fill = True
 
     window = make_window()
     engine._on_new_window(window)
 
     assert engine.current_window == window
-    assert engine._window_open_price == 84250.0
+    assert engine._window_open_price == 0.0
+    assert engine._window_open_ts is None
     assert engine._already_traded_this_window is False
+    assert engine._window_submitted is False
+    assert engine._window_confirmed_fill is False
+    engine.memory.close()
+
+
+def test_engine_anchors_new_window_open_from_start_trade_history():
+    engine = make_engine()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    window = MarketWindow(
+        market_id="m-anchor",
+        question="BTC Up/Down",
+        start_time=now,
+        end_time=now + timedelta(minutes=5),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+    )
+    engine._current_btc_price = 99999.0
+    engine._price_history.append((now.timestamp() - 1.0, 84100.0))
+    engine._price_history.append((now.timestamp() + 0.250, 84250.0))
+
+    engine._on_new_window(window)
+
+    assert engine._window_open_price == 84250.0
+    assert engine._window_open_ts == pytest.approx(now.timestamp() + 0.250)
+    engine.memory.close()
+
+
+def test_engine_does_not_anchor_mid_window_startup_to_current_price():
+    engine = make_engine()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    window = MarketWindow(
+        market_id="m-mid",
+        question="BTC Up/Down",
+        start_time=now - timedelta(minutes=2),
+        end_time=now + timedelta(minutes=3),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+    )
+    engine._current_btc_price = 84250.0
+    engine._price_history.append((now.timestamp(), 84250.0))
+
+    engine._on_new_window(window)
+
+    assert engine._window_open_price == 0.0
+    assert engine._window_open_ts is None
     engine.memory.close()
 
 
@@ -292,6 +340,20 @@ def test_engine_no_double_trade():
     engine._window_open_price = 100.0
     engine._current_btc_price = 110.0
     engine._already_traded_this_window = True
+
+    trades = engine._check_entry()
+
+    assert trades == []
+    engine.memory.close()
+
+
+def test_engine_no_second_signal_after_submitted_order():
+    engine = make_engine()
+    engine.current_window = make_window(up_price=0.02, down_price=0.98)
+    engine._window_open_price = 100.0
+    engine._current_btc_price = 110.0
+    engine._already_traded_this_window = False
+    engine._window_submitted = True
 
     trades = engine._check_entry()
 

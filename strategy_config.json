@@ -299,6 +299,7 @@
         "reject_streak_limit": 10,
         "reject_cooldown_seconds": 60,
         "reject_streak_cooldown_seconds": 600,
+        "paired_paper_enabled": true,
         "redeem_sweep_interval_seconds": 300,
         "redeem_blind_when_token_missing": true,
         "take_profit_enabled": true,

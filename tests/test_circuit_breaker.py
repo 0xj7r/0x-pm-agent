@@ -5,6 +5,7 @@ These prevent catastrophic trading losses.
 from __future__ import annotations
 
 import time
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -90,7 +91,7 @@ class TestRateLimiter:
         rm = _make_risk()
 
         old_time = time.time() - 3700
-        rm._trade_timestamps = [old_time] * 25
+        rm._trade_timestamps = deque([old_time] * 25)
 
         assert rm.is_rate_limited() is False, (
             "Entries older than 1 hour should not count toward rate limit"

@@ -51,6 +51,11 @@ LIVE_ENTRY_SLIPPAGE_USD = 0.01
 # Hard cap: never quote a BUY above 0.99 even after slippage.
 MAX_BUY_PRICE = 0.99
 
+# A valid window open must be anchored to an exchange trade very close to the
+# Polymarket window start. If the bot starts mid-window, do not fabricate an
+# open from the current price; skip that window instead.
+WINDOW_OPEN_ANCHOR_MAX_LAG_S = 5.0
+
 
 def _compact_dict(d: dict | None, keys: list[str]) -> dict:
     if not isinstance(d, dict):
@@ -228,6 +233,8 @@ class BTCTradingEngine:
         from collections import deque
         self._price_history: deque[tuple[float, float]] = deque()
         self._already_traded_this_window: bool = False
+        self._window_submitted: bool = False
+        self._window_confirmed_fill: bool = False
         self._running: bool = False
         self._paper_trades: list[dict] = []
         self._scanner: MarketWindowScanner | None = None
@@ -249,6 +256,10 @@ class BTCTradingEngine:
         self._live_entry_slippage_usd: float = float(
             getattr(strategy_cfg.risk, "live_entry_slippage_usd", LIVE_ENTRY_SLIPPAGE_USD)
         )
+        self._paired_paper_enabled: bool = bool(
+            getattr(strategy_cfg.risk, "paired_paper_enabled", False)
+        )
+        self._window_open_ts: float | None = None
 
     def _book_snapshot(self, token_id: str) -> dict:
         book = self.poly_ws.get_book(token_id)
@@ -391,11 +402,13 @@ class BTCTradingEngine:
 
     def _on_new_window(self, window: MarketWindow) -> None:
         self.current_window = window
-        self._window_open_price = self._current_btc_price
+        self._window_open_price = 0.0
+        self._window_open_ts = None
         self._already_traded_this_window = False
+        self._window_submitted = False
+        self._window_confirmed_fill = False
         self._last_processed_snap = None
-        if self._window_open_price > 0:
-            self._strategy.start_window(window.market_id, self._window_open_price)
+        self._anchor_window_open_from_history()
         token_ids = [t for t in [window.up_token_id, window.down_token_id] if t]
         if token_ids:
             try:
@@ -404,19 +417,76 @@ class BTCTradingEngine:
                 loop = None
             if loop is not None:
                 loop.create_task(self.poly_ws.subscribe(token_ids))
+        open_label = (
+            f"${self._window_open_price:,.2f}"
+            if self._window_open_price > 0
+            else "pending Binance start anchor"
+        )
         logger.info(
             f"New window: {window.question} | "
-            f"BTC open: ${self._window_open_price:,.2f} | "
+            f"BTC open: {open_label} | "
             f"UP: {window.up_price:.2f} DOWN: {window.down_price:.2f}"
         )
 
     async def _on_binance_trade(self, update: TradeUpdate) -> None:
         self._current_btc_price = update.price
-        now = _time.time()
-        self._price_history.append((now, update.price))
-        cutoff = now - 3600
+        event_ts = (
+            update.timestamp_ms / 1000.0
+            if update.timestamp_ms
+            else _time.time()
+        )
+        self._price_history.append((event_ts, update.price))
+        cutoff = event_ts - 3600
         while self._price_history and self._price_history[0][0] < cutoff:
             self._price_history.popleft()
+        self._anchor_window_open_from_history()
+
+    def _anchor_window_open_from_history(self) -> bool:
+        """Set the current window open from the first Binance trade at start.
+
+        This keeps paper/live decisions aligned around the same Polymarket
+        market start. A process that starts mid-window lacks that anchor and
+        must skip entries until the next window, rather than treating its first
+        observed price as the open.
+        """
+        if self.current_window is None:
+            return False
+        if self._window_open_price > 0:
+            return True
+
+        start_ts = self.current_window.start_time.timestamp()
+        end_ts = self.current_window.end_time.timestamp()
+        for ts, price in self._price_history:
+            if ts < start_ts:
+                continue
+            if ts >= end_ts:
+                break
+            lag_s = ts - start_ts
+            if lag_s > WINDOW_OPEN_ANCHOR_MAX_LAG_S:
+                logger.warning(
+                    "Skipping window %s until next rollover: first Binance "
+                    "trade after start is %.3fs late (max %.3fs)",
+                    self.current_window.market_id,
+                    lag_s,
+                    WINDOW_OPEN_ANCHOR_MAX_LAG_S,
+                )
+                return False
+            if price <= 0:
+                return False
+            self._window_open_price = float(price)
+            self._window_open_ts = float(ts)
+            self._strategy.start_window(
+                self.current_window.market_id,
+                self._window_open_price,
+            )
+            logger.info(
+                "Anchored window open: market=%s open=$%.2f lag_ms=%d",
+                self.current_window.market_id,
+                self._window_open_price,
+                int(lag_s * 1000),
+            )
+            return True
+        return False
 
     def _compute_regime(self) -> dict:
         """60-min vol + trend + categorical regime label at trigger time.
@@ -477,7 +547,7 @@ class BTCTradingEngine:
         }
 
     def _check_entry(self) -> list[dict]:
-        if not self.current_window or self._already_traded_this_window:
+        if not self.current_window or self._already_traded_this_window or self._window_submitted:
             return []
         if (self._supa is None and not self.cfg.paper.enabled
                 and os.environ.get("ALLOW_LIVE_WITHOUT_SUPABASE") != "1"):
@@ -504,9 +574,8 @@ class BTCTradingEngine:
         if self._reconcile_halt:
             return []
         if self._window_open_price == 0:
-            self._window_open_price = self._current_btc_price
-            self._strategy.start_window(self.current_window.market_id, self._window_open_price)
-            logger.info(f"Backfilled open price: ${self._window_open_price:,.2f}")
+            self._anchor_window_open_from_history()
+        if self._window_open_price == 0:
             return []
 
         # Only trade with live book data, never stale fallbacks
@@ -641,15 +710,18 @@ class BTCTradingEngine:
                     return []
 
         self._already_traded_this_window = True
+        self._window_submitted = True
         self.risk.record_trade_entry()
         regime = self._compute_regime()
         decision_ts = datetime.now(timezone.utc).isoformat()
+        decision_id = f"{self._coin}-{self._strategy.name}-{self.current_window.market_id}-{uuid4().hex}"
         book_snapshots = {
             "up": self._book_snapshot(self.current_window.up_token_id),
             "down": self._book_snapshot(self.current_window.down_token_id),
             "selected": self._book_snapshot(token_id),
         }
         trade = {
+            "decision_id": decision_id,
             "market_id": self.current_window.market_id,
             "direction": direction,
             "token_id": token_id,
@@ -662,6 +734,9 @@ class BTCTradingEngine:
             "p_win_samples": p_win_estimate.samples if p_win_estimate is not None else 0,
             "btc_price": self._current_btc_price,
             "move_pct": move_pct,
+            "window_open_price": self._window_open_price,
+            "window_open_ts": self._window_open_ts,
+            "window_start_ts": self.current_window.start_time.timestamp(),
             "strategy": self._strategy.name,
             "timestamp": decision_ts,
             "regime": regime,
@@ -705,6 +780,7 @@ class BTCTradingEngine:
                 message="paper livelike: missing token_id",
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             return None
 
         submit_price = float(t.get("token_price") or 0.0)
@@ -715,6 +791,7 @@ class BTCTradingEngine:
                 message="paper livelike: invalid submit price/size",
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             return None
 
         current_ask = float(self.poly_ws.get_price(token_id) or 0.0)
@@ -724,6 +801,7 @@ class BTCTradingEngine:
                 message="paper livelike: no live ask",
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             return None
 
         if current_ask > submit_price + 1e-9:
@@ -732,6 +810,7 @@ class BTCTradingEngine:
                 message=f"paper livelike: ask {current_ask:.4f} > submit {submit_price:.4f}",
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             return None
 
         filled_shares = desired_shares
@@ -966,10 +1045,12 @@ class BTCTradingEngine:
                 message=msg,
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             self.persistence.record_order_submit(
                 market_id=t.get("market_id", "unknown"),
                 payload={
                     "trade_id": t.get("id"),
+                    "decision_id": t.get("decision_id"),
                     "order_attempt_id": order_attempt_id,
                     "side": "BUY",
                     "token_id": t.get("token_id"),
@@ -997,10 +1078,12 @@ class BTCTradingEngine:
                 message=msg,
             )
             self._already_traded_this_window = False
+            self._window_submitted = False
             self.persistence.record_order_submit(
                 market_id=t.get("market_id", "unknown"),
                 payload={
                     "trade_id": t.get("id"),
+                    "decision_id": t.get("decision_id"),
                     "order_attempt_id": order_attempt_id,
                     "side": "BUY",
                     "token_id": t.get("token_id"),
@@ -1029,6 +1112,7 @@ class BTCTradingEngine:
             market_id=t.get("market_id", "unknown"),
             payload={
                 "trade_id": t.get("id"),
+                "decision_id": t.get("decision_id"),
                 "order_attempt_id": order_attempt_id,
                 "order_id": order_id,
                 "side": "BUY",
@@ -1049,6 +1133,7 @@ class BTCTradingEngine:
         # Fast path: order already fully matched on submit.
         if immediate_status == "matched":
             self.risk.record_order_success()
+            self._window_confirmed_fill = True
             logger.warning(
                 f"[LIVE] Order matched on submit: id={order_id}"
             )
@@ -1056,6 +1141,7 @@ class BTCTradingEngine:
                 market_id=t.get("market_id", "unknown"),
                 payload={
                     "trade_id": t.get("id"),
+                    "decision_id": t.get("decision_id"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": "matched",
@@ -1087,12 +1173,14 @@ class BTCTradingEngine:
 
         if status == "matched":
             self.risk.record_order_success()
+            self._window_confirmed_fill = True
             t["order_status"] = "matched"
             t["filled_shares"] = filled
             self.persistence.record_order_final(
                 market_id=t.get("market_id", "unknown"),
                 payload={
                     "trade_id": t.get("id"),
+                    "decision_id": t.get("decision_id"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": status,
@@ -1118,11 +1206,13 @@ class BTCTradingEngine:
             t["shares"] = filled
             t["size_usd"] = float(t["size_usd"]) * fill_ratio
             self.risk.record_order_success()
+            self._window_confirmed_fill = True
             t["filled_shares"] = filled
             self.persistence.record_order_final(
                 market_id=t.get("market_id", "unknown"),
                 payload={
                     "trade_id": t.get("id"),
+                    "decision_id": t.get("decision_id"),
                     "order_attempt_id": order_attempt_id,
                     "order_id": order_id,
                     "final_status": status,
@@ -1157,12 +1247,16 @@ class BTCTradingEngine:
             msg = f"order {status} id={order_id} resp={last_resp}"
             reason = _classify_reject_reason(msg)
         self.risk.record_order_rejection(reason=reason, message=msg)
-        self._already_traded_this_window = False
+        # Do not release the window after a submitted live order reaches a
+        # terminal no-fill state. A second same-window signal can straddle the
+        # first decision and corrupt paired paper/live attribution.
+        self._already_traded_this_window = True
         # Also persist the classified reject so we can analyze execution failure rates later.
         self.persistence.record_order_final(
             market_id=t.get("market_id", "unknown"),
             payload={
                 "trade_id": t.get("id"),
+                "decision_id": t.get("decision_id"),
                 "order_attempt_id": order_attempt_id,
                 "order_id": order_id,
                 "final_status": status,
@@ -1178,7 +1272,7 @@ class BTCTradingEngine:
         )
         logger.warning(
             f"[LIVE] Order NOT filled (status={status}): id={order_id}. "
-            f"No position recorded. Releasing window."
+            f"No position recorded. Window remains closed for re-entry."
         )
         return None
 
@@ -2050,6 +2144,11 @@ class BTCTradingEngine:
 
                     for t in self._check_entry():
                         if not self.cfg.paper.enabled:
+                            if self._paired_paper_enabled:
+                                self.persistence.record_paper_shadow_entry(
+                                    self._strategy.name,
+                                    t,
+                                )
                             trade = await self._submit_and_confirm_live_order(t)
                             if trade is None:
                                 # Order never filled (timeout / cancel / reject).

@@ -261,7 +261,7 @@ async def test_place_order_uses_market_fee_when_none_supplied(client, mock_clob_
     mock_instance.post_order.assert_called_once_with(
         {"signed": True}, OrderType.GTC
     )
-    assert result == {"orderID": "abc123", "status": "matched"}
+    assert result == {"orderID": "abc123", "status": "matched", "fee_rate_bps": 10}
 
 
 @pytest.mark.asyncio
