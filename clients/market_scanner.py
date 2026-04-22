@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -19,6 +20,9 @@ from shared.constants import SLUG_PATTERNS, WINDOW_MINUTES
 logger = logging.getLogger(__name__)
 
 SLUG_PREFIX_5M = "btc-updown-5m-"
+_PRICE_TO_BEAT_PATTERN_TEMPLATE = (
+    r'"ticker":"{slug}","slug":"{slug}".{{0,4000}}?"eventMetadata":{{"priceToBeat":([0-9.]+)'
+)
 
 
 def _safe_float(value: str | float | None, default: float = 0.0) -> float:
@@ -116,6 +120,7 @@ def parse_coin_event(
         down_token_id=down_token_id,
         up_price=up_price,
         down_price=down_price,
+        price_to_beat=None,
     )
 
 
@@ -149,6 +154,8 @@ class MarketWindowScanner:
         )
         self._slug_prefix = pattern.replace("{ts}", "")
         self._http = httpx.AsyncClient(timeout=30.0)
+        self._polymarket_event_url = "https://polymarket.com/event"
+        self._price_to_beat_cache: dict[str, float] = {}
 
     def _generate_candidate_slugs(self, count: int = 24) -> list[str]:
         """Generate slug candidates for the next N window-aligned windows."""
@@ -190,9 +197,58 @@ class MarketWindowScanner:
 
         return windows
 
+    def _parse_price_to_beat_from_html(self, html: str, slug: str) -> float | None:
+        pattern = _PRICE_TO_BEAT_PATTERN_TEMPLATE.format(slug=re.escape(slug))
+        match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        return _safe_float(match.group(1), default=0.0) or None
+
+    async def _fetch_price_to_beat(self, slug: str) -> float | None:
+        cached = self._price_to_beat_cache.get(slug)
+        if cached is not None:
+            return cached
+
+        try:
+            resp = await self._http.get(f"{self._polymarket_event_url}/{slug}")
+            if resp.status_code != 200:
+                return None
+            price_to_beat = self._parse_price_to_beat_from_html(resp.text, slug)
+            if price_to_beat is not None:
+                self._price_to_beat_cache[slug] = price_to_beat
+            return price_to_beat
+        except Exception as e:
+            logger.debug("Price To Beat fetch failed for %s: %s", slug, e)
+            return None
+
+    async def _enrich_price_to_beat(self, windows: list[MarketWindow]) -> None:
+        if not windows:
+            return
+
+        now = datetime.now(timezone.utc)
+        candidates: list[MarketWindow] = []
+        active = [w for w in windows if w.is_active(now)]
+        upcoming = sorted(
+            [w for w in windows if w.start_time >= now],
+            key=lambda w: w.start_time,
+        )
+        if active:
+            candidates.append(active[0])
+        if upcoming:
+            candidates.append(upcoming[0])
+
+        seen: set[str] = set()
+        for window in candidates:
+            if not window.slug or window.slug in seen:
+                continue
+            seen.add(window.slug)
+            if window.price_to_beat is None:
+                window.price_to_beat = await self._fetch_price_to_beat(window.slug)
+
     async def get_current_window(self) -> MarketWindow | None:
         now = datetime.now(timezone.utc)
         windows = await self.find_active_windows()
+        await self._enrich_price_to_beat(windows)
 
         for w in windows:
             if w.is_active(now):
