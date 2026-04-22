@@ -232,10 +232,11 @@ async def test_reconciles_three_entries_marks_two_resolved_one_won():
     # Exactly two resolution rows written. Active market still only has
     # its entry.
     resolutions = mem.conn.execute(
-        "SELECT window_id FROM event_log WHERE event_type = 'resolution' ORDER BY id"
+        "SELECT window_id, details FROM event_log WHERE event_type = 'resolution' ORDER BY id"
     ).fetchall()
     resolved_windows = sorted(r[0] for r in resolutions)
     assert resolved_windows == ["m-lost", "m-won"]
+    assert all('"source": "reconcile"' in details for _, details in resolutions)
 
     active_events = mem.get_events_for_window("m-active")
     assert [e["event_type"] for e in active_events] == ["entry"]

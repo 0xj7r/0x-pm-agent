@@ -30,12 +30,14 @@ def test_record_entry_assigns_stable_id_and_resolution_reuses_it():
     entry_payload = supabase.upsert_trade_safe.call_args_list[0][0][0]
 
     resolution = MagicMock(won=True, pnl_usd=12.34)
-    persistence.record_resolution("threshold", trade, resolution, "UP")
+    persistence.record_resolution("threshold", trade, resolution, "UP", source="push")
     resolution_payload = supabase.upsert_trade_safe.call_args_list[1][0][0]
+    _, resolution_kwargs = memory.save_event.call_args_list[1]
 
     assert trade["id"].startswith("btc-threshold-123-")
     assert entry_payload["id"] == trade["id"]
     assert resolution_payload["id"] == trade["id"]
+    assert resolution_kwargs["details"]["source"] == "push"
 
 
 def test_record_entry_respects_existing_trade_id():
