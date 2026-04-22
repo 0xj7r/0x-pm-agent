@@ -271,6 +271,8 @@ class BTCTradingEngine:
             getattr(strategy_cfg.risk, "paired_paper_enabled", False)
         )
         self._window_open_ts: float | None = None
+        self._entry_blocker: dict | None = None
+        self._last_logged_entry_blocker_key: tuple[str, str] | None = None
 
     def _book_snapshot(self, token_id: str) -> dict:
         book = self.poly_ws.get_book(token_id)
@@ -286,6 +288,103 @@ class BTCTradingEngine:
             "best_ask_size": float(getattr(book, "best_ask_size", 0.0) or 0.0),
             "spread": float(book.spread or 0.0),
             "age_ms": age_ms,
+        }
+
+    def _set_entry_blocker(self, reason: str, **details) -> None:
+        window_id = self.current_window.market_id if self.current_window else "none"
+        blocker = {
+            "window_id": window_id,
+            "reason": reason,
+            **details,
+        }
+        self._entry_blocker = blocker
+        blocker_key = (window_id, reason)
+        if self._last_logged_entry_blocker_key != blocker_key:
+            detail_parts = [f"{k}={v}" for k, v in details.items() if v is not None]
+            suffix = f" | {' '.join(detail_parts)}" if detail_parts else ""
+            logger.info("ENTRY BLOCKED: %s%s", reason, suffix)
+            self._last_logged_entry_blocker_key = blocker_key
+
+    def _clear_entry_blocker(self) -> None:
+        self._entry_blocker = None
+        self._last_logged_entry_blocker_key = None
+
+    def _classify_signal_skip(
+        self,
+        signal: str | None,
+        move_pct: float,
+        current_hour: int,
+        price_up: float,
+        price_down: float,
+    ) -> tuple[str, dict]:
+        params = self._strategy.params
+        move_threshold = float(params.get("move", 0.08))
+        if signal is None and abs(move_pct) < move_threshold:
+            return "below_move", {
+                "move_pct": round(move_pct, 6),
+                "move_threshold": move_threshold,
+            }
+
+        skip_hours = params.get("skip_hours")
+        if skip_hours is not None and current_hour in {int(h) for h in skip_hours}:
+            return "disallowed_hour", {
+                "current_hour": current_hour,
+            }
+
+        allowed_hours = params.get("allowed_hours")
+        if allowed_hours is not None and current_hour not in {int(h) for h in allowed_hours}:
+            return "disallowed_hour", {
+                "current_hour": current_hour,
+            }
+
+        hour_start = params.get("hour_start")
+        hour_end = params.get("hour_end")
+        if (
+            hour_start is not None
+            and hour_end is not None
+            and not ((hour_start <= current_hour < hour_end) if hour_start <= hour_end else (current_hour >= hour_start or current_hour < hour_end))
+        ):
+            return "disallowed_hour", {
+                "current_hour": current_hour,
+            }
+
+        elapsed_pct = None
+        if self._strategy._market_state and self._strategy._market_state.elapsed_pct:
+            elapsed_pct = float(self._strategy._market_state.elapsed_pct[-1])
+        elapsed_limit = float(params.get("elapsed", 1.0))
+        if elapsed_pct is not None and elapsed_pct > elapsed_limit:
+            return "elapsed_too_late", {
+                "elapsed_pct": round(elapsed_pct, 6),
+                "elapsed_limit": elapsed_limit,
+            }
+
+        if move_pct > 0:
+            direction = "UP"
+            candidate_price = price_up
+        elif move_pct < 0:
+            direction = "DOWN"
+            candidate_price = price_down
+        else:
+            direction = None
+            candidate_price = None
+        max_entry = float(params.get("max_entry", MAX_BUY_PRICE))
+        min_entry = float(params.get("min_entry", 0.0))
+        if candidate_price is not None and candidate_price > max_entry:
+            return "entry_above_max", {
+                "direction": direction,
+                "candidate_price": round(candidate_price, 6),
+                "max_entry": max_entry,
+            }
+        if candidate_price is not None and candidate_price < min_entry:
+            return "entry_below_min", {
+                "direction": direction,
+                "candidate_price": round(candidate_price, 6),
+                "min_entry": min_entry,
+            }
+
+        return "strategy_filter_skip", {
+            "signal": signal,
+            "move_pct": round(move_pct, 6),
         }
 
     @staticmethod
@@ -416,6 +515,7 @@ class BTCTradingEngine:
         self._window_open_price = 0.0
         self._window_open_source = None
         self._window_open_ts = None
+        self._entry_blocker = None
         self._price_to_beat_refresh_market_id = None
         self._window_open_skip_logged_market_id = None
         self._already_traded_this_window = False
@@ -653,8 +753,17 @@ class BTCTradingEngine:
         }
 
     def _check_entry(self) -> list[dict]:
-        if not self.current_window or self._already_traded_this_window or self._window_submitted:
+        def blocked(reason: str, **details) -> list[dict]:
+            self._set_entry_blocker(reason, **details)
             return []
+
+        if not self.current_window or self._already_traded_this_window or self._window_submitted:
+            reason = "no_active_window"
+            if self._already_traded_this_window:
+                reason = "already_traded_window"
+            elif self._window_submitted:
+                reason = "window_submitted_pending"
+            return blocked(reason)
         if (self._supa is None and not self.cfg.paper.enabled
                 and os.environ.get("ALLOW_LIVE_WITHOUT_SUPABASE") != "1"):
             if not getattr(self, "_logged_no_supa", False):
@@ -664,31 +773,39 @@ class BTCTradingEngine:
                     "ALLOW_LIVE_WITHOUT_SUPABASE=1 to bypass."
                 )
                 self._logged_no_supa = True
-            return []
+            return blocked("live_supabase_missing")
         if self._current_btc_price == 0:
-            return []
+            return blocked("btc_price_unavailable")
         if self.balance <= self.risk.kill_balance:
-            return []
+            return blocked(
+                "kill_balance",
+                balance=round(self.balance, 6),
+                kill_balance=round(self.risk.kill_balance, 6),
+            )
         if self.risk.is_drawdown_breaker_tripped(self.balance):
-            return []
+            return blocked("drawdown_breaker", balance=round(self.balance, 6))
         if self.risk.is_rate_limited():
-            return []
+            return blocked("rate_limited")
         if self.risk.is_daily_trade_cap_reached():
-            return []
+            return blocked("daily_trade_cap")
         if self.risk.is_reject_streak_tripped():
-            return []
+            return blocked("reject_streak")
         if self._reconcile_halt:
-            return []
+            return blocked("reconcile_halt")
         if self._window_open_price == 0:
             self._anchor_window_open_from_history()
         if self._window_open_price == 0:
-            return []
+            return blocked("missing_window_anchor")
 
         # Only trade with live book data, never stale fallbacks
         has_live_up = self.poly_ws.has_live_book(self.current_window.up_token_id)
         has_live_down = self.poly_ws.has_live_book(self.current_window.down_token_id)
         if not has_live_up or not has_live_down:
-            return []
+            return blocked(
+                "missing_live_book",
+                has_live_up=has_live_up,
+                has_live_down=has_live_down,
+            )
 
         move_pct = (self._current_btc_price - self._window_open_price) / self._window_open_price * 100
 
@@ -697,7 +814,7 @@ class BTCTradingEngine:
 
         current_snap = (self._current_btc_price, price_up, price_down)
         if self._last_processed_snap == current_snap:
-            return []
+            return blocked("duplicate_market_snapshot")
         self._last_processed_snap = current_snap
 
         current_hour = datetime.now(timezone.utc).hour
@@ -721,7 +838,14 @@ class BTCTradingEngine:
             )
 
         if signal is None or signal == "SKIP":
-            return []
+            reason, details = self._classify_signal_skip(
+                signal=signal,
+                move_pct=move_pct,
+                current_hour=current_hour,
+                price_up=price_up,
+                price_down=price_down,
+            )
+            return blocked(reason, **details)
 
         direction = signal.upper()
         if direction == "UP":
@@ -783,7 +907,12 @@ class BTCTradingEngine:
                     p_win_estimate.samples,
                     effective_token_price,
                 )
-            return []
+            return blocked(
+                "empirical_kelly_zero",
+                bucket=p_win_estimate.bucket if p_win_estimate is not None else None,
+                p_win=round(p_win_estimate.p_win, 6) if p_win_estimate is not None else None,
+                price=round(effective_token_price, 6),
+            )
 
         # Polymarket CLOB rejects live orders below its per-market minimum
         # share count (typically 5). Paper mode has no such constraint —
@@ -801,7 +930,12 @@ class BTCTradingEngine:
                         f"SKIP: Kelly size ${size_usd:.2f} gives shares {shares_at_size:.2f} "
                         f"< min_shares={min_shares}; not scaling beyond Kelly"
                     )
-                    return []
+                    return blocked(
+                        "min_shares_not_met",
+                        shares=round(shares_at_size, 6),
+                        min_shares=round(min_shares, 6),
+                        size_usd=round(size_usd, 6),
+                    )
                 elif needed_usd <= cap_usd and needed_usd <= self.balance * self.cfg.risk.max_position_pct * 1.5:
                     logger.info(
                         f"Scaling size ${size_usd:.2f} -> ${needed_usd:.2f} to meet "
@@ -813,10 +947,16 @@ class BTCTradingEngine:
                         f"SKIP: shares {shares_at_size:.2f} < min {min_shares} "
                         f"and needed ${needed_usd:.2f} exceeds 1.5x cap"
                     )
-                    return []
+                    return blocked(
+                        "min_shares_not_met",
+                        shares=round(shares_at_size, 6),
+                        min_shares=round(min_shares, 6),
+                        needed_usd=round(needed_usd, 6),
+                    )
 
         self._already_traded_this_window = True
         self._window_submitted = True
+        self._clear_entry_blocker()
         self.risk.record_trade_entry()
         regime = self._compute_regime()
         decision_ts = datetime.now(timezone.utc).isoformat()
@@ -2399,6 +2539,7 @@ class BTCTradingEngine:
                             trades_total=total,
                             up_price=up_live,
                             down_price=down_live,
+                            entry_blocker=self._entry_blocker,
                         )
 
                         if self._supa and self._supa._dlq:
