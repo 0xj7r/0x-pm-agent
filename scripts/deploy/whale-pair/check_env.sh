@@ -15,7 +15,6 @@ fi
 REQUIRED_VARS=(
     POLYMARKET_PRIVATE_KEY
     POLYMARKET_SIGNATURE_TYPE
-    POLYMARKET_FUNDER
     STRATEGY_CONFIG
 )
 
@@ -44,11 +43,17 @@ case "$SIG_VALUE" in
         ;;
 esac
 
-# Funder must look like a hex address.
-FUNDER_VALUE=$(grep -E "^POLYMARKET_FUNDER=" "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-if ! printf '%s' "$FUNDER_VALUE" | grep -qiE '^0x[0-9a-f]{40}$'; then
-    echo "ERROR: POLYMARKET_FUNDER must be a 0x-prefixed 40-char hex address" >&2
-    exit 5
+# Funder is required only for proxy/safe modes.
+FUNDER_VALUE=$(grep -E "^POLYMARKET_FUNDER=" "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+if [ "$SIG_VALUE" = "1" ] || [ "$SIG_VALUE" = "2" ]; then
+    if [ -z "$FUNDER_VALUE" ]; then
+        echo "ERROR: POLYMARKET_FUNDER is required when POLYMARKET_SIGNATURE_TYPE=$SIG_VALUE" >&2
+        exit 5
+    fi
+    if ! printf '%s' "$FUNDER_VALUE" | grep -qiE '^0x[0-9a-f]{40}$'; then
+        echo "ERROR: POLYMARKET_FUNDER must be a 0x-prefixed 40-char hex address" >&2
+        exit 5
+    fi
 fi
 
 # Private key must look like hex (allow with or without 0x prefix).
