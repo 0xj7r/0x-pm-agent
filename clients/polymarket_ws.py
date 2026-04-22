@@ -26,6 +26,22 @@ class TokenBook:
     spread: float = 0.0
     last_trade_price: float = 0.0
     last_update: float = 0.0
+    bids: list[dict[str, float]] = field(default_factory=list)
+    asks: list[dict[str, float]] = field(default_factory=list)
+
+    def as_orderbook(self, depth: int | None = None) -> dict[str, list[dict[str, float]]]:
+        """Return a JSON-serialisable orderbook view.
+
+        `depth=None` keeps all stored levels. When `depth` is positive, the
+        returned arrays are truncated to that many levels per side.
+        """
+        if depth is None or depth <= 0:
+            bids = self.bids
+            asks = self.asks
+        else:
+            bids = self.bids[:depth]
+            asks = self.asks[:depth]
+        return {"bids": bids, "asks": asks}
 
 
 class PolymarketWSClient:
@@ -56,6 +72,38 @@ class PolymarketWSClient:
         """Check if we have a live order book (not stale fallback)."""
         book = self._books.get(token_id)
         return book is not None and book.best_ask > 0
+
+    def book_age_ms(self, token_id: str, now: float | None = None) -> float | None:
+        """Milliseconds since the last book update for `token_id`.
+
+        Returns None when the token has never been seen or has no update yet.
+        `now` is an epoch seconds override for tests.
+        """
+        book = self._books.get(token_id)
+        if book is None or book.last_update <= 0:
+            return None
+        current = time.time() if now is None else now
+        return max(0.0, (current - book.last_update) * 1000.0)
+
+    def is_book_fresh(
+        self,
+        token_id: str,
+        *,
+        max_age_ms: float,
+        now: float | None = None,
+    ) -> bool:
+        """True when we have a live ask and its age is within `max_age_ms`."""
+        if not self.has_live_book(token_id):
+            return False
+        age = self.book_age_ms(token_id, now=now)
+        if age is None:
+            return False
+        return age <= max_age_ms
+
+    @property
+    def connected(self) -> bool:
+        """True while a live WS connection is held."""
+        return self._ws is not None
 
     async def subscribe(self, token_ids: list[str]) -> None:
         """Subscribe to new token IDs (can be called while connected)."""
@@ -158,6 +206,20 @@ class PolymarketWSClient:
 
         bids = data.get("bids", [])
         asks = data.get("asks", [])
+        book.bids = [
+            {
+                "price": float(level.get("price", 0) or 0),
+                "size": float(level.get("size", level.get("s", 0)) or 0),
+            }
+            for level in bids
+        ]
+        book.asks = [
+            {
+                "price": float(level.get("price", 0) or 0),
+                "size": float(level.get("size", level.get("s", 0)) or 0),
+            }
+            for level in asks
+        ]
         if bids:
             book.best_bid = float(bids[0].get("price", 0))
             book.best_bid_size = float(bids[0].get("size", bids[0].get("s", 0)) or 0)

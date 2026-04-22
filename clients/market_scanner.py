@@ -118,6 +118,13 @@ def parse_coin_event(
         up_price=up_price,
         down_price=down_price,
         price_to_beat=None,
+        condition_id=str(
+            market.get("conditionId")
+            or market.get("condition_id")
+            or event.get("conditionId")
+            or ""
+        ),
+        event_id=str(event.get("id", market.get("id", ""))),
     )
 
 
