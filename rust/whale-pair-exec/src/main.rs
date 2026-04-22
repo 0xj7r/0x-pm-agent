@@ -1,11 +1,5 @@
-mod book;
-mod config;
-mod logging;
-mod market_ws;
-mod metrics;
-mod user_ws;
-
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::task::JoinHandle;
@@ -13,20 +7,34 @@ use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::book::BookStore;
-use crate::config::AppConfig;
-use crate::market_ws::MarketWsClient;
-use crate::metrics::{serve_http, AppMetrics};
-use crate::user_ws::UserWsClient;
+use whale_pair_exec::book::BookStore;
+use whale_pair_exec::config::AppConfig;
+use whale_pair_exec::market_ws::MarketWsClient;
+use whale_pair_exec::metrics::{serve_http, AppMetrics};
+use whale_pair_exec::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
+use whale_pair_exec::strategy::NoopStrategy;
+use whale_pair_exec::types::{InstrumentId, MarketId, RuntimeStatus};
+use whale_pair_exec::user_ws::UserWsClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = AppConfig::from_env()?;
-    logging::init(&config)?;
+    whale_pair_exec::logging::init(&config)?;
 
     let metrics = Arc::new(AppMetrics::new()?);
     let books = Arc::new(BookStore::new(&config.market_assets));
     let shutdown = CancellationToken::new();
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: config.starting_cash_usd,
+            event_log_capacity: config.event_log_capacity,
+            initial_status: RuntimeStatus::Starting,
+        },
+        config.risk_limits.clone(),
+        NoopStrategy,
+    );
+
+    log_runtime_outcome("startup", runtime.start(now_unix_ms()));
 
     info!(
         service = %config.service_name,
@@ -35,14 +43,24 @@ async fn main() -> Result<()> {
         metrics_bind = %config.metrics_bind,
         loop_interval_ms = config.runtime_loop_interval.as_millis(),
         book_stale_after_ms = config.book_stale_after.as_millis(),
+        starting_cash_usd = config.starting_cash_usd,
+        event_log_capacity = config.event_log_capacity,
         "starting whale pair execution scaffold"
     );
 
     let metrics_handle = spawn_metrics(metrics.clone(), &config, shutdown.child_token());
-    let market_ws_handle = spawn_market_ws(metrics.clone(), books.clone(), &config, shutdown.child_token());
+    let market_ws_handle =
+        spawn_market_ws(metrics.clone(), books.clone(), &config, shutdown.child_token());
     let user_ws_handle = spawn_user_ws(metrics.clone(), &config, shutdown.child_token());
 
-    run_runtime_loop(&config, books.clone(), metrics.clone(), shutdown.clone()).await?;
+    run_runtime_loop(
+        &config,
+        books.clone(),
+        metrics.clone(),
+        shutdown.clone(),
+        &mut runtime,
+    )
+    .await?;
 
     shutdown.cancel();
     join_task("market-ws", market_ws_handle).await;
@@ -115,6 +133,7 @@ async fn run_runtime_loop(
     books: Arc<BookStore>,
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
+    runtime: &mut Runtime<NoopStrategy>,
 ) -> Result<()> {
     let mut ticks = interval(config.runtime_loop_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -136,7 +155,15 @@ async fn run_runtime_loop(
                 metrics.refresh_stream_ages();
                 for asset_id in &config.market_assets {
                     match books.snapshot(asset_id).await {
-                        Some(book) if book.last_update_unix_ms > 0 => metrics.observe_book(&book, config.book_stale_after),
+                        Some(book) if book.last_update_unix_ms > 0 => {
+                            metrics.observe_book(&book, config.book_stale_after);
+                            let outcome = runtime.on_book_state(
+                                MarketId::from(config.market_id_for_asset(asset_id)),
+                                InstrumentId::from(asset_id.as_str()),
+                                &book,
+                            )?;
+                            log_runtime_outcome("book", outcome);
+                        }
                         _ => metrics.observe_missing_book(asset_id),
                     }
                 }
@@ -160,7 +187,14 @@ async fn run_runtime_loop(
                         )
                     })
                     .collect();
-                info!(books = summary.join(" | "), "runtime book summary");
+                info!(
+                    books = summary.join(" | "),
+                    runtime_events = runtime.event_log().latest_seq(),
+                    open_orders = runtime.open_orders().count(),
+                    free_cash_usd = runtime.inventory().free_cash_usd(),
+                    gross_exposure_usd = runtime.inventory().gross_exposure_usd(),
+                    "runtime book summary"
+                );
             }
         }
     }
@@ -170,4 +204,30 @@ async fn join_task(name: &str, handle: JoinHandle<()>) {
     if let Err(error) = handle.await {
         warn!(task = name, error = ?error, "background task join failed");
     }
+}
+
+fn log_runtime_outcome(source: &str, outcome: RuntimeOutcome) {
+    if !outcome.commands.is_empty() {
+        warn!(
+            source,
+            command_count = outcome.commands.len(),
+            commands = ?outcome.commands,
+            "runtime emitted commands but execution adapter is not wired yet"
+        );
+    }
+    if !outcome.event_seqs.is_empty() {
+        info!(
+            source,
+            event_count = outcome.event_seqs.len(),
+            latest_seq = outcome.event_seqs.last().copied().unwrap_or_default(),
+            "runtime accepted hot-path update"
+        );
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

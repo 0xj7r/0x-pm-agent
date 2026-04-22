@@ -23,6 +23,7 @@ Passive standby means:
 
 - bootstrap: [scripts/deploy/whale-pair/standby_bootstrap.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/standby_bootstrap.sh)
 - status: [scripts/deploy/whale-pair/standby_status.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/standby_status.sh)
+- promote: [scripts/deploy/whale-pair/promote_standby.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/promote_standby.sh)
 - restore helper: [scripts/deploy/whale-pair/restore_data.sh](/Users/jackreid/go/polymarket-agent/scripts/deploy/whale-pair/restore_data.sh)
 
 ## Bootstrap the Standby
@@ -67,9 +68,11 @@ bash scripts/deploy/whale-pair/standby_status.sh
 It shows:
 
 - standby role marker contents
+- restore metadata and restored archive provenance
 - ledger path, size, and modification time
 - latest backup archive present locally
 - current Docker Compose service status
+- `promotion_ready=yes|no` plus guardrail reasons when it is not safe to fail over
 
 ## Daily Operator Loop
 
@@ -80,7 +83,13 @@ cd /opt/polymarket-agent
 bash scripts/deploy/whale-pair/backup_data.sh
 ```
 
-2. Copy latest archive to standby.
+2. Copy latest archive to standby. For a repeatable copy step:
+
+```bash
+cd /opt/polymarket-agent
+bash scripts/deploy/whale-pair/replicate_backup.sh --latest --dest deploy@us-east-standby:/opt/polymarket-agent/data/backups/
+```
+
 3. On standby, refresh from that archive:
 
 ```bash
@@ -109,8 +118,12 @@ Promotion command:
 
 ```bash
 cd /opt/polymarket-agent
-bash scripts/deploy/whale-pair/start.sh --live
+bash scripts/deploy/whale-pair/promote_standby.sh --confirm-primary-stopped
 ```
+
+`promote_standby.sh` blocks promotion unless the standby is still marked passive, the restore metadata exists, and the restored archive matches the newest local backup unless you deliberately override that check.
+
+Direct `start.sh --live` is blocked on passive standby hosts so failover always goes through this guardrailed path.
 
 After promotion:
 
@@ -132,7 +145,8 @@ Do not reintroduce it as live until there is a deliberate handoff.
 
 ## Constraints
 
-- This is not automated replication.
+- This is not database-level replication.
+- Recurring backup replication can be installed separately with `install_backup_replication_cron.sh`.
 - This does not guarantee zero data loss between the last copied backup and the failure moment.
 - `.env` and wallet custody remain manual operator responsibilities.
 

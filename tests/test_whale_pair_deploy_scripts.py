@@ -33,9 +33,12 @@ EXPECTED_SCRIPTS = [
     "health.sh",
     "kill.sh",
     "backup_data.sh",
+    "replicate_backup.sh",
+    "install_backup_replication_cron.sh",
     "restore_data.sh",
     "standby_bootstrap.sh",
     "standby_status.sh",
+    "promote_standby.sh",
 ]
 
 EXPECTED_MONITORING_SCRIPTS = [
@@ -44,6 +47,8 @@ EXPECTED_MONITORING_SCRIPTS = [
     "refresh_monitoring_metrics.sh",
     "install_monitoring_cron.sh",
     "monitoring_health.sh",
+    "render_alertmanager_config.sh",
+    "send_test_alert.sh",
 ]
 
 VALID_FUNDER = "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
@@ -112,6 +117,7 @@ class TestDeployDirectoryLayout:
         text = MONITOR_DOC_PATH.read_text()
         assert "Prometheus" in text
         assert "Grafana" in text
+        assert "Alertmanager" in text
         assert "cron" in text.lower()
         assert "alert" in text.lower()
         assert "start_monitoring.sh" in text
@@ -184,8 +190,14 @@ class TestMonitoringComposeFile:
     def test_contains_monitoring_services(self) -> None:
         data = self._load()
         services = data.get("services", {})
-        for name in ("prometheus", "grafana", "node-exporter", "cadvisor"):
+        for name in ("alertmanager", "prometheus", "grafana", "node-exporter", "cadvisor"):
             assert name in services
+
+    def test_alertmanager_mounts_runtime_config(self) -> None:
+        svc = self._load()["services"]["alertmanager"]
+        volumes = svc.get("volumes", [])
+        assert any("data/monitoring/alertmanager/alertmanager.yml" in item for item in volumes)
+        assert any("data/monitoring/alertmanager/data" in item for item in volumes)
 
     def test_prometheus_mounts_repo_config_and_rules(self) -> None:
         svc = self._load()["services"]["prometheus"]
@@ -201,8 +213,10 @@ class TestMonitoringComposeFile:
 
     def test_binds_only_loopback_by_default(self) -> None:
         data = self._load()
+        alertmanager_ports = data["services"]["alertmanager"].get("ports", [])
         prom_ports = data["services"]["prometheus"].get("ports", [])
         grafana_ports = data["services"]["grafana"].get("ports", [])
+        assert any("127.0.0.1" in port for port in alertmanager_ports)
         assert any("127.0.0.1" in port for port in prom_ports)
         assert any("127.0.0.1" in port for port in grafana_ports)
 
@@ -215,6 +229,8 @@ class TestMonitoringOpsFiles:
         jobs = {job["job_name"] for job in data.get("scrape_configs", [])}
         assert {"prometheus", "node-exporter", "cadvisor"} <= jobs
         assert data.get("rule_files"), "prometheus config must load alert rules"
+        targets = data["alerting"]["alertmanagers"][0]["static_configs"][0]["targets"]
+        assert "alertmanager:9093" in targets
 
     def test_alert_rules_exist_for_key_failures(self) -> None:
         path = OPS_DIR / "prometheus" / "rules" / "whale-pair-alerts.yml"
@@ -237,6 +253,59 @@ class TestMonitoringOpsFiles:
         assert ds.is_file()
         assert dashboards.is_file()
         assert dashboard_json.is_file()
+
+    def test_render_alertmanager_script_renders_blackhole_by_default(self, tmp_path: Path) -> None:
+        output = tmp_path / "alertmanager.yml"
+        result = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "render_alertmanager_config.sh"),
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "REPO_ROOT": str(REPO_ROOT)},
+        )
+        assert result.returncode == 0, result.stderr
+        assert output.is_file()
+        data = yaml.safe_load(output.read_text())
+        assert data["route"]["receiver"] == "blackhole"
+        assert any(receiver["name"] == "blackhole" for receiver in data["receivers"])
+
+    def test_render_alertmanager_script_renders_enabled_receivers(self, tmp_path: Path) -> None:
+        output = tmp_path / "alertmanager.yml"
+        env = {
+            **os.environ,
+            "WHALE_PAIR_DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/test",
+            "WHALE_PAIR_TELEGRAM_BOT_TOKEN": "123456:test-token",
+            "WHALE_PAIR_TELEGRAM_CHAT_ID": "-1001234567890",
+            "WHALE_PAIR_ALERT_WEBHOOK_URL": "https://alerts.example.test/hook",
+            "WHALE_PAIR_ALERT_WEBHOOK_BEARER_TOKEN": "secret-token",
+        }
+        result = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "render_alertmanager_config.sh"),
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        data = yaml.safe_load(output.read_text())
+        assert data["route"]["receiver"] == "whale-pair-notifications"
+        receiver = next(item for item in data["receivers"] if item["name"] == "whale-pair-notifications")
+        assert receiver["discord_configs"][0]["webhook_url"] == "https://discord.com/api/webhooks/test"
+        assert receiver["telegram_configs"][0]["bot_token"] == "123456:test-token"
+        assert receiver["telegram_configs"][0]["chat_id"] == -1001234567890
+        assert receiver["webhook_configs"][0]["url"] == "https://alerts.example.test/hook"
+        assert (
+            receiver["webhook_configs"][0]["http_config"]["authorization"]["credentials"]
+            == "secret-token"
+        )
 
     def test_dashboard_json_mentions_core_metrics(self) -> None:
         path = OPS_DIR / "grafana" / "dashboards" / "whale-pair-overview.json"
@@ -336,7 +405,18 @@ class TestScriptUsage:
         )
         assert result.returncode != 0
 
-    @pytest.mark.parametrize("name", ["backup_data.sh", "restore_data.sh", "standby_bootstrap.sh"])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "backup_data.sh",
+            "replicate_backup.sh",
+            "install_backup_replication_cron.sh",
+            "restore_data.sh",
+            "standby_bootstrap.sh",
+            "standby_status.sh",
+            "promote_standby.sh",
+        ],
+    )
     def test_usage_scripts_print_help(self, name: str) -> None:
         result = subprocess.run(
             ["bash", str(DEPLOY_DIR / name), "--help"],
@@ -381,6 +461,40 @@ class TestBackupAndStandbyHelpers:
         checksums = list(backups_dir.glob("whale-pair-data-*.sha256"))
         assert len(archives) == len(manifests) == len(checksums) == 1
         assert "db count: 1" in result.stdout
+
+    def test_backup_data_can_run_replication_hook(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "notes.txt").write_text("backup hello\n")
+        conn = sqlite3.connect(str(data_dir / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('row-1')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        replica_dir = tmp_path / "replica"
+        result = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+                "--replicate-hook",
+                str(DEPLOY_DIR / "replicate_backup.sh"),
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(data_dir),
+                "BACKUP_REPLICA_DEST": str(replica_dir),
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert list(replica_dir.glob("whale-pair-data-*.tar.gz"))
+        assert list(replica_dir.glob("whale-pair-data-*.sha256"))
+        assert list(replica_dir.glob("whale-pair-data-*.manifest.json"))
 
     def test_restore_data_restores_latest_archive(self, tmp_path: Path) -> None:
         source_data = tmp_path / "source-data"
@@ -428,11 +542,53 @@ class TestBackupAndStandbyHelpers:
         )
         assert restore.returncode == 0, restore.stderr
         assert (target_data / "notes.txt").read_text() == "restored hello\n"
+        meta_file = target_data / "whale_pair_restore.meta"
+        assert meta_file.is_file()
+        assert "archive_basename=" in meta_file.read_text()
 
         conn = sqlite3.connect(str(target_data / "whale_pair_live.db"))
         row = conn.execute("SELECT note FROM events").fetchone()
         conn.close()
         assert row == ("restored-row",)
+
+    def test_restore_data_inspect_prints_manifest_and_checksum(self, tmp_path: Path) -> None:
+        source_data = tmp_path / "source-data"
+        source_data.mkdir()
+        (source_data / "notes.txt").write_text("inspect hello\n")
+        conn = sqlite3.connect(str(source_data / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('inspect-row')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        backup = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(source_data)},
+        )
+        assert backup.returncode == 0, backup.stderr
+
+        archive = next(backups_dir.glob("whale-pair-data-*.tar.gz"))
+        inspect = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "restore_data.sh"),
+                str(archive),
+                "--inspect",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert inspect.returncode == 0, inspect.stderr
+        assert "manifest=" in inspect.stdout
+        assert "checksum=" in inspect.stdout
 
     def test_standby_bootstrap_writes_role_file_without_starting(self, tmp_path: Path) -> None:
         data_dir = tmp_path / "standby-data"
@@ -462,6 +618,173 @@ class TestBackupAndStandbyHelpers:
         text = role_file.read_text()
         assert "role=passive-standby" in text
         assert "primary=pytest-primary" in text
+        assert "restore_mode=none" in text
+
+    def test_standby_status_reports_promotion_ready_when_restore_matches_latest_backup(self, tmp_path: Path) -> None:
+        source_data = tmp_path / "source-data"
+        source_data.mkdir()
+        (source_data / "notes.txt").write_text("ready hello\n")
+        conn = sqlite3.connect(str(source_data / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('ready-row')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        backup = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(source_data)},
+        )
+        assert backup.returncode == 0, backup.stderr
+
+        standby_data = tmp_path / "standby-data"
+        standby_data.mkdir()
+        env_file = _write_env(tmp_path, POLYMARKET_SIGNATURE_TYPE="0", POLYMARKET_FUNDER="")
+        bootstrap = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "standby_bootstrap.sh"),
+                "--restore-latest",
+                "--primary",
+                "pytest-primary",
+                "--no-start",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(standby_data),
+                "BACKUP_DIR": str(backups_dir),
+                "ENV_FILE": str(env_file),
+            },
+        )
+        assert bootstrap.returncode == 0, bootstrap.stderr
+
+        status = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "standby_status.sh"),
+                "--assert-ready",
+                "--skip-health-check",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(standby_data),
+                "BACKUP_DIR": str(backups_dir),
+            },
+        )
+        assert status.returncode == 0, status.stderr
+        assert "promotion_ready=yes" in status.stdout
+
+    def test_start_live_rejects_passive_standby_without_promotion_flow(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "standby-data"
+        data_dir.mkdir()
+        (data_dir / "whale_pair_standby.role").write_text("role=passive-standby\n")
+        env_file = _write_env(tmp_path)
+
+        result = subprocess.run(
+            ["bash", str(DEPLOY_DIR / "start.sh"), "--live"],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(data_dir),
+                "ROLE_FILE": str(data_dir / "whale_pair_standby.role"),
+                "ENV_FILE": str(env_file),
+            },
+        )
+        assert result.returncode != 0
+        assert "promote_standby.sh" in result.stderr
+
+    def test_promote_standby_requires_primary_stop_confirmation(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "standby-data"
+        data_dir.mkdir()
+        (data_dir / "whale_pair_standby.role").write_text("role=passive-standby\n")
+        (data_dir / "whale_pair_restore.meta").write_text("archive_basename=archive.tar.gz\n")
+
+        result = subprocess.run(
+            ["bash", str(DEPLOY_DIR / "promote_standby.sh"), "--dry-run"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(data_dir)},
+        )
+        assert result.returncode != 0
+        assert "--confirm-primary-stopped" in result.stderr
+
+    def test_promote_standby_dry_run_validates_guardrails(self, tmp_path: Path) -> None:
+        source_data = tmp_path / "source-data"
+        source_data.mkdir()
+        (source_data / "notes.txt").write_text("promote hello\n")
+        conn = sqlite3.connect(str(source_data / "whale_pair_live.db"))
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO events (note) VALUES ('promote-row')")
+        conn.commit()
+        conn.close()
+
+        backups_dir = tmp_path / "backups"
+        backup = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "backup_data.sh"),
+                "--dest",
+                str(backups_dir),
+            ],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DATA_DIR": str(source_data)},
+        )
+        assert backup.returncode == 0, backup.stderr
+
+        standby_data = tmp_path / "standby-data"
+        standby_data.mkdir()
+        env_file = _write_env(tmp_path, POLYMARKET_SIGNATURE_TYPE="0", POLYMARKET_FUNDER="")
+        bootstrap = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "standby_bootstrap.sh"),
+                "--restore-latest",
+                "--primary",
+                "pytest-primary",
+                "--no-start",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(standby_data),
+                "BACKUP_DIR": str(backups_dir),
+                "ENV_FILE": str(env_file),
+            },
+        )
+        assert bootstrap.returncode == 0, bootstrap.stderr
+
+        promote = subprocess.run(
+            [
+                "bash",
+                str(DEPLOY_DIR / "promote_standby.sh"),
+                "--confirm-primary-stopped",
+                "--skip-health-check",
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATA_DIR": str(standby_data),
+                "BACKUP_DIR": str(backups_dir),
+            },
+        )
+        assert promote.returncode == 0, promote.stderr
+        assert "dry-run passed" in promote.stdout.lower()
 
 
 class TestDocContract:
@@ -499,6 +822,7 @@ class TestDocContract:
         text = BACKUP_DOC_PATH.read_text().lower()
         assert "/opt/polymarket-agent/data" in text
         assert "backup_data.sh" in text
+        assert "replicate_backup.sh" in text
         assert "restore_data.sh" in text
         assert "--force" in text
         assert "standby" in text
@@ -507,5 +831,17 @@ class TestDocContract:
         text = STANDBY_DOC_PATH.read_text().lower()
         assert "standby_bootstrap.sh" in text
         assert "standby_status.sh" in text
+        assert "promote_standby.sh" in text
         assert "dry-run" in text
         assert "--live" in text
+
+    def test_monitoring_doc_mentions_transport_env_vars(self) -> None:
+        text = MONITOR_DOC_PATH.read_text()
+        for var in (
+            "WHALE_PAIR_DISCORD_WEBHOOK_URL",
+            "WHALE_PAIR_TELEGRAM_BOT_TOKEN",
+            "WHALE_PAIR_TELEGRAM_CHAT_ID",
+            "WHALE_PAIR_ALERT_WEBHOOK_URL",
+        ):
+            assert var in text, f"monitoring doc must mention {var}"
+        assert "send_test_alert.sh" in text

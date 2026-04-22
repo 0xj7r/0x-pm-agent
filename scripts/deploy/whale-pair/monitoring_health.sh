@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 COMPOSE_FILE="$REPO_ROOT/scripts/deploy/whale-pair/docker-compose.monitoring.whale-pair.yml"
+ALERTMANAGER_URL="${ALERTMANAGER_URL:-http://127.0.0.1:${WHALE_PAIR_ALERTMANAGER_PORT:-9093}}"
 PROM_URL="${PROM_URL:-http://127.0.0.1:${WHALE_PAIR_PROMETHEUS_PORT:-9090}}"
 GRAFANA_URL="${GRAFANA_URL:-http://127.0.0.1:${WHALE_PAIR_GRAFANA_PORT:-3000}}"
 METRICS_FILE="${METRICS_FILE:-$REPO_ROOT/data/monitoring/node-exporter/whale_pair.prom}"
@@ -12,12 +13,13 @@ fail() {
   exit 1
 }
 
-for service in prometheus grafana node-exporter cadvisor; do
+for service in alertmanager prometheus grafana node-exporter cadvisor; do
   if ! docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q "$service"; then
     fail "$service is not running"
   fi
 done
 
+curl -fsS "$ALERTMANAGER_URL/-/ready" >/dev/null || fail "alertmanager not ready at $ALERTMANAGER_URL"
 curl -fsS "$PROM_URL/-/ready" >/dev/null || fail "prometheus not ready at $PROM_URL"
 curl -fsS "$GRAFANA_URL/api/health" >/dev/null || fail "grafana not healthy at $GRAFANA_URL"
 

@@ -7,7 +7,7 @@ use crate::inventory::{InventoryError, InventoryState};
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
 use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
 use crate::types::{
-    ClientOrderId, EpochMillis, FillReport, InstrumentId, MarketSnapshot, OrderIntent,
+    ClientOrderId, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
     RuntimeCommand, RuntimeStatus,
 };
 
@@ -138,6 +138,13 @@ impl<S: Strategy> Runtime<S> {
         self.open_orders.values()
     }
 
+    pub fn last_quote(
+        &self,
+        instrument_id: &InstrumentId,
+    ) -> Option<&crate::types::QuoteSnapshot> {
+        self.last_quotes.get(instrument_id)
+    }
+
     pub fn start(&mut self, now_ms: EpochMillis) -> RuntimeOutcome {
         self.status = RuntimeStatus::Running;
         let mut outcome = RuntimeOutcome::default();
@@ -179,6 +186,30 @@ impl<S: Strategy> Runtime<S> {
                 .on_market_snapshot(&self.strategy_context(now_ms), &snapshot);
             Ok(self.accept_strategy_decision(decision, now_ms))
         }
+    }
+
+    pub fn on_book_state(
+        &mut self,
+        market_id: MarketId,
+        instrument_id: InstrumentId,
+        book: &crate::book::BookState,
+    ) -> Result<RuntimeOutcome, RuntimeError> {
+        let best_bid = (book.best_bid > 0.0)
+            .then(|| crate::types::BookLevel::new(book.best_bid, book.best_bid_size));
+        let best_ask = (book.best_ask > 0.0)
+            .then(|| crate::types::BookLevel::new(book.best_ask, book.best_ask_size));
+        let last_trade_price = (book.last_trade_price > 0.0).then_some(book.last_trade_price);
+
+        self.on_market_snapshot(MarketSnapshot {
+            market_id,
+            instrument_id,
+            quote: crate::types::QuoteSnapshot {
+                best_bid,
+                best_ask,
+                last_trade_price,
+                observed_at_ms: book.last_update_unix_ms,
+            },
+        })
     }
 
     pub fn on_fill(&mut self, fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
@@ -533,5 +564,48 @@ mod tests {
         assert_eq!(runtime.open_orders().count(), 0);
         assert_eq!(runtime.inventory().position_qty(&InstrumentId::from("token-1")), 10.0);
         assert!((runtime.inventory().free_cash_usd() - 95.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn on_book_state_caches_latest_quote() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 0.0,
+                event_log_capacity: 32,
+                initial_status: RuntimeStatus::Starting,
+            },
+            RiskLimits::default(),
+            crate::strategy::NoopStrategy,
+        );
+
+        runtime.start(1);
+
+        let book = crate::book::BookState {
+            asset_id: "token-up".into(),
+            best_bid: 0.41,
+            best_bid_size: 12.0,
+            best_ask: 0.44,
+            best_ask_size: 7.0,
+            spread: 0.03,
+            last_trade_price: 0.43,
+            last_update_unix_ms: 25,
+            ..crate::book::BookState::default()
+        };
+
+        let outcome = runtime
+            .on_book_state(
+                MarketId::from("market-1"),
+                InstrumentId::from("token-up"),
+                &book,
+            )
+            .expect("book state");
+
+        assert!(outcome.commands.is_empty());
+        let quote = runtime
+            .last_quote(&InstrumentId::from("token-up"))
+            .expect("cached quote");
+        assert_eq!(quote.observed_at_ms, 25);
+        assert_eq!(quote.best_bid.as_ref().unwrap().price, 0.41);
+        assert_eq!(quote.best_ask.as_ref().unwrap().price, 0.44);
     }
 }
