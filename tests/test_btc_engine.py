@@ -126,6 +126,27 @@ def test_engine_anchors_new_window_open_from_start_trade_history():
     engine.memory.close()
 
 
+def test_engine_prefers_polymarket_price_to_beat_anchor():
+    engine = make_engine()
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    window = MarketWindow(
+        market_id="m-ptb",
+        question="BTC Up/Down",
+        start_time=now - timedelta(minutes=2),
+        end_time=now + timedelta(minutes=3),
+        up_token_id="tok_up",
+        down_token_id="tok_down",
+        price_to_beat=77986.83151,
+    )
+
+    engine._on_new_window(window)
+
+    assert engine._window_open_price == pytest.approx(77986.83151)
+    assert engine._window_open_ts == pytest.approx(window.start_time.timestamp())
+    assert engine._window_open_source == "polymarket_price_to_beat"
+    engine.memory.close()
+
+
 def test_engine_does_not_anchor_mid_window_startup_to_current_price():
     engine = make_engine()
     now = datetime.now(timezone.utc).replace(microsecond=0)
