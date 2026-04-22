@@ -44,6 +44,9 @@ class CoinDataFetcher:
         coin: str,
         market_type: str = "5m",
         snapshot_workers: int = 6,
+        *,
+        store_orderbooks: bool = False,
+        orderbook_depth: int = 0,
     ):
         self.coin = coin
         self.market_type = market_type
@@ -51,6 +54,8 @@ class CoinDataFetcher:
         self.api_key = POLYBACKTEST_API_KEYS.get(coin, POLYBACKTEST_API_KEYS["btc"])
         self.rate_limit = RATE_LIMIT_DELAY
         self.snapshot_workers = max(1, snapshot_workers)
+        self.store_orderbooks = store_orderbooks
+        self.orderbook_depth = max(0, orderbook_depth)
 
     def _headers(self) -> dict[str, str]:
         return {"X-API-Key": self.api_key}
@@ -224,7 +229,12 @@ class CoinDataFetcher:
         return all_snaps
 
     @staticmethod
-    def _extract_book(ob: dict | None) -> tuple:
+    def _extract_book(
+        ob: dict | None,
+        *,
+        include_orderbook: bool = False,
+        depth: int = 0,
+    ) -> tuple:
         """Pull top-of-book + full JSON from a PolyBackTest orderbook object.
 
         PolyBackTest returns orderbook_up / orderbook_down each shaped as
@@ -244,20 +254,21 @@ class CoinDataFetcher:
         best_ask = asks[0].get("price") if asks else None
         bid_sz = bids[0].get("size") if bids else None
         ask_sz = asks[0].get("size") if asks else None
-        # NOTE: orderbook_up_json / orderbook_down_json are deliberately
-        # set to None here. The columns still exist in the schema for
-        # forward compatibility with a future slippage modelling layer,
-        # but storing the full depth as JSON was consuming ~85% of the
-        # on-disk db size (~20GB per coin) with no current reader. The
-        # simulator and feature store only use the scalar best_bid /
-        # best_ask / sizes extracted above. If a slippage model is ever
-        # built, refetch the depth via a one-off backfill run.
+        orderbook_json = None
+        if include_orderbook:
+            if depth > 0:
+                bids = bids[:depth]
+                asks = asks[:depth]
+            orderbook_json = json.dumps(
+                {"bids": bids, "asks": asks},
+                separators=(",", ":"),
+            )
         return (
             best_bid,
             best_ask,
             bid_sz,
             ask_sz,
-            None,
+            orderbook_json,
         )
 
     def fetch_snapshot_rows(self, market: dict) -> tuple[str, list[tuple]]:
@@ -275,8 +286,16 @@ class CoinDataFetcher:
         rows = []
         for s in snaps:
             p = s.get("btc_price") or s.get(f"{self.coin}_price", 0)
-            up = self._extract_book(s.get("orderbook_up"))
-            down = self._extract_book(s.get("orderbook_down"))
+            up = self._extract_book(
+                s.get("orderbook_up"),
+                include_orderbook=self.store_orderbooks,
+                depth=self.orderbook_depth,
+            )
+            down = self._extract_book(
+                s.get("orderbook_down"),
+                include_orderbook=self.store_orderbooks,
+                depth=self.orderbook_depth,
+            )
             rows.append(
                 (
                     market["market_id"],
@@ -448,8 +467,25 @@ def main():
              "should only be used for narrow exploratory pulls, never for "
              "research backfills.",
     )
+    parser.add_argument(
+        "--store-orderbooks",
+        action="store_true",
+        help="Persist orderbook_up_json/orderbook_down_json into SQLite snapshots",
+    )
+    parser.add_argument(
+        "--orderbook-depth",
+        type=int,
+        default=0,
+        help="Optional depth limit per side when --store-orderbooks is set; 0 keeps the full book",
+    )
     args = parser.parse_args()
-    fetcher = CoinDataFetcher(args.coin, args.type, args.snapshot_workers)
+    fetcher = CoinDataFetcher(
+        args.coin,
+        args.type,
+        args.snapshot_workers,
+        store_orderbooks=args.store_orderbooks,
+        orderbook_depth=args.orderbook_depth,
+    )
     fetcher.fetch_all(args.limit, args.move_threshold)
 
 
