@@ -153,6 +153,16 @@ class MarketWindowScanner:
         self._polymarket_event_url = "https://polymarket.com/event"
         self._price_to_beat_cache: dict[str, float] = {}
 
+    def _price_query_window_label(self) -> str | None:
+        return {
+            "5m": "fiveminute",
+            "15m": "fifteenminute",
+        }.get(self._market_type)
+
+    @staticmethod
+    def _payload_iso(ts: datetime) -> str:
+        return ts.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
     def _generate_candidate_slugs(self, count: int = 24) -> list[str]:
         """Generate slug candidates for the next N window-aligned windows."""
         now = datetime.now(timezone.utc)
@@ -193,7 +203,7 @@ class MarketWindowScanner:
 
         return windows
 
-    def _parse_price_to_beat_from_html(self, html: str, slug: str) -> float | None:
+    def _parse_price_to_beat_from_html(self, html: str, window: MarketWindow) -> float | None:
         script_prefix = '<script id="__NEXT_DATA__"'
         script_start = html.find(script_prefix)
         if script_start == -1:
@@ -210,11 +220,28 @@ class MarketWindowScanner:
         except json.JSONDecodeError:
             return None
 
+        query_window_label = self._price_query_window_label()
+        start_iso = self._payload_iso(window.start_time)
+        end_iso = self._payload_iso(window.end_time)
+        expected_query_key = (
+            ["crypto-prices", "price", self._coin.upper(), start_iso, query_window_label, end_iso]
+            if query_window_label
+            else None
+        )
+
         stack: list[object] = [payload]
         while stack:
             node = stack.pop()
             if isinstance(node, dict):
-                if node.get("slug") == slug:
+                if expected_query_key and node.get("queryKey") == expected_query_key:
+                    state = node.get("state")
+                    if isinstance(state, dict):
+                        data = state.get("data")
+                        if isinstance(data, dict):
+                            open_price = _safe_float(data.get("openPrice"), default=0.0)
+                            if open_price > 0:
+                                return open_price
+                if node.get("slug") == window.slug:
                     event_metadata = node.get("eventMetadata")
                     if isinstance(event_metadata, dict):
                         price_to_beat = _safe_float(
@@ -228,21 +255,24 @@ class MarketWindowScanner:
                 stack.extend(node)
         return None
 
-    async def _fetch_price_to_beat(self, slug: str) -> float | None:
-        cached = self._price_to_beat_cache.get(slug)
+    async def _fetch_price_to_beat(self, window: MarketWindow) -> float | None:
+        if not window.slug:
+            return None
+
+        cached = self._price_to_beat_cache.get(window.slug)
         if cached is not None:
             return cached
 
         try:
-            resp = await self._http.get(f"{self._polymarket_event_url}/{slug}")
+            resp = await self._http.get(f"{self._polymarket_event_url}/{window.slug}")
             if resp.status_code != 200:
                 return None
-            price_to_beat = self._parse_price_to_beat_from_html(resp.text, slug)
+            price_to_beat = self._parse_price_to_beat_from_html(resp.text, window)
             if price_to_beat is not None:
-                self._price_to_beat_cache[slug] = price_to_beat
+                self._price_to_beat_cache[window.slug] = price_to_beat
             return price_to_beat
         except Exception as e:
-            logger.debug("Price To Beat fetch failed for %s: %s", slug, e)
+            logger.debug("Price To Beat fetch failed for %s: %s", window.slug, e)
             return None
 
     async def _enrich_price_to_beat(self, windows: list[MarketWindow]) -> None:
@@ -267,7 +297,7 @@ class MarketWindowScanner:
                 continue
             seen.add(window.slug)
             if window.price_to_beat is None:
-                window.price_to_beat = await self._fetch_price_to_beat(window.slug)
+                window.price_to_beat = await self._fetch_price_to_beat(window)
 
     async def get_current_window(self) -> MarketWindow | None:
         now = datetime.now(timezone.utc)
