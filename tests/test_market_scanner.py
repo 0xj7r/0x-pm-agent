@@ -85,9 +85,11 @@ async def test_find_active_windows():
 def test_parse_price_to_beat_from_page_html():
     scanner = MarketWindowScanner()
     html = (
-        '{"id":"402307","ticker":"btc-updown-5m-1776846600",'
-        '"slug":"btc-updown-5m-1776846600","title":"Bitcoin Up or Down",'
-        '"eventMetadata":{"priceToBeat":77986.83150999999}}'
+        '<html><body><script id="__NEXT_DATA__" type="application/json">'
+        '{"props":{"pageProps":{"dehydratedState":{"queries":[{"state":{"data":[{"id":"402307",'
+        '"ticker":"btc-updown-5m-1776846600","slug":"btc-updown-5m-1776846600",'
+        '"title":"Bitcoin Up or Down","eventMetadata":{"priceToBeat":77986.83150999999}}]}}]}}}}'
+        "</script></body></html>"
     )
 
     price = scanner._parse_price_to_beat_from_html(html, "btc-updown-5m-1776846600")
