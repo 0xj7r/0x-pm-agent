@@ -229,3 +229,47 @@ async def test_resolution_push_annotates_open_trade():
     # Idempotent on second fire.
     await eng._on_resolution_push("0x" + "ab" * 32, "YES", [1, 0])
     assert len(eng._push_resolved_condition_ids) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pending_push_resolution", "expected_source"),
+    [(True, "push"), (False, "poll")],
+)
+async def test_process_resolutions_tags_resolution_source(
+    pending_push_resolution: bool,
+    expected_source: str,
+):
+    eng = BTCTradingEngine.__new__(BTCTradingEngine)
+    trade = {
+        "market_id": "42",
+        "condition_id": "0x" + "ab" * 32,
+        "direction": "UP",
+        "token_price": 0.05,
+        "shares": 100.0,
+        "size_usd": 5.0,
+        "pending_push_resolution": pending_push_resolution,
+    }
+    resolution = MagicMock(won=True, pnl_usd=95.0)
+    eng._open_trades = [trade]
+    eng.resolver = MagicMock()
+    eng.resolver.resolve_trades = AsyncMock(return_value=[(trade, resolution, "UP")])
+    eng.resolver.prune_resolved.return_value = []
+    eng.risk = MagicMock()
+    eng.slack = MagicMock()
+    eng.slack.notify_resolution = AsyncMock()
+    eng.persistence = MagicMock()
+    eng._strategy = MagicMock()
+    eng._strategy.name = "timing"
+    eng._redeemer = None
+    eng.balance = 100.0
+
+    await eng._process_resolutions()
+
+    eng.persistence.record_resolution.assert_called_once_with(
+        "timing",
+        trade,
+        resolution,
+        "UP",
+        source=expected_source,
+    )

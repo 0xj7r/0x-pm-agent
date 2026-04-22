@@ -148,6 +148,7 @@ class BTCTradingEngine:
         self._last_redeem_sweep_ts: float = 0.0
         self._last_take_profit_ts_by_market: dict[str, float] = {}
         self._last_stop_loss_ts_by_market: dict[str, float] = {}
+        self._window_open_skip_logged_market_id: str | None = None
 
         # Push-path state (parallel to polling). Keys are orderIDs; the
         # asyncio.Event fires as soon as a trade/order event on the user
@@ -411,6 +412,7 @@ class BTCTradingEngine:
         self.current_window = window
         self._window_open_price = 0.0
         self._window_open_ts = None
+        self._window_open_skip_logged_market_id = None
         self._already_traded_this_window = False
         self._window_submitted = False
         self._window_confirmed_fill = False
@@ -477,13 +479,16 @@ class BTCTradingEngine:
                 break
             lag_s = ts - start_ts
             if lag_s > WINDOW_OPEN_ANCHOR_MAX_LAG_S:
-                logger.warning(
-                    "Skipping window %s until next rollover: first Binance "
-                    "trade after start is %.3fs late (max %.3fs)",
-                    self.current_window.market_id,
-                    lag_s,
-                    WINDOW_OPEN_ANCHOR_MAX_LAG_S,
-                )
+                market_id = self.current_window.market_id
+                if self._window_open_skip_logged_market_id != market_id:
+                    logger.warning(
+                        "Skipping window %s until next rollover: first Binance "
+                        "trade after start is %.3fs late (max %.3fs)",
+                        market_id,
+                        lag_s,
+                        WINDOW_OPEN_ANCHOR_MAX_LAG_S,
+                    )
+                    self._window_open_skip_logged_market_id = market_id
                 return False
             if price <= 0:
                 return False
@@ -1823,7 +1828,16 @@ class BTCTradingEngine:
                 resolved_direction=resolved_dir,
                 balance=self.balance,
             )
-            self.persistence.record_resolution(self._strategy.name, trade, res, resolved_dir)
+            resolution_source = (
+                "push" if trade.get("pending_push_resolution") else "poll"
+            )
+            self.persistence.record_resolution(
+                self._strategy.name,
+                trade,
+                res,
+                resolved_dir,
+                source=resolution_source,
+            )
 
             if self._redeemer is not None:
                 await self._redeem_winning_trade(trade)
@@ -2003,7 +2017,11 @@ class BTCTradingEngine:
             )
             res = resolve_paper_trade(record, resolved_dir)
             self.persistence.record_resolution(
-                self._strategy.name, trade, res, resolved_dir
+                self._strategy.name,
+                trade,
+                res,
+                resolved_dir,
+                source="reconcile",
             )
             self.resolver.resolved_ids.add(market_id)
             self.balance += float(trade["size_usd"]) + res.pnl_usd
