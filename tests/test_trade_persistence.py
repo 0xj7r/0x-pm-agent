@@ -98,3 +98,31 @@ def test_record_paper_shadow_entry_uses_same_trade_and_decision_ids():
     assert kwargs["details"]["execution_mode"] == "paper_shadow"
     assert kwargs["details"]["live_paired"] is True
     supabase.upsert_trade_safe.assert_not_called()
+
+
+def test_record_status_includes_entry_blocker():
+    memory = MagicMock()
+    supabase = MagicMock()
+    persistence = TradePersistence("btc", memory, supabase)
+
+    blocker = {
+        "window_id": "123",
+        "reason": "entry_above_max",
+        "direction": "DOWN",
+        "candidate_price": 0.78,
+        "max_entry": 0.55,
+    }
+
+    persistence.record_status(
+        window_id="123",
+        btc_price=78010.92,
+        balance=89.97,
+        trades_total=0,
+        up_price=0.23,
+        down_price=0.78,
+        entry_blocker=blocker,
+    )
+
+    _, kwargs = memory.save_event.call_args
+    assert kwargs["event_type"] == "status_tick"
+    assert kwargs["details"]["entry_blocker"] == blocker
