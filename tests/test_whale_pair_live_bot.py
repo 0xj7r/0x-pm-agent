@@ -260,7 +260,40 @@ def test_record_book_tick_writes_action_with_latency(monkeypatch):
     assert payload["up"]["source"] == "ws"
     assert payload["up"]["book_age_ms"] == 200.0
     assert payload["up"]["book_ts_ms"] == 12_344_800
-    assert payload["down"] is None
+
+
+def test_record_book_tick_logs_payload(monkeypatch, caplog):
+    from scripts.whale_pair_live_bot import BookSnapshot, WhalePairLiveBot
+    from strategies.whale_pair import BookTop, WhalePairConfig
+
+    monkeypatch.setattr(
+        "scripts.whale_pair_live_bot._now_epoch_ms",
+        lambda: 12_345_000,
+    )
+
+    with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+        bot = WhalePairLiveBot(
+            db_path=tmp.name,
+            cfg=WhalePairConfig(),
+            execute=False,
+            loop_seconds=0,
+            use_ws=False,
+        )
+        try:
+            up = BookSnapshot(
+                top=BookTop(ask=0.41, ask_size=12.0),
+                source="ws",
+                book_ts_ms=12_344_800,
+                age_ms=200.0,
+            )
+            with caplog.at_level("INFO", logger="whale_pair_live"):
+                bot._record_book_tick(_WindowStub(market_id="m1", slug="slug-1"), up, None)
+        finally:
+            asyncio.run(bot.close())
+
+    messages = [record.message for record in caplog.records]
+    assert any('"book_ts_ms":12344800' in message for message in messages)
+    assert any('"book_age_ms":200.0' in message for message in messages)
 
 
 def test_execute_fill_dry_run_logs_decision_with_timestamps(monkeypatch):

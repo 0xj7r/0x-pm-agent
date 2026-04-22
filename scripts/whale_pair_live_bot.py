@@ -309,6 +309,7 @@ class WhalePairLiveBot:
             "ws_connected": bool(self.ws.connected) if self.ws is not None else False,
         }
         record_action(self.conn, window.market_id, "book_tick", compact(payload))
+        logger.info("[BOOK] %s", compact(payload))
 
     async def _execute_fill(
         self,
