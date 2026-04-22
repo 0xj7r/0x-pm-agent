@@ -39,6 +39,33 @@ impl Default for BookState {
 }
 
 impl BookState {
+    pub fn from_top_of_book(
+        asset_id: impl Into<String>,
+        best_bid: f64,
+        best_bid_size: f64,
+        best_ask: f64,
+        best_ask_size: f64,
+        last_trade_price: f64,
+        last_update_unix_ms: u64,
+    ) -> Self {
+        let spread = if best_bid > 0.0 && best_ask > 0.0 {
+            best_ask - best_bid
+        } else {
+            0.0
+        };
+        Self {
+            asset_id: asset_id.into(),
+            best_bid,
+            best_bid_size,
+            best_ask,
+            best_ask_size,
+            spread,
+            last_trade_price,
+            last_update_unix_ms,
+            last_update_mono: None,
+        }
+    }
+
     pub fn age(&self) -> Option<Duration> {
         self.last_update_mono.map(|instant| instant.elapsed())
     }
