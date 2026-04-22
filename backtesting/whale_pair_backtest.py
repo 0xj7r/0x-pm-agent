@@ -367,6 +367,7 @@ def simulate_market(
     missed_orders = 0
     partial_orders = 0
     execution_slippage_usd = 0.0
+    allow_single_leg_accumulate = cfg.variant in ("skewed_pair_builder", "passive_ladder")
     for snap_index, snap in enumerate(snapshots):
         best_ask_up = snap.get("best_ask_up")
         best_ask_down = snap.get("best_ask_down")
@@ -390,6 +391,7 @@ def simulate_market(
             state=state,
             cfg=cfg,
         )
+        pair_applied = False
         if pair_fill is not None:
             attempted_orders += 2
             exec_snap = _execution_snapshot(snapshots, snap_index, execution)
@@ -420,6 +422,10 @@ def simulate_market(
                     else:
                         sim_down_buy_usdc += fill.gross_cost_usd
                 match_pairs(state)
+                pair_applied = True
+
+        if pair_applied:
+            continue
 
         sides.sort(key=lambda item: item[1].ask)
         exec_snap = _execution_snapshot(snapshots, snap_index, execution)
@@ -429,7 +435,7 @@ def simulate_market(
                 top=top,
                 state=state,
                 cfg=cfg,
-                allow_accumulate=False,
+                allow_accumulate=allow_single_leg_accumulate,
             )
             if fill is not None:
                 attempted_orders += 1
@@ -591,6 +597,7 @@ def run_backtest(
     losers = [r for r in active if r.total_pnl_usd < 0]
     report = {
         "db_path": str(db_path),
+        "config": asdict(cfg),
         "execution": asdict(execution or ExecutionModel()),
         "markets_considered": len(results),
         "markets_traded": len(active),
@@ -664,11 +671,18 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="backtesting/btc.db")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument(
+        "--variant",
+        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder"),
+        default="pair_recycler",
+    )
     ap.add_argument("--accumulate-price-max", type=float, default=0.50)
     ap.add_argument("--aggressive-price-max", type=float, default=0.10)
     ap.add_argument("--max-pair-cost", type=float, default=0.99)
     ap.add_argument("--base-clip-usd", type=float, default=10.0)
     ap.add_argument("--aggressive-clip-usd", type=float, default=25.0)
+    ap.add_argument("--base-clip-shares", type=float, default=0.0)
+    ap.add_argument("--aggressive-clip-shares", type=float, default=0.0)
     ap.add_argument("--max-gross-cost-usd", type=float, default=200.0)
     ap.add_argument("--min-seconds-from-start", type=int, default=10)
     ap.add_argument("--max-seconds-from-start", type=int, default=298)
@@ -681,11 +695,14 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = WhalePairConfig(
+        variant=args.variant,
         accumulate_price_max=args.accumulate_price_max,
         aggressive_price_max=args.aggressive_price_max,
         max_pair_cost=args.max_pair_cost,
         base_clip_usd=args.base_clip_usd,
         aggressive_clip_usd=args.aggressive_clip_usd,
+        base_clip_shares=(args.base_clip_shares or None),
+        aggressive_clip_shares=(args.aggressive_clip_shares or None),
         max_gross_cost_usd=args.max_gross_cost_usd,
         min_seconds_from_start=args.min_seconds_from_start,
         max_seconds_from_start=args.max_seconds_from_start,
@@ -702,6 +719,7 @@ def main() -> None:
             fill_fraction=max(0.0, min(1.0, float(args.fill_fraction))),
         ),
     )
+    report["config"] = asdict(cfg)
     text = json.dumps(report, indent=2)
     if args.output:
         Path(args.output).write_text(text)

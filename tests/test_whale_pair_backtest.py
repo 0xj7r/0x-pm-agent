@@ -336,3 +336,106 @@ def test_build_w1_comparison_both_active_rate_none_when_empty():
     assert cmp_obj["both_active_rate"] is None
     assert cmp_obj["aggregates"]["side_tilt_agreement_rate"] is None
     assert cmp_obj["aggregates"]["side_tilt_markets_considered"] == 0
+
+
+def test_pair_recycler_does_not_single_side_accumulate_when_pair_not_available():
+    market = {
+        "market_id": "m4",
+        "slug": "btc-updown-5m-pair-only",
+        "start_time": "2026-01-01T00:00:00+00:00",
+        "winner": "Down",
+    }
+    snapshots = [
+        {
+            "time": "2026-01-01T00:00:20+00:00",
+            "best_ask_up": 0.20,
+            "ask_size_up": 100.0,
+            "best_ask_down": 0.90,
+            "ask_size_down": 100.0,
+        },
+    ]
+    cfg = WhalePairConfig(
+        variant="pair_recycler",
+        accumulate_price_max=0.50,
+        max_pair_cost=0.95,
+        base_clip_usd=10.0,
+        aggressive_clip_usd=20.0,
+        max_gross_cost_usd=100.0,
+        min_seconds_from_start=10,
+        max_seconds_from_start=298,
+    )
+
+    result = simulate_market(market, snapshots, cfg)
+
+    assert result.fills == 0
+    assert result.gross_cost_usd == 0.0
+
+
+def test_skewed_pair_builder_can_accumulate_single_cheap_side():
+    market = {
+        "market_id": "m5",
+        "slug": "btc-updown-5m-skew",
+        "start_time": "2026-01-01T00:00:00+00:00",
+        "winner": "Down",
+    }
+    snapshots = [
+        {
+            "time": "2026-01-01T00:00:20+00:00",
+            "best_ask_up": 0.20,
+            "ask_size_up": 100.0,
+            "best_ask_down": 0.90,
+            "ask_size_down": 100.0,
+        },
+    ]
+    cfg = WhalePairConfig(
+        variant="skewed_pair_builder",
+        accumulate_price_max=0.50,
+        max_pair_cost=0.95,
+        base_clip_usd=10.0,
+        aggressive_clip_usd=20.0,
+        max_gross_cost_usd=100.0,
+        min_seconds_from_start=10,
+        max_seconds_from_start=298,
+    )
+
+    result = simulate_market(market, snapshots, cfg)
+
+    assert result.fills == 1
+    assert result.sim_up_buy_usdc == pytest.approx(10.0)
+    assert result.sim_down_buy_usdc == 0.0
+
+
+def test_passive_ladder_uses_share_clips_for_pair_fills():
+    market = {
+        "market_id": "m6",
+        "slug": "btc-updown-5m-ladder",
+        "start_time": "2026-01-01T00:00:00+00:00",
+        "winner": "Up",
+    }
+    snapshots = [
+        {
+            "time": "2026-01-01T00:00:20+00:00",
+            "best_ask_up": 0.40,
+            "ask_size_up": 100.0,
+            "best_ask_down": 0.50,
+            "ask_size_down": 100.0,
+        },
+    ]
+    cfg = WhalePairConfig(
+        variant="passive_ladder",
+        max_pair_cost=0.95,
+        base_clip_usd=10.0,
+        aggressive_clip_usd=20.0,
+        base_clip_shares=25.0,
+        aggressive_clip_shares=100.0,
+        max_gross_cost_usd=1000.0,
+        min_seconds_from_start=10,
+        max_seconds_from_start=298,
+    )
+
+    result = simulate_market(market, snapshots, cfg)
+
+    assert result.fills == 2
+    assert result.sim_up_buy_usdc == pytest.approx(40.0)
+    assert result.sim_down_buy_usdc == pytest.approx(50.0)
+    assert result.matches == 1
