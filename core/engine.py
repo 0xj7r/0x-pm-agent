@@ -236,7 +236,12 @@ class BTCTradingEngine:
         self._window_submitted: bool = False
         self._window_confirmed_fill: bool = False
         self._running: bool = False
-        self._paper_trades: list[dict] = []
+        self._open_trades: list[dict] = self._query_open_entries()
+        if self._open_trades:
+            logger.warning(
+                "Rehydrated %d open trade(s) from event_log",
+                len(self._open_trades),
+            )
         self._scanner: MarketWindowScanner | None = None
         self._scan_interval: float = 30.0
         self._last_scan_time: float = 0.0
@@ -247,6 +252,7 @@ class BTCTradingEngine:
             getattr(strategy_cfg.risk, "drift_threshold_usd", 2.0)
         )
         self._live_usdc_anchor: float | None = None
+        self._live_internal_balance_anchor: float | None = None
         self._order_poll_interval_s: float = float(
             getattr(strategy_cfg.risk, "order_poll_interval_seconds", 3.0)
         )
@@ -372,7 +378,7 @@ class BTCTradingEngine:
         # resolution by calling through the Gamma path next tick. What
         # we CAN do now: mark the trade and kick the loop.
         matched_any = False
-        for t in self._paper_trades:
+        for t in self._open_trades:
             if not t.get("condition_id") and t.get("market_id"):
                 # We do not yet have a conditionId on the trade; without
                 # the Gamma lookup we can't map push conditionId -> trade.
@@ -387,7 +393,7 @@ class BTCTradingEngine:
             logger.warning(
                 "[PUSH] Resolution event matched %d open trade(s) for "
                 "condition=%s winner=%s. Awaiting next poll tick to record.",
-                sum(1 for t in self._paper_trades
+                sum(1 for t in self._open_trades
                     if t.get("condition_id", "").lower() == condition_id.lower()),
                 condition_id,
                 winner,
@@ -1355,7 +1361,7 @@ class BTCTradingEngine:
         min_seconds_remaining = float(getattr(self.cfg.risk, "take_profit_min_seconds_remaining", 0.0))
 
         # We only ever have a handful of open positions; linear scan is fine.
-        for t in list(self._paper_trades):
+        for t in list(self._open_trades):
             if t.get("exited"):
                 continue
             token_id = t.get("token_id")
@@ -1472,7 +1478,7 @@ class BTCTradingEngine:
                 # Prevent resolution/redeem bookkeeping for this market.
                 self.resolver.resolved_ids.add(market_id)
                 try:
-                    self._paper_trades.remove(t)
+                    self._open_trades.remove(t)
                 except ValueError:
                     pass
             else:
@@ -1519,7 +1525,7 @@ class BTCTradingEngine:
         timeout_s = float(getattr(self.cfg.risk, "stop_loss_order_timeout_seconds", 20))
         min_shares = float(getattr(self.cfg.risk, "min_shares", 5.0))
 
-        for t in list(self._paper_trades):
+        for t in list(self._open_trades):
             if t.get("exited"):
                 continue
             token_id = t.get("token_id")
@@ -1622,7 +1628,7 @@ class BTCTradingEngine:
                 t["exited"] = True
                 self.resolver.resolved_ids.add(market_id)
                 try:
-                    self._paper_trades.remove(t)
+                    self._open_trades.remove(t)
                 except ValueError:
                     pass
             else:
@@ -1666,7 +1672,7 @@ class BTCTradingEngine:
             return
         if self._polymarket is None:
             return
-        if len(self._paper_trades) > 0:
+        if len(self._open_trades) > 0:
             return
         try:
             result = await self._polymarket.get_balance_allowance()
@@ -1674,24 +1680,26 @@ class BTCTradingEngine:
             logger.warning(f"Live balance reconciliation failed: {e}")
             return
         actual = float(result.get("balance_usdc", 0.0))
-        # First call anchors the baseline. Subsequent calls expect
-        # anchor + realized_pnl_since_anchor (which equals internal
-        # `balance - starting_balance` delta).
-        if self._live_usdc_anchor is None:
+        # First call anchors both ledgers. Subsequent calls compare only
+        # changes since this anchor, so historical event_log P&L drift does
+        # not immediately re-trip the breaker after restart.
+        if self._live_usdc_anchor is None or self._live_internal_balance_anchor is None:
             self._live_usdc_anchor = actual
+            self._live_internal_balance_anchor = self.balance
             logger.info(
-                f"LIVE reconciliation anchor set: on-chain USDC=${actual:.2f}. "
+                f"LIVE reconciliation anchor set: on-chain USDC=${actual:.2f}, "
+                f"internal balance=${self.balance:.2f}. "
                 f"Future drift checks measure deviations from this baseline."
             )
             return
-        realized_since_start = self.balance - self.cfg.paper.starting_balance
-        expected = self._live_usdc_anchor + realized_since_start
+        internal_delta = self.balance - self._live_internal_balance_anchor
+        expected = self._live_usdc_anchor + internal_delta
         diff = abs(actual - expected)
         if diff > self._drift_threshold_usd:
             logger.warning(
                 f"LIVE BALANCE DRIFT: actual=${actual:.2f} "
                 f"expected=${expected:.2f} (anchor=${self._live_usdc_anchor:.2f} "
-                f"+ realized=${realized_since_start:+.2f}) "
+                f"+ internal_delta=${internal_delta:+.2f}) "
                 f"diff=${diff:.2f} (threshold=${self._drift_threshold_usd:.2f}). "
                 f"Halting entries."
             )
@@ -1713,7 +1721,7 @@ class BTCTradingEngine:
             logger.warning(f"Market scan failed: {e}")
 
     async def _process_resolutions(self) -> None:
-        resolved = await self.resolver.resolve_trades(self._paper_trades)
+        resolved = await self.resolver.resolve_trades(self._open_trades)
         for trade, res, resolved_dir in resolved:
             self.balance += trade["size_usd"] + res.pnl_usd
             self.risk.record_trade_result(res.pnl_usd)
@@ -1737,7 +1745,7 @@ class BTCTradingEngine:
             if self._redeemer is not None:
                 await self._redeem_winning_trade(trade)
 
-        self._paper_trades = self.resolver.prune_resolved(self._paper_trades)
+        self._open_trades = self.resolver.prune_resolved(self._open_trades)
 
     async def _redeem_winning_trade(self, trade: dict) -> None:
         """Call CTF.redeemPositions for any resolved live trade (win or loss).
@@ -1934,6 +1942,8 @@ class BTCTradingEngine:
             n_lost,
             len(won_trades),
         )
+        if n_marked:
+            self._open_trades = self.resolver.prune_resolved(self._open_trades)
         return won_trades
 
     async def _startup_redemption_sweep(
@@ -2163,7 +2173,7 @@ class BTCTradingEngine:
                                 if trade is None:
                                     continue
                                 t = trade
-                        self._paper_trades.append(t)
+                        self._open_trades.append(t)
                         # Fill-confirmed: persist the entry. Paper mode
                         # always "fills" on append; live mode only reaches
                         # here after _submit_and_confirm_live_order reported
@@ -2189,7 +2199,7 @@ class BTCTradingEngine:
                         await self._reconcile_live_balance()
                     if tick_count % 600 == 0:
                         await self._process_resolutions()
-                        total = len(self._paper_trades) + len(self.resolver.resolved_ids)
+                        total = len(self._open_trades) + len(self.resolver.resolved_ids)
 
                         up_live = self.poly_ws.get_price(self.current_window.up_token_id) if self.current_window else 0
                         down_live = self.poly_ws.get_price(self.current_window.down_token_id) if self.current_window else 0
@@ -2224,13 +2234,13 @@ class BTCTradingEngine:
                         )
                         logger.info(
                             f"Status: Balance=${self.balance:.2f} | "
-                            f"Trades={len(self._paper_trades)} | "
+                            f"Trades={len(self._open_trades)} | "
                             f"Resolved={len(self.resolver.resolved_ids)}"
                         )
 
                     if tick_count % 36000 == 0:
                         uptime_h = (_time.time() - start_time) / 3600
-                        total = len(self._paper_trades) + len(self.resolver.resolved_ids)
+                        total = len(self._open_trades) + len(self.resolver.resolved_ids)
                         await self.slack.notify_status(
                             balance=self.balance, trades=total,
                             resolved=len(self.resolver.resolved_ids),
