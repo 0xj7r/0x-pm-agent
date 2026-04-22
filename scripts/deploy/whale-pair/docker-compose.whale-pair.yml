@@ -20,7 +20,8 @@ services:
     environment:
       LOG_LEVEL: INFO
       STRATEGY_CONFIG: /app/strategy_config.json
-      POLYMARKET_SIGNATURE_TYPE: "1"
+      POLYMARKET_SIGNATURE_TYPE: "${POLYMARKET_SIGNATURE_TYPE:-0}"
+      POLYMARKET_FUNDER: "${POLYMARKET_FUNDER:-}"
       ALLOW_LIVE_WITHOUT_SUPABASE: "${ALLOW_LIVE_WITHOUT_SUPABASE:-1}"
     volumes:
       - ../../../data:/data
