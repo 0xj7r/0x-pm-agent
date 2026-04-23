@@ -217,3 +217,13 @@ services:
       - ./data:/data
     entrypoint: ["python", "-u", "scripts/endgame_paper_bot.py"]
     command: ["--db", "/data/endgame_paper_trades.db", "--loop", "5"]
+
+  wallet-watcher:
+    <<: *agent-service
+    container_name: polymarket-wallet-watcher
+    environment:
+      LOG_LEVEL: INFO
+    volumes:
+      - ./research:/app/research
+    entrypoint: ["python", "-u", "scripts/watch_wallets.py"]
+    command: ["--loop-interval-seconds", "120"]
