@@ -101,8 +101,12 @@ def main() -> None:
         (wallet_dir / "pnl_timeseries.json").write_text(json.dumps(series, indent=2))
         (wallet_dir / "daily_pnl.json").write_text(json.dumps(daily_eod(series), indent=2))
         # Copy the activity file if it exists.
-        act = ROOT / "data" / f"whale_activity_{last6}.json"
-        if act.exists():
+        act_candidates = [
+            wallet_dir / "activity.json",
+            ROOT / "data" / f"whale_activity_{last6}.json",
+        ]
+        act = next((c for c in act_candidates if c.exists()), None)
+        if act is not None:
             shutil.copy(act, wallet_dir / "activity.json")
         comparison.append(summarize(wallet, label, series))
 

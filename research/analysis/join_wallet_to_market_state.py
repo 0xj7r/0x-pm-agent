@@ -63,8 +63,6 @@ def resolve_activity_path(wallet: str | None, activity_path: str | None) -> Path
     last6 = wallet.lower()[-6:]
     candidates = [
         WHALE_DIR / last6 / "activity.json",
-        ROOT / "data" / f"whale_activity_{last6}.json",
-        ROOT / "data" / "research" / "whale_analysis" / f"activity_{last6}.json",
     ]
     for candidate in candidates:
         if candidate.exists():

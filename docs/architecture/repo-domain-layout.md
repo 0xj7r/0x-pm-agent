@@ -69,8 +69,3 @@ independently.
   - `data/research/wallet_research`
   - `data/research/archive`
   - `data/research/snapshots_bridge`
-- Compatibility paths remain at:
-  - `data/whale_analysis`
-  - `data/wallet_research`
-  - `data/archive`
-  - `data/snapshots_bridge`

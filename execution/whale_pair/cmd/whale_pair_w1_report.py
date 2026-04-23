@@ -21,7 +21,7 @@ Usage:
     --activity-json data/research/whale_analysis/8b5b82/activity.json \\
     --pnl-json data/research/whale_analysis/8b5b82/pnl_timeseries.json \\
     --db backtesting/btc.db \\
-    --output data/research/whale_analysis/comparison.json
+    --output data/research/whale_analysis/8b5b82/comparison.json
 """
 from __future__ import annotations
 
