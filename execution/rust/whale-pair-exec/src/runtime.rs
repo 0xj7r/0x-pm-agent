@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
 use crate::inventory::InventoryState;
+use crate::market_context::MarketContextStore;
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
 use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
 use crate::types::{
@@ -20,10 +21,16 @@ pub struct Runtime<S: Strategy> {
     status: RuntimeStatus,
     open_orders: HashMap<ClientOrderId, ManagedOrder>,
     last_quotes: HashMap<InstrumentId, crate::types::QuoteSnapshot>,
+    market_contexts: MarketContextStore,
 }
 
 impl<S: Strategy> Runtime<S> {
-    pub fn new(config: RuntimeConfig, risk_limits: RiskLimits, strategy: S) -> Self {
+    pub fn new(
+        config: RuntimeConfig,
+        risk_limits: RiskLimits,
+        strategy: S,
+        market_contexts: MarketContextStore,
+    ) -> Self {
         Self {
             strategy,
             inventory: InventoryState::new(config.starting_cash_usd),
@@ -32,6 +39,7 @@ impl<S: Strategy> Runtime<S> {
             status: config.initial_status,
             open_orders: HashMap::new(),
             last_quotes: HashMap::new(),
+            market_contexts,
         }
     }
 
@@ -55,6 +63,10 @@ impl<S: Strategy> Runtime<S> {
         self.open_orders.values()
     }
 
+    pub fn open_order_snapshots(&self) -> Vec<ManagedOrder> {
+        self.open_orders.values().cloned().collect()
+    }
+
     pub fn last_quote(
         &self,
         instrument_id: &InstrumentId,
@@ -69,7 +81,7 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             self.status,
         )));
-        let decision = self.strategy.on_start(&self.strategy_context(now_ms));
+        let decision = self.strategy.on_start(&self.strategy_context(now_ms, None));
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
         outcome
     }
@@ -94,13 +106,13 @@ impl<S: Strategy> Runtime<S> {
             ));
             let decision = self
                 .strategy
-                .on_market_snapshot(&self.strategy_context(now_ms), &snapshot);
+                .on_market_snapshot(&self.strategy_context(now_ms, Some(&snapshot.market_id)), &snapshot);
             outcome.extend(self.accept_strategy_decision(decision, now_ms));
             Ok(outcome)
         } else {
             let decision = self
                 .strategy
-                .on_market_snapshot(&self.strategy_context(now_ms), &snapshot);
+                .on_market_snapshot(&self.strategy_context(now_ms, Some(&snapshot.market_id)), &snapshot);
             Ok(self.accept_strategy_decision(decision, now_ms))
         }
     }
@@ -136,7 +148,11 @@ impl<S: Strategy> Runtime<S> {
             EventRecord::new(
                 EventCategory::Execution,
                 now_ms,
-                "received fill report",
+                if let Some(close_method) = fill.close_method {
+                    format!("received fill report via close_method={}", close_method.as_str())
+                } else {
+                    "received fill report".to_string()
+                },
             )
             .with_market(fill.market_id.clone())
             .with_instrument(fill.instrument_id.clone())
@@ -175,7 +191,9 @@ impl<S: Strategy> Runtime<S> {
             adjustment.to_event("inventory updated from fill"),
         ));
 
-        let decision = self.strategy.on_fill(&self.strategy_context(now_ms), &fill);
+        let decision = self
+            .strategy
+            .on_fill(&self.strategy_context(now_ms, Some(&fill.market_id)), &fill);
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
         Ok(outcome)
     }
@@ -370,12 +388,13 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
-    fn strategy_context(&self, now_ms: EpochMillis) -> StrategyContext {
+    fn strategy_context(&self, now_ms: EpochMillis, market_id: Option<&MarketId>) -> StrategyContext {
         StrategyContext {
             now_ms,
             runtime_status: self.status,
             inventory: self.inventory.snapshot(),
             open_orders_total: self.open_orders.len(),
+            market_context: market_id.and_then(|market_id| self.market_contexts.get(market_id).cloned()),
         }
     }
 
@@ -390,6 +409,7 @@ impl<S: Strategy> Runtime<S> {
 #[cfg(test)]
 mod tests {
     use super::{Runtime, RuntimeConfig};
+    use crate::market_context::MarketContextStore;
     use crate::risk::RiskLimits;
     use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
@@ -439,6 +459,7 @@ mod tests {
             },
             RiskLimits::default(),
             SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
         );
 
         let started = runtime.start(1);
@@ -476,6 +497,7 @@ mod tests {
                 quantity: 10.0,
                 fee_usd: 0.10,
                 liquidity: FillLiquidity::Taker,
+                close_method: None,
                 observed_at_ms: 3,
             })
             .expect("fill");
@@ -495,6 +517,7 @@ mod tests {
             },
             RiskLimits::default(),
             crate::strategy::NoopStrategy,
+            MarketContextStore::empty(),
         );
 
         runtime.start(1);

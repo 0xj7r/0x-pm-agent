@@ -208,8 +208,12 @@ def main() -> None:
     enriched = [enrich_row(row) for row in joined_rows]
     summary = summarize(enriched)
 
-    wallet_suffix = args.wallet.lower()[-6:] if args.wallet else joined_path.stem.split("_")[0]
-    wallet_dir = OUT / wallet_suffix
+    wallet_key = (
+        wallet_dir_name(args.wallet)
+        if args.wallet
+        else joined_path.parent.name
+    )
+    wallet_dir = OUT / wallet_key
     output_path = Path(args.output) if args.output else wallet_dir / "execution_features.json"
     output = {
         "source_joined_file": str(joined_path),

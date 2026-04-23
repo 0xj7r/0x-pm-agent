@@ -2,9 +2,9 @@
 # Run the Rust paper variants launcher on a remote host.
 #
 # Usage:
-#   scripts/whale_pair/cmd/whale_pair_rust_paper_remote.sh start [variant]
-#   scripts/whale_pair/cmd/whale_pair_rust_paper_remote.sh stop [variant]
-#   scripts/whale_pair/cmd/whale_pair_rust_paper_remote.sh status [variant]
+#   execution/whale_pair/cmd/whale_pair_rust_paper_remote.sh start [variant]
+#   execution/whale_pair/cmd/whale_pair_rust_paper_remote.sh stop [variant]
+#   execution/whale_pair/cmd/whale_pair_rust_paper_remote.sh status [variant]
 #
 # Set one of these in your environment:
 #   WHALE_PAIR_PAPER_HOST=<host-or-alias>
@@ -29,7 +29,7 @@ REMOTE_HOST="${WHALE_PAIR_PAPER_HOST}"
 REMOTE_USER="${WHALE_PAIR_PAPER_REMOTE_USER:-ubuntu}"
 REMOTE_DIR="${WHALE_PAIR_PAPER_REMOTE_DIR:-/opt/polymarket-agent}"
 SSH_KEY="${WHALE_PAIR_PAPER_SSH_KEY:-}"
-EXTRA_SSH_OPTS="${WHALE_PAIR_PAPER_SSH_OPTS:---BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3}"
+EXTRA_SSH_OPTS="${WHALE_PAIR_PAPER_SSH_OPTS:--o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3}"
 
 if [[ "$REMOTE_HOST" != *"@"* ]]; then
     REMOTE_HOST="${REMOTE_USER}@${REMOTE_HOST}"
@@ -42,7 +42,7 @@ fi
 
 remote_cmd=(
     "bash"
-    "scripts/whale_pair/cmd/whale_pair_rust_paper_variants.sh"
+    "execution/whale_pair/cmd/whale_pair_rust_paper_variants.sh"
     "$MODE"
 )
 if [ -n "$TARGET" ]; then

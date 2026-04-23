@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-CRATE_DIR="$REPO_ROOT/rust/whale-pair-exec"
+CRATE_DIR="$REPO_ROOT/execution/rust/whale-pair-exec"
 WORK_ROOT="${WHALE_PAIR_PAPER_WORK_ROOT:-$REPO_ROOT/data/whale_pair_rust_paper}"
 ENV_FILE="${WHALE_PAIR_PAPER_ENV_FILE:-$REPO_ROOT/.env}"
 METRICS_PORT_BASE="${WHALE_PAIR_PAPER_METRICS_PORT_BASE:-9108}"
@@ -68,7 +68,7 @@ load_variants_from_python() {
     # order-book replay validation.
     mapfile -t VARIANTS < <(
         PYTHONPATH="$REPO_ROOT" "$PYTHON_BIN" - <<'PY'
-from scripts.whale_pair.strategy_presets import rust_variant_env_lines
+from execution.whale_pair.strategy_presets import rust_variant_env_lines
 
 for line in rust_variant_env_lines():
     print(line)
@@ -76,7 +76,7 @@ PY
     )
 
     if [ ${#VARIANTS[@]} -eq 0 ]; then
-        echo "ERROR: failed to load Rust variants from scripts/whale_pair/strategy_presets.py" >&2
+        echo "ERROR: failed to load Rust variants from execution/whale_pair/strategy_presets.py" >&2
         return 10
     fi
 }
