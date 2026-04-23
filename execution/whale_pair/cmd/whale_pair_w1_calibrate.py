@@ -22,7 +22,7 @@ Usage:
     python scripts/whale_pair_w1_calibrate.py \\
         --activity-json data/research/whale_analysis/8b5b82/activity.json \\
         --db backtesting/btc.db \\
-        --output data/research/whale_analysis/calibration.json
+        --output data/research/whale_analysis/8b5b82/calibration.json
 """
 from __future__ import annotations
 

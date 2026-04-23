@@ -239,11 +239,7 @@ def load_json(path: Path) -> Any:
 
 def load_activity(wallet: str) -> list[dict[str, Any]]:
     last6 = wallet[-6:].lower()
-    candidates = [
-        WHALE_DIR / last6 / "activity.json",
-        ROOT / "data" / f"whale_activity_{last6}.json",
-        ROOT / "data" / "research" / "whale_analysis" / f"activity_{last6}.json",
-    ]
+    candidates = [WHALE_DIR / last6 / "activity.json"]
     for path in candidates:
         if path.exists():
             return load_json(path)

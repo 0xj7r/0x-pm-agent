@@ -237,7 +237,14 @@ def main() -> None:
     rows = fetch_activity(wallet)
     print(f"Fetched {len(rows)} rows")
     # Dump raw for later inspection.
-    out = Path(__file__).parent.parent / "data" / f"whale_activity_{wallet[-6:]}.json"
+    out = (
+        Path(__file__).parent.parent
+        / "data"
+        / "research"
+        / "whale_analysis"
+        / wallet[-6:]
+        / "activity.json"
+    )
     out.parent.mkdir(exist_ok=True)
     out.write_text(json.dumps(rows, indent=2))
     print(f"Saved raw to {out}")
