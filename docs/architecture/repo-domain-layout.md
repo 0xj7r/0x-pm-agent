@@ -1,25 +1,47 @@
 # Domain-oriented repository layout
 
-This project has two primary execution streams:
+This project is now grouped by domain: **execution** and **research**, with
+compatibility links at legacy paths.
 
-- **Execution / live trading**
-  - `core/`, `strategies/`, `clients/`, `models/`, `shared/`
-  - `scripts/whale_pair/` and `scripts/bots/` orchestration entrypoints
-  - `rust/` for Rust execution implementations (paper/live parity)
-  - `tests/` covers runtime and bot behavior
+## Execution (live / paper / Rust implementation)
 
-- **Research / analysis**
-  - `backtesting/` strategy/market simulations
-  - `scripts/analysis/` and `scripts/dataops/` data extraction and transform jobs
-  - `research/` experimental studies and notebooks-like scripts
-  - `data/` research exports (e.g., `wallet_research/`, `whale_analysis/`)
+- Canonical:
+  - `execution/clients`
+  - `execution/core`
+  - `execution/models`
+  - `execution/shared`
+  - `execution/strategies`
+  - `execution/rust`
+  - `execution/bots`
+  - `execution/whale_pair`
+  - `execution/main.py`
+- Compatibility:
+  - `clients`, `core`, `models`, `shared`, `strategies`, `rust`, `main.py`
+    are symlinks to `execution/*`
+  - `scripts/bots` and `scripts/whale_pair` remain compatibility wrappers
+    and point into `execution/`
 
-- **Operations**
-  - `ops/` monitoring, deploy manifests, and local infra helpers
-  - `deploy.sh` remains a compatibility entry for Hetzner; canonical source is
-    `ops/deploy/deploy_hetzner.sh`
-  - Runtime dashboards now live in `ops/monitoring/dashboard.html` with a
-    compatibility root symlink
+## Research & modeling
 
-This split is intentional: keep execution-path changes isolated from analysis
-pipelines so strategy experiments and trade validation can evolve independently.
+- Canonical:
+  - `research/backtesting`
+  - `research/collector`
+  - `research/analysis`
+  - `research/dataops`
+  - `research/wallet_profiles`
+  - `research/weather`
+- Compatibility:
+  - `backtesting`, `collector`, `scripts/analysis`, `scripts/dataops`
+    are symlinks to `research/*`
+
+## Operations
+
+- `ops/` holds monitoring, infra scripts, and deploy manifests.
+- `deploy.sh` is the compatibility entry for Hetzner with canonical source at
+  `ops/deploy/deploy_hetzner.sh`.
+- Runtime dashboards are canonical at `ops/monitoring/dashboard.html` with
+  `dashboard.html` compatibility entry.
+
+This split is intentional: keep execution-path changes isolated from analysis and
+historical-modeling work so research and production execution can evolve
+independently.

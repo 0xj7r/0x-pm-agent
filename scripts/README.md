@@ -8,6 +8,15 @@ Repository-level script organization:
 - `scripts/deploy/` — environment and deployment scripts.
 - `scripts/whale_pair/` — whale-pair strategy-specific command-line tools and presets.
 
+Canonical location note:
+
+- `scripts/analysis/` and `scripts/dataops/` are now canonical under
+  `research/`.
+- `scripts/bots/` and `scripts/whale_pair/` are now canonical under
+  `execution/`.
+- The top-level shim scripts (`scripts/*.py`, `scripts/*.sh`) remain for legacy
+  launch compatibility and still execute their canonical counterparts.
+
 Legacy command locations (kept for compatibility):
 
 - `scripts/*.py` and `scripts/*.sh` still resolve to the canonical files in this
