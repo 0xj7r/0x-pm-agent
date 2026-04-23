@@ -218,6 +218,7 @@ def _imbalance_ratio(up_usdc: float, down_usdc: float) -> float | None:
     return larger / smaller
 
 
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
 def _heavier_side(up_usdc: float, down_usdc: float) -> str | None:
     up = max(0.0, float(up_usdc))
     down = max(0.0, float(down_usdc))
@@ -230,6 +231,8 @@ def _heavier_side(up_usdc: float, down_usdc: float) -> str | None:
     return "Even"
 
 
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
 def _market_comparison_row(r: "BacktestMarketResult") -> dict:
     sim_total = float(r.sim_up_buy_usdc) + float(r.sim_down_buy_usdc)
     whale_total = float(r.whale_up_buy_usdc) + float(r.whale_down_buy_usdc)
@@ -246,7 +249,10 @@ def _market_comparison_row(r: "BacktestMarketResult") -> dict:
             "buy_usdc_down": float(r.sim_down_buy_usdc),
             "buy_usdc_total": sim_total,
             "imbalance_ratio": _imbalance_ratio(r.sim_up_buy_usdc, r.sim_down_buy_usdc),
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
             "heavier_side": _heavier_side(r.sim_up_buy_usdc, r.sim_down_buy_usdc),
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         },
         "whale": {
             "first_buy_offset_sec": r.whale_first_offset_sec,
@@ -256,7 +262,10 @@ def _market_comparison_row(r: "BacktestMarketResult") -> dict:
             "buy_usdc_down": float(r.whale_down_buy_usdc),
             "buy_usdc_total": whale_total,
             "imbalance_ratio": _imbalance_ratio(r.whale_up_buy_usdc, r.whale_down_buy_usdc),
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
             "heavier_side": _heavier_side(r.whale_up_buy_usdc, r.whale_down_buy_usdc),
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         },
     }
 
@@ -308,6 +317,7 @@ def build_w1_comparison(overlap_results: list["BacktestMarketResult"]) -> dict:
 
     overlap_markets = [r for r in rows if r["sim"]["fill_count"] > 0 and r["whale"]["fill_count"] > 0]
 
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     side_tilt_considered = 0
     side_tilt_agree = 0
     for row in rows:
@@ -330,6 +340,11 @@ def build_w1_comparison(overlap_results: list["BacktestMarketResult"]) -> dict:
         "overlap_markets": len(rows),
         "overlap_markets_both_active": len(overlap_markets),
         "both_active_rate": both_active_rate,
+=======
+    return {
+        "overlap_markets": len(rows),
+        "overlap_markets_both_active": len(overlap_markets),
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         "aggregates": {
             "first_buy_offset_sec_mean_diff": _mean_or_none(first_offset_diffs),
             "first_buy_offset_sec_median_diff": _median_or_none(first_offset_diffs),
@@ -343,8 +358,11 @@ def build_w1_comparison(overlap_results: list["BacktestMarketResult"]) -> dict:
             "buy_usdc_down_mean_diff": _mean_or_none(down_usdc_diffs),
             "imbalance_ratio_mean_diff": _mean_or_none(imbalance_diffs),
             "imbalance_ratio_median_diff": _median_or_none(imbalance_diffs),
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
             "side_tilt_agreement_rate": side_tilt_agreement_rate,
             "side_tilt_markets_considered": side_tilt_considered,
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         },
         "per_market": rows,
     }
@@ -367,11 +385,14 @@ def simulate_market(
     missed_orders = 0
     partial_orders = 0
     execution_slippage_usd = 0.0
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     allow_single_leg_accumulate = cfg.variant in (
         "skewed_pair_builder",
         "passive_ladder",
         "w1_mimic",
     )
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
     for snap_index, snap in enumerate(snapshots):
         best_ask_up = snap.get("best_ask_up")
         best_ask_down = snap.get("best_ask_down")
@@ -395,7 +416,10 @@ def simulate_market(
             state=state,
             cfg=cfg,
         )
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
         pair_applied = False
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         if pair_fill is not None:
             attempted_orders += 2
             exec_snap = _execution_snapshot(snapshots, snap_index, execution)
@@ -426,10 +450,13 @@ def simulate_market(
                     else:
                         sim_down_buy_usdc += fill.gross_cost_usd
                 match_pairs(state)
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
                 pair_applied = True
 
         if pair_applied:
             continue
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
 
         sides.sort(key=lambda item: item[1].ask)
         exec_snap = _execution_snapshot(snapshots, snap_index, execution)
@@ -439,7 +466,11 @@ def simulate_market(
                 top=top,
                 state=state,
                 cfg=cfg,
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
                 allow_accumulate=allow_single_leg_accumulate,
+=======
+                allow_accumulate=False,
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
             )
             if fill is not None:
                 attempted_orders += 1
@@ -560,7 +591,10 @@ def run_backtest(
     db_path: Path,
     cfg: WhalePairConfig,
     *,
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     market_type: str = "5m",
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
     limit: int | None = None,
     whale_activity_path: Path | None = None,
     execution: ExecutionModel | None = None,
@@ -574,7 +608,10 @@ def run_backtest(
         markets = load_markets(
             conn,
             limit=limit,
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
             market_type=market_type,
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
             include_slugs=set(whale_by_slug.keys()) if whale_by_slug else None,
         )
         results: list[BacktestMarketResult] = []
@@ -603,8 +640,11 @@ def run_backtest(
     losers = [r for r in active if r.total_pnl_usd < 0]
     report = {
         "db_path": str(db_path),
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
         "market_type": market_type,
         "config": asdict(cfg),
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         "execution": asdict(execution or ExecutionModel()),
         "markets_considered": len(results),
         "markets_traded": len(active),
@@ -678,18 +718,24 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="backtesting/btc.db")
     ap.add_argument("--limit", type=int, default=0)
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     ap.add_argument(
         "--variant",
         choices=("pair_recycler", "skewed_pair_builder", "passive_ladder", "w1_mimic"),
         default="pair_recycler",
     )
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
     ap.add_argument("--accumulate-price-max", type=float, default=0.50)
     ap.add_argument("--aggressive-price-max", type=float, default=0.10)
     ap.add_argument("--max-pair-cost", type=float, default=0.99)
     ap.add_argument("--base-clip-usd", type=float, default=10.0)
     ap.add_argument("--aggressive-clip-usd", type=float, default=25.0)
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     ap.add_argument("--base-clip-shares", type=float, default=0.0)
     ap.add_argument("--aggressive-clip-shares", type=float, default=0.0)
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
     ap.add_argument("--max-gross-cost-usd", type=float, default=200.0)
     ap.add_argument("--min-seconds-from-start", type=int, default=10)
     ap.add_argument("--max-seconds-from-start", type=int, default=298)
@@ -702,14 +748,20 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = WhalePairConfig(
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
         variant=args.variant,
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         accumulate_price_max=args.accumulate_price_max,
         aggressive_price_max=args.aggressive_price_max,
         max_pair_cost=args.max_pair_cost,
         base_clip_usd=args.base_clip_usd,
         aggressive_clip_usd=args.aggressive_clip_usd,
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
         base_clip_shares=(args.base_clip_shares or None),
         aggressive_clip_shares=(args.aggressive_clip_shares or None),
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
         max_gross_cost_usd=args.max_gross_cost_usd,
         min_seconds_from_start=args.min_seconds_from_start,
         max_seconds_from_start=args.max_seconds_from_start,
@@ -726,7 +778,10 @@ def main() -> None:
             fill_fraction=max(0.0, min(1.0, float(args.fill_fraction))),
         ),
     )
+<<<<<<< HEAD:research/backtesting/whale_pair_backtest.py
     report["config"] = asdict(cfg)
+=======
+>>>>>>> feat/whale-pair-eval:backtesting/whale_pair_backtest.py
     text = json.dumps(report, indent=2)
     if args.output:
         Path(args.output).write_text(text)
