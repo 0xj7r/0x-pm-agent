@@ -15,3 +15,8 @@ backtesting/eval/features/
 backtesting/*.html
 backtesting/weather/
 autoresearch/candidates/
+data/wallet_research/history_*/
+data/wallet_research/*/activity_windows/
+data/wallet_research/*/closed_positions.json
+data/wallet_research/*/summary.json
+data/wallet_research/*/activity_windows_summary.json
