@@ -1,0 +1,25 @@
+[
+  {
+    "proxyWallet": "0x7da07b2a8b009a406198677debda46ad651b6be2",
+    "timestamp": 1775264413,
+    "conditionId": "",
+    "type": "MAKER_REBATE",
+    "size": 1.0656,
+    "usdcSize": 1.0656,
+    "transactionHash": "0xdaa713ad4f1f883a97f9fb4934cc2457251398bf0a32ff157af1f90c8996826f",
+    "price": 0,
+    "asset": "",
+    "side": "",
+    "outcomeIndex": 999,
+    "title": "",
+    "slug": "",
+    "icon": "",
+    "eventSlug": "",
+    "outcome": "",
+    "name": "0x7Da07B2a8B009A406198677dEBDA46",
+    "pseudonym": "Dimpled-Dill",
+    "bio": "",
+    "profileImage": "",
+    "profileImageOptimized": ""
+  }
+]
