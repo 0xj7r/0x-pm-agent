@@ -3,6 +3,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
+const MAX_BOOK_LEVELS: usize = 20;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Level {
     pub price: f64,
@@ -16,6 +18,8 @@ pub struct BookState {
     pub best_bid_size: f64,
     pub best_ask: f64,
     pub best_ask_size: f64,
+    pub bids: Vec<Level>,
+    pub asks: Vec<Level>,
     pub spread: f64,
     pub last_trade_price: f64,
     pub last_update_unix_ms: u64,
@@ -30,6 +34,8 @@ impl Default for BookState {
             best_bid_size: 0.0,
             best_ask: 0.0,
             best_ask_size: 0.0,
+            bids: Vec::new(),
+            asks: Vec::new(),
             spread: 0.0,
             last_trade_price: 0.0,
             last_update_unix_ms: 0,
@@ -59,6 +65,14 @@ impl BookState {
             best_bid_size,
             best_ask,
             best_ask_size,
+            bids: vec![Level {
+                price: best_bid,
+                size: best_bid_size,
+            }],
+            asks: vec![Level {
+                price: best_ask,
+                size: best_ask_size,
+            }],
             spread,
             last_trade_price,
             last_update_unix_ms,
@@ -89,6 +103,35 @@ impl BookState {
         } else {
             0.0
         };
+    }
+
+    pub fn bid_levels(&self) -> &[Level] {
+        &self.bids
+    }
+
+    pub fn ask_levels(&self) -> &[Level] {
+        &self.asks
+    }
+
+    fn update_levels(&mut self, bids: &[Level], asks: &[Level]) {
+        if !bids.is_empty() {
+            let mut sorted = normalize_levels(bids, true);
+            sorted.sort_by(|left, right| right.price.total_cmp(&left.price));
+            self.bids = sorted.into_iter().take(MAX_BOOK_LEVELS).collect();
+            if let Some(level) = self.bids.first().copied() {
+                self.best_bid = level.price;
+                self.best_bid_size = level.size;
+            }
+        }
+        if !asks.is_empty() {
+            let mut sorted = normalize_levels(asks, false);
+            sorted.sort_by(|left, right| left.price.total_cmp(&right.price));
+            self.asks = sorted.into_iter().take(MAX_BOOK_LEVELS).collect();
+            if let Some(level) = self.asks.first().copied() {
+                self.best_ask = level.price;
+                self.best_ask_size = level.size;
+            }
+        }
     }
 }
 
@@ -125,14 +168,7 @@ impl BookStore {
             asset_id: asset_id.to_string(),
             ..BookState::default()
         });
-        if let Some(level) = bids.first().copied() {
-            book.best_bid = level.price;
-            book.best_bid_size = level.size;
-        }
-        if let Some(level) = asks.first().copied() {
-            book.best_ask = level.price;
-            book.best_ask_size = level.size;
-        }
+        book.update_levels(bids, asks);
         book.touch();
         book.clone()
     }
@@ -148,11 +184,53 @@ impl BookStore {
             asset_id: asset_id.to_string(),
             ..BookState::default()
         });
-        if let Some(value) = best_bid {
-            book.best_bid = value;
+        if let Some(best_bid) = best_bid {
+            book.best_bid = best_bid;
+            book.best_bid_size = book
+                .bids
+                .iter()
+                .find(|level| (level.price - best_bid).abs() < f64::EPSILON)
+                .map(|level| level.size)
+                .unwrap_or_else(|| book.best_bid_size.max(0.0));
+            if book.bids.is_empty() {
+                book.bids.push(Level {
+                    price: best_bid,
+                    size: book.best_bid_size,
+                });
+                book.bids.sort_by(|left, right| right.price.total_cmp(&left.price));
+                book.bids.truncate(MAX_BOOK_LEVELS);
+            } else if let Some(first) = book.bids.first_mut() {
+                first.price = best_bid;
+                if first.size <= 0.0 {
+                    first.size = book.best_bid_size;
+                }
+            }
+            book.bids.sort_by(|left, right| right.price.total_cmp(&left.price));
+            book.bids.truncate(MAX_BOOK_LEVELS);
         }
-        if let Some(value) = best_ask {
-            book.best_ask = value;
+        if let Some(best_ask) = best_ask {
+            book.best_ask = best_ask;
+            book.best_ask_size = book
+                .asks
+                .iter()
+                .find(|level| (level.price - best_ask).abs() < f64::EPSILON)
+                .map(|level| level.size)
+                .unwrap_or_else(|| book.best_ask_size.max(0.0));
+            if book.asks.is_empty() {
+                book.asks.push(Level {
+                    price: best_ask,
+                    size: book.best_ask_size,
+                });
+                book.asks.sort_by(|left, right| left.price.total_cmp(&right.price));
+                book.asks.truncate(MAX_BOOK_LEVELS);
+            } else if let Some(first) = book.asks.first_mut() {
+                first.price = best_ask;
+                if first.size <= 0.0 {
+                    first.size = book.best_ask_size;
+                }
+            }
+            book.asks.sort_by(|left, right| left.price.total_cmp(&right.price));
+            book.asks.truncate(MAX_BOOK_LEVELS);
         }
         book.touch();
         book.clone()
@@ -187,6 +265,21 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn normalize_levels(levels: &[Level], highest_bid: bool) -> Vec<Level> {
+    let mut normalized = levels
+        .iter()
+        .filter(|level| level.price.is_finite() && level.size.is_finite())
+        .filter(|level| level.price > 0.0 && level.size > 0.0)
+        .copied()
+        .collect::<Vec<_>>();
+    if highest_bid {
+        normalized.sort_by(|left, right| right.price.total_cmp(&left.price));
+    } else {
+        normalized.sort_by(|left, right| left.price.total_cmp(&right.price));
+    }
+    normalized
 }
 
 #[cfg(test)]

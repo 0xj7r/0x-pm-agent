@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
-from strategies.whale_pair import WhalePairConfig, WhalePairVariant
+try:
+    from execution.strategies.whale_pair import WhalePairConfig, WhalePairVariant
+except ModuleNotFoundError:  # Backward compatibility during incremental package migration
+    from strategies.whale_pair import WhalePairConfig, WhalePairVariant
 
 
 @dataclass(frozen=True)
@@ -162,4 +165,3 @@ RUST_VARIANT_MATRIX: Final[list[tuple[str, dict[str, str]]]] = [
 
 def rust_variant_env_lines() -> list[str]:
     return ["|".join([name] + [f"{key}={value}" for key, value in env.items()]) for name, env in RUST_VARIANT_MATRIX]
-

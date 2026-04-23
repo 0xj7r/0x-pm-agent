@@ -4,13 +4,63 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::UserWsAuth;
+use crate::types::CloseMethod;
 use crate::metrics::{AppMetrics, StreamKind};
+
+#[derive(Debug, Clone)]
+pub enum UserOrderEvent {
+    OrderOpened {
+        client_order_id: String,
+        observed_at_ms: u64,
+    },
+    OrderRejected {
+        client_order_id: Option<String>,
+        reason: Option<String>,
+        observed_at_ms: u64,
+    },
+    OrderCancelled {
+        client_order_id: Option<String>,
+        reason: Option<String>,
+        observed_at_ms: u64,
+    },
+    OrderFilled {
+        order_id: Option<String>,
+        client_order_id: Option<String>,
+        close_method: Option<CloseMethod>,
+        market_id: Option<String>,
+        asset_id: Option<String>,
+        side: String,
+        price: f64,
+        quantity: f64,
+        liquidity: Option<String>,
+        observed_at_ms: u64,
+    },
+    OrderMerged {
+        order_id: Option<String>,
+        client_order_id: Option<String>,
+        market_id: Option<String>,
+        asset_id: Option<String>,
+        price: f64,
+        quantity: f64,
+        observed_at_ms: u64,
+    },
+    OrderRedeemed {
+        order_id: Option<String>,
+        client_order_id: Option<String>,
+        market_id: Option<String>,
+        asset_id: Option<String>,
+        price: f64,
+        quantity: f64,
+        observed_at_ms: u64,
+    },
+}
 
 pub struct UserWsClient {
     url: String,
@@ -18,6 +68,7 @@ pub struct UserWsClient {
     markets: Vec<String>,
     ping_interval: Duration,
     metrics: Arc<AppMetrics>,
+    event_tx: Option<mpsc::UnboundedSender<UserOrderEvent>>,
 }
 
 impl UserWsClient {
@@ -27,6 +78,7 @@ impl UserWsClient {
         markets: Vec<String>,
         ping_interval: Duration,
         metrics: Arc<AppMetrics>,
+        event_tx: Option<mpsc::UnboundedSender<UserOrderEvent>>,
     ) -> Self {
         Self {
             url,
@@ -34,6 +86,7 @@ impl UserWsClient {
             markets,
             ping_interval,
             metrics,
+            event_tx,
         }
     }
 
@@ -137,6 +190,12 @@ impl UserWsClient {
         let status = event.get("status").and_then(Value::as_str).unwrap_or("unknown");
         self.metrics.observe_user_message(event_type, status);
 
+        if let Some(tx) = &self.event_tx {
+            if let Some(event) = classify_user_event(&event) {
+                let _ = tx.send(event);
+            }
+        }
+
         debug!(
             event_type,
             status,
@@ -156,6 +215,199 @@ impl UserWsClient {
         );
         Ok(())
     }
+}
+
+fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
+    let observed_at_ms = event
+        .get("timestamp")
+        .and_then(value_as_u64_opt)
+        .or_else(|| event.get("ts").and_then(value_as_u64_opt))
+        .unwrap_or_else(now_millis_fallback);
+
+    let event_type = event
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let status = event
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let market_id = event
+        .get("market")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let asset_id = event
+        .get("asset_id")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("assetId").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+
+    let order_id = event.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+    let client_order_id = event
+        .get("client_order_id")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("taker_order_id").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+
+    let side = event
+        .get("side")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let price = event
+        .get("price")
+        .and_then(value_as_f64_opt)
+        .or_else(|| event.get("match_price").and_then(value_as_f64_opt))
+        .unwrap_or(0.0);
+    let qty = event
+        .get("size")
+        .or_else(|| event.get("matched_amount"))
+        .and_then(value_as_f64_opt)
+        .unwrap_or(0.0);
+    let liquidity = event
+        .get("liquidity")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| event.get("maker_or_taker").and_then(Value::as_str).map(ToOwned::to_owned));
+
+    let reason = event
+        .get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("cancel_reason").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+
+    let close_method = parse_str(
+        event,
+        &["close_method", "activity", "method", "tx_type", "event", "type"],
+    )
+    .map(CloseMethod::from_raw)
+    .filter(|method| *method != CloseMethod::Unknown);
+
+    let status_low = status.to_ascii_lowercase();
+    let event_type_low = event_type.to_ascii_lowercase();
+    let is_merge_signal = status_low.contains("merged")
+        || event_type_low.contains("merge")
+        || matches!(close_method, Some(CloseMethod::Merge | CloseMethod::Settle | CloseMethod::Settlement));
+    let is_redeem_signal = status_low.contains("redeemed")
+        || event_type_low.contains("redeem")
+        || matches!(close_method, Some(CloseMethod::Redeem));
+    let is_fill_signal = event_type_low == "fill"
+        || event_type_low == "trade"
+        || event_type_low == "trades"
+        || status_low.contains("filled")
+        || (status_low.contains("match") && qty > 0.0)
+        || matches!(status_low.as_str(), "closed" | "done")
+        || (matches!(event_type_low.as_str(), "order" | "order_update" | "orderbook")
+            && qty > 0.0
+            && status_low.contains("fill"));
+
+    if is_merge_signal
+    {
+        if qty > 0.0 {
+            return Some(UserOrderEvent::OrderMerged {
+                order_id,
+                client_order_id,
+                market_id,
+                asset_id,
+                price,
+                quantity: qty,
+                observed_at_ms,
+            });
+        }
+    }
+
+    if is_redeem_signal
+    {
+        if qty > 0.0 {
+            return Some(UserOrderEvent::OrderRedeemed {
+                order_id,
+                client_order_id,
+                market_id,
+                asset_id,
+                price,
+                quantity: qty,
+                observed_at_ms,
+            });
+        }
+    }
+
+    if is_fill_signal
+    {
+        if qty > 0.0 {
+            return Some(UserOrderEvent::OrderFilled {
+                order_id,
+                client_order_id,
+                close_method,
+                market_id,
+                asset_id,
+                side,
+                price,
+                quantity: qty,
+                liquidity,
+                observed_at_ms,
+            });
+        }
+    }
+
+    if status_low.contains("rejected") {
+        return Some(UserOrderEvent::OrderRejected {
+            client_order_id,
+            reason,
+            observed_at_ms,
+        });
+    }
+
+    if status_low.contains("cancel") || event_type_low == "cancel" {
+        return Some(UserOrderEvent::OrderCancelled {
+            client_order_id,
+            reason,
+            observed_at_ms,
+        });
+    }
+
+    if status_low == "open"
+        || status_low == "opened"
+        || status_low == "active"
+        || (event_type_low == "order" && status_low.contains("open"))
+    {
+        if let Some(client_order_id) = client_order_id {
+            return Some(UserOrderEvent::OrderOpened {
+                client_order_id,
+                observed_at_ms,
+            });
+        }
+    }
+
+    if matches!(event_type_low.as_str(), "order" | "orderbook" | "order_update")
+        && qty > 0.0
+        && !client_order_id.is_none()
+        && (status_low.contains("closed") || status_low.contains("done") || status_low.contains("fill"))
+    {
+        return Some(UserOrderEvent::OrderFilled {
+            order_id,
+            client_order_id,
+            market_id,
+            asset_id,
+            side,
+            price,
+            quantity: qty,
+            liquidity,
+            close_method: None,
+            observed_at_ms,
+        });
+    }
+
+    None
+}
+
+fn parse_str<'a>(event: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| event.get(key))
+        .and_then(Value::as_str)
 }
 
 fn build_subscribe_payload(auth: &UserWsAuth, markets: &[String]) -> Value {
@@ -187,4 +439,20 @@ fn value_as_f64_opt(value: &Value) -> Option<f64> {
         Value::String(raw) => raw.parse().ok(),
         _ => None,
     }
+}
+
+fn value_as_u64_opt(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(raw) => raw.parse().ok(),
+        _ => None,
+    }
+}
+
+fn now_millis_fallback() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

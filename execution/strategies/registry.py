@@ -212,7 +212,18 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
     skip_hours = set(int(h) for h in _skip_hours) if _skip_hours is not None else None
     filters = [FILTER_MAP[name] for name in definition.filters]
 
-    def fn(pm, i: int, current_hour: int | None = None) -> str | None:
+    def _to_float(value: object) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def fn(
+        pm,
+        i: int,
+        current_hour: int | None = None,
+        **_signal_context,
+    ) -> str | None:
         if hour_start is not None and hour_end is not None and current_hour is not None:
             if not _in_trading_hours(current_hour, hour_start, hour_end):
                 return "SKIP"
@@ -228,6 +239,15 @@ def build_check_fn(strategy_name: str, params: dict) -> Callable:
             return None
         if direction == "SKIP":
             return "SKIP"
+
+        signal_seconds_from_start = _to_float(_signal_context.get("seconds_from_start"))
+        if signal_seconds_from_start is not None:
+            min_elapsed_seconds = _to_float(params.get("min_elapsed_seconds"))
+            if min_elapsed_seconds is not None and signal_seconds_from_start < min_elapsed_seconds:
+                return "SKIP"
+            max_elapsed_seconds = _to_float(params.get("max_elapsed_seconds"))
+            if max_elapsed_seconds is not None and signal_seconds_from_start > max_elapsed_seconds:
+                return "SKIP"
 
         for filt in filters:
             result = filt(pm, i, direction, params)

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,6 +29,7 @@ pub struct UserWsAuth {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub service_name: String,
+    pub strategy_name: String,
     pub paper_mode: bool,
     pub log_level: String,
     pub log_format: LogFormat,
@@ -40,12 +42,16 @@ pub struct AppConfig {
     pub summary_log_interval: Duration,
     pub book_stale_after: Duration,
     pub ping_interval: Duration,
+    pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
     pub risk_limits: RiskLimits,
     pub user_auth: Option<UserWsAuth>,
+    pub dashboard_whale_events_path: Option<std::path::PathBuf>,
+    pub dashboard_refresh_ms: u64,
+    pub dashboard_event_limit: usize,
 }
 
 impl AppConfig {
@@ -55,6 +61,7 @@ impl AppConfig {
         let _ = dotenvy::dotenv();
 
         let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "whale-pair-exec");
+        let strategy_name = env_or("WHALE_PAIR_STRATEGY", "unlawful_shear");
         let paper_mode = parse_bool("WHALE_PAIR_PAPER_MODE", true)?;
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
@@ -82,6 +89,7 @@ impl AppConfig {
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
+        let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
         let starting_cash_usd =
             parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
@@ -121,9 +129,16 @@ impl AppConfig {
             )?,
         };
         let user_auth = load_user_auth();
+        let dashboard_whale_events_path =
+            parse_path_optional("WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH");
+        let dashboard_refresh_ms =
+            parse_duration_ms("WHALE_PAIR_DASHBOARD_REFRESH_MS", 2_000)?.as_millis() as u64;
+        let dashboard_event_limit =
+            parse_usize("WHALE_PAIR_DASHBOARD_EVENT_LIMIT", 200)?;
 
         Ok(Self {
             service_name,
+            strategy_name,
             paper_mode,
             log_level,
             log_format,
@@ -136,12 +151,16 @@ impl AppConfig {
             summary_log_interval,
             book_stale_after,
             ping_interval,
+            market_context_path,
             journal_path,
             starting_cash_usd,
             event_log_capacity,
             market_id_by_asset,
             risk_limits,
             user_auth,
+            dashboard_whale_events_path,
+            dashboard_refresh_ms,
+            dashboard_event_limit,
         })
     }
 
