@@ -26,6 +26,12 @@ Legacy one-shot shims now defer to the canonical command under
 `scripts/whale_pair/cmd/` through a shared dispatch convention shared by root-level
 wrappers.
 
+For programmatic imports, import command modules from `scripts.whale_pair.cmd`:
+
+```python
+from scripts.whale_pair import cmd
+```
+
 ## Shared settings
 
 - Strategy presets: `scripts/whale_pair/strategy_presets.py`
