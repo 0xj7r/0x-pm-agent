@@ -42,3 +42,4 @@ data/research/wallet_research/*/strategy_report_*.json
 execution/whale-dashboard/
 execution/rust/target/
 **/target/
+execution/rust/whale-pair-exec/.unlawful_shear_context.json
