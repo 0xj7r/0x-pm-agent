@@ -42,6 +42,13 @@ class LiveRuntimeStrategy:
         btc_open: float,
         snap: tuple[float, float, float],
         current_hour: int | None = None,
+        sample_ts: float | None = None,
+        seconds_from_start: float | None = None,
+        seconds_to_close: float | None = None,
+        window_duration_seconds: float | None = None,
+        window_open_ts: float | None = None,
+        price_to_beat: float | None = None,
+        **_signal_context: object,
     ) -> str | None:
         if self.name == "disabled" or btc_open <= 0:
             return None
@@ -54,4 +61,33 @@ class LiveRuntimeStrategy:
         if self._market_state.num_snaps <= 0:
             return None
         pm = self._market_state.as_precomputed_market()
-        return self._check_fn(pm, pm.num_snaps - 1, current_hour=current_hour)
+        idx = pm.num_snaps - 1
+        if seconds_from_start is not None and idx < len(pm.elapsed_pct):
+            if window_duration_seconds is not None and window_duration_seconds > 0:
+                elapsed_pct = min(
+                    1.0,
+                    max(0.0, float(seconds_from_start) / float(window_duration_seconds)),
+                )
+                pm.elapsed_pct[idx] = elapsed_pct
+            pm.seconds_from_start = float(seconds_from_start)
+        if seconds_to_close is not None:
+            pm.seconds_to_close = float(seconds_to_close)
+        if window_duration_seconds is not None:
+            pm.window_duration_seconds = float(window_duration_seconds)
+        if window_open_ts is not None:
+            pm.window_open_ts = float(window_open_ts)
+        if sample_ts is not None:
+            pm.sample_ts = float(sample_ts)
+        if price_to_beat is not None:
+            pm.price_to_beat = float(price_to_beat)
+        return self._check_fn(
+            pm,
+            idx,
+            current_hour=current_hour,
+            seconds_from_start=seconds_from_start,
+            seconds_to_close=seconds_to_close,
+            window_duration_seconds=window_duration_seconds,
+            window_open_ts=window_open_ts,
+            price_to_beat=price_to_beat,
+            sample_ts=sample_ts,
+        )

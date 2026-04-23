@@ -1,4 +1,6 @@
 .env
+*.env
+!*.env.example
 __pycache__/
 *.pyc
 *.db
@@ -31,3 +33,13 @@ data/research/wallet_research/*/closed_positions.json
 data/research/wallet_research/*/summary.json
 data/research/wallet_research/*/activity_windows_summary.json
 data/research/wallet_research/*/activity_history.json
+data/research/wallet_research/*/raw_capture/
+data/research/wallet_research/*/live_capture/
+data/research/wallet_research/*/collection_summary.json
+data/research/wallet_research/*/btc_5m_window_reconstruction.json
+data/research/wallet_research/*/rust_market_context.json
+data/research/wallet_research/*/strategy_report_*.json
+execution/whale-dashboard/
+execution/rust/target/
+**/target/
+execution/rust/whale-pair-exec/.unlawful_shear_context.json
