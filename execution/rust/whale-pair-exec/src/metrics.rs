@@ -1,19 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::Router;
 use prometheus::{
     Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::book::BookState;
 
@@ -32,6 +24,7 @@ impl StreamKind {
     }
 }
 
+#[derive(Debug)]
 pub struct AppMetrics {
     registry: Registry,
     market_ws_connected: IntGauge,
@@ -216,7 +209,7 @@ impl AppMetrics {
         }
     }
 
-    fn encode(&self) -> Result<Vec<u8>> {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -224,41 +217,6 @@ impl AppMetrics {
             .encode(&metric_families, &mut buffer)
             .context("failed to encode prometheus metrics")?;
         Ok(buffer)
-    }
-}
-
-pub async fn serve_http(metrics: Arc<AppMetrics>, bind: std::net::SocketAddr, shutdown: CancellationToken) -> Result<()> {
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/metrics", get(metrics_handler))
-        .with_state(metrics);
-
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("failed to bind metrics server at {bind}"))?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await
-        .context("metrics server terminated unexpectedly")?;
-    Ok(())
-}
-
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-async fn metrics_handler(State(metrics): State<Arc<AppMetrics>>) -> Response {
-    match metrics.encode() {
-        Ok(body) => (
-            [(CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
-            body,
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("metrics encoding failed: {error:#}"),
-        )
-            .into_response(),
     }
 }
 

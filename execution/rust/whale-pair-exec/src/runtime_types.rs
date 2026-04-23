@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::inventory::InventoryError;
-use crate::types::{ClientOrderId, EpochMillis, RuntimeCommand, RuntimeStatus};
+use crate::types::{EpochMillis, RuntimeCommand, RuntimeStatus};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeConfig {
@@ -87,4 +87,3 @@ impl From<InventoryError> for RuntimeError {
         Self::Inventory(value)
     }
 }
-

@@ -335,7 +335,7 @@ impl InventoryState {
 
         let client_order_id = fill.client_order_id.clone();
         let notional_usd = fill.notional_usd();
-        let mut cash_delta_usd = 0.0;
+        let cash_delta_usd;
         let mut realized_pnl_delta_usd = 0.0;
         let position_delta = fill.quantity * fill.side.sign();
         let reservation_amount = client_order_id
@@ -385,7 +385,7 @@ impl InventoryState {
                 entry.updated_at_ms = fill.observed_at_ms;
             }
             TradeSide::Sell => {
-                let mut remove_after = false;
+                let remove_after;
                 {
                     let entry = self
                         .positions
@@ -506,6 +506,7 @@ mod tests {
                 quantity: 10.0,
                 fee_usd: 0.10,
                 liquidity: FillLiquidity::Taker,
+                close_method: None,
                 observed_at_ms: 12,
             })
             .expect("buy fill");
@@ -524,6 +525,7 @@ mod tests {
                 quantity: 10.0,
                 fee_usd: 0.10,
                 liquidity: FillLiquidity::Taker,
+                close_method: None,
                 observed_at_ms: 20,
             })
             .expect("sell fill");

@@ -80,6 +80,39 @@ pub enum FillLiquidity {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum CloseMethod {
+    #[default]
+    Unknown,
+    Merge,
+    Redeem,
+    Sell,
+    Settle,
+    Settlement,
+}
+
+impl CloseMethod {
+    pub fn from_raw(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "merge" | "mergepositions" => Self::Merge,
+            "redeem" | "redeempositions" => Self::Redeem,
+            "sell" => Self::Sell,
+            "settle" | "settlement" => Self::Settlement,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Merge => "merge",
+            Self::Redeem => "redeem",
+            Self::Sell => "sell",
+            Self::Settle | Self::Settlement => "settlement",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BookLevel {
     pub price: f64,
@@ -166,6 +199,7 @@ pub struct FillReport {
     pub quantity: f64,
     pub fee_usd: f64,
     pub liquidity: FillLiquidity,
+    pub close_method: Option<CloseMethod>,
     pub observed_at_ms: EpochMillis,
 }
 
