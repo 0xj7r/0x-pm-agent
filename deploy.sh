@@ -1,1 +1,0 @@
-ops/deploy/deploy_hetzner.sh
