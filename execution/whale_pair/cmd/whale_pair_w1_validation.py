@@ -181,7 +181,7 @@ def main() -> None:
     ap.add_argument("--db", default="backtesting/btc.db")
     ap.add_argument(
         "--activity-json",
-        default="data/research/whale_analysis/8b5b82/activity.json",
+        default="data/research/whale_analysis/unlawful-shear/activity.json",
         help="W1 activity slice JSON",
     )
     ap.add_argument(

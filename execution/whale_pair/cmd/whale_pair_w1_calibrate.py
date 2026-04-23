@@ -20,9 +20,9 @@ Expected pnl JSON schema:
 
 Usage:
     python scripts/whale_pair_w1_calibrate.py \\
-        --activity-json data/research/whale_analysis/8b5b82/activity.json \\
+        --activity-json data/research/whale_analysis/unlawful-shear/activity.json \\
         --db backtesting/btc.db \\
-        --output data/research/whale_analysis/8b5b82/calibration.json
+        --output data/research/whale_analysis/unlawful-shear/calibration.json
 """
 from __future__ import annotations
 
@@ -133,11 +133,11 @@ def main() -> None:
     ap.add_argument("--db", default="backtesting/btc.db")
     ap.add_argument(
         "--activity-json",
-        default="data/research/whale_analysis/8b5b82/activity.json",
+        default="data/research/whale_analysis/unlawful-shear/activity.json",
     )
     ap.add_argument(
         "--pnl-json",
-        default="data/research/whale_analysis/8b5b82/pnl_timeseries.json",
+        default="data/research/whale_analysis/unlawful-shear/pnl_timeseries.json",
     )
     ap.add_argument("--output", default="")
     ap.add_argument("--base-clip-usds", default="")

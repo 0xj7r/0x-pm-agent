@@ -127,7 +127,7 @@ This order matters. We need the clean core before we add execution complexity.
 
 ## Historical data notes (2026-03-20 → 2026-04-23 UTC)
 
-- Full backfill for `0xb27...` was pulled into `data/research/wallet_research/8b5b82/history/historical/`.
+- Full backfill for `0xb27...` was pulled into `data/research/wallet_research/unlawful-shear/history/historical/`.
 - The recovered history file is large (`activity_history.json` ~106MB) and is available locally for analysis.
 - Companion summaries are in:
   - `summary.json`
@@ -149,7 +149,7 @@ Observed shape from this span:
 python3 scripts/whale_pair_compare_variants.py \
   --db backtesting/btc.db \
   --limit 40 \
-  --whale-activity data/research/wallet_research/8b5b82/recent_cap_activity.json \
+  --whale-activity data/research/wallet_research/unlawful-shear/recent_cap_activity.json \
   --latency-snapshots 1 \
   --fill-fraction 0.7 \
   --output /tmp/w1_variant_compare.json

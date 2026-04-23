@@ -5,7 +5,7 @@ take `/activity` rows and align them to contemporaneous local snapshot state
 from `backtesting/{btc,eth}.db`.
 
 Usage:
-  python3 scripts/join_wallet_to_market_state.py --activity data/research/whale_analysis/f73cad/activity.json
+  python3 scripts/join_wallet_to_market_state.py --activity data/research/whale_analysis/split-sell/activity.json
   python3 scripts/join_wallet_to_market_state.py --wallet 0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad
 """
 from __future__ import annotations
@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from research.wallet_aliases import wallet_dir_name
 
 ROOT = Path(__file__).resolve().parent.parent
 WHALE_DIR = ROOT / "data" / "research" / "whale_analysis"
@@ -60,14 +62,14 @@ def resolve_activity_path(wallet: str | None, activity_path: str | None) -> Path
         return Path(activity_path)
     if not wallet:
         raise SystemExit("Either --wallet or --activity is required")
-    last6 = wallet.lower()[-6:]
+    wallet_dir = wallet_dir_name(wallet)
     candidates = [
-        WHALE_DIR / last6 / "activity.json",
+        WHALE_DIR / wallet_dir / "activity.json",
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    raise SystemExit(f"Could not find local activity file for wallet suffix {last6}")
+    raise SystemExit(f"Could not find local activity file for wallet {wallet}")
 
 
 def get_conn(db_path: Path) -> sqlite3.Connection:

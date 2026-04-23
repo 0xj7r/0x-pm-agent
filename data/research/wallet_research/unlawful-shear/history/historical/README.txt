@@ -1,4 +1,4 @@
-Wallet research artifacts (8b5b82) — generated from
+Wallet research artifacts (unlawful-shear) — generated from
 `scripts/backfill_wallet_history.py --wallet 0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82`.
 
 Included:

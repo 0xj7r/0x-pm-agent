@@ -3,8 +3,8 @@
 
 Usage:
   python3 scripts/summarize_wallet_history.py \
-      --history data/research/wallet_research/8b5b82/history/historical/activity_history.json \
-      --output data/research/wallet_research/8b5b82/history/historical/phase_summary.json
+      --history data/research/wallet_research/unlawful-shear/history/historical/activity_history.json \
+      --output data/research/wallet_research/unlawful-shear/history/historical/phase_summary.json
 """
 from __future__ import annotations
 

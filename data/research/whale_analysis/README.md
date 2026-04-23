@@ -9,7 +9,7 @@ Captured: 2026-04-22T09:41:13.917249+00:00
 
 ## Files
 
-### `pnl_timeseries_<last6>.json`
+### `<wallet-dir>/pnl_timeseries.json`
 Raw time-series P&L from Polymarket's internal endpoint:
 ```
 GET https://user-pnl-api.polymarket.com/user-pnl?user_address=<wallet>&interval=all
@@ -17,11 +17,11 @@ GET https://user-pnl-api.polymarket.com/user-pnl?user_address=<wallet>&interval=
 Each point: `{"t": unix_ts, "p": pnl_usdc}`. Hourly fidelity. This is the same
 series that powers the green/purple P&L chart on each profile page.
 
-### `daily_pnl_<last6>.json`
+### `<wallet-dir>/daily_pnl.json`
 End-of-UTC-day P&L snapshots derived from the time series above. Useful for
 day-level comparison across wallets.
 
-### `activity_<last6>.json`
+### `<wallet-dir>/activity.json`
 Raw activity rows from `data-api.polymarket.com/activity?user=<wallet>`, up to
 the 3500-row API cap (newest first). Each row is a TRADE / MERGE / SPLIT / REDEEM
 event with conditionId, slug, price, size, usdcSize, outcome, transactionHash.

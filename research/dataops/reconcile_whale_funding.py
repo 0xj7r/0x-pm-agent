@@ -24,6 +24,8 @@ from typing import Any
 
 import httpx
 
+from research.wallet_aliases import wallet_dir_name
+
 getcontext().prec = 28
 
 ETHERSCAN_V2 = "https://api.etherscan.io/v2/api"
@@ -96,8 +98,7 @@ def _row_key(row: dict[str, Any]) -> tuple[str, ...]:
 
 
 def checkpoint_paths(wallet: str) -> tuple[Path, Path]:
-    last6 = wallet[-6:].lower()
-    checkpoint_dir = WHALE_DIR / last6 / "etherscan_checkpoint"
+    checkpoint_dir = WHALE_DIR / wallet_dir_name(wallet) / "etherscan_checkpoint"
     return checkpoint_dir / "rows.jsonl", checkpoint_dir / "state.json"
 
 
@@ -238,8 +239,7 @@ def load_json(path: Path) -> Any:
 
 
 def load_activity(wallet: str) -> list[dict[str, Any]]:
-    last6 = wallet[-6:].lower()
-    candidates = [WHALE_DIR / last6 / "activity.json"]
+    candidates = [WHALE_DIR / wallet_dir_name(wallet) / "activity.json"]
     for path in candidates:
         if path.exists():
             return load_json(path)
@@ -382,8 +382,7 @@ def summarize(
             running -= t.amount
         by_day[t.date_utc] = running
 
-    last6 = wallet[-6:].lower()
-    wallet_dir = WHALE_DIR / last6
+    wallet_dir = WHALE_DIR / wallet_dir_name(wallet)
     pnl_path = wallet_dir / "pnl_timeseries.json"
     daily_pnl_path = wallet_dir / "daily_pnl.json"
     pnl_series = load_json(pnl_path) if pnl_path.exists() else []
@@ -555,17 +554,17 @@ def main() -> None:
     transfers = normalize_transfers(wallet=wallet, rows=rows, activity_by_tx=activity_by_tx)
     summary = summarize(wallet=wallet, current_cash_usdc=args.current_cash_usdc, transfers=transfers)
 
-    last6 = wallet[-6:]
-    out_dir = WHALE_DIR / last6
+    dir_name = wallet_dir_name(wallet)
+    out_dir = WHALE_DIR / dir_name
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"usdc_transfers_{last6}.json").write_text(
+    (out_dir / f"usdc_transfers_{dir_name}.json").write_text(
         json.dumps([asdict(t) | {"amount": str(t.amount)} for t in transfers], indent=2)
     )
-    (out_dir / f"funding_summary_{last6}.json").write_text(json.dumps(summary, indent=2))
+    (out_dir / f"funding_summary_{dir_name}.json").write_text(json.dumps(summary, indent=2))
     print(render_report(summary))
     print("")
-    print(f"Saved: {out_dir / f'usdc_transfers_{last6}.json'}")
-    print(f"Saved: {out_dir / f'funding_summary_{last6}.json'}")
+    print(f"Saved: {out_dir / f'usdc_transfers_{dir_name}.json'}")
+    print(f"Saved: {out_dir / f'funding_summary_{dir_name}.json'}")
 
 
 if __name__ == "__main__":

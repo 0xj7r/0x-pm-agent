@@ -2,7 +2,7 @@
 
 Usage:
   python3 scripts/infer_whale_execution_features.py --wallet 0xb27bc9...
-  python3 scripts/infer_whale_execution_features.py --joined data/research/wallet_research/8b5b82/market_join.json
+  python3 scripts/infer_whale_execution_features.py --joined data/research/wallet_research/unlawful-shear/market_join.json
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from research.wallet_aliases import wallet_dir_name
 from scripts.join_wallet_to_market_state import main as join_main
 
 OUT = ROOT / "data" / "research" / "wallet_research"
@@ -164,15 +165,18 @@ def resolve_joined_path(wallet: str | None, joined_path: str | None) -> Path:
         return Path(joined_path)
     if not wallet:
         raise SystemExit("Either --wallet or --joined is required")
-    last6 = wallet.lower()[-6:]
-    candidates = [OUT / last6 / "market_join.json", OUT / last6 / "live_market_join.json"]
+    wallet_dir = wallet_dir_name(wallet)
+    candidates = [
+        OUT / wallet_dir / "market_join.json",
+        OUT / wallet_dir / "live_market_join.json",
+    ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
-    candidate = OUT / last6 / f"{last6}_market_join.json"
+    candidate = OUT / wallet_dir / f"{wallet_dir}_market_join.json"
     if candidate.exists():
         return candidate
-    raise SystemExit(f"Could not find joined market-state file for wallet suffix {last6}")
+    raise SystemExit(f"Could not find joined market-state file for wallet {wallet}")
 
 
 def ensure_joined(wallet: str | None, joined_path: Path) -> None:

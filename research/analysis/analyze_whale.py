@@ -14,6 +14,8 @@ from statistics import mean, median
 
 import httpx
 
+from research.wallet_aliases import wallet_dir_name
+
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 DEFAULT_WALLET = "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82"
@@ -242,7 +244,7 @@ def main() -> None:
         / "data"
         / "research"
         / "whale_analysis"
-        / wallet[-6:]
+        / wallet_dir_name(wallet)
         / "activity.json"
     )
     out.parent.mkdir(exist_ok=True)
