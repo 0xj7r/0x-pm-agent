@@ -14,8 +14,6 @@ use crate::config::AppConfig;
 use crate::event_log::EventLog;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
-use crate::market_ws::MarketWsClient;
-use crate::api::{DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot, DashboardUiState, serve_http};
 use crate::metrics::AppMetrics;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use crate::strategy::{Strategy, StrategyMode};
@@ -23,7 +21,12 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, RuntimeCommand,
     RuntimeStatus, TradeSide,
 };
-use crate::user_ws::{UserOrderEvent, UserWsClient};
+use crate::wire::api::{
+    DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot,
+    DashboardUiState, serve_http,
+};
+use crate::wire::market_ws::MarketWsClient;
+use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 pub async fn run() -> Result<()> {
     let config = AppConfig::from_env()?;

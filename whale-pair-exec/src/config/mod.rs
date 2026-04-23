@@ -1,3 +1,5 @@
+pub mod parser;
+
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -6,12 +8,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::risk::RiskLimits;
-use crate::config_parser::{
+use crate::config::parser::{
     env_or, load_user_auth, parse_asset_market_map, parse_bool, parse_duration_ms, parse_f64,
     parse_log_format, parse_path_optional, parse_socket_addr, parse_usize, split_csv_optional,
     split_csv_required,
 };
+use crate::risk::RiskLimits;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LogFormat {

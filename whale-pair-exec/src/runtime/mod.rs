@@ -1,3 +1,6 @@
+pub mod runner;
+pub mod types;
+
 use std::collections::HashMap;
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
@@ -8,7 +11,7 @@ use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
 use crate::types::{
     ClientOrderId, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
 };
-pub use crate::runtime_types::{
+pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
