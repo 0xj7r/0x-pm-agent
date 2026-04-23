@@ -1,0 +1,14 @@
+{
+  "files": [
+    {
+      "name": "positions.csv",
+      "size_bytes": 60597,
+      "row_count": 329
+    },
+    {
+      "name": "equity.csv",
+      "size_bytes": 108,
+      "row_count": 1
+    }
+  ]
+}
