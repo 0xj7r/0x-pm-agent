@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import replace
 from pathlib import Path
 import sys
 
@@ -14,49 +13,11 @@ if str(ROOT) not in sys.path:
 
 from backtesting.whale_pair_backtest import ExecutionModel, run_backtest
 from strategies.whale_pair import WhalePairConfig
-
-
-BASE_CFG = WhalePairConfig(
-    max_pair_cost=0.985,
-    accumulate_price_max=0.50,
-    aggressive_price_max=0.10,
-    base_clip_usd=25.0,
-    aggressive_clip_usd=50.0,
-    max_gross_cost_usd=250.0,
-    min_seconds_from_start=10,
-    max_seconds_from_start=240,
-    completion_min_pnl_per_share=0.002,
-    max_imbalance_ratio=3.0,
-)
+from scripts.whale_pair.strategy_presets import default_compare_variants
 
 
 def build_variants() -> dict[str, WhalePairConfig]:
-    return {
-        "pair_recycler": replace(BASE_CFG, variant="pair_recycler"),
-        "w1_mimic": replace(
-            BASE_CFG,
-            variant="w1_mimic",
-            max_pair_cost=0.99,
-            accumulate_price_max=0.50,
-            base_clip_shares=25.0,
-            aggressive_clip_shares=100.0,
-            max_imbalance_ratio=4.0,
-        ),
-        "skewed_pair_builder": replace(
-            BASE_CFG,
-            variant="skewed_pair_builder",
-            accumulate_price_max=0.60,
-            max_imbalance_ratio=4.0,
-        ),
-        "passive_ladder": replace(
-            BASE_CFG,
-            variant="passive_ladder",
-            max_pair_cost=0.99,
-            max_imbalance_ratio=4.0,
-            base_clip_shares=25.0,
-            aggressive_clip_shares=100.0,
-        ),
-    }
+    return default_compare_variants()
 
 
 def summarize(report: dict) -> dict:
