@@ -21,6 +21,8 @@ Legacy command locations (kept for compatibility):
 
 - `scripts/*.py` and `scripts/*.sh` still resolve to the canonical files in this
   directory tree through `scripts/_legacy_script_dispatch.sh`.
+- `scripts/deploy/whale-pair` is a compatibility entry that points to
+  `ops/deploy/whale-pair`.
 
 The dispatch shim is now directory-driven, so newly added scripts placed under:
 - `scripts/analysis/`
