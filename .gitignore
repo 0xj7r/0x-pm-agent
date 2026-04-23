@@ -16,9 +16,7 @@ venv/
 .pytest_cache/
 logs/
 .chronos_cache/
-data/research/
-data/wallet_research/
-execution/whale-dashboard/
-execution/rust/target/
+data/
+execution/
 **/target/
-execution/rust/whale-pair-exec/.unlawful_shear_context.json
+whale-pair-exec/.unlawful_shear_context.json
