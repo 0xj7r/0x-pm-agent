@@ -692,7 +692,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-pair-cost", type=float, default=0.99)
     ap.add_argument(
         "--variant",
-        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder"),
+        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder", "w1_mimic"),
         default="pair_recycler",
     )
     ap.add_argument("--base-clip-usd", type=float, default=50.0)

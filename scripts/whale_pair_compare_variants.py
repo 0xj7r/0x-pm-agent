@@ -33,6 +33,15 @@ BASE_CFG = WhalePairConfig(
 def build_variants() -> dict[str, WhalePairConfig]:
     return {
         "pair_recycler": replace(BASE_CFG, variant="pair_recycler"),
+        "w1_mimic": replace(
+            BASE_CFG,
+            variant="w1_mimic",
+            max_pair_cost=0.99,
+            accumulate_price_max=0.50,
+            base_clip_shares=25.0,
+            aggressive_clip_shares=100.0,
+            max_imbalance_ratio=4.0,
+        ),
         "skewed_pair_builder": replace(
             BASE_CFG,
             variant="skewed_pair_builder",

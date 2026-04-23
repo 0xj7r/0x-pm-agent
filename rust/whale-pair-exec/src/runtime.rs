@@ -386,6 +386,8 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn accept_intent(&mut self, intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
+        // TODO(2026-04-23): integrate execution acknowledgements/fill events from a downstream
+        // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
         if self.open_orders.contains_key(&intent.client_order_id) {
             outcome.push_event(self.event_log.push(

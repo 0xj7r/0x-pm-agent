@@ -367,7 +367,11 @@ def simulate_market(
     missed_orders = 0
     partial_orders = 0
     execution_slippage_usd = 0.0
-    allow_single_leg_accumulate = cfg.variant in ("skewed_pair_builder", "passive_ladder")
+    allow_single_leg_accumulate = cfg.variant in (
+        "skewed_pair_builder",
+        "passive_ladder",
+        "w1_mimic",
+    )
     for snap_index, snap in enumerate(snapshots):
         best_ask_up = snap.get("best_ask_up")
         best_ask_down = snap.get("best_ask_down")
@@ -556,6 +560,7 @@ def run_backtest(
     db_path: Path,
     cfg: WhalePairConfig,
     *,
+    market_type: str = "5m",
     limit: int | None = None,
     whale_activity_path: Path | None = None,
     execution: ExecutionModel | None = None,
@@ -569,6 +574,7 @@ def run_backtest(
         markets = load_markets(
             conn,
             limit=limit,
+            market_type=market_type,
             include_slugs=set(whale_by_slug.keys()) if whale_by_slug else None,
         )
         results: list[BacktestMarketResult] = []
@@ -597,6 +603,7 @@ def run_backtest(
     losers = [r for r in active if r.total_pnl_usd < 0]
     report = {
         "db_path": str(db_path),
+        "market_type": market_type,
         "config": asdict(cfg),
         "execution": asdict(execution or ExecutionModel()),
         "markets_considered": len(results),
@@ -673,7 +680,7 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument(
         "--variant",
-        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder"),
+        choices=("pair_recycler", "skewed_pair_builder", "passive_ladder", "w1_mimic"),
         default="pair_recycler",
     )
     ap.add_argument("--accumulate-price-max", type=float, default=0.50)
