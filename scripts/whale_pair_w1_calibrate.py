@@ -40,6 +40,7 @@ from backtesting.whale_pair_backtest import (
     ExecutionModel,
     run_backtest,
 )
+from scripts.whale_pair.strategy_presets import W1_COMPARE_VARIANTS
 from strategies.whale_pair import WhalePairConfig
 
 
@@ -150,7 +151,7 @@ def main() -> None:
     if not activity_path.exists():
         raise SystemExit(f"activity json not found: {activity_path}")
 
-    base = WhalePairConfig()
+    base = W1_COMPARE_VARIANTS.get("pair_recycler", WhalePairConfig())
     execution = ExecutionModel(
         latency_snapshots=max(0, int(args.latency_snapshots)),
         fill_fraction=max(0.0, min(1.0, float(args.fill_fraction))),

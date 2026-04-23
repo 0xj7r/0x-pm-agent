@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from statistics import median
@@ -26,99 +25,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtesting.whale_pair_backtest import ExecutionModel, run_backtest
+from scripts.whale_pair.strategy_presets import W1_VALIDATION_SPECS, ValidationSpec
 from strategies.whale_pair import WhalePairConfig
-from strategies.whale_pair import WhalePairVariant
 
 
-@dataclass(frozen=True)
-class ValidationSpec:
-    variant: WhalePairVariant
-    description: str
-    defaults: WhalePairConfig
-
-
-BASE_SPECS: dict[str, ValidationSpec] = {
-    "pair_recycler": ValidationSpec(
-        variant="pair_recycler",
-        description=(
-            "Neutral recycler baseline: pair-first preference + strict same-side cap"
-        ),
-        defaults=WhalePairConfig(
-            variant="pair_recycler",
-            max_pair_cost=0.985,
-            accumulate_price_max=0.50,
-            aggressive_price_max=0.10,
-            base_clip_usd=25.0,
-            aggressive_clip_usd=50.0,
-            max_gross_cost_usd=250.0,
-            min_seconds_from_start=10,
-            max_seconds_from_start=240,
-            completion_min_pnl_per_share=0.002,
-            max_imbalance_ratio=3.0,
-        ),
-    ),
-    "skewed_pair_builder": ValidationSpec(
-        variant="skewed_pair_builder",
-        description=(
-            "Intentional skew allowed with controlled imbalance bounds"
-        ),
-        defaults=WhalePairConfig(
-            variant="skewed_pair_builder",
-            max_pair_cost=0.985,
-            accumulate_price_max=0.60,
-            aggressive_price_max=0.10,
-            base_clip_usd=25.0,
-            aggressive_clip_usd=50.0,
-            max_gross_cost_usd=250.0,
-            min_seconds_from_start=10,
-            max_seconds_from_start=240,
-            completion_min_pnl_per_share=0.002,
-            max_imbalance_ratio=4.0,
-        ),
-    ),
-    "passive_ladder": ValidationSpec(
-        variant="passive_ladder",
-        description=(
-            "Passive-style clip behavior (share-sized legs) with same execution budget"
-        ),
-        defaults=WhalePairConfig(
-            variant="passive_ladder",
-            max_pair_cost=0.99,
-            accumulate_price_max=0.50,
-            aggressive_price_max=0.10,
-            base_clip_usd=25.0,
-            aggressive_clip_usd=50.0,
-            base_clip_shares=25.0,
-            aggressive_clip_shares=100.0,
-            max_gross_cost_usd=250.0,
-            min_seconds_from_start=10,
-            max_seconds_from_start=240,
-            completion_min_pnl_per_share=0.002,
-            max_imbalance_ratio=4.0,
-        ),
-    ),
-    "w1_mimic": ValidationSpec(
-        variant="w1_mimic",
-        description=(
-            "Explicit W1-hypothesis profile: passive-style clips plus controlled skew"
-        ),
-        defaults=WhalePairConfig(
-            variant="w1_mimic",
-            max_pair_cost=0.99,
-            accumulate_price_max=0.50,
-            aggressive_price_max=0.10,
-            base_clip_usd=25.0,
-            aggressive_clip_usd=50.0,
-            base_clip_shares=25.0,
-            aggressive_clip_shares=100.0,
-            max_gross_cost_usd=250.0,
-            min_seconds_from_start=10,
-            max_seconds_from_start=240,
-            completion_min_pnl_per_share=0.002,
-            max_imbalance_ratio=4.0,
-        ),
-    ),
-}
+BASE_SPECS: dict[str, ValidationSpec] = {name: spec for name, spec in W1_VALIDATION_SPECS.items()}
 
 
 SHAPE_WEIGHT = {
