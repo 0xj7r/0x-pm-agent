@@ -7,6 +7,7 @@ pub mod logging;
 pub mod market_ws;
 pub mod metrics;
 pub mod risk;
+pub mod runtime_types;
 pub mod runtime;
 pub mod strategy;
 pub mod types;
