@@ -77,6 +77,20 @@ class RiskConfig:
     stop_loss_min_best_bid_size_shares: float = 0.0
     stop_loss_exit_slippage_usd: float = 0.01
     stop_loss_order_timeout_seconds: int = 20
+    # Whale-copy ingest & replay controls.
+    whale_copy_enabled: bool = False
+    whale_copy_allow_live: bool = False
+    whale_copy_watch_wallets: list[str] = field(default_factory=list)
+    whale_copy_poll_interval_seconds: float = 45.0
+    whale_copy_event_ttl_seconds: float = 900.0
+    whale_copy_lookback_seconds: float = 3600.0
+    whale_copy_slug_prefix: str = "btc-updown-5m-"
+    whale_copy_activity_api: str = "https://data-api.polymarket.com"
+    whale_copy_activity_timeout_seconds: float = 15.0
+    whale_copy_follow_ratio: float = 0.0
+    whale_copy_default_size_usd: float = 0.0
+    whale_copy_min_size_usd: float = 1.0
+    whale_copy_size_cap_usd: float = 0.0
 
 
 @dataclass

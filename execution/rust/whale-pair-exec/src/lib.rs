@@ -5,6 +5,8 @@ pub mod config_parser;
 pub mod inventory;
 pub mod journal;
 pub mod logging;
+pub mod api;
+pub mod market_context;
 pub mod market_ws;
 pub mod metrics;
 pub mod risk;

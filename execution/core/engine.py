@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import time as _time
+from collections import deque
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from core.kelly import (
 )
 from core.memory import MemoryStore
 from core.notifier import SlackNotifier
+from core.whale_copy import WhaleCopySignal, WhaleCopySignalIngestor
 from core.resolver import PaperTradeResolver
 from core.risk import RejectReason, RiskManager
 from core.trade_persistence import TradePersistence
@@ -232,7 +234,6 @@ class BTCTradingEngine:
         self._current_btc_price: float = 0.0
         # Rolling 60-min price history for regime tagging on each trade.
         # Deque of (timestamp_sec, price). Evicted on each tick.
-        from collections import deque
         self._price_history: deque[tuple[float, float]] = deque()
         self._trade_volume_history: deque[tuple[float, float]] = deque()
         self._already_traded_this_window: bool = False
@@ -270,6 +271,77 @@ class BTCTradingEngine:
         self._paired_paper_enabled: bool = bool(
             getattr(strategy_cfg.risk, "paired_paper_enabled", False)
         )
+        self._whale_copy_ingestor: WhaleCopySignalIngestor | None = None
+        self._whale_copy_task: asyncio.Task | None = None
+        self._whale_copy_signal_queue: deque[WhaleCopySignal] = deque()
+        self._whale_copy_poll_interval_seconds: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_poll_interval_seconds", 45.0)
+        )
+        self._whale_copy_event_ttl_seconds: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_event_ttl_seconds", 900.0)
+        )
+        self._whale_copy_follow_ratio: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_follow_ratio", 0.0)
+        )
+        self._whale_copy_default_size_usd: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_default_size_usd", 0.0)
+        )
+        self._whale_copy_min_size_usd: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_min_size_usd", 1.0)
+        )
+        self._whale_copy_size_cap_usd: float = float(
+            getattr(strategy_cfg.risk, "whale_copy_size_cap_usd", 0.0)
+        )
+        self._whale_copy_enabled: bool = bool(
+            getattr(strategy_cfg.risk, "whale_copy_enabled", False)
+        ) and bool(strategy_cfg.paper.enabled or getattr(strategy_cfg.risk, "whale_copy_allow_live", False))
+        watch_wallets = [
+            str(w).lower() for w in getattr(strategy_cfg.risk, "whale_copy_watch_wallets", []) if str(w).strip()
+        ]
+        if self._whale_copy_enabled and watch_wallets:
+            self._whale_copy_ingestor = WhaleCopySignalIngestor(
+                wallets=watch_wallets,
+                api_base=str(
+                    getattr(
+                        strategy_cfg.risk,
+                        "whale_copy_activity_api",
+                        "https://data-api.polymarket.com",
+                    )
+                ).rstrip("/"),
+                poll_interval_seconds=self._whale_copy_poll_interval_seconds,
+                event_ttl_seconds=self._whale_copy_event_ttl_seconds,
+                lookback_seconds=float(
+                    getattr(strategy_cfg.risk, "whale_copy_lookback_seconds", 3600.0)
+                ),
+                slug_prefix=str(
+                    getattr(strategy_cfg.risk, "whale_copy_slug_prefix", "btc-updown-5m-")
+                ),
+                timeout_seconds=float(
+                    getattr(
+                        strategy_cfg.risk,
+                        "whale_copy_activity_timeout_seconds",
+                        15.0,
+                    )
+                ),
+            )
+            logger.info(
+                "Whale-copy ingestion ready: %d wallets, poll=%.1fs, ttl=%.0fs, lookback=%.0fs",
+                len(watch_wallets),
+                self._whale_copy_poll_interval_seconds,
+                self._whale_copy_event_ttl_seconds,
+                getattr(strategy_cfg.risk, "whale_copy_lookback_seconds", 3600.0),
+            )
+        elif self._whale_copy_enabled:
+            logger.warning(
+                "Whale-copy enabled but no watch wallets configured; disabling. "
+                "Set risk.whale_copy_watch_wallets in strategy config."
+            )
+            self._whale_copy_enabled = False
+        elif bool(getattr(strategy_cfg.risk, "whale_copy_enabled", False)):
+            logger.info(
+                "Whale-copy signal ingestion configured but disabled in this mode. "
+                "Enable in paper mode, or set whale_copy_allow_live=true for live."
+            )
         self._window_open_ts: float | None = None
         self._entry_blocker: dict | None = None
         self._last_logged_entry_blocker_key: tuple[str, str] | None = None
@@ -410,6 +482,67 @@ class BTCTradingEngine:
             "signal": signal,
             "move_pct": round(move_pct, 6),
         }
+
+    def _consume_whale_copy_signal(self) -> WhaleCopySignal | None:
+        if not self._whale_copy_ingestor or not self._whale_copy_enabled:
+            return None
+        if self.current_window is None:
+            return None
+
+        now = _time.time()
+        ttl_start = now - self._whale_copy_event_ttl_seconds
+        current_slug = self.current_window.slug
+        window_id = self.current_window.market_id
+        retained: deque[WhaleCopySignal] = deque()
+        matched = None
+
+        for signal in self._whale_copy_signal_queue:
+            if signal.event_ts < ttl_start:
+                continue
+            if matched is None and signal.slug == current_slug:
+                # Consume the first matching event for this active window.
+                matched = signal
+                logger.info(
+                    "Consuming whale-copy signal: window=%s event=%s wallet=%s direction=%s "
+                    "size=$%.2f age=%.1fs",
+                    window_id,
+                    signal.event_id,
+                    signal.wallet,
+                    signal.direction,
+                    signal.usdc_size,
+                    now - signal.event_ts,
+                )
+                continue
+            retained.append(signal)
+
+        self._whale_copy_signal_queue = retained
+        return matched
+
+    async def _run_whale_copy_poller(self) -> None:
+        while self._running:
+            if not self._whale_copy_ingestor:
+                return
+            try:
+                signals = await self._whale_copy_ingestor.poll()
+                if signals:
+                    self._whale_copy_signal_queue.extend(signals)
+                    logger.info(
+                        "Whale-copy queue size=%d (added=%d)",
+                        len(self._whale_copy_signal_queue),
+                        len(signals),
+                    )
+            except Exception as e:
+                logger.warning(f"Whale-copy polling failed: {e}")
+
+            if self._whale_copy_signal_queue:
+                # keep bounded memory if upstream becomes noisy.
+                max_queue = 500
+                while len(self._whale_copy_signal_queue) > max_queue:
+                    self._whale_copy_signal_queue.popleft()
+
+            # WhaleCopySignalIngestor also gate-keeps polling, so this
+            # loop only needs to be a coarse heartbeat.
+            await asyncio.sleep(max(1.0, self._whale_copy_poll_interval_seconds))
 
     @staticmethod
     def _init_risk(cfg: StrategyConfig) -> RiskManager:
@@ -841,27 +974,54 @@ class BTCTradingEngine:
             return blocked("duplicate_market_snapshot")
         self._last_processed_snap = current_snap
 
-        current_hour = datetime.now(timezone.utc).hour
-        signal = self._strategy.check_signal(
-            self.current_window.market_id,
-            self._window_open_price,
-            current_snap,
-            current_hour=current_hour,
-        )
+        now_dt = datetime.now(timezone.utc)
+        current_hour = now_dt.hour
+        window_start_ts = self.current_window.start_time.timestamp()
+        window_end_ts = self.current_window.end_time.timestamp()
+        window_duration_seconds = max(1.0, window_end_ts - window_start_ts)
+        seconds_from_start = max(0.0, now_dt.timestamp() - window_start_ts)
+        seconds_to_close = max(0.0, window_end_ts - now_dt.timestamp())
+        whale_signal = self._consume_whale_copy_signal()
+        used_whale_copy = whale_signal is not None
         snap_count = self._strategy.num_snaps
 
-        if signal is not None and signal != "SKIP":
+        if used_whale_copy:
+            signal = whale_signal.direction
             logger.info(
-                f"SIGNAL: {signal} | move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
-                f"snaps={snap_count}"
+                "WHALE SIGNAL: %s | move=%+.3f%% | UP=%.2f DOWN=%.2f | wallet=%s event=%s",
+                signal,
+                move_pct,
+                price_up,
+                price_down,
+                whale_signal.wallet,
+                whale_signal.event_id,
             )
-        elif abs(move_pct) >= 0.04 and snap_count > 0 and snap_count % 20 == 0:
-            logger.info(
-                f"Checking: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
-                f"signal={signal} | snaps={snap_count}"
+        else:
+            signal = self._strategy.check_signal(
+                self.current_window.market_id,
+                self._window_open_price,
+                current_snap,
+                current_hour=current_hour,
+                sample_ts=now_dt.timestamp(),
+                seconds_from_start=seconds_from_start,
+                seconds_to_close=seconds_to_close,
+                window_duration_seconds=window_duration_seconds,
+                window_open_ts=window_start_ts,
+                price_to_beat=getattr(self.current_window, "price_to_beat", None),
             )
 
-        if signal is None or signal == "SKIP":
+            if signal is not None and signal != "SKIP":
+                logger.info(
+                    f"SIGNAL: {signal} | move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
+                    f"snaps={snap_count}"
+                )
+            elif abs(move_pct) >= 0.04 and snap_count > 0 and snap_count % 20 == 0:
+                logger.info(
+                    f"Checking: move={move_pct:+.3f}% | UP={price_up:.2f} DOWN={price_down:.2f} | "
+                    f"signal={signal} | snaps={snap_count}"
+                )
+
+        if not used_whale_copy and (signal is None or signal == "SKIP"):
             reason, details = self._classify_signal_skip(
                 signal=signal,
                 move_pct=move_pct,
@@ -891,7 +1051,29 @@ class BTCTradingEngine:
         )
         empirical_kelly_enabled = bool(getattr(self.cfg.risk, "empirical_kelly_enabled", False))
         p_win_estimate = None
-        if empirical_kelly_enabled:
+        if used_whale_copy and whale_signal is not None:
+            signal_size = float(whale_signal.usdc_size or 0.0)
+            if signal_size <= 0:
+                # Fall back to on-chain amount*price as a rough proxy.
+                signal_size = float(whale_signal.size or 0.0) * float(whale_signal.price or 0.0)
+            if signal_size <= 0:
+                signal_size = self._whale_copy_default_size_usd
+            if signal_size > 0:
+                if self._whale_copy_follow_ratio > 0:
+                    signal_size *= self._whale_copy_follow_ratio
+                size_usd = signal_size
+            else:
+                size_usd = 0.0
+            if size_usd <= 0:
+                size_usd = min(
+                    self.balance * self.cfg.risk.max_position_pct,
+                    self.cfg.risk.max_position_usd,
+                )
+            if self._whale_copy_min_size_usd > 0:
+                size_usd = max(size_usd, self._whale_copy_min_size_usd)
+            if self._whale_copy_size_cap_usd > 0:
+                size_usd = min(size_usd, self._whale_copy_size_cap_usd)
+        elif empirical_kelly_enabled:
             p_win_estimate = estimate_price_bucket_p_win(self.memory, effective_token_price)
             # Cold-start: no resolutions in this bucket yet. Synthesize an
             # empty estimate so the prior still drives sizing instead of
@@ -903,12 +1085,12 @@ class BTCTradingEngine:
                     wins=0, losses=0, p_win=0.0,
                 )
 
-        if p_win_estimate is None:
+        if p_win_estimate is None and not used_whale_copy:
             size_usd = min(
                 self.balance * self.cfg.risk.max_position_pct,
                 self.cfg.risk.max_position_usd,
             )
-        else:
+        elif not used_whale_copy:
             p_win_estimate = smoothed_bucket_estimate(
                 p_win_estimate,
                 effective_token_price,
@@ -993,6 +1175,7 @@ class BTCTradingEngine:
         trade = {
             "decision_id": decision_id,
             "market_id": self.current_window.market_id,
+            "signal_source": "whale_copy" if used_whale_copy else "strategy",
             "direction": direction,
             "token_id": token_id,
             "token_price": effective_token_price,
@@ -1006,8 +1189,14 @@ class BTCTradingEngine:
             "move_pct": move_pct,
             "window_open_price": self._window_open_price,
             "window_open_ts": self._window_open_ts,
+            "window_anchor_source": self._window_open_source,
+            "window_anchor_ts": self._window_open_ts,
             "window_open_source": self._window_open_source,
             "window_start_ts": self.current_window.start_time.timestamp(),
+            "window_duration_seconds": window_duration_seconds,
+            "window_elapsed_seconds": seconds_from_start,
+            "window_seconds_to_close": seconds_to_close,
+            "window_price_to_beat": getattr(self.current_window, "price_to_beat", None),
             "market_anchor": self._market_anchor_payload(),
             "strategy": self._strategy.name,
             "timestamp": decision_ts,
@@ -1016,6 +1205,22 @@ class BTCTradingEngine:
             "book_snapshot": book_snapshots,
             "btc_volume_60s": self._btc_volume_60s(),
         }
+        if used_whale_copy and whale_signal is not None:
+            trade["whale_copy_signal"] = {
+                "event_id": whale_signal.event_id,
+                "wallet": whale_signal.wallet,
+                "slug": whale_signal.slug,
+                "condition_id": whale_signal.condition_id,
+                "direction": whale_signal.direction,
+                "event_ts": whale_signal.event_ts,
+                "usdc_size": whale_signal.usdc_size,
+                "size": whale_signal.size,
+                "price": whale_signal.price,
+                "follow_ratio": self._whale_copy_follow_ratio,
+                "size_cap_usd": self._whale_copy_size_cap_usd,
+                "size_min_usd": self._whale_copy_min_size_usd,
+                "size_default_usd": self._whale_copy_default_size_usd,
+            }
 
         logger.info(
             f"ENTRY [{self._strategy.name.upper()}]: {direction} @ ${effective_token_price:.3f} "
@@ -2434,6 +2639,10 @@ class BTCTradingEngine:
         binance = BinanceWSClient(on_trade=self._on_binance_trade, on_book_update=on_book, symbol=binance_symbol)
         binance_task = asyncio.create_task(binance.connect())
         poly_ws_task = asyncio.create_task(self.poly_ws.connect())
+        whale_copy_task: asyncio.Task | None = None
+        if self._whale_copy_ingestor is not None:
+            whale_copy_task = asyncio.create_task(self._run_whale_copy_poller())
+            self._whale_copy_task = whale_copy_task
 
         # Push paths (parallel to polling). Start only in live mode.
         user_ws_task: asyncio.Task | None = None
@@ -2620,6 +2829,9 @@ class BTCTradingEngine:
             binance_task.cancel()
             await self.poly_ws.close()
             poly_ws_task.cancel()
+            if whale_copy_task is not None:
+                whale_copy_task.cancel()
+            self._whale_copy_task = None
             if self._user_ws is not None:
                 try:
                     await self._user_ws.close()

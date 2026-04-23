@@ -10,6 +10,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +49,17 @@ class TokenBook:
 class PolymarketWSClient:
     """Real-time order book data from Polymarket CLOB WebSocket."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        event_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self._ws = None
         self._running = False
         self._subscribed_ids: set[str] = set()
         self._books: dict[str, TokenBook] = {}
         self._reconnect_delay = 1.0
+        self._event_callback = event_callback
         self._stats = {
             "subscribe_calls": 0,
             "unsubscribe_calls": 0,
@@ -287,6 +294,7 @@ class PolymarketWSClient:
         if book.best_bid > 0 and book.best_ask > 0:
             book.spread = book.best_ask - book.best_bid
         book.last_update = time.time()
+        self._emit_event("book", aid, data)
 
     def _process_price_change(self, data: dict) -> None:
         changes = data.get("price_changes", data.get("pc", []))
@@ -304,12 +312,14 @@ class PolymarketWSClient:
             if book.best_bid > 0 and book.best_ask > 0:
                 book.spread = book.best_ask - book.best_bid
             book.last_update = time.time()
+            self._emit_event("price_change", aid, pc)
 
     def _process_trade(self, data: dict) -> None:
         aid = data.get("asset_id", "")
         if aid in self._books:
             self._books[aid].last_trade_price = float(data.get("price", 0))
             self._books[aid].last_update = time.time()
+            self._emit_event("last_trade_price", aid, data)
 
     def _process_bba(self, data: dict) -> None:
         aid = data.get("asset_id", "")
@@ -320,6 +330,30 @@ class PolymarketWSClient:
         book.best_ask = float(data.get("best_ask", 0))
         book.spread = float(data.get("spread", 0))
         book.last_update = time.time()
+        self._emit_event("best_bid_ask", aid, data)
+
+    def _emit_event(self, event_type: str, token_id: str, payload: dict[str, Any]) -> None:
+        if self._event_callback is None:
+            return
+        book = self._books.get(token_id)
+        event = {
+            "event_type": event_type,
+            "token_id": token_id,
+            "captured_at": datetime.now(tz=UTC).isoformat().replace("+00:00", "Z"),
+            "best_bid": book.best_bid if book else 0.0,
+            "best_ask": book.best_ask if book else 0.0,
+            "bid_size": book.best_bid_size if book else 0.0,
+            "ask_size": book.best_ask_size if book else 0.0,
+            "spread": book.spread if book else 0.0,
+            "last_trade_price": book.last_trade_price if book else 0.0,
+            "trade_price": payload.get("price"),
+            "trade_size": payload.get("size", payload.get("s")),
+            "trade_side": payload.get("side"),
+            "bids": book.bids if book else [],
+            "asks": book.asks if book else [],
+            "raw": payload,
+        }
+        self._event_callback(event)
 
     async def close(self) -> None:
         self._running = False
