@@ -17,7 +17,12 @@ from aiohttp import web
 
 logger = logging.getLogger(__name__)
 
-DASHBOARD_HTML = Path(__file__).parent.parent / "dashboard.html"
+_ROOT_PATH = Path(__file__).parent.parent
+DASHBOARD_CANDIDATES = [
+    _ROOT_PATH / "dashboard.html",
+    _ROOT_PATH / "ops" / "monitoring" / "dashboard.html",
+]
+DASHBOARD_HTML = next((path for path in DASHBOARD_CANDIDATES if path.exists()), DASHBOARD_CANDIDATES[0])
 
 
 class HealthServer:
@@ -139,7 +144,7 @@ class HealthServer:
                 text=DASHBOARD_HTML.read_text(),
                 content_type="text/html",
             )
-        return web.Response(text="Dashboard not found. Place dashboard.html in project root.")
+        return web.Response(text="Dashboard not found. Place dashboard HTML under dashboard.html or ops/monitoring/dashboard.html.")
 
     async def start(self) -> None:
         self._runner = web.AppRunner(self._app)
