@@ -47,6 +47,16 @@ compatibility links at legacy paths.
 - Runtime dashboards are canonical at `ops/monitoring/dashboard.html` with
   `dashboard.html` compatibility entry.
 
+## Test suites
+
+- Canonical:
+  - `tests/execution/` for live/paper execution, engine/core, and client tests.
+  - `tests/research/` for research, wallet analytics, and backtesting studies.
+  - `tests/ops/` for deployment and runbook validation tests.
+- Compatibility/legacy notes:
+  - legacy top-level execution test files were consolidated under `tests/execution/`
+    to complete the domain split.
+
 This split is intentional: keep execution-path changes isolated from analysis and
 historical-modeling work so research and production execution can evolve
 independently.

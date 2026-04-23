@@ -22,7 +22,7 @@ Repo reality checked against:
 - `clients/ctf_redeemer.py`
 - `clients/ctf_merger.py`
 - `requirements.txt`
-- `tests/test_polymarket_client.py`
+- `tests/execution/test_polymarket_client.py`
 
 ## Executive summary
 
@@ -47,6 +47,7 @@ Current repo:
 - `requirements.txt` pins `py-clob-client`
 - `clients/polymarket.py` imports from `py_clob_client.*`
 - tests patch `py_clob_client.client.ClobClient`
+- tests patch `tests/execution/test_polymarket_client.py` against the V1 client contract
 
 V2 requirement:
 
@@ -56,7 +57,7 @@ Impact:
 
 - `clients/polymarket.py`
 - `requirements.txt`
-- `tests/test_polymarket_client.py`
+- `tests/execution/test_polymarket_client.py`
 - any scripts or tools importing V1 types
 
 Blocker class: hard blocker
@@ -284,4 +285,3 @@ Deliverables:
 4. No explicit pUSD wrap/approval workflow
 5. No V2-validated startup reconciliation for post-wipe recovery
 6. No execution/control-plane split for standby-safe live trading
-

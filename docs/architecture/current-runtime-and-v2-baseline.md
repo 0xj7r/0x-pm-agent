@@ -74,7 +74,7 @@ The repo currently assumes `py-clob-client`:
 
 - `requirements.txt` installs `py-clob-client>=0.0.1`
 - `clients/polymarket.py` imports from `py_clob_client.client` and `py_clob_client.clob_types`
-- tests in `tests/test_polymarket_client.py` mock the V1 package directly
+- tests in `tests/execution/test_polymarket_client.py` mock the V1 package directly
 
 ### Order-placement assumptions baked into repo code
 
@@ -152,4 +152,3 @@ That means the current repo is not just "missing an upgrade"; it is structurally
 4. Revalidate merge/redeem/on-chain token operations against V2-era contracts and settlement flow.
 5. Add startup reconciliation that is safe after order-book wipe and process crash.
 6. Separate hot-path execution from Python research/runtime glue.
-
