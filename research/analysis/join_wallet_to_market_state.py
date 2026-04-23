@@ -5,7 +5,7 @@ take `/activity` rows and align them to contemporaneous local snapshot state
 from `backtesting/{btc,eth}.db`.
 
 Usage:
-  python3 scripts/join_wallet_to_market_state.py --activity data/whale_analysis/activity_f73cad.json
+  python3 scripts/join_wallet_to_market_state.py --activity data/research/whale_analysis/f73cad/activity.json
   python3 scripts/join_wallet_to_market_state.py --wallet 0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad
 """
 from __future__ import annotations
@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-WHALE_DIR = ROOT / "data" / "whale_analysis"
-OUTPUT_DIR = ROOT / "data" / "wallet_research"
+WHALE_DIR = ROOT / "data" / "research" / "whale_analysis"
+OUTPUT_DIR = ROOT / "data" / "research" / "wallet_research"
 DBS_BY_ASSET = {
     "btc": [
         ROOT / "backtesting" / "btc.db",
@@ -62,8 +62,9 @@ def resolve_activity_path(wallet: str | None, activity_path: str | None) -> Path
         raise SystemExit("Either --wallet or --activity is required")
     last6 = wallet.lower()[-6:]
     candidates = [
-        WHALE_DIR / f"activity_{last6}.json",
+        WHALE_DIR / last6 / "activity.json",
         ROOT / "data" / f"whale_activity_{last6}.json",
+        ROOT / "data" / "research" / "whale_analysis" / f"activity_{last6}.json",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -323,8 +324,15 @@ def main() -> None:
     }
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    default_name = activity_path.stem.replace("activity_", "") + "_market_join.json"
-    output_path = Path(args.output) if args.output else OUTPUT_DIR / default_name
+    wallet_dir = OUTPUT_DIR / (args.wallet.lower()[-6:] if args.wallet else activity_path.parent.name)
+    output_dir = wallet_dir if wallet_dir.exists() else OUTPUT_DIR
+    if activity_path.name == "activity.json":
+        default_name = "market_join.json"
+    elif activity_path.name.startswith("activity_"):
+        default_name = activity_path.stem.replace("activity_", "") + "_market_join.json"
+    else:
+        default_name = activity_path.stem + "_market_join.json"
+    output_path = Path(args.output) if args.output else output_dir / default_name
     output_path.write_text(json.dumps(output, indent=2))
 
     print(json.dumps(summary, indent=2))

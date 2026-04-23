@@ -2,7 +2,7 @@
 
 This is the operational wrapper around the current whale workflow:
   1. fetch raw activity / pnl / current value
-  2. save artifacts under data/wallet_research/
+  2. save artifacts under data/research/wallet_research/<wallet>/
   3. join activity rows to local historical market snapshots
   4. emit a compact research summary
 
@@ -24,7 +24,7 @@ import httpx
 from scripts.join_wallet_to_market_state import main as join_main
 
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "data" / "wallet_research"
+OUT = ROOT / "data" / "research" / "wallet_research"
 
 
 def fetch_json(url: str, *, params: dict[str, str]) -> object:
@@ -101,6 +101,7 @@ def main() -> None:
     wallet = args.wallet.lower()
     last6 = wallet[-6:]
     label = args.label or last6
+    wallet_dir = OUT / last6
 
     activity = fetch_json(
         "https://data-api.polymarket.com/activity",
@@ -115,10 +116,10 @@ def main() -> None:
         params={"user": wallet},
     )
 
-    activity_path = OUT / f"activity_{label}.json"
-    pnl_path = OUT / f"pnl_timeseries_{label}.json"
-    daily_path = OUT / f"daily_pnl_{label}.json"
-    value_path = OUT / f"value_{label}.json"
+    activity_path = wallet_dir / "activity.json"
+    pnl_path = wallet_dir / "pnl_timeseries.json"
+    daily_path = wallet_dir / "daily_pnl.json"
+    value_path = wallet_dir / "value.json"
 
     save_json(activity_path, activity)
     save_json(pnl_path, pnl)
@@ -139,7 +140,7 @@ def main() -> None:
     finally:
         sys.argv = argv_prev
 
-    join_path = OUT / f"{activity_path.stem.replace('activity_', '')}_market_join.json"
+    join_path = wallet_dir / "market_join.json"
     join_payload = json.loads(join_path.read_text()) if join_path.exists() else {"summary": {}}
 
     summary = {
@@ -151,7 +152,7 @@ def main() -> None:
         "current_value": value[0]["value"] if isinstance(value, list) and value else None,
         "market_join": join_payload.get("summary", {}),
     }
-    summary_path = OUT / f"summary_{label}.json"
+    summary_path = wallet_dir / f"summary.json"
     save_json(summary_path, summary)
     print(json.dumps(summary, indent=2))
     print(f"Saved: {summary_path}")

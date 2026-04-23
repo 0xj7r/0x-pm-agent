@@ -1,6 +1,6 @@
 {
   "summary": {
-    "activity_file": "/Users/jackreid/go/polymarket-agent/data/whale_analysis/activity_b5f694.json",
+    "activity_file": "data/research/whale_analysis/b5f694/activity.json",
     "total_activity_rows": 3500,
     "joined_rows": 3500,
     "joined_snapshot_rows": 3500,
