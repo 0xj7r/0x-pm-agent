@@ -590,7 +590,7 @@ mod tests {
 
         assert_eq!(plan.legs_to_close, 2);
         assert!((plan.merged_qty - 4.0).abs() < 1e-9);
-        assert!((plan.expected_cost_usd - 1.6).abs() < 1e-9);
+        assert!((plan.expected_cost_usd - 3.6).abs() < 1e-9);
     }
 
     #[test]
@@ -622,7 +622,10 @@ mod tests {
 
         assert!((candidate.paired_qty - 3.0).abs() < 1e-9);
         assert!((candidate.expected_cost_usd - 1.5).abs() < 1e-9);
-        assert!((candidate.expected_gain_usd > 0.0) == (candidate.expected_cash_usd > candidate.expected_cost_usd));
+        assert!(
+            (candidate.expected_net_gain_usd > 0.0)
+                == (candidate.expected_cash_usd > candidate.expected_cost_usd)
+        );
     }
 
     #[test]

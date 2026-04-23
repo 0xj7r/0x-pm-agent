@@ -1,9 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
 const MAX_BOOK_LEVELS: usize = 20;
+const TRADE_ACTIVITY_WINDOW_10S_MS: u64 = 10_000;
+const TRADE_ACTIVITY_WINDOW_30S_MS: u64 = 30_000;
+const TRADE_ACTIVITY_WINDOW_60S_MS: u64 = 60_000;
+const MAX_TRADE_ACTIVITY_ENTRIES: usize = 4_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Level {
@@ -24,6 +28,7 @@ pub struct BookState {
     pub last_trade_price: f64,
     pub last_update_unix_ms: u64,
     last_update_mono: Option<Instant>,
+    trade_events_unix_ms: VecDeque<u64>,
 }
 
 impl Default for BookState {
@@ -40,6 +45,7 @@ impl Default for BookState {
             last_trade_price: 0.0,
             last_update_unix_ms: 0,
             last_update_mono: None,
+            trade_events_unix_ms: VecDeque::new(),
         }
     }
 }
@@ -77,6 +83,7 @@ impl BookState {
             last_trade_price,
             last_update_unix_ms,
             last_update_mono: None,
+            trade_events_unix_ms: VecDeque::new(),
         }
     }
 
@@ -103,6 +110,47 @@ impl BookState {
         } else {
             0.0
         };
+    }
+
+    fn prune_trade_events(&mut self, now_ms: u64) {
+        while let Some(timestamp) = self.trade_events_unix_ms.front().copied() {
+            if now_ms.saturating_sub(timestamp) <= TRADE_ACTIVITY_WINDOW_60S_MS {
+                break;
+            }
+            self.trade_events_unix_ms.pop_front();
+        }
+        while self.trade_events_unix_ms.len() > MAX_TRADE_ACTIVITY_ENTRIES {
+            self.trade_events_unix_ms.pop_front();
+        }
+    }
+
+    fn record_trade_event(&mut self, observed_at_ms: u64) {
+        self.prune_trade_events(observed_at_ms);
+        self.trade_events_unix_ms.push_back(observed_at_ms);
+    }
+
+    pub fn trade_activity_counts(&mut self, now_ms: u64) -> (u32, u32, u32, Option<u64>) {
+        self.prune_trade_events(now_ms);
+        let mut c10 = 0u32;
+        let mut c30 = 0u32;
+        let mut c60 = 0u32;
+        for &trade_ms in &self.trade_events_unix_ms {
+            let age_ms = now_ms.saturating_sub(trade_ms);
+            if age_ms <= TRADE_ACTIVITY_WINDOW_10S_MS {
+                c10 += 1;
+            }
+            if age_ms <= TRADE_ACTIVITY_WINDOW_30S_MS {
+                c30 += 1;
+            }
+            if age_ms <= TRADE_ACTIVITY_WINDOW_60S_MS {
+                c60 += 1;
+            }
+        }
+        let last_trade_event_age_ms = self
+            .trade_events_unix_ms
+            .back()
+            .map(|last_ms| now_ms.saturating_sub(*last_ms));
+        (c10, c30, c60, last_trade_event_age_ms)
     }
 
     pub fn bid_levels(&self) -> &[Level] {
@@ -243,8 +291,45 @@ impl BookStore {
             ..BookState::default()
         });
         book.last_trade_price = price;
-        book.touch();
+        let observed_at_ms = now_unix_ms();
+        book.record_trade_event(observed_at_ms);
+        book.last_update_unix_ms = observed_at_ms;
+        book.last_update_mono = Some(Instant::now());
+        book.spread = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+            book.best_ask - book.best_bid
+        } else {
+            0.0
+        };
         book.clone()
+    }
+
+    pub async fn record_trade_event(&self, asset_id: &str, observed_at_ms: u64) {
+        let mut guard = self.inner.write().await;
+        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
+            asset_id: asset_id.to_string(),
+            ..BookState::default()
+        });
+        book.record_trade_event(observed_at_ms);
+        book.last_update_unix_ms = observed_at_ms;
+        book.last_update_mono = Some(Instant::now());
+        book.spread = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+            book.best_ask - book.best_bid
+        } else {
+            0.0
+        };
+    }
+
+    pub async fn trade_activity(
+        &self,
+        asset_id: &str,
+        now_ms: u64,
+    ) -> (u32, u32, u32, Option<u64>) {
+        let mut guard = self.inner.write().await;
+        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
+            asset_id: asset_id.to_string(),
+            ..BookState::default()
+        });
+        book.trade_activity_counts(now_ms)
     }
 
     pub async fn snapshot(&self, asset_id: &str) -> Option<BookState> {

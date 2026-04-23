@@ -13,8 +13,8 @@ use crate::config::parser::{
     parse_log_format, parse_path_optional, parse_socket_addr, parse_usize, split_csv_optional,
     split_csv_required,
 };
-use crate::strategy::StrategyProfile;
 use crate::risk::RiskLimits;
+use crate::strategy::StrategyProfile;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LogFormat {
@@ -39,6 +39,8 @@ pub struct AppConfig {
     pub metrics_bind: SocketAddr,
     pub market_ws_url: String,
     pub user_ws_url: String,
+    pub spot_ws_url: String,
+    pub spot_symbol: String,
     pub market_assets: Vec<String>,
     pub user_markets: Vec<String>,
     pub runtime_loop_interval: Duration,
@@ -87,6 +89,11 @@ impl AppConfig {
             "POLYMARKET_USER_WS_URL",
             "wss://ws-subscriptions-clob.polymarket.com/ws/user",
         );
+        let spot_ws_url = env_or(
+            "WHALE_PAIR_EXEC_SPOT_WS_URL",
+            "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+        );
+        let spot_symbol = env_or("WHALE_PAIR_EXEC_SPOT_SYMBOL", "BTCUSDT");
         let market_assets = split_csv_required("WHALE_PAIR_ASSET_IDS")?;
         let user_markets = split_csv_optional("WHALE_PAIR_USER_MARKETS");
         let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
@@ -99,12 +106,14 @@ impl AppConfig {
         let runtime_checkpoint_interval =
             parse_duration_ms("WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS", 30_000)?;
         let order_store_path = parse_path_optional("WHALE_PAIR_ORDER_STORE_PATH");
-        let runtime_run_id = env::var("WHALE_PAIR_RUNTIME_RUN_ID").ok().filter(|value| {
-            !value.trim().is_empty()
-        });
+        let runtime_run_id = env::var("WHALE_PAIR_RUNTIME_RUN_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let book_stale_after = parse_duration_ms_or_profile(
             "WHALE_PAIR_EXEC_BOOK_STALE_MS",
-            strategy_profile.as_ref().and_then(|profile| profile.risk.book_stale_ms),
+            strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.risk.book_stale_ms),
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
@@ -112,9 +121,8 @@ impl AppConfig {
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
         let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity = parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
-        let market_id_by_asset = parse_asset_market_map(
-            &env::var("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default(),
-        )?;
+        let market_id_by_asset =
+            parse_asset_market_map(&env::var("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default())?;
         let profile_inventory = strategy_profile.as_ref().map(|profile| &profile.inventory);
         let risk_limits = RiskLimits {
             max_order_notional_usd: parse_f64_or_profile(
@@ -134,8 +142,7 @@ impl AppConfig {
             )?,
             max_position_quantity_per_instrument: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
-                profile_inventory
-                    .and_then(|profile| profile.max_position_quantity_per_instrument),
+                profile_inventory.and_then(|profile| profile.max_position_quantity_per_instrument),
                 10_000.0,
             )?,
             min_free_cash_usd: parse_f64_or_profile(
@@ -159,8 +166,7 @@ impl AppConfig {
             parse_path_optional("WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH");
         let dashboard_refresh_ms =
             parse_duration_ms("WHALE_PAIR_DASHBOARD_REFRESH_MS", 2_000)?.as_millis() as u64;
-        let dashboard_event_limit =
-            parse_usize("WHALE_PAIR_DASHBOARD_EVENT_LIMIT", 200)?;
+        let dashboard_event_limit = parse_usize("WHALE_PAIR_DASHBOARD_EVENT_LIMIT", 200)?;
 
         Ok(Self {
             service_name,
@@ -171,6 +177,8 @@ impl AppConfig {
             metrics_bind,
             market_ws_url,
             user_ws_url,
+            spot_ws_url,
+            spot_symbol,
             market_assets,
             user_markets,
             runtime_loop_interval,
@@ -205,11 +213,7 @@ impl AppConfig {
     }
 }
 
-fn parse_duration_ms_or_profile(
-    key: &str,
-    profile: Option<u64>,
-    default: u64,
-) -> Result<Duration> {
+fn parse_duration_ms_or_profile(key: &str, profile: Option<u64>, default: u64) -> Result<Duration> {
     if env::var_os(key).is_some() {
         parse_duration_ms(key, default)
     } else {

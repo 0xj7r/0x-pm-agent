@@ -442,13 +442,13 @@ impl QuoteReconciler {
 
 #[cfg(test)]
 mod tests {
-    use super::{QuoteAction, QuotePlan, QuoteReconciler, ReconcilerConfig};
+    use super::{QuoteAction, QuoteReconciler, ReconcilerConfig};
     use crate::runtime::ManagedOrder;
     use crate::runtime::ManagedOrderStatus;
     use crate::types::{ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderIntent, TradeSide};
     use std::collections::HashMap;
 
-    fn managed(id: &str, intent: &OrderIntent, updated_ms: EpochMillis) -> ManagedOrder {
+    fn managed(_id: &str, intent: &OrderIntent, updated_ms: EpochMillis) -> ManagedOrder {
         ManagedOrder {
             intent: intent.clone(),
             status: ManagedOrderStatus::Working,
@@ -475,9 +475,12 @@ mod tests {
 
     #[test]
     fn quote_reconciler_keeps_matching_quote_set() {
-        let intent = intent("existing", 0.2);
+        let existing_intent = intent("existing", 0.2);
         let mut open_orders = HashMap::new();
-        open_orders.insert(ClientOrderId::from("existing"), managed("existing", &intent, 1));
+        open_orders.insert(
+            ClientOrderId::from("existing"),
+            managed("existing", &existing_intent, 1),
+        );
 
         let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
             min_order_age_ms: 0,
@@ -490,7 +493,7 @@ mod tests {
         });
         let desired = crate::quote_engine::DesiredQuoteSet {
             quotes: vec![crate::quote_engine::DesiredQuote {
-                intent,
+                intent: existing_intent,
                 level: 0,
                 is_cleanup: false,
                 suppress_if_stale: false,
@@ -506,9 +509,12 @@ mod tests {
 
     #[test]
     fn quote_reconciler_replaces_when_price_changes() {
-        let intent = intent("existing", 0.2);
+        let existing_intent = intent("existing", 0.2);
         let mut open_orders = HashMap::new();
-        open_orders.insert(ClientOrderId::from("existing"), managed("existing", &intent, 1));
+        open_orders.insert(
+            ClientOrderId::from("existing"),
+            managed("existing", &existing_intent, 1),
+        );
 
         let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
             min_order_age_ms: 0,
@@ -538,9 +544,12 @@ mod tests {
 
     #[test]
     fn quote_reconciler_keeps_when_min_age_blocks_reprice() {
-        let intent = intent("existing", 0.2);
+        let existing_intent = intent("existing", 0.2);
         let mut open_orders = HashMap::new();
-        open_orders.insert(ClientOrderId::from("existing"), managed("existing", &intent, 9));
+        open_orders.insert(
+            ClientOrderId::from("existing"),
+            managed("existing", &existing_intent, 9),
+        );
 
         let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
             min_order_age_ms: 50,

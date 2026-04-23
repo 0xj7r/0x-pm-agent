@@ -32,6 +32,7 @@ use crate::wire::api::{
     DashboardUiState, serve_http,
 };
 use crate::wire::market_ws::MarketWsClient;
+use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 pub async fn run() -> Result<()> {
@@ -158,6 +159,13 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     );
     let market_ws_handle =
         spawn_market_ws(metrics.clone(), books.clone(), &config, shutdown.child_token());
+    let (spot_trade_tx, spot_trade_rx) = mpsc::unbounded_channel();
+    let spot_ws_handle = spawn_spot_ws(
+        metrics.clone(),
+        &config,
+        Some(spot_trade_tx),
+        shutdown.child_token(),
+    );
     let (user_order_tx, user_order_rx) = mpsc::unbounded_channel();
     let user_ws_handle = spawn_user_ws(
         metrics.clone(),
@@ -179,6 +187,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut paper_order_ctx,
         &mut execution_venue_map,
         execution_adapter,
+        spot_trade_rx,
         user_order_rx,
         dashboard_state.clone(),
         config.dashboard_event_limit,
@@ -188,6 +197,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
 
     shutdown.cancel();
     join_task("market-ws", market_ws_handle).await;
+    join_task("spot-ws", spot_ws_handle).await;
     if let Some(handle) = user_ws_handle {
         join_task("user-ws", handle).await;
     }
@@ -235,6 +245,24 @@ fn spawn_market_ws(
     })
 }
 
+fn spawn_spot_ws(
+    metrics: Arc<AppMetrics>,
+    config: &AppConfig,
+    event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    let client = SpotWsClient::new(
+        config.spot_ws_url.clone(),
+        config.spot_symbol.clone(),
+        config.ping_interval,
+        metrics,
+        event_tx,
+    );
+    tokio::spawn(async move {
+        client.run(shutdown).await;
+    })
+}
+
 fn spawn_user_ws(
     metrics: Arc<AppMetrics>,
     config: &AppConfig,
@@ -272,6 +300,7 @@ async fn run_runtime_loop(
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     execution_adapter: Arc<dyn ExecutionAdapter>,
+    mut spot_events: mpsc::UnboundedReceiver<SpotTradeEvent>,
     mut user_events: mpsc::UnboundedReceiver<UserOrderEvent>,
     dashboard: Arc<RwLock<DashboardSnapshot>>,
     dashboard_event_limit: usize,
@@ -288,6 +317,7 @@ async fn run_runtime_loop(
 
     let mut summaries = interval(config.summary_log_interval);
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut spot_events_open = true;
     let mut user_events_open = true;
 
     loop {
@@ -298,6 +328,17 @@ async fn run_runtime_loop(
             }
             _ = shutdown.cancelled() => {
                 return Ok(());
+            }
+            maybe_spot_event = spot_events.recv(), if spot_events_open => {
+                match maybe_spot_event {
+                    Some(event) => {
+                        runtime.on_btc_trade(event.price, event.observed_at_ms);
+                    }
+                    None => {
+                        spot_events_open = false;
+                        info!("spot websocket event channel closed; disabling btc regime updates");
+                    }
+                }
             }
             maybe_user_event = user_events.recv(), if user_events_open => {
                 match maybe_user_event {
@@ -340,6 +381,17 @@ async fn run_runtime_loop(
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
                             metrics.observe_book(&book, config.book_stale_after);
+                            let (c10, c30, c60, last_age_ms) =
+                                books.trade_activity(asset_id, now_unix_ms()).await;
+                            runtime.on_market_activity(
+                                InstrumentId::from(asset_id.as_str()),
+                                crate::signals::MarketActivitySignal {
+                                    last_trade_event_count_10s: c10,
+                                    last_trade_event_count_30s: c30,
+                                    last_trade_event_count_60s: c60,
+                                    last_trade_event_age_ms: last_age_ms,
+                                },
+                            );
                             let outcome = runtime.on_book_state(
                                 MarketId::from(config.market_id_for_asset(asset_id)),
                                 InstrumentId::from(asset_id.as_str()),

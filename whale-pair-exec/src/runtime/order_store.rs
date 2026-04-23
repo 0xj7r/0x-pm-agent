@@ -606,6 +606,7 @@ mod tests {
                 quantity: 4.0,
                 reduce_only: false,
                 reason: "test".to_string(),
+                quote_level_tag: None,
                 created_at_ms: now,
             },
             "strat",
@@ -652,6 +653,7 @@ mod tests {
             quantity: 1.0,
             reduce_only: false,
             reason: "dup".to_string(),
+            quote_level_tag: None,
             created_at_ms: now,
         };
         let record = crate::runtime::order_store::OrderRecord::from_intent("run", &intent, "strat");
