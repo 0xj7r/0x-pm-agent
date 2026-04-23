@@ -7,6 +7,7 @@ from .strategy_presets import (
     default_compare_variants,
     rust_variant_env_lines,
 )
+from . import cmd
 
 __all__ = [
     "ValidationSpec",
@@ -14,4 +15,5 @@ __all__ = [
     "W1_VALIDATION_SPECS",
     "default_compare_variants",
     "rust_variant_env_lines",
+    "cmd",
 ]
