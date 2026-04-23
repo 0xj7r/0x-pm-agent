@@ -1,0 +1,568 @@
+{
+  "wallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
+  "label": "8b5b82",
+  "fetched_at": "2026-04-22T21:27:00.663267Z",
+  "activity": {
+    "rows": 133000,
+    "type_counts": {
+      "TRADE": 127027,
+      "MERGE": 5525,
+      "REDEEM": 448
+    },
+    "asset_counts": {
+      "ETH": 10333,
+      "BTC": 117125,
+      "SOL": 2895,
+      "XRP": 2348,
+      "OTHER": 162,
+      "BNB": 137
+    },
+    "family_counts": {
+      "updown_5m": 122307,
+      "updown_15m": 10315,
+      "updown_other": 378
+    },
+    "market_count": 525,
+    "two_sided_market_count": 477,
+    "merge_market_count": 474,
+    "earliest_timestamp": 1773589567,
+    "latest_timestamp": 1776815990,
+    "top_markets": [
+      {
+        "slug": "btc-updown-5m-1773964500",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1849,
+        "merge_rows": 23,
+        "two_sided": true,
+        "imbalance": 0.095
+      },
+      {
+        "slug": "btc-updown-5m-1774136400",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1550,
+        "merge_rows": 13,
+        "two_sided": true,
+        "imbalance": 0.103
+      },
+      {
+        "slug": "btc-updown-5m-1773964200",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1487,
+        "merge_rows": 14,
+        "two_sided": true,
+        "imbalance": 0.475
+      },
+      {
+        "slug": "btc-updown-5m-1774828200",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1413,
+        "merge_rows": 0,
+        "two_sided": true,
+        "imbalance": 0.155
+      },
+      {
+        "slug": "btc-updown-5m-1774396500",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1337,
+        "merge_rows": 21,
+        "two_sided": true,
+        "imbalance": 0.431
+      },
+      {
+        "slug": "btc-updown-5m-1774223700",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1332,
+        "merge_rows": 22,
+        "two_sided": true,
+        "imbalance": 0.024
+      },
+      {
+        "slug": "btc-updown-5m-1774482900",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1315,
+        "merge_rows": 8,
+        "two_sided": true,
+        "imbalance": 0.121
+      },
+      {
+        "slug": "btc-updown-5m-1775259300",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1232,
+        "merge_rows": 18,
+        "two_sided": true,
+        "imbalance": 0.431
+      },
+      {
+        "slug": "btc-updown-5m-1774050900",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1189,
+        "merge_rows": 19,
+        "two_sided": true,
+        "imbalance": 0.407
+      },
+      {
+        "slug": "btc-updown-5m-1774828500",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1167,
+        "merge_rows": 0,
+        "two_sided": true,
+        "imbalance": 0.714
+      },
+      {
+        "slug": "btc-updown-5m-1774050600",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1156,
+        "merge_rows": 16,
+        "two_sided": true,
+        "imbalance": 0.179
+      },
+      {
+        "slug": "btc-updown-5m-1775174100",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1139,
+        "merge_rows": 19,
+        "two_sided": true,
+        "imbalance": 0.011
+      },
+      {
+        "slug": "btc-updown-5m-1774050300",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1109,
+        "merge_rows": 9,
+        "two_sided": true,
+        "imbalance": 0.194
+      },
+      {
+        "slug": "btc-updown-5m-1775173800",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1099,
+        "merge_rows": 14,
+        "two_sided": true,
+        "imbalance": 0.225
+      },
+      {
+        "slug": "btc-updown-5m-1774569300",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1092,
+        "merge_rows": 6,
+        "two_sided": true,
+        "imbalance": 0.262
+      },
+      {
+        "slug": "btc-updown-15m-1773877500",
+        "asset": "BTC",
+        "family": "updown_15m",
+        "trade_rows": 1040,
+        "merge_rows": 10,
+        "two_sided": true,
+        "imbalance": 0.293
+      },
+      {
+        "slug": "btc-updown-5m-1774309500",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1034,
+        "merge_rows": 14,
+        "two_sided": true,
+        "imbalance": 0.055
+      },
+      {
+        "slug": "btc-updown-5m-1776036000",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 1030,
+        "merge_rows": 21,
+        "two_sided": true,
+        "imbalance": 0.279
+      },
+      {
+        "slug": "btc-updown-5m-1773878100",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 989,
+        "merge_rows": 5,
+        "two_sided": true,
+        "imbalance": 0.344
+      },
+      {
+        "slug": "btc-updown-5m-1774137300",
+        "asset": "BTC",
+        "family": "updown_5m",
+        "trade_rows": 937,
+        "merge_rows": 8,
+        "two_sided": true,
+        "imbalance": 0.222
+      }
+    ]
+  },
+  "closed_positions": {
+    "rows": 50,
+    "asset_counts": {
+      "BTC": 50
+    },
+    "family_counts": {
+      "updown_5m": 50
+    },
+    "positive_rows": 24,
+    "negative_rows": 26,
+    "net_realized_pnl": 2286.89,
+    "top_wins": [
+      {
+        "slug": "btc-updown-5m-1776886500",
+        "outcome": "Up",
+        "realizedPnl": 2427.508248,
+        "totalBought": 6033.979552,
+        "avgPrice": 0.016183,
+        "timestamp": 1776886958
+      },
+      {
+        "slug": "btc-updown-5m-1776885900",
+        "outcome": "Down",
+        "realizedPnl": 1841.325307,
+        "totalBought": 5783.831117,
+        "avgPrice": 0.043716,
+        "timestamp": 1776886366
+      },
+      {
+        "slug": "btc-updown-5m-1776891300",
+        "outcome": "Down",
+        "realizedPnl": 1675.606061,
+        "totalBought": 9456.932343,
+        "avgPrice": 0.435347,
+        "timestamp": 1776891758
+      },
+      {
+        "slug": "btc-updown-5m-1776887400",
+        "outcome": "Up",
+        "realizedPnl": 1593.174469,
+        "totalBought": 5455.075477,
+        "avgPrice": 0.467444,
+        "timestamp": 1776887872
+      },
+      {
+        "slug": "btc-updown-5m-1776889200",
+        "outcome": "Up",
+        "realizedPnl": 1532.297391,
+        "totalBought": 3998.676752,
+        "avgPrice": 0.015123,
+        "timestamp": 1776889660
+      },
+      {
+        "slug": "btc-updown-5m-1776888300",
+        "outcome": "Up",
+        "realizedPnl": 1448.718455,
+        "totalBought": 4038.253865,
+        "avgPrice": 0.01,
+        "timestamp": 1776888764
+      },
+      {
+        "slug": "btc-updown-5m-1776891600",
+        "outcome": "Down",
+        "realizedPnl": 1390.567581,
+        "totalBought": 4257.897437,
+        "avgPrice": 0.023298,
+        "timestamp": 1776892132
+      },
+      {
+        "slug": "btc-updown-5m-1776891000",
+        "outcome": "Up",
+        "realizedPnl": 1342.150751,
+        "totalBought": 9510.186483,
+        "avgPrice": 0.022389,
+        "timestamp": 1776891483
+      },
+      {
+        "slug": "btc-updown-5m-1776889500",
+        "outcome": "Down",
+        "realizedPnl": 846.8586589999999,
+        "totalBought": 3316.220482,
+        "avgPrice": 0.019612,
+        "timestamp": 1776889936
+      },
+      {
+        "slug": "btc-updown-5m-1776885300",
+        "outcome": "Down",
+        "realizedPnl": 718.802637,
+        "totalBought": 3611.7974900000004,
+        "avgPrice": 0.04156100000000001,
+        "timestamp": 1776885808
+      },
+      {
+        "slug": "btc-updown-5m-1776885600",
+        "outcome": "Down",
+        "realizedPnl": 683.54225,
+        "totalBought": 4136.223527,
+        "avgPrice": 0.046145,
+        "timestamp": 1776886066
+      },
+      {
+        "slug": "btc-updown-5m-1776886800",
+        "outcome": "Up",
+        "realizedPnl": 622.469895,
+        "totalBought": 3228.352789,
+        "avgPrice": 0.074798,
+        "timestamp": 1776887272
+      },
+      {
+        "slug": "btc-updown-5m-1776888000",
+        "outcome": "Down",
+        "realizedPnl": 572.21195,
+        "totalBought": 3489.1629609999995,
+        "avgPrice": 0.024998,
+        "timestamp": 1776888488
+      },
+      {
+        "slug": "btc-updown-5m-1776890100",
+        "outcome": "Up",
+        "realizedPnl": 477.060006,
+        "totalBought": 4519.792333,
+        "avgPrice": 0.028577000000000005,
+        "timestamp": 1776890566
+      },
+      {
+        "slug": "btc-updown-5m-1776887700",
+        "outcome": "Down",
+        "realizedPnl": 449.188344,
+        "totalBought": 4335.930239,
+        "avgPrice": 0.832482,
+        "timestamp": 1776888184
+      },
+      {
+        "slug": "btc-updown-5m-1776890400",
+        "outcome": "Down",
+        "realizedPnl": 287.370718,
+        "totalBought": 6267.654004,
+        "avgPrice": 0.929125,
+        "timestamp": 1776890863
+      },
+      {
+        "slug": "btc-updown-5m-1776890700",
+        "outcome": "Up",
+        "realizedPnl": 285.828087,
+        "totalBought": 3443.903413,
+        "avgPrice": 0.095092,
+        "timestamp": 1776891170
+      },
+      {
+        "slug": "btc-updown-5m-1776891000",
+        "outcome": "Down",
+        "realizedPnl": 260.428397,
+        "totalBought": 9478.739676,
+        "avgPrice": 0.728482,
+        "timestamp": 1776891483
+      },
+      {
+        "slug": "btc-updown-5m-1776891900",
+        "outcome": "Down",
+        "realizedPnl": 181.537367,
+        "totalBought": 2581.5251720000006,
+        "avgPrice": 0.346287,
+        "timestamp": 1776892361
+      },
+      {
+        "slug": "btc-updown-5m-1776892800",
+        "outcome": "Down",
+        "realizedPnl": 142.464321,
+        "totalBought": 2625.156061,
+        "avgPrice": 0.564498,
+        "timestamp": 1776893112
+      }
+    ],
+    "top_losses": [
+      {
+        "slug": "btc-updown-5m-1776886500",
+        "outcome": "Down",
+        "realizedPnl": -2104.032676,
+        "totalBought": 6048.91454,
+        "avgPrice": 0.898,
+        "timestamp": 1776886958
+      },
+      {
+        "slug": "btc-updown-5m-1776887400",
+        "outcome": "Down",
+        "realizedPnl": -1488.328592,
+        "totalBought": 5456.40323,
+        "avgPrice": 0.892314,
+        "timestamp": 1776887872
+      },
+      {
+        "slug": "btc-updown-5m-1776885900",
+        "outcome": "Up",
+        "realizedPnl": -1369.488236,
+        "totalBought": 5807.200722000001,
+        "avgPrice": 0.771267,
+        "timestamp": 1776886366
+      },
+      {
+        "slug": "btc-updown-5m-1776891600",
+        "outcome": "Up",
+        "realizedPnl": -1359.731226,
+        "totalBought": 4331.397227,
+        "avgPrice": 0.936147,
+        "timestamp": 1776892132
+      },
+      {
+        "slug": "btc-updown-5m-1776889200",
+        "outcome": "Down",
+        "realizedPnl": -1292.150216,
+        "totalBought": 4110.400018,
+        "avgPrice": 0.965994,
+        "timestamp": 1776889660
+      },
+      {
+        "slug": "btc-updown-5m-1776891300",
+        "outcome": "Up",
+        "realizedPnl": -1233.443484,
+        "totalBought": 9359.53766,
+        "avgPrice": 0.758811,
+        "timestamp": 1776891759
+      },
+      {
+        "slug": "btc-updown-5m-1776888300",
+        "outcome": "Down",
+        "realizedPnl": -1106.862112,
+        "totalBought": 4099.797987,
+        "avgPrice": 0.8571,
+        "timestamp": 1776888764
+      },
+      {
+        "slug": "btc-updown-5m-1776887700",
+        "outcome": "Up",
+        "realizedPnl": -1074.672662,
+        "totalBought": 4418.204976,
+        "avgPrice": 0.832221,
+        "timestamp": 1776888184
+      },
+      {
+        "slug": "btc-updown-5m-1776889500",
+        "outcome": "Up",
+        "realizedPnl": -813.1182990000001,
+        "totalBought": 3340.11555,
+        "avgPrice": 0.855027,
+        "timestamp": 1776889936
+      },
+      {
+        "slug": "btc-updown-5m-1776885600",
+        "outcome": "Up",
+        "realizedPnl": -706.248529,
+        "totalBought": 4187.45293,
+        "avgPrice": 0.685794,
+        "timestamp": 1776886066
+      },
+      {
+        "slug": "btc-updown-5m-1776888000",
+        "outcome": "Up",
+        "realizedPnl": -636.206662,
+        "totalBought": 3618.4115810000003,
+        "avgPrice": 0.77504,
+        "timestamp": 1776888488
+      },
+      {
+        "slug": "btc-updown-5m-1776885300",
+        "outcome": "Up",
+        "realizedPnl": -588.339951,
+        "totalBought": 3702.523688,
+        "avgPrice": 0.715926,
+        "timestamp": 1776885808
+      },
+      {
+        "slug": "btc-updown-5m-1776886800",
+        "outcome": "Down",
+        "realizedPnl": -563.256631,
+        "totalBought": 3231.151114,
+        "avgPrice": 0.7156510000000001,
+        "timestamp": 1776887272
+      },
+      {
+        "slug": "btc-updown-5m-1776887100",
+        "outcome": "Down",
+        "realizedPnl": -453.573322,
+        "totalBought": 3865.592333,
+        "avgPrice": 0.590611,
+        "timestamp": 1776887582
+      },
+      {
+        "slug": "btc-updown-5m-1776886200",
+        "outcome": "Down",
+        "realizedPnl": -338.240953,
+        "totalBought": 3123.272129,
+        "avgPrice": 0.8203749999999999,
+        "timestamp": 1776886470
+      },
+      {
+        "slug": "btc-updown-5m-1776889800",
+        "outcome": "Up",
+        "realizedPnl": -302.039567,
+        "totalBought": 4611.235515,
+        "avgPrice": 0.582985,
+        "timestamp": 1776890260
+      },
+      {
+        "slug": "btc-updown-5m-1776892500",
+        "outcome": "Up",
+        "realizedPnl": -234.173971,
+        "totalBought": 2573.522984,
+        "avgPrice": 0.467877,
+        "timestamp": 1776892964
+      },
+      {
+        "slug": "btc-updown-5m-1776890100",
+        "outcome": "Down",
+        "realizedPnl": -204.73932800000003,
+        "totalBought": 4474.250599,
+        "avgPrice": 0.642292,
+        "timestamp": 1776890566
+      },
+      {
+        "slug": "btc-updown-5m-1776890400",
+        "outcome": "Up",
+        "realizedPnl": -149.813755,
+        "totalBought": 6350.653769,
+        "avgPrice": 0.551004,
+        "timestamp": 1776890862
+      },
+      {
+        "slug": "btc-updown-5m-1776890700",
+        "outcome": "Down",
+        "realizedPnl": -139.0926,
+        "totalBought": 3566.718267,
+        "avgPrice": 0.546195,
+        "timestamp": 1776891170
+      }
+    ]
+  },
+  "windows_requested": 38,
+  "windows_with_rows": 38,
+  "bucket_hours": 24,
+  "start_date": "2026-03-15",
+  "end_date": "2026-04-22",
+  "accounting_snapshot": {
+    "files": [
+      {
+        "name": "positions.csv",
+        "size_bytes": 60787,
+        "row_count": 330
+      },
+      {
+        "name": "equity.csv",
+        "size_bytes": 108,
+        "row_count": 1
+      }
+    ]
+  }
+}
