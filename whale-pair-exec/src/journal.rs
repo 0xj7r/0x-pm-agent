@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::event_log::EventRecord;
+use crate::runtime::RuntimeCheckpoint;
 use crate::types::RuntimeCommand;
 
 #[derive(Debug, Serialize)]
@@ -13,6 +14,17 @@ use crate::types::RuntimeCommand;
 enum JournalLine<'a> {
     RuntimeEvent { record: &'a EventRecord },
     RuntimeCommand { command: &'a RuntimeCommand },
+    RuntimeCheckpoint {
+        observed_at_ms: u64,
+        run_id: &'a str,
+        name: &'a str,
+        open_orders: usize,
+        needs_reconcile_orders: usize,
+        event_seq_checkpoint: u64,
+    },
+    RuntimeReplayCheckpoint {
+        checkpoint: &'a RuntimeCheckpoint,
+    },
 }
 
 pub struct JournalWriter {
@@ -49,6 +61,32 @@ impl JournalWriter {
 
     pub fn append_command(&mut self, command: &RuntimeCommand) -> Result<()> {
         self.append_line(&JournalLine::RuntimeCommand { command })
+    }
+
+    pub fn append_checkpoint(
+        &mut self,
+        observed_at_ms: u64,
+        run_id: &str,
+        name: &str,
+        open_orders: usize,
+        needs_reconcile_orders: usize,
+        event_seq_checkpoint: u64,
+    ) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeCheckpoint {
+            observed_at_ms,
+            run_id,
+            name,
+            open_orders,
+            needs_reconcile_orders,
+            event_seq_checkpoint,
+        })
+    }
+
+    pub fn append_runtime_checkpoint(
+        &mut self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeReplayCheckpoint { checkpoint })
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -100,6 +138,7 @@ mod tests {
                 quantity: 10.0,
                 reduce_only: false,
                 reason: "test".to_string(),
+                quote_level_tag: None,
                 created_at_ms: 2,
             }))
             .unwrap();
@@ -112,5 +151,28 @@ mod tests {
         assert!(lines[0].contains("\"kind\":\"runtime_event\""));
         assert!(lines[1].contains("\"kind\":\"runtime_command\""));
         assert!(lines[1].contains("\"client_order_id\":\"coid-1\""));
+    }
+
+    #[test]
+    fn writes_runtime_checkpoint_jsonl() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("whale-pair-journal-checkpoint-{unique}.jsonl"));
+
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal
+            .append_checkpoint(1, "run-1", "startup", 3, 1, 17)
+            .unwrap();
+        journal.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"kind\":\"runtime_checkpoint\""));
+        assert!(lines[0].contains("\"run_id\":\"run-1\""));
     }
 }

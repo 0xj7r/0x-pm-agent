@@ -6,13 +6,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::parser::{
     env_or, load_user_auth, parse_asset_market_map, parse_bool, parse_duration_ms, parse_f64,
     parse_log_format, parse_path_optional, parse_socket_addr, parse_usize, split_csv_optional,
     split_csv_required,
 };
+use crate::strategy::StrategyProfile;
 use crate::risk::RiskLimits;
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +43,12 @@ pub struct AppConfig {
     pub user_markets: Vec<String>,
     pub runtime_loop_interval: Duration,
     pub summary_log_interval: Duration,
+    pub order_reconcile_interval: Duration,
+    pub order_reconcile_stale_window: Duration,
+    pub runtime_checkpoint_interval: Duration,
     pub book_stale_after: Duration,
+    pub order_store_path: Option<PathBuf>,
+    pub runtime_run_id: Option<String>,
     pub ping_interval: Duration,
     pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
@@ -50,6 +56,8 @@ pub struct AppConfig {
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
     pub risk_limits: RiskLimits,
+    pub strategy_profile_path: Option<PathBuf>,
+    pub strategy_profile: Option<StrategyProfile>,
     pub user_auth: Option<UserWsAuth>,
     pub dashboard_whale_events_path: Option<std::path::PathBuf>,
     pub dashboard_refresh_ms: u64,
@@ -58,12 +66,15 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        // TODO(2026-04-23): centralize strategy config into one versioned block so
-        // multi-strategy paper runs can be selected/enforced per run without env drift.
         let _ = dotenvy::dotenv();
 
         let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "whale-pair-exec");
         let strategy_name = env_or("WHALE_PAIR_STRATEGY", "unlawful_shear");
+        let strategy_profile_path = parse_path_optional("WHALE_PAIR_STRATEGY_PROFILE_PATH");
+        let strategy_profile = strategy_profile_path
+            .as_deref()
+            .map(StrategyProfile::load)
+            .transpose()?;
         let paper_mode = parse_bool("WHALE_PAIR_PAPER_MODE", true)?;
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
@@ -78,55 +89,68 @@ impl AppConfig {
         );
         let market_assets = split_csv_required("WHALE_PAIR_ASSET_IDS")?;
         let user_markets = split_csv_optional("WHALE_PAIR_USER_MARKETS");
-        let runtime_loop_interval = parse_duration_ms(
-            "WHALE_PAIR_EXEC_LOOP_INTERVAL_MS",
-            1_000,
-        )?;
-        let summary_log_interval = parse_duration_ms(
-            "WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS",
-            10_000,
-        )?;
-        let book_stale_after = parse_duration_ms(
+        let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
+        let summary_log_interval =
+            parse_duration_ms("WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
+        let order_reconcile_interval =
+            parse_duration_ms("WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS", 15_000)?;
+        let order_reconcile_stale_window =
+            parse_duration_ms("WHALE_PAIR_ORDER_RECONCILE_STALE_MS", 30_000)?;
+        let runtime_checkpoint_interval =
+            parse_duration_ms("WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS", 30_000)?;
+        let order_store_path = parse_path_optional("WHALE_PAIR_ORDER_STORE_PATH");
+        let runtime_run_id = env::var("WHALE_PAIR_RUNTIME_RUN_ID").ok().filter(|value| {
+            !value.trim().is_empty()
+        });
+        let book_stale_after = parse_duration_ms_or_profile(
             "WHALE_PAIR_EXEC_BOOK_STALE_MS",
+            strategy_profile.as_ref().and_then(|profile| profile.risk.book_stale_ms),
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
         let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
-        let starting_cash_usd =
-            parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
-        let event_log_capacity =
-            parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
+        let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
+        let event_log_capacity = parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset = parse_asset_market_map(
             &env::var("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default(),
         )?;
+        let profile_inventory = strategy_profile.as_ref().map(|profile| &profile.inventory);
         let risk_limits = RiskLimits {
-            max_order_notional_usd: parse_f64(
+            max_order_notional_usd: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MAX_ORDER_NOTIONAL_USD",
+                profile_inventory.and_then(|profile| profile.max_order_notional_usd),
                 250.0,
             )?,
-            max_gross_notional_usd: parse_f64(
+            max_gross_notional_usd: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD",
+                profile_inventory.and_then(|profile| profile.max_gross_notional_usd),
                 1_000.0,
             )?,
-            max_net_notional_per_market_usd: parse_f64(
+            max_net_notional_per_market_usd: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
+                profile_inventory.and_then(|profile| profile.max_net_notional_per_market_usd),
                 500.0,
             )?,
-            max_position_quantity_per_instrument: parse_f64(
+            max_position_quantity_per_instrument: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
+                profile_inventory
+                    .and_then(|profile| profile.max_position_quantity_per_instrument),
                 10_000.0,
             )?,
-            min_free_cash_usd: parse_f64(
+            min_free_cash_usd: parse_f64_or_profile(
                 "WHALE_PAIR_EXEC_MIN_FREE_CASH_USD",
+                profile_inventory.and_then(|profile| profile.min_free_cash_usd),
                 0.0,
             )?,
-            max_open_orders_total: parse_usize(
+            max_open_orders_total: parse_usize_or_profile(
                 "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL",
+                profile_inventory.and_then(|profile| profile.max_open_orders_total),
                 32,
             )?,
-            max_open_orders_per_market: parse_usize(
+            max_open_orders_per_market: parse_usize_or_profile(
                 "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+                profile_inventory.and_then(|profile| profile.max_open_orders_per_market),
                 8,
             )?,
         };
@@ -151,7 +175,12 @@ impl AppConfig {
             user_markets,
             runtime_loop_interval,
             summary_log_interval,
+            order_reconcile_interval,
+            order_reconcile_stale_window,
+            runtime_checkpoint_interval,
             book_stale_after,
+            order_store_path,
+            runtime_run_id,
             ping_interval,
             market_context_path,
             journal_path,
@@ -159,6 +188,8 @@ impl AppConfig {
             event_log_capacity,
             market_id_by_asset,
             risk_limits,
+            strategy_profile_path,
+            strategy_profile,
             user_auth,
             dashboard_whale_events_path,
             dashboard_refresh_ms,
@@ -171,5 +202,33 @@ impl AppConfig {
             .get(asset_id)
             .cloned()
             .unwrap_or_else(|| asset_id.to_string())
+    }
+}
+
+fn parse_duration_ms_or_profile(
+    key: &str,
+    profile: Option<u64>,
+    default: u64,
+) -> Result<Duration> {
+    if env::var_os(key).is_some() {
+        parse_duration_ms(key, default)
+    } else {
+        Ok(Duration::from_millis(profile.unwrap_or(default)))
+    }
+}
+
+fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result<f64> {
+    if env::var_os(key).is_some() {
+        parse_f64(key, default)
+    } else {
+        Ok(profile.unwrap_or(default))
+    }
+}
+
+fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> Result<usize> {
+    if env::var_os(key).is_some() {
+        parse_usize(key, default)
+    } else {
+        Ok(profile.unwrap_or(default))
     }
 }

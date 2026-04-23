@@ -75,6 +75,7 @@ impl RiskDecision {
             position_delta: Some(order.quantity * order.side.sign()),
             free_cash_after_usd: Some(self.projected_free_cash_usd),
             gross_exposure_after_usd: Some(self.projected_gross_notional_usd),
+            risk_reject_reason: self.reject_reason.map(|reason| format!("{reason:?}")),
         })
     }
 }
@@ -275,6 +276,7 @@ mod tests {
             quantity: 8.0,
             reduce_only: false,
             reason: "test".into(),
+            quote_level_tag: None,
             created_at_ms: 1,
         };
 

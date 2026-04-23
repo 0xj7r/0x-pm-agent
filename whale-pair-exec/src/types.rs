@@ -57,7 +57,7 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub enum TradeSide {
     Buy,
     Sell,
@@ -175,6 +175,7 @@ pub struct OrderIntent {
     pub quantity: f64,
     pub reduce_only: bool,
     pub reason: String,
+    pub quote_level_tag: Option<String>,
     pub created_at_ms: EpochMillis,
 }
 

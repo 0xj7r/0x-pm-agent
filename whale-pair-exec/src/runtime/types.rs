@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::inventory::InventoryError;
+use crate::quote_engine::QuoteEngineConfig;
 use crate::types::{EpochMillis, RuntimeCommand, RuntimeStatus};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -9,6 +10,8 @@ pub struct RuntimeConfig {
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub initial_status: RuntimeStatus,
+    pub quote_engine_config: QuoteEngineConfig,
+    pub quote_stale_ms: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -17,6 +20,8 @@ impl Default for RuntimeConfig {
             starting_cash_usd: 0.0,
             event_log_capacity: 4_096,
             initial_status: RuntimeStatus::Starting,
+            quote_engine_config: QuoteEngineConfig::default(),
+            quote_stale_ms: 10_000,
         }
     }
 }
@@ -24,11 +29,13 @@ impl Default for RuntimeConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedOrderStatus {
     PendingSubmit,
+    Submitted,
     Working,
     CancelRequested,
     Filled,
     Cancelled,
     Rejected,
+    NeedsReconcile,
 }
 
 #[derive(Clone, Debug, PartialEq)]
