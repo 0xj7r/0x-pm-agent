@@ -16,10 +16,16 @@ use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
+use crate::runtime::order_store::SqliteOrderStore;
+use crate::runtime::types::ManagedOrderStatus;
 use crate::strategy::{Strategy, StrategyMode};
 use crate::types::{
-    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, RuntimeCommand,
-    RuntimeStatus, TradeSide,
+    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, OrderId,
+    RuntimeCommand, RuntimeStatus, TradeSide,
+};
+use crate::wire::execution_adapter::{
+    CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, PolymarketCredentials,
+    PolymarketExecutionAdapter, SubmitOrderRequest, TimeInForce,
 };
 use crate::wire::api::{
     DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot,
@@ -42,19 +48,38 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         Some(path) => MarketContextStore::load_json(path)?,
         None => MarketContextStore::empty(),
     };
-    let strategy = StrategyMode::from_name(&config.strategy_name);
+    let strategy = StrategyMode::from_name(&config.strategy_name, config.strategy_profile.as_ref());
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();
-    let mut runtime = Runtime::new(
+    let order_store = config
+        .order_store_path
+        .as_ref()
+        .map(|path| -> Result<Box<dyn crate::runtime::order_store::OrderStore>> {
+            Ok(Box::new(SqliteOrderStore::open(path)?))
+        })
+        .transpose()?;
+    let mut runtime = Runtime::new_with_order_store(
         RuntimeConfig {
             starting_cash_usd: config.starting_cash_usd,
             event_log_capacity: config.event_log_capacity,
             initial_status: RuntimeStatus::Starting,
+            quote_engine_config: config
+                .strategy_profile
+                .as_ref()
+                .map(|profile| profile.quote_engine_config())
+                .unwrap_or_default(),
+            quote_stale_ms: config
+                .strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.quote.min_quote_age_ms)
+                .unwrap_or(10_000),
         },
         config.risk_limits.clone(),
         strategy,
         market_contexts,
+        order_store,
+        config.runtime_run_id.clone().unwrap_or_else(|| format!("run-{}", now_unix_ms())),
     );
     let mut journal = config
         .journal_path
@@ -62,17 +87,42 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .map(JournalWriter::open)
         .transpose()?;
 
-    let startup_outcome = runtime.start(now_unix_ms());
+    let mut startup_outcome =
+        runtime.recover_from_store(now_unix_ms(), config.order_reconcile_stale_window.as_millis() as u64);
+    startup_outcome.extend(runtime.start(now_unix_ms()));
     persist_runtime_outcome(
         &mut journal,
         runtime.event_log(),
         "startup",
         startup_outcome,
     )?;
+    persist_runtime_checkpoint(
+        &mut journal,
+        &runtime,
+        now_unix_ms(),
+        "startup",
+    )?;
+    let execution_adapter: Arc<dyn ExecutionAdapter> = match (config.paper_mode, &config.user_auth) {
+        (true, _) => Arc::new(PaperExecutionAdapter::new()),
+        (false, None) => {
+            warn!(
+                "POLYMARKET_API_KEY/SECRET/PASSPHRASE not set; falling back to paper mode execution"
+            );
+            Arc::new(PaperExecutionAdapter::new())
+        }
+        (false, Some(auth)) => Arc::new(PolymarketExecutionAdapter::new(PolymarketCredentials {
+            api_key: auth.api_key.clone(),
+            api_secret: auth.api_secret.clone(),
+            api_passphrase: auth.api_passphrase.clone(),
+        })),
+    };
+    metrics.set_execution_adapter_connected(true);
     let dashboard_state = Arc::new(RwLock::new(DashboardSnapshot::default()));
     refresh_dashboard_state(
         &mut runtime,
         &books,
+        metrics.as_ref(),
+        &config,
         dashboard_state.clone(),
         &config.market_assets,
         &strategy_name,
@@ -115,6 +165,8 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         Some(user_order_tx),
         shutdown.child_token(),
     );
+    let mut paper_order_ctx = HashMap::<ClientOrderId, PaperOrderContext>::new();
+    let mut execution_venue_map = HashMap::<ClientOrderId, Option<OrderId>>::new();
 
     run_runtime_loop(
         &config,
@@ -124,7 +176,9 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         shutdown.clone(),
         &mut runtime,
         &mut journal,
-        &mut HashMap::<ClientOrderId, PaperOrderContext>::new(),
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        execution_adapter,
         user_order_rx,
         dashboard_state.clone(),
         config.dashboard_event_limit,
@@ -216,6 +270,8 @@ async fn run_runtime_loop(
     runtime: &mut Runtime<StrategyMode>,
     journal: &mut Option<JournalWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
+    execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    execution_adapter: Arc<dyn ExecutionAdapter>,
     mut user_events: mpsc::UnboundedReceiver<UserOrderEvent>,
     dashboard: Arc<RwLock<DashboardSnapshot>>,
     dashboard_event_limit: usize,
@@ -223,6 +279,12 @@ async fn run_runtime_loop(
 ) -> Result<()> {
     let mut ticks = interval(config.runtime_loop_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut reconcile_ticks = interval(config.order_reconcile_interval);
+    reconcile_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut checkpoint_ticks = interval(config.runtime_checkpoint_interval);
+    checkpoint_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut summaries = interval(config.summary_log_interval);
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -240,7 +302,13 @@ async fn run_runtime_loop(
             maybe_user_event = user_events.recv(), if user_events_open => {
                 match maybe_user_event {
                     Some(event) => {
-                        let user_outcome = handle_user_event(runtime, paper_order_ctx, event)?;
+                        let user_outcome = handle_user_event(
+                            runtime,
+                            paper_order_ctx,
+                            execution_venue_map,
+                            metrics.as_ref(),
+                            event,
+                        )?;
                         persist_runtime_outcome(
                             journal,
                             runtime.event_log(),
@@ -250,6 +318,8 @@ async fn run_runtime_loop(
                         refresh_dashboard_state(
                             runtime,
                             &books,
+                            metrics.as_ref(),
+                            &config,
                             dashboard.clone(),
                             &config.market_assets,
                             strategy_name,
@@ -279,8 +349,11 @@ async fn run_runtime_loop(
                                 runtime,
                                 books,
                                 paper_fee_coeff,
+                                metrics.as_ref(),
                                 outcome,
                                 paper_order_ctx,
+                                execution_venue_map,
+                                execution_adapter.clone(),
                                 config.paper_mode,
                             )
                             .await?;
@@ -293,6 +366,8 @@ async fn run_runtime_loop(
                             refresh_dashboard_state(
                                 runtime,
                                 books,
+                                metrics.as_ref(),
+                                &config,
                                 dashboard.clone(),
                                 &config.market_assets,
                                 strategy_name,
@@ -303,6 +378,34 @@ async fn run_runtime_loop(
                         _ => metrics.observe_missing_book(asset_id),
                     }
                 }
+            }
+            _ = reconcile_ticks.tick() => {
+                let reconcile_outcome = runtime.reconcile_open_orders(
+                    now_unix_ms(),
+                    config.order_reconcile_stale_window.as_millis() as u64,
+                );
+                persist_runtime_outcome(
+                    journal,
+                    runtime.event_log(),
+                    "reconcile",
+                    reconcile_outcome,
+                )?;
+                metrics.touch_reconcile();
+                metrics.refresh_stream_ages();
+                persist_runtime_checkpoint(
+                    journal,
+                    runtime,
+                    now_unix_ms(),
+                    "reconcile",
+                )?;
+            }
+            _ = checkpoint_ticks.tick() => {
+                persist_runtime_checkpoint(
+                    journal,
+                    runtime,
+                    now_unix_ms(),
+                    "periodic",
+                )?;
             }
             _ = summaries.tick() => {
                 let snapshots = books.snapshots(&config.market_assets).await;
@@ -341,6 +444,8 @@ async fn run_runtime_loop(
 async fn refresh_dashboard_state(
     runtime: &mut Runtime<StrategyMode>,
     books: &Arc<BookStore>,
+    metrics: &AppMetrics,
+    config: &AppConfig,
     dashboard: Arc<RwLock<DashboardSnapshot>>,
     market_assets: &[String],
     strategy_name: &str,
@@ -349,9 +454,13 @@ async fn refresh_dashboard_state(
     let inventory_snapshot = runtime.inventory().snapshot();
     let open_order_snapshots = runtime.open_order_snapshots();
     let books = books.snapshots(market_assets).await;
+    let now_ms = now_unix_ms();
+    let profile = config.strategy_profile.as_ref();
+    metrics.refresh_stream_ages();
 
     let open_orders: Vec<DashboardOrder> = open_order_snapshots
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|managed| DashboardOrder {
             client_order_id: managed.intent.client_order_id.as_str().to_string(),
             market_id: managed.intent.market_id.as_str().to_string(),
@@ -368,11 +477,27 @@ async fn refresh_dashboard_state(
         })
         .collect();
 
+    let mut yes_qty = 0.0;
+    let mut no_qty = 0.0;
+    let mut yes_notional_usd = 0.0;
+    let mut no_notional_usd = 0.0;
+    let mut unrealized_pnl_usd = 0.0;
     let positions: Vec<DashboardPosition> = inventory_snapshot
         .positions
         .into_iter()
         .map(|position| {
             let unrealized = (position.mark_or_cost() - position.avg_price) * position.quantity;
+            let is_yes_like = is_yes_like(&position.instrument_id.as_str().to_ascii_lowercase());
+            let quantity = position.quantity.abs();
+            let notional = quantity * position.mark_or_cost();
+            if is_yes_like {
+                yes_qty += quantity;
+                yes_notional_usd += notional;
+            } else {
+                no_qty += quantity;
+                no_notional_usd += notional;
+            }
+            unrealized_pnl_usd += unrealized;
             DashboardPosition {
                 market_id: position.market_id.as_str().to_string(),
                 instrument_id: position.instrument_id.as_str().to_string(),
@@ -386,6 +511,7 @@ async fn refresh_dashboard_state(
         })
         .collect();
 
+    let mut book_mid_by_asset = HashMap::new();
     let books_state: Vec<DashboardBook> = books
         .into_iter()
         .map(|book| {
@@ -394,6 +520,9 @@ async fn refresh_dashboard_state(
             } else {
                 None
             };
+            if let Some(mid) = mid_price {
+                book_mid_by_asset.insert(book.asset_id.clone(), mid);
+            }
             let bids = book
                 .bid_levels()
                 .iter()
@@ -421,6 +550,76 @@ async fn refresh_dashboard_state(
             }
         })
         .collect();
+
+    let quote_snapshot = profile.map(|profile| profile.quote.clone()).unwrap_or_default();
+    let quote_ladder_count = open_order_snapshots
+        .iter()
+        .filter(|managed| managed.remaining_qty() > 0.0 && managed.intent.quote_level_tag.is_some())
+        .count();
+    let quote_edge_bps = if quote_ladder_count == 0 {
+        0.0
+    } else {
+        let mut total_edge_bps = 0.0;
+        let mut matched_quotes = 0.0;
+        for managed in open_order_snapshots {
+            if managed.remaining_qty() <= 0.0 {
+                continue;
+            }
+            let Some(mid_price) = book_mid_by_asset.get(managed.intent.instrument_id.as_str()) else {
+                continue;
+            };
+            if *mid_price <= 0.0 {
+                continue;
+            }
+            let edge_bps = match managed.intent.side {
+                crate::types::TradeSide::Buy => {
+                    ((*mid_price - managed.intent.limit_price) / *mid_price) * 10_000.0
+                }
+                crate::types::TradeSide::Sell => {
+                    ((managed.intent.limit_price - *mid_price) / *mid_price) * 10_000.0
+                }
+            };
+            total_edge_bps += edge_bps;
+            matched_quotes += 1.0;
+        }
+        if matched_quotes > 0.0 {
+            total_edge_bps / matched_quotes
+        } else {
+            0.0
+        }
+    };
+    let quote_age_ms = runtime
+        .open_order_snapshots()
+        .into_iter()
+        .map(|managed| now_ms.saturating_sub(managed.last_update_ms) as f64)
+        .fold(0.0, f64::max);
+    metrics.set_quote_metrics(
+        quote_ladder_count,
+        quote_snapshot.max_quote_per_side_usd.unwrap_or(0.0),
+        quote_snapshot.min_edge_bps.unwrap_or(0.0),
+        quote_snapshot.skew_cap_bps.unwrap_or(0.0),
+        quote_snapshot.refresh_interval_ms.unwrap_or(0),
+        quote_edge_bps,
+        quote_age_ms,
+    );
+
+    let merge_candidate_qty = yes_qty.min(no_qty);
+    let stranded_yes_qty = (yes_qty - no_qty).max(0.0);
+    let stranded_no_qty = (no_qty - yes_qty).max(0.0);
+    let inventory_skew_usd = (yes_notional_usd - no_notional_usd).abs();
+    metrics.set_pair_metrics(stranded_yes_qty, stranded_no_qty, merge_candidate_qty);
+    metrics.set_risk_metrics(inventory_skew_usd);
+
+    let control_plane_metrics = metrics.snapshot();
+    let net_edge_usd_total = inventory_snapshot.realized_pnl_usd + unrealized_pnl_usd
+        - control_plane_metrics.fees_usd_total
+        + control_plane_metrics.rebates_usd_total;
+    metrics.set_economics_metrics(
+        inventory_snapshot.realized_pnl_usd,
+        unrealized_pnl_usd,
+        net_edge_usd_total,
+    );
+    let control_plane_metrics = metrics.snapshot();
 
     let recent_events: Vec<DashboardEvent> = runtime
         .event_log()
@@ -463,6 +662,57 @@ async fn refresh_dashboard_state(
         open_orders,
         books: books_state,
         recent_events,
+        control_plane: crate::wire::api::RuntimeControlPlaneState {
+            profile_name: profile.map(|profile| profile.profile_name.clone()),
+            profile_version: profile.and_then(|profile| profile.version.clone()),
+            market_context_version: Some(runtime.market_context_version().to_string()),
+            quote: crate::wire::api::QuoteControlPlaneState {
+                ladder_count: control_plane_metrics.quote_ladder_count,
+                max_quote_per_side_usd: control_plane_metrics.quote_max_per_side_usd,
+                min_edge_bps: control_plane_metrics.quote_min_edge_bps,
+                skew_cap_bps: control_plane_metrics.quote_skew_cap_bps,
+                refresh_interval_ms: control_plane_metrics.quote_refresh_interval_ms as u64,
+                edge_bps: control_plane_metrics.quote_edge_bps,
+                age_ms: control_plane_metrics.quote_age_ms,
+            },
+            fill: crate::wire::api::FillControlPlaneState {
+                total: control_plane_metrics.fill_total,
+                maker_total: control_plane_metrics.fill_maker_total,
+                taker_total: control_plane_metrics.fill_taker_total,
+                maker_share: control_plane_metrics.fill_maker_share,
+                notional_usd_total: control_plane_metrics.fill_notional_usd_total,
+            },
+            pair: crate::wire::api::PairControlPlaneState {
+                completed_qty_total: control_plane_metrics.pair_completed_qty_total,
+                stranded_yes_qty: control_plane_metrics.stranded_yes_qty,
+                stranded_no_qty: control_plane_metrics.stranded_no_qty,
+                merge_candidate_qty: control_plane_metrics.merge_candidate_qty,
+                merge_latency_ms: control_plane_metrics.merge_latency_ms,
+            },
+            risk: crate::wire::api::RiskControlPlaneState {
+                book_stale_events_total: control_plane_metrics.book_stale_events_total,
+                reconcile_failures_total: control_plane_metrics.reconcile_failures_total,
+                runtime_riskoff_transitions_total: control_plane_metrics
+                    .runtime_riskoff_transitions_total,
+                uncertain_submit_total: control_plane_metrics.uncertain_submit_total,
+                inventory_skew_usd: control_plane_metrics.inventory_skew_usd,
+            },
+            economics: crate::wire::api::EconomicsControlPlaneState {
+                realized_pnl_usd: control_plane_metrics.realized_pnl_usd,
+                unrealized_pnl_usd: control_plane_metrics.unrealized_pnl_usd,
+                fees_usd_total: control_plane_metrics.fees_usd_total,
+                rebates_usd_total: control_plane_metrics.rebates_usd_total,
+                net_edge_usd_total: control_plane_metrics.net_edge_usd_total,
+            },
+            health: crate::wire::api::HealthControlPlaneState {
+                market_ws_connected: control_plane_metrics.market_ws_connected,
+                user_ws_connected: control_plane_metrics.user_ws_connected,
+                execution_adapter_connected: control_plane_metrics.execution_adapter_connected,
+                last_market_message_age_ms: control_plane_metrics.market_last_message_age_ms,
+                last_user_message_age_ms: control_plane_metrics.user_last_message_age_ms,
+                last_reconcile_age_ms: control_plane_metrics.last_reconcile_age_ms,
+            },
+        },
     };
     Ok(())
 }
@@ -470,6 +720,8 @@ async fn refresh_dashboard_state(
 fn handle_user_event(
     runtime: &mut Runtime<StrategyMode>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
+    execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    metrics: &AppMetrics,
     event: UserOrderEvent,
 ) -> Result<RuntimeOutcome> {
     let outcome = match event {
@@ -484,9 +736,11 @@ fn handle_user_event(
             observed_at_ms,
         } => {
             if let Some(client_order_id) = client_order_id {
-                paper_order_ctx.remove(&ClientOrderId::from(client_order_id.clone()));
+                let client_order_id = ClientOrderId::from(client_order_id);
+                paper_order_ctx.remove(&client_order_id);
+                execution_venue_map.remove(&client_order_id);
                 runtime.on_order_rejected(
-                    &ClientOrderId::from(client_order_id),
+                    &client_order_id,
                     reason.unwrap_or_else(|| "order rejected".to_string()),
                     observed_at_ms,
                 )
@@ -501,9 +755,11 @@ fn handle_user_event(
             observed_at_ms,
         } => {
             if let Some(client_order_id) = client_order_id {
-                paper_order_ctx.remove(&ClientOrderId::from(client_order_id.clone()));
+                let client_order_id = ClientOrderId::from(client_order_id);
+                paper_order_ctx.remove(&client_order_id);
+                execution_venue_map.remove(&client_order_id);
                 runtime.on_order_cancelled(
-                    &ClientOrderId::from(client_order_id),
+                    &client_order_id,
                     reason.unwrap_or_else(|| "order cancelled".to_string()),
                     observed_at_ms,
                 )
@@ -544,6 +800,14 @@ fn handle_user_event(
                     close_method,
                     observed_at_ms,
                 };
+                metrics.record_fill(
+                    &fill,
+                    if matches!(fill.close_method, Some(crate::types::CloseMethod::Merge)) {
+                        Some(0)
+                    } else {
+                        None
+                    },
+                );
                 runtime.on_fill(fill)?
             }
         }
@@ -574,6 +838,7 @@ fn handle_user_event(
                 close_method: Some(crate::types::CloseMethod::Merge),
                 observed_at_ms,
             };
+            metrics.record_fill(&fill, Some(0));
             runtime.on_fill(fill)?
         }
         UserOrderEvent::OrderRedeemed {
@@ -603,6 +868,7 @@ fn handle_user_event(
                 close_method: Some(crate::types::CloseMethod::Redeem),
                 observed_at_ms,
             };
+            metrics.record_fill(&fill, None);
             runtime.on_fill(fill)?
         }
     };
@@ -659,6 +925,14 @@ fn parse_fill_liquidity(raw: &Option<String>) -> FillLiquidity {
     }
 }
 
+fn is_yes_like(raw: &str) -> bool {
+    raw.contains("yes")
+        || raw.contains("up")
+        || raw.contains("long")
+        || raw.contains("bull")
+        || raw.contains("call")
+}
+
 async fn join_task(name: &str, handle: JoinHandle<()>) {
     if let Err(error) = handle.await {
         warn!(task = name, error = ?error, "background task join failed");
@@ -699,50 +973,165 @@ fn persist_runtime_outcome(
     Ok(())
 }
 
+fn persist_runtime_checkpoint(
+    journal: &mut Option<JournalWriter>,
+    runtime: &Runtime<StrategyMode>,
+    observed_at_ms: u64,
+    name: &str,
+) -> Result<()> {
+    if let Some(writer) = journal.as_mut() {
+        let open_orders = runtime.open_order_snapshots();
+        let open_orders_count = open_orders.len();
+        let needs_reconcile_orders = open_orders
+            .iter()
+            .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+            .count();
+        writer.append_checkpoint(
+            observed_at_ms,
+            runtime.run_id(),
+            name,
+            open_orders_count,
+            needs_reconcile_orders,
+            runtime.event_log().latest_seq(),
+        )?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 async fn execute_execution_adapter(
     runtime: &mut Runtime<StrategyMode>,
     books: &Arc<BookStore>,
     paper_fee_coeff: f64,
+    metrics: &AppMetrics,
     outcome: RuntimeOutcome,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
+    execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    execution_adapter: Arc<dyn ExecutionAdapter>,
     paper_mode: bool,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
         event_seqs: outcome.event_seqs,
     };
-    // Simulate execution locally for both paper-mode and non-paper-mode fallback.
-    let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+
     let observed_at_ms = now_unix_ms();
+    let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+
+    if !paper_mode {
+        sync_execution_state(execution_adapter.as_ref(), runtime, execution_venue_map).await;
+        let mut dedupe = HashSet::new();
+        for managed in runtime.open_order_snapshots() {
+            if managed.remaining_qty() <= 0.0 {
+                continue;
+            }
+            let client_order_id = managed.intent.client_order_id.clone();
+            if !dedupe.insert(client_order_id.clone()) {
+                continue;
+            }
+            match managed.status {
+                ManagedOrderStatus::PendingSubmit => {
+                    queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
+                }
+                ManagedOrderStatus::NeedsReconcile => {
+                    queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
+                }
+                ManagedOrderStatus::CancelRequested => queue.push_back(RuntimeCommand::Cancel {
+                    client_order_id,
+                    reason: "recovering live order".to_string(),
+                }),
+                _ => {}
+            }
+        }
+    }
+
     while let Some(command) = queue.pop_front() {
         combined.commands.push(command.clone());
         match command {
             RuntimeCommand::Submit(intent) => {
-                let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
-                    continue;
-                };
-                let ctx = paper_order_context(paper_order_ctx, &intent, observed_at_ms);
-                mark_paper_attempt(paper_order_ctx, &intent, observed_at_ms);
+                if paper_mode {
+                    let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
+                        continue;
+                    };
+                    let ctx = paper_order_context(paper_order_ctx, &intent, observed_at_ms);
+                    mark_paper_attempt(paper_order_ctx, &intent, observed_at_ms);
 
-                if !paper_mode {
-                    let opened_outcome =
-                        runtime.on_order_opened(&intent.client_order_id, observed_at_ms);
-                    combined.extend(opened_outcome);
+                    if let Some(fill) = paper_fill_from_book_snapshot(
+                        &book,
+                        &intent,
+                        observed_at_ms,
+                        paper_fee_coeff,
+                        &ctx,
+                        intent.quantity,
+                    ) {
+                        metrics.record_fill(
+                            &fill,
+                            if matches!(fill.close_method, Some(crate::types::CloseMethod::Merge))
+                            {
+                                Some(observed_at_ms.saturating_sub(fill.observed_at_ms))
+                            } else {
+                                None
+                            },
+                        );
+                        let fill_outcome = runtime.on_fill(fill)?;
+                        let chained_commands = fill_outcome.commands.clone();
+                        combined.extend(fill_outcome);
+                        for command in chained_commands {
+                            queue.push_back(command);
+                        }
+                    }
+                    continue;
                 }
 
-                if let Some(fill) = paper_fill_from_book_snapshot(
-                    &book,
-                    &intent,
-                    observed_at_ms,
-                    paper_fee_coeff,
-                    &ctx,
-                    intent.quantity,
-                ) {
-                    let fill_outcome = runtime.on_fill(fill)?;
-                    let chained_commands = fill_outcome.commands.clone();
-                    combined.extend(fill_outcome);
-                    for command in chained_commands {
-                        queue.push_back(command);
+                let submit_req = submit_request_from_intent(&intent, observed_at_ms);
+                match execution_adapter.submit(submit_req).await {
+                    Ok(ack) if ack.accepted => {
+                        if let Some(order_id) = ack.venue_order_id.clone() {
+                            execution_venue_map.insert(intent.client_order_id.clone(), Some(order_id));
+                        }
+                        let opened_outcome =
+                            runtime.on_order_opened(&intent.client_order_id, observed_at_ms);
+                        combined.extend(opened_outcome);
+                    }
+                    Ok(ack) => {
+                        let reason = ack
+                            .venue_message
+                            .unwrap_or_else(|| "execution venue rejected submit".to_string());
+                        let rejected_outcome = runtime.on_order_rejected(
+                            &intent.client_order_id,
+                            reason,
+                            ack.accepted_at_ms,
+                        );
+                        paper_order_ctx.remove(&intent.client_order_id);
+                        combined.extend(rejected_outcome);
+                    }
+                    Err(error) => {
+                        if error.is_retryable() {
+                            warn!(
+                                mode = "live",
+                                client_order_id = %intent.client_order_id,
+                                error = %error,
+                                requires_reconcile = error.requires_reconcile(),
+                                "submit retry scheduled by classification"
+                            );
+                            if error.requires_reconcile() {
+                                metrics.observe_uncertain_submit();
+                                combined.extend(runtime.set_order_status(
+                                    &intent.client_order_id,
+                                    ManagedOrderStatus::NeedsReconcile,
+                                    observed_at_ms,
+                                    "submission uncertain; moving to needs-reconcile",
+                                ));
+                            }
+                        } else {
+                            let rejected_outcome = runtime.on_order_rejected(
+                                &intent.client_order_id,
+                                error.to_string(),
+                                observed_at_ms,
+                            );
+                            paper_order_ctx.remove(&intent.client_order_id);
+                            combined.extend(rejected_outcome);
+                        }
                     }
                 }
             }
@@ -750,24 +1139,76 @@ async fn execute_execution_adapter(
                 client_order_id,
                 reason,
             } => {
-                if !paper_mode {
+                if paper_mode {
                     let cancelled_outcome = runtime.on_order_cancelled(
                         &client_order_id,
                         reason.clone(),
                         observed_at_ms,
                     );
                     combined.extend(cancelled_outcome);
+                    paper_order_ctx.remove(&client_order_id);
+                    debug!(
+                        source = "execution_bridge",
+                        client_order_id = %client_order_id,
+                        mode = "paper",
+                        "cancel command reconciled locally"
+                    );
+                    continue;
                 }
-                paper_order_ctx.remove(&client_order_id);
-                debug!(
-                    source = "execution_bridge",
-                    client_order_id = %client_order_id,
-                    mode = if paper_mode { "paper" } else { "fallback-exec" },
-                    "cancel command reconciled locally"
-                );
+
+                let cancel_req = CancelOrderRequest {
+                    client_order_id: client_order_id.clone(),
+                    venue_order_id: execution_venue_map.get(&client_order_id).cloned().flatten(),
+                    reason,
+                    submitted_at_ms: observed_at_ms,
+                };
+                match execution_adapter.cancel(cancel_req).await {
+                    Ok(ack) if ack.accepted => {
+                        execution_venue_map.remove(&client_order_id);
+                        let cancelled_outcome = runtime.on_order_cancelled(
+                            &client_order_id,
+                            ack.venue_message.unwrap_or_else(|| "execution cancelled".to_string()),
+                            ack.accepted_at_ms,
+                        );
+                        combined.extend(cancelled_outcome);
+                    }
+                    Ok(ack) => {
+                        let reason = ack
+                            .venue_message
+                            .unwrap_or_else(|| "execution venue rejected cancel".to_string());
+                        let rejected_outcome = runtime.on_order_rejected(
+                            &client_order_id,
+                            reason,
+                            ack.accepted_at_ms,
+                        );
+                        combined.extend(rejected_outcome);
+                    }
+                    Err(error) => {
+                        if error.is_retryable() {
+                            warn!(
+                                mode = "live",
+                                client_order_id = %client_order_id,
+                                error = %error,
+                                requires_reconcile = error.requires_reconcile(),
+                                "cancel retry scheduled by classification"
+                            );
+                        } else {
+                            let rejected_outcome = runtime.on_order_rejected(
+                                &client_order_id,
+                                error.to_string(),
+                                observed_at_ms,
+                            );
+                            combined.extend(rejected_outcome);
+                        }
+                    }
+                }
             }
             RuntimeCommand::Noop => {}
         }
+    }
+
+    if !paper_mode {
+        return Ok(combined);
     }
 
     let open_orders = runtime.open_order_snapshots();
@@ -794,6 +1235,14 @@ async fn execute_execution_adapter(
             &ctx,
             managed.remaining_qty(),
         ) {
+            metrics.record_fill(
+                &fill,
+                if matches!(fill.close_method, Some(crate::types::CloseMethod::Merge)) {
+                    Some(observed_at_ms.saturating_sub(fill.observed_at_ms))
+                } else {
+                    None
+                },
+            );
             let fill_outcome = runtime.on_fill(fill)?;
             combined.extend(fill_outcome);
         }
@@ -809,6 +1258,63 @@ async fn execute_execution_adapter(
     }
 
     Ok(combined)
+}
+
+fn submit_request_from_intent(intent: &OrderIntent, observed_at_ms: u64) -> SubmitOrderRequest {
+    SubmitOrderRequest {
+        client_order_id: intent.client_order_id.clone(),
+        market_id: intent.market_id.clone(),
+        instrument_id: intent.instrument_id.clone(),
+        side: intent.side,
+        limit_price: intent.limit_price,
+        quantity: intent.quantity,
+        post_only: false,
+        time_in_force: TimeInForce::Gtc,
+        strategy_tag: "runtime".to_string(),
+        quote_level_tag: intent.quote_level_tag.clone(),
+        submitted_at_ms: observed_at_ms,
+    }
+}
+
+async fn sync_execution_state(
+    execution_adapter: &dyn ExecutionAdapter,
+    runtime: &Runtime<StrategyMode>,
+    execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+) {
+    match execution_adapter.sync_open_orders().await {
+        Ok(open_orders) => {
+            let open_order_count = open_orders.len();
+            for order in open_orders {
+                if let Some(client_order_id) = order.client_order_id.clone() {
+                    execution_venue_map
+                        .entry(client_order_id)
+                        .or_insert(Some(order.venue_order_id.clone()));
+                }
+            }
+            debug!(
+                open_orders = open_order_count,
+                local_open_orders = runtime.open_order_snapshots().len(),
+                "synced execution open orders"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "execution open orders sync failed");
+        }
+    }
+
+    match execution_adapter.sync_balances().await {
+        Ok(balances) => {
+            debug!(
+                cash_usd = balances.cash_usd,
+                positions = balances.positions.len(),
+                observed_at_ms = balances.observed_at_ms,
+                "synced execution balances"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "execution balances sync failed");
+        }
+    }
 }
 
 fn paper_fill_from_book_snapshot(

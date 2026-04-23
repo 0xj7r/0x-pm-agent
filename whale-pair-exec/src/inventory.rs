@@ -43,6 +43,7 @@ pub enum InventoryAdjustmentReason {
     Reserved,
     Released,
     FillApplied,
+    MergeApplied,
     MarkUpdated,
 }
 
@@ -72,6 +73,7 @@ impl InventoryAdjustment {
             position_delta: Some(self.position_delta),
             free_cash_after_usd: Some(self.free_cash_after_usd),
             gross_exposure_after_usd: Some(self.gross_exposure_after_usd),
+            risk_reject_reason: None,
         };
         let mut record =
             EventRecord::new(EventCategory::Inventory, self.observed_at_ms, message)
@@ -441,6 +443,112 @@ impl InventoryState {
         })
     }
 
+    pub fn apply_merge(
+        &mut self,
+        market_id: &MarketId,
+        yes_instrument_id: &InstrumentId,
+        no_instrument_id: &InstrumentId,
+        merged_qty: f64,
+        merged_cost_usd: f64,
+        merged_cash_usd: f64,
+        additional_fee_usd: f64,
+        observed_at_ms: EpochMillis,
+    ) -> Result<InventoryAdjustment, InventoryError> {
+        if merged_qty <= 0.0 || merged_cash_usd < 0.0 || merged_cost_usd < 0.0 {
+            return Err(InventoryError::InvalidFill("invalid merge quantity/cash"));
+        }
+
+        let yes_position_qty = self.position_qty(yes_instrument_id);
+        if yes_position_qty + 1e-9 < merged_qty {
+            return Err(InventoryError::Oversell {
+                instrument_id: yes_instrument_id.clone(),
+                available_qty: yes_position_qty,
+                attempted_qty: merged_qty,
+            });
+        }
+
+        let no_position_qty = self.position_qty(no_instrument_id);
+        if no_position_qty + 1e-9 < merged_qty {
+            return Err(InventoryError::Oversell {
+                instrument_id: no_instrument_id.clone(),
+                available_qty: no_position_qty,
+                attempted_qty: merged_qty,
+            });
+        }
+
+        let net_cash_usd = merged_cash_usd - additional_fee_usd;
+        let realized_pnl_delta_usd = net_cash_usd - merged_cost_usd;
+        let mut remove_yes = false;
+        let mut remove_no = false;
+
+        if let Some(entry) = self.positions.get_mut(yes_instrument_id) {
+            if entry.quantity + 1e-9 < merged_qty {
+                return Err(InventoryError::Oversell {
+                    instrument_id: yes_instrument_id.clone(),
+                    available_qty: entry.quantity,
+                    attempted_qty: merged_qty,
+                });
+            }
+            entry.quantity -= merged_qty;
+            entry.updated_at_ms = observed_at_ms;
+            if entry.quantity <= 1e-9 {
+                remove_yes = true;
+            }
+        } else {
+            return Err(InventoryError::Oversell {
+                instrument_id: yes_instrument_id.clone(),
+                available_qty: 0.0,
+                attempted_qty: merged_qty,
+            });
+        }
+
+        if let Some(entry) = self.positions.get_mut(no_instrument_id) {
+            if entry.quantity + 1e-9 < merged_qty {
+                return Err(InventoryError::Oversell {
+                    instrument_id: no_instrument_id.clone(),
+                    available_qty: entry.quantity,
+                    attempted_qty: merged_qty,
+                });
+            }
+            entry.quantity -= merged_qty;
+            entry.updated_at_ms = observed_at_ms;
+            if entry.quantity <= 1e-9 {
+                remove_no = true;
+            }
+        } else {
+            return Err(InventoryError::Oversell {
+                instrument_id: no_instrument_id.clone(),
+                available_qty: 0.0,
+                attempted_qty: merged_qty,
+            });
+        }
+
+        if remove_yes {
+            self.positions.remove(yes_instrument_id);
+        }
+        if remove_no {
+            self.positions.remove(no_instrument_id);
+        }
+
+        self.free_cash_usd += net_cash_usd;
+        self.realized_pnl_usd += realized_pnl_delta_usd;
+
+        Ok(InventoryAdjustment {
+            reason: InventoryAdjustmentReason::MergeApplied,
+            observed_at_ms,
+            market_id: Some(market_id.clone()),
+            instrument_id: None,
+            client_order_id: None,
+            cash_delta_usd: net_cash_usd,
+            reserved_cash_delta_usd: 0.0,
+            position_delta: 0.0,
+            realized_pnl_delta_usd,
+            free_cash_after_usd: self.free_cash_usd,
+            reserved_cash_after_usd: self.reserved_cash_usd,
+            gross_exposure_after_usd: self.gross_exposure_usd(),
+        })
+    }
+
     fn noop_adjustment(
         &self,
         reason: InventoryAdjustmentReason,
@@ -488,6 +596,7 @@ mod tests {
                 quantity: 10.0,
                 reduce_only: false,
                 reason: "test".into(),
+                quote_level_tag: None,
                 created_at_ms: 10,
             })
             .expect("buy reserve");

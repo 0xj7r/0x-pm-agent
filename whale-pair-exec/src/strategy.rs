@@ -1,8 +1,14 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::inventory::{InventorySnapshot, PositionState};
 use crate::market_context::MarketContextRecord;
+use crate::quote_engine::QuoteEngineConfig;
 use crate::types::{
     ClientOrderId, EpochMillis, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
     QuoteSnapshot, RuntimeStatus, TradeSide,
@@ -161,12 +167,343 @@ impl StrategyDecision {
     }
 }
 
+fn deterministic_quote_unit(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    (value * 100_000_000.0).round() / 100_000_000.0
+}
+
+fn deterministic_client_order_id(
+    strategy_tag: &str,
+    market_id: &MarketId,
+    instrument_id: &InstrumentId,
+    side: TradeSide,
+    reduce_only: bool,
+    quote_level_tag: &str,
+    price: f64,
+    quantity: f64,
+) -> ClientOrderId {
+    let side_tag = if matches!(side, TradeSide::Buy) { "b" } else { "s" };
+    let mode_tag = if reduce_only { "r" } else { "n" };
+    ClientOrderId::from(format!(
+        "{strategy_tag}:{market}:{instrument}:{side}:{mode}:{level}:{price:.8}:{qty:.8}",
+        market = market_id.as_str(),
+        instrument = instrument_id.as_str(),
+        side = side_tag,
+        mode = mode_tag,
+        level = quote_level_tag,
+        price = deterministic_quote_unit(price),
+        qty = deterministic_quote_unit(quantity),
+    ))
+}
+
 pub struct StrategyContext {
     pub now_ms: EpochMillis,
     pub runtime_status: RuntimeStatus,
     pub inventory: InventorySnapshot,
     pub open_orders_total: usize,
     pub market_context: Option<MarketContextRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrategyProfile {
+    pub profile_name: String,
+    pub version: Option<String>,
+    pub quote: ProfileQuote,
+    pub inventory: ProfileInventory,
+    pub risk: ProfileRisk,
+    pub fill: ProfileFill,
+    pub pair: ProfilePair,
+    pub economics: ProfileEconomics,
+    pub health: ProfileHealth,
+    pub strategies: StrategyOverrides,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl StrategyProfile {
+    pub fn load(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        let profile: StrategyProfile = serde_json::from_str(&raw)?;
+        Ok(profile)
+    }
+
+    pub fn quote_engine_config(&self) -> QuoteEngineConfig {
+        QuoteEngineConfig {
+            max_levels_per_side: self.quote.levels_per_side.unwrap_or(3),
+            skew_bps: self.quote.skew_cap_bps.unwrap_or(7.5),
+            stale_quote_max_age_ms: self.quote.min_quote_age_ms,
+            quote_expiry_ms: self.quote.expiry_suppression_ms,
+        }
+    }
+
+    pub fn unlawful_shear_config(&self) -> UnlawfulShearConfig {
+        UnlawfulShearConfig {
+            cheap_hedge_price_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CHEAP_HEDGE_PRICE_MAX",
+                self.strategies.unlawful_shear.cheap_hedge_price_max,
+                0.38,
+            ),
+            core_price_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CORE_PRICE_MIN",
+                self.strategies.unlawful_shear.core_price_min,
+                0.52,
+            ),
+            core_price_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CORE_PRICE_MAX",
+                self.strategies.unlawful_shear.core_price_max,
+                0.92,
+            ),
+            min_price_gap: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MIN_PRICE_GAP",
+                self.strategies.unlawful_shear.min_price_gap,
+                0.12,
+            ),
+            probe_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PROBE_CLIP_USD",
+                self.strategies.unlawful_shear.probe_clip_usd,
+                3.0,
+            ),
+            core_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CORE_CLIP_USD",
+                self.strategies.unlawful_shear.core_clip_usd,
+                20.0,
+            ),
+            hedge_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_HEDGE_CLIP_USD",
+                self.strategies.unlawful_shear.hedge_clip_usd,
+                6.0,
+            ),
+            rebalance_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_REBALANCE_CLIP_USD",
+                self.strategies.unlawful_shear.rebalance_clip_usd,
+                12.0,
+            ),
+            trim_clip_fraction: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_TRIM_CLIP_FRACTION",
+                self.strategies.unlawful_shear.trim_clip_fraction,
+                0.30,
+            ),
+            max_gross_cost_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MAX_GROSS_COST_USD",
+                self.strategies.unlawful_shear.max_gross_cost_usd,
+                120.0,
+            ),
+            target_hedge_ratio_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_TARGET_HEDGE_RATIO_MIN",
+                self.strategies.unlawful_shear.target_hedge_ratio_min,
+                0.20,
+            ),
+            target_hedge_ratio_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_TARGET_HEDGE_RATIO_MAX",
+                self.strategies.unlawful_shear.target_hedge_ratio_max,
+                0.60,
+            ),
+            salvage_drawdown_ratio: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SALVAGE_DRAWDOWN_RATIO",
+                self.strategies.unlawful_shear.salvage_drawdown_ratio,
+                0.18,
+            ),
+            salvage_bid_floor: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SALVAGE_BID_FLOOR",
+                self.strategies.unlawful_shear.salvage_bid_floor,
+                0.05,
+            ),
+            max_open_orders_total: env_or_profile_usize(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MAX_OPEN_ORDERS_TOTAL",
+                self.strategies.unlawful_shear.max_open_orders_total,
+                6,
+            ),
+            taker_fee_coeff: env_or_profile_f64(
+                "WHALE_PAIR_TAKER_FEE_COEFF",
+                self.strategies.unlawful_shear.taker_fee_coeff,
+                0.072,
+            ),
+        }
+    }
+
+    pub fn goat_pair_config(&self) -> GoatPairConfig {
+        GoatPairConfig {
+            accumulate_price_max: env_or_profile_f64(
+                "WHALE_PAIR_ACCUMULATE_PRICE_MAX",
+                self.strategies.goat_pair.accumulate_price_max,
+                0.50,
+            ),
+            aggressive_price_max: env_or_profile_f64(
+                "WHALE_PAIR_AGGRESSIVE_PRICE_MAX",
+                self.strategies.goat_pair.aggressive_price_max,
+                0.10,
+            ),
+            base_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_BASE_CLIP_USD",
+                self.strategies.goat_pair.base_clip_usd,
+                20.0,
+            ),
+            aggressive_clip_usd: env_or_profile_f64(
+                "WHALE_PAIR_AGGRESSIVE_CLIP_USD",
+                self.strategies.goat_pair.aggressive_clip_usd,
+                50.0,
+            ),
+            max_gross_cost_usd: env_or_profile_f64(
+                "WHALE_PAIR_MAX_GROSS_COST_USD",
+                self.strategies.goat_pair.max_gross_cost_usd,
+                200.0,
+            ),
+            completion_min_pnl_per_share: env_or_profile_f64(
+                "WHALE_PAIR_COMPLETION_MIN_PNL_PER_SHARE",
+                self.strategies.goat_pair.completion_min_pnl_per_share,
+                0.002,
+            ),
+            max_imbalance_ratio: env_or_profile_f64(
+                "WHALE_PAIR_MAX_IMBALANCE_RATIO",
+                self.strategies.goat_pair.max_imbalance_ratio,
+                3.0,
+            ),
+            taker_fee_coeff: env_or_profile_f64(
+                "WHALE_PAIR_TAKER_FEE_COEFF",
+                self.strategies.goat_pair.taker_fee_coeff,
+                0.072,
+            ),
+        }
+    }
+
+    pub fn goat_pair_cooldown_ms(&self) -> u64 {
+        env_or_profile_u64(
+            "WHALE_PAIR_GOAT_PAIR_COOLDOWN_MS",
+            self.strategies.goat_pair.cooldown_ms,
+            250,
+        )
+    }
+
+    pub fn unlawful_shear_cooldown_ms(&self) -> u64 {
+        env_or_profile_u64(
+            "WHALE_PAIR_UNLAWFUL_SHEAR_COOLDOWN_MS",
+            self.strategies.unlawful_shear.cooldown_ms,
+            400,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileQuote {
+    pub levels_per_side: Option<usize>,
+    pub base_clip_usd: Option<f64>,
+    pub max_quote_per_side_usd: Option<f64>,
+    pub max_clip_usd: Option<f64>,
+    pub min_edge_bps: Option<f64>,
+    pub inventory_skew_bps: Option<f64>,
+    pub min_quote_age_ms: Option<u64>,
+    pub expiry_suppression_ms: Option<u64>,
+    pub refresh_interval_ms: Option<u64>,
+    pub skew_cap_bps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileInventory {
+    pub max_order_notional_usd: Option<f64>,
+    pub max_gross_notional_usd: Option<f64>,
+    pub max_net_notional_per_market_usd: Option<f64>,
+    pub max_position_quantity_per_instrument: Option<f64>,
+    pub min_free_cash_usd: Option<f64>,
+    pub max_open_orders_total: Option<usize>,
+    pub max_open_orders_per_market: Option<usize>,
+    pub max_stranded_leg_usd: Option<f64>,
+    pub pair_merge_min_qty: Option<f64>,
+    pub cleanup_min_qty: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileRisk {
+    pub book_stale_ms: Option<u64>,
+    pub user_ws_stale_ms: Option<u64>,
+    pub max_consecutive_reconcile_failures: Option<usize>,
+    pub disable_making_on_spot_shock_bps: Option<f64>,
+    pub kill_switch_inventory_skew_usd: Option<f64>,
+    pub kill_switch_open_orders_total: Option<usize>,
+    pub kill_switch_quote_age_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileFill {
+    pub maker_rebate_bps: Option<f64>,
+    pub taker_fee_bps: Option<f64>,
+    pub max_fill_notional_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfilePair {
+    pub merge_min_qty: Option<f64>,
+    pub cleanup_min_qty: Option<f64>,
+    pub expiry_phase_cutoff_ms: Option<u64>,
+    pub stale_feed_cutoff_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileEconomics {
+    pub target_edge_bps: Option<f64>,
+    pub max_fees_usd: Option<f64>,
+    pub max_rebates_usd: Option<f64>,
+    pub target_net_edge_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileHealth {
+    pub market_ws_stale_ms: Option<u64>,
+    pub user_ws_stale_ms: Option<u64>,
+    pub execution_adapter_stale_ms: Option<u64>,
+    pub health_check_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StrategyOverrides {
+    pub goat_pair: GoatPairProfile,
+    pub unlawful_shear: UnlawfulShearProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoatPairProfile {
+    pub accumulate_price_max: Option<f64>,
+    pub aggressive_price_max: Option<f64>,
+    pub base_clip_usd: Option<f64>,
+    pub aggressive_clip_usd: Option<f64>,
+    pub max_gross_cost_usd: Option<f64>,
+    pub completion_min_pnl_per_share: Option<f64>,
+    pub max_imbalance_ratio: Option<f64>,
+    pub taker_fee_coeff: Option<f64>,
+    pub cooldown_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UnlawfulShearProfile {
+    pub cheap_hedge_price_max: Option<f64>,
+    pub core_price_min: Option<f64>,
+    pub core_price_max: Option<f64>,
+    pub min_price_gap: Option<f64>,
+    pub probe_clip_usd: Option<f64>,
+    pub core_clip_usd: Option<f64>,
+    pub hedge_clip_usd: Option<f64>,
+    pub rebalance_clip_usd: Option<f64>,
+    pub trim_clip_fraction: Option<f64>,
+    pub max_gross_cost_usd: Option<f64>,
+    pub target_hedge_ratio_min: Option<f64>,
+    pub target_hedge_ratio_max: Option<f64>,
+    pub salvage_drawdown_ratio: Option<f64>,
+    pub salvage_bid_floor: Option<f64>,
+    pub max_open_orders_total: Option<usize>,
+    pub taker_fee_coeff: Option<f64>,
+    pub cooldown_ms: Option<u64>,
 }
 
 pub trait Strategy {
@@ -201,11 +538,13 @@ pub enum StrategyMode {
 }
 
 impl StrategyMode {
-    pub fn from_name(name: &str) -> Self {
+    pub fn from_name(name: &str, profile: Option<&StrategyProfile>) -> Self {
         match name {
-            "goat_pair" => Self::Goat(GoatPairStrategy::with_defaults()),
+            "goat_pair" => {
+                Self::Goat(GoatPairStrategy::with_profile(profile))
+            }
             "noop" => Self::Noop(NoopStrategy),
-            "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_defaults()),
+            "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile)),
             _ => Self::UnlawfulShear(UnlawfulShearStrategy::with_defaults()),
         }
     }
@@ -265,6 +604,12 @@ impl Strategy for StrategyMode {
 pub struct GoatPairStrategy {
     config: GoatPairConfig,
     cooldown_ms: u64,
+    quote_levels_per_side: usize,
+    quote_min_edge_bps: f64,
+    quote_inventory_skew_bps: f64,
+    quote_min_quote_age_ms: Option<u64>,
+    quote_expiry_suppression_ms: Option<u64>,
+    quote_refresh_interval_ms: Option<u64>,
     market_states: HashMap<MarketId, GoatMarketState>,
 }
 
@@ -273,12 +618,34 @@ impl GoatPairStrategy {
         Self {
             config,
             cooldown_ms,
+            quote_levels_per_side: 1,
+            quote_min_edge_bps: 0.0,
+            quote_inventory_skew_bps: 0.0,
+            quote_min_quote_age_ms: None,
+            quote_expiry_suppression_ms: None,
+            quote_refresh_interval_ms: None,
             market_states: HashMap::new(),
         }
     }
 
     pub fn with_defaults() -> Self {
         Self::new(GoatPairConfig::from_env(), 250)
+    }
+
+    pub fn with_profile(profile: Option<&StrategyProfile>) -> Self {
+        match profile {
+            Some(profile) => {
+                let mut strategy = Self::new(profile.goat_pair_config(), profile.goat_pair_cooldown_ms());
+                strategy.quote_levels_per_side = profile.quote.levels_per_side.unwrap_or(1).clamp(1, 3);
+                strategy.quote_min_edge_bps = profile.quote.min_edge_bps.unwrap_or(0.0).max(0.0);
+                strategy.quote_inventory_skew_bps = profile.quote.inventory_skew_bps.unwrap_or(0.0).max(0.0);
+                strategy.quote_min_quote_age_ms = profile.quote.min_quote_age_ms;
+                strategy.quote_expiry_suppression_ms = profile.quote.expiry_suppression_ms;
+                strategy.quote_refresh_interval_ms = profile.quote.refresh_interval_ms;
+                strategy
+            }
+            None => Self::with_defaults(),
+        }
     }
 
     pub fn taker_fee_coeff(&self) -> f64 {
@@ -335,25 +702,127 @@ impl GoatPairStrategy {
         1.0 - opposite_avg - price - self.config.taker_fee_coeff * price * (1.0 - price)
     }
 
+    fn quote_is_fresh(&self, observed_at_ms: EpochMillis, now_ms: EpochMillis) -> bool {
+        if let Some(max_age_ms) = self.quote_min_quote_age_ms {
+            if now_ms.saturating_sub(observed_at_ms) > max_age_ms {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn quote_refresh_allowed(
+        &self,
+        last_action_ms: Option<EpochMillis>,
+        now_ms: EpochMillis,
+    ) -> bool {
+        let Some(refresh_interval_ms) = self.quote_refresh_interval_ms else {
+            return true;
+        };
+        let Some(last_action_ms) = last_action_ms else {
+            return true;
+        };
+        now_ms.saturating_sub(last_action_ms) >= refresh_interval_ms
+    }
+
+    fn quote_expired(
+        &self,
+        last_action_ms: Option<EpochMillis>,
+        now_ms: EpochMillis,
+    ) -> bool {
+        self.quote_expiry_suppression_ms
+            .is_some_and(|expiry_ms| last_action_ms.is_some_and(|last_action_ms| now_ms.saturating_sub(last_action_ms) > expiry_ms))
+    }
+
+    fn inventory_skew_scale(&self, this_qty: f64, opp_qty: f64) -> f64 {
+        if self.quote_inventory_skew_bps <= 0.0 {
+            return 1.0;
+        }
+        let imbalance = if opp_qty > 0.0 {
+            (this_qty - opp_qty) / opp_qty.max(1.0)
+        } else {
+            this_qty
+        };
+        let skew = (imbalance.abs() * self.quote_inventory_skew_bps / 10_000.0).min(0.5);
+        if imbalance >= 0.0 {
+            (1.0 - skew).max(0.4)
+        } else {
+            (1.0 + skew).min(1.6)
+        }
+    }
+
+    fn push_quote_ladder(
+        &mut self,
+        intents: &mut Vec<OrderIntent>,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        best_ask: f64,
+        this_qty: f64,
+        opp_qty: f64,
+        opp_avg: f64,
+        clip_usd: f64,
+        quote_base_tag: &str,
+        reason: &str,
+        now_ms: EpochMillis,
+    ) {
+        let levels = self.quote_levels_per_side.clamp(1, 3);
+        let inventory_scale = self.inventory_skew_scale(this_qty, opp_qty);
+        let edge_bps = self.quote_min_edge_bps.max(0.0);
+        let level_weight = (clip_usd / levels as f64).max(0.01);
+
+        for level in 0..levels {
+            let step_bps = edge_bps * (level as f64 + 1.0);
+            let level_price = deterministic_quote_unit((best_ask * (1.0 - step_bps / 10_000.0)).max(0.000_000_01));
+            if level_price <= 0.0 {
+                continue;
+            }
+            let level_qty_scale = inventory_scale / (1.0 + level as f64 * 0.35);
+            let level_notional = (level_weight * level_qty_scale).min(self.config.max_gross_cost_usd.max(0.01));
+            let quantity = (level_notional / level_price).max(0.0);
+            if quantity <= 0.0 {
+                continue;
+            }
+            let level_tag = format!("{quote_base_tag}:{level}");
+            let level_reason = if level == 0 {
+                reason.to_string()
+            } else {
+                format!("{reason} ladder={level} opp_avg={opp_avg:.4}")
+            };
+            intents.push(self.build_order(
+                market_id.clone(),
+                instrument_id.clone(),
+                level_price,
+                quantity,
+                level_tag,
+                level_reason,
+                now_ms,
+            ));
+        }
+    }
+
     fn build_order(
         &mut self,
         market_id: MarketId,
         instrument_id: InstrumentId,
         price: f64,
         quantity: f64,
+        quote_level_tag: String,
         reason: String,
         now_ms: EpochMillis,
     ) -> OrderIntent {
         let market_state = self.market_states.entry(market_id.clone()).or_default();
         market_state.last_seq = market_state.last_seq.saturating_add(1);
         market_state.last_fill_ms = Some(now_ms);
-        let client_order_id = ClientOrderId::from(format!(
-            "{}-{}-{}-{}",
-            market_id.as_str(),
-            market_state.last_seq,
-            instrument_id.as_str(),
-            now_ms
-        ));
+        let client_order_id = deterministic_client_order_id(
+            "goat-pair",
+            &market_id,
+            &instrument_id,
+            TradeSide::Buy,
+            false,
+            &quote_level_tag,
+            price,
+            quantity,
+        );
 
         OrderIntent {
             client_order_id,
@@ -364,6 +833,7 @@ impl GoatPairStrategy {
             quantity,
             reduce_only: false,
             reason,
+            quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
         }
     }
@@ -404,30 +874,69 @@ impl Strategy for GoatPairStrategy {
             None => return StrategyDecision::none(),
         };
 
-        let market_state = self.market_states.entry(snapshot.market_id.clone()).or_default();
-        let last_fill_ms = market_state.last_fill_ms.unwrap_or_default();
-        if self.cooldown_ms > 0 && context.now_ms.saturating_sub(last_fill_ms) < self.cooldown_ms {
+        let config = self.config;
+        let cooldown_ms = self.cooldown_ms;
+        let quote_min_quote_age_ms = self.quote_min_quote_age_ms;
+        let quote_expiry_suppression_ms = self.quote_expiry_suppression_ms;
+        let quote_refresh_interval_ms = self.quote_refresh_interval_ms;
+        let mut sides: Vec<(InstrumentId, f64)> = {
+            let market_state = self
+                .market_states
+                .entry(snapshot.market_id.clone())
+                .or_default();
+            let last_fill_ms = market_state.last_fill_ms;
+            if cooldown_ms > 0
+                && last_fill_ms.is_some_and(|ms| context.now_ms.saturating_sub(ms) < cooldown_ms)
+            {
+                market_state.asks.insert(instrument_id.clone(), ask);
+                return StrategyDecision::none();
+            }
+            if quote_refresh_interval_ms.is_some_and(|refresh_interval_ms| {
+                last_fill_ms.is_some_and(|ms| context.now_ms.saturating_sub(ms) < refresh_interval_ms)
+            }) {
+                market_state.asks.insert(instrument_id.clone(), ask);
+                return StrategyDecision::none();
+            }
+            if quote_min_quote_age_ms.is_some_and(|max_age_ms| {
+                context
+                    .now_ms
+                    .saturating_sub(snapshot.quote.observed_at_ms)
+                    > max_age_ms
+            }) {
+                market_state.asks.insert(instrument_id.clone(), ask);
+                return StrategyDecision::none();
+            }
+            if quote_expiry_suppression_ms.is_some_and(|expiry_ms| {
+                last_fill_ms.is_some_and(|ms| context.now_ms.saturating_sub(ms) > expiry_ms)
+            }) {
+                market_state.asks.insert(instrument_id.clone(), ask);
+                return StrategyDecision::none();
+            }
+
             market_state.asks.insert(instrument_id.clone(), ask);
-            return StrategyDecision::none();
-        }
+            if market_state.asks.len() < 2 {
+                return StrategyDecision::none();
+            }
 
-        market_state.asks.insert(instrument_id.clone(), ask);
-        if market_state.asks.len() < 2 {
-            return StrategyDecision::none();
-        }
-
-        let mut sides: Vec<(InstrumentId, f64)> = market_state
-            .asks
-            .iter()
-            .map(|(id, level)| (id.clone(), *level))
-            .collect();
+            market_state
+                .asks
+                .iter()
+                .map(|(id, level)| (id.clone(), *level))
+                .collect()
+        };
         sides.retain(|(_, level)| level.is_finite() && *level > 0.0);
         if sides.len() < 2 {
             return StrategyDecision::none();
         }
 
+        let mut intents = Vec::new();
+        let mut next_quote_seq = 0usize;
+        let mut next_quote_tag = |label: &str| {
+            next_quote_seq += 1;
+            format!("lvl-{next_quote_seq}:{label}")
+        };
+
         sides.sort_by(|left, right| left.1.total_cmp(&right.1));
-        let mut candidate = None;
         for (side_instrument, side_ask) in sides.clone() {
             let (this_qty, _) = self.position_for(&context.inventory, &side_instrument);
             let opposite_instrument = if side_instrument == sides[0].0 {
@@ -441,8 +950,8 @@ impl Strategy for GoatPairStrategy {
             let clip_usd = self.choose_clip_usd(side_ask).or_else(|| {
                 if opposite_has && opp_qty > this_qty {
                     let pnl = self.completion_pnl_per_share(opp_avg, side_ask);
-                    if pnl >= self.config.completion_min_pnl_per_share {
-                        Some(self.config.base_clip_usd)
+                    if pnl >= config.completion_min_pnl_per_share {
+                        Some(config.base_clip_usd)
                     } else {
                         None
                     }
@@ -458,28 +967,25 @@ impl Strategy for GoatPairStrategy {
             if opposite_has {
                 let projected_same = this_qty + clip_usd / side_ask;
                 let ratio = projected_same / opp_qty.max(1e-9);
-                if ratio > self.config.max_imbalance_ratio {
+                if ratio > config.max_imbalance_ratio {
                     continue;
                 }
             }
 
-            let remaining_gross = self.config.max_gross_cost_usd
+            let remaining_gross = config.max_gross_cost_usd
                 - self.gross_cost_usd(&context.inventory, &snapshot.market_id);
             let remaining_qty = remaining_gross.max(0.0) / side_ask;
             if remaining_qty <= 0.0 || remaining_qty * side_ask < 5e-4 {
                 return StrategyDecision::none();
             }
 
-            let mut qty = clip_usd / side_ask;
-            if qty > remaining_qty {
-                qty = remaining_qty;
-            }
+            let qty = (clip_usd / side_ask).min(remaining_qty);
             if qty <= 0.0 {
                 return StrategyDecision::none();
             }
 
             let fee = self.taker_fee_usd(side_ask, qty * side_ask);
-            let reason = if clip_usd >= self.config.aggressive_clip_usd {
+            let reason = if clip_usd >= config.aggressive_clip_usd {
                 format!(
                     "goat-pair accumulate aggressive p={side_ask:.4},fee={fee:.4},qty={qty:.4}"
                 )
@@ -488,22 +994,29 @@ impl Strategy for GoatPairStrategy {
             } else {
                 format!("goat-pair accumulate p={side_ask:.4},qty={qty:.4}")
             };
-            let order = self.build_order(
-                snapshot.market_id.clone(),
-                side_instrument,
+            self.push_quote_ladder(
+                &mut intents,
+                &snapshot.market_id,
+                &side_instrument,
                 side_ask,
-                qty,
-                reason,
+                this_qty,
+                opp_qty,
+                opp_avg,
+                qty * side_ask,
+                &next_quote_tag("goat-primary"),
+                &reason,
                 context.now_ms,
             );
-            candidate = Some(order);
             break;
         }
 
-        let Some(order) = candidate else {
+        if intents.is_empty() {
             return StrategyDecision::none();
-        };
-        StrategyDecision::single(order)
+        }
+        StrategyDecision {
+            intents,
+            notes: Vec::new(),
+        }
     }
 
     fn on_fill(
@@ -550,6 +1063,13 @@ impl UnlawfulShearStrategy {
             UnlawfulShearConfig::from_env(),
             parse_u64("WHALE_PAIR_UNLAWFUL_SHEAR_COOLDOWN_MS", 400),
         )
+    }
+
+    pub fn with_profile(profile: Option<&StrategyProfile>) -> Self {
+        match profile {
+            Some(profile) => Self::new(profile.unlawful_shear_config(), profile.unlawful_shear_cooldown_ms()),
+            None => Self::with_defaults(),
+        }
     }
 
     pub fn taker_fee_coeff(&self) -> f64 {
@@ -600,23 +1120,23 @@ impl UnlawfulShearStrategy {
         price: f64,
         quantity: f64,
         reduce_only: bool,
+        quote_level_tag: String,
         reason: String,
         now_ms: EpochMillis,
     ) -> OrderIntent {
         let market_state = self.market_states.entry(market_id.clone()).or_default();
         market_state.last_seq = market_state.last_seq.saturating_add(1);
         market_state.last_action_ms = Some(now_ms);
-        let client_order_id = ClientOrderId::from(format!(
-            "{}-{}-{}-{}-{}",
-            market_id.as_str(),
-            market_state.last_seq,
-            instrument_id.as_str(),
-            match side {
-                TradeSide::Buy => "buy",
-                TradeSide::Sell => "sell",
-            },
-            now_ms
-        ));
+        let client_order_id = deterministic_client_order_id(
+            "unlawful-shear",
+            &market_id,
+            &instrument_id,
+            side,
+            reduce_only,
+            &quote_level_tag,
+            price,
+            quantity,
+        );
 
         OrderIntent {
             client_order_id,
@@ -627,6 +1147,7 @@ impl UnlawfulShearStrategy {
             quantity,
             reduce_only,
             reason,
+            quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
         }
     }
@@ -639,6 +1160,7 @@ impl UnlawfulShearStrategy {
         instrument_id: &InstrumentId,
         price: f64,
         clip_usd: f64,
+        quote_level_tag: String,
         reason: String,
         now_ms: EpochMillis,
     ) {
@@ -660,6 +1182,7 @@ impl UnlawfulShearStrategy {
             price,
             quantity,
             false,
+            quote_level_tag,
             reason,
             now_ms,
         ));
@@ -673,6 +1196,7 @@ impl UnlawfulShearStrategy {
         instrument_id: &InstrumentId,
         price: f64,
         quantity: f64,
+        quote_level_tag: String,
         reason: String,
         now_ms: EpochMillis,
     ) {
@@ -686,6 +1210,7 @@ impl UnlawfulShearStrategy {
             price,
             quantity,
             true,
+            quote_level_tag,
             reason,
             now_ms,
         ));
@@ -919,6 +1444,11 @@ impl Strategy for UnlawfulShearStrategy {
         };
 
         let mut intents = Vec::new();
+        let mut next_quote_seq = 0usize;
+        let mut next_quote_tag = |label: &str| {
+            next_quote_seq += 1;
+            format!("lvl-{next_quote_seq}:{label}")
+        };
         let progress = self.window_progress(context);
         let phase = self.determine_phase(context);
         let phase_clip_scale = self.phase_clip_scale(phase);
@@ -953,6 +1483,7 @@ impl Strategy for UnlawfulShearStrategy {
                                 cheap_id,
                                 cheap_bid,
                                 cheap_qty,
+                                next_quote_tag("close-cheap-inferred"),
                                 format!(
                                     "unlawful-shear end-window close winner={}",
                                     if cheap_id == &winner_id { "cheap" } else { "loser" },
@@ -967,6 +1498,7 @@ impl Strategy for UnlawfulShearStrategy {
                                 expensive_id,
                                 expensive_bid,
                                 expensive_qty,
+                                next_quote_tag("close-expensive-inferred"),
                                 format!(
                                     "unlawful-shear end-window close winner={}",
                                     if expensive_id == &winner_id {
@@ -1020,6 +1552,7 @@ impl Strategy for UnlawfulShearStrategy {
                             cheap_id,
                             cheap_bid,
                             amount,
+                            next_quote_tag("fallback-close-cheap"),
                             format!(
                                 "unlawful-shear end-window fallback cleanup fraction={:.2}",
                                 close_fraction
@@ -1037,6 +1570,7 @@ impl Strategy for UnlawfulShearStrategy {
                             expensive_id,
                             expensive_bid,
                             amount,
+                            next_quote_tag("fallback-close-expensive"),
                             format!(
                                 "unlawful-shear end-window fallback cleanup fraction={:.2}",
                                 close_fraction
@@ -1077,6 +1611,7 @@ impl Strategy for UnlawfulShearStrategy {
                     expensive_id,
                     expensive_bid,
                     trim_qty,
+                    next_quote_tag("salvage-expensive"),
                     format!(
                         "unlawful-shear salvage expensive bid={:.4} avg={:.4}",
                         expensive_bid, expensive_avg
@@ -1096,6 +1631,7 @@ impl Strategy for UnlawfulShearStrategy {
                     cheap_id,
                     cheap_bid,
                     trim_qty,
+                    next_quote_tag("salvage-cheap"),
                     format!(
                         "unlawful-shear salvage hedge bid={:.4} avg={:.4}",
                         cheap_bid, cheap_avg
@@ -1126,6 +1662,7 @@ impl Strategy for UnlawfulShearStrategy {
                 expensive_id,
                 expensive_ask,
                 core_clip_usd,
+                next_quote_tag("core-entry"),
                 format!(
                     "unlawful-shear core-entry gap={:.4} ask={:.4}",
                     price_gap, expensive_ask
@@ -1147,6 +1684,7 @@ impl Strategy for UnlawfulShearStrategy {
                 cheap_id,
                 cheap_ask,
                 hedge_probe_usd,
+                next_quote_tag("hedge-probe"),
                 format!(
                     "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
                     price_gap, cheap_ask
@@ -1165,15 +1703,16 @@ impl Strategy for UnlawfulShearStrategy {
                 self.push_buy(
                     &mut intents,
                     &mut remaining_gross,
-                    &snapshot.market_id,
-                    cheap_id,
-                    cheap_ask,
-                    hedge_clip_usd,
-                    format!(
-                        "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
-                        hedge_ratio, cheap_ask
-                    ),
-                    context.now_ms,
+                &snapshot.market_id,
+                cheap_id,
+                cheap_ask,
+                hedge_clip_usd,
+                next_quote_tag("add-hedge"),
+                format!(
+                    "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
+                    hedge_ratio, cheap_ask
+                ),
+                context.now_ms,
                 );
             } else if hedge_ratio > self.config.target_hedge_ratio_max && core_candidate {
                 let rebalance_clip_usd = match phase {
@@ -1184,15 +1723,16 @@ impl Strategy for UnlawfulShearStrategy {
                 self.push_buy(
                     &mut intents,
                     &mut remaining_gross,
-                    &snapshot.market_id,
-                    expensive_id,
-                    expensive_ask,
-                    rebalance_clip_usd,
-                    format!(
-                        "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
-                        hedge_ratio, expensive_ask
-                    ),
-                    context.now_ms,
+                &snapshot.market_id,
+                expensive_id,
+                expensive_ask,
+                rebalance_clip_usd,
+                next_quote_tag("rebalance-core"),
+                format!(
+                    "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
+                    hedge_ratio, expensive_ask
+                ),
+                context.now_ms,
                 );
             } else if core_candidate
                 && cheap_candidate
@@ -1212,19 +1752,20 @@ impl Strategy for UnlawfulShearStrategy {
                 self.push_buy(
                     &mut intents,
                     &mut remaining_gross,
-                    &snapshot.market_id,
-                    target_id,
-                    target_price,
-                    match phase {
-                        UnlawfulShearPhase::VeryLate => self.config.rebalance_clip_usd * 1.35,
-                        UnlawfulShearPhase::Late => self.config.rebalance_clip_usd * 1.2,
-                        _ => self.config.rebalance_clip_usd * phase_clip_scale,
-                    },
-                    format!(
-                        "unlawful-shear high-flip rebalance gap={:.4} target={}",
-                        price_gap, target_id
-                    ),
-                    context.now_ms,
+                &snapshot.market_id,
+                target_id,
+                target_price,
+                match phase {
+                    UnlawfulShearPhase::VeryLate => self.config.rebalance_clip_usd * 1.35,
+                    UnlawfulShearPhase::Late => self.config.rebalance_clip_usd * 1.2,
+                    _ => self.config.rebalance_clip_usd * phase_clip_scale,
+                },
+                next_quote_tag("rebalance-flip"),
+                format!(
+                    "unlawful-shear high-flip rebalance gap={:.4} target={}",
+                    price_gap, target_id
+                ),
+                context.now_ms,
                 );
             }
         } else if cheap_candidate
@@ -1240,6 +1781,7 @@ impl Strategy for UnlawfulShearStrategy {
                 cheap_id,
                 cheap_ask,
                 (self.config.probe_clip_usd * phase_clip_scale).max(1.0),
+                next_quote_tag("early-probe"),
                 format!(
                     "unlawful-shear early-probe ask={:.4} gap={:.4}",
                     cheap_ask, price_gap
@@ -1330,6 +1872,27 @@ fn parse_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_or_profile_f64(key: &str, profile: Option<f64>, default: f64) -> f64 {
+    env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .unwrap_or(profile.unwrap_or(default))
+}
+
+fn env_or_profile_usize(key: &str, profile: Option<usize>, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(profile.unwrap_or(default))
+}
+
+fn env_or_profile_u64(key: &str, profile: Option<u64>, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(profile.unwrap_or(default))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1399,6 +1962,35 @@ mod tests {
         let decision =
             strategy.on_market_snapshot(&context(Vec::new()), &snapshot("down", "market-a", 0.5, 0.52, 10));
         assert!(!matches!(decision, StrategyDecision { intents: ref i, .. } if i.is_empty()));
+    }
+
+    #[test]
+    fn goat_pairs_emit_three_level_bid_ladder() {
+        let mut strategy = GoatPairStrategy::new(
+            GoatPairConfig {
+                accumulate_price_max: 1.0,
+                aggressive_price_max: 0.6,
+                base_clip_usd: 30.0,
+                aggressive_clip_usd: 50.0,
+                max_gross_cost_usd: 1_000.0,
+                completion_min_pnl_per_share: 0.0,
+                max_imbalance_ratio: 9.0,
+                taker_fee_coeff: 0.072,
+            },
+            0,
+        );
+        strategy.quote_levels_per_side = 3;
+        strategy.quote_min_edge_bps = 50.0;
+        strategy.quote_inventory_skew_bps = 25.0;
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-b", 0.50, 0.50, 10));
+        let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-b", 0.50, 0.52, 10));
+        assert_eq!(decision.intents.len(), 3);
+        assert!(decision.intents.iter().all(|intent| intent.side == TradeSide::Buy));
+        assert!(decision
+            .intents
+            .windows(2)
+            .all(|window| window[0].limit_price >= window[1].limit_price));
     }
 
     #[test]

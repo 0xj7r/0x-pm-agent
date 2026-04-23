@@ -24,6 +24,7 @@ pub struct EventMetrics {
     pub position_delta: Option<f64>,
     pub free_cash_after_usd: Option<f64>,
     pub gross_exposure_after_usd: Option<f64>,
+    pub risk_reject_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

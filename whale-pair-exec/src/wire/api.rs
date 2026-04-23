@@ -95,6 +95,7 @@ pub struct DashboardEventPayload {
     pub open_orders: Vec<DashboardOrder>,
     pub books: Vec<DashboardBook>,
     pub recent_events: Vec<DashboardEvent>,
+    pub control_plane: RuntimeControlPlaneState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +115,7 @@ pub struct DashboardSnapshot {
     pub open_orders: Vec<DashboardOrder>,
     pub books: Vec<DashboardBook>,
     pub recent_events: Vec<DashboardEvent>,
+    pub control_plane: RuntimeControlPlaneState,
 }
 
 impl DashboardSnapshot {
@@ -135,8 +137,79 @@ impl DashboardSnapshot {
             open_orders: self.open_orders.clone(),
             books: self.books.clone(),
             recent_events: self.recent_events.clone(),
+            control_plane: self.control_plane.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RuntimeControlPlaneState {
+    pub profile_name: Option<String>,
+    pub profile_version: Option<String>,
+    pub market_context_version: Option<String>,
+    pub quote: QuoteControlPlaneState,
+    pub fill: FillControlPlaneState,
+    pub pair: PairControlPlaneState,
+    pub risk: RiskControlPlaneState,
+    pub economics: EconomicsControlPlaneState,
+    pub health: HealthControlPlaneState,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QuoteControlPlaneState {
+    pub ladder_count: usize,
+    pub max_quote_per_side_usd: f64,
+    pub min_edge_bps: f64,
+    pub skew_cap_bps: f64,
+    pub refresh_interval_ms: u64,
+    pub edge_bps: f64,
+    pub age_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FillControlPlaneState {
+    pub total: u64,
+    pub maker_total: u64,
+    pub taker_total: u64,
+    pub maker_share: f64,
+    pub notional_usd_total: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PairControlPlaneState {
+    pub completed_qty_total: f64,
+    pub stranded_yes_qty: f64,
+    pub stranded_no_qty: f64,
+    pub merge_candidate_qty: f64,
+    pub merge_latency_ms: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RiskControlPlaneState {
+    pub book_stale_events_total: u64,
+    pub reconcile_failures_total: u64,
+    pub runtime_riskoff_transitions_total: u64,
+    pub uncertain_submit_total: u64,
+    pub inventory_skew_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EconomicsControlPlaneState {
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub fees_usd_total: f64,
+    pub rebates_usd_total: f64,
+    pub net_edge_usd_total: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HealthControlPlaneState {
+    pub market_ws_connected: bool,
+    pub user_ws_connected: bool,
+    pub execution_adapter_connected: bool,
+    pub last_market_message_age_ms: f64,
+    pub last_user_message_age_ms: f64,
+    pub last_reconcile_age_ms: f64,
 }
 
 #[derive(Debug, Clone)]
