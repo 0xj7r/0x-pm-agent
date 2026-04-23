@@ -1,1 +1,0 @@
-_legacy_script_dispatch.sh
