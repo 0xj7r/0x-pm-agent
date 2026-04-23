@@ -184,9 +184,16 @@ impl MarketWsClient {
                         .get("best_ask")
                         .or_else(|| change.get("ba"))
                         .and_then(value_as_f64_opt);
+                    let observed_at_ms = change
+                        .get("timestamp")
+                        .or_else(|| change.get("t"))
+                        .or_else(|| change.get("ts"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(now_unix_ms);
                     self.books
                         .apply_best_bid_ask(asset_id, best_bid, best_ask)
                         .await;
+                    self.books.record_trade_event(asset_id, observed_at_ms).await;
                 }
             }
             "best_bid_ask" => {
@@ -255,4 +262,12 @@ fn value_as_f64_opt(value: &Value) -> Option<f64> {
         Value::String(raw) => raw.parse().ok(),
         _ => None,
     }
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

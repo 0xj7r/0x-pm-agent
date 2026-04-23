@@ -3,7 +3,7 @@ pub mod reconcile;
 pub mod order_store;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
@@ -14,7 +14,18 @@ use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
 use crate::runtime::order_store::{OrderRecord, OrderStore};
 use crate::market_context::MarketContextStore;
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
-use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
+use crate::signals::{
+    evaluate_unlawful_mode, BtcRegimeSnapshot as GateBtcRegimeSnapshot,
+    MarketActivitySignal as GateMarketActivitySignal, PairedBookSignal as GatePairedBookSignal,
+    SessionBucket as GateSessionBucket, UnlawfulExecutionMode as GateExecutionMode,
+    UnlawfulGateConfig, UnlawfulGateInputs, UnlawfulSignalSnapshot as GateSignalSnapshot,
+};
+use crate::strategy::{
+    BtcRegimeSnapshot as StrategyBtcRegimeSnapshot, MarketActivitySignal as StrategyMarketActivitySignal,
+    PairedBookSignal as StrategyPairedBookSignal, SessionBucket as StrategySessionBucket,
+    Strategy, StrategyContext, StrategyDecision, UnlawfulExecutionMode as StrategyExecutionMode,
+    UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot,
+};
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot,
     OrderIntent, TradeSide,
@@ -24,7 +35,135 @@ pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
+
+const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
+const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
+const BTC_SIGNAL_WINDOW_20M_MS: u64 = 20 * 60 * 1_000;
+const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
+
+#[derive(Debug, Default)]
+struct BtcSignalStore {
+    last_price: Option<f64>,
+    observed_at_ms: u64,
+    price_samples: VecDeque<(u64, f64)>,
+    trade_times: VecDeque<u64>,
+}
+
+impl BtcSignalStore {
+    fn record_trade(&mut self, price: f64, observed_at_ms: u64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        self.last_price = Some(price);
+        self.observed_at_ms = observed_at_ms;
+        self.price_samples.push_back((observed_at_ms, price));
+        self.trade_times.push_back(observed_at_ms);
+        self.prune(observed_at_ms);
+    }
+
+    fn snapshot(&self, now_ms: u64) -> GateBtcRegimeSnapshot {
+        let realized_vol_5m_bps = self.realized_vol_bps(now_ms, BTC_SIGNAL_WINDOW_5M_MS);
+        let realized_vol_15m_bps = self.realized_vol_bps(now_ms, BTC_SIGNAL_WINDOW_15M_MS);
+        let trade_count_5m = self.trade_count(now_ms, BTC_SIGNAL_WINDOW_5M_MS);
+        let trade_count_15m = self.trade_count(now_ms, BTC_SIGNAL_WINDOW_15M_MS);
+        let return_30s_bps = self.return_bps(now_ms, 30_000);
+        let return_60s_bps = self.return_bps(now_ms, 60_000);
+
+        GateBtcRegimeSnapshot {
+            last_price: self.last_price,
+            realized_vol_5m_bps,
+            realized_vol_15m_bps,
+            trade_count_5m,
+            trade_count_15m,
+            return_30s_bps,
+            return_60s_bps,
+            observed_at_ms: self.observed_at_ms,
+        }
+    }
+
+    fn prune(&mut self, now_ms: u64) {
+        while let Some((sample_ms, _)) = self.price_samples.front().copied() {
+            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_20M_MS {
+                break;
+            }
+            self.price_samples.pop_front();
+        }
+        while let Some(sample_ms) = self.trade_times.front().copied() {
+            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_20M_MS {
+                break;
+            }
+            self.trade_times.pop_front();
+        }
+        while self.price_samples.len() > MAX_BTC_PRICE_SAMPLES {
+            self.price_samples.pop_front();
+        }
+    }
+
+    fn trade_count(&self, now_ms: u64, window_ms: u64) -> u64 {
+        self.trade_times
+            .iter()
+            .rev()
+            .take_while(|&&sample_ms| now_ms.saturating_sub(sample_ms) <= window_ms)
+            .count() as u64
+    }
+
+    fn realized_vol_bps(&self, now_ms: u64, window_ms: u64) -> Option<f64> {
+        let points = self
+            .price_samples
+            .iter()
+            .copied()
+            .filter(|(sample_ms, price)| {
+                now_ms.saturating_sub(*sample_ms) <= window_ms && price.is_finite() && *price > 0.0
+            })
+            .collect::<Vec<_>>();
+        if points.len() < 2 {
+            return None;
+        }
+        let mut returns = Vec::with_capacity(points.len().saturating_sub(1));
+        for pair in points.windows(2) {
+            let prev = pair[0].1;
+            let next = pair[1].1;
+            if prev > 0.0 && next > 0.0 {
+                returns.push(((next / prev) - 1.0) * 10_000.0);
+            }
+        }
+        if returns.len() < 2 {
+            return None;
+        }
+        let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+        let var = returns
+            .iter()
+            .map(|value| {
+                let d = *value - mean;
+                d * d
+            })
+            .sum::<f64>()
+            / returns.len() as f64;
+        Some(var.sqrt())
+    }
+
+    fn return_bps(&self, now_ms: u64, horizon_ms: u64) -> Option<f64> {
+        let current = self.last_price?;
+        let target_ms = now_ms.saturating_sub(horizon_ms);
+        let baseline = self
+            .price_samples
+            .iter()
+            .rev()
+            .find(|(sample_ms, _)| *sample_ms <= target_ms)
+            .map(|(_, price)| *price)
+            .or_else(|| {
+                self.price_samples
+                    .iter()
+                    .find(|(sample_ms, _)| *sample_ms >= target_ms)
+                    .map(|(_, price)| *price)
+            })?;
+        if baseline <= 0.0 {
+            return None;
+        }
+        Some(((current / baseline) - 1.0) * 10_000.0)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RuntimeCheckpointOrder {
@@ -107,6 +246,7 @@ impl ManagedOrderStatus {
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
+    unlawful_gate_config: Option<UnlawfulGateConfig>,
     inventory: InventoryState,
     risk: RiskEngine,
     event_log: EventLog,
@@ -119,6 +259,11 @@ pub struct Runtime<S: Strategy> {
     quote_reconciler: QuoteReconciler,
     quote_engine_config: QuoteEngineConfig,
     quote_stale_ms: u64,
+    btc_signals: BtcSignalStore,
+    market_activity: HashMap<InstrumentId, GateMarketActivitySignal>,
+    first_fill_by_market: HashMap<MarketId, EpochMillis>,
+    first_merge_by_market: HashMap<MarketId, EpochMillis>,
+    unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
     order_store: Option<Box<dyn OrderStore>>,
 }
 
@@ -147,8 +292,10 @@ impl<S: Strategy> Runtime<S> {
         order_store: Option<Box<dyn OrderStore>>,
         run_id: String,
     ) -> Self {
+        let unlawful_gate_config = strategy.unlawful_gate_config();
         Self {
             strategy,
+            unlawful_gate_config,
             inventory: InventoryState::new(config.starting_cash_usd),
             risk: RiskEngine::new(risk_limits),
             event_log: EventLog::new(config.event_log_capacity),
@@ -161,6 +308,11 @@ impl<S: Strategy> Runtime<S> {
             quote_reconciler: QuoteReconciler::default(),
             quote_engine_config: config.quote_engine_config,
             quote_stale_ms: config.quote_stale_ms,
+            btc_signals: BtcSignalStore::default(),
+            market_activity: HashMap::new(),
+            first_fill_by_market: HashMap::new(),
+            first_merge_by_market: HashMap::new(),
+            unlawful_mode_by_market: HashMap::new(),
             order_store,
         }
     }
@@ -472,16 +624,25 @@ impl<S: Strategy> Runtime<S> {
             outcome.push_event(self.event_log.push(
                 adjustment.to_event("inventory mark refreshed from market snapshot"),
             ));
+            let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self
                 .strategy
-                .on_market_snapshot(&self.strategy_context(now_ms, Some(&snapshot.market_id)), &snapshot);
+                .on_market_snapshot(&context, &snapshot);
             outcome.extend(self.accept_strategy_decision(decision, now_ms));
+            if let Some(signal) = context.unlawful_signal.as_ref() {
+                outcome.extend(self.enforce_unlawful_mode(&snapshot.market_id, signal, now_ms));
+            }
             Ok(outcome)
         } else {
+            let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self
                 .strategy
-                .on_market_snapshot(&self.strategy_context(now_ms, Some(&snapshot.market_id)), &snapshot);
-            Ok(self.accept_strategy_decision(decision, now_ms))
+                .on_market_snapshot(&context, &snapshot);
+            let mut outcome = self.accept_strategy_decision(decision, now_ms);
+            if let Some(signal) = context.unlawful_signal.as_ref() {
+                outcome.extend(self.enforce_unlawful_mode(&snapshot.market_id, signal, now_ms));
+            }
+            Ok(outcome)
         }
     }
 
@@ -507,6 +668,18 @@ impl<S: Strategy> Runtime<S> {
                 observed_at_ms: book.last_update_unix_ms,
             },
         })
+    }
+
+    pub fn on_market_activity(
+        &mut self,
+        instrument_id: InstrumentId,
+        signal: GateMarketActivitySignal,
+    ) {
+        self.market_activity.insert(instrument_id, signal);
+    }
+
+    pub fn on_btc_trade(&mut self, price: f64, observed_at_ms: EpochMillis) {
+        self.btc_signals.record_trade(price, observed_at_ms);
     }
 
     pub fn on_fill(&mut self, fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
@@ -620,26 +793,43 @@ impl<S: Strategy> Runtime<S> {
             ));
         }
 
+        if executed_qty > 0.0 {
+            if merge_flow {
+                self.first_merge_by_market
+                    .entry(fill.market_id.clone())
+                    .or_insert(now_ms);
+            } else {
+                self.first_fill_by_market
+                    .entry(fill.market_id.clone())
+                    .or_insert(now_ms);
+            }
+        }
+
         if let Some(client_order_id) = &fill.client_order_id {
             let mut remove_after = false;
             let mut next_status = None;
+            let mut persist_fill = false;
             if let Some(managed) = self.open_orders.get_mut(client_order_id) {
                 managed.cumulative_filled_qty += executed_qty;
                 managed.last_update_ms = now_ms;
+                persist_fill = executed_qty > 0.0;
                 if managed.remaining_qty() <= 1e-9 {
                     remove_after = true;
                     next_status = Some(ManagedOrderStatus::Filled);
                 } else {
                     next_status = Some(ManagedOrderStatus::Working);
                 }
-            } else if let Some(store) = self.order_store.as_mut() {
-                if let Err(error) = store.apply_fill(client_order_id, executed_qty, now_ms) {
-                    warn!(
-                        run_id = %self.run_id,
-                        error = ?error,
-                        client_order_id = %client_order_id,
-                        "unable to persist fill for missing in-memory order"
-                    );
+            }
+            if persist_fill || !self.open_orders.contains_key(client_order_id) {
+                if let Some(store) = self.order_store.as_mut() {
+                    if let Err(error) = store.apply_fill(client_order_id, executed_qty, now_ms) {
+                        warn!(
+                            run_id = %self.run_id,
+                            error = ?error,
+                            client_order_id = %client_order_id,
+                            "unable to persist fill in durable order store"
+                        );
+                    }
                 }
             }
             if let Some(status) = next_status {
@@ -669,6 +859,7 @@ impl<S: Strategy> Runtime<S> {
             .strategy
             .on_fill(&self.strategy_context(now_ms, Some(&fill.market_id)), &fill);
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
+        self.maybe_clear_market_timing(&fill.market_id);
         Ok(outcome)
     }
 
@@ -979,13 +1170,374 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn strategy_context(&self, now_ms: EpochMillis, market_id: Option<&MarketId>) -> StrategyContext {
+        let market_context = market_id.and_then(|id| self.market_contexts.get(id).cloned());
+        let unlawful_signal = match (market_id, self.unlawful_gate_config.as_ref()) {
+            (Some(id), Some(cfg)) => Some(self.build_unlawful_signal(
+                id,
+                market_context.as_ref(),
+                now_ms,
+                cfg,
+            )),
+            _ => None,
+        };
         StrategyContext {
             now_ms,
             runtime_status: self.status,
             inventory: self.inventory.snapshot(),
             open_orders_total: self.open_orders.len(),
-            market_context: market_id.and_then(|market_id| self.market_contexts.get(market_id).cloned()),
+            market_context,
+            unlawful_signal,
         }
+    }
+
+    fn build_unlawful_signal(
+        &self,
+        market_id: &MarketId,
+        market_context: Option<&crate::market_context::MarketContextRecord>,
+        now_ms: EpochMillis,
+        cfg: &UnlawfulGateConfig,
+    ) -> StrategyUnlawfulSignalSnapshot {
+        let paired_book = self.build_paired_book_signal(market_id, market_context, now_ms, cfg);
+        let activity = self.aggregate_market_activity(&paired_book);
+        let btc = self.btc_signals.snapshot(now_ms);
+        let session_bucket = self.classify_session_bucket(market_context, cfg);
+        let has_inventory = self.market_has_inventory(market_id);
+        let cleanup_backlog = self
+            .open_orders
+            .values()
+            .filter(|managed| &managed.intent.market_id == market_id)
+            .filter(|managed| {
+                matches!(
+                    managed.status,
+                    ManagedOrderStatus::NeedsReconcile | ManagedOrderStatus::CancelRequested
+                )
+            })
+            .count();
+        let cleanup_backlog_exceeded =
+            cleanup_backlog > self.risk.limits().max_open_orders_per_market;
+        let inventory_imbalance_exceeded = self.inventory.net_exposure_for_market_usd(market_id).abs()
+            > self.risk.limits().max_net_notional_per_market_usd;
+
+        let inputs = UnlawfulGateInputs {
+            session_bucket,
+            now_ms,
+            market_start_ms: market_context.and_then(|ctx| ctx.event_start_time_ms),
+            market_end_ms: market_context.and_then(|ctx| ctx.event_end_time_ms),
+            market_context_present: market_context.is_some(),
+            has_inventory,
+            cleanup_backlog_exceeded,
+            first_fill_ms: self.first_fill_by_market.get(market_id).copied(),
+            first_merge_ms: self.first_merge_by_market.get(market_id).copied(),
+            btc,
+            book: paired_book,
+            activity,
+        };
+
+        let mut signal = evaluate_unlawful_mode(&inputs, cfg);
+        if inventory_imbalance_exceeded {
+            signal.mode = if signal.mode == GateExecutionMode::Flatten {
+                GateExecutionMode::Flatten
+            } else {
+                GateExecutionMode::Cleanup
+            };
+            signal.gate_reasons.push(format!(
+                "inventory imbalance exceeded hard cap {:.2}",
+                self.risk.limits().max_net_notional_per_market_usd
+            ));
+            signal.clip_scale = 0.0;
+        }
+        self.map_signal_snapshot(signal)
+    }
+
+    fn classify_session_bucket(
+        &self,
+        market_context: Option<&crate::market_context::MarketContextRecord>,
+        cfg: &UnlawfulGateConfig,
+    ) -> GateSessionBucket {
+        let Some(start_ms) = market_context.and_then(|ctx| ctx.event_start_time_ms) else {
+            return GateSessionBucket::Opportunistic;
+        };
+        let hour = ((start_ms / 1_000 / 3_600) % 24) as u8;
+        if cfg.regime_primary_hours_utc.contains(&hour) {
+            GateSessionBucket::Preferred
+        } else if cfg.regime_secondary_hours_utc.contains(&hour) {
+            GateSessionBucket::Neutral
+        } else {
+            GateSessionBucket::Opportunistic
+        }
+    }
+
+    fn market_has_inventory(&self, market_id: &MarketId) -> bool {
+        self.inventory
+            .positions()
+            .any(|position| &position.market_id == market_id && position.quantity.abs() > 1e-9)
+    }
+
+    fn build_paired_book_signal(
+        &self,
+        market_id: &MarketId,
+        market_context: Option<&crate::market_context::MarketContextRecord>,
+        now_ms: EpochMillis,
+        cfg: &UnlawfulGateConfig,
+    ) -> GatePairedBookSignal {
+        let mut instrument_ids = market_context
+            .map(|ctx| ctx.instrument_ids.clone())
+            .unwrap_or_default();
+        if instrument_ids.len() < 2 {
+            for managed in self.open_orders.values() {
+                if &managed.intent.market_id != market_id {
+                    continue;
+                }
+                if !instrument_ids
+                    .iter()
+                    .any(|existing| existing == managed.intent.instrument_id.as_str())
+                {
+                    instrument_ids.push(managed.intent.instrument_id.as_str().to_string());
+                }
+                if instrument_ids.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        if instrument_ids.len() < 2 {
+            instrument_ids.resize(2, String::new());
+        }
+
+        let left_id = InstrumentId::from(instrument_ids[0].as_str());
+        let right_id = InstrumentId::from(instrument_ids[1].as_str());
+        let left_quote = self.last_quotes.get(&left_id);
+        let right_quote = self.last_quotes.get(&right_id);
+        let left_ask = left_quote.and_then(|quote| quote.best_ask.clone());
+        let right_ask = right_quote.and_then(|quote| quote.best_ask.clone());
+        let left_bid = left_quote.and_then(|quote| quote.best_bid.clone());
+        let right_bid = right_quote.and_then(|quote| quote.best_bid.clone());
+
+        let left_ask_price = left_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
+        let right_ask_price = right_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
+        let left_is_cheap = left_ask_price <= right_ask_price;
+
+        let (cheap_id, cheap_bid, cheap_ask, cheap_obs) = if left_is_cheap {
+            (
+                left_id.clone(),
+                left_bid.clone(),
+                left_ask.clone(),
+                left_quote.map(|quote| quote.observed_at_ms),
+            )
+        } else {
+            (
+                right_id.clone(),
+                right_bid.clone(),
+                right_ask.clone(),
+                right_quote.map(|quote| quote.observed_at_ms),
+            )
+        };
+        let (expensive_id, expensive_bid, expensive_ask, expensive_obs) = if left_is_cheap {
+            (
+                right_id,
+                right_bid.clone(),
+                right_ask.clone(),
+                right_quote.map(|quote| quote.observed_at_ms),
+            )
+        } else {
+            (
+                left_id,
+                left_bid.clone(),
+                left_ask.clone(),
+                left_quote.map(|quote| quote.observed_at_ms),
+            )
+        };
+
+        let observed_at_ms = cheap_obs
+            .into_iter()
+            .chain(expensive_obs)
+            .min()
+            .unwrap_or(0);
+        let books_fresh = observed_at_ms > 0
+            && now_ms.saturating_sub(observed_at_ms) <= cfg.entry_book_max_age_ms;
+        let both_sides_present = cheap_bid
+            .as_ref()
+            .zip(cheap_ask.as_ref())
+            .zip(expensive_bid.as_ref().zip(expensive_ask.as_ref()))
+            .is_some_and(|((cb, ca), (eb, ea))| {
+                cb.price > 0.0
+                    && ca.price > 0.0
+                    && eb.price > 0.0
+                    && ea.price > 0.0
+                    && cb.quantity > 0.0
+                    && ca.quantity > 0.0
+                    && eb.quantity > 0.0
+                    && ea.quantity > 0.0
+            });
+
+        let price_gap = cheap_ask
+            .as_ref()
+            .zip(expensive_ask.as_ref())
+            .map(|(cheap, expensive)| expensive.price - cheap.price);
+
+        GatePairedBookSignal {
+            cheap_instrument_id: cheap_id.as_str().to_string(),
+            expensive_instrument_id: expensive_id.as_str().to_string(),
+            cheap_bid,
+            cheap_ask,
+            expensive_bid,
+            expensive_ask,
+            price_gap,
+            observed_at_ms,
+            books_fresh,
+            both_sides_present,
+        }
+    }
+
+    fn aggregate_market_activity(
+        &self,
+        signal: &GatePairedBookSignal,
+    ) -> GateMarketActivitySignal {
+        let cheap = self
+            .market_activity
+            .get(&InstrumentId::from(signal.cheap_instrument_id.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let expensive = self
+            .market_activity
+            .get(&InstrumentId::from(signal.expensive_instrument_id.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        GateMarketActivitySignal {
+            last_trade_event_count_10s: cheap
+                .last_trade_event_count_10s
+                .saturating_add(expensive.last_trade_event_count_10s),
+            last_trade_event_count_30s: cheap
+                .last_trade_event_count_30s
+                .saturating_add(expensive.last_trade_event_count_30s),
+            last_trade_event_count_60s: cheap
+                .last_trade_event_count_60s
+                .saturating_add(expensive.last_trade_event_count_60s),
+            last_trade_event_age_ms: match (cheap.last_trade_event_age_ms, expensive.last_trade_event_age_ms) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            },
+        }
+    }
+
+    fn map_signal_snapshot(&self, signal: GateSignalSnapshot) -> StrategyUnlawfulSignalSnapshot {
+        StrategyUnlawfulSignalSnapshot {
+            session_bucket: Self::map_session_bucket(signal.session_bucket),
+            mode: Self::map_execution_mode(signal.mode),
+            gate_reasons: signal.gate_reasons,
+            btc: StrategyBtcRegimeSnapshot {
+                last_price: signal.btc.last_price,
+                realized_vol_5m_bps: signal.btc.realized_vol_5m_bps,
+                realized_vol_15m_bps: signal.btc.realized_vol_15m_bps,
+                trade_count_5m: signal.btc.trade_count_5m,
+                trade_count_15m: signal.btc.trade_count_15m,
+                return_30s_bps: signal.btc.return_30s_bps,
+                return_60s_bps: signal.btc.return_60s_bps,
+                observed_at_ms: signal.btc.observed_at_ms,
+            },
+            book: StrategyPairedBookSignal {
+                cheap_instrument_id: InstrumentId::from(signal.book.cheap_instrument_id),
+                expensive_instrument_id: InstrumentId::from(signal.book.expensive_instrument_id),
+                cheap_bid: signal.book.cheap_bid,
+                cheap_ask: signal.book.cheap_ask,
+                expensive_bid: signal.book.expensive_bid,
+                expensive_ask: signal.book.expensive_ask,
+                price_gap: signal.book.price_gap,
+                observed_at_ms: signal.book.observed_at_ms,
+                books_fresh: signal.book.books_fresh,
+                both_sides_present: signal.book.both_sides_present,
+            },
+            activity: StrategyMarketActivitySignal {
+                last_trade_event_count_10s: signal.activity.last_trade_event_count_10s,
+                last_trade_event_count_30s: signal.activity.last_trade_event_count_30s,
+                last_trade_event_count_60s: signal.activity.last_trade_event_count_60s,
+                last_trade_event_age_ms: signal.activity.last_trade_event_age_ms,
+            },
+            first_fill_ms: signal.first_fill_ms,
+            first_merge_ms: signal.first_merge_ms,
+            elapsed_s: signal.elapsed_s,
+            time_remaining_s: signal.time_remaining_s,
+            clip_scale: signal.clip_scale,
+        }
+    }
+
+    fn map_session_bucket(bucket: GateSessionBucket) -> StrategySessionBucket {
+        match bucket {
+            GateSessionBucket::Preferred => StrategySessionBucket::Preferred,
+            GateSessionBucket::Neutral => StrategySessionBucket::Neutral,
+            GateSessionBucket::Opportunistic => StrategySessionBucket::Opportunistic,
+        }
+    }
+
+    fn map_execution_mode(mode: GateExecutionMode) -> StrategyExecutionMode {
+        match mode {
+            GateExecutionMode::Standby => StrategyExecutionMode::Standby,
+            GateExecutionMode::Entry => StrategyExecutionMode::Entry,
+            GateExecutionMode::Manage => StrategyExecutionMode::Manage,
+            GateExecutionMode::Cleanup => StrategyExecutionMode::Cleanup,
+            GateExecutionMode::Flatten => StrategyExecutionMode::Flatten,
+        }
+    }
+
+    fn enforce_unlawful_mode(
+        &mut self,
+        market_id: &MarketId,
+        signal: &StrategyUnlawfulSignalSnapshot,
+        now_ms: EpochMillis,
+    ) -> RuntimeOutcome {
+        let previous_mode = self.unlawful_mode_by_market.insert(market_id.clone(), signal.mode);
+        let entering_cleanup = matches!(
+            signal.mode,
+            StrategyExecutionMode::Cleanup | StrategyExecutionMode::Flatten
+        ) && !matches!(
+            previous_mode,
+            Some(StrategyExecutionMode::Cleanup | StrategyExecutionMode::Flatten)
+        );
+        if !entering_cleanup {
+            return RuntimeOutcome::default();
+        }
+
+        let mut outcome = RuntimeOutcome::default();
+        let to_cancel = self
+            .open_orders
+            .values()
+            .filter(|managed| &managed.intent.market_id == market_id)
+            .filter(|managed| !managed.intent.reduce_only)
+            .filter(|managed| {
+                matches!(
+                    managed.status,
+                    ManagedOrderStatus::PendingSubmit
+                        | ManagedOrderStatus::Submitted
+                        | ManagedOrderStatus::Working
+                )
+            })
+            .map(|managed| managed.intent.client_order_id.clone())
+            .collect::<Vec<_>>();
+        for client_order_id in to_cancel {
+            outcome.extend(self.request_cancel(
+                &client_order_id,
+                format!("unlawful mode transitioned to {:?}", signal.mode),
+                now_ms,
+            ));
+        }
+        outcome
+    }
+
+    fn maybe_clear_market_timing(&mut self, market_id: &MarketId) {
+        if self.market_has_inventory(market_id) {
+            return;
+        }
+        let has_open_orders = self
+            .open_orders
+            .values()
+            .any(|managed| &managed.intent.market_id == market_id && !managed.status.is_terminal());
+        if has_open_orders {
+            return;
+        }
+        self.first_fill_by_market.remove(market_id);
+        self.first_merge_by_market.remove(market_id);
+        self.unlawful_mode_by_market.remove(market_id);
     }
 
     fn open_orders_for_market(&self, market_id: &crate::types::MarketId) -> usize {
@@ -1216,8 +1768,7 @@ fn generate_run_id() -> String {
 mod tests {
     use super::{Runtime, RuntimeConfig};
     use crate::market_context::MarketContextStore;
-    use crate::runtime::order_store::SqliteOrderStore;
-    use crate::runtime::order_store::OrderRecord;
+    use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::risk::RiskLimits;
     use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
@@ -1382,6 +1933,7 @@ mod tests {
                 quantity: 5.0,
                 reduce_only: false,
                 reason: "recover".to_string(),
+                quote_level_tag: None,
                 created_at_ms: now_ms,
             },
             "single-shot",

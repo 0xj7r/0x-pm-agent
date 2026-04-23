@@ -662,7 +662,7 @@ Current env-based config should remain supported, but we need one versioned stra
 
 New config path:
 
-- `whale-pair-exec/config/strategies/btc_5m_mm_v1.json`
+- optional named profile artifacts if we later choose to serialize sleeve variants into JSON
 
 Required fields:
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -223,15 +223,18 @@ impl From<FixtureLiquidity> for FillLiquidity {
 
 #[derive(Clone)]
 struct FixtureStrategy {
-    decisions_by_at_ms: HashMap<u64, Vec<OrderIntent>>,
+    decisions_by_key: HashMap<(u64, String), Vec<OrderIntent>>,
 }
 
 impl FixtureStrategy {
     fn from_fixture(fixture: &ScenarioFixture) -> Self {
-        let mut decisions_by_at_ms = HashMap::new();
+        let mut decisions_by_key = HashMap::new();
         for event in &fixture.events {
             if let ScenarioEvent::Snapshot {
-                at_ms, decisions, ..
+                at_ms,
+                instrument_id,
+                decisions,
+                ..
             } = event
             {
                 let intents = decisions
@@ -249,10 +252,10 @@ impl FixtureStrategy {
                         created_at_ms: *at_ms,
                     })
                     .collect::<Vec<_>>();
-                decisions_by_at_ms.insert(*at_ms, intents);
+                decisions_by_key.insert((*at_ms, instrument_id.clone()), intents);
             }
         }
-        Self { decisions_by_at_ms }
+        Self { decisions_by_key }
     }
 }
 
@@ -267,8 +270,11 @@ impl Strategy for FixtureStrategy {
         snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
         let intents = self
-            .decisions_by_at_ms
-            .remove(&snapshot.quote.observed_at_ms)
+            .decisions_by_key
+            .remove(&(
+                snapshot.quote.observed_at_ms,
+                snapshot.instrument_id.as_str().to_string(),
+            ))
             .unwrap_or_default();
         StrategyDecision {
             intents,
@@ -311,6 +317,7 @@ fn build_runtime(fixture: &ScenarioFixture, store_path: &Path, starting_cash_usd
             starting_cash_usd,
             event_log_capacity: fixture.event_log_capacity,
             initial_status: RuntimeStatus::Starting,
+            ..RuntimeConfig::default()
         },
         RiskLimits::default(),
         FixtureStrategy::from_fixture(fixture),
@@ -455,7 +462,11 @@ fn handle_submit_ack(
 
     match outcome.outcome.as_str() {
         "accepted" => Some(runtime.on_order_opened(&intent.client_order_id, at_ms)),
-        "uncertain" => None,
+        "uncertain" => Some(runtime.mark_order_needs_reconcile(
+            &intent.client_order_id,
+            at_ms,
+            "submission uncertain; moving to needs-reconcile",
+        )),
         "rejected" => Some(runtime.on_order_rejected(
             &intent.client_order_id,
             outcome
@@ -502,8 +513,18 @@ fn run_fixture(name: &str) {
     let mut runtime = build_runtime(&fixture, &store_path, fixture.starting_cash_usd);
     let mut last_seq = 0_u64;
     let mut seen_categories = BTreeSet::new();
-    let mut submit_idx = 0_usize;
-    let mut cancel_idx = 0_usize;
+    let submit_outcomes_by_id = fixture
+        .adapter
+        .submit
+        .iter()
+        .map(|outcome| (outcome.client_order_id.clone(), outcome))
+        .collect::<HashMap<_, _>>();
+    let cancel_outcomes_by_id = fixture
+        .adapter
+        .cancel
+        .iter()
+        .map(|outcome| (outcome.client_order_id.clone(), outcome))
+        .collect::<HashMap<_, _>>();
 
     let startup_outcome = runtime.start(1);
     assert!(startup_outcome.commands.is_empty());
@@ -541,29 +562,41 @@ fn run_fixture(name: &str) {
                     )
                     .expect("snapshot");
                 drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
-                let mut command_idx = 0_usize;
+                let decision_lookup = decisions
+                    .iter()
+                    .map(|decision| (decision.client_order_id.clone(), decision))
+                    .collect::<HashMap<_, _>>();
+                let mut submitted_decisions = HashSet::new();
                 for command in outcome.commands {
                     journal.append_command(&command).unwrap();
                     match &command {
                         RuntimeCommand::Submit(_) => {
-                            assert!(command_idx < decisions.len(), "more submit commands than decisions");
-                            assert_submit_intent(&command, &decisions[command_idx]);
-                            let adapter_outcome = fixture
-                                .adapter
-                                .submit
-                                .get(submit_idx)
-                                .unwrap_or_else(|| panic!("missing submit outcome {}", submit_idx));
-                            assert_eq!(
-                                adapter_outcome.client_order_id,
-                                decisions[command_idx].client_order_id
-                            );
+                            let submit_client_order_id = match &command {
+                                RuntimeCommand::Submit(intent) => {
+                                    intent.client_order_id.as_str().to_string()
+                                }
+                                _ => unreachable!(),
+                            };
+                            let adapter_outcome = submit_outcomes_by_id
+                                .get(&submit_client_order_id)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "missing submit outcome for client_order_id {}",
+                                        submit_client_order_id
+                                    )
+                                });
+                            if let Some(decision) =
+                                decision_lookup.get(&submit_client_order_id)
+                            {
+                                assert_submit_intent(&command, decision);
+                                submitted_decisions.insert(submit_client_order_id.clone());
+                            }
                             let ack_outcome = handle_submit_ack(
                                 &mut runtime,
                                 &command,
                                 adapter_outcome,
                                 *at_ms + 1,
                             );
-                            submit_idx += 1;
                             if let Some(ack_outcome) = ack_outcome {
                                 drain_event_log(
                                     &runtime,
@@ -588,22 +621,22 @@ fn run_fixture(name: &str) {
                                     &mut last_seq,
                                 );
                             }
-                            command_idx += 1;
                         }
                         RuntimeCommand::Cancel { client_order_id, .. } => {
-                            let adapter_outcome = fixture
-                                .adapter
-                                .cancel
-                                .get(cancel_idx)
-                                .unwrap_or_else(|| panic!("missing cancel outcome {}", cancel_idx));
-                            assert_eq!(adapter_outcome.client_order_id, client_order_id.as_str());
+                            let adapter_outcome = cancel_outcomes_by_id
+                                .get(client_order_id.as_str())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "missing cancel outcome for client_order_id {}",
+                                        client_order_id
+                                    )
+                                });
                             let ack_outcome = handle_cancel_ack(
                                 &mut runtime,
                                 &command,
                                 adapter_outcome,
                                 *at_ms + 1,
                             );
-                            cancel_idx += 1;
                             if let Some(ack_outcome) = ack_outcome {
                                 drain_event_log(
                                     &runtime,
@@ -639,9 +672,9 @@ fn run_fixture(name: &str) {
                         }
                     }
                 }
-                if command_idx != decisions.len() {
+                if submitted_decisions.len() != decisions.len() {
                     assert_eq!(
-                        command_idx,
+                        submitted_decisions.len(),
                         decisions.len(),
                         "not all decisions were submitted"
                     );
@@ -880,4 +913,24 @@ fn end_of_window_cleanup() {
 #[test]
 fn replay_reconcile_merge_recovery() {
     run_fixture("replay_reconcile_merge_recovery");
+}
+
+#[test]
+fn unlawful_entry_window_valid_core_entry_and_hedge_probe() {
+    run_fixture("unlawful_entry_window");
+}
+
+#[test]
+fn unlawful_regime_closed_no_buy_intents() {
+    run_fixture("unlawful_regime_closed");
+}
+
+#[test]
+fn unlawful_merge_stall_drives_cleanup_only_actions() {
+    run_fixture("unlawful_merge_stall_cleanup");
+}
+
+#[test]
+fn unlawful_late_window_only_reduce_only_cleanup() {
+    run_fixture("unlawful_late_window_cleanup_only");
 }

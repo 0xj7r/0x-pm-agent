@@ -78,26 +78,12 @@ impl Default for DesiredQuoteSet {
 }
 
 impl DesiredQuoteSet {
-    fn bucket_id(intent: &OrderIntent) -> (MarketId, InstrumentId, TradeSide, bool, String) {
-        let level_tag = intent
-            .quote_level_tag
-            .as_deref()
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!(
-                    "{}:{}:{}:{}",
-                    intent.market_id.as_str(),
-                    intent.instrument_id.as_str(),
-                    if intent.side == TradeSide::Buy { "buy" } else { "sell" },
-                    if intent.reduce_only { "reduce-only" } else { "normal" }
-                )
-            });
+    fn bucket_id(intent: &OrderIntent) -> (MarketId, InstrumentId, TradeSide, bool) {
         (
             intent.market_id.clone(),
             intent.instrument_id.clone(),
             intent.side,
             intent.reduce_only,
-            level_tag,
         )
     }
 
@@ -123,7 +109,7 @@ impl DesiredQuoteSet {
     pub fn from_intents(mut intents: Vec<OrderIntent>, config: &QuoteEngineConfig) -> Self {
         let max_levels = config.max_levels_per_side.clamp(1, 3);
 
-        let mut buckets: BTreeMap<(MarketId, InstrumentId, TradeSide, bool, String), Vec<OrderIntent>> =
+        let mut buckets: BTreeMap<(MarketId, InstrumentId, TradeSide, bool), Vec<OrderIntent>> =
             BTreeMap::new();
         for intent in intents.drain(..) {
             if intent.limit_price <= 0.0 || intent.quantity <= 0.0 {
@@ -183,13 +169,30 @@ impl DesiredQuoteSet {
         }
 
         quotes.sort_by(|left, right| {
-            let left_key = (&left.intent.market_id, &left.intent.instrument_id, left.intent.side, left.intent.reduce_only, left.intent.quote_level_tag.as_deref().unwrap_or_default());
-            let right_key = (&right.intent.market_id, &right.intent.instrument_id, right.intent.side, right.intent.reduce_only, right.intent.quote_level_tag.as_deref().unwrap_or_default());
+            let left_key = (
+                &left.intent.market_id,
+                &left.intent.instrument_id,
+                left.intent.side,
+                left.intent.reduce_only,
+            );
+            let right_key = (
+                &right.intent.market_id,
+                &right.intent.instrument_id,
+                right.intent.side,
+                right.intent.reduce_only,
+            );
             left_key
                 .cmp(&right_key)
+                .then_with(|| left.level.cmp(&right.level))
                 .then_with(|| left.intent.limit_price.total_cmp(&right.intent.limit_price))
                 .then_with(|| left.intent.quantity.total_cmp(&right.intent.quantity))
-                .then_with(|| left.level.cmp(&right.level))
+                .then_with(|| {
+                    left.intent
+                        .quote_level_tag
+                        .as_deref()
+                        .unwrap_or_default()
+                        .cmp(right.intent.quote_level_tag.as_deref().unwrap_or_default())
+                })
         });
 
         Self {
@@ -279,7 +282,7 @@ impl DesiredQuoteSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesiredQuoteSet, ExpiryMode, QuoteEngineConfig, StaleMode};
+    use super::{DesiredQuote, DesiredQuoteSet, ExpiryMode, QuoteEngineConfig, StaleMode};
     use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, QuoteSnapshot, TradeSide};
     use std::collections::HashMap;
 

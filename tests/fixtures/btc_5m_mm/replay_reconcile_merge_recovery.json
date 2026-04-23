@@ -67,7 +67,12 @@
     {
       "type": "checkpoint",
       "at_ms": 7020,
-      "label": "merge-crash-state"
+      "label": "merge-crash-state",
+      "expected": {
+        "runtime_status": "Running",
+        "inventory": {},
+        "open_orders": []
+      }
     },
     {
       "type": "restart",

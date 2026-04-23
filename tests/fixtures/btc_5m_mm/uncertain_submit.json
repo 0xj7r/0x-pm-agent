@@ -62,6 +62,6 @@
     "free_cash_usd": 292.9,
     "open_order_count": 1,
     "required_checkpoint_keys": ["checkpoint_id", "run_id", "created_at_ms", "runtime_status", "inventory_json", "open_orders_json", "pair_state_json"],
-    "required_event_categories": ["Runtime", "Strategy", "Execution", "Inventory", "Risk"]
+    "required_event_categories": ["Runtime", "Strategy", "Inventory", "Risk"]
   }
 }

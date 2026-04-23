@@ -9,10 +9,173 @@ use serde::{Deserialize, Serialize};
 use crate::inventory::{InventorySnapshot, PositionState};
 use crate::market_context::MarketContextRecord;
 use crate::quote_engine::QuoteEngineConfig;
+use crate::signals::UnlawfulGateConfig;
 use crate::types::{
-    ClientOrderId, EpochMillis, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
+    BookLevel, ClientOrderId, EpochMillis, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
     QuoteSnapshot, RuntimeStatus, TradeSide,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionBucket {
+    Preferred,
+    Neutral,
+    Opportunistic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlawfulExecutionMode {
+    Standby,
+    Entry,
+    Manage,
+    Cleanup,
+    Flatten,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlawfulAggressionTier {
+    Suppressed,
+    Light,
+    Normal,
+    Press,
+}
+
+#[derive(Debug, Clone)]
+pub struct BtcRegimeSnapshot {
+    pub last_price: Option<f64>,
+    pub realized_vol_5m_bps: Option<f64>,
+    pub realized_vol_15m_bps: Option<f64>,
+    pub trade_count_5m: u64,
+    pub trade_count_15m: u64,
+    pub return_30s_bps: Option<f64>,
+    pub return_60s_bps: Option<f64>,
+    pub observed_at_ms: u64,
+}
+
+impl Default for BtcRegimeSnapshot {
+    fn default() -> Self {
+        Self {
+            last_price: None,
+            realized_vol_5m_bps: None,
+            realized_vol_15m_bps: None,
+            trade_count_5m: 0,
+            trade_count_15m: 0,
+            return_30s_bps: None,
+            return_60s_bps: None,
+            observed_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PairedBookSignal {
+    pub cheap_instrument_id: InstrumentId,
+    pub expensive_instrument_id: InstrumentId,
+    pub cheap_bid: Option<BookLevel>,
+    pub cheap_ask: Option<BookLevel>,
+    pub expensive_bid: Option<BookLevel>,
+    pub expensive_ask: Option<BookLevel>,
+    pub price_gap: Option<f64>,
+    pub observed_at_ms: u64,
+    pub books_fresh: bool,
+    pub both_sides_present: bool,
+}
+
+impl PairedBookSignal {
+    fn with_ids(
+        cheap_instrument_id: InstrumentId,
+        expensive_instrument_id: InstrumentId,
+        cheap_bid: Option<BookLevel>,
+        cheap_ask: Option<BookLevel>,
+        expensive_bid: Option<BookLevel>,
+        expensive_ask: Option<BookLevel>,
+        observed_at_ms: u64,
+        books_fresh: bool,
+    ) -> Self {
+        let price_gap = cheap_ask.as_ref().and_then(|cheap| {
+            expensive_ask
+                .as_ref()
+                .map(|expensive| expensive.price - cheap.price)
+        });
+        let both_sides_present = cheap_bid.is_some()
+            && cheap_ask.is_some()
+            && expensive_bid.is_some()
+            && expensive_ask.is_some();
+        Self {
+            cheap_instrument_id,
+            expensive_instrument_id,
+            cheap_bid,
+            cheap_ask,
+            expensive_bid,
+            expensive_ask,
+            price_gap,
+            observed_at_ms,
+            books_fresh,
+            both_sides_present,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketActivitySignal {
+    pub last_trade_event_count_10s: u32,
+    pub last_trade_event_count_30s: u32,
+    pub last_trade_event_count_60s: u32,
+    pub last_trade_event_age_ms: Option<u64>,
+}
+
+impl Default for MarketActivitySignal {
+    fn default() -> Self {
+        Self {
+            last_trade_event_count_10s: 0,
+            last_trade_event_count_30s: 0,
+            last_trade_event_count_60s: 0,
+            last_trade_event_age_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnlawfulSignalSnapshot {
+    pub session_bucket: SessionBucket,
+    pub mode: UnlawfulExecutionMode,
+    pub gate_reasons: Vec<String>,
+    pub btc: BtcRegimeSnapshot,
+    pub book: PairedBookSignal,
+    pub activity: MarketActivitySignal,
+    pub first_fill_ms: Option<u64>,
+    pub first_merge_ms: Option<u64>,
+    pub elapsed_s: Option<u64>,
+    pub time_remaining_s: Option<u64>,
+    pub clip_scale: f64,
+}
+
+impl Default for UnlawfulSignalSnapshot {
+    fn default() -> Self {
+        Self {
+            session_bucket: SessionBucket::Unknown,
+            mode: UnlawfulExecutionMode::Standby,
+            gate_reasons: Vec::new(),
+            btc: BtcRegimeSnapshot::default(),
+            book: PairedBookSignal::with_ids(
+                InstrumentId::from(""),
+                InstrumentId::from(""),
+                None,
+                None,
+                None,
+                None,
+                0,
+                false,
+            ),
+            activity: MarketActivitySignal::default(),
+            first_fill_ms: None,
+            first_merge_ms: None,
+            elapsed_s: None,
+            time_remaining_s: None,
+            clip_scale: 1.0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GoatPairConfig {
@@ -44,7 +207,7 @@ impl GoatPairConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct UnlawfulShearConfig {
     pub cheap_hedge_price_max: f64,
     pub core_price_min: f64,
@@ -62,11 +225,42 @@ pub struct UnlawfulShearConfig {
     pub salvage_bid_floor: f64,
     pub max_open_orders_total: usize,
     pub taker_fee_coeff: f64,
+
+    pub regime_primary_hours_utc: Vec<u32>,
+    pub regime_secondary_hours_utc: Vec<u32>,
+    pub allow_extreme_offhour_override: bool,
+    pub entry_window_seconds: u64,
+    pub cleanup_start_seconds: u64,
+    pub close_start_seconds: u64,
+    pub merge_stall_seconds: u64,
+    pub entry_book_max_age_ms: u64,
+    pub entry_btc_signal_max_age_ms: u64,
+    pub primary_min_btc_realized_vol_5m_bps: f64,
+    pub primary_min_btc_realized_vol_15m_bps: f64,
+    pub primary_min_btc_trade_count_5m: u64,
+    pub secondary_min_btc_realized_vol_5m_bps: f64,
+    pub secondary_min_btc_realized_vol_15m_bps: f64,
+    pub secondary_min_btc_trade_count_5m: u64,
+    pub override_min_btc_realized_vol_5m_bps: f64,
+    pub override_min_btc_realized_vol_15m_bps: f64,
+    pub override_min_btc_trade_count_5m: u64,
+    pub entry_cheap_ask_max: f64,
+    pub entry_expensive_ask_min: f64,
+    pub entry_expensive_ask_max: f64,
+    pub entry_price_gap_min: f64,
+    pub preferred_cheap_ask_max: f64,
+    pub preferred_expensive_ask_min: f64,
+    pub preferred_expensive_ask_max: f64,
+    pub preferred_price_gap_min: f64,
+    pub hard_shock_return_30s_bps: f64,
+    pub hard_shock_return_60s_bps: f64,
+    pub soft_shock_return_30s_bps: f64,
+    pub soft_shock_return_60s_bps: f64,
 }
 
 impl UnlawfulShearConfig {
     pub fn from_env() -> Self {
-        Self {
+        let config = Self {
             cheap_hedge_price_max: parse_f64(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_CHEAP_HEDGE_PRICE_MAX",
                 0.38,
@@ -77,18 +271,9 @@ impl UnlawfulShearConfig {
             probe_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_PROBE_CLIP_USD", 3.0),
             core_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_CORE_CLIP_USD", 20.0),
             hedge_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_HEDGE_CLIP_USD", 6.0),
-            rebalance_clip_usd: parse_f64(
-                "WHALE_PAIR_UNLAWFUL_SHEAR_REBALANCE_CLIP_USD",
-                12.0,
-            ),
-            trim_clip_fraction: parse_f64(
-                "WHALE_PAIR_UNLAWFUL_SHEAR_TRIM_CLIP_FRACTION",
-                0.30,
-            ),
-            max_gross_cost_usd: parse_f64(
-                "WHALE_PAIR_UNLAWFUL_SHEAR_MAX_GROSS_COST_USD",
-                120.0,
-            ),
+            rebalance_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_REBALANCE_CLIP_USD", 12.0),
+            trim_clip_fraction: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_TRIM_CLIP_FRACTION", 0.30),
+            max_gross_cost_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_MAX_GROSS_COST_USD", 120.0),
             target_hedge_ratio_min: parse_f64(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_TARGET_HEDGE_RATIO_MIN",
                 0.20,
@@ -101,16 +286,112 @@ impl UnlawfulShearConfig {
                 "WHALE_PAIR_UNLAWFUL_SHEAR_SALVAGE_DRAWDOWN_RATIO",
                 0.18,
             ),
-            salvage_bid_floor: parse_f64(
-                "WHALE_PAIR_UNLAWFUL_SHEAR_SALVAGE_BID_FLOOR",
-                0.05,
-            ),
+            salvage_bid_floor: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_SALVAGE_BID_FLOOR", 0.05),
             max_open_orders_total: parse_usize(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_MAX_OPEN_ORDERS_TOTAL",
                 6,
             ),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
-        }
+
+            regime_primary_hours_utc: vec![10, 11, 19, 22, 23],
+            regime_secondary_hours_utc: vec![0, 9, 12, 20, 21],
+            allow_extreme_offhour_override: false,
+            entry_window_seconds: parse_u64("WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_WINDOW_SECONDS", 30),
+            cleanup_start_seconds: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CLEANUP_START_SECONDS",
+                210,
+            ),
+            close_start_seconds: parse_u64("WHALE_PAIR_UNLAWFUL_SHEAR_CLOSE_START_SECONDS", 270),
+            merge_stall_seconds: parse_u64("WHALE_PAIR_UNLAWFUL_SHEAR_MERGE_STALL_SECONDS", 60),
+            entry_book_max_age_ms: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_BOOK_MAX_AGE_MS",
+                1200,
+            ),
+            entry_btc_signal_max_age_ms: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_BTC_SIGNAL_MAX_AGE_MS",
+                2000,
+            ),
+            primary_min_btc_realized_vol_5m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_5M_BPS",
+                5.0,
+            ),
+            primary_min_btc_realized_vol_15m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_15M_BPS",
+                11.0,
+            ),
+            primary_min_btc_trade_count_5m: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_TRADE_COUNT_5M",
+                5000,
+            ),
+            secondary_min_btc_realized_vol_5m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_5M_BPS",
+                8.0,
+            ),
+            secondary_min_btc_realized_vol_15m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_15M_BPS",
+                15.0,
+            ),
+            secondary_min_btc_trade_count_5m: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_TRADE_COUNT_5M",
+                8000,
+            ),
+            override_min_btc_realized_vol_5m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_5M_BPS",
+                12.0,
+            ),
+            override_min_btc_realized_vol_15m_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_15M_BPS",
+                20.0,
+            ),
+            override_min_btc_trade_count_5m: parse_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_TRADE_COUNT_5M",
+                10000,
+            ),
+            entry_cheap_ask_max: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_CHEAP_ASK_MAX", 0.47),
+            entry_expensive_ask_min: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_EXPENSIVE_ASK_MIN",
+                0.56,
+            ),
+            entry_expensive_ask_max: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_EXPENSIVE_ASK_MAX",
+                0.84,
+            ),
+            entry_price_gap_min: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_PRICE_GAP_MIN", 0.22),
+            preferred_cheap_ask_max: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_CHEAP_ASK_MAX",
+                0.40,
+            ),
+            preferred_expensive_ask_min: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_EXPENSIVE_ASK_MIN",
+                0.62,
+            ),
+            preferred_expensive_ask_max: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_EXPENSIVE_ASK_MAX",
+                0.78,
+            ),
+            preferred_price_gap_min: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_PRICE_GAP_MIN",
+                0.35,
+            ),
+            hard_shock_return_30s_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_HARD_SHOCK_RETURN_30S_BPS",
+                25.0,
+            ),
+            hard_shock_return_60s_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_HARD_SHOCK_RETURN_60S_BPS",
+                30.0,
+            ),
+            soft_shock_return_30s_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SOFT_SHOCK_RETURN_30S_BPS",
+                15.0,
+            ),
+            soft_shock_return_60s_bps: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SOFT_SHOCK_RETURN_60S_BPS",
+                20.0,
+            ),
+        };
+
+        normalize_unlawful_invariants(config)
     }
 }
 
@@ -184,7 +465,11 @@ fn deterministic_client_order_id(
     price: f64,
     quantity: f64,
 ) -> ClientOrderId {
-    let side_tag = if matches!(side, TradeSide::Buy) { "b" } else { "s" };
+    let side_tag = if matches!(side, TradeSide::Buy) {
+        "b"
+    } else {
+        "s"
+    };
     let mode_tag = if reduce_only { "r" } else { "n" };
     ClientOrderId::from(format!(
         "{strategy_tag}:{market}:{instrument}:{side}:{mode}:{level}:{price:.8}:{qty:.8}",
@@ -204,6 +489,7 @@ pub struct StrategyContext {
     pub inventory: InventorySnapshot,
     pub open_orders_total: usize,
     pub market_context: Option<MarketContextRecord>,
+    pub unlawful_signal: Option<UnlawfulSignalSnapshot>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -240,7 +526,7 @@ impl StrategyProfile {
     }
 
     pub fn unlawful_shear_config(&self) -> UnlawfulShearConfig {
-        UnlawfulShearConfig {
+        let config = UnlawfulShearConfig {
             cheap_hedge_price_max: env_or_profile_f64(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_CHEAP_HEDGE_PRICE_MAX",
                 self.strategies.unlawful_shear.cheap_hedge_price_max,
@@ -321,7 +607,183 @@ impl StrategyProfile {
                 self.strategies.unlawful_shear.taker_fee_coeff,
                 0.072,
             ),
-        }
+            regime_primary_hours_utc: sorted_unique_u32_vec(
+                self.strategies
+                    .unlawful_shear
+                    .regime_primary_hours_utc
+                    .clone()
+                    .unwrap_or_else(|| vec![10, 11, 19, 22, 23]),
+            ),
+            regime_secondary_hours_utc: sorted_unique_u32_vec(
+                self.strategies
+                    .unlawful_shear
+                    .regime_secondary_hours_utc
+                    .clone()
+                    .unwrap_or_else(|| vec![10, 22]),
+            ),
+            allow_extreme_offhour_override: env_or_profile_bool(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ALLOW_EXTREME_OFFHOUR_OVERRIDE",
+                self.strategies
+                    .unlawful_shear
+                    .allow_extreme_offhour_override,
+                false,
+            ),
+            entry_window_seconds: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_WINDOW_SECONDS",
+                self.strategies.unlawful_shear.entry_window_seconds,
+                30,
+            ),
+            cleanup_start_seconds: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CLEANUP_START_SECONDS",
+                self.strategies.unlawful_shear.cleanup_start_seconds,
+                210,
+            ),
+            close_start_seconds: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_CLOSE_START_SECONDS",
+                self.strategies.unlawful_shear.close_start_seconds,
+                270,
+            ),
+            merge_stall_seconds: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MERGE_STALL_SECONDS",
+                self.strategies.unlawful_shear.merge_stall_seconds,
+                60,
+            ),
+            entry_book_max_age_ms: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_BOOK_MAX_AGE_MS",
+                self.strategies.unlawful_shear.entry_book_max_age_ms,
+                1200,
+            ),
+            entry_btc_signal_max_age_ms: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_BTC_SIGNAL_MAX_AGE_MS",
+                self.strategies.unlawful_shear.entry_btc_signal_max_age_ms,
+                2000,
+            ),
+            primary_min_btc_realized_vol_5m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_5M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .primary_min_btc_realized_vol_5m_bps,
+                5.0,
+            ),
+            primary_min_btc_realized_vol_15m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_15M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .primary_min_btc_realized_vol_15m_bps,
+                11.0,
+            ),
+            primary_min_btc_trade_count_5m: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_TRADE_COUNT_5M",
+                self.strategies
+                    .unlawful_shear
+                    .primary_min_btc_trade_count_5m,
+                5000,
+            ),
+            secondary_min_btc_realized_vol_5m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_5M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .secondary_min_btc_realized_vol_5m_bps,
+                8.0,
+            ),
+            secondary_min_btc_realized_vol_15m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_15M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .secondary_min_btc_realized_vol_15m_bps,
+                15.0,
+            ),
+            secondary_min_btc_trade_count_5m: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_TRADE_COUNT_5M",
+                self.strategies
+                    .unlawful_shear
+                    .secondary_min_btc_trade_count_5m,
+                8000,
+            ),
+            override_min_btc_realized_vol_5m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_5M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .override_min_btc_realized_vol_5m_bps,
+                12.0,
+            ),
+            override_min_btc_realized_vol_15m_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_15M_BPS",
+                self.strategies
+                    .unlawful_shear
+                    .override_min_btc_realized_vol_15m_bps,
+                20.0,
+            ),
+            override_min_btc_trade_count_5m: env_or_profile_u64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_TRADE_COUNT_5M",
+                self.strategies
+                    .unlawful_shear
+                    .override_min_btc_trade_count_5m,
+                10000,
+            ),
+            entry_cheap_ask_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_CHEAP_ASK_MAX",
+                self.strategies.unlawful_shear.entry_cheap_ask_max,
+                0.47,
+            ),
+            entry_expensive_ask_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_EXPENSIVE_ASK_MIN",
+                self.strategies.unlawful_shear.entry_expensive_ask_min,
+                0.56,
+            ),
+            entry_expensive_ask_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_EXPENSIVE_ASK_MAX",
+                self.strategies.unlawful_shear.entry_expensive_ask_max,
+                0.84,
+            ),
+            entry_price_gap_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_PRICE_GAP_MIN",
+                self.strategies.unlawful_shear.entry_price_gap_min,
+                0.22,
+            ),
+            preferred_cheap_ask_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_CHEAP_ASK_MAX",
+                self.strategies.unlawful_shear.preferred_cheap_ask_max,
+                0.40,
+            ),
+            preferred_expensive_ask_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_EXPENSIVE_ASK_MIN",
+                self.strategies.unlawful_shear.preferred_expensive_ask_min,
+                0.62,
+            ),
+            preferred_expensive_ask_max: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_EXPENSIVE_ASK_MAX",
+                self.strategies.unlawful_shear.preferred_expensive_ask_max,
+                0.78,
+            ),
+            preferred_price_gap_min: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_PREFERRED_PRICE_GAP_MIN",
+                self.strategies.unlawful_shear.preferred_price_gap_min,
+                0.35,
+            ),
+            hard_shock_return_30s_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_HARD_SHOCK_RETURN_30S_BPS",
+                self.strategies.unlawful_shear.hard_shock_return_30s_bps,
+                25.0,
+            ),
+            hard_shock_return_60s_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_HARD_SHOCK_RETURN_60S_BPS",
+                self.strategies.unlawful_shear.hard_shock_return_60s_bps,
+                30.0,
+            ),
+            soft_shock_return_30s_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SOFT_SHOCK_RETURN_30S_BPS",
+                self.strategies.unlawful_shear.soft_shock_return_30s_bps,
+                15.0,
+            ),
+            soft_shock_return_60s_bps: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_SOFT_SHOCK_RETURN_60S_BPS",
+                self.strategies.unlawful_shear.soft_shock_return_60s_bps,
+                20.0,
+            ),
+        };
+
+        normalize_unlawful_invariants(config)
     }
 
     pub fn goat_pair_config(&self) -> GoatPairConfig {
@@ -504,10 +966,45 @@ pub struct UnlawfulShearProfile {
     pub max_open_orders_total: Option<usize>,
     pub taker_fee_coeff: Option<f64>,
     pub cooldown_ms: Option<u64>,
+
+    pub regime_primary_hours_utc: Option<Vec<u32>>,
+    pub regime_secondary_hours_utc: Option<Vec<u32>>,
+    pub allow_extreme_offhour_override: Option<bool>,
+    pub entry_window_seconds: Option<u64>,
+    pub cleanup_start_seconds: Option<u64>,
+    pub close_start_seconds: Option<u64>,
+    pub merge_stall_seconds: Option<u64>,
+    pub entry_book_max_age_ms: Option<u64>,
+    pub entry_btc_signal_max_age_ms: Option<u64>,
+    pub primary_min_btc_realized_vol_5m_bps: Option<f64>,
+    pub primary_min_btc_realized_vol_15m_bps: Option<f64>,
+    pub primary_min_btc_trade_count_5m: Option<u64>,
+    pub secondary_min_btc_realized_vol_5m_bps: Option<f64>,
+    pub secondary_min_btc_realized_vol_15m_bps: Option<f64>,
+    pub secondary_min_btc_trade_count_5m: Option<u64>,
+    pub override_min_btc_realized_vol_5m_bps: Option<f64>,
+    pub override_min_btc_realized_vol_15m_bps: Option<f64>,
+    pub override_min_btc_trade_count_5m: Option<u64>,
+    pub entry_cheap_ask_max: Option<f64>,
+    pub entry_expensive_ask_min: Option<f64>,
+    pub entry_expensive_ask_max: Option<f64>,
+    pub entry_price_gap_min: Option<f64>,
+    pub preferred_cheap_ask_max: Option<f64>,
+    pub preferred_expensive_ask_min: Option<f64>,
+    pub preferred_expensive_ask_max: Option<f64>,
+    pub preferred_price_gap_min: Option<f64>,
+    pub hard_shock_return_30s_bps: Option<f64>,
+    pub hard_shock_return_60s_bps: Option<f64>,
+    pub soft_shock_return_30s_bps: Option<f64>,
+    pub soft_shock_return_60s_bps: Option<f64>,
 }
 
 pub trait Strategy {
     fn name(&self) -> &str;
+
+    fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
+        None
+    }
 
     fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
         StrategyDecision::none()
@@ -540,9 +1037,7 @@ pub enum StrategyMode {
 impl StrategyMode {
     pub fn from_name(name: &str, profile: Option<&StrategyProfile>) -> Self {
         match name {
-            "goat_pair" => {
-                Self::Goat(GoatPairStrategy::with_profile(profile))
-            }
+            "goat_pair" => Self::Goat(GoatPairStrategy::with_profile(profile)),
             "noop" => Self::Noop(NoopStrategy),
             "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile)),
             _ => Self::UnlawfulShear(UnlawfulShearStrategy::with_defaults()),
@@ -556,6 +1051,14 @@ impl StrategyMode {
             Self::Noop(_) => 0.0,
         }
     }
+
+    pub fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
+        match self {
+            Self::Goat(_) => None,
+            Self::Noop(_) => None,
+            Self::UnlawfulShear(strategy) => Some(strategy.unlawful_gate_config()),
+        }
+    }
 }
 
 impl Strategy for StrategyMode {
@@ -565,6 +1068,10 @@ impl Strategy for StrategyMode {
             Self::UnlawfulShear(strategy) => strategy.name(),
             Self::Noop(strategy) => strategy.name(),
         }
+    }
+
+    fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
+        StrategyMode::unlawful_gate_config(self)
     }
 
     fn on_start(&mut self, context: &StrategyContext) -> StrategyDecision {
@@ -635,10 +1142,13 @@ impl GoatPairStrategy {
     pub fn with_profile(profile: Option<&StrategyProfile>) -> Self {
         match profile {
             Some(profile) => {
-                let mut strategy = Self::new(profile.goat_pair_config(), profile.goat_pair_cooldown_ms());
-                strategy.quote_levels_per_side = profile.quote.levels_per_side.unwrap_or(1).clamp(1, 3);
+                let mut strategy =
+                    Self::new(profile.goat_pair_config(), profile.goat_pair_cooldown_ms());
+                strategy.quote_levels_per_side =
+                    profile.quote.levels_per_side.unwrap_or(1).clamp(1, 3);
                 strategy.quote_min_edge_bps = profile.quote.min_edge_bps.unwrap_or(0.0).max(0.0);
-                strategy.quote_inventory_skew_bps = profile.quote.inventory_skew_bps.unwrap_or(0.0).max(0.0);
+                strategy.quote_inventory_skew_bps =
+                    profile.quote.inventory_skew_bps.unwrap_or(0.0).max(0.0);
                 strategy.quote_min_quote_age_ms = profile.quote.min_quote_age_ms;
                 strategy.quote_expiry_suppression_ms = profile.quote.expiry_suppression_ms;
                 strategy.quote_refresh_interval_ms = profile.quote.refresh_interval_ms;
@@ -672,7 +1182,9 @@ impl GoatPairStrategy {
             .positions
             .iter()
             .find(|position| &position.instrument_id == instrument_id)
-            .map_or((0.0, 0.0), |position| (position.quantity, position.avg_price))
+            .map_or((0.0, 0.0), |position| {
+                (position.quantity, position.avg_price)
+            })
     }
 
     fn gross_cost_usd(&self, inventory: &InventorySnapshot, market_id: &MarketId) -> f64 {
@@ -725,13 +1237,11 @@ impl GoatPairStrategy {
         now_ms.saturating_sub(last_action_ms) >= refresh_interval_ms
     }
 
-    fn quote_expired(
-        &self,
-        last_action_ms: Option<EpochMillis>,
-        now_ms: EpochMillis,
-    ) -> bool {
-        self.quote_expiry_suppression_ms
-            .is_some_and(|expiry_ms| last_action_ms.is_some_and(|last_action_ms| now_ms.saturating_sub(last_action_ms) > expiry_ms))
+    fn quote_expired(&self, last_action_ms: Option<EpochMillis>, now_ms: EpochMillis) -> bool {
+        self.quote_expiry_suppression_ms.is_some_and(|expiry_ms| {
+            last_action_ms
+                .is_some_and(|last_action_ms| now_ms.saturating_sub(last_action_ms) > expiry_ms)
+        })
     }
 
     fn inventory_skew_scale(&self, this_qty: f64, opp_qty: f64) -> f64 {
@@ -772,12 +1282,15 @@ impl GoatPairStrategy {
 
         for level in 0..levels {
             let step_bps = edge_bps * (level as f64 + 1.0);
-            let level_price = deterministic_quote_unit((best_ask * (1.0 - step_bps / 10_000.0)).max(0.000_000_01));
+            let level_price = deterministic_quote_unit(
+                (best_ask * (1.0 - step_bps / 10_000.0)).max(0.000_000_01),
+            );
             if level_price <= 0.0 {
                 continue;
             }
             let level_qty_scale = inventory_scale / (1.0 + level as f64 * 0.35);
-            let level_notional = (level_weight * level_qty_scale).min(self.config.max_gross_cost_usd.max(0.01));
+            let level_notional =
+                (level_weight * level_qty_scale).min(self.config.max_gross_cost_usd.max(0.01));
             let quantity = (level_notional / level_price).max(0.0);
             if quantity <= 0.0 {
                 continue;
@@ -892,16 +1405,14 @@ impl Strategy for GoatPairStrategy {
                 return StrategyDecision::none();
             }
             if quote_refresh_interval_ms.is_some_and(|refresh_interval_ms| {
-                last_fill_ms.is_some_and(|ms| context.now_ms.saturating_sub(ms) < refresh_interval_ms)
+                last_fill_ms
+                    .is_some_and(|ms| context.now_ms.saturating_sub(ms) < refresh_interval_ms)
             }) {
                 market_state.asks.insert(instrument_id.clone(), ask);
                 return StrategyDecision::none();
             }
             if quote_min_quote_age_ms.is_some_and(|max_age_ms| {
-                context
-                    .now_ms
-                    .saturating_sub(snapshot.quote.observed_at_ms)
-                    > max_age_ms
+                context.now_ms.saturating_sub(snapshot.quote.observed_at_ms) > max_age_ms
             }) {
                 market_state.asks.insert(instrument_id.clone(), ask);
                 return StrategyDecision::none();
@@ -986,9 +1497,7 @@ impl Strategy for GoatPairStrategy {
 
             let fee = self.taker_fee_usd(side_ask, qty * side_ask);
             let reason = if clip_usd >= config.aggressive_clip_usd {
-                format!(
-                    "goat-pair accumulate aggressive p={side_ask:.4},fee={fee:.4},qty={qty:.4}"
-                )
+                format!("goat-pair accumulate aggressive p={side_ask:.4},fee={fee:.4},qty={qty:.4}")
             } else if this_qty > 0.0 && opp_qty > this_qty {
                 format!("goat-pair completion p={side_ask:.4},opp_avg={opp_avg:.4}")
             } else {
@@ -1067,13 +1576,67 @@ impl UnlawfulShearStrategy {
 
     pub fn with_profile(profile: Option<&StrategyProfile>) -> Self {
         match profile {
-            Some(profile) => Self::new(profile.unlawful_shear_config(), profile.unlawful_shear_cooldown_ms()),
+            Some(profile) => Self::new(
+                profile.unlawful_shear_config(),
+                profile.unlawful_shear_cooldown_ms(),
+            ),
             None => Self::with_defaults(),
         }
     }
 
     pub fn taker_fee_coeff(&self) -> f64 {
         self.config.taker_fee_coeff
+    }
+
+    pub fn unlawful_gate_config(&self) -> UnlawfulGateConfig {
+        UnlawfulGateConfig {
+            regime_primary_hours_utc: self
+                .config
+                .regime_primary_hours_utc
+                .iter()
+                .map(|value| (*value).min(23) as u8)
+                .collect(),
+            regime_secondary_hours_utc: self
+                .config
+                .regime_secondary_hours_utc
+                .iter()
+                .map(|value| (*value).min(23) as u8)
+                .collect(),
+            allow_extreme_offhour_override: self.config.allow_extreme_offhour_override,
+            entry_window_seconds: self.config.entry_window_seconds,
+            cleanup_start_seconds: self.config.cleanup_start_seconds,
+            close_start_seconds: self.config.close_start_seconds,
+            merge_stall_seconds: self.config.merge_stall_seconds,
+            entry_book_max_age_ms: self.config.entry_book_max_age_ms,
+            entry_btc_signal_max_age_ms: self.config.entry_btc_signal_max_age_ms,
+            primary_min_btc_realized_vol_5m_bps: self.config.primary_min_btc_realized_vol_5m_bps,
+            primary_min_btc_realized_vol_15m_bps: self.config.primary_min_btc_realized_vol_15m_bps,
+            primary_min_btc_trade_count_5m: self.config.primary_min_btc_trade_count_5m,
+            secondary_min_btc_realized_vol_5m_bps: self
+                .config
+                .secondary_min_btc_realized_vol_5m_bps,
+            secondary_min_btc_realized_vol_15m_bps: self
+                .config
+                .secondary_min_btc_realized_vol_15m_bps,
+            secondary_min_btc_trade_count_5m: self.config.secondary_min_btc_trade_count_5m,
+            override_min_btc_realized_vol_5m_bps: self.config.override_min_btc_realized_vol_5m_bps,
+            override_min_btc_realized_vol_15m_bps: self
+                .config
+                .override_min_btc_realized_vol_15m_bps,
+            override_min_btc_trade_count_5m: self.config.override_min_btc_trade_count_5m,
+            entry_cheap_ask_max: self.config.entry_cheap_ask_max,
+            entry_expensive_ask_min: self.config.entry_expensive_ask_min,
+            entry_expensive_ask_max: self.config.entry_expensive_ask_max,
+            entry_price_gap_min: self.config.entry_price_gap_min,
+            preferred_cheap_ask_max: self.config.preferred_cheap_ask_max,
+            preferred_expensive_ask_min: self.config.preferred_expensive_ask_min,
+            preferred_expensive_ask_max: self.config.preferred_expensive_ask_max,
+            preferred_price_gap_min: self.config.preferred_price_gap_min,
+            hard_shock_return_30s_bps: self.config.hard_shock_return_30s_bps,
+            hard_shock_return_60s_bps: self.config.hard_shock_return_60s_bps,
+            soft_shock_return_30s_bps: self.config.soft_shock_return_30s_bps,
+            soft_shock_return_60s_bps: self.config.soft_shock_return_60s_bps,
+        }
     }
 
     fn best_bid(quote: &QuoteSnapshot) -> Option<f64> {
@@ -1369,11 +1932,179 @@ impl UnlawfulShearStrategy {
             SettlementLeg::Unknown => None,
         }
     }
+
+    fn signal_mode_and_aggression(
+        &self,
+        context: &StrategyContext,
+        elapsed_s: Option<u64>,
+        has_inventory: bool,
+        cheap_ask: f64,
+        expensive_ask: f64,
+        price_gap: f64,
+    ) -> (
+        UnlawfulExecutionMode,
+        UnlawfulAggressionTier,
+        Vec<String>,
+        f64,
+    ) {
+        if let Some(signal) = context.unlawful_signal.as_ref() {
+            let mut mode = signal.mode;
+            let mut reasons = signal.gate_reasons.clone();
+            let mut aggression = if matches!(
+                mode,
+                UnlawfulExecutionMode::Standby
+                    | UnlawfulExecutionMode::Cleanup
+                    | UnlawfulExecutionMode::Flatten
+            ) || !signal.clip_scale.is_finite()
+                || signal.clip_scale <= 0.0
+            {
+                UnlawfulAggressionTier::Suppressed
+            } else if signal.clip_scale <= 0.6 {
+                UnlawfulAggressionTier::Light
+            } else if signal.clip_scale < 1.0 {
+                UnlawfulAggressionTier::Normal
+            } else {
+                UnlawfulAggressionTier::Press
+            };
+
+            let geometry_clip_scale = self.geometry_clip_scale(cheap_ask, expensive_ask, price_gap);
+
+            if geometry_clip_scale <= 0.0
+                && matches!(
+                    mode,
+                    UnlawfulExecutionMode::Entry | UnlawfulExecutionMode::Manage
+                )
+            {
+                reasons.push("entry geometry gate blocked (hard entry band invalid)".to_string());
+                aggression = UnlawfulAggressionTier::Suppressed;
+                mode = UnlawfulExecutionMode::Standby;
+            }
+
+            if has_inventory
+                && signal.first_fill_ms.is_some()
+                && signal.first_merge_ms.is_none()
+                && signal.first_fill_ms.is_some_and(|filled_at| {
+                    context.now_ms.saturating_sub(filled_at)
+                        > self.config.merge_stall_seconds.saturating_mul(1000)
+                })
+            {
+                reasons.push("merge stalled 60s".to_string());
+                mode = UnlawfulExecutionMode::Cleanup;
+                aggression = UnlawfulAggressionTier::Suppressed;
+            }
+
+            let clip_scale = if matches!(
+                mode,
+                UnlawfulExecutionMode::Standby
+                    | UnlawfulExecutionMode::Cleanup
+                    | UnlawfulExecutionMode::Flatten
+            ) {
+                0.0
+            } else {
+                signal.clip_scale.max(0.0) * geometry_clip_scale
+            };
+            return (mode, aggression, reasons, clip_scale);
+        }
+
+        let elapsed_s = match elapsed_s {
+            Some(value) => value,
+            None => 0,
+        };
+
+        let entry_window_seconds = self.config.entry_window_seconds.max(1);
+        let cleanup_start_seconds = self
+            .config
+            .cleanup_start_seconds
+            .max(entry_window_seconds.saturating_add(1));
+        let close_start_seconds = self
+            .config
+            .close_start_seconds
+            .max(cleanup_start_seconds.saturating_add(1));
+
+        let mode = if context.market_context.is_none() {
+            UnlawfulExecutionMode::Standby
+        } else if elapsed_s >= close_start_seconds {
+            UnlawfulExecutionMode::Flatten
+        } else if elapsed_s >= cleanup_start_seconds {
+            UnlawfulExecutionMode::Cleanup
+        } else if elapsed_s <= entry_window_seconds {
+            UnlawfulExecutionMode::Entry
+        } else if has_inventory {
+            UnlawfulExecutionMode::Manage
+        } else {
+            UnlawfulExecutionMode::Standby
+        };
+
+        let aggression = match mode {
+            UnlawfulExecutionMode::Standby => UnlawfulAggressionTier::Suppressed,
+            UnlawfulExecutionMode::Entry => UnlawfulAggressionTier::Normal,
+            UnlawfulExecutionMode::Manage => UnlawfulAggressionTier::Normal,
+            UnlawfulExecutionMode::Cleanup => UnlawfulAggressionTier::Suppressed,
+            UnlawfulExecutionMode::Flatten => UnlawfulAggressionTier::Suppressed,
+        };
+        let reasons = vec!["unlawful_signal missing: fallback mode evaluation".to_string()];
+        let clip_scale = if matches!(
+            mode,
+            UnlawfulExecutionMode::Entry | UnlawfulExecutionMode::Manage
+        ) {
+            self.geometry_clip_scale(cheap_ask, expensive_ask, price_gap)
+        } else {
+            0.0
+        };
+
+        (mode, aggression, reasons, clip_scale)
+    }
+
+    fn geometry_clip_scale(&self, cheap_ask: f64, expensive_ask: f64, price_gap: f64) -> f64 {
+        let hard_band = cheap_ask <= self.config.entry_cheap_ask_max
+            && expensive_ask >= self.config.entry_expensive_ask_min
+            && expensive_ask <= self.config.entry_expensive_ask_max
+            && price_gap >= self.config.entry_price_gap_min;
+        let preferred_band = cheap_ask <= self.config.preferred_cheap_ask_max
+            && expensive_ask >= self.config.preferred_expensive_ask_min
+            && expensive_ask <= self.config.preferred_expensive_ask_max
+            && price_gap >= self.config.preferred_price_gap_min;
+
+        if hard_band {
+            if preferred_band {
+                1.0
+            } else {
+                0.6
+            }
+        } else {
+            0.0
+        }
+    }
+
+    fn aggression_clip_scale(&self, aggression: UnlawfulAggressionTier) -> f64 {
+        match aggression {
+            UnlawfulAggressionTier::Suppressed => 0.0,
+            UnlawfulAggressionTier::Light => 0.6,
+            UnlawfulAggressionTier::Normal => 1.0,
+            UnlawfulAggressionTier::Press => 1.1,
+        }
+    }
+
+    fn can_launch_mode_action(mode: UnlawfulExecutionMode, action: &str) -> bool {
+        matches!(
+            (mode, action),
+            (UnlawfulExecutionMode::Entry, "core-entry")
+                | (UnlawfulExecutionMode::Entry, "hedge-probe")
+                | (UnlawfulExecutionMode::Entry, "early-probe")
+                | (UnlawfulExecutionMode::Manage, "add-hedge")
+                | (UnlawfulExecutionMode::Manage, "rebalance-core")
+                | (UnlawfulExecutionMode::Manage, "rebalance-flip")
+        )
+    }
 }
 
 impl Strategy for UnlawfulShearStrategy {
     fn name(&self) -> &str {
         "unlawful_shear"
+    }
+
+    fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
+        Some(UnlawfulShearStrategy::unlawful_gate_config(self))
     }
 
     fn on_market_snapshot(
@@ -1389,7 +2120,10 @@ impl Strategy for UnlawfulShearStrategy {
         }
 
         let (mut sides, last_action_ms) = {
-            let market_state = self.market_states.entry(snapshot.market_id.clone()).or_default();
+            let market_state = self
+                .market_states
+                .entry(snapshot.market_id.clone())
+                .or_default();
             let last_action_ms = market_state.last_action_ms.unwrap_or_default();
             market_state
                 .quotes
@@ -1418,7 +2152,8 @@ impl Strategy for UnlawfulShearStrategy {
             left_ask.total_cmp(&right_ask)
         });
         let (cheap_id, cheap_quote) = (&sides[0].0, &sides[0].1);
-        let (expensive_id, expensive_quote) = (&sides[sides.len() - 1].0, &sides[sides.len() - 1].1);
+        let (expensive_id, expensive_quote) =
+            (&sides[sides.len() - 1].0, &sides[sides.len() - 1].1);
         let Some(cheap_ask) = Self::best_ask(cheap_quote) else {
             return StrategyDecision::none();
         };
@@ -1430,11 +2165,19 @@ impl Strategy for UnlawfulShearStrategy {
         let cheap_position = self.position_state(&context.inventory, cheap_id);
         let expensive_position = self.position_state(&context.inventory, expensive_id);
 
-        let cheap_qty = cheap_position.map(|position| position.quantity).unwrap_or(0.0);
-        let cheap_avg = cheap_position.map(|position| position.avg_price).unwrap_or(0.0);
+        let cheap_qty = cheap_position
+            .map(|position| position.quantity)
+            .unwrap_or(0.0);
+        let cheap_avg = cheap_position
+            .map(|position| position.avg_price)
+            .unwrap_or(0.0);
         let cheap_cost = cheap_qty * cheap_avg;
-        let expensive_qty = expensive_position.map(|position| position.quantity).unwrap_or(0.0);
-        let expensive_avg = expensive_position.map(|position| position.avg_price).unwrap_or(0.0);
+        let expensive_qty = expensive_position
+            .map(|position| position.quantity)
+            .unwrap_or(0.0);
+        let expensive_avg = expensive_position
+            .map(|position| position.avg_price)
+            .unwrap_or(0.0);
         let expensive_cost = expensive_qty * expensive_avg;
         let paired = cheap_qty > 0.0 && expensive_qty > 0.0;
         let hedge_ratio = if expensive_cost > 0.0 {
@@ -1442,6 +2185,18 @@ impl Strategy for UnlawfulShearStrategy {
         } else {
             0.0
         };
+        let has_inventory = paired || cheap_qty > 0.0 || expensive_qty > 0.0;
+        let elapsed_s = self.window_elapsed_seconds(context);
+        let (mode, aggression, gate_reasons, signal_clip_scale) = self.signal_mode_and_aggression(
+            context,
+            elapsed_s,
+            has_inventory,
+            cheap_ask,
+            expensive_ask,
+            price_gap,
+        );
+        let aggression_clip_scale = self.aggression_clip_scale(aggression);
+        let buy_clip_scale = signal_clip_scale * aggression_clip_scale;
 
         let mut intents = Vec::new();
         let mut next_quote_seq = 0usize;
@@ -1452,8 +2207,10 @@ impl Strategy for UnlawfulShearStrategy {
         let progress = self.window_progress(context);
         let phase = self.determine_phase(context);
         let phase_clip_scale = self.phase_clip_scale(phase);
-        let salvage_phase = matches!(phase, UnlawfulShearPhase::Late | UnlawfulShearPhase::VeryLate)
-            || progress.is_none();
+        let salvage_phase = matches!(
+            phase,
+            UnlawfulShearPhase::Late | UnlawfulShearPhase::VeryLate
+        ) || progress.is_none();
         let mut notes = vec![format!(
             "market={} cheap={} ask={:.4} expensive={} ask={:.4} gap={:.4} hedge_ratio={:.4} progress={:?}",
             snapshot.market_id,
@@ -1465,11 +2222,21 @@ impl Strategy for UnlawfulShearStrategy {
             hedge_ratio,
             progress
         )];
+        notes.push(format!(
+            "unlawful gate mode={:?} aggression={:?} buy_clip_scale={:.3} market_has_inventory={}",
+            mode, aggression, buy_clip_scale, has_inventory
+        ));
+        let suppressed_by_gate_reasons = !gate_reasons.is_empty();
+        notes.extend(
+            gate_reasons
+                .into_iter()
+                .map(|reason| format!("unlawful gate reason: {reason}")),
+        );
 
         let expensive_bid = Self::best_bid(expensive_quote).unwrap_or(0.0);
         let cheap_bid = Self::best_bid(cheap_quote).unwrap_or(0.0);
-        let near_end = self.window_at_or_past_end(context)
-            || progress.is_some_and(|value| value >= 0.96);
+        let near_end =
+            self.window_at_or_past_end(context) || progress.is_some_and(|value| value >= 0.96);
         let close_fraction = self.fallback_close_fraction(phase, progress);
         if near_end {
             if let Some(market) = context.market_context.as_ref() {
@@ -1486,7 +2253,11 @@ impl Strategy for UnlawfulShearStrategy {
                                 next_quote_tag("close-cheap-inferred"),
                                 format!(
                                     "unlawful-shear end-window close winner={}",
-                                    if cheap_id == &winner_id { "cheap" } else { "loser" },
+                                    if cheap_id == &winner_id {
+                                        "cheap"
+                                    } else {
+                                        "loser"
+                                    },
                                 ),
                                 context.now_ms,
                             );
@@ -1641,8 +2412,14 @@ impl Strategy for UnlawfulShearStrategy {
             }
         }
 
-        let mut remaining_gross =
-            self.config.max_gross_cost_usd - self.gross_cost_usd(&context.inventory, &snapshot.market_id);
+        let mut remaining_gross = self.config.max_gross_cost_usd
+            - self.gross_cost_usd(&context.inventory, &snapshot.market_id);
+        let record_action_block = |action: &str, action_note: &str, notes: &mut Vec<String>| {
+            notes.push(format!(
+                "unlawful gate blocked action={} mode={:?} reason={}",
+                action, mode, action_note
+            ));
+        };
 
         let core_candidate = price_gap >= self.config.min_price_gap
             && expensive_ask >= self.config.core_price_min
@@ -1655,20 +2432,32 @@ impl Strategy for UnlawfulShearStrategy {
                 UnlawfulShearPhase::Early => self.config.probe_clip_usd.max(core_clip_base),
                 _ => core_clip_base,
             };
-            self.push_buy(
-                &mut intents,
-                &mut remaining_gross,
-                &snapshot.market_id,
-                expensive_id,
-                expensive_ask,
-                core_clip_usd,
-                next_quote_tag("core-entry"),
-                format!(
-                    "unlawful-shear core-entry gap={:.4} ask={:.4}",
-                    price_gap, expensive_ask
-                ),
-                context.now_ms,
-            );
+            if Self::can_launch_mode_action(mode, "core-entry") && buy_clip_scale > 0.0 {
+                self.push_buy(
+                    &mut intents,
+                    &mut remaining_gross,
+                    &snapshot.market_id,
+                    expensive_id,
+                    expensive_ask,
+                    core_clip_usd * buy_clip_scale,
+                    next_quote_tag("core-entry"),
+                    format!(
+                        "unlawful-shear core-entry gap={:.4} ask={:.4}",
+                        price_gap, expensive_ask
+                    ),
+                    context.now_ms,
+                );
+            } else {
+                record_action_block(
+                    "core-entry",
+                    if buy_clip_scale <= 0.0 {
+                        "zero clip scale"
+                    } else {
+                        "mode disallowed"
+                    },
+                    &mut notes,
+                );
+            }
         }
 
         if cheap_cost <= 0.0 && cheap_candidate {
@@ -1677,20 +2466,32 @@ impl Strategy for UnlawfulShearStrategy {
             } else {
                 (self.config.hedge_clip_usd * phase_clip_scale).min(self.config.hedge_clip_usd)
             };
-            self.push_buy(
-                &mut intents,
-                &mut remaining_gross,
-                &snapshot.market_id,
-                cheap_id,
-                cheap_ask,
-                hedge_probe_usd,
-                next_quote_tag("hedge-probe"),
-                format!(
-                    "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
-                    price_gap, cheap_ask
-                ),
-                context.now_ms,
-            );
+            if Self::can_launch_mode_action(mode, "hedge-probe") && buy_clip_scale > 0.0 {
+                self.push_buy(
+                    &mut intents,
+                    &mut remaining_gross,
+                    &snapshot.market_id,
+                    cheap_id,
+                    cheap_ask,
+                    hedge_probe_usd * buy_clip_scale,
+                    next_quote_tag("hedge-probe"),
+                    format!(
+                        "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
+                        price_gap, cheap_ask
+                    ),
+                    context.now_ms,
+                );
+            } else {
+                record_action_block(
+                    "hedge-probe",
+                    if buy_clip_scale <= 0.0 {
+                        "zero clip scale"
+                    } else {
+                        "mode disallowed"
+                    },
+                    &mut notes,
+                );
+            }
         }
 
         if paired {
@@ -1700,40 +2501,64 @@ impl Strategy for UnlawfulShearStrategy {
                     UnlawfulShearPhase::Late => self.config.hedge_clip_usd * 1.15,
                     _ => self.config.hedge_clip_usd * phase_clip_scale,
                 };
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                &snapshot.market_id,
-                cheap_id,
-                cheap_ask,
-                hedge_clip_usd,
-                next_quote_tag("add-hedge"),
-                format!(
-                    "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
-                    hedge_ratio, cheap_ask
-                ),
-                context.now_ms,
-                );
+                if Self::can_launch_mode_action(mode, "add-hedge") && buy_clip_scale > 0.0 {
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        cheap_id,
+                        cheap_ask,
+                        hedge_clip_usd * buy_clip_scale,
+                        next_quote_tag("add-hedge"),
+                        format!(
+                            "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
+                            hedge_ratio, cheap_ask
+                        ),
+                        context.now_ms,
+                    );
+                } else {
+                    record_action_block(
+                        "add-hedge",
+                        if buy_clip_scale <= 0.0 {
+                            "zero clip scale"
+                        } else {
+                            "mode disallowed"
+                        },
+                        &mut notes,
+                    );
+                }
             } else if hedge_ratio > self.config.target_hedge_ratio_max && core_candidate {
                 let rebalance_clip_usd = match phase {
                     UnlawfulShearPhase::VeryLate => self.config.rebalance_clip_usd * 1.35,
                     UnlawfulShearPhase::Late => self.config.rebalance_clip_usd * 1.2,
                     _ => self.config.rebalance_clip_usd * phase_clip_scale,
                 };
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                &snapshot.market_id,
-                expensive_id,
-                expensive_ask,
-                rebalance_clip_usd,
-                next_quote_tag("rebalance-core"),
-                format!(
-                    "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
-                    hedge_ratio, expensive_ask
-                ),
-                context.now_ms,
-                );
+                if Self::can_launch_mode_action(mode, "rebalance-core") && buy_clip_scale > 0.0 {
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        expensive_id,
+                        expensive_ask,
+                        rebalance_clip_usd * buy_clip_scale,
+                        next_quote_tag("rebalance-core"),
+                        format!(
+                            "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
+                            hedge_ratio, expensive_ask
+                        ),
+                        context.now_ms,
+                    );
+                } else {
+                    record_action_block(
+                        "rebalance-core",
+                        if buy_clip_scale <= 0.0 {
+                            "zero clip scale"
+                        } else {
+                            "mode disallowed"
+                        },
+                        &mut notes,
+                    );
+                }
             } else if core_candidate
                 && cheap_candidate
                 && price_gap >= self.config.min_price_gap * 1.5
@@ -1749,48 +2574,94 @@ impl Strategy for UnlawfulShearStrategy {
                 } else {
                     cheap_ask
                 };
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                &snapshot.market_id,
-                target_id,
-                target_price,
-                match phase {
-                    UnlawfulShearPhase::VeryLate => self.config.rebalance_clip_usd * 1.35,
-                    UnlawfulShearPhase::Late => self.config.rebalance_clip_usd * 1.2,
-                    _ => self.config.rebalance_clip_usd * phase_clip_scale,
-                },
-                next_quote_tag("rebalance-flip"),
-                format!(
-                    "unlawful-shear high-flip rebalance gap={:.4} target={}",
-                    price_gap, target_id
-                ),
-                context.now_ms,
-                );
+                if Self::can_launch_mode_action(mode, "rebalance-flip") && buy_clip_scale > 0.0 {
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        target_id,
+                        target_price,
+                        match phase {
+                            UnlawfulShearPhase::VeryLate => {
+                                self.config.rebalance_clip_usd * 1.35 * buy_clip_scale
+                            }
+                            UnlawfulShearPhase::Late => {
+                                self.config.rebalance_clip_usd * 1.2 * buy_clip_scale
+                            }
+                            _ => self.config.rebalance_clip_usd * phase_clip_scale * buy_clip_scale,
+                        },
+                        next_quote_tag("rebalance-flip"),
+                        format!(
+                            "unlawful-shear high-flip rebalance gap={:.4} target={}",
+                            price_gap, target_id
+                        ),
+                        context.now_ms,
+                    );
+                } else {
+                    record_action_block(
+                        "rebalance-flip",
+                        if buy_clip_scale <= 0.0 {
+                            "zero clip scale"
+                        } else {
+                            "mode disallowed"
+                        },
+                        &mut notes,
+                    );
+                }
             }
         } else if cheap_candidate
             && cheap_cost <= 0.0
-            && !intents.iter().any(|intent| {
-                intent.side == TradeSide::Buy && intent.instrument_id == *cheap_id
-            })
+            && !intents
+                .iter()
+                .any(|intent| intent.side == TradeSide::Buy && intent.instrument_id == *cheap_id)
         {
-            self.push_buy(
-                &mut intents,
-                &mut remaining_gross,
-                &snapshot.market_id,
-                cheap_id,
-                cheap_ask,
-                (self.config.probe_clip_usd * phase_clip_scale).max(1.0),
-                next_quote_tag("early-probe"),
-                format!(
-                    "unlawful-shear early-probe ask={:.4} gap={:.4}",
-                    cheap_ask, price_gap
-                ),
-                context.now_ms,
-            );
+            if Self::can_launch_mode_action(mode, "early-probe") && buy_clip_scale > 0.0 {
+                self.push_buy(
+                    &mut intents,
+                    &mut remaining_gross,
+                    &snapshot.market_id,
+                    cheap_id,
+                    cheap_ask,
+                    (self.config.probe_clip_usd * phase_clip_scale).max(1.0) * buy_clip_scale,
+                    next_quote_tag("early-probe"),
+                    format!(
+                        "unlawful-shear early-probe ask={:.4} gap={:.4}",
+                        cheap_ask, price_gap
+                    ),
+                    context.now_ms,
+                );
+            } else {
+                record_action_block(
+                    "early-probe",
+                    if buy_clip_scale <= 0.0 {
+                        "zero clip scale"
+                    } else {
+                        "mode disallowed"
+                    },
+                    &mut notes,
+                );
+            }
         }
 
         if intents.is_empty() {
+            let suppression_mode = matches!(
+                mode,
+                UnlawfulExecutionMode::Standby
+                    | UnlawfulExecutionMode::Cleanup
+                    | UnlawfulExecutionMode::Flatten
+            );
+            let suppression_due_to_scaling = buy_clip_scale <= 0.0
+                && (matches!(
+                    mode,
+                    UnlawfulExecutionMode::Entry | UnlawfulExecutionMode::Manage
+                ));
+            if suppressed_by_gate_reasons || suppression_mode || suppression_due_to_scaling {
+                notes.push(format!(
+                    "unlawful gate suppressed market mode={:?} actions_blocked",
+                    mode
+                ));
+                return StrategyDecision { intents, notes };
+            }
             return StrategyDecision::none();
         }
 
@@ -1886,6 +2757,13 @@ fn env_or_profile_usize(key: &str, profile: Option<usize>, default: usize) -> us
         .unwrap_or(profile.unwrap_or(default))
 }
 
+fn env_or_profile_bool(key: &str, profile: Option<bool>, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .and_then(|raw| raw.parse::<bool>().ok())
+        .unwrap_or(profile.unwrap_or(default))
+}
+
 fn env_or_profile_u64(key: &str, profile: Option<u64>, default: u64) -> u64 {
     env::var(key)
         .ok()
@@ -1893,14 +2771,54 @@ fn env_or_profile_u64(key: &str, profile: Option<u64>, default: u64) -> u64 {
         .unwrap_or(profile.unwrap_or(default))
 }
 
+fn sorted_unique_u32_vec(mut values: Vec<u32>) -> Vec<u32> {
+    values.retain(|value| *value < 24);
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn normalize_unlawful_invariants(mut config: UnlawfulShearConfig) -> UnlawfulShearConfig {
+    config.regime_primary_hours_utc = sorted_unique_u32_vec(config.regime_primary_hours_utc);
+    if config.regime_primary_hours_utc.is_empty() {
+        config.regime_primary_hours_utc = vec![10, 11, 19, 22, 23];
+    }
+
+    config.regime_secondary_hours_utc = sorted_unique_u32_vec(config.regime_secondary_hours_utc);
+    if config.regime_secondary_hours_utc.is_empty() {
+        config.regime_secondary_hours_utc = vec![0, 9, 12, 20, 21];
+    }
+
+    config.entry_window_seconds = config.entry_window_seconds.max(1);
+    config.cleanup_start_seconds = config
+        .cleanup_start_seconds
+        .max(config.entry_window_seconds.saturating_add(1));
+    config.close_start_seconds = config
+        .close_start_seconds
+        .max(config.cleanup_start_seconds.saturating_add(1));
+
+    config.merge_stall_seconds = config.merge_stall_seconds.max(1);
+    config.entry_book_max_age_ms = config.entry_book_max_age_ms.max(1);
+    config.entry_btc_signal_max_age_ms = config.entry_btc_signal_max_age_ms.max(1);
+
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        BtcRegimeSnapshot, MarketActivitySignal, PairedBookSignal, SessionBucket,
+        UnlawfulAggressionTier, UnlawfulExecutionMode, UnlawfulShearConfig, UnlawfulShearStrategy,
+        UnlawfulSignalSnapshot,
+    };
+    use super::{
         GoatPairConfig, GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext,
-        StrategyDecision, UnlawfulShearConfig, UnlawfulShearStrategy,
+        StrategyDecision,
     };
     use crate::inventory::{InventorySnapshot, PositionState};
-    use crate::types::{BookLevel, InstrumentId, MarketId, MarketSnapshot, RuntimeStatus, TradeSide};
+    use crate::types::{
+        BookLevel, InstrumentId, MarketId, MarketSnapshot, RuntimeStatus, TradeSide,
+    };
 
     fn snapshot(asset: &str, market: &str, bid: f64, ask: f64, ts: u64) -> MarketSnapshot {
         MarketSnapshot {
@@ -1916,8 +2834,16 @@ mod tests {
     }
 
     fn context(positions: Vec<PositionState>) -> StrategyContext {
+        context_with_unlawful_signal(positions, 10, None)
+    }
+
+    fn context_with_unlawful_signal(
+        positions: Vec<PositionState>,
+        now_ms: u64,
+        unlawful_signal: Option<UnlawfulSignalSnapshot>,
+    ) -> StrategyContext {
         StrategyContext {
-            now_ms: 10,
+            now_ms,
             runtime_status: RuntimeStatus::Running,
             inventory: InventorySnapshot {
                 free_cash_usd: 1_000.0,
@@ -1932,15 +2858,79 @@ mod tests {
             },
             open_orders_total: 0,
             market_context: None,
+            unlawful_signal,
         }
+    }
+
+    fn unlawful_signal_snapshot(
+        mode: UnlawfulExecutionMode,
+        clip_scale: f64,
+        now_ms: u64,
+    ) -> UnlawfulSignalSnapshot {
+        UnlawfulSignalSnapshot {
+            session_bucket: SessionBucket::Preferred,
+            mode,
+            gate_reasons: vec!["unlawful test signal".to_string()],
+            btc: BtcRegimeSnapshot {
+                last_price: Some(50_000.0),
+                realized_vol_5m_bps: Some(6.0),
+                realized_vol_15m_bps: Some(12.0),
+                trade_count_5m: 9_000,
+                trade_count_15m: 9_000,
+                return_30s_bps: Some(0.0),
+                return_60s_bps: Some(0.0),
+                observed_at_ms: now_ms,
+            },
+            book: PairedBookSignal::with_ids(
+                InstrumentId::from("down"),
+                InstrumentId::from("up"),
+                Some(BookLevel::new(0.24, 1_000.0)),
+                Some(BookLevel::new(0.24, 1_000.0)),
+                Some(BookLevel::new(0.65, 1_000.0)),
+                Some(BookLevel::new(0.65, 1_000.0)),
+                now_ms,
+                true,
+            ),
+            activity: MarketActivitySignal::default(),
+            first_fill_ms: None,
+            first_merge_ms: None,
+            elapsed_s: None,
+            time_remaining_s: None,
+            clip_scale,
+        }
+    }
+
+    fn unlawful_shear_test_config() -> UnlawfulShearConfig {
+        let mut cfg = UnlawfulShearConfig::from_env();
+        cfg.cheap_hedge_price_max = 0.40;
+        cfg.core_price_min = 0.50;
+        cfg.core_price_max = 0.95;
+        cfg.min_price_gap = 0.10;
+        cfg.probe_clip_usd = 10.0;
+        cfg.core_clip_usd = 35.0;
+        cfg.hedge_clip_usd = 15.0;
+        cfg.rebalance_clip_usd = 20.0;
+        cfg.trim_clip_fraction = 0.25;
+        cfg.max_gross_cost_usd = 120.0;
+        cfg.target_hedge_ratio_min = 0.20;
+        cfg.target_hedge_ratio_max = 0.60;
+        cfg.salvage_drawdown_ratio = 0.20;
+        cfg.salvage_bid_floor = 0.05;
+        cfg.max_open_orders_total = 8;
+        cfg.taker_fee_coeff = 0.072;
+        cfg
     }
 
     #[test]
     fn noop_stays_idle() {
         let mut strategy = NoopStrategy;
-        let decision =
-            strategy.on_market_snapshot(&context(Vec::new()), &snapshot("token-up", "market", 0.4, 0.5, 1));
-        assert!(matches!(decision, StrategyDecision { intents: ref i, notes: ref n } if i.is_empty() && n.is_empty()));
+        let decision = strategy.on_market_snapshot(
+            &context(Vec::new()),
+            &snapshot("token-up", "market", 0.4, 0.5, 1),
+        );
+        assert!(
+            matches!(decision, StrategyDecision { intents: ref i, notes: ref n } if i.is_empty() && n.is_empty())
+        );
     }
 
     #[test]
@@ -1958,9 +2948,14 @@ mod tests {
             },
             0,
         );
-        strategy.on_market_snapshot(&context(Vec::new()), &snapshot("up", "market-a", 0.5, 0.5, 10));
-        let decision =
-            strategy.on_market_snapshot(&context(Vec::new()), &snapshot("down", "market-a", 0.5, 0.52, 10));
+        strategy.on_market_snapshot(
+            &context(Vec::new()),
+            &snapshot("up", "market-a", 0.5, 0.5, 10),
+        );
+        let decision = strategy.on_market_snapshot(
+            &context(Vec::new()),
+            &snapshot("down", "market-a", 0.5, 0.52, 10),
+        );
         assert!(!matches!(decision, StrategyDecision { intents: ref i, .. } if i.is_empty()));
     }
 
@@ -1984,9 +2979,13 @@ mod tests {
         strategy.quote_inventory_skew_bps = 25.0;
         let ctx = context(Vec::new());
         strategy.on_market_snapshot(&ctx, &snapshot("up", "market-b", 0.50, 0.50, 10));
-        let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-b", 0.50, 0.52, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-b", 0.50, 0.52, 10));
         assert_eq!(decision.intents.len(), 3);
-        assert!(decision.intents.iter().all(|intent| intent.side == TradeSide::Buy));
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| intent.side == TradeSide::Buy));
         assert!(decision
             .intents
             .windows(2)
@@ -1995,58 +2994,31 @@ mod tests {
 
     #[test]
     fn unlawful_shear_builds_core_and_hedge() {
-        let mut strategy = UnlawfulShearStrategy::new(
-            UnlawfulShearConfig {
-                cheap_hedge_price_max: 0.40,
-                core_price_min: 0.50,
-                core_price_max: 0.95,
-                min_price_gap: 0.10,
-                probe_clip_usd: 10.0,
-                core_clip_usd: 35.0,
-                hedge_clip_usd: 15.0,
-                rebalance_clip_usd: 20.0,
-                trim_clip_fraction: 0.25,
-                max_gross_cost_usd: 120.0,
-                target_hedge_ratio_min: 0.20,
-                target_hedge_ratio_max: 0.60,
-                salvage_drawdown_ratio: 0.20,
-                salvage_bid_floor: 0.05,
-                max_open_orders_total: 8,
-                taker_fee_coeff: 0.072,
-            },
-            0,
+        let mut strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let ctx = context_with_unlawful_signal(
+            Vec::new(),
+            10,
+            Some(unlawful_signal_snapshot(
+                UnlawfulExecutionMode::Entry,
+                1.0,
+                10,
+            )),
         );
-        let ctx = context(Vec::new());
         strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10));
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
         assert_eq!(decision.intents.len(), 2);
-        assert!(decision.intents.iter().any(|intent| intent.side == TradeSide::Buy));
+        assert!(decision
+            .intents
+            .iter()
+            .any(|intent| intent.side == TradeSide::Buy));
     }
 
     #[test]
     fn unlawful_shear_salvages_losing_leg() {
-        let mut strategy = UnlawfulShearStrategy::new(
-            UnlawfulShearConfig {
-                cheap_hedge_price_max: 0.40,
-                core_price_min: 0.50,
-                core_price_max: 0.95,
-                min_price_gap: 0.10,
-                probe_clip_usd: 10.0,
-                core_clip_usd: 35.0,
-                hedge_clip_usd: 15.0,
-                rebalance_clip_usd: 20.0,
-                trim_clip_fraction: 0.25,
-                max_gross_cost_usd: 120.0,
-                target_hedge_ratio_min: 0.20,
-                target_hedge_ratio_max: 0.60,
-                salvage_drawdown_ratio: 0.15,
-                salvage_bid_floor: 0.05,
-                max_open_orders_total: 8,
-                taker_fee_coeff: 0.072,
-            },
-            0,
-        );
+        let mut config = unlawful_shear_test_config();
+        config.salvage_drawdown_ratio = 0.15;
+        let mut strategy = UnlawfulShearStrategy::new(config, 0);
         let positions = vec![
             PositionState {
                 market_id: MarketId::from("market-a"),
@@ -2073,5 +3045,163 @@ mod tests {
             .intents
             .iter()
             .any(|intent| intent.side == TradeSide::Sell && intent.reduce_only));
+    }
+
+    #[test]
+    fn unlawful_shear_mode_action_rules_are_deterministic() {
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Entry,
+            "core-entry"
+        ));
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Entry,
+            "hedge-probe"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Entry,
+            "add-hedge"
+        ));
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Manage,
+            "rebalance-core"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Manage,
+            "core-entry"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Cleanup,
+            "core-entry"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            UnlawfulExecutionMode::Flatten,
+            "hedge-probe"
+        ));
+    }
+
+    #[test]
+    fn unlawful_shear_signal_mode_entry_allows_core_and_hedge_actions_only() {
+        let strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let (mode, _, _, clip_scale) = strategy.signal_mode_and_aggression(
+            &context_with_unlawful_signal(
+                Vec::new(),
+                10_000,
+                Some(unlawful_signal_snapshot(
+                    UnlawfulExecutionMode::Entry,
+                    1.0,
+                    10_000,
+                )),
+            ),
+            Some(10),
+            false,
+            0.38,
+            0.64,
+            0.26,
+        );
+
+        assert_eq!(mode, UnlawfulExecutionMode::Entry);
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "core-entry"
+        ));
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "hedge-probe"
+        ));
+        assert_eq!(clip_scale, 0.6);
+    }
+
+    #[test]
+    fn unlawful_shear_signal_mode_manage_stays_aggressive_and_no_entry_actions() {
+        let strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let (mode, aggression, _reasons, clip_scale) = strategy.signal_mode_and_aggression(
+            &context_with_unlawful_signal(
+                Vec::new(),
+                10_000,
+                Some(unlawful_signal_snapshot(
+                    UnlawfulExecutionMode::Manage,
+                    1.0,
+                    10_000,
+                )),
+            ),
+            Some(40),
+            true,
+            0.38,
+            0.64,
+            0.26,
+        );
+
+        assert_eq!(mode, UnlawfulExecutionMode::Manage);
+        assert_ne!(aggression, UnlawfulAggressionTier::Suppressed);
+        assert!(clip_scale > 0.0);
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "core-entry"
+        ));
+        assert!(UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "add-hedge"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "early-probe"
+        ));
+    }
+
+    #[test]
+    fn unlawful_shear_signal_mode_standby_blocks_buys() {
+        let strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let (mode, aggression, _reasons, clip_scale) = strategy.signal_mode_and_aggression(
+            &context_with_unlawful_signal(
+                Vec::new(),
+                10_000,
+                Some(unlawful_signal_snapshot(
+                    UnlawfulExecutionMode::Standby,
+                    0.2,
+                    10_000,
+                )),
+            ),
+            Some(5),
+            false,
+            0.38,
+            0.64,
+            0.26,
+        );
+
+        assert_eq!(mode, UnlawfulExecutionMode::Standby);
+        assert_eq!(aggression, UnlawfulAggressionTier::Suppressed);
+        assert_eq!(clip_scale, 0.0);
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "core-entry"
+        ));
+        assert!(!UnlawfulShearStrategy::can_launch_mode_action(
+            mode,
+            "rebalance-core"
+        ));
+    }
+
+    #[test]
+    fn unlawful_shear_signal_reason_and_aggression_logged_in_decision_notes() {
+        let mut strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let mut signal = unlawful_signal_snapshot(UnlawfulExecutionMode::Entry, 1.0, 10_000);
+        signal.gate_reasons = vec![
+            "unit-test gate reason: entry geometry valid".to_string(),
+            "unit-test gate reason: synthetic invariant".to_string(),
+        ];
+
+        let ctx = context_with_unlawful_signal(Vec::new(), 10_000, Some(signal));
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10_000));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10_000));
+
+        let notes_blob = decision.notes.join("|");
+        assert!(notes_blob.contains("unlawful gate mode=Entry"));
+        assert!(notes_blob.contains("aggression=Press"));
+        assert!(notes_blob
+            .contains("unlawful gate reason: unit-test gate reason: entry geometry valid"));
+        assert!(
+            notes_blob.contains("unlawful gate reason: unit-test gate reason: synthetic invariant")
+        );
     }
 }

@@ -89,7 +89,8 @@ pub fn load_user_auth() -> Option<UserWsAuth> {
     let api_key = env::var("POLYMARKET_API_KEY").ok()?;
     let api_secret = env::var("POLYMARKET_API_SECRET").ok()?;
     let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok()?;
-    if api_key.trim().is_empty() || api_secret.trim().is_empty() || api_passphrase.trim().is_empty() {
+    if api_key.trim().is_empty() || api_secret.trim().is_empty() || api_passphrase.trim().is_empty()
+    {
         return None;
     }
     Some(UserWsAuth {
@@ -101,7 +102,11 @@ pub fn load_user_auth() -> Option<UserWsAuth> {
 
 pub fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
     let mut mapping = HashMap::new();
-    for pair in raw.split(',').map(str::trim).filter(|pair| !pair.is_empty()) {
+    for pair in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
         let (asset_id, market_id) = pair
             .split_once(':')
             .with_context(|| {
@@ -157,4 +162,3 @@ mod tests {
         assert!(parse_asset_market_map("token-up").is_err());
     }
 }
-

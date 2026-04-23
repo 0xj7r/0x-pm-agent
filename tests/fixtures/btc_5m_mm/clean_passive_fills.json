@@ -29,7 +29,18 @@
           "quantity": 10.0,
           "reduce_only": false,
           "reason": "passive-buy-up"
-        },
+        }
+      ]
+    },
+    {
+      "type": "snapshot",
+      "at_ms": 1001,
+      "instrument_id": "down-token",
+      "market_id": "btc-5m",
+      "best_bid": { "price": 0.39, "quantity": 100.0 },
+      "best_ask": { "price": 0.40, "quantity": 120.0 },
+      "last_trade_price": 0.40,
+      "decisions": [
         {
           "client_order_id": "clean-passive-down",
           "instrument_id": "down-token",
