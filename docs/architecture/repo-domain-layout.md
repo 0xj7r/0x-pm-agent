@@ -9,14 +9,17 @@ compatibility links at legacy paths.
   - `execution/clients`
   - `execution/core`
   - `execution/models`
+  - `execution/config.py`
   - `execution/shared`
   - `execution/strategies`
   - `execution/rust`
   - `execution/bots`
   - `execution/whale_pair`
   - `execution/main.py`
+  - `execution/strategy_config.json`
 - Compatibility:
-  - `clients`, `core`, `models`, `shared`, `strategies`, `rust`, `main.py`
+  - `clients`, `core`, `models`, `config.py`, `shared`, `strategies`,
+    `rust`, `main.py`, `strategy_config.json`
     are symlinks to `execution/*`
   - `scripts/bots` and `scripts/whale_pair` remain compatibility wrappers
     and point into `execution/`
