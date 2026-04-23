@@ -18,6 +18,7 @@ backtesting/features/
 backtesting/eval/features/
 backtesting/*.html
 backtesting/weather/
+research/backtesting/weather/
 autoresearch/candidates/
 data/wallet_research/history_*/
 data/wallet_research/*/activity_windows/
