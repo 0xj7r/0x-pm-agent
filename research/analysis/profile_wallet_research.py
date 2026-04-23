@@ -21,6 +21,7 @@ from statistics import mean
 
 import httpx
 
+from research.wallet_aliases import wallet_dir_name
 from scripts.join_wallet_to_market_state import main as join_main
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,9 +100,9 @@ def build_args() -> argparse.Namespace:
 def main() -> None:
     args = build_args()
     wallet = args.wallet.lower()
-    last6 = wallet[-6:]
-    label = args.label or last6
-    wallet_dir = OUT / last6
+    dir_name = wallet_dir_name(wallet)
+    label = args.label or dir_name
+    wallet_dir = OUT / dir_name
 
     activity = fetch_json(
         "https://data-api.polymarket.com/activity",

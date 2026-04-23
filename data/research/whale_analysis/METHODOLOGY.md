@@ -43,7 +43,7 @@ Wallets used in this dataset:
 
 ## 2. Activity rows — `data-api.polymarket.com`
 
-Endpoint used to populate `activity_<last6>.json`:
+Endpoint used to populate `<wallet-dir>/activity.json`:
 
 ```
 GET https://data-api.polymarket.com/activity
@@ -102,7 +102,7 @@ while True:
 ## 3. P&L time series — `user-pnl-api.polymarket.com`
 
 This is the **authoritative** long-horizon P&L source; it's what renders the
-profile P&L chart. Populates `pnl_timeseries_<last6>.json`.
+profile P&L chart. Populates `<wallet-dir>/pnl_timeseries.json`.
 
 ```
 GET https://user-pnl-api.polymarket.com/user-pnl
@@ -134,9 +134,9 @@ GET https://data-api.polymarket.com/value?user=<wallet>
 
 | File | Source | Notes |
 |------|--------|-------|
-| `activity_<last6>.json` | `/activity` endpoint | Up to 3500 newest rows |
-| `pnl_timeseries_<last6>.json` | `/user-pnl` endpoint | Full-history hourly |
-| `daily_pnl_<last6>.json` | derived from above | EOD UTC snapshots |
+| `<wallet-dir>/activity.json` | `/activity` endpoint | Up to 3500 newest rows |
+| `<wallet-dir>/pnl_timeseries.json` | `/user-pnl` endpoint | Full-history hourly |
+| `<wallet-dir>/daily_pnl.json` | derived from above | EOD UTC snapshots |
 | `comparison.json` | derived | Aggregate stats across wallets |
 
 Scripts used:

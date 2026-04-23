@@ -18,10 +18,10 @@ Expected pnl JSON schema:
 
 Usage:
     python scripts/whale_pair_w1_report.py \\
-    --activity-json data/research/whale_analysis/8b5b82/activity.json \\
-    --pnl-json data/research/whale_analysis/8b5b82/pnl_timeseries.json \\
+    --activity-json data/research/whale_analysis/unlawful-shear/activity.json \\
+    --pnl-json data/research/whale_analysis/unlawful-shear/pnl_timeseries.json \\
     --db backtesting/btc.db \\
-    --output data/research/whale_analysis/8b5b82/comparison.json
+    --output data/research/whale_analysis/unlawful-shear/comparison.json
 """
 from __future__ import annotations
 
@@ -132,11 +132,11 @@ def main() -> None:
     ap.add_argument("--db", default="backtesting/btc.db")
     ap.add_argument(
         "--activity-json",
-        default="data/research/whale_analysis/8b5b82/activity.json",
+        default="data/research/whale_analysis/unlawful-shear/activity.json",
     )
     ap.add_argument(
         "--pnl-json",
-        default="data/research/whale_analysis/8b5b82/pnl_timeseries.json",
+        default="data/research/whale_analysis/unlawful-shear/pnl_timeseries.json",
     )
     ap.add_argument("--output", default="")
     ap.add_argument("--accumulate-price-max", type=float, default=0.50)

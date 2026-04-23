@@ -2,8 +2,8 @@
   "wallets": [
     {
       "wallet": "0x7da07b2a8b009a406198677debda46ad651b6be2",
-      "suffix": "1b6be2",
-      "pseudonym": "Dimpled-Dill",
+      "suffix": "penny-tail",
+      "pseudonym": "penny-tail",
       "rows": 3500,
       "trade_rows": 3492,
       "type_counts": {
@@ -15,7 +15,7 @@
     },
     {
       "wallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
-      "suffix": "8b5b82",
+      "suffix": "unlawful-shear",
       "pseudonym": "Unlawful-Shear",
       "rows": 3500,
       "trade_rows": 3291,
@@ -29,8 +29,8 @@
     },
     {
       "wallet": "0xcfb103c37c0234f524c632d964ed31f117b5f694",
-      "suffix": "b5f694",
-      "pseudonym": "Little-Fraction",
+      "suffix": "xuanxuan008",
+      "pseudonym": "xuanxuan008",
       "rows": 3500,
       "trade_rows": 2944,
       "type_counts": {
@@ -43,8 +43,8 @@
     },
     {
       "wallet": "0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad",
-      "suffix": "f73cad",
-      "pseudonym": "f73cad",
+      "suffix": "split-sell",
+      "pseudonym": "SPLIT/SELL",
       "rows": 3500,
       "trade_rows": 1090,
       "type_counts": {
@@ -61,7 +61,7 @@
     {
       "left_wallet": "0x7da07b2a8b009a406198677debda46ad651b6be2",
       "right_wallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
-      "left_label": "Dimpled-Dill",
+      "left_label": "penny-tail",
       "right_label": "Unlawful-Shear",
       "shared_slugs": 12,
       "shared_condition_ids": 13,
@@ -73,8 +73,8 @@
     {
       "left_wallet": "0x7da07b2a8b009a406198677debda46ad651b6be2",
       "right_wallet": "0xcfb103c37c0234f524c632d964ed31f117b5f694",
-      "left_label": "Dimpled-Dill",
-      "right_label": "Little-Fraction",
+      "left_label": "penny-tail",
+      "right_label": "xuanxuan008",
       "shared_slugs": 69,
       "shared_condition_ids": 69,
       "slug_jaccard": 0.12683823529411764,
@@ -85,8 +85,8 @@
     {
       "left_wallet": "0x7da07b2a8b009a406198677debda46ad651b6be2",
       "right_wallet": "0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad",
-      "left_label": "Dimpled-Dill",
-      "right_label": "f73cad",
+      "left_label": "penny-tail",
+      "right_label": "SPLIT/SELL",
       "shared_slugs": 11,
       "shared_condition_ids": 77,
       "slug_jaccard": 0.020793950850661626,
@@ -98,7 +98,7 @@
       "left_wallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
       "right_wallet": "0xcfb103c37c0234f524c632d964ed31f117b5f694",
       "left_label": "Unlawful-Shear",
-      "right_label": "Little-Fraction",
+      "right_label": "xuanxuan008",
       "shared_slugs": 12,
       "shared_condition_ids": 12,
       "slug_jaccard": 0.05217391304347826,
@@ -110,7 +110,7 @@
       "left_wallet": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
       "right_wallet": "0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad",
       "left_label": "Unlawful-Shear",
-      "right_label": "f73cad",
+      "right_label": "SPLIT/SELL",
       "shared_slugs": 0,
       "shared_condition_ids": 13,
       "slug_jaccard": 0.0,
@@ -121,8 +121,8 @@
     {
       "left_wallet": "0xcfb103c37c0234f524c632d964ed31f117b5f694",
       "right_wallet": "0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad",
-      "left_label": "Little-Fraction",
-      "right_label": "f73cad",
+      "left_label": "xuanxuan008",
+      "right_label": "SPLIT/SELL",
       "shared_slugs": 21,
       "shared_condition_ids": 177,
       "slug_jaccard": 0.05737704918032787,

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import httpx
 
+from research.wallet_aliases import wallet_dir_name
+
 WALLETS = [
     ("Unlawful-Shear (w1)", "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82"),
     ("xuanxuan008 (w2)",    "0xcfb103c37c0234f524c632d964ed31f117b5f694"),
@@ -93,18 +95,15 @@ def summarize(wallet: str, label: str, series: list[dict]) -> dict:
 def main() -> None:
     comparison = []
     for label, wallet in WALLETS:
-        last6 = wallet[-6:]
-        wallet_dir = OUT / last6
+        dir_name = wallet_dir_name(wallet)
+        wallet_dir = OUT / dir_name
         wallet_dir.mkdir(parents=True, exist_ok=True)
         print(f"Fetching P&L for {label} ({wallet})...")
         series = fetch_pnl(wallet)
         (wallet_dir / "pnl_timeseries.json").write_text(json.dumps(series, indent=2))
         (wallet_dir / "daily_pnl.json").write_text(json.dumps(daily_eod(series), indent=2))
         # Copy the activity file if it exists.
-        act_candidates = [
-            wallet_dir / "activity.json",
-            ROOT / "data" / f"whale_activity_{last6}.json",
-        ]
+        act_candidates = [wallet_dir / "activity.json"]
         act = next((c for c in act_candidates if c.exists()), None)
         if act is not None:
             shutil.copy(act, wallet_dir / "activity.json")

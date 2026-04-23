@@ -29,6 +29,8 @@ from typing import Any
 
 import httpx
 
+from research.wallet_aliases import wallet_dir_name
+
 DATA_API = "https://data-api.polymarket.com"
 ROOT = Path(__file__).resolve().parent.parent
 OUT_ROOT = ROOT / "data" / "wallet_research"
@@ -348,7 +350,7 @@ def build_args() -> argparse.Namespace:
 def main() -> None:
     args = build_args()
     wallet = args.wallet.lower()
-    label = args.label or wallet[-6:]
+    label = args.label or wallet_dir_name(wallet)
     start = parse_date(args.start_date)
     end = parse_date(args.end_date)
     out_dir = OUT_ROOT / f"history_{label}"
