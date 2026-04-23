@@ -216,6 +216,7 @@ async def test_sweep_blind_redeem_failure_is_recorded():
     fake_redeem = AsyncMock(side_effect=RuntimeError("rpc down"))
     balances = {}
     with _patch_balances(r, balances), \
+<<<<<<< HEAD:tests/execution/test_redemption_sweep.py
         patch.object(r, "redeem", fake_redeem):
         results = await r.sweep_wallet([
             {"condition_id": COND_A},  # no token_id
