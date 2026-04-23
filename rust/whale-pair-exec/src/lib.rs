@@ -1,6 +1,7 @@
 pub mod book;
 pub mod config;
 pub mod event_log;
+pub mod config_parser;
 pub mod inventory;
 pub mod journal;
 pub mod logging;
@@ -9,6 +10,7 @@ pub mod metrics;
 pub mod risk;
 pub mod runtime_types;
 pub mod runtime;
+pub mod runner;
 pub mod strategy;
 pub mod types;
 pub mod user_ws;
