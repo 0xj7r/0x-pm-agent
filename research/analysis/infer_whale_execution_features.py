@@ -2,7 +2,7 @@
 
 Usage:
   python3 scripts/infer_whale_execution_features.py --wallet 0xb27bc9...
-  python3 scripts/infer_whale_execution_features.py --joined data/wallet_research/8b5b82_market_join.json
+  python3 scripts/infer_whale_execution_features.py --joined data/research/wallet_research/8b5b82/market_join.json
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.join_wallet_to_market_state import main as join_main
 
-OUT = ROOT / "data" / "wallet_research"
+OUT = ROOT / "data" / "research" / "wallet_research"
 
 
 def _distance(fill: float | None, touch: float | None) -> float | None:
@@ -165,7 +165,11 @@ def resolve_joined_path(wallet: str | None, joined_path: str | None) -> Path:
     if not wallet:
         raise SystemExit("Either --wallet or --joined is required")
     last6 = wallet.lower()[-6:]
-    candidate = OUT / f"{last6}_market_join.json"
+    candidates = [OUT / last6 / "market_join.json", OUT / last6 / "live_market_join.json"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    candidate = OUT / last6 / f"{last6}_market_join.json"
     if candidate.exists():
         return candidate
     raise SystemExit(f"Could not find joined market-state file for wallet suffix {last6}")
@@ -201,7 +205,8 @@ def main() -> None:
     summary = summarize(enriched)
 
     wallet_suffix = args.wallet.lower()[-6:] if args.wallet else joined_path.stem.split("_")[0]
-    output_path = Path(args.output) if args.output else OUT / f"{wallet_suffix}_execution_features.json"
+    wallet_dir = OUT / wallet_suffix
+    output_path = Path(args.output) if args.output else wallet_dir / "execution_features.json"
     output = {
         "source_joined_file": str(joined_path),
         "summary": summary,

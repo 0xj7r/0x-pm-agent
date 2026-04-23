@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-WHALE_DIR = ROOT / "data" / "whale_analysis"
-OUT = ROOT / "data" / "wallet_research"
+WHALE_DIR = ROOT / "data" / "research" / "whale_analysis"
+OUT = ROOT / "data" / "research" / "wallet_research"
 
 
 @dataclass(frozen=True)
@@ -44,7 +44,12 @@ class WalletProfile:
 
 def load_profiles() -> list[WalletProfile]:
     profiles: list[WalletProfile] = []
-    for activity_path in sorted(WHALE_DIR.glob("activity_*.json")):
+    for wallet_dir in sorted(WHALE_DIR.iterdir()):
+        if not wallet_dir.is_dir():
+            continue
+        activity_path = wallet_dir / "activity.json"
+        if not activity_path.exists():
+            continue
         rows = json.loads(activity_path.read_text())
         if not rows:
             continue
@@ -52,7 +57,7 @@ def load_profiles() -> list[WalletProfile]:
         wallet = str(first.get("proxyWallet") or "").lower()
         if not wallet:
             continue
-        suffix = activity_path.stem.replace("activity_", "")
+        suffix = wallet_dir.name
         profiles.append(
             WalletProfile(
                 wallet=wallet,

@@ -1,8 +1,8 @@
 """Layer-1 validation: can we reproduce w1's P&L from his activity data?
 
 Inputs:
-  - data/whale_analysis/activity_8b5b82.json  (3500 newest activity rows)
-  - data/whale_analysis/pnl_timeseries_8b5b82.json  (hourly user-pnl from Polymarket)
+  - data/research/whale_analysis/8b5b82/activity.json  (3500 newest activity rows)
+  - data/research/whale_analysis/8b5b82/pnl_timeseries.json  (hourly user-pnl from Polymarket)
 
 Model (our thesis of w1's edge):
   - BUY cost:    sum(usdcSize) for TRADE BUYs
@@ -28,9 +28,9 @@ from statistics import median
 
 import httpx
 
-DATA = Path(__file__).parent.parent / "data" / "whale_analysis"
-ACT_PATH = DATA / "activity_8b5b82.json"
-PNL_PATH = DATA / "pnl_timeseries_8b5b82.json"
+DATA = Path(__file__).parent.parent / "data" / "research" / "whale_analysis" / "8b5b82"
+ACT_PATH = DATA / "activity.json"
+PNL_PATH = DATA / "pnl_timeseries.json"
 GAMMA = "https://gamma-api.polymarket.com"
 
 

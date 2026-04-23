@@ -31,7 +31,7 @@ POLYGON_CHAIN_ID = "137"
 USDC_E_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 DEFAULT_WALLET = "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82"
 ROOT = Path(__file__).resolve().parent.parent
-WHALE_DIR = ROOT / "data" / "whale_analysis"
+WHALE_DIR = ROOT / "data" / "research" / "whale_analysis"
 KNOWN_PROTOCOL_ADDRESSES = {
     "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e": "ctf_exchange",
     "0x4d97dcd97ec945f40cf65f87097ace5ea0476045": "ctf_contract",
@@ -97,7 +97,7 @@ def _row_key(row: dict[str, Any]) -> tuple[str, ...]:
 
 def checkpoint_paths(wallet: str) -> tuple[Path, Path]:
     last6 = wallet[-6:].lower()
-    checkpoint_dir = WHALE_DIR / f"etherscan_checkpoint_{last6}"
+    checkpoint_dir = WHALE_DIR / last6 / "etherscan_checkpoint"
     return checkpoint_dir / "rows.jsonl", checkpoint_dir / "state.json"
 
 
@@ -240,8 +240,9 @@ def load_json(path: Path) -> Any:
 def load_activity(wallet: str) -> list[dict[str, Any]]:
     last6 = wallet[-6:].lower()
     candidates = [
-        WHALE_DIR / f"activity_{last6}.json",
+        WHALE_DIR / last6 / "activity.json",
         ROOT / "data" / f"whale_activity_{last6}.json",
+        ROOT / "data" / "research" / "whale_analysis" / f"activity_{last6}.json",
     ]
     for path in candidates:
         if path.exists():
@@ -386,8 +387,9 @@ def summarize(
         by_day[t.date_utc] = running
 
     last6 = wallet[-6:].lower()
-    pnl_path = WHALE_DIR / f"pnl_timeseries_{last6}.json"
-    daily_pnl_path = WHALE_DIR / f"daily_pnl_{last6}.json"
+    wallet_dir = WHALE_DIR / last6
+    pnl_path = wallet_dir / "pnl_timeseries.json"
+    daily_pnl_path = wallet_dir / "daily_pnl.json"
     pnl_series = load_json(pnl_path) if pnl_path.exists() else []
     daily_pnl = load_json(daily_pnl_path) if daily_pnl_path.exists() else {}
     current_pnl = _d(pnl_series[-1]["p"]) if pnl_series else None
@@ -557,9 +559,9 @@ def main() -> None:
     transfers = normalize_transfers(wallet=wallet, rows=rows, activity_by_tx=activity_by_tx)
     summary = summarize(wallet=wallet, current_cash_usdc=args.current_cash_usdc, transfers=transfers)
 
-    out_dir = WHALE_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
     last6 = wallet[-6:]
+    out_dir = WHALE_DIR / last6
+    out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"usdc_transfers_{last6}.json").write_text(
         json.dumps([asdict(t) | {"amount": str(t.amount)} for t in transfers], indent=2)
     )

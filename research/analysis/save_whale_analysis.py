@@ -1,11 +1,11 @@
 """Save whale analysis artifacts for cross-validation.
 
-Outputs under data/whale_analysis/:
-  - pnl_timeseries_<last6>.json  — raw user-pnl time series
-  - activity_<last6>.json        — raw /activity rows (copied from data/)
-  - comparison.json              — aggregate stats across wallets
-  - daily_pnl_<last6>.json       — EOD P&L series per wallet
-  - README.md                    — what each file is and how it was fetched
+Outputs under data/research/whale_analysis/<wallet>/:
+  - pnl_timeseries.json      — raw user-pnl time series
+  - activity.json            — raw /activity rows (copied from data/)
+  - comparison.json          — aggregate stats across wallets (kept at wallet root)
+  - daily_pnl.json           — EOD P&L series per wallet
+  - README.md               — what each file is and how it was fetched
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ WALLETS = [
 ]
 
 ROOT = Path(__file__).parent.parent
-OUT = ROOT / "data" / "whale_analysis"
+OUT = ROOT / "data" / "research" / "whale_analysis"
 OUT.mkdir(parents=True, exist_ok=True)
 
 
@@ -94,14 +94,16 @@ def main() -> None:
     comparison = []
     for label, wallet in WALLETS:
         last6 = wallet[-6:]
+        wallet_dir = OUT / last6
+        wallet_dir.mkdir(parents=True, exist_ok=True)
         print(f"Fetching P&L for {label} ({wallet})...")
         series = fetch_pnl(wallet)
-        (OUT / f"pnl_timeseries_{last6}.json").write_text(json.dumps(series, indent=2))
-        (OUT / f"daily_pnl_{last6}.json").write_text(json.dumps(daily_eod(series), indent=2))
+        (wallet_dir / "pnl_timeseries.json").write_text(json.dumps(series, indent=2))
+        (wallet_dir / "daily_pnl.json").write_text(json.dumps(daily_eod(series), indent=2))
         # Copy the activity file if it exists.
         act = ROOT / "data" / f"whale_activity_{last6}.json"
         if act.exists():
-            shutil.copy(act, OUT / f"activity_{last6}.json")
+            shutil.copy(act, wallet_dir / "activity.json")
         comparison.append(summarize(wallet, label, series))
 
     (OUT / "comparison.json").write_text(json.dumps(comparison, indent=2))
@@ -116,7 +118,7 @@ Captured: {datetime.now(timezone.utc).isoformat()}
     readme += """
 ## Files
 
-### `pnl_timeseries_<last6>.json`
+### `pnl_timeseries.json`
 Raw time-series P&L from Polymarket's internal endpoint:
 ```
 GET https://user-pnl-api.polymarket.com/user-pnl?user_address=<wallet>&interval=all
@@ -124,11 +126,11 @@ GET https://user-pnl-api.polymarket.com/user-pnl?user_address=<wallet>&interval=
 Each point: `{"t": unix_ts, "p": pnl_usdc}`. Hourly fidelity. This is the same
 series that powers the green/purple P&L chart on each profile page.
 
-### `daily_pnl_<last6>.json`
+### `daily_pnl.json`
 End-of-UTC-day P&L snapshots derived from the time series above. Useful for
 day-level comparison across wallets.
 
-### `activity_<last6>.json`
+### `activity.json`
 Raw activity rows from `data-api.polymarket.com/activity?user=<wallet>`, up to
 the 3500-row API cap (newest first). Each row is a TRADE / MERGE / SPLIT / REDEEM
 event with conditionId, slug, price, size, usdcSize, outcome, transactionHash.
