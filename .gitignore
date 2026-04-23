@@ -25,3 +25,9 @@ data/wallet_research/*/activity_windows/
 data/wallet_research/*/closed_positions.json
 data/wallet_research/*/summary.json
 data/wallet_research/*/activity_windows_summary.json
+data/research/wallet_research/history_*/
+data/research/wallet_research/*/activity_windows/
+data/research/wallet_research/*/closed_positions.json
+data/research/wallet_research/*/summary.json
+data/research/wallet_research/*/activity_windows_summary.json
+data/research/wallet_research/*/activity_history.json
