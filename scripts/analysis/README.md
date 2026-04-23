@@ -8,3 +8,9 @@ Wallet and market analysis helpers used for research:
 
 Legacy entrypoints remain at repository root and route through
 `scripts/_legacy_script_dispatch.sh`.
+
+The dispatch layer now resolves canonical scripts automatically by scanning:
+- `scripts/analysis`
+- `scripts/bots`
+- `scripts/dataops`
+- `scripts/whale_pair/cmd`

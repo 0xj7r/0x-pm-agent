@@ -8,3 +8,7 @@ Data ingestion and maintenance scripts:
 
 Legacy entrypoints remain at repository root and route through
 `scripts/_legacy_script_dispatch.sh`.
+
+The dispatch layer now resolves canonical scripts automatically by scanning
+`scripts/dataops` (and the other grouped directories), which keeps future
+command additions lightweight.

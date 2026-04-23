@@ -22,6 +22,10 @@ Top-level wrappers remain for backwards compatibility:
 - `scripts/whale_pair_rust_paper_variants.sh`
 - `scripts/whale_pair_rust_paper_remote.sh`
 
+Legacy one-shot shims now defer to the canonical command under
+`scripts/whale_pair/cmd/` through a shared dispatch convention shared by root-level
+wrappers.
+
 ## Shared settings
 
 - Strategy presets: `scripts/whale_pair/strategy_presets.py`
