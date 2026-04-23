@@ -259,4 +259,4 @@ Do **not** attempt to run the whale-pair bot on the Hetzner host as a rollback. 
 - `scripts/deploy/whale-pair/install_backup_replication_cron.sh`
 - `scripts/deploy/whale-pair/promote_standby.sh`
 - `scripts/deploy/whale-pair/docker-compose.whale-pair.yml` (template, copied to host during provisioning)
-- `tests/test_whale_pair_deploy_scripts.py` (script-level sanity tests)
+- `tests/ops/test_whale_pair_deploy_scripts.py` (script-level sanity tests)
