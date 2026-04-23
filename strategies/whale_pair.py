@@ -6,7 +6,12 @@ from typing import Literal
 
 from shared.fees import taker_fee_usd
 
-WhalePairVariant = Literal["pair_recycler", "skewed_pair_builder", "passive_ladder"]
+WhalePairVariant = Literal[
+    "pair_recycler",
+    "skewed_pair_builder",
+    "passive_ladder",
+    "w1_mimic",
+]
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,7 @@ def choose_accumulate_clip_usd(price: float, cfg: WhalePairConfig) -> float | No
 
 
 def choose_clip_shares(price: float, cfg: WhalePairConfig) -> float | None:
-    if cfg.variant != "passive_ladder" or price <= 0:
+    if cfg.variant not in ("passive_ladder", "w1_mimic") or price <= 0:
         return None
     if price <= cfg.aggressive_price_max:
         return cfg.aggressive_clip_shares or 100.0
@@ -122,7 +127,7 @@ def choose_clip_shares(price: float, cfg: WhalePairConfig) -> float | None:
 
 
 def choose_pair_clip_shares(cfg: WhalePairConfig) -> float | None:
-    if cfg.variant != "passive_ladder":
+    if cfg.variant not in ("passive_ladder", "w1_mimic"):
         return None
     return cfg.aggressive_clip_shares or 100.0
 

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,13 +10,15 @@ use tracing::{info, warn};
 
 use whale_pair_exec::book::BookStore;
 use whale_pair_exec::config::AppConfig;
+use whale_pair_exec::event_log::EventLog;
 use whale_pair_exec::journal::JournalWriter;
 use whale_pair_exec::market_ws::MarketWsClient;
 use whale_pair_exec::metrics::{serve_http, AppMetrics};
-use whale_pair_exec::event_log::EventLog;
 use whale_pair_exec::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use whale_pair_exec::strategy::NoopStrategy;
-use whale_pair_exec::types::{InstrumentId, MarketId, RuntimeStatus};
+use whale_pair_exec::strategy::GoatPairStrategy;
+use whale_pair_exec::types::{
+    FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, RuntimeCommand, RuntimeStatus,
+};
 use whale_pair_exec::user_ws::UserWsClient;
 
 #[tokio::main]
@@ -25,6 +28,8 @@ async fn main() -> Result<()> {
 
     let metrics = Arc::new(AppMetrics::new()?);
     let books = Arc::new(BookStore::new(&config.market_assets));
+    let strategy = GoatPairStrategy::with_defaults();
+    let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();
     let mut runtime = Runtime::new(
         RuntimeConfig {
@@ -33,7 +38,7 @@ async fn main() -> Result<()> {
             initial_status: RuntimeStatus::Starting,
         },
         config.risk_limits.clone(),
-        NoopStrategy,
+        strategy,
     );
     let mut journal = config
         .journal_path
@@ -47,6 +52,7 @@ async fn main() -> Result<()> {
         runtime.event_log(),
         "startup",
         startup_outcome,
+        config.paper_mode,
     )?;
 
     info!(
@@ -59,6 +65,7 @@ async fn main() -> Result<()> {
         starting_cash_usd = config.starting_cash_usd,
         event_log_capacity = config.event_log_capacity,
         journal_path = ?config.journal_path,
+        paper_mode = config.paper_mode,
         "starting whale pair execution scaffold"
     );
 
@@ -69,7 +76,8 @@ async fn main() -> Result<()> {
 
     run_runtime_loop(
         &config,
-        books.clone(),
+        &books,
+        paper_fee_coeff,
         metrics.clone(),
         shutdown.clone(),
         &mut runtime,
@@ -145,10 +153,11 @@ fn spawn_user_ws(
 
 async fn run_runtime_loop(
     config: &AppConfig,
-    books: Arc<BookStore>,
+    books: &Arc<BookStore>,
+    paper_fee_coeff: f64,
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
-    runtime: &mut Runtime<NoopStrategy>,
+    runtime: &mut Runtime<GoatPairStrategy>,
     journal: &mut Option<JournalWriter>,
 ) -> Result<()> {
     let mut ticks = interval(config.runtime_loop_interval);
@@ -178,11 +187,17 @@ async fn run_runtime_loop(
                                 InstrumentId::from(asset_id.as_str()),
                                 &book,
                             )?;
+                            let combined = if config.paper_mode {
+                                execute_paper_adapter(runtime, books, paper_fee_coeff, outcome).await?
+                            } else {
+                                outcome
+                            };
                             persist_runtime_outcome(
                                 journal,
                                 runtime.event_log(),
                                 "book",
-                                outcome,
+                                combined,
+                                config.paper_mode,
                             )?;
                         }
                         _ => metrics.observe_missing_book(asset_id),
@@ -204,7 +219,9 @@ async fn run_runtime_loop(
                             book.best_bid,
                             book.best_ask,
                             book.spread,
-                            book.age_ms().map(|value| value.to_string()).unwrap_or_else(|| "na".to_string()),
+                            book.age_ms()
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "na".to_string()),
                         )
                     })
                     .collect();
@@ -232,8 +249,9 @@ fn persist_runtime_outcome(
     event_log: &EventLog,
     source: &str,
     outcome: RuntimeOutcome,
+    paper_mode: bool,
 ) -> Result<()> {
-    if !outcome.commands.is_empty() {
+    if !paper_mode && !outcome.commands.is_empty() {
         warn!(
             source,
             command_count = outcome.commands.len(),
@@ -267,6 +285,85 @@ fn persist_runtime_outcome(
     }
 
     Ok(())
+}
+
+async fn execute_paper_adapter(
+    runtime: &mut Runtime<GoatPairStrategy>,
+    books: &Arc<BookStore>,
+    paper_fee_coeff: f64,
+    outcome: RuntimeOutcome,
+) -> Result<RuntimeOutcome> {
+    let mut combined = RuntimeOutcome {
+        commands: Vec::new(),
+        event_seqs: outcome.event_seqs,
+    };
+    // TODO(2026-04-23): paper execution currently only evaluates top-of-book immediate fills.
+    // Replace with depth-limited, queue-aware, latency-modeled matching for proper strategy validation.
+    let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+
+    while let Some(command) = queue.pop_front() {
+        combined.commands.push(command.clone());
+        if let RuntimeCommand::Submit(intent) = command {
+            let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
+                continue;
+            };
+            if let Some(fill) = paper_fill_from_book_snapshot(&book, &intent, paper_fee_coeff) {
+                let fill_outcome = runtime.on_fill(fill)?;
+                combined.extend(fill_outcome);
+                for command in &fill_outcome.commands {
+                    queue.push_back(command.clone());
+                }
+            }
+        }
+    }
+    Ok(combined)
+}
+
+fn paper_fill_from_book_snapshot(
+    book: &whale_pair_exec::book::BookState,
+    intent: &OrderIntent,
+    paper_fee_coeff: f64,
+) -> Option<FillReport> {
+    // TODO(2026-04-23): this is a simplified immediate-taker model.
+    // Add market microstructure dynamics (queue position, partial fills, cancel/reprice effects).
+    let (fill_price, available_qty, side) = match intent.side {
+        whale_pair_exec::types::TradeSide::Buy => {
+            if book.best_ask <= 0.0 || book.best_ask > intent.limit_price {
+                return None;
+            }
+            (book.best_ask, book.best_ask_size, whale_pair_exec::types::TradeSide::Buy)
+        }
+        whale_pair_exec::types::TradeSide::Sell => {
+            if book.best_bid <= 0.0 || book.best_bid < intent.limit_price {
+                return None;
+            }
+            (book.best_bid, book.best_bid_size, whale_pair_exec::types::TradeSide::Sell)
+        }
+    };
+
+    if available_qty <= 0.0 || fill_price <= 0.0 {
+        return None;
+    }
+
+    let fill_qty = intent.quantity.min(available_qty);
+    if fill_qty <= 0.0 {
+        return None;
+    }
+
+    let notional = fill_qty * fill_price;
+    let fee = notional * paper_fee_coeff * fill_price * (1.0 - fill_price);
+    Some(FillReport {
+        order_id: None,
+        client_order_id: Some(intent.client_order_id.clone()),
+        market_id: intent.market_id.clone(),
+        instrument_id: intent.instrument_id.clone(),
+        side,
+        price: fill_price,
+        quantity: fill_qty,
+        fee_usd: fee.max(0.0),
+        liquidity: FillLiquidity::Taker,
+        observed_at_ms: now_unix_ms(),
+    })
 }
 
 fn now_unix_ms() -> u64 {

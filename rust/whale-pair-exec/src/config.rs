@@ -24,6 +24,7 @@ pub struct UserWsAuth {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub service_name: String,
+    pub paper_mode: bool,
     pub log_level: String,
     pub log_format: LogFormat,
     pub metrics_bind: SocketAddr,
@@ -45,9 +46,12 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
+        // TODO(2026-04-23): centralize strategy config into one versioned block so
+        // multi-strategy paper runs can be selected/enforced per run without env drift.
         let _ = dotenvy::dotenv();
 
         let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "whale-pair-exec");
+        let paper_mode = parse_bool("WHALE_PAIR_PAPER_MODE", true)?;
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
         let metrics_bind = parse_socket_addr("WHALE_PAIR_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
@@ -116,6 +120,7 @@ impl AppConfig {
 
         Ok(Self {
             service_name,
+            paper_mode,
             log_level,
             log_format,
             metrics_bind,
@@ -146,6 +151,17 @@ impl AppConfig {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn parse_bool(key: &str, default_value: bool) -> Result<bool> {
+    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "y" => Ok(true),
+        "0" | "false" | "off" | "no" | "n" => Ok(false),
+        other => bail!(
+            "failed to parse {key} as bool (accepted: 0/1, true/false, on/off, yes/no): {other}"
+        ),
+    }
 }
 
 fn parse_log_format(raw: &str) -> Result<LogFormat> {
@@ -247,7 +263,7 @@ fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_asset_market_map, parse_log_format, LogFormat};
+    use super::{parse_asset_market_map, parse_bool, parse_log_format, LogFormat};
 
     #[test]
     fn parses_json_log_format() {
@@ -257,6 +273,16 @@ mod tests {
     #[test]
     fn rejects_unknown_log_format() {
         assert!(parse_log_format("xml").is_err());
+    }
+
+    #[test]
+    fn parses_missing_bool_with_default() {
+        assert!(parse_bool("WHALE_PAIR_PAPER_MODE_MISSING", true).unwrap());
+    }
+
+    #[test]
+    fn parses_bool_from_text() {
+        assert!(!parse_bool("WHALE_PAIR_PAPER_MODE_NO", false).unwrap());
     }
 
     #[test]
