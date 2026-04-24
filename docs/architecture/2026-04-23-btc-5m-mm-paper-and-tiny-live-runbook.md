@@ -249,6 +249,11 @@ Do not start tiny-live until all of these are true:
 - order-store and journal recovery are verified on restart
 - market slate export is working from `--source live`
 - metrics and health endpoints are reachable
+- microstructure controller is enabled and visible in decision notes
+- `WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH=true` is set for live
+- top-3 ask notional caps are tighter than max order notional
+- stale `CancelRequested` orders transition to `NeedsReconcile`
+- operator kill path has been tested with `systemctl --user stop whale-pair-exec@<sleeve>`
 
 First tiny-live run should be:
 
@@ -256,6 +261,13 @@ First tiny-live run should be:
 - one host only
 - smallest practical size
 - manual observation on logs and metrics
+- zero auto-restart escalation after a kill until the order store is reconciled
+
+Live kill/health loop:
+
+1. Watch `/healthz`, `/api/state`, systemd status, journal append rate, and order-store active orders.
+2. Kill immediately if user websocket is stale, orders remain `CancelRequested` past the reconciliation window, depth telemetry disappears while `MICROSTRUCTURE_REQUIRE_DEPTH=true`, or inventory exceeds the configured hard cap.
+3. After a kill, reconcile venue open orders first, then restart the sleeve only after `orders` has no unknown active rows.
 
 ## 11. Collector relationship
 
