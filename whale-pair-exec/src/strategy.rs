@@ -3304,6 +3304,7 @@ mod tests {
                 best_ask: Some(BookLevel::new(ask, 1000.0)),
                 bid_levels: vec![BookLevel::new(bid, 1000.0)],
                 ask_levels: vec![BookLevel::new(ask, 1000.0)],
+                depth_observed_at_ms: Some(ts),
                 last_trade_price: Some(ask),
                 observed_at_ms: ts,
             },

@@ -707,6 +707,8 @@ impl<S: Strategy> Runtime<S> {
                     .iter()
                     .map(|level| crate::types::BookLevel::new(level.price, level.size))
                     .collect(),
+                depth_observed_at_ms: (book.depth_update_unix_ms > 0)
+                    .then_some(book.depth_update_unix_ms),
                 last_trade_price,
                 observed_at_ms: book.last_update_unix_ms,
             },
@@ -1450,10 +1452,28 @@ impl<S: Strategy> Runtime<S> {
         let right_ask = right_quote.and_then(|quote| quote.best_ask.clone());
         let left_bid = left_quote.and_then(|quote| quote.best_bid.clone());
         let right_bid = right_quote.and_then(|quote| quote.best_bid.clone());
-        let left_bid_levels = left_quote.map(|quote| quote.bid_levels.as_slice()).unwrap_or(&[]);
-        let left_ask_levels = left_quote.map(|quote| quote.ask_levels.as_slice()).unwrap_or(&[]);
-        let right_bid_levels = right_quote.map(|quote| quote.bid_levels.as_slice()).unwrap_or(&[]);
-        let right_ask_levels = right_quote.map(|quote| quote.ask_levels.as_slice()).unwrap_or(&[]);
+        let left_depth_fresh = left_quote
+            .and_then(|quote| quote.depth_observed_at_ms)
+            .is_some_and(|observed| now_ms.saturating_sub(observed) <= cfg.entry_book_max_age_ms);
+        let right_depth_fresh = right_quote
+            .and_then(|quote| quote.depth_observed_at_ms)
+            .is_some_and(|observed| now_ms.saturating_sub(observed) <= cfg.entry_book_max_age_ms);
+        let left_bid_levels = left_quote
+            .filter(|_| left_depth_fresh)
+            .map(|quote| quote.bid_levels.as_slice())
+            .unwrap_or(&[]);
+        let left_ask_levels = left_quote
+            .filter(|_| left_depth_fresh)
+            .map(|quote| quote.ask_levels.as_slice())
+            .unwrap_or(&[]);
+        let right_bid_levels = right_quote
+            .filter(|_| right_depth_fresh)
+            .map(|quote| quote.bid_levels.as_slice())
+            .unwrap_or(&[]);
+        let right_ask_levels = right_quote
+            .filter(|_| right_depth_fresh)
+            .map(|quote| quote.ask_levels.as_slice())
+            .unwrap_or(&[]);
 
         let left_ask_price = left_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
         let right_ask_price = right_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
@@ -2036,6 +2056,7 @@ mod tests {
                 best_ask: Some(BookLevel::new(0.40, 100.0)),
                 bid_levels: vec![BookLevel::new(0.39, 100.0)],
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
                 observed_at_ms: 2,
             },
@@ -2113,6 +2134,7 @@ mod tests {
         assert_eq!(quote.observed_at_ms, 25);
         assert_eq!(quote.best_bid.as_ref().unwrap().price, 0.41);
         assert_eq!(quote.best_ask.as_ref().unwrap().price, 0.44);
+        assert_eq!(quote.depth_observed_at_ms, Some(25));
         assert_eq!(quote.bid_levels.len(), 1);
         assert_eq!(quote.ask_levels.len(), 1);
         assert_eq!(quote.bid_levels[0].quantity, 12.0);
@@ -2211,6 +2233,73 @@ mod tests {
     }
 
     #[test]
+    fn paired_book_signal_drops_stale_depth_features() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 0.0,
+                event_log_capacity: 32,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            crate::strategy::NoopStrategy,
+            MarketContextStore::empty(),
+        );
+        runtime.start(1);
+
+        let market_id = MarketId::from("market-1");
+        let cheap_id = InstrumentId::from("cheap-token");
+        let expensive_id = InstrumentId::from("expensive-token");
+        runtime.last_quotes.insert(
+            cheap_id.clone(),
+            QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.37, 100.0)),
+                best_ask: Some(BookLevel::new(0.39, 100.0)),
+                bid_levels: vec![BookLevel::new(0.37, 100.0)],
+                ask_levels: vec![BookLevel::new(0.39, 100.0)],
+                depth_observed_at_ms: Some(10),
+                last_trade_price: Some(0.38),
+                observed_at_ms: 2_000,
+            },
+        );
+        runtime.last_quotes.insert(
+            expensive_id.clone(),
+            QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.58, 100.0)),
+                best_ask: Some(BookLevel::new(0.60, 100.0)),
+                bid_levels: vec![BookLevel::new(0.58, 100.0)],
+                ask_levels: vec![BookLevel::new(0.60, 100.0)],
+                depth_observed_at_ms: Some(10),
+                last_trade_price: Some(0.59),
+                observed_at_ms: 2_000,
+            },
+        );
+
+        let market_context = MarketContextRecord {
+            market_id: market_id.as_str().to_string(),
+            instrument_ids: vec![cheap_id.as_str().to_string(), expensive_id.as_str().to_string()],
+            ..MarketContextRecord::default()
+        };
+        let mut cfg = UnlawfulGateConfig::default();
+        cfg.entry_book_max_age_ms = 1_000;
+        let signal = runtime.build_paired_book_signal(
+            &market_id,
+            Some(&market_context),
+            2_000,
+            &cfg,
+        );
+
+        assert_eq!(signal.cheap_ask_depth_top3_qty, None);
+        assert_eq!(signal.expensive_ask_depth_top3_qty, None);
+        assert_eq!(signal.cheap_ask_notional_top3, None);
+        assert_eq!(signal.expensive_ask_notional_top3, None);
+        assert_eq!(signal.cheap_depth_imbalance_top3, None);
+        assert_eq!(signal.expensive_depth_imbalance_top3, None);
+        assert!((signal.cheap_spread.unwrap() - 0.02).abs() < 1e-9);
+        assert!((signal.expensive_spread.unwrap() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
     fn recover_from_store_reconstructs_orders_and_marks_uncertain_submits() {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2301,6 +2390,7 @@ mod tests {
                 best_ask: Some(BookLevel::new(0.40, 100.0)),
                 bid_levels: vec![BookLevel::new(0.39, 100.0)],
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
                 observed_at_ms: 2,
             },
