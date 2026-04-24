@@ -295,7 +295,12 @@ impl UnlawfulShearConfig {
 
             regime_primary_hours_utc: vec![10, 11, 19, 22, 23],
             regime_secondary_hours_utc: vec![0, 9, 12, 20, 21],
-            allow_extreme_offhour_override: false,
+            allow_extreme_offhour_override: env::var(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_ALLOW_EXTREME_OFFHOUR_OVERRIDE",
+            )
+            .ok()
+            .and_then(|raw| raw.parse::<bool>().ok())
+            .unwrap_or(false),
             entry_window_seconds: parse_u64("WHALE_PAIR_UNLAWFUL_SHEAR_ENTRY_WINDOW_SECONDS", 30),
             cleanup_start_seconds: parse_u64(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_CLEANUP_START_SECONDS",
@@ -488,6 +493,7 @@ pub struct StrategyContext {
     pub runtime_status: RuntimeStatus,
     pub inventory: InventorySnapshot,
     pub open_orders_total: usize,
+    pub open_orders_for_market: usize,
     pub market_context: Option<MarketContextRecord>,
     pub unlawful_signal: Option<UnlawfulSignalSnapshot>,
 }
@@ -1904,6 +1910,21 @@ impl UnlawfulShearStrategy {
         }
     }
 
+    fn quantize_cleanup_qty(raw_qty: f64) -> f64 {
+        if !raw_qty.is_finite() || raw_qty <= 0.0 {
+            return 0.0;
+        }
+        // Coarse cleanup sizing reduces cancel/recreate churn from tiny inventory
+        // changes in late-window salvage and fallback-close mode.
+        let bucket = 0.25;
+        let quantized = (raw_qty / bucket).floor() * bucket;
+        if quantized >= bucket {
+            quantized
+        } else {
+            0.0
+        }
+    }
+
     fn winning_instrument_id(
         &self,
         market: &crate::market_context::MarketContextRecord,
@@ -2085,6 +2106,117 @@ impl UnlawfulShearStrategy {
         }
     }
 
+    fn fmt_opt_f64(value: Option<f64>, decimals: usize) -> String {
+        value.map_or_else(
+            || "na".to_string(),
+            |value| format!("{value:.decimals$}"),
+        )
+    }
+
+    fn fmt_opt_u64(value: Option<u64>) -> String {
+        value.map_or_else(|| "na".to_string(), |value| value.to_string())
+    }
+
+    fn format_gate_reasons(reasons: &[String]) -> String {
+        if reasons.is_empty() {
+            "none".to_string()
+        } else {
+            reasons.join(";")
+        }
+    }
+
+    fn format_unlawful_eval_summary(
+        &self,
+        context: &StrategyContext,
+        snapshot: &MarketSnapshot,
+        signal: Option<&UnlawfulSignalSnapshot>,
+        cheap_id: &InstrumentId,
+        cheap_bid: f64,
+        cheap_ask: f64,
+        expensive_id: &InstrumentId,
+        expensive_bid: f64,
+        expensive_ask: f64,
+        price_gap: f64,
+        hedge_ratio: f64,
+        progress: Option<f64>,
+        mode: UnlawfulExecutionMode,
+        aggression: UnlawfulAggressionTier,
+        signal_clip_scale: f64,
+        phase_clip_scale: f64,
+        buy_clip_scale: f64,
+        has_inventory: bool,
+        gate_reasons: &[String],
+    ) -> String {
+        let session_bucket = signal
+            .map(|signal| format!("{:?}", signal.session_bucket))
+            .unwrap_or_else(|| "Unknown".to_string());
+        let books_fresh = signal
+            .map(|signal| signal.book.books_fresh)
+            .unwrap_or(false);
+        let both_sides_present = signal
+            .map(|signal| signal.book.both_sides_present)
+            .unwrap_or(false);
+        let book_age_ms = signal.and_then(|signal| {
+            (signal.book.observed_at_ms > 0)
+                .then_some(context.now_ms.saturating_sub(signal.book.observed_at_ms))
+        });
+        let btc_age_ms = signal.and_then(|signal| {
+            (signal.btc.observed_at_ms > 0)
+                .then_some(context.now_ms.saturating_sub(signal.btc.observed_at_ms))
+        });
+
+        format!(
+            "unlawful eval market={} cheap_id={} expensive_id={} progress={} elapsed_s={} remaining_s={} session={} btc_last={} btc_vol_5m_bps={} btc_vol_15m_bps={} btc_trade_count_5m={} btc_trade_count_15m={} btc_ret_30s_bps={} btc_ret_60s_bps={} btc_age_ms={} cheap_bid={:.4} cheap_ask={:.4} expensive_bid={:.4} expensive_ask={:.4} gap={:.4} hedge_ratio={:.4} book_age_ms={} books_fresh={} both_sides_present={} activity_10s={} activity_30s={} activity_60s={} activity_age_ms={} first_fill_ms={} first_merge_ms={} mode={:?} aggression={:?} signal_clip_scale={:.3} phase_clip_scale={:.3} buy_clip_scale={:.3} market_has_inventory={} reasons={}",
+            snapshot.market_id,
+            cheap_id,
+            expensive_id,
+            Self::fmt_opt_f64(progress, 3),
+            Self::fmt_opt_u64(signal.and_then(|signal| signal.elapsed_s)),
+            Self::fmt_opt_u64(signal.and_then(|signal| signal.time_remaining_s)),
+            session_bucket,
+            Self::fmt_opt_f64(signal.and_then(|signal| signal.btc.last_price), 2),
+            Self::fmt_opt_f64(signal.and_then(|signal| signal.btc.realized_vol_5m_bps), 2),
+            Self::fmt_opt_f64(signal.and_then(|signal| signal.btc.realized_vol_15m_bps), 2),
+            signal
+                .map(|signal| signal.btc.trade_count_5m.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            signal
+                .map(|signal| signal.btc.trade_count_15m.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            Self::fmt_opt_f64(signal.and_then(|signal| signal.btc.return_30s_bps), 2),
+            Self::fmt_opt_f64(signal.and_then(|signal| signal.btc.return_60s_bps), 2),
+            Self::fmt_opt_u64(btc_age_ms),
+            cheap_bid,
+            cheap_ask,
+            expensive_bid,
+            expensive_ask,
+            price_gap,
+            hedge_ratio,
+            Self::fmt_opt_u64(book_age_ms),
+            books_fresh,
+            both_sides_present,
+            signal
+                .map(|signal| signal.activity.last_trade_event_count_10s.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            signal
+                .map(|signal| signal.activity.last_trade_event_count_30s.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            signal
+                .map(|signal| signal.activity.last_trade_event_count_60s.to_string())
+                .unwrap_or_else(|| "na".to_string()),
+            Self::fmt_opt_u64(signal.and_then(|signal| signal.activity.last_trade_event_age_ms)),
+            Self::fmt_opt_u64(signal.and_then(|signal| signal.first_fill_ms)),
+            Self::fmt_opt_u64(signal.and_then(|signal| signal.first_merge_ms)),
+            mode,
+            aggression,
+            signal_clip_scale,
+            phase_clip_scale,
+            buy_clip_scale,
+            has_inventory,
+            Self::format_gate_reasons(gate_reasons),
+        )
+    }
+
     fn can_launch_mode_action(mode: UnlawfulExecutionMode, action: &str) -> bool {
         matches!(
             (mode, action),
@@ -2113,9 +2245,6 @@ impl Strategy for UnlawfulShearStrategy {
         snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
         if context.runtime_status != RuntimeStatus::Running {
-            return StrategyDecision::none();
-        }
-        if context.open_orders_total >= self.config.max_open_orders_total {
             return StrategyDecision::none();
         }
 
@@ -2211,30 +2340,30 @@ impl Strategy for UnlawfulShearStrategy {
             phase,
             UnlawfulShearPhase::Late | UnlawfulShearPhase::VeryLate
         ) || progress.is_none();
-        let mut notes = vec![format!(
-            "market={} cheap={} ask={:.4} expensive={} ask={:.4} gap={:.4} hedge_ratio={:.4} progress={:?}",
-            snapshot.market_id,
+        let suppressed_by_gate_reasons = !gate_reasons.is_empty();
+        let expensive_bid = Self::best_bid(expensive_quote).unwrap_or(0.0);
+        let cheap_bid = Self::best_bid(cheap_quote).unwrap_or(0.0);
+        let mut notes = vec![self.format_unlawful_eval_summary(
+            context,
+            snapshot,
+            context.unlawful_signal.as_ref(),
             cheap_id,
+            cheap_bid,
             cheap_ask,
             expensive_id,
+            expensive_bid,
             expensive_ask,
             price_gap,
             hedge_ratio,
-            progress
+            progress,
+            mode,
+            aggression,
+            signal_clip_scale,
+            phase_clip_scale,
+            buy_clip_scale,
+            has_inventory,
+            &gate_reasons,
         )];
-        notes.push(format!(
-            "unlawful gate mode={:?} aggression={:?} buy_clip_scale={:.3} market_has_inventory={}",
-            mode, aggression, buy_clip_scale, has_inventory
-        ));
-        let suppressed_by_gate_reasons = !gate_reasons.is_empty();
-        notes.extend(
-            gate_reasons
-                .into_iter()
-                .map(|reason| format!("unlawful gate reason: {reason}")),
-        );
-
-        let expensive_bid = Self::best_bid(expensive_quote).unwrap_or(0.0);
-        let cheap_bid = Self::best_bid(cheap_quote).unwrap_or(0.0);
         let near_end =
             self.window_at_or_past_end(context) || progress.is_some_and(|value| value >= 0.96);
         let close_fraction = self.fallback_close_fraction(phase, progress);
@@ -2313,7 +2442,9 @@ impl Strategy for UnlawfulShearStrategy {
                 ));
             }
             if intents.is_empty() {
-                let close_qty = |qty: f64, fraction: f64| (qty * fraction).min(qty);
+                let close_qty = |qty: f64, fraction: f64| {
+                    Self::quantize_cleanup_qty((qty * fraction).min(qty))
+                };
                 if cheap_qty > 0.0 && cheap_bid > 0.0 {
                     let amount = close_qty(cheap_qty, close_fraction);
                     if amount > 0.0 {
@@ -2834,12 +2965,14 @@ mod tests {
     }
 
     fn context(positions: Vec<PositionState>) -> StrategyContext {
-        context_with_unlawful_signal(positions, 10, None)
+        context_with_unlawful_signal(positions, 10, 0, 0, None)
     }
 
     fn context_with_unlawful_signal(
         positions: Vec<PositionState>,
         now_ms: u64,
+        open_orders_total: usize,
+        open_orders_for_market: usize,
         unlawful_signal: Option<UnlawfulSignalSnapshot>,
     ) -> StrategyContext {
         StrategyContext {
@@ -2856,7 +2989,8 @@ mod tests {
                     .sum(),
                 positions,
             },
-            open_orders_total: 0,
+            open_orders_total,
+            open_orders_for_market,
             market_context: None,
             unlawful_signal,
         }
@@ -2919,6 +3053,32 @@ mod tests {
         cfg.max_open_orders_total = 8;
         cfg.taker_fee_coeff = 0.072;
         cfg
+    }
+
+    #[test]
+    fn unlawful_shear_from_env_respects_offhour_override_flag() {
+        let key = "WHALE_PAIR_UNLAWFUL_SHEAR_ALLOW_EXTREME_OFFHOUR_OVERRIDE";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "true");
+
+        let cfg = UnlawfulShearConfig::from_env();
+
+        match original {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+
+        assert!(cfg.allow_extreme_offhour_override);
+    }
+
+    #[test]
+    fn unlawful_cleanup_qty_quantization_drops_micro_churn_and_buckets_size() {
+        assert_eq!(UnlawfulShearStrategy::quantize_cleanup_qty(0.01), 0.0);
+        assert_eq!(UnlawfulShearStrategy::quantize_cleanup_qty(0.10), 0.0);
+        assert_eq!(UnlawfulShearStrategy::quantize_cleanup_qty(0.24), 0.0);
+        assert!((UnlawfulShearStrategy::quantize_cleanup_qty(0.25) - 0.25).abs() < 1e-9);
+        assert!((UnlawfulShearStrategy::quantize_cleanup_qty(1.23) - 1.0).abs() < 1e-9);
+        assert!((UnlawfulShearStrategy::quantize_cleanup_qty(2.74) - 2.5).abs() < 1e-9);
     }
 
     #[test]
@@ -2998,6 +3158,8 @@ mod tests {
         let ctx = context_with_unlawful_signal(
             Vec::new(),
             10,
+            0,
+            0,
             Some(unlawful_signal_snapshot(
                 UnlawfulExecutionMode::Entry,
                 1.0,
@@ -3012,6 +3174,31 @@ mod tests {
             .intents
             .iter()
             .any(|intent| intent.side == TradeSide::Buy));
+    }
+
+    #[test]
+    fn unlawful_shear_allows_new_market_entry_despite_global_open_order_pressure() {
+        let mut strategy = UnlawfulShearStrategy::new(unlawful_shear_test_config(), 0);
+        let ctx = context_with_unlawful_signal(
+            Vec::new(),
+            10,
+            32,
+            0,
+            Some(unlawful_signal_snapshot(
+                UnlawfulExecutionMode::Entry,
+                1.0,
+                10,
+            )),
+        );
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
+
+        assert_eq!(decision.intents.len(), 2);
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| intent.market_id == MarketId::from("market-a")));
     }
 
     #[test]
@@ -3086,6 +3273,8 @@ mod tests {
             &context_with_unlawful_signal(
                 Vec::new(),
                 10_000,
+                0,
+                0,
                 Some(unlawful_signal_snapshot(
                     UnlawfulExecutionMode::Entry,
                     1.0,
@@ -3118,6 +3307,8 @@ mod tests {
             &context_with_unlawful_signal(
                 Vec::new(),
                 10_000,
+                0,
+                0,
                 Some(unlawful_signal_snapshot(
                     UnlawfulExecutionMode::Manage,
                     1.0,
@@ -3155,6 +3346,8 @@ mod tests {
             &context_with_unlawful_signal(
                 Vec::new(),
                 10_000,
+                0,
+                0,
                 Some(unlawful_signal_snapshot(
                     UnlawfulExecutionMode::Standby,
                     0.2,
@@ -3190,18 +3383,25 @@ mod tests {
             "unit-test gate reason: synthetic invariant".to_string(),
         ];
 
-        let ctx = context_with_unlawful_signal(Vec::new(), 10_000, Some(signal));
+        let ctx = context_with_unlawful_signal(Vec::new(), 10_000, 0, 0, Some(signal));
         strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10_000));
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10_000));
 
         let notes_blob = decision.notes.join("|");
-        assert!(notes_blob.contains("unlawful gate mode=Entry"));
+        assert!(notes_blob.contains("unlawful eval market=market-a"));
+        assert!(notes_blob.contains("cheap_id=down"));
+        assert!(notes_blob.contains("expensive_id=up"));
+        assert!(notes_blob.contains("session=Preferred"));
+        assert!(notes_blob.contains("btc_vol_5m_bps=6.00"));
+        assert!(notes_blob.contains("btc_trade_count_5m=9000"));
+        assert!(notes_blob.contains("mode=Entry"));
         assert!(notes_blob.contains("aggression=Press"));
-        assert!(notes_blob
-            .contains("unlawful gate reason: unit-test gate reason: entry geometry valid"));
-        assert!(
-            notes_blob.contains("unlawful gate reason: unit-test gate reason: synthetic invariant")
-        );
+        assert!(notes_blob.contains("signal_clip_scale=1.000"));
+        assert!(notes_blob.contains("buy_clip_scale=1.100"));
+        assert!(notes_blob.contains("books_fresh=true"));
+        assert!(notes_blob.contains(
+            "reasons=unit-test gate reason: entry geometry valid;unit-test gate reason: synthetic invariant"
+        ));
     }
 }

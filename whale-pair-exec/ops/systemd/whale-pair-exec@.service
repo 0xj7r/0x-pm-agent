@@ -2,6 +2,7 @@
 Description=whale-pair-exec sleeve %i
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,11 +11,22 @@ Environment=WHALE_PAIR_ROOT_DIR=%h/go/polymarket-agent
 Environment=WHALE_PAIR_CONTEXT_SOURCE=live
 Environment=WHALE_PAIR_INCLUDE_PREV=1
 Environment=WHALE_PAIR_INCLUDE_NEXT=1
-ExecStart=/usr/bin/env bash -lc '$WHALE_PAIR_ROOT_DIR/whale-pair-exec/scripts/run_sleeve.sh %i'
+Environment=WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=45
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+Environment=WHALE_PAIR_PYTHON_BIN=python3
+Environment=WHALE_PAIR_CARGO_BIN=cargo
+EnvironmentFile=-%h/.config/whale-pair-exec/common.env
+EnvironmentFile=-%h/.config/whale-pair-exec/paper.d/%i.env
+ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/paper" "$HOME/.config/whale-pair-exec/paper.d"'
+ExecStart=/usr/bin/env bash -lc '"${WHALE_PAIR_ROOT_DIR}/whale-pair-exec/scripts/run_sleeve.sh" %i'
 Restart=always
-RestartSec=5
+RestartSec=10
 TimeoutStopSec=20
 KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whale-pair-exec-%i
 
 [Install]
 WantedBy=default.target

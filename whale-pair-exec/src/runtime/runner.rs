@@ -85,7 +85,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let mut journal = config
         .journal_path
         .clone()
-        .map(JournalWriter::open)
+        .map(|path| JournalWriter::open_with_rotation(path, config.journal_rotate_bytes))
         .transpose()?;
 
     let mut startup_outcome =
@@ -147,6 +147,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         starting_cash_usd = config.starting_cash_usd,
         event_log_capacity = config.event_log_capacity,
         journal_path = ?config.journal_path,
+        journal_rotate_bytes = ?config.journal_rotate_bytes,
         paper_mode = config.paper_mode,
         "starting whale pair execution scaffold"
     );

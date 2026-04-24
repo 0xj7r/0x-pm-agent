@@ -60,7 +60,18 @@ What it does:
 - regenerates:
   - `data/research/wallet_research/unlawful-shear/rust_runtime.env`
   - `data/research/wallet_research/unlawful-shear/rust_market_context.json`
+- re-exports the rolling BTC 5m slate every `45s` by default
+- restarts the sleeve when the market slate changes so websocket subscriptions stay fresh
 - starts the Rust runtime with `cargo run`
+
+Override the refresh cadence with:
+
+- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=<n>`
+- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=0` to disable refresh supervision
+
+The rolling refresh is a launcher/control-plane responsibility, not a strategy signal.
+On an always-on host it should stay enabled so the sleeves keep rotating onto fresh
+BTC 5m prev/current/next markets without operator intervention.
 
 ## 4. Parallel paper launch
 
@@ -72,7 +83,6 @@ Example:
 whale-pair-exec/scripts/run_sleeve.sh unlawful_baseline
 whale-pair-exec/scripts/run_sleeve.sh unlawful_broad_hours
 whale-pair-exec/scripts/run_sleeve.sh unlawful_press
-whale-pair-exec/scripts/run_sleeve.sh goat_pair_baseline
 ```
 
 Metrics ports:
@@ -155,7 +165,62 @@ Template file:
 
 - `whale-pair-exec/ops/systemd/whale-pair-exec@.service`
 
-## 8. Tiny-live minimum env additions
+Host install helpers:
+
+- `whale-pair-exec/ops/systemd/install_user_paper_services.sh`
+- `whale-pair-exec/ops/systemd/manage_unlawful_paper_services.sh`
+
+Host env surfaces:
+
+- `~/.config/whale-pair-exec/common.env`
+- `~/.config/whale-pair-exec/paper.d/unlawful_baseline.env`
+- `~/.config/whale-pair-exec/paper.d/unlawful_broad_hours.env`
+- `~/.config/whale-pair-exec/paper.d/unlawful_press.env`
+
+The systemd template reads those env files if present, then executes the checked-in
+repo launcher. That means repo updates remain the source of truth for the sleeves,
+while host env files only carry deployment-specific overrides.
+
+## 8. Paper env and secret surfaces
+
+Paper mode still needs a small number of explicit host surfaces:
+
+- `WHALE_PAIR_ROOT_DIR`
+- `WHALE_PAIR_CONTEXT_SOURCE`
+- `WHALE_PAIR_INCLUDE_PREV`
+- `WHALE_PAIR_INCLUDE_NEXT`
+- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC`
+- `WHALE_PAIR_PYTHON_BIN`
+- `WHALE_PAIR_CARGO_BIN`
+- `WHALE_PAIR_EXEC_SPOT_WS_URL`
+- `WHALE_PAIR_EXEC_SPOT_SYMBOL`
+- `POLYMARKET_MARKET_WS_URL`
+- `POLYMARKET_USER_WS_URL`
+- `RUST_LOG`
+- `RUST_BACKTRACE`
+
+Paper mode does not require:
+
+- `POLYMARKET_API_KEY`
+- `POLYMARKET_API_SECRET`
+- `POLYMARKET_API_PASSPHRASE`
+
+Journal and state paths remain sleeve-local and come from the checked-in env files:
+
+- `data/runtime/unlawful-baseline/order-store.sqlite`
+- `data/execution/paper/unlawful-baseline/journal.jsonl`
+- `data/runtime/unlawful-broad-hours/order-store.sqlite`
+- `data/execution/paper/unlawful-broad-hours/journal.jsonl`
+- `data/runtime/unlawful-press/order-store.sqlite`
+- `data/execution/paper/unlawful-press/journal.jsonl`
+
+Process logs for always-on runs live in journald:
+
+- `journalctl --user -u whale-pair-exec@unlawful_baseline`
+- `journalctl --user -u whale-pair-exec@unlawful_broad_hours`
+- `journalctl --user -u whale-pair-exec@unlawful_press`
+
+## 9. Tiny-live minimum env additions
 
 Paper mode leaves these unset.
 
@@ -174,7 +239,7 @@ And verify:
 - approvals and balances are already staged
 - the user websocket is receiving live order / fill events
 
-## 9. Tiny-live checklist
+## 10. Tiny-live checklist
 
 Do not start tiny-live until all of these are true:
 
@@ -192,7 +257,7 @@ First tiny-live run should be:
 - smallest practical size
 - manual observation on logs and metrics
 
-## 10. Collector relationship
+## 11. Collector relationship
 
 The runtime and the unlawful live collector are separate processes.
 
@@ -203,3 +268,51 @@ The collector should be run alongside paper so:
 - live unlawful timing can be rechecked
 - session drift can be measured
 - geometry thresholds can be recalibrated
+
+## 12. Concise AWS paper checklist
+
+Tomorrow’s always-on paper deploy should be:
+
+1. Launch an EU host if available, preferably `eu-west-1`.
+2. Clone the repo to the final path, for example:
+   - `$HOME/go/polymarket-agent`
+3. Install Rust, Python 3, and systemd user-service support.
+4. Run:
+
+```bash
+whale-pair-exec/ops/systemd/install_user_paper_services.sh
+```
+
+5. Edit `~/.config/whale-pair-exec/common.env`:
+   - set `WHALE_PAIR_ROOT_DIR`
+   - confirm BTC spot WS URL and symbol
+   - keep `WHALE_PAIR_CONTEXT_SOURCE=live`
+6. Enable lingering:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+7. Reload and start the three unlawful services:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now whale-pair-exec@unlawful_baseline
+systemctl --user enable --now whale-pair-exec@unlawful_broad_hours
+systemctl --user enable --now whale-pair-exec@unlawful_press
+```
+
+8. Verify:
+   - `systemctl --user status whale-pair-exec@unlawful_baseline`
+   - `curl -sS http://127.0.0.1:9108/healthz`
+   - `curl -sS http://127.0.0.1:9109/healthz`
+   - `curl -sS http://127.0.0.1:9110/healthz`
+   - journals are appending under `data/execution/paper/*/journal.jsonl`
+   - SQLite stores exist under `data/runtime/*/order-store.sqlite`
+
+For a direct Hetzner-style rollout from a local checkout, use:
+
+```bash
+HETZNER_HOST=<current-host-or-ip> \
+ops/deploy/deploy_paper_hetzner.sh
+```

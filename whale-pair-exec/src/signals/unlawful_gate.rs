@@ -305,6 +305,7 @@ pub fn evaluate_unlawful_mode(
     inputs: &UnlawfulGateInputs,
     cfg: &UnlawfulGateConfig,
 ) -> UnlawfulSignalSnapshot {
+    const PRE_START_GRACE_MS: u64 = 5_000;
     let mut reasons: Vec<String> = Vec::new();
 
     let Some(start_ms) = inputs.market_start_ms else {
@@ -349,7 +350,7 @@ pub fn evaluate_unlawful_mode(
     let elapsed_s = inputs.elapsed_s().unwrap_or(0);
     let time_remaining_s = end_ms.checked_sub(inputs.now_ms).map(|value| value / 1_000);
 
-    if inputs.now_ms < start_ms {
+    if inputs.now_ms.saturating_add(PRE_START_GRACE_MS) < start_ms {
         reasons.push("pre-start window".to_string());
         return baseline_result(
             inputs,

@@ -54,6 +54,7 @@ pub struct AppConfig {
     pub ping_interval: Duration,
     pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
+    pub journal_rotate_bytes: Option<u64>,
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
@@ -119,6 +120,19 @@ impl AppConfig {
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
         let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
+        let journal_rotate_bytes = env::var("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .with_context(|| {
+                        format!(
+                            "failed to parse WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES as u64 from `{value}`"
+                        )
+                    })
+            })
+            .transpose()?;
         let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity = parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
@@ -192,6 +206,7 @@ impl AppConfig {
             ping_interval,
             market_context_path,
             journal_path,
+            journal_rotate_bytes,
             starting_cash_usd,
             event_log_capacity,
             market_id_by_asset,

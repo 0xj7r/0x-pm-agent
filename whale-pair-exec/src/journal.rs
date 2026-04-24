@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -30,10 +31,16 @@ enum JournalLine<'a> {
 pub struct JournalWriter {
     path: PathBuf,
     writer: BufWriter<File>,
+    rotate_bytes: Option<u64>,
+    current_size_bytes: u64,
 }
 
 impl JournalWriter {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_rotation(path, None)
+    }
+
+    pub fn open_with_rotation(path: impl Into<PathBuf>, rotate_bytes: Option<u64>) -> Result<Self> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -45,9 +52,15 @@ impl JournalWriter {
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open journal {}", path.display()))?;
+        let current_size_bytes = file
+            .metadata()
+            .with_context(|| format!("failed to stat journal {}", path.display()))?
+            .len();
         Ok(Self {
             path,
             writer: BufWriter::new(file),
+            rotate_bytes,
+            current_size_bytes,
         })
     }
 
@@ -96,14 +109,62 @@ impl JournalWriter {
     }
 
     fn append_line(&mut self, line: &JournalLine<'_>) -> Result<()> {
+        self.rotate_if_needed()?;
         serde_json::to_writer(&mut self.writer, line).with_context(|| {
             format!("failed to serialize journal line to {}", self.path.display())
         })?;
         self.writer
             .write_all(b"\n")
             .with_context(|| format!("failed to append newline to {}", self.path.display()))?;
+        self.current_size_bytes = self.current_size_bytes.saturating_add(1);
         Ok(())
     }
+
+    fn rotate_if_needed(&mut self) -> Result<()> {
+        let Some(limit_bytes) = self.rotate_bytes else {
+            return Ok(());
+        };
+        if self.current_size_bytes < limit_bytes {
+            return Ok(());
+        }
+
+        self.writer
+            .flush()
+            .with_context(|| format!("failed to flush journal {}", self.path.display()))?;
+
+        let rotated_path = rotated_journal_path(&self.path);
+        fs::rename(&self.path, &rotated_path).with_context(|| {
+            format!(
+                "failed to rotate journal {} -> {}",
+                self.path.display(),
+                rotated_path.display()
+            )
+        })?;
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to reopen rotated journal {}", self.path.display()))?;
+        self.writer = BufWriter::new(file);
+        self.current_size_bytes = 0;
+        Ok(())
+    }
+}
+
+fn rotated_journal_path(path: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("journal");
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("jsonl");
+    parent.join(format!("{stem}.{ts}.{ext}"))
 }
 
 #[cfg(test)]
@@ -174,5 +235,38 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("\"kind\":\"runtime_checkpoint\""));
         assert!(lines[0].contains("\"run_id\":\"run-1\""));
+    }
+
+    #[test]
+    fn rotates_journal_when_size_limit_hit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("whale-pair-journal-rotate-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+
+        let mut journal = JournalWriter::open_with_rotation(&path, Some(1)).unwrap();
+        journal
+            .append_event(&EventRecord::new(EventCategory::Runtime, 1, "started"))
+            .unwrap();
+        journal
+            .append_event(&EventRecord::new(EventCategory::Runtime, 2, "second"))
+            .unwrap();
+        journal.flush().unwrap();
+
+        let rotated = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|entry| entry.file_name().and_then(|v| v.to_str()).unwrap_or("").starts_with("journal."))
+            .collect::<Vec<_>>();
+        assert!(!rotated.is_empty());
+
+        let active_contents = fs::read_to_string(&path).unwrap();
+        assert!(active_contents.contains("\"second\""));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
