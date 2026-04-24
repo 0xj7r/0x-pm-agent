@@ -59,6 +59,7 @@ struct ExecutionSyncReport {
     balance_synced: bool,
     venue_cash_usd: Option<f64>,
     venue_position_count: usize,
+    venue_positions_authoritative: bool,
     venue_balance_observed_at_ms: Option<u64>,
     venue_fills: Vec<VenueFill>,
     venue_positions: Vec<VenuePosition>,
@@ -1821,6 +1822,52 @@ async fn execute_execution_adapter(
                     &mut combined,
                 );
             }
+            RuntimeCommand::Merge(intent) => {
+                if execution_policy.paper_mode {
+                    let fill = crate::types::FillReport {
+                        order_id: None,
+                        client_order_id: Some(intent.command_id.clone()),
+                        market_id: intent.market_id.clone(),
+                        instrument_id: intent.yes_instrument_id.clone(),
+                        side: TradeSide::Buy,
+                        price: 1.0,
+                        quantity: intent.quantity,
+                        fee_usd: intent.expected_fee_usd + intent.expected_gas_usd,
+                        liquidity: crate::types::FillLiquidity::Unknown,
+                        close_method: Some(crate::types::CloseMethod::Merge),
+                        observed_at_ms,
+                    };
+                    metrics.record_fill(
+                        &fill,
+                        Some(observed_at_ms.saturating_sub(intent.created_at_ms)),
+                    );
+                    let merge_outcome = runtime.on_fill(fill)?;
+                    let chained_commands = merge_outcome.commands.clone();
+                    combined.extend(merge_outcome);
+                    for command in chained_commands {
+                        queue.push_back(command);
+                    }
+                    continue;
+                }
+
+                warn!(
+                    mode = "live",
+                    market_id = %intent.market_id,
+                    yes_instrument_id = %intent.yes_instrument_id,
+                    no_instrument_id = %intent.no_instrument_id,
+                    quantity = intent.quantity,
+                    command_id = %intent.command_id,
+                    "merge command planned but live relayer submission is not implemented"
+                );
+            }
+            RuntimeCommand::Redeem(intent) => {
+                warn!(
+                    mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                    market_id = %intent.market_id,
+                    command_id = %intent.command_id,
+                    "redeem command planned but relayer submission is not implemented"
+                );
+            }
             RuntimeCommand::Noop => {}
         }
     }
@@ -2021,11 +2068,13 @@ async fn sync_execution_state(
             report.balance_synced = true;
             report.venue_cash_usd = Some(balances.cash_usd);
             report.venue_position_count = balances.positions.len();
+            report.venue_positions_authoritative = balances.positions_authoritative;
             report.venue_balance_observed_at_ms = Some(balances.observed_at_ms);
             report.venue_positions = balances.positions;
             debug!(
                 cash_usd = balances.cash_usd,
                 positions = report.venue_position_count,
+                positions_authoritative = report.venue_positions_authoritative,
                 observed_at_ms = balances.observed_at_ms,
                 "synced execution balances"
             );
@@ -2071,9 +2120,9 @@ fn apply_sync_report(
                 "synced venue balance state"
             );
         }
-        if !report.venue_positions.is_empty() {
+        if report.venue_positions_authoritative || !report.venue_positions.is_empty() {
             let observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
-            let snapshots = report
+            let mut snapshots = report
                 .venue_positions
                 .iter()
                 .map(|position| VenuePositionSnapshot {
@@ -2085,9 +2134,35 @@ fn apply_sync_report(
                     observed_at_ms,
                 })
                 .collect::<Vec<_>>();
+            if report.venue_positions_authoritative {
+                let venue_instruments = snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.instrument_id.clone())
+                    .collect::<HashSet<_>>();
+                snapshots.extend(
+                    runtime
+                        .inventory()
+                        .positions()
+                        .filter(|position| !venue_instruments.contains(&position.instrument_id))
+                        .map(|position| VenuePositionSnapshot {
+                            market_id: position.market_id.clone(),
+                            instrument_id: position.instrument_id.clone(),
+                            quantity: 0.0,
+                            average_cost_usd: position.avg_price,
+                            mark_price: position.mark_price,
+                            observed_at_ms,
+                        }),
+                );
+            }
             match runtime.reconcile_venue_positions(&snapshots, observed_at_ms) {
                 Ok(reconcile_report) => {
+                    let mut merge_markets = snapshots
+                        .iter()
+                        .filter(|snapshot| snapshot.quantity > 1e-9)
+                        .map(|snapshot| snapshot.market_id.clone())
+                        .collect::<HashSet<_>>();
                     for stranded in reconcile_report.stranded_markets {
+                        merge_markets.insert(stranded.market_id.clone());
                         warn!(
                             mode = "live",
                             market_id = %stranded.market_id,
@@ -2095,6 +2170,13 @@ fn apply_sync_report(
                             stranded_legs = stranded.stranded_positions.len(),
                             "venue reconciliation found stranded inventory"
                         );
+                    }
+                    for market_id in merge_markets {
+                        combined.extend(runtime.plan_merge_command_for_market(
+                            &market_id,
+                            observed_at_ms,
+                            "paired inventory after venue reconciliation",
+                        ));
                     }
                 }
                 Err(error) => {
@@ -2106,8 +2188,6 @@ fn apply_sync_report(
                 }
             }
         } else {
-            // The current live adapter does not yet mark empty position snapshots as authoritative.
-            // Do not flatten local inventory on an empty Vec until the adapter exposes that contract.
             debug!("venue balance sync returned no positions; local inventory left unchanged");
         }
     }
@@ -2602,6 +2682,7 @@ mod tests {
             Ok(self.balances.clone().unwrap_or(VenueBalances {
                 cash_usd: 0.0,
                 positions: Vec::new(),
+                positions_authoritative: false,
                 observed_at_ms: 0,
             }))
         }
@@ -2796,6 +2877,7 @@ mod tests {
                     quantity: 6.5,
                     average_cost_usd: 0.80,
                 }],
+                positions_authoritative: true,
                 observed_at_ms: now_ms,
             }),
             ..RecordingAdapter::default()
@@ -2834,6 +2916,84 @@ mod tests {
         assert_eq!(runtime.stranded_inventory().len(), 1);
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
         assert_eq!(metrics.snapshot().venue_position_count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        let now_ms = now_unix_ms();
+        runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: MarketId::from("market-mm"),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.80,
+                    mark_price: None,
+                    observed_at_ms: now_ms,
+                }],
+                now_ms,
+            )
+            .expect("seed inventory");
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("down")),
+            6.5
+        );
+
+        let adapter = Arc::new(RecordingAdapter {
+            balances: Some(VenueBalances {
+                cash_usd: 80.0,
+                positions: Vec::new(),
+                positions_authoritative: true,
+                observed_at_ms: now_ms.saturating_add(1),
+            }),
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter,
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("down")),
+            0.0
+        );
+        assert_eq!(metrics.snapshot().venue_position_count, 0);
+        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
     }
 
     #[test]

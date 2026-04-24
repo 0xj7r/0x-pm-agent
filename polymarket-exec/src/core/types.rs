@@ -195,6 +195,39 @@ impl OrderIntent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MergeIntent {
+    pub command_id: ClientOrderId,
+    pub market_id: MarketId,
+    pub yes_instrument_id: InstrumentId,
+    pub no_instrument_id: InstrumentId,
+    pub quantity: f64,
+    pub expected_cash_usd: f64,
+    pub expected_cost_usd: f64,
+    pub expected_fee_usd: f64,
+    pub expected_gas_usd: f64,
+    pub reason: String,
+    pub created_at_ms: EpochMillis,
+}
+
+impl MergeIntent {
+    pub fn expected_net_gain_usd(&self) -> f64 {
+        self.expected_cash_usd
+            - self.expected_cost_usd
+            - self.expected_fee_usd
+            - self.expected_gas_usd
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RedeemIntent {
+    pub command_id: ClientOrderId,
+    pub market_id: MarketId,
+    pub condition_id: Option<String>,
+    pub reason: String,
+    pub created_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FillReport {
     pub order_id: Option<OrderId>,
     pub client_order_id: Option<ClientOrderId>,
@@ -222,5 +255,7 @@ pub enum RuntimeCommand {
         client_order_id: ClientOrderId,
         reason: String,
     },
+    Merge(MergeIntent),
+    Redeem(RedeemIntent),
     Noop,
 }
