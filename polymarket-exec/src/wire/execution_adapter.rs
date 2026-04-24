@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
-use polymarket_client_sdk::auth::{Credentials as SdkCredentials, Signer, Uuid};
+use polymarket_client_sdk::auth::{Credentials as SdkCredentials, ExposeSecret, Signer, Uuid};
 use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk::clob::types::{
     OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
@@ -388,6 +388,15 @@ impl PolymarketExecutionAdapter {
             client,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
+    }
+
+    pub fn api_credentials(&self) -> (String, String, String) {
+        let credentials = self.client.credentials();
+        (
+            credentials.key().to_string(),
+            credentials.secret().expose_secret().to_string(),
+            credentials.passphrase().expose_secret().to_string(),
+        )
     }
 
     fn map_order_type(req: &SubmitOrderRequest) -> Result<SdkOrderType, ExecutionError> {
