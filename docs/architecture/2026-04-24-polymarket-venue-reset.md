@@ -20,6 +20,7 @@ The runtime now supports an explicit CLOB REST base URL:
 
 ```env
 POLYMARKET_CLOB_API_URL=https://clob.polymarket.com
+POLYMARKET_DATA_API_URL=https://data-api.polymarket.com
 ```
 
 Existing websocket endpoints remain separately configurable:
@@ -33,6 +34,7 @@ For a sandbox smoke, use a dedicated env file and a burner wallet:
 
 ```env
 POLYMARKET_CLOB_API_URL=https://clob.loremipsumtrade.com
+POLYMARKET_DATA_API_URL=<sandbox data api if provided>
 POLYMARKET_MARKET_WS_URL=<sandbox market ws if provided>
 POLYMARKET_USER_WS_URL=<sandbox user ws if provided>
 POLYMARKET_PRIVATE_KEY=<burner only>
