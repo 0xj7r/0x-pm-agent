@@ -139,7 +139,10 @@ impl QuoteReconciler {
     }
 
     fn can_change(&self, order: &ManagedOrder, now_ms: EpochMillis) -> bool {
-        if matches!(order.status, ManagedOrderStatus::Filled | ManagedOrderStatus::Cancelled) {
+        if matches!(
+            order.status,
+            ManagedOrderStatus::Filled | ManagedOrderStatus::Cancelled
+        ) {
             return false;
         }
         Self::order_age_ms(order, now_ms) >= self.config.min_order_age_ms
@@ -193,7 +196,11 @@ impl QuoteReconciler {
     }
 
     fn record_replace(&mut self, now_ms: EpochMillis) {
-        Self::prune_window(&mut self.replace_events, now_ms, self.config.churn_window_ms);
+        Self::prune_window(
+            &mut self.replace_events,
+            now_ms,
+            self.config.churn_window_ms,
+        );
         self.replace_events.push_back(now_ms);
     }
 
@@ -282,7 +289,8 @@ impl QuoteReconciler {
     ) -> QuotePlan {
         let mut plan = QuotePlan::default();
         if self.should_hard_pull(now_ms) {
-            plan.actions.extend(self.build_cancel_all(open_orders, now_ms));
+            plan.actions
+                .extend(self.build_cancel_all(open_orders, now_ms));
             plan.notes.push("hard pull active".to_string());
             return plan;
         }
@@ -326,7 +334,8 @@ impl QuoteReconciler {
 
             let (existing_id, existing_order) = matches.remove(0);
             if Self::same_quote(&existing_order.intent, &desired_intent) {
-                plan.actions.push(QuoteAction::Keep(existing_order.intent.clone()));
+                plan.actions
+                    .push(QuoteAction::Keep(existing_order.intent.clone()));
             } else if self.can_change(existing_order, now_ms) {
                 if self.can_replace(now_ms, planned_replaces + 1) {
                     plan.actions.push(QuoteAction::Replace {
@@ -338,11 +347,13 @@ impl QuoteReconciler {
                     planned_replaces += 1;
                     planned_churn += 2;
                 } else {
-                    plan.actions.push(QuoteAction::Keep(existing_order.intent.clone()));
+                    plan.actions
+                        .push(QuoteAction::Keep(existing_order.intent.clone()));
                     plan.notes.push("replace rate cap reached".to_string());
                 }
             } else {
-                plan.actions.push(QuoteAction::Keep(existing_order.intent.clone()));
+                plan.actions
+                    .push(QuoteAction::Keep(existing_order.intent.clone()));
             }
 
             for (extra_id, extra_order) in matches {
@@ -355,11 +366,13 @@ impl QuoteReconciler {
                         planned_cancels += 1;
                         planned_churn += 1;
                     } else {
-                        plan.actions.push(QuoteAction::Keep(extra_order.intent.clone()));
+                        plan.actions
+                            .push(QuoteAction::Keep(extra_order.intent.clone()));
                         plan.notes.push("cancel rate cap reached".to_string());
                     }
                 } else {
-                    plan.actions.push(QuoteAction::Keep(extra_order.intent.clone()));
+                    plan.actions
+                        .push(QuoteAction::Keep(extra_order.intent.clone()));
                 }
             }
         }
@@ -406,35 +419,42 @@ impl QuoteReconciler {
             ));
         }
 
-        plan.actions.sort_by(|left, right| match (left, right) {
-            (
-                QuoteAction::Cancel { client_order_id: left_id, .. },
-                QuoteAction::Cancel { client_order_id: right_id, .. },
-            ) => left_id.as_str().cmp(right_id.as_str()),
-            (
-                QuoteAction::Replace {
-                    existing_client_order_id: left_id,
-                    ..
-                },
-                QuoteAction::Replace {
-                    existing_client_order_id: right_id,
-                    ..
-                },
-            ) => left_id.as_str().cmp(right_id.as_str()),
-            (
-                QuoteAction::Submit(_) | QuoteAction::Keep(_),
-                QuoteAction::Submit(_) | QuoteAction::Keep(_),
-            ) => std::cmp::Ordering::Equal,
-            (QuoteAction::Cancel { .. }, _) => std::cmp::Ordering::Less,
-            (_, QuoteAction::Cancel { .. }) => std::cmp::Ordering::Greater,
-            (QuoteAction::Replace { .. }, QuoteAction::Submit(_) | QuoteAction::Keep(_)) => {
-                std::cmp::Ordering::Less
+        plan.actions.sort_by(|left, right| {
+            fn action_rank(action: &QuoteAction) -> u8 {
+                match action {
+                    QuoteAction::Cancel { .. } => 0,
+                    QuoteAction::Replace { .. } => 1,
+                    QuoteAction::Keep(_) => 2,
+                    QuoteAction::Submit(_) => 3,
+                }
             }
-            (QuoteAction::Submit(_) | QuoteAction::Keep(_), QuoteAction::Replace { .. }) => {
-                std::cmp::Ordering::Greater
+
+            match action_rank(left).cmp(&action_rank(right)) {
+                std::cmp::Ordering::Equal => match (left, right) {
+                    (
+                        QuoteAction::Cancel {
+                            client_order_id: left_id,
+                            ..
+                        },
+                        QuoteAction::Cancel {
+                            client_order_id: right_id,
+                            ..
+                        },
+                    ) => left_id.as_str().cmp(right_id.as_str()),
+                    (
+                        QuoteAction::Replace {
+                            existing_client_order_id: left_id,
+                            ..
+                        },
+                        QuoteAction::Replace {
+                            existing_client_order_id: right_id,
+                            ..
+                        },
+                    ) => left_id.as_str().cmp(right_id.as_str()),
+                    _ => std::cmp::Ordering::Equal,
+                },
+                ordering => ordering,
             }
-            (QuoteAction::Keep(_), QuoteAction::Submit(_)) => std::cmp::Ordering::Less,
-            (QuoteAction::Submit(_), QuoteAction::Keep(_)) => std::cmp::Ordering::Greater,
         });
         plan
     }
@@ -445,7 +465,9 @@ mod tests {
     use super::{QuoteAction, QuoteReconciler, ReconcilerConfig};
     use crate::runtime::ManagedOrder;
     use crate::runtime::ManagedOrderStatus;
-    use crate::types::{ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderIntent, TradeSide};
+    use crate::types::{
+        ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderIntent, TradeSide,
+    };
     use std::collections::HashMap;
 
     fn managed(_id: &str, intent: &OrderIntent, updated_ms: EpochMillis) -> ManagedOrder {
@@ -601,6 +623,9 @@ mod tests {
         };
         let plan = reconciler.plan(desired, &HashMap::new(), 2);
         assert!(plan.actions.is_empty());
-        assert!(plan.notes.iter().any(|note| note.contains("submit rate cap reached")));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("submit rate cap reached")));
     }
 }

@@ -3,7 +3,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::event_log::{EventCategory, EventMetrics, EventRecord};
-use crate::types::{ClientOrderId, EpochMillis, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide};
+use crate::types::{
+    ClientOrderId, EpochMillis, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PositionState {
@@ -75,9 +77,8 @@ impl InventoryAdjustment {
             gross_exposure_after_usd: Some(self.gross_exposure_after_usd),
             risk_reject_reason: None,
         };
-        let mut record =
-            EventRecord::new(EventCategory::Inventory, self.observed_at_ms, message)
-                .with_metrics(metrics);
+        let mut record = EventRecord::new(EventCategory::Inventory, self.observed_at_ms, message)
+            .with_metrics(metrics);
         if let Some(market_id) = &self.market_id {
             record = record.with_market(market_id.clone());
         }
@@ -103,7 +104,10 @@ pub struct InventorySnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InventoryError {
-    InsufficientFreeCash { required_usd: f64, available_usd: f64 },
+    InsufficientFreeCash {
+        required_usd: f64,
+        available_usd: f64,
+    },
     DuplicateReservation(ClientOrderId),
     Oversell {
         instrument_id: InstrumentId,
@@ -389,14 +393,13 @@ impl InventoryState {
             TradeSide::Sell => {
                 let remove_after;
                 {
-                    let entry = self
-                        .positions
-                        .get_mut(&fill.instrument_id)
-                        .ok_or_else(|| InventoryError::Oversell {
+                    let entry = self.positions.get_mut(&fill.instrument_id).ok_or_else(|| {
+                        InventoryError::Oversell {
                             instrument_id: fill.instrument_id.clone(),
                             available_qty: 0.0,
                             attempted_qty: fill.quantity,
-                        })?;
+                        }
+                    })?;
                     if entry.quantity + 1e-9 < fill.quantity {
                         return Err(InventoryError::Oversell {
                             instrument_id: fill.instrument_id.clone(),
@@ -577,7 +580,9 @@ impl InventoryState {
 #[cfg(test)]
 mod tests {
     use super::InventoryState;
-    use crate::types::{ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide};
+    use crate::types::{
+        ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide,
+    };
 
     #[test]
     fn reserve_buy_and_apply_round_trip_sell() {

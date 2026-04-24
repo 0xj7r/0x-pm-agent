@@ -1,13 +1,21 @@
 //! Live CLOB execution adapter contract (Section 8.1).
-//! Agent A scope: execution adapter implementation and test coverage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use polymarket_client_sdk::auth::{Credentials as SdkCredentials, Signer, Uuid};
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
+use polymarket_client_sdk::clob::types::{
+    OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
+};
+use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
+use polymarket_client_sdk::types::{Address as SdkAddress, Decimal as SdkDecimal, U256 as SdkU256};
+use polymarket_client_sdk::{auth, POLYGON};
 use tokio::sync::RwLock;
 
 use crate::types::{
@@ -122,6 +130,38 @@ pub struct PolymarketCredentials {
     pub api_key: String,
     pub api_secret: String,
     pub api_passphrase: String,
+    pub private_key: String,
+    pub signature_type: PolymarketSignatureType,
+    pub funder_address: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PolymarketSignatureType {
+    Eoa,
+    Proxy,
+    #[default]
+    GnosisSafe,
+}
+
+impl PolymarketSignatureType {
+    pub fn parse(raw: &str) -> Result<Self, ExecutionError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "eoa" => Ok(Self::Eoa),
+            "1" | "proxy" | "poly_proxy" | "poly-proxy" => Ok(Self::Proxy),
+            "2" | "safe" | "gnosis" | "gnosis_safe" | "gnosis-safe" => Ok(Self::GnosisSafe),
+            other => Err(ExecutionError::BadRequest(format!(
+                "unsupported POLYMARKET_SIGNATURE_TYPE `{other}`"
+            ))),
+        }
+    }
+
+    fn as_sdk(self) -> SdkSignatureType {
+        match self {
+            Self::Eoa => SdkSignatureType::Eoa,
+            Self::Proxy => SdkSignatureType::Proxy,
+            Self::GnosisSafe => SdkSignatureType::GnosisSafe,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,9 +184,7 @@ pub enum ExecutionError {
     TransientNetwork(String),
     AuthFailure(String),
     BadRequest(String),
-    RateLimit {
-        retry_after_ms: Option<u64>,
-    },
+    RateLimit { retry_after_ms: Option<u64> },
     VenueRejection(String),
     UncertainOutcome(String),
 }
@@ -194,149 +232,6 @@ pub trait ExecutionAdapter: Send + Sync {
 struct AdapterState {
     submitted_orders: HashMap<ClientOrderId, SubmitOrderAck>,
     venue_order_map: HashMap<ClientOrderId, OrderId>,
-    canceled_orders: HashSet<ClientOrderId>,
-}
-
-#[derive(Clone, Debug)]
-struct HttpResponse {
-    status: u16,
-    body: Value,
-    retry_after_ms: Option<u64>,
-}
-
-#[async_trait]
-trait PolymarketHttpClient: Send + Sync {
-    async fn call(
-        &self,
-        method: HttpMethod,
-        path: &str,
-        body: Option<&Value>,
-    ) -> Result<HttpResponse, ExecutionError>;
-}
-
-#[derive(Clone, Copy)]
-enum HttpMethod {
-    Get,
-    Post,
-    Delete,
-}
-
-#[derive(Clone)]
-struct ReqwestPolymarketClient {
-    api_url: String,
-    credentials: Option<PolymarketCredentials>,
-    client: reqwest::Client,
-}
-
-impl ReqwestPolymarketClient {
-    fn build_url(&self, path: &str) -> String {
-        let trimmed_base = self.api_url.trim_end_matches('/');
-        let trimmed_path = path.trim_start_matches('/');
-        format!("{trimmed_base}/{trimmed_path}")
-    }
-
-    fn attach_auth_headers(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
-        let Some(auth) = &self.credentials else {
-            return request;
-        };
-
-        request
-            .header("POLYMARKET-API-KEY", auth.api_key.clone())
-            .header("POLYMARKET-API-SECRET", auth.api_secret.clone())
-            .header("POLYMARKET-PASSPHRASE", auth.api_passphrase.clone())
-    }
-
-    async fn decode_retry_after(response: &reqwest::Response) -> Option<u64> {
-        let header = response.headers().get("retry-after")?;
-        let value = header.to_str().ok()?.trim();
-        if value.is_empty() {
-            return None;
-        }
-        value.parse::<u64>().ok()
-    }
-
-    fn map_status_error(status: u16, retry_after_ms: Option<u64>, body: &Value) -> Option<ExecutionError> {
-        if (200..300).contains(&status) {
-            return None;
-        }
-
-        let message = body
-            .get("message")
-            .or_else(|| body.get("error"))
-            .or_else(|| body.get("detail"))
-            .and_then(Self::as_string)
-            .or_else(|| {
-                body.get("errors")
-                    .and_then(Value::as_array)
-                    .and_then(|errors| errors.first())
-                    .and_then(Self::as_string)
-            })
-            .unwrap_or_else(|| format!("http status {status}"));
-
-        match status {
-            401 | 403 => Some(ExecutionError::AuthFailure(message)),
-            400 | 422 => Some(ExecutionError::BadRequest(message)),
-            408 | 425 | 429 => Some(ExecutionError::RateLimit { retry_after_ms }),
-            500 | 502 | 503 | 504 => Some(ExecutionError::TransientNetwork(message)),
-            409 => Some(ExecutionError::UncertainOutcome(message)),
-            _ => Some(ExecutionError::VenueRejection(message)),
-        }
-    }
-
-    fn as_string(value: &Value) -> Option<String> {
-        match value {
-            Value::String(raw) => Some(raw.clone()),
-            _ => value.as_str().map(ToOwned::to_owned),
-        }
-    }
-}
-
-#[async_trait]
-impl PolymarketHttpClient for ReqwestPolymarketClient {
-    async fn call(
-        &self,
-        method: HttpMethod,
-        path: &str,
-        body: Option<&Value>,
-    ) -> Result<HttpResponse, ExecutionError> {
-        let url = self.build_url(path);
-        let mut request = match method {
-            HttpMethod::Get => self.client.get(url),
-            HttpMethod::Post => self.client.post(url),
-            HttpMethod::Delete => self.client.delete(url),
-        };
-
-        request = request.header("content-type", "application/json");
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        request = self.attach_auth_headers(request);
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
-
-        let status = response.status().as_u16();
-        let retry_after_ms = Self::decode_retry_after(&response).await;
-        let body = response
-            .json::<Value>()
-            .await
-            .unwrap_or(Value::Null);
-
-        if let Some(error) = Self::map_status_error(status, retry_after_ms, &body) {
-            return Err(error);
-        }
-
-        Ok(HttpResponse {
-            status,
-            body,
-            retry_after_ms,
-        })
-    }
 }
 
 pub struct PaperExecutionAdapter;
@@ -384,242 +279,147 @@ impl ExecutionAdapter for PaperExecutionAdapter {
 
 pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
-    http_client: Arc<dyn PolymarketHttpClient + Send + Sync>,
+    signer: PrivateKeySigner,
+    client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
     state: Arc<RwLock<AdapterState>>,
 }
 
 impl PolymarketExecutionAdapter {
-    pub fn new(credentials: PolymarketCredentials) -> Self {
-        Self::with_config(PolymarketConfig {
+    pub async fn connect(credentials: PolymarketCredentials) -> Result<Self, ExecutionError> {
+        Self::connect_with_config(PolymarketConfig {
             api_url: "https://clob.polymarket.com".to_string(),
             credentials: Some(credentials),
         })
+        .await
     }
 
-    pub fn with_config(config: PolymarketConfig) -> Self {
-        let http_client = ReqwestPolymarketClient {
-            api_url: config.api_url.clone(),
-            credentials: config.credentials.clone(),
-            client: reqwest::Client::new(),
-        };
-        Self {
-            _config: config,
-            http_client: Arc::new(http_client),
-            state: Arc::new(RwLock::new(AdapterState::default())),
+    pub async fn connect_with_config(config: PolymarketConfig) -> Result<Self, ExecutionError> {
+        let credentials = config.credentials.clone().ok_or_else(|| {
+            ExecutionError::AuthFailure("missing Polymarket live credentials".to_string())
+        })?;
+        let api_key = Uuid::parse_str(credentials.api_key.trim()).map_err(|error| {
+            ExecutionError::AuthFailure(format!("invalid POLYMARKET_API_KEY: {error}"))
+        })?;
+        let sdk_credentials = SdkCredentials::new(
+            api_key,
+            credentials.api_secret.clone(),
+            credentials.api_passphrase.clone(),
+        );
+        let signer = PrivateKeySigner::from_str(credentials.private_key.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid POLYMARKET_PRIVATE_KEY: {error}"))
+            })?
+            .with_chain_id(Some(POLYGON));
+
+        let mut auth_builder = SdkClobClient::new(
+            config.api_url.as_str(),
+            SdkClobConfig::builder().use_server_time(true).build(),
+        )
+        .map_err(map_sdk_error)?
+        .authentication_builder(&signer)
+        .credentials(sdk_credentials)
+        .signature_type(credentials.signature_type.as_sdk());
+
+        if let Some(funder) = credentials
+            .funder_address
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            auth_builder = auth_builder.funder(SdkAddress::from_str(funder).map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
+            })?);
         }
-    }
 
-    fn build_submit_payload(req: &SubmitOrderRequest) -> Value {
-        json!({
-            "client_order_id": req.client_order_id.as_str(),
-            "market_id": req.market_id.as_str(),
-            "instrument_id": req.instrument_id.as_str(),
-            "side": match req.side {
-                TradeSide::Buy => "BUY",
-                TradeSide::Sell => "SELL",
-            },
-            "size": req.quantity,
-            "price": req.limit_price,
-            "post_only": req.post_only,
-            "time_in_force": req.time_in_force.as_str(),
-            "strategy_tag": req.strategy_tag,
-            "quote_level_tag": req.quote_level_tag,
-            "created_at_ms": req.submitted_at_ms,
+        let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+
+        Ok(Self {
+            _config: config,
+            signer,
+            client,
+            state: Arc::new(RwLock::new(AdapterState::default())),
         })
     }
 
-    fn build_cancel_payload(
-        req: &CancelOrderRequest,
-        venue_order_id: Option<&OrderId>,
-    ) -> (String, Value) {
-        let order_id = venue_order_id
-            .or_else(|| req.venue_order_id.as_ref())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| req.client_order_id.as_str().to_string());
-
-        let payload = json!({
-            "client_order_id": req.client_order_id.as_str(),
-            "order_id": order_id,
-            "reason": req.reason.clone(),
-            "ts": req.submitted_at_ms,
-        });
-
-        (order_id, payload)
-    }
-
-    fn parse_message(body: &Value) -> Option<String> {
-        body.get("message")
-            .or_else(|| body.get("error"))
-            .or_else(|| body.get("reason"))
-            .and_then(Self::as_string)
-            .or_else(|| {
-                body.get("errors")
-                    .and_then(Value::as_array)
-                    .and_then(|errors| errors.first())
-                    .and_then(Self::as_string)
-            })
-    }
-
-    fn parse_order_id(body: &Value) -> Option<OrderId> {
-        body
-            .get("id")
-            .or_else(|| body.get("order_id"))
-            .or_else(|| body.get("orderId"))
-            .or_else(|| body.get("venue_order_id"))
-            .and_then(Self::as_string)
-            .map(OrderId::from)
-    }
-
-    fn parse_status(body: &Value) -> Option<String> {
-        body.get("status")
-            .or_else(|| body.get("result"))
-            .or_else(|| body.get("state"))
-            .and_then(Self::as_string)
-    }
-
-    fn parse_submit_ack_status(body: &Value, fallback: bool) -> bool {
-        if let Some(status) = Self::parse_status(body).map(|value| value.to_ascii_lowercase()) {
-            return match status.as_str() {
-                "open" | "accepted" | "active" | "working" | "created" | "new" => true,
-                "rejected" | "error" => false,
-                _ => fallback,
-            };
-        }
-        body.get("accepted").and_then(Value::as_bool).unwrap_or(fallback)
-    }
-
-    fn parse_cancel_ack_status(body: &Value, fallback: bool) -> bool {
-        if let Some(status) = Self::parse_status(body).map(|value| value.to_ascii_lowercase()) {
-            return match status.as_str() {
-                "cancelled" | "canceled" | "success" | "complete" => true,
-                "open" | "accepted" | "active" | "working" => false,
-                "rejected" | "error" | "not_found" => false,
-                _ => fallback,
-            };
-        }
-        body.get("accepted").and_then(Value::as_bool).unwrap_or(fallback)
-    }
-
-    fn parse_u64(value: &Value) -> Option<u64> {
-        match value {
-            Value::Number(number) => {
-                if let Some(value) = number.as_u64() {
-                    Some(value)
+    fn map_order_type(req: &SubmitOrderRequest) -> Result<SdkOrderType, ExecutionError> {
+        match req.time_in_force {
+            TimeInForce::Gtc => Ok(SdkOrderType::GTC),
+            TimeInForce::Ioc => {
+                if req.post_only {
+                    Err(ExecutionError::BadRequest(
+                        "post-only IOC/FAK orders are invalid on Polymarket".to_string(),
+                    ))
                 } else {
-                    number
-                        .as_f64()
-                        .and_then(|value| {
-                            if value.is_finite() && value >= 0.0 {
-                                Some(value as u64)
-                            } else {
-                                None
-                            }
-                        })
+                    Ok(SdkOrderType::FAK)
                 }
             }
-            Value::String(raw) => raw.parse::<u64>().ok(),
-            _ => None,
+            TimeInForce::Fok => {
+                if req.post_only {
+                    Err(ExecutionError::BadRequest(
+                        "post-only FOK orders are invalid on Polymarket".to_string(),
+                    ))
+                } else {
+                    Ok(SdkOrderType::FOK)
+                }
+            }
+            TimeInForce::Gtd => Err(ExecutionError::BadRequest(
+                "GTD live order expiration is not wired; use GTC until expiration is supplied"
+                    .to_string(),
+            )),
         }
     }
 
-    fn parse_f64(value: &Value) -> Option<f64> {
-        value
-            .as_f64()
-            .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
-    }
-
-    fn as_string(value: &Value) -> Option<String> {
-        match value {
-            Value::String(raw) => Some(raw.clone()),
-            _ => value.as_str().map(ToOwned::to_owned),
+    fn sdk_side(side: TradeSide) -> SdkSide {
+        match side {
+            TradeSide::Buy => SdkSide::Buy,
+            TradeSide::Sell => SdkSide::Sell,
         }
     }
 
-    fn parse_trade_side(raw: &str) -> TradeSide {
-        match raw.to_ascii_lowercase().as_str() {
-            "buy" | "bid" => TradeSide::Buy,
-            _ => TradeSide::Sell,
+    fn decimal_from_f64(
+        value: f64,
+        scale: usize,
+        field: &str,
+    ) -> Result<SdkDecimal, ExecutionError> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(ExecutionError::BadRequest(format!(
+                "{field} must be positive and finite, got {value}"
+            )));
         }
-    }
-
-    fn parse_open_order_items(body: &Value) -> Option<&Vec<Value>> {
-        body.get("data")
-            .or_else(|| body.get("orders"))
-            .and_then(Self::as_array)
-            .or_else(|| body.as_array())
-    }
-
-    fn as_array(value: &Value) -> Option<&Vec<Value>> {
-        value.as_array()
+        format!("{value:.scale$}")
+            .parse::<SdkDecimal>()
+            .map_err(|error| ExecutionError::BadRequest(format!("invalid {field}: {error}")))
     }
 
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
-        let response = self.http_client.call(HttpMethod::Get, "/v1/orders", None).await?;
-        let Some(items) = Self::parse_open_order_items(&response.body) else {
-            return Ok(Vec::new());
-        };
-
+        let page = self
+            .client
+            .orders(&OrdersRequest::default(), None)
+            .await
+            .map_err(map_sdk_error)?;
         let mut orders = Vec::new();
-        for item in items {
-            let venue_order_id = Self::parse_order_id(item).map(|value| value.to_string());
-            let Some(venue_order_id) = venue_order_id else {
-                continue;
-            };
-            let market_id = item
-                .get("market_id")
-                .or_else(|| item.get("marketId"))
-                .and_then(Self::as_string)
-                .unwrap_or_default();
-            let instrument_id = item
-                .get("instrument_id")
-                .or_else(|| item.get("asset_id"))
-                .or_else(|| item.get("instrumentId"))
-                .or_else(|| item.get("assetId"))
-                .and_then(Self::as_string)
-                .unwrap_or_default();
-            let status = item.get("status").and_then(Self::as_string).unwrap_or_default();
-            let status = status.to_ascii_lowercase();
-            let relevant = matches!(
-                status.as_str(),
-                "open" | "working" | "active" | "new" | "created" | "accepted" | ""
-            );
-            if !relevant {
+        for item in page.data {
+            if !matches!(
+                item.status,
+                OrderStatusType::Live | OrderStatusType::Delayed
+            ) {
                 continue;
             }
-
+            let original_qty = item.original_size.to_string().parse::<f64>().unwrap_or(0.0);
+            let matched_qty = item.size_matched.to_string().parse::<f64>().unwrap_or(0.0);
             orders.push(VenueOpenOrder {
-                venue_order_id: OrderId::from(venue_order_id),
-                client_order_id: item
-                    .get("client_order_id")
-                    .or_else(|| item.get("clientOrderId"))
-                    .and_then(Self::as_string)
-                    .map(ClientOrderId::from),
-                market_id: MarketId::from(market_id),
-                instrument_id: InstrumentId::from(instrument_id),
-                side: item
-                    .get("side")
-                    .and_then(Self::as_string)
-                    .map(|value| Self::parse_trade_side(&value))
-                    .unwrap_or(TradeSide::Buy),
-                limit_price: item
-                    .get("price")
-                    .or_else(|| item.get("limit_price"))
-                    .and_then(Self::parse_f64)
-                    .unwrap_or(0.0),
-                original_qty: item
-                    .get("size")
-                    .or_else(|| item.get("original_qty"))
-                    .and_then(Self::parse_f64)
-                    .unwrap_or(0.0),
-                remaining_qty: item
-                    .get("remaining")
-                    .or_else(|| item.get("remaining_qty"))
-                    .and_then(Self::parse_f64)
-                    .unwrap_or(0.0),
-                created_at_ms: item
-                    .get("created_at_ms")
-                    .and_then(Self::parse_u64)
-                    .unwrap_or_else(now_unix_ms),
+                venue_order_id: OrderId::from(item.id),
+                client_order_id: None,
+                market_id: MarketId::from(format!("{:#x}", item.market)),
+                instrument_id: InstrumentId::from(item.asset_id.to_string()),
+                side: match item.side {
+                    SdkSide::Buy => TradeSide::Buy,
+                    _ => TradeSide::Sell,
+                },
+                limit_price: item.price.to_string().parse::<f64>().unwrap_or(0.0),
+                original_qty,
+                remaining_qty: (original_qty - matched_qty).max(0.0),
+                created_at_ms: item.created_at.timestamp_millis().max(0) as u64,
             });
         }
 
@@ -628,67 +428,14 @@ impl PolymarketExecutionAdapter {
 
     async fn sync_balances_from_client(&self) -> Result<VenueBalances, ExecutionError> {
         let response = self
-            .http_client
-            .call(HttpMethod::Get, "/v1/balances", None)
-            .await?;
-        let body = response.body;
-
-        let cash_usd = body
-            .get("cash_usd")
-            .or_else(|| body.get("cash"))
-            .or_else(|| body.get("balance"))
-            .and_then(Self::parse_f64)
-            .unwrap_or(0.0);
-
-        let mut positions = Vec::new();
-        if let Some(position_values) = body
-            .get("positions")
-            .or_else(|| body.get("assets"))
-            .and_then(Self::as_array)
-        {
-            for position in position_values {
-                let market_id = position
-                    .get("market_id")
-                    .or_else(|| position.get("marketId"))
-                    .and_then(Self::as_string)
-                    .unwrap_or_default();
-                let instrument_id = position
-                    .get("instrument_id")
-                    .or_else(|| position.get("asset_id"))
-                    .or_else(|| position.get("assetId"))
-                    .and_then(Self::as_string)
-                    .unwrap_or_default();
-                let quantity = position
-                    .get("quantity")
-                    .or_else(|| position.get("size"))
-                    .and_then(Self::parse_f64)
-                    .unwrap_or(0.0);
-                let average_cost_usd = position
-                    .get("average_cost_usd")
-                    .or_else(|| position.get("average_cost"))
-                    .or_else(|| position.get("avg_price"))
-                    .and_then(Self::parse_f64)
-                    .unwrap_or(0.0);
-
-                if market_id.is_empty() && instrument_id.is_empty() {
-                    continue;
-                }
-                positions.push(VenuePosition {
-                    market_id: MarketId::from(market_id),
-                    instrument_id: InstrumentId::from(instrument_id),
-                    quantity,
-                    average_cost_usd,
-                });
-            }
-        }
-
+            .client
+            .balance_allowance(BalanceAllowanceRequest::default())
+            .await
+            .map_err(map_sdk_error)?;
         Ok(VenueBalances {
-            cash_usd,
-            positions,
-            observed_at_ms: body
-                .get("observed_at_ms")
-                .and_then(Self::parse_u64)
-                .unwrap_or_else(now_unix_ms),
+            cash_usd: response.balance.to_string().parse::<f64>().unwrap_or(0.0),
+            positions: Vec::new(),
+            observed_at_ms: now_unix_ms(),
         })
     }
 }
@@ -696,34 +443,71 @@ impl PolymarketExecutionAdapter {
 #[async_trait]
 impl ExecutionAdapter for PolymarketExecutionAdapter {
     async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
-        if let Some(cached) = self.state.read().await.submitted_orders.get(&req.client_order_id).cloned()
+        if let Some(cached) = self
+            .state
+            .read()
+            .await
+            .submitted_orders
+            .get(&req.client_order_id)
+            .cloned()
         {
             return Ok(cached);
         }
 
+        let token_id = SdkU256::from_str(req.instrument_id.as_str()).map_err(|error| {
+            ExecutionError::BadRequest(format!(
+                "invalid Polymarket token id `{}`: {error}",
+                req.instrument_id
+            ))
+        })?;
+        let order_type = Self::map_order_type(&req)?;
+        let price = Self::decimal_from_f64(req.limit_price, 4, "limit_price")?;
+        let size = Self::decimal_from_f64(req.quantity, 2, "quantity")?;
+        let order = self
+            .client
+            .limit_order()
+            .token_id(token_id)
+            .order_type(order_type)
+            .post_only(req.post_only)
+            .price(price)
+            .size(size)
+            .side(Self::sdk_side(req.side))
+            .build()
+            .await
+            .map_err(map_sdk_error)?;
+        let signed_order = self
+            .client
+            .sign(&self.signer, order)
+            .await
+            .map_err(map_sdk_error)?;
         let response = self
-            .http_client
-            .call(HttpMethod::Post, "/v1/orders", Some(&Self::build_submit_payload(&req)))
-            .await?;
+            .client
+            .post_order(signed_order)
+            .await
+            .map_err(map_sdk_error)?;
 
-        let accepted = Self::parse_submit_ack_status(&response.body, true);
+        let accepted = response.success;
         let ack = SubmitOrderAck {
             client_order_id: req.client_order_id.clone(),
-            venue_order_id: Self::parse_order_id(&response.body),
+            venue_order_id: if response.order_id.is_empty() {
+                None
+            } else {
+                Some(OrderId::from(response.order_id.clone()))
+            },
             accepted,
-            accepted_at_ms: response
-                .body
-                .get("accepted_at_ms")
-                .and_then(Self::parse_u64)
-                .unwrap_or_else(now_unix_ms),
-            venue_message: Self::parse_message(&response.body),
+            accepted_at_ms: now_unix_ms(),
+            venue_message: response.error_msg,
         };
 
         if accepted {
             let mut state = self.state.write().await;
-            state.submitted_orders.insert(req.client_order_id.clone(), ack.clone());
+            state
+                .submitted_orders
+                .insert(req.client_order_id.clone(), ack.clone());
             if let Some(order_id) = ack.venue_order_id.clone() {
-                state.venue_order_map.insert(req.client_order_id.clone(), order_id);
+                state
+                    .venue_order_map
+                    .insert(req.client_order_id.clone(), order_id);
             }
         }
 
@@ -731,19 +515,6 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
     }
 
     async fn cancel(&self, req: CancelOrderRequest) -> Result<CancelOrderAck, ExecutionError> {
-        {
-            let state = self.state.read().await;
-            if state.canceled_orders.contains(&req.client_order_id) {
-                return Ok(CancelOrderAck {
-                    client_order_id: req.client_order_id,
-                    venue_order_id: req.venue_order_id,
-                    accepted: true,
-                    accepted_at_ms: now_unix_ms(),
-                    venue_message: Some("idempotent cancel replay".to_string()),
-                });
-            }
-        }
-
         let state = self.state.read().await;
         let venue_order_id = req
             .venue_order_id
@@ -751,28 +522,36 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             .or_else(|| state.venue_order_map.get(&req.client_order_id).cloned());
         drop(state);
 
-        let (order_id, payload) = Self::build_cancel_payload(&req, venue_order_id.as_ref());
+        let Some(order_id) = venue_order_id.clone() else {
+            return Err(ExecutionError::BadRequest(format!(
+                "cannot cancel {} without venue_order_id",
+                req.client_order_id
+            )));
+        };
         let response = self
-            .http_client
-            .call(HttpMethod::Delete, &format!("/v1/orders/{order_id}"), Some(&payload))
-            .await?;
+            .client
+            .cancel_order(order_id.as_str())
+            .await
+            .map_err(map_sdk_error)?;
 
-        let accepted = Self::parse_cancel_ack_status(&response.body, true);
+        let accepted = response
+            .canceled
+            .iter()
+            .any(|canceled| canceled == order_id.as_str());
         let ack = CancelOrderAck {
             client_order_id: req.client_order_id.clone(),
-            venue_order_id: venue_order_id.or_else(|| Self::parse_order_id(&response.body)),
+            venue_order_id: Some(order_id.clone()),
             accepted,
-            accepted_at_ms: response
-                .body
-                .get("accepted_at_ms")
-                .and_then(Self::parse_u64)
-                .unwrap_or_else(now_unix_ms),
-            venue_message: Self::parse_message(&response.body),
+            accepted_at_ms: now_unix_ms(),
+            venue_message: response
+                .not_canceled
+                .get(order_id.as_str())
+                .cloned()
+                .or_else(|| Some("cancel submitted to Polymarket CLOB".to_string())),
         };
 
         if accepted {
             let mut state = self.state.write().await;
-            state.canceled_orders.insert(req.client_order_id.clone());
             state.submitted_orders.remove(&req.client_order_id);
             state.venue_order_map.remove(&req.client_order_id);
         }
@@ -796,160 +575,89 @@ fn now_unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("401") || lower.contains("403") || lower.contains("auth") {
+        ExecutionError::AuthFailure(message)
+    } else if lower.contains("429") || lower.contains("rate limit") {
+        ExecutionError::RateLimit {
+            retry_after_ms: None,
+        }
+    } else if lower.contains("timeout")
+        || lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
+    {
+        ExecutionError::TransientNetwork(message)
+    } else if lower.contains("409") || lower.contains("uncertain") {
+        ExecutionError::UncertainOutcome(message)
+    } else if lower.contains("400") || lower.contains("422") || lower.contains("validation") {
+        ExecutionError::BadRequest(message)
+    } else {
+        ExecutionError::VenueRejection(message)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
 
-    #[derive(Clone)]
-    struct MockHttpClient {
-        responses: Arc<Mutex<VecDeque<Result<HttpResponse, ExecutionError>>>>,
-        calls: Arc<Mutex<Vec<(HttpMethod, String, Option<Value>)>>>,
-    }
-
-    impl MockHttpClient {
-        fn new(responses: Vec<Result<HttpResponse, ExecutionError>>) -> Self {
-            Self {
-                responses: Arc::new(Mutex::new(VecDeque::from(responses))),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn success_submit() -> Self {
-            let response = HttpResponse {
-                status: 200,
-                body: json!({
-                    "id": "venue-1",
-                    "status": "open",
-                    "accepted": true,
-                    "message": "accepted",
-                    "accepted_at_ms": now_unix_ms()
-                }),
-                retry_after_ms: None,
-            };
-            Self::new(vec![Ok(response)])
-        }
-
-        fn success_cancel() -> Self {
-            let response = HttpResponse {
-                status: 200,
-                body: json!({
-                    "status": "cancelled",
-                    "accepted": true,
-                    "message": "cancelled",
-                    "accepted_at_ms": now_unix_ms()
-                }),
-                retry_after_ms: None,
-            };
-            Self::new(vec![Ok(response)])
-        }
-    }
-
-    #[async_trait]
-    impl PolymarketHttpClient for MockHttpClient {
-        async fn call(
-            &self,
-            method: HttpMethod,
-            path: &str,
-            body: Option<&Value>,
-        ) -> Result<HttpResponse, ExecutionError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((method, path.to_string(), body.cloned()));
-
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(ExecutionError::TransientNetwork("no response queued".to_string())))
-        }
-    }
-
-    #[tokio::test]
-    async fn submit_and_cancel_path_is_idempotent() {
-        let shared_client = Arc::new({
-            let mut responses = VecDeque::new();
-            responses.push_back(Ok(HttpResponse {
-                status: 200,
-                body: json!({
-                    "id": "venue-1",
-                    "status": "open",
-                    "accepted": true,
-                    "message": "accepted",
-                    "accepted_at_ms": now_unix_ms()
-                }),
-                retry_after_ms: None,
-            }));
-            responses.push_back(Ok(HttpResponse {
-                status: 200,
-                body: json!({
-                    "status": "cancelled",
-                    "accepted": true,
-                    "message": "cancelled",
-                    "accepted_at_ms": now_unix_ms()
-                }),
-                retry_after_ms: None,
-            }));
-            MockHttpClient {
-                responses: Arc::new(Mutex::new(responses)),
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        });
-
-        let adapter = PolymarketExecutionAdapter {
-            _config: PolymarketConfig::default(),
-            http_client: shared_client.clone(),
-            state: Arc::new(RwLock::new(AdapterState::default())),
-        };
-
-        let req = SubmitOrderRequest {
+    fn submit_req(time_in_force: TimeInForce, post_only: bool) -> SubmitOrderRequest {
+        SubmitOrderRequest {
             client_order_id: ClientOrderId::from("client-1"),
             market_id: MarketId::from("market-1"),
             instrument_id: InstrumentId::from("asset-1"),
             side: TradeSide::Buy,
             limit_price: 0.5,
             quantity: 1.0,
-            post_only: true,
-            time_in_force: TimeInForce::Gtc,
+            post_only,
+            time_in_force,
             strategy_tag: "strategy-a".to_string(),
             quote_level_tag: None,
             submitted_at_ms: now_unix_ms(),
-        };
+        }
+    }
 
-        let first = adapter.submit(req.clone()).await.expect("submit ok");
-        let second = adapter.submit(req.clone()).await.expect("submit replay ok");
-        assert_eq!(first, second);
-        assert_eq!(first.venue_order_id, Some(OrderId::from("venue-1")));
+    #[test]
+    fn post_only_market_order_types_are_rejected_before_venue() {
+        assert!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Gtc, true)).is_ok()
+        );
+        assert!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Ioc, false))
+                .is_ok()
+        );
+        assert!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Fok, false))
+                .is_ok()
+        );
+        assert!(matches!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Ioc, true)),
+            Err(ExecutionError::BadRequest(_))
+        ));
+        assert!(matches!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Fok, true)),
+            Err(ExecutionError::BadRequest(_))
+        ));
+    }
 
-        let cancel = adapter
-            .cancel(CancelOrderRequest {
-                client_order_id: ClientOrderId::from("client-1"),
-                venue_order_id: first.venue_order_id,
-                reason: "test cancel".to_string(),
-                submitted_at_ms: now_unix_ms(),
-            })
-            .await
-            .expect("cancel ok");
-        assert!(cancel.accepted);
-
-        let second_cancel = adapter
-            .cancel(CancelOrderRequest {
-                client_order_id: ClientOrderId::from("client-1"),
-                venue_order_id: None,
-                reason: "test cancel replay".to_string(),
-                submitted_at_ms: now_unix_ms(),
-            })
-            .await
-            .expect("cancel replay ok");
-        assert!(second_cancel.accepted);
-
-        let call_count = shared_client
-            .calls
-            .lock()
-            .unwrap()
-            .len();
-        assert_eq!(call_count, 2);
+    #[test]
+    fn signature_type_parser_accepts_polymarket_codes() {
+        assert_eq!(
+            PolymarketSignatureType::parse("0").unwrap(),
+            PolymarketSignatureType::Eoa
+        );
+        assert_eq!(
+            PolymarketSignatureType::parse("POLY_PROXY").unwrap(),
+            PolymarketSignatureType::Proxy
+        );
+        assert_eq!(
+            PolymarketSignatureType::parse("gnosis_safe").unwrap(),
+            PolymarketSignatureType::GnosisSafe
+        );
+        assert!(PolymarketSignatureType::parse("bad").is_err());
     }
 }

@@ -1,19 +1,23 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::get};
-use anyhow::{Context, Result};
+use axum::{routing::get, Json, Router};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::RwLock;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::AppMetrics;
+
+const HEALTH_MAX_SNAPSHOT_AGE_MS: u64 = 120_000;
+const HEALTH_MAX_MARKET_MESSAGE_AGE_MS: f64 = 30_000.0;
+const HEALTH_MAX_ACTIVE_ORDER_RECONCILE_AGE_MS: f64 = 120_000.0;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardPosition {
@@ -239,6 +243,15 @@ pub struct WhalePayload {
     pub events: Vec<WhaleEvent>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthPayload {
+    pub ok: bool,
+    pub status: String,
+    pub generated_at_ms: u64,
+    pub snapshot_age_ms: u64,
+    pub failures: Vec<String>,
+}
+
 pub async fn serve_http(
     state: DashboardUiState,
     bind: std::net::SocketAddr,
@@ -261,14 +274,32 @@ pub async fn serve_http(
     Ok(())
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz(State(state): State<DashboardUiState>) -> Response {
+    let snapshot = state.snapshot.read().await.clone();
+    let now_ms = now_unix_ms();
+    let failures = health_failures(&snapshot, now_ms);
+    let status = if failures.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let payload = HealthPayload {
+        ok: failures.is_empty(),
+        status: snapshot.status,
+        generated_at_ms: snapshot.generated_at_ms,
+        snapshot_age_ms: now_ms.saturating_sub(snapshot.generated_at_ms),
+        failures,
+    };
+    (status, Json(payload)).into_response()
 }
 
 async fn metrics_handler(State(state): State<DashboardUiState>) -> Response {
     match state.metrics.encode() {
         Ok(body) => (
-            [(CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
+            [(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
             body,
         )
             .into_response(),
@@ -291,8 +322,14 @@ async fn api_whale_events(State(state): State<DashboardUiState>) -> Json<WhalePa
         .as_deref()
         .map(|path| load_whale_events(path, state.whale_events_limit))
         .unwrap_or_default();
-    let source_path = state.whale_events_path.as_deref().map(|path| path.display().to_string());
-    Json(WhalePayload { source_path, events })
+    let source_path = state
+        .whale_events_path
+        .as_deref()
+        .map(|path| path.display().to_string());
+    Json(WhalePayload {
+        source_path,
+        events,
+    })
 }
 
 fn load_whale_events(path: &std::path::Path, limit: usize) -> Vec<WhaleEvent> {
@@ -316,8 +353,11 @@ fn load_whale_events(path: &std::path::Path, limit: usize) -> Vec<WhaleEvent> {
     let mut events = rows
         .into_iter()
         .map(|row| {
-            let observed_at_ms = value_to_u64(&row, &["timestamp", "observed_at_ms", "ts", "time", "time_ms"])
-                .unwrap_or(0);
+            let observed_at_ms = value_to_u64(
+                &row,
+                &["timestamp", "observed_at_ms", "ts", "time", "time_ms"],
+            )
+            .unwrap_or(0);
             let market_id = value_to_string(&row, &["market_id", "market", "marketId"]);
             let instrument_id = value_to_string(&row, &["instrument_id", "asset_id", "assetId"]);
             let side = value_to_string(&row, &["side", "direction"]);
@@ -352,21 +392,71 @@ fn load_whale_events(path: &std::path::Path, limit: usize) -> Vec<WhaleEvent> {
     events
 }
 
+fn health_failures(snapshot: &DashboardSnapshot, now_ms: u64) -> Vec<String> {
+    let mut failures = Vec::new();
+    let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_at_ms);
+    if snapshot.generated_at_ms == 0 || snapshot_age_ms > HEALTH_MAX_SNAPSHOT_AGE_MS {
+        failures.push("runtime snapshot stale".to_string());
+    }
+    if snapshot.status != "Running" {
+        failures.push(format!("runtime status {}", snapshot.status));
+    }
+
+    let health = &snapshot.control_plane.health;
+    if !health.market_ws_connected {
+        failures.push("market websocket disconnected".to_string());
+    }
+    if health.last_market_message_age_ms < 0.0 {
+        failures.push("market websocket has no messages".to_string());
+    } else if health.last_market_message_age_ms > HEALTH_MAX_MARKET_MESSAGE_AGE_MS {
+        failures.push(format!(
+            "market messages stale {:.0}ms",
+            health.last_market_message_age_ms
+        ));
+    }
+    if !health.execution_adapter_connected {
+        failures.push("execution adapter disconnected".to_string());
+    }
+    if !snapshot.open_orders.is_empty()
+        && (health.last_reconcile_age_ms < 0.0
+            || health.last_reconcile_age_ms > HEALTH_MAX_ACTIVE_ORDER_RECONCILE_AGE_MS)
+    {
+        failures.push(format!(
+            "active orders without recent reconcile {:.0}ms",
+            health.last_reconcile_age_ms
+        ));
+    }
+    failures
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn value_to_u64(value: &Value, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| value.get(key)).and_then(|candidate| {
-        candidate
-            .as_u64()
-            .or_else(|| candidate.as_f64().map(|value| value as u64))
-            .or_else(|| candidate.as_str().and_then(|raw| raw.parse().ok()))
-    })
+    keys.iter()
+        .find_map(|key| value.get(key))
+        .and_then(|candidate| {
+            candidate
+                .as_u64()
+                .or_else(|| candidate.as_f64().map(|value| value as u64))
+                .or_else(|| candidate.as_str().and_then(|raw| raw.parse().ok()))
+        })
 }
 
 fn value_to_f64(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| value.get(key)).and_then(|candidate| {
-        candidate
-            .as_f64()
-            .or_else(|| candidate.as_str().and_then(|raw| raw.parse().ok()))
-    })
+    keys.iter()
+        .find_map(|key| value.get(key))
+        .and_then(|candidate| {
+            candidate
+                .as_f64()
+                .or_else(|| candidate.as_str().and_then(|raw| raw.parse().ok()))
+        })
 }
 
 fn value_to_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -374,4 +464,75 @@ fn value_to_string(value: &Value, keys: &[&str]) -> Option<String> {
         .find_map(|key| value.get(key))
         .and_then(|candidate| candidate.as_str())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        health_failures, DashboardOrder, DashboardSnapshot, HealthControlPlaneState,
+        RuntimeControlPlaneState,
+    };
+
+    fn healthy_snapshot(now_ms: u64) -> DashboardSnapshot {
+        DashboardSnapshot {
+            status: "Running".to_string(),
+            generated_at_ms: now_ms,
+            control_plane: RuntimeControlPlaneState {
+                health: HealthControlPlaneState {
+                    market_ws_connected: true,
+                    execution_adapter_connected: true,
+                    last_market_message_age_ms: 100.0,
+                    last_reconcile_age_ms: 1_000.0,
+                    ..HealthControlPlaneState::default()
+                },
+                ..RuntimeControlPlaneState::default()
+            },
+            ..DashboardSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn health_allows_running_snapshot_with_fresh_market_data() {
+        let snapshot = healthy_snapshot(10_000);
+
+        assert!(health_failures(&snapshot, 10_100).is_empty());
+    }
+
+    #[test]
+    fn health_fails_closed_on_stale_market_data() {
+        let mut snapshot = healthy_snapshot(10_000);
+        snapshot.control_plane.health.last_market_message_age_ms = 45_000.0;
+
+        let failures = health_failures(&snapshot, 10_100);
+
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("market messages stale")));
+    }
+
+    #[test]
+    fn health_requires_recent_reconcile_when_orders_are_active() {
+        let mut snapshot = healthy_snapshot(10_000);
+        snapshot.control_plane.health.last_reconcile_age_ms = 180_000.0;
+        snapshot.open_orders.push(DashboardOrder {
+            client_order_id: "client-1".to_string(),
+            market_id: "market-1".to_string(),
+            instrument_id: "token-1".to_string(),
+            side: "Buy".to_string(),
+            status: "Working".to_string(),
+            created_at_ms: 1,
+            last_update_ms: 1,
+            limit_price: 0.40,
+            quantity: 1.0,
+            cumulative_filled_qty: 0.0,
+            remaining_qty: 1.0,
+            reserved_cash_usd: 0.40,
+        });
+
+        let failures = health_failures(&snapshot, 10_100);
+
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("active orders without recent reconcile")));
+    }
 }

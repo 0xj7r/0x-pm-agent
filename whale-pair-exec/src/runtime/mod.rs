@@ -1,6 +1,6 @@
-pub mod runner;
-pub mod reconcile;
 pub mod order_store;
+pub mod reconcile;
+pub mod runner;
 pub mod types;
 
 use std::collections::{HashMap, VecDeque};
@@ -8,12 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
 use crate::inventory::InventoryState;
+use crate::market_context::MarketContextStore;
 use crate::merge_executor::MergeExecutor;
 use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
 use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
-use crate::runtime::order_store::{OrderRecord, OrderStore, SignalSnapshotRecord};
-use crate::market_context::MarketContextStore;
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
+use crate::runtime::order_store::{OrderRecord, OrderStore, SignalSnapshotRecord};
+pub use crate::runtime::types::{
+    ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
+};
 use crate::signals::{
     evaluate_unlawful_mode, BtcRegimeSnapshot as GateBtcRegimeSnapshot,
     MarketActivitySignal as GateMarketActivitySignal, PairedBookSignal as GatePairedBookSignal,
@@ -21,20 +24,18 @@ use crate::signals::{
     UnlawfulGateConfig, UnlawfulGateInputs, UnlawfulSignalSnapshot as GateSignalSnapshot,
 };
 use crate::strategy::{
-    BtcRegimeSnapshot as StrategyBtcRegimeSnapshot, MarketActivitySignal as StrategyMarketActivitySignal,
-    PairedBookSignal as StrategyPairedBookSignal, SessionBucket as StrategySessionBucket,
-    Strategy, StrategyContext, StrategyDecision, UnlawfulExecutionMode as StrategyExecutionMode,
+    BtcRegimeSnapshot as StrategyBtcRegimeSnapshot,
+    MarketActivitySignal as StrategyMarketActivitySignal,
+    PairedBookSignal as StrategyPairedBookSignal, SessionBucket as StrategySessionBucket, Strategy,
+    StrategyContext, StrategyDecision, UnlawfulExecutionMode as StrategyExecutionMode,
     UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot,
 };
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot,
     OrderIntent, TradeSide,
 };
-use serde::Serialize;
-pub use crate::runtime::types::{
-    ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
-};
 use crate::types::{RuntimeCommand, RuntimeStatus};
+use serde::Serialize;
 use tracing::{info, warn};
 
 const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
@@ -257,7 +258,10 @@ impl ManagedOrderStatus {
                 next,
                 Working | CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile
             ),
-            Working => matches!(next, CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile),
+            Working => matches!(
+                next,
+                CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile
+            ),
             CancelRequested => matches!(next, Cancelled | Filled | Rejected | NeedsReconcile),
             Filled | Cancelled | Rejected => false,
             NeedsReconcile => matches!(
@@ -294,7 +298,8 @@ pub struct Runtime<S: Strategy> {
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
-    last_persisted_unlawful_signal_by_market: HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
+    last_persisted_unlawful_signal_by_market:
+        HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
     order_store: Option<Box<dyn OrderStore>>,
 }
 
@@ -392,19 +397,21 @@ impl<S: Strategy> Runtime<S> {
             );
             let client_order_id = managed.intent.client_order_id.clone();
             self.open_orders.insert(client_order_id, managed.clone());
-            outcome.push_event(self.event_log.push(
-                EventRecord::new(
-                    EventCategory::Runtime,
-                    now_ms,
-                    format!(
-                        "restored order from durable store status={:?}",
-                        managed.status
-                    ),
-                )
-                .with_market(managed.intent.market_id)
-                .with_instrument(managed.intent.instrument_id)
-                .with_client_order(managed.intent.client_order_id),
-            ));
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        format!(
+                            "restored order from durable store status={:?}",
+                            managed.status
+                        ),
+                    )
+                    .with_market(managed.intent.market_id)
+                    .with_instrument(managed.intent.instrument_id)
+                    .with_client_order(managed.intent.client_order_id),
+                ),
+            );
         }
         outcome.extend(self.reconcile_open_orders(now_ms, stale_after_ms));
         outcome
@@ -467,19 +474,21 @@ impl<S: Strategy> Runtime<S> {
                         if managed.status.can_transition_to(store_status) {
                             let previous_status = managed.status;
                             managed.status = store_status;
-                            outcome.push_event(self.event_log.push(
-                                EventRecord::new(
-                                    EventCategory::Runtime,
-                                    now_ms,
-                                    format!(
-                                        "order status {:?} -> {:?} after durable sync",
-                                        previous_status, store_status
-                                    ),
-                                )
-                                .with_client_order(record.client_order_id.clone())
-                                .with_market(record.market_id.clone())
-                                .with_instrument(record.instrument_id.clone()),
-                            ));
+                            outcome.push_event(
+                                self.event_log.push(
+                                    EventRecord::new(
+                                        EventCategory::Runtime,
+                                        now_ms,
+                                        format!(
+                                            "order status {:?} -> {:?} after durable sync",
+                                            previous_status, store_status
+                                        ),
+                                    )
+                                    .with_client_order(record.client_order_id.clone())
+                                    .with_market(record.market_id.clone())
+                                    .with_instrument(record.instrument_id.clone()),
+                                ),
+                            );
                         } else {
                             mark_needs_reconcile = true;
                         }
@@ -491,24 +500,26 @@ impl<S: Strategy> Runtime<S> {
                     let managed = Self::managed_from_record(record.clone());
                     self.open_orders
                         .insert(record.client_order_id.clone(), managed.clone());
-                    outcome.push_event(self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Runtime,
-                            now_ms,
-                            "restored missing open order during durable sync",
-                        )
-                        .with_market(managed.intent.market_id.clone())
-                        .with_instrument(managed.intent.instrument_id.clone())
-                        .with_client_order(managed.intent.client_order_id.clone()),
-                    ));
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Runtime,
+                                now_ms,
+                                "restored missing open order during durable sync",
+                            )
+                            .with_market(managed.intent.market_id.clone())
+                            .with_instrument(managed.intent.instrument_id.clone())
+                            .with_client_order(managed.intent.client_order_id.clone()),
+                        ),
+                    );
                 }
             }
             if mark_needs_reconcile {
-                            outcome.extend(self.mark_order_needs_reconcile(
-                                &record.client_order_id,
-                                now_ms,
-                                "durable store diverged from in-memory order state",
-                            ));
+                outcome.extend(self.mark_order_needs_reconcile(
+                    &record.client_order_id,
+                    now_ms,
+                    "durable store diverged from in-memory order state",
+                ));
             }
         }
 
@@ -545,7 +556,10 @@ impl<S: Strategy> Runtime<S> {
         let strategy_tag = self.strategy.name().to_string();
         let open_orders = if let Some(order_store) = self.order_store.as_ref() {
             match order_store.list_open() {
-                Ok(records) => records.into_iter().map(Self::checkpoint_order_from_record).collect(),
+                Ok(records) => records
+                    .into_iter()
+                    .map(Self::checkpoint_order_from_record)
+                    .collect(),
                 Err(error) => {
                     warn!(
                         error = ?error,
@@ -599,40 +613,40 @@ impl<S: Strategy> Runtime<S> {
         for record in open_orders {
             let managed = Self::managed_from_checkpoint_order(record);
             let client_order_id = managed.intent.client_order_id.clone();
-            self.open_orders.insert(client_order_id.clone(), managed.clone());
-            outcome.push_event(self.event_log.push(
-                EventRecord::new(
-                    EventCategory::Runtime,
-                    observed_at_ms,
-                    "restored order from checkpoint",
-                )
-                .with_market(managed.intent.market_id.clone())
-                .with_instrument(managed.intent.instrument_id.clone())
-                .with_client_order(client_order_id),
-            ));
+            self.open_orders
+                .insert(client_order_id.clone(), managed.clone());
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        observed_at_ms,
+                        "restored order from checkpoint",
+                    )
+                    .with_market(managed.intent.market_id.clone())
+                    .with_instrument(managed.intent.instrument_id.clone())
+                    .with_client_order(client_order_id),
+                ),
+            );
         }
 
-        outcome.push_event(self.event_log.push(EventRecord::runtime_status(
-            observed_at_ms,
-            self.status,
-        )));
+        outcome.push_event(
+            self.event_log
+                .push(EventRecord::runtime_status(observed_at_ms, self.status)),
+        );
         outcome
     }
 
-    pub fn last_quote(
-        &self,
-        instrument_id: &InstrumentId,
-    ) -> Option<&crate::types::QuoteSnapshot> {
+    pub fn last_quote(&self, instrument_id: &InstrumentId) -> Option<&crate::types::QuoteSnapshot> {
         self.last_quotes.get(instrument_id)
     }
 
     pub fn start(&mut self, now_ms: EpochMillis) -> RuntimeOutcome {
         self.status = RuntimeStatus::Running;
         let mut outcome = RuntimeOutcome::default();
-        outcome.push_event(self.event_log.push(EventRecord::runtime_status(
-            now_ms,
-            self.status,
-        )));
+        outcome.push_event(
+            self.event_log
+                .push(EventRecord::runtime_status(now_ms, self.status)),
+        );
         let context = self.strategy_context(now_ms, None);
         let decision = self.strategy.on_start(&context);
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
@@ -654,13 +668,12 @@ impl<S: Strategy> Runtime<S> {
                 now_ms,
             );
             let mut outcome = RuntimeOutcome::default();
-            outcome.push_event(self.event_log.push(
-                adjustment.to_event("inventory mark refreshed from market snapshot"),
-            ));
+            outcome.push_event(
+                self.event_log
+                    .push(adjustment.to_event("inventory mark refreshed from market snapshot")),
+            );
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
-            let decision = self
-                .strategy
-                .on_market_snapshot(&context, &snapshot);
+            let decision = self.strategy.on_market_snapshot(&context, &snapshot);
             outcome.extend(self.accept_strategy_decision(decision, now_ms));
             if let Some(signal) = context.unlawful_signal.as_ref() {
                 outcome.extend(self.enforce_unlawful_mode(&snapshot.market_id, signal, now_ms));
@@ -668,9 +681,7 @@ impl<S: Strategy> Runtime<S> {
             Ok(outcome)
         } else {
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
-            let decision = self
-                .strategy
-                .on_market_snapshot(&context, &snapshot);
+            let decision = self.strategy.on_market_snapshot(&context, &snapshot);
             let mut outcome = self.accept_strategy_decision(decision, now_ms);
             if let Some(signal) = context.unlawful_signal.as_ref() {
                 outcome.extend(self.enforce_unlawful_mode(&snapshot.market_id, signal, now_ms));
@@ -734,33 +745,41 @@ impl<S: Strategy> Runtime<S> {
             Some(CloseMethod::Merge) | Some(CloseMethod::Settle) | Some(CloseMethod::Settlement)
         );
         let mut outcome = RuntimeOutcome::default();
-        outcome.push_event(self.event_log.push(
-            EventRecord::new(
-                EventCategory::Execution,
-                now_ms,
-                if let Some(close_method) = fill.close_method {
-                    format!("received fill report via close_method={}", close_method.as_str())
-                } else {
-                    "received fill report".to_string()
-                },
-            )
-            .with_market(fill.market_id.clone())
-            .with_instrument(fill.instrument_id.clone())
-            .with_metrics(EventMetrics {
-                price: Some(fill.price),
-                quantity: Some(fill.quantity),
-                notional_usd: Some(fill.notional_usd()),
-                cash_delta_usd: None,
-                position_delta: Some(fill.quantity * fill.side.sign()),
-                free_cash_after_usd: None,
-                gross_exposure_after_usd: None,
-                risk_reject_reason: None,
-            }),
-        ));
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Execution,
+                    now_ms,
+                    if let Some(close_method) = fill.close_method {
+                        format!(
+                            "received fill report via close_method={}",
+                            close_method.as_str()
+                        )
+                    } else {
+                        "received fill report".to_string()
+                    },
+                )
+                .with_market(fill.market_id.clone())
+                .with_instrument(fill.instrument_id.clone())
+                .with_metrics(EventMetrics {
+                    price: Some(fill.price),
+                    quantity: Some(fill.quantity),
+                    notional_usd: Some(fill.notional_usd()),
+                    cash_delta_usd: None,
+                    position_delta: Some(fill.quantity * fill.side.sign()),
+                    free_cash_after_usd: None,
+                    gross_exposure_after_usd: None,
+                    risk_reject_reason: None,
+                }),
+            ),
+        );
 
         let mut executed_qty = 0.0;
         if merge_flow {
-            if let Some(execution) = self.merge_executor.apply_merge(&fill, &mut self.inventory)? {
+            if let Some(execution) = self
+                .merge_executor
+                .apply_merge(&fill, &mut self.inventory)?
+            {
                 executed_qty = execution.merged_qty;
                 outcome.push_event(self.event_log.push(
                     EventRecord::new(
@@ -815,27 +834,37 @@ impl<S: Strategy> Runtime<S> {
                         risk_reject_reason: None,
                     }),
                 ));
-                outcome.push_event(self.event_log.push(
-                    execution.adjustment.to_event("inventory updated from merge completion"),
-                ));
+                outcome.push_event(
+                    self.event_log.push(
+                        execution
+                            .adjustment
+                            .to_event("inventory updated from merge completion"),
+                    ),
+                );
             } else {
-                outcome.push_event(self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Execution,
-                        now_ms,
-                        format!("merge skipped: no mergeable quantity for {}", fill.market_id),
-                    )
-                    .with_market(fill.market_id.clone())
-                    .with_instrument(fill.instrument_id.clone()),
-                ));
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge skipped: no mergeable quantity for {}",
+                                fill.market_id
+                            ),
+                        )
+                        .with_market(fill.market_id.clone())
+                        .with_instrument(fill.instrument_id.clone()),
+                    ),
+                );
             }
         } else {
             let adjustment = self.inventory.apply_fill(&fill)?;
             self.merge_executor.on_fill(&fill);
             executed_qty = fill.quantity;
-            outcome.push_event(self.event_log.push(
-                adjustment.to_event("inventory updated from fill"),
-            ));
+            outcome.push_event(
+                self.event_log
+                    .push(adjustment.to_event("inventory updated from fill")),
+            );
         }
 
         if executed_qty > 0.0 {
@@ -861,6 +890,8 @@ impl<S: Strategy> Runtime<S> {
                 if managed.remaining_qty() <= 1e-9 {
                     remove_after = true;
                     next_status = Some(ManagedOrderStatus::Filled);
+                } else if matches!(managed.status, ManagedOrderStatus::CancelRequested) {
+                    next_status = None;
                 } else {
                     next_status = Some(ManagedOrderStatus::Working);
                 }
@@ -892,9 +923,10 @@ impl<S: Strategy> Runtime<S> {
                     "order transitioned to Filled and removed from memory"
                 );
                 if let Some(release) = self.inventory.release_reservation(client_order_id, now_ms) {
-                    outcome.push_event(self.event_log.push(
-                        release.to_event("released reservation after full fill"),
-                    ));
+                    outcome.push_event(
+                        self.event_log
+                            .push(release.to_event("released reservation after full fill")),
+                    );
                 }
                 self.open_orders.remove(client_order_id);
             }
@@ -913,22 +945,22 @@ impl<S: Strategy> Runtime<S> {
         now_ms: EpochMillis,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
-        outcome.extend(
-            self.set_order_status(
-                client_order_id,
-                ManagedOrderStatus::Working,
-                now_ms,
-                "order acknowledged by downstream execution layer",
+        outcome.extend(self.set_order_status(
+            client_order_id,
+            ManagedOrderStatus::Working,
+            now_ms,
+            "order acknowledged by downstream execution layer",
+        ));
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Execution,
+                    now_ms,
+                    "order acknowledged by downstream execution layer",
+                )
+                .with_client_order(client_order_id.clone()),
             ),
         );
-        outcome.push_event(self.event_log.push(
-            EventRecord::new(
-                EventCategory::Execution,
-                now_ms,
-                "order acknowledged by downstream execution layer",
-            )
-            .with_client_order(client_order_id.clone()),
-        ));
         outcome
     }
 
@@ -948,16 +980,19 @@ impl<S: Strategy> Runtime<S> {
         ));
         if let Some(managed) = self.open_orders.remove(client_order_id) {
             if let Some(release) = self.inventory.release_reservation(client_order_id, now_ms) {
-                outcome.push_event(self.event_log.push(
-                    release.to_event("released reservation after downstream rejection"),
-                ));
+                outcome.push_event(
+                    self.event_log
+                        .push(release.to_event("released reservation after downstream rejection")),
+                );
             }
-            outcome.push_event(self.event_log.push(
-                EventRecord::new(EventCategory::Execution, now_ms, reason)
-                    .with_market(managed.intent.market_id.clone())
-                    .with_instrument(managed.intent.instrument_id.clone())
-                    .with_client_order(client_order_id.clone()),
-            ));
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(EventCategory::Execution, now_ms, reason)
+                        .with_market(managed.intent.market_id.clone())
+                        .with_instrument(managed.intent.instrument_id.clone())
+                        .with_client_order(client_order_id.clone()),
+                ),
+            );
         }
         outcome
     }
@@ -978,16 +1013,19 @@ impl<S: Strategy> Runtime<S> {
         ));
         if let Some(managed) = self.open_orders.remove(client_order_id) {
             if let Some(release) = self.inventory.release_reservation(client_order_id, now_ms) {
-                outcome.push_event(self.event_log.push(
-                    release.to_event("released reservation after cancellation"),
-                ));
+                outcome.push_event(
+                    self.event_log
+                        .push(release.to_event("released reservation after cancellation")),
+                );
             }
-            outcome.push_event(self.event_log.push(
-                EventRecord::new(EventCategory::Execution, now_ms, reason)
-                    .with_market(managed.intent.market_id.clone())
-                    .with_instrument(managed.intent.instrument_id.clone())
-                    .with_client_order(client_order_id.clone()),
-            ));
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(EventCategory::Execution, now_ms, reason)
+                        .with_market(managed.intent.market_id.clone())
+                        .with_instrument(managed.intent.instrument_id.clone())
+                        .with_client_order(client_order_id.clone()),
+                ),
+            );
         }
         outcome
     }
@@ -1032,12 +1070,18 @@ impl<S: Strategy> Runtime<S> {
             client_order_id: client_order_id.clone(),
             reason: reason.clone(),
         });
-        outcome.push_event(self.event_log.push(
-            EventRecord::new(EventCategory::Runtime, now_ms, "requested order cancellation")
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Runtime,
+                    now_ms,
+                    "requested order cancellation",
+                )
                 .with_market(market_id)
                 .with_instrument(instrument_id)
                 .with_client_order(client_order_id.clone()),
-        ));
+            ),
+        );
         outcome
     }
 
@@ -1060,11 +1104,15 @@ impl<S: Strategy> Runtime<S> {
                 now_ms,
                 &self.last_quotes,
                 StaleMode::Remove,
-                |snapshot, now| snapshot.is_none_or(|quote| {
-                    now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
-                }),
+                |snapshot, now| {
+                    snapshot.is_none_or(|quote| {
+                        now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
+                    })
+                },
             );
-        let plan = self.quote_reconciler.plan(desired, &self.open_orders, now_ms);
+        let plan = self
+            .quote_reconciler
+            .plan(desired, &self.open_orders, now_ms);
         outcome.push_event(self.event_log.push(EventRecord::new(
             EventCategory::Strategy,
             now_ms,
@@ -1084,16 +1132,14 @@ impl<S: Strategy> Runtime<S> {
         for action in plan.actions {
             match action {
                 QuoteAction::Keep(intent) => {
-                    outcome.push_event(self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Runtime,
-                            now_ms,
-                            "quote keep",
-                        )
-                        .with_market(intent.market_id.clone())
-                        .with_instrument(intent.instrument_id.clone())
-                        .with_client_order(intent.client_order_id.clone()),
-                    ));
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(EventCategory::Runtime, now_ms, "quote keep")
+                                .with_market(intent.market_id.clone())
+                                .with_instrument(intent.instrument_id.clone())
+                                .with_client_order(intent.client_order_id.clone()),
+                        ),
+                    );
                 }
                 QuoteAction::Cancel {
                     client_order_id,
@@ -1106,7 +1152,11 @@ impl<S: Strategy> Runtime<S> {
                     replacement,
                     cancel_reason,
                 } => {
-                    outcome.extend(self.request_cancel(&existing_client_order_id, cancel_reason, now_ms));
+                    outcome.extend(self.request_cancel(
+                        &existing_client_order_id,
+                        cancel_reason,
+                        now_ms,
+                    ));
                     outcome.extend(self.accept_intent(replacement, now_ms));
                 }
                 QuoteAction::Submit(intent) => {
@@ -1122,16 +1172,18 @@ impl<S: Strategy> Runtime<S> {
         // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
         if self.open_orders.contains_key(&intent.client_order_id) {
-            outcome.push_event(self.event_log.push(
-                EventRecord::new(
-                    EventCategory::Runtime,
-                    now_ms,
-                    "duplicate client_order_id rejected before risk",
-                )
-                .with_market(intent.market_id.clone())
-                .with_instrument(intent.instrument_id.clone())
-                .with_client_order(intent.client_order_id.clone()),
-            ));
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "duplicate client_order_id rejected before risk",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
             return outcome;
         }
 
@@ -1164,8 +1216,11 @@ impl<S: Strategy> Runtime<S> {
                     intent: intent.clone(),
                 };
                 if let Some(order_store) = self.order_store.as_mut() {
-                    let record =
-                        OrderRecord::from_intent(self.run_id.clone(), &managed.intent, self.strategy.name());
+                    let record = OrderRecord::from_intent(
+                        self.run_id.clone(),
+                        &managed.intent,
+                        self.strategy.name(),
+                    );
                     if let Err(error) = order_store.insert(record) {
                         warn!(
                             run_id = %self.run_id,
@@ -1177,37 +1232,40 @@ impl<S: Strategy> Runtime<S> {
                             .inventory
                             .release_reservation(&intent.client_order_id, now_ms)
                         {
-                            outcome.push_event(self.event_log.push(
-                                release.to_event(
-                                    "released reservation after durable persistence failure",
-                                ),
-                            ));
+                            outcome.push_event(self.event_log.push(release.to_event(
+                                "released reservation after durable persistence failure",
+                            )));
                         }
-                        outcome.push_event(self.event_log.push(
-                            EventRecord::new(
-                                EventCategory::Runtime,
-                                now_ms,
-                                "order not accepted due to durable store failure",
-                            )
-                            .with_client_order(intent.client_order_id.clone()),
-                        ));
+                        outcome.push_event(
+                            self.event_log.push(
+                                EventRecord::new(
+                                    EventCategory::Runtime,
+                                    now_ms,
+                                    "order not accepted due to durable store failure",
+                                )
+                                .with_client_order(intent.client_order_id.clone()),
+                            ),
+                        );
                         return outcome;
                     }
                 }
-                self.open_orders.insert(intent.client_order_id.clone(), managed);
+                self.open_orders
+                    .insert(intent.client_order_id.clone(), managed);
                 outcome.push_command(RuntimeCommand::Submit(intent));
             }
             Err(source) => {
-                outcome.push_event(self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Inventory,
-                        now_ms,
-                        format!("inventory rejected submit: {source}"),
-                    )
-                    .with_market(intent.market_id.clone())
-                    .with_instrument(intent.instrument_id.clone())
-                    .with_client_order(intent.client_order_id.clone()),
-                ));
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Inventory,
+                            now_ms,
+                            format!("inventory rejected submit: {source}"),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
             }
         }
         outcome
@@ -1221,12 +1279,9 @@ impl<S: Strategy> Runtime<S> {
         let market_context = market_id.and_then(|id| self.market_contexts.get(id).cloned());
         let unlawful_gate_config = self.unlawful_gate_config.clone();
         let unlawful_signal = match (market_id, unlawful_gate_config.as_ref()) {
-            (Some(id), Some(cfg)) => Some(self.build_unlawful_signal(
-                id,
-                market_context.as_ref(),
-                now_ms,
-                cfg,
-            )),
+            (Some(id), Some(cfg)) => {
+                Some(self.build_unlawful_signal(id, market_context.as_ref(), now_ms, cfg))
+            }
             _ => None,
         };
         StrategyContext {
@@ -1267,8 +1322,9 @@ impl<S: Strategy> Runtime<S> {
             .count();
         let cleanup_backlog_exceeded =
             cleanup_backlog > self.risk.limits().max_open_orders_per_market;
-        let inventory_imbalance_exceeded = self.inventory.net_exposure_for_market_usd(market_id).abs()
-            > self.risk.limits().max_net_notional_per_market_usd;
+        let inventory_imbalance_exceeded =
+            self.inventory.net_exposure_for_market_usd(market_id).abs()
+                > self.risk.limits().max_net_notional_per_market_usd;
 
         let inputs = UnlawfulGateInputs {
             session_bucket,
@@ -1475,29 +1531,36 @@ impl<S: Strategy> Runtime<S> {
             .map(|quote| quote.ask_levels.as_slice())
             .unwrap_or(&[]);
 
-        let left_ask_price = left_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
-        let right_ask_price = right_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
+        let left_ask_price = left_ask
+            .as_ref()
+            .map(|level| level.price)
+            .unwrap_or(f64::MAX);
+        let right_ask_price = right_ask
+            .as_ref()
+            .map(|level| level.price)
+            .unwrap_or(f64::MAX);
         let left_is_cheap = left_ask_price <= right_ask_price;
 
-        let (cheap_id, cheap_bid, cheap_ask, cheap_obs, cheap_bid_levels, cheap_ask_levels) = if left_is_cheap {
-            (
-                left_id.clone(),
-                left_bid.clone(),
-                left_ask.clone(),
-                left_quote.map(|quote| quote.observed_at_ms),
-                left_bid_levels,
-                left_ask_levels,
-            )
-        } else {
-            (
-                right_id.clone(),
-                right_bid.clone(),
-                right_ask.clone(),
-                right_quote.map(|quote| quote.observed_at_ms),
-                right_bid_levels,
-                right_ask_levels,
-            )
-        };
+        let (cheap_id, cheap_bid, cheap_ask, cheap_obs, cheap_bid_levels, cheap_ask_levels) =
+            if left_is_cheap {
+                (
+                    left_id.clone(),
+                    left_bid.clone(),
+                    left_ask.clone(),
+                    left_quote.map(|quote| quote.observed_at_ms),
+                    left_bid_levels,
+                    left_ask_levels,
+                )
+            } else {
+                (
+                    right_id.clone(),
+                    right_bid.clone(),
+                    right_ask.clone(),
+                    right_quote.map(|quote| quote.observed_at_ms),
+                    right_bid_levels,
+                    right_ask_levels,
+                )
+            };
         let (
             expensive_id,
             expensive_bid,
@@ -1532,15 +1595,16 @@ impl<S: Strategy> Runtime<S> {
             .unwrap_or(0);
         let books_fresh = observed_at_ms > 0
             && now_ms.saturating_sub(observed_at_ms) <= cfg.entry_book_max_age_ms;
-        let both_sides_present = cheap_ask
-            .as_ref()
-            .zip(expensive_ask.as_ref())
-            .is_some_and(|(cheap, expensive)| {
-                cheap.price > 0.0
-                    && expensive.price > 0.0
-                    && cheap.quantity > 0.0
-                    && expensive.quantity > 0.0
-            });
+        let both_sides_present =
+            cheap_ask
+                .as_ref()
+                .zip(expensive_ask.as_ref())
+                .is_some_and(|(cheap, expensive)| {
+                    cheap.price > 0.0
+                        && expensive.price > 0.0
+                        && cheap.quantity > 0.0
+                        && expensive.quantity > 0.0
+                });
 
         let price_gap = cheap_ask
             .as_ref()
@@ -1595,10 +1659,7 @@ impl<S: Strategy> Runtime<S> {
         }
     }
 
-    fn aggregate_market_activity(
-        &self,
-        signal: &GatePairedBookSignal,
-    ) -> GateMarketActivitySignal {
+    fn aggregate_market_activity(&self, signal: &GatePairedBookSignal) -> GateMarketActivitySignal {
         let cheap = self
             .market_activity
             .get(&InstrumentId::from(signal.cheap_instrument_id.as_str()))
@@ -1619,7 +1680,10 @@ impl<S: Strategy> Runtime<S> {
             last_trade_event_count_60s: cheap
                 .last_trade_event_count_60s
                 .saturating_add(expensive.last_trade_event_count_60s),
-            last_trade_event_age_ms: match (cheap.last_trade_event_age_ms, expensive.last_trade_event_age_ms) {
+            last_trade_event_age_ms: match (
+                cheap.last_trade_event_age_ms,
+                expensive.last_trade_event_age_ms,
+            ) {
                 (Some(left), Some(right)) => Some(left.min(right)),
                 (Some(left), None) => Some(left),
                 (None, Some(right)) => Some(right),
@@ -1705,7 +1769,9 @@ impl<S: Strategy> Runtime<S> {
         signal: &StrategyUnlawfulSignalSnapshot,
         now_ms: EpochMillis,
     ) -> RuntimeOutcome {
-        let previous_mode = self.unlawful_mode_by_market.insert(market_id.clone(), signal.mode);
+        let previous_mode = self
+            .unlawful_mode_by_market
+            .insert(market_id.clone(), signal.mode);
         let entering_cleanup = matches!(
             signal.mode,
             StrategyExecutionMode::Cleanup | StrategyExecutionMode::Flatten
@@ -1819,16 +1885,18 @@ impl<S: Strategy> Runtime<S> {
                     to = ?status,
                     reason
                 );
-                outcome.push_event(self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Runtime,
-                        now_ms,
-                        format!("order status {:?} -> {:?}: {}", old_status, status, reason),
-                    )
-                    .with_client_order(client_order_id.clone())
-                    .with_market(managed.intent.market_id.clone())
-                    .with_instrument(managed.intent.instrument_id.clone()),
-                ));
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!("order status {:?} -> {:?}: {}", old_status, status, reason),
+                        )
+                        .with_client_order(client_order_id.clone())
+                        .with_market(managed.intent.market_id.clone())
+                        .with_instrument(managed.intent.instrument_id.clone()),
+                    ),
+                );
             }
             None => {
                 warn!(
@@ -1934,7 +2002,9 @@ impl<S: Strategy> Runtime<S> {
                 limit_price: record.limit_price,
                 quantity: record.original_qty,
                 reduce_only: record.reduce_only,
-                reason: record.reason.unwrap_or_else(|| "checkpoint recovery".to_string()),
+                reason: record
+                    .reason
+                    .unwrap_or_else(|| "checkpoint recovery".to_string()),
                 quote_level_tag: record.quote_level_tag,
                 created_at_ms: record.submitted_at_ms,
             },
@@ -1985,10 +2055,10 @@ fn generate_run_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Runtime, RuntimeConfig};
+    use super::{ManagedOrderStatus, Runtime, RuntimeConfig};
     use crate::market_context::{MarketContextRecord, MarketContextStore};
-    use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::risk::RiskLimits;
+    use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::signals::unlawful_gate::UnlawfulGateConfig;
     use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
@@ -2089,8 +2159,72 @@ mod tests {
             .expect("fill");
 
         assert_eq!(runtime.open_orders().count(), 0);
-        assert_eq!(runtime.inventory().position_qty(&InstrumentId::from("token-1")), 10.0);
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("token-1")),
+            10.0
+        );
         assert!((runtime.inventory().free_cash_usd() - 95.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn late_partial_fill_after_cancel_request_keeps_cancel_pending() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
+        );
+
+        runtime.start(1);
+        let snapshot = MarketSnapshot {
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.39, 100.0)),
+                best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
+                last_trade_price: Some(0.40),
+                observed_at_ms: 2,
+            },
+        };
+        runtime.on_market_snapshot(snapshot).expect("quote");
+        runtime.request_cancel(&ClientOrderId::from("client-1"), "test cancel", 3);
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: Some(ClientOrderId::from("client-1")),
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                price: 0.40,
+                quantity: 4.0,
+                fee_usd: 0.04,
+                liquidity: FillLiquidity::Taker,
+                close_method: None,
+                observed_at_ms: 4,
+            })
+            .expect("fill");
+
+        let open_order = runtime.open_orders().next().expect("remaining order");
+        assert_eq!(open_order.status, ManagedOrderStatus::CancelRequested);
+        assert!((open_order.cumulative_filled_qty - 4.0).abs() < 1e-9);
+        assert!((open_order.remaining_qty() - 6.0).abs() < 1e-9);
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("token-1")),
+            4.0
+        );
     }
 
     #[test]
@@ -2109,15 +2243,8 @@ mod tests {
 
         runtime.start(1);
 
-        let book = crate::book::BookState::from_top_of_book(
-            "token-up",
-            0.41,
-            12.0,
-            0.44,
-            7.0,
-            0.43,
-            25,
-        );
+        let book =
+            crate::book::BookState::from_top_of_book("token-up", 0.41, 12.0, 0.44, 7.0, 0.43, 25);
 
         let outcome = runtime
             .on_book_state(
@@ -2170,15 +2297,36 @@ mod tests {
             10,
         );
         cheap_book.bids = vec![
-            crate::book::Level { price: 0.37, size: 100.0 },
-            crate::book::Level { price: 0.36, size: 50.0 },
-            crate::book::Level { price: 0.35, size: 25.0 },
-            crate::book::Level { price: 0.34, size: 10.0 },
+            crate::book::Level {
+                price: 0.37,
+                size: 100.0,
+            },
+            crate::book::Level {
+                price: 0.36,
+                size: 50.0,
+            },
+            crate::book::Level {
+                price: 0.35,
+                size: 25.0,
+            },
+            crate::book::Level {
+                price: 0.34,
+                size: 10.0,
+            },
         ];
         cheap_book.asks = vec![
-            crate::book::Level { price: 0.39, size: 200.0 },
-            crate::book::Level { price: 0.40, size: 100.0 },
-            crate::book::Level { price: 0.41, size: 50.0 },
+            crate::book::Level {
+                price: 0.39,
+                size: 200.0,
+            },
+            crate::book::Level {
+                price: 0.40,
+                size: 100.0,
+            },
+            crate::book::Level {
+                price: 0.41,
+                size: 50.0,
+            },
         ];
 
         let mut expensive_book = crate::book::BookState::from_top_of_book(
@@ -2191,14 +2339,32 @@ mod tests {
             10,
         );
         expensive_book.bids = vec![
-            crate::book::Level { price: 0.58, size: 10.0 },
-            crate::book::Level { price: 0.57, size: 20.0 },
-            crate::book::Level { price: 0.56, size: 30.0 },
+            crate::book::Level {
+                price: 0.58,
+                size: 10.0,
+            },
+            crate::book::Level {
+                price: 0.57,
+                size: 20.0,
+            },
+            crate::book::Level {
+                price: 0.56,
+                size: 30.0,
+            },
         ];
         expensive_book.asks = vec![
-            crate::book::Level { price: 0.60, size: 40.0 },
-            crate::book::Level { price: 0.61, size: 50.0 },
-            crate::book::Level { price: 0.62, size: 60.0 },
+            crate::book::Level {
+                price: 0.60,
+                size: 40.0,
+            },
+            crate::book::Level {
+                price: 0.61,
+                size: 50.0,
+            },
+            crate::book::Level {
+                price: 0.62,
+                size: 60.0,
+            },
         ];
 
         runtime
@@ -2210,7 +2376,10 @@ mod tests {
 
         let market_context = MarketContextRecord {
             market_id: market_id.as_str().to_string(),
-            instrument_ids: vec![cheap_id.as_str().to_string(), expensive_id.as_str().to_string()],
+            instrument_ids: vec![
+                cheap_id.as_str().to_string(),
+                expensive_id.as_str().to_string(),
+            ],
             ..MarketContextRecord::default()
         };
         let signal = runtime.build_paired_book_signal(
@@ -2277,17 +2446,16 @@ mod tests {
 
         let market_context = MarketContextRecord {
             market_id: market_id.as_str().to_string(),
-            instrument_ids: vec![cheap_id.as_str().to_string(), expensive_id.as_str().to_string()],
+            instrument_ids: vec![
+                cheap_id.as_str().to_string(),
+                expensive_id.as_str().to_string(),
+            ],
             ..MarketContextRecord::default()
         };
         let mut cfg = UnlawfulGateConfig::default();
         cfg.entry_book_max_age_ms = 1_000;
-        let signal = runtime.build_paired_book_signal(
-            &market_id,
-            Some(&market_context),
-            2_000,
-            &cfg,
-        );
+        let signal =
+            runtime.build_paired_book_signal(&market_id, Some(&market_context), 2_000, &cfg);
 
         assert_eq!(signal.cheap_ask_depth_top3_qty, None);
         assert_eq!(signal.expensive_ask_depth_top3_qty, None);
@@ -2345,7 +2513,22 @@ mod tests {
         assert!(!outcome.event_seqs.is_empty());
         let recovered = runtime.open_order_snapshots();
         assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].status, crate::runtime::types::ManagedOrderStatus::NeedsReconcile);
+        assert_eq!(
+            recovered[0].status,
+            crate::runtime::types::ManagedOrderStatus::NeedsReconcile
+        );
+        let recent_messages = runtime
+            .event_log()
+            .recent(8)
+            .into_iter()
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            recent_messages
+                .iter()
+                .any(|message| message.contains("fail-closed stale submit state PendingSubmit")),
+            "missing fail-closed pending-submit event in {recent_messages:?}"
+        );
     }
 
     #[test]
@@ -2408,6 +2591,76 @@ mod tests {
         assert_eq!(
             order.status,
             crate::runtime::types::ManagedOrderStatus::NeedsReconcile
+        );
+        let recent_messages = runtime
+            .event_log()
+            .recent(8)
+            .into_iter()
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            recent_messages
+                .iter()
+                .any(|message| message.contains("fail-closed stale cancel state CancelRequested")),
+            "missing fail-closed cancel event in {recent_messages:?}"
+        );
+    }
+
+    #[test]
+    fn reconcile_open_orders_marks_stale_submit_states_with_fail_closed_events() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
+        );
+        runtime.start(1);
+
+        let snapshot = MarketSnapshot {
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.39, 100.0)),
+                best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
+                last_trade_price: Some(0.40),
+                observed_at_ms: 2,
+            },
+        };
+        runtime.on_market_snapshot(snapshot).expect("quote");
+        runtime.set_order_status(
+            &ClientOrderId::from("client-1"),
+            ManagedOrderStatus::Submitted,
+            3,
+            "adapter accepted submit but user stream has not opened it",
+        );
+
+        let outcome = runtime.reconcile_open_orders(2_000, 500);
+        assert!(!outcome.event_seqs.is_empty());
+        let order = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .find(|managed| managed.intent.client_order_id == ClientOrderId::from("client-1"))
+            .expect("managed order");
+        assert_eq!(order.status, ManagedOrderStatus::NeedsReconcile);
+        let recent_messages = runtime
+            .event_log()
+            .recent(8)
+            .into_iter()
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            recent_messages
+                .iter()
+                .any(|message| message.contains("fail-closed stale submit state Submitted")),
+            "missing fail-closed submit event in {recent_messages:?}"
         );
     }
 }

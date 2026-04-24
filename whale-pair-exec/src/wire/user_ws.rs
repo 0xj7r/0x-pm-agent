@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::config::UserWsAuth;
-use crate::types::CloseMethod;
 use crate::metrics::{AppMetrics, StreamKind};
+use crate::types::CloseMethod;
 
 #[derive(Debug, Clone)]
 pub enum UserOrderEvent {
@@ -119,7 +119,10 @@ impl UserWsClient {
         let (stream, _) = connect_async(self.url.as_str())
             .await
             .with_context(|| format!("failed to connect user websocket {}", self.url))?;
-        info!(market_count = self.markets.len(), "user websocket connected");
+        info!(
+            market_count = self.markets.len(),
+            "user websocket connected"
+        );
         self.metrics.set_stream_connected(StreamKind::User, true);
 
         let (mut write, mut read) = stream.split();
@@ -169,7 +172,8 @@ impl UserWsClient {
             return Ok(());
         }
 
-        let payload: Value = serde_json::from_str(text).context("failed to decode user websocket payload")?;
+        let payload: Value =
+            serde_json::from_str(text).context("failed to decode user websocket payload")?;
         match payload {
             Value::Array(items) => {
                 for item in items {
@@ -187,7 +191,10 @@ impl UserWsClient {
             .get("event_type")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        let status = event.get("status").and_then(Value::as_str).unwrap_or("unknown");
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         self.metrics.observe_user_message(event_type, status);
 
         if let Some(tx) = &self.event_tx {
@@ -200,9 +207,7 @@ impl UserWsClient {
             event_type,
             status,
             order_id = event.get("id").and_then(|value| value.as_str()),
-            taker_order_id = event
-                .get("taker_order_id")
-                .and_then(|value| value.as_str()),
+            taker_order_id = event.get("taker_order_id").and_then(|value| value.as_str()),
             market = event.get("market").and_then(|value| value.as_str()),
             asset_id = event.get("asset_id").and_then(|value| value.as_str()),
             side = event.get("side").and_then(|value| value.as_str()),
@@ -245,7 +250,10 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         .or_else(|| event.get("assetId").and_then(Value::as_str))
         .map(ToOwned::to_owned);
 
-    let order_id = event.get("id").and_then(Value::as_str).map(ToOwned::to_owned);
+    let order_id = event
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let client_order_id = event
         .get("client_order_id")
         .and_then(Value::as_str)
@@ -272,7 +280,12 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         .get("liquidity")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .or_else(|| event.get("maker_or_taker").and_then(Value::as_str).map(ToOwned::to_owned));
+        .or_else(|| {
+            event
+                .get("maker_or_taker")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
 
     let reason = event
         .get("reason")
@@ -282,7 +295,14 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
 
     let close_method = parse_str(
         event,
-        &["close_method", "activity", "method", "tx_type", "event", "type"],
+        &[
+            "close_method",
+            "activity",
+            "method",
+            "tx_type",
+            "event",
+            "type",
+        ],
     )
     .map(CloseMethod::from_raw)
     .filter(|method| *method != CloseMethod::Unknown);
@@ -291,7 +311,10 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
     let event_type_low = event_type.to_ascii_lowercase();
     let is_merge_signal = status_low.contains("merged")
         || event_type_low.contains("merge")
-        || matches!(close_method, Some(CloseMethod::Merge | CloseMethod::Settle | CloseMethod::Settlement));
+        || matches!(
+            close_method,
+            Some(CloseMethod::Merge | CloseMethod::Settle | CloseMethod::Settlement)
+        );
     let is_redeem_signal = status_low.contains("redeemed")
         || event_type_low.contains("redeem")
         || matches!(close_method, Some(CloseMethod::Redeem));
@@ -301,12 +324,13 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         || status_low.contains("filled")
         || (status_low.contains("match") && qty > 0.0)
         || matches!(status_low.as_str(), "closed" | "done")
-        || (matches!(event_type_low.as_str(), "order" | "order_update" | "orderbook")
-            && qty > 0.0
+        || (matches!(
+            event_type_low.as_str(),
+            "order" | "order_update" | "orderbook"
+        ) && qty > 0.0
             && status_low.contains("fill"));
 
-    if is_merge_signal
-    {
+    if is_merge_signal {
         if qty > 0.0 {
             return Some(UserOrderEvent::OrderMerged {
                 order_id,
@@ -320,8 +344,7 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         }
     }
 
-    if is_redeem_signal
-    {
+    if is_redeem_signal {
         if qty > 0.0 {
             return Some(UserOrderEvent::OrderRedeemed {
                 order_id,
@@ -335,8 +358,7 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         }
     }
 
-    if is_fill_signal
-    {
+    if is_fill_signal {
         if qty > 0.0 {
             return Some(UserOrderEvent::OrderFilled {
                 order_id,
@@ -382,10 +404,14 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         }
     }
 
-    if matches!(event_type_low.as_str(), "order" | "orderbook" | "order_update")
-        && qty > 0.0
+    if matches!(
+        event_type_low.as_str(),
+        "order" | "orderbook" | "order_update"
+    ) && qty > 0.0
         && !client_order_id.is_none()
-        && (status_low.contains("closed") || status_low.contains("done") || status_low.contains("fill"))
+        && (status_low.contains("closed")
+            || status_low.contains("done")
+            || status_low.contains("fill"))
     {
         return Some(UserOrderEvent::OrderFilled {
             order_id,

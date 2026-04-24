@@ -2044,7 +2044,11 @@ impl UnlawfulShearStrategy {
         // changes in late-window salvage and fallback-close mode.
         let bucket = 0.25;
         let quantized = (raw_qty / bucket).floor() * bucket;
-        if quantized >= bucket { quantized } else { 0.0 }
+        if quantized >= bucket {
+            quantized
+        } else {
+            0.0
+        }
     }
 
     fn winning_instrument_id(
@@ -2209,7 +2213,11 @@ impl UnlawfulShearStrategy {
             && price_gap >= self.config.preferred_price_gap_min;
 
         if hard_band {
-            if preferred_band { 1.0 } else { 0.6 }
+            if preferred_band {
+                1.0
+            } else {
+                0.6
+            }
         } else {
             0.0
         }
@@ -3512,18 +3520,14 @@ mod tests {
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-b", 0.50, 0.52, 10));
         assert_eq!(decision.intents.len(), 3);
-        assert!(
-            decision
-                .intents
-                .iter()
-                .all(|intent| intent.side == TradeSide::Buy)
-        );
-        assert!(
-            decision
-                .intents
-                .windows(2)
-                .all(|window| window[0].limit_price >= window[1].limit_price)
-        );
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| intent.side == TradeSide::Buy));
+        assert!(decision
+            .intents
+            .windows(2)
+            .all(|window| window[0].limit_price >= window[1].limit_price));
     }
 
     #[test]
@@ -3544,12 +3548,10 @@ mod tests {
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
         assert_eq!(decision.intents.len(), 2);
-        assert!(
-            decision
-                .intents
-                .iter()
-                .any(|intent| intent.side == TradeSide::Buy)
-        );
+        assert!(decision
+            .intents
+            .iter()
+            .any(|intent| intent.side == TradeSide::Buy));
     }
 
     #[test]
@@ -3576,12 +3578,10 @@ mod tests {
             .find(|intent| intent.instrument_id == InstrumentId::from("up"))
             .expect("core order");
         assert!((core.quantity * core.limit_price - 5.0).abs() < 1e-9);
-        assert!(
-            decision
-                .notes
-                .iter()
-                .any(|note| note.contains("microstructure scaled action=core-entry"))
-        );
+        assert!(decision
+            .notes
+            .iter()
+            .any(|note| note.contains("microstructure scaled action=core-entry")));
     }
 
     #[test]
@@ -3604,17 +3604,14 @@ mod tests {
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
 
         assert!(decision.intents.is_empty());
-        assert!(
-            decision
-                .notes
-                .iter()
-                .any(|note| note.contains("microstructure blocked action=core-entry"))
-        );
-        assert!(
-            decision.notes.iter().any(|note| {
-                note.contains("unlawful microstructure controller suppressed market")
-            })
-        );
+        assert!(decision
+            .notes
+            .iter()
+            .any(|note| note.contains("microstructure blocked action=core-entry")));
+        assert!(decision
+            .notes
+            .iter()
+            .any(|note| { note.contains("unlawful microstructure controller suppressed market") }));
     }
 
     #[test]
@@ -3636,12 +3633,10 @@ mod tests {
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
 
         assert_eq!(decision.intents.len(), 2);
-        assert!(
-            decision
-                .intents
-                .iter()
-                .all(|intent| intent.market_id == MarketId::from("market-a"))
-        );
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| intent.market_id == MarketId::from("market-a")));
     }
 
     #[test]
@@ -3671,12 +3666,10 @@ mod tests {
         strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.55, 0.60, 10));
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.22, 0.25, 10));
-        assert!(
-            decision
-                .intents
-                .iter()
-                .any(|intent| intent.side == TradeSide::Sell && intent.reduce_only)
-        );
+        assert!(decision
+            .intents
+            .iter()
+            .any(|intent| intent.side == TradeSide::Sell && intent.reduce_only));
     }
 
     #[test]

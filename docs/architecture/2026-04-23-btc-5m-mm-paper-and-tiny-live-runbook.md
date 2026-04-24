@@ -1,7 +1,7 @@
 # BTC 5m MM Paper And Tiny-Live Runbook
 
-Status: operator runbook  
-Date: 2026-04-23  
+Status: operator runbook
+Date: 2026-04-24
 Primary runtime: `whale-pair-exec`
 
 ## 1. Scope
@@ -13,11 +13,28 @@ This runbook covers:
 - the exact persistent paths and health checks to verify
 - the minimum operator path for tiny-live once the runtime is stable
 
+It is intentionally limited to ops/docs/script surfaces. It does not approve
+capital deployment by itself.
+
 It assumes the repo lives at:
 
 - `/Users/jackreid/go/polymarket-agent`
 
 Adjust paths if the runtime is moved to a dedicated host.
+
+## 1.1 Hard live gate
+
+Live mode must not carry capital until order submission, cancel, replace, open
+order sync, and balance sync go through the signed Polymarket CLOB API/SDK path.
+Do not work around this with unsigned/raw HTTP calls or paper adapter semantics.
+
+Tiny-live may only start after:
+
+- `WHALE_PAIR_PAPER_MODE=false` is deliberate and reviewed
+- signed CLOB credentials are present and scoped to the tiny-live wallet
+- the user websocket is authenticated and producing order/fill events
+- startup reconciliation has been tested against the venue open-order source
+- the first funded run uses one sleeve, one host, and the smallest practical size
 
 ## 2. Available sleeve presets
 
@@ -143,6 +160,20 @@ Expected paper checks:
 - the journal file is being appended to
 - the order-store SQLite file exists and grows
 
+Heartbeat expectations:
+
+- `/healthz` fails if the runtime snapshot is older than `120s`
+- `/healthz` fails if market websocket messages are older than `30s`
+- `/healthz` fails if active orders exist and reconcile age exceeds `120s`
+- `/metrics` should expose `market_ws_last_message_age_ms`,
+  `user_ws_last_message_age_ms`, and `last_reconcile_age_ms`
+- paper services should append journal/checkpoint records at least every active
+  runtime checkpoint interval, default `30s`, once a market slate is live
+
+If `/healthz` is red, treat it as fail-closed for tiny-live. For paper, keep the
+process running only if the failure is understood and the journal/order store are
+still useful for diagnosis.
+
 ## 7. Restart procedure
 
 Manual:
@@ -150,6 +181,17 @@ Manual:
 1. stop the process
 2. re-run the same sleeve command
 3. verify `healthz`, `api/state`, and journal append behavior
+
+Startup reconciliation:
+
+1. On startup, the runtime opens the configured SQLite order store.
+2. Active rows older than `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`, default
+   `30000ms`, are moved toward `NeedsReconcile`.
+3. A startup checkpoint is written to the journal.
+4. In paper, confirm old `CancelRequested` rows do not remain stuck after restart.
+5. In tiny-live, compare local active rows with venue open orders before allowing
+   new risk. If any local/venue state is unknown, keep the sleeve stopped or in
+   cleanup-only mode until reconciled.
 
 systemd:
 
@@ -181,7 +223,33 @@ The systemd template reads those env files if present, then executes the checked
 repo launcher. That means repo updates remain the source of truth for the sleeves,
 while host env files only carry deployment-specific overrides.
 
-## 8. Paper env and secret surfaces
+## 8. Hetzner paper service model
+
+Current direct rollout entrypoint:
+
+```bash
+HETZNER_HOST=<host-or-ip> ops/deploy/deploy_paper_hetzner.sh
+```
+
+Default remote surfaces:
+
+- SSH key: `~/.ssh/polymarket_hetzner`
+- remote user: `root`
+- remote checkout: `/root/go/polymarket-agent`
+- managed services:
+  - `whale-pair-exec@unlawful_baseline`
+  - `whale-pair-exec@unlawful_broad_hours`
+  - `whale-pair-exec@unlawful_press`
+
+The deploy script syncs the repo, installs user services, enables lingering,
+starts the three paper sleeves, and probes ports `9108`, `9109`, and `9110`.
+It excludes local `data/`, `target/`, `.git/`, `.venv/`, and runtime artifacts.
+
+Hetzner paper is acceptable for continuous paper service operation. For real
+capital, prefer the EU live plan below rather than treating the current Hetzner
+paper host as the permanent live trading plane.
+
+## 9. Paper env and secret surfaces
 
 Paper mode still needs a small number of explicit host surfaces:
 
@@ -196,8 +264,20 @@ Paper mode still needs a small number of explicit host surfaces:
 - `WHALE_PAIR_EXEC_SPOT_SYMBOL`
 - `POLYMARKET_MARKET_WS_URL`
 - `POLYMARKET_USER_WS_URL`
+- `WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS`
+- `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`
+- `WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS`
+- `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES`
 - `RUST_LOG`
 - `RUST_BACKTRACE`
+
+The rolling exporter generates these at launch:
+
+- `WHALE_PAIR_ASSET_IDS`
+- `WHALE_PAIR_INSTRUMENT_MARKETS`
+- `WHALE_PAIR_USER_MARKETS`
+- `WHALE_PAIR_LATEST_MARKET_SLUG`
+- `WHALE_PAIR_LATEST_MARKET_END_TIME`
 
 Paper mode does not require:
 
@@ -220,7 +300,52 @@ Process logs for always-on runs live in journald:
 - `journalctl --user -u whale-pair-exec@unlawful_broad_hours`
 - `journalctl --user -u whale-pair-exec@unlawful_press`
 
-## 9. Tiny-live minimum env additions
+## 10. Data retention and off-disk storage
+
+Hot state stays local and sleeve-specific:
+
+- SQLite order stores under `data/runtime/*/order-store.sqlite`
+- active journals under `data/execution/paper/*/journal.jsonl`
+- rotated journal segments under the same paper directories
+
+Off-disk policy:
+
+- enable `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES=268435456`
+- archive rotated journal segments and explicit backup directories to S3
+- use `DEEP_ARCHIVE` for cold paper logs unless active replay access is needed
+- do not delete local active `journal.jsonl`
+- only enable `WHALE_PAIR_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=true` after S3
+  object existence has been verified
+
+Run a local candidate listing before trusting credentials:
+
+```bash
+WHALE_PAIR_ARCHIVE_LIST_ONLY=true whale-pair-exec/scripts/archive_paper_artifacts.sh
+```
+
+Detailed archive procedure:
+
+- `docs/architecture/2026-04-24-paper-storage-archive-plan.md`
+
+## 11. EU/live considerations
+
+Paper can run on local or Hetzner as long as websockets are stable and retention
+is configured.
+
+Tiny-live/live should use a Europe-based trading plane, with `eu-west-1` as the
+default AWS target when moving beyond paper. The control plane and research
+collector can lag behind; the trading plane needs the lowest operational
+uncertainty for websocket, CLOB, RPC, and reconciliation surfaces.
+
+Do not run meaningful capital from a host where:
+
+- user websocket auth is untested
+- Polygon RPC is missing or rate-limited
+- signed CLOB API/SDK execution is not the only live order path
+- order-store persistence is on ephemeral disk without a tested backup path
+- archive/retention is disabled and active journals are unbounded
+
+## 12. Tiny-live minimum env additions
 
 Paper mode leaves these unset.
 
@@ -230,16 +355,22 @@ Before tiny-live, fill:
 - `POLYMARKET_API_SECRET`
 - `POLYMARKET_API_PASSPHRASE`
 - `WHALE_PAIR_PAPER_MODE=false`
+- `POLYMARKET_MARKET_WS_URL`
+- `POLYMARKET_USER_WS_URL`
 - `WHALE_PAIR_EXEC_SPOT_WS_URL`
 - `WHALE_PAIR_EXEC_SPOT_SYMBOL`
+- `WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS`
+- `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`
 
 And verify:
 
 - the live wallet is distinct from the research wallet
 - approvals and balances are already staged
 - the user websocket is receiving live order / fill events
+- signed CLOB API/SDK submit/cancel/open-order sync is confirmed before capital
+- startup reconciliation agrees with venue open orders before new risk is allowed
 
-## 10. Tiny-live checklist
+## 13. Tiny-live checklist
 
 Do not start tiny-live until all of these are true:
 
@@ -251,6 +382,8 @@ Do not start tiny-live until all of these are true:
 - metrics and health endpoints are reachable
 - microstructure controller is enabled and visible in decision notes
 - `WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH=true` is set for live
+- signed CLOB API/SDK is the only live order submission/cancel path
+- startup reconciliation against venue open orders is manually verified
 - top-3 ask notional caps are tighter than max order notional
 - stale `CancelRequested` orders transition to `NeedsReconcile`
 - operator kill path has been tested with `systemctl --user stop whale-pair-exec@<sleeve>`
@@ -269,7 +402,7 @@ Live kill/health loop:
 2. Kill immediately if user websocket is stale, orders remain `CancelRequested` past the reconciliation window, depth telemetry disappears while `MICROSTRUCTURE_REQUIRE_DEPTH=true`, or inventory exceeds the configured hard cap.
 3. After a kill, reconcile venue open orders first, then restart the sleeve only after `orders` has no unknown active rows.
 
-## 11. Collector relationship
+## 14. Collector relationship
 
 The runtime and the unlawful live collector are separate processes.
 
@@ -281,9 +414,9 @@ The collector should be run alongside paper so:
 - session drift can be measured
 - geometry thresholds can be recalibrated
 
-## 12. Concise AWS paper checklist
+## 15. Concise AWS paper checklist
 
-Tomorrow’s always-on paper deploy should be:
+An always-on paper deploy should be:
 
 1. Launch an EU host if available, preferably `eu-west-1`.
 2. Clone the repo to the final path, for example:

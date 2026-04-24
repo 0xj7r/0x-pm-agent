@@ -222,10 +222,12 @@ impl BookStore {
         asks: &[Level],
     ) -> BookState {
         let mut guard = self.inner.write().await;
-        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
-            asset_id: asset_id.to_string(),
-            ..BookState::default()
-        });
+        let book = guard
+            .entry(asset_id.to_string())
+            .or_insert_with(|| BookState {
+                asset_id: asset_id.to_string(),
+                ..BookState::default()
+            });
         book.update_levels(bids, asks);
         book.touch();
         if !bids.is_empty() || !asks.is_empty() {
@@ -241,10 +243,12 @@ impl BookStore {
         best_ask: Option<f64>,
     ) -> BookState {
         let mut guard = self.inner.write().await;
-        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
-            asset_id: asset_id.to_string(),
-            ..BookState::default()
-        });
+        let book = guard
+            .entry(asset_id.to_string())
+            .or_insert_with(|| BookState {
+                asset_id: asset_id.to_string(),
+                ..BookState::default()
+            });
         if let Some(best_bid) = best_bid {
             book.best_bid = best_bid;
             book.best_bid_size = book
@@ -258,7 +262,8 @@ impl BookStore {
                     price: best_bid,
                     size: book.best_bid_size,
                 });
-                book.bids.sort_by(|left, right| right.price.total_cmp(&left.price));
+                book.bids
+                    .sort_by(|left, right| right.price.total_cmp(&left.price));
                 book.bids.truncate(MAX_BOOK_LEVELS);
             } else if let Some(first) = book.bids.first_mut() {
                 first.price = best_bid;
@@ -266,7 +271,8 @@ impl BookStore {
                     first.size = book.best_bid_size;
                 }
             }
-            book.bids.sort_by(|left, right| right.price.total_cmp(&left.price));
+            book.bids
+                .sort_by(|left, right| right.price.total_cmp(&left.price));
             book.bids.truncate(MAX_BOOK_LEVELS);
         }
         if let Some(best_ask) = best_ask {
@@ -282,7 +288,8 @@ impl BookStore {
                     price: best_ask,
                     size: book.best_ask_size,
                 });
-                book.asks.sort_by(|left, right| left.price.total_cmp(&right.price));
+                book.asks
+                    .sort_by(|left, right| left.price.total_cmp(&right.price));
                 book.asks.truncate(MAX_BOOK_LEVELS);
             } else if let Some(first) = book.asks.first_mut() {
                 first.price = best_ask;
@@ -290,7 +297,8 @@ impl BookStore {
                     first.size = book.best_ask_size;
                 }
             }
-            book.asks.sort_by(|left, right| left.price.total_cmp(&right.price));
+            book.asks
+                .sort_by(|left, right| left.price.total_cmp(&right.price));
             book.asks.truncate(MAX_BOOK_LEVELS);
         }
         book.touch();
@@ -299,10 +307,12 @@ impl BookStore {
 
     pub async fn apply_last_trade(&self, asset_id: &str, price: f64) -> BookState {
         let mut guard = self.inner.write().await;
-        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
-            asset_id: asset_id.to_string(),
-            ..BookState::default()
-        });
+        let book = guard
+            .entry(asset_id.to_string())
+            .or_insert_with(|| BookState {
+                asset_id: asset_id.to_string(),
+                ..BookState::default()
+            });
         book.last_trade_price = price;
         let observed_at_ms = now_unix_ms();
         book.record_trade_event(observed_at_ms);
@@ -318,10 +328,12 @@ impl BookStore {
 
     pub async fn record_trade_event(&self, asset_id: &str, observed_at_ms: u64) {
         let mut guard = self.inner.write().await;
-        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
-            asset_id: asset_id.to_string(),
-            ..BookState::default()
-        });
+        let book = guard
+            .entry(asset_id.to_string())
+            .or_insert_with(|| BookState {
+                asset_id: asset_id.to_string(),
+                ..BookState::default()
+            });
         book.record_trade_event(observed_at_ms);
         book.last_update_unix_ms = observed_at_ms;
         book.last_update_mono = Some(Instant::now());
@@ -338,10 +350,12 @@ impl BookStore {
         now_ms: u64,
     ) -> (u32, u32, u32, Option<u64>) {
         let mut guard = self.inner.write().await;
-        let book = guard.entry(asset_id.to_string()).or_insert_with(|| BookState {
-            asset_id: asset_id.to_string(),
-            ..BookState::default()
-        });
+        let book = guard
+            .entry(asset_id.to_string())
+            .or_insert_with(|| BookState {
+                asset_id: asset_id.to_string(),
+                ..BookState::default()
+            });
         book.trade_activity_counts(now_ms)
     }
 

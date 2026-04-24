@@ -8,6 +8,18 @@ This workspace contains the Rust execution scaffold for whale-pair.
 - The binary owns websocket intake, metrics, and a minimal runtime loop.
 - The hot path now feeds top-of-book updates into the deterministic execution runtime instead of only logging book summaries.
 
+## Operational runbooks
+
+- Paper/tiny-live runbook: `docs/architecture/2026-04-23-btc-5m-mm-paper-and-tiny-live-runbook.md`
+- Infra requirements: `docs/architecture/2026-04-23-btc-5m-mm-infra-requirements.md`
+- Paper storage/archive plan: `docs/architecture/2026-04-24-paper-storage-archive-plan.md`
+- Hetzner paper deploy helper: `ops/deploy/deploy_paper_hetzner.sh`
+- Systemd env template: `whale-pair-exec/ops/systemd/common.env.example`
+
+Live mode must use the signed Polymarket CLOB API/SDK path for submit, cancel,
+open-order sync, and balance sync before any capital is deployed. Do not treat
+paper-mode simulation or unsigned/raw HTTP as tiny-live ready.
+
 ## Key env vars
 
 - `WHALE_PAIR_ASSET_IDS`

@@ -12,8 +12,8 @@ use whale_pair_exec::runtime::order_store::SqliteOrderStore;
 use whale_pair_exec::runtime::{ManagedOrderStatus, Runtime, RuntimeConfig};
 use whale_pair_exec::strategy::{Strategy, StrategyContext, StrategyDecision};
 use whale_pair_exec::types::{
-    BookLevel, ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId,
-    MarketSnapshot, OrderIntent, RuntimeCommand, RuntimeStatus, TradeSide,
+    ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId, MarketSnapshot,
+    OrderIntent, RuntimeCommand, RuntimeStatus, TradeSide,
 };
 
 const FIXTURE_DIR: &str = "tests/fixtures/btc_5m_mm";
@@ -292,12 +292,10 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn load_fixture(name: &str) -> ScenarioFixture {
     let path = fixture_path(name);
-    let raw = fs::read_to_string(&path).unwrap_or_else(|error| {
-        panic!("failed to read fixture {}: {error}", path.display())
-    });
-    serde_json::from_str(&raw).unwrap_or_else(|error| {
-        panic!("failed to parse fixture {}: {error}", path.display())
-    })
+    let raw = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read fixture {}: {error}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("failed to parse fixture {}: {error}", path.display()))
 }
 
 fn unique_workspace_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -308,9 +306,16 @@ fn unique_workspace_path(prefix: &str, suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{unique}{suffix}"))
 }
 
-fn build_runtime(fixture: &ScenarioFixture, store_path: &Path, starting_cash_usd: f64) -> Runtime<FixtureStrategy> {
+fn build_runtime(
+    fixture: &ScenarioFixture,
+    store_path: &Path,
+    starting_cash_usd: f64,
+) -> Runtime<FixtureStrategy> {
     let order_store = SqliteOrderStore::open(store_path).unwrap_or_else(|error| {
-        panic!("failed to open order store {}: {error}", store_path.display())
+        panic!(
+            "failed to open order store {}: {error}",
+            store_path.display()
+        )
     });
     Runtime::new_with_order_store(
         RuntimeConfig {
@@ -426,7 +431,10 @@ fn assert_runtime_expectations(
     _runtime: &Runtime<FixtureStrategy>,
     seen_categories: &BTreeSet<String>,
 ) {
-    assert_eq!(format!("{:?}", _runtime.status()), fixture.expected.runtime_status);
+    assert_eq!(
+        format!("{:?}", _runtime.status()),
+        fixture.expected.runtime_status
+    );
     for required in &fixture.expected.required_event_categories {
         assert!(
             seen_categories.contains(required),
@@ -467,14 +475,16 @@ fn handle_submit_ack(
             at_ms,
             "submission uncertain; moving to needs-reconcile",
         )),
-        "rejected" => Some(runtime.on_order_rejected(
-            &intent.client_order_id,
-            outcome
-                .reason
-                .clone()
-                .unwrap_or_else(|| "rejected by adapter".to_string()),
-            at_ms,
-        )),
+        "rejected" => Some(
+            runtime.on_order_rejected(
+                &intent.client_order_id,
+                outcome
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "rejected by adapter".to_string()),
+                at_ms,
+            ),
+        ),
         other => panic!("unsupported submit outcome {other}"),
     }
 }
@@ -493,14 +503,16 @@ fn handle_cancel_ack(
     };
 
     match outcome.outcome.as_str() {
-        "cancelled" => Some(runtime.on_order_cancelled(
-            client_order_id,
-            outcome
-                .reason
-                .clone()
-                .unwrap_or_else(|| "cancelled by adapter".to_string()),
-            at_ms,
-        )),
+        "cancelled" => Some(
+            runtime.on_order_cancelled(
+                client_order_id,
+                outcome
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "cancelled by adapter".to_string()),
+                at_ms,
+            ),
+        ),
         other => panic!("unsupported cancel outcome {other}"),
     }
 }
@@ -585,9 +597,7 @@ fn run_fixture(name: &str) {
                                         submit_client_order_id
                                     )
                                 });
-                            if let Some(decision) =
-                                decision_lookup.get(&submit_client_order_id)
-                            {
+                            if let Some(decision) = decision_lookup.get(&submit_client_order_id) {
                                 assert_submit_intent(&command, decision);
                                 submitted_decisions.insert(submit_client_order_id.clone());
                             }
@@ -622,7 +632,9 @@ fn run_fixture(name: &str) {
                                 );
                             }
                         }
-                        RuntimeCommand::Cancel { client_order_id, .. } => {
+                        RuntimeCommand::Cancel {
+                            client_order_id, ..
+                        } => {
                             let adapter_outcome = cancel_outcomes_by_id
                                 .get(client_order_id.as_str())
                                 .unwrap_or_else(|| {
@@ -785,7 +797,9 @@ fn run_fixture(name: &str) {
                         .as_ref()
                         .expect("sync open orders");
                     let local = open_orders.first().expect("local open order");
-                    assert!((local.remaining_qty() - synced.open_orders[0].remaining_qty).abs() < 1e-9);
+                    assert!(
+                        (local.remaining_qty() - synced.open_orders[0].remaining_qty).abs() < 1e-9
+                    );
                 }
 
                 if fixture.name == "replay_reconcile_merge_recovery" {
@@ -805,12 +819,12 @@ fn run_fixture(name: &str) {
                 expected,
             } => {
                 assert_checkpoint(&runtime, &fixture, expected, *at_ms);
-                let checkpoint_line = checkpoint_artifact(
-                    &runtime,
-                    &format!("{}-{}", fixture.name, at_ms),
-                    *at_ms,
-                );
-                assert!(checkpoint_line.as_object().unwrap().contains_key("inventory_json"));
+                let checkpoint_line =
+                    checkpoint_artifact(&runtime, &format!("{}-{}", fixture.name, at_ms), *at_ms);
+                assert!(checkpoint_line
+                    .as_object()
+                    .unwrap()
+                    .contains_key("inventory_json"));
                 let journal_checkpoint_name = format!("checkpoint-{}-{}", fixture.name, at_ms);
                 let checkpoint_path = journal_path_for_checkpoint(&fixture.name, *at_ms);
                 let mut checkpoint_journal = JournalWriter::open(checkpoint_path)

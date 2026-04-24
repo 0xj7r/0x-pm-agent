@@ -66,7 +66,10 @@ impl MarketWsClient {
         let (stream, _) = connect_async(self.url.as_str())
             .await
             .with_context(|| format!("failed to connect market websocket {}", self.url))?;
-        info!(asset_count = self.assets.len(), "market websocket connected");
+        info!(
+            asset_count = self.assets.len(),
+            "market websocket connected"
+        );
         self.metrics.set_stream_connected(StreamKind::Market, true);
 
         let (mut write, mut read) = stream.split();
@@ -122,7 +125,8 @@ impl MarketWsClient {
             return Ok(());
         }
 
-        let payload: Value = serde_json::from_str(text).context("failed to decode market websocket payload")?;
+        let payload: Value =
+            serde_json::from_str(text).context("failed to decode market websocket payload")?;
         match payload {
             Value::Array(items) => {
                 for item in items {
@@ -139,7 +143,13 @@ impl MarketWsClient {
         let event_type = event
             .get("event_type")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| if event.get("bids").is_some() || event.get("asks").is_some() { "book" } else { "unknown" });
+            .unwrap_or_else(|| {
+                if event.get("bids").is_some() || event.get("asks").is_some() {
+                    "book"
+                } else {
+                    "unknown"
+                }
+            });
 
         match event_type {
             "book" => {
@@ -193,7 +203,9 @@ impl MarketWsClient {
                     self.books
                         .apply_best_bid_ask(asset_id, best_bid, best_ask)
                         .await;
-                    self.books.record_trade_event(asset_id, observed_at_ms).await;
+                    self.books
+                        .record_trade_event(asset_id, observed_at_ms)
+                        .await;
                 }
             }
             "best_bid_ask" => {

@@ -2,9 +2,7 @@ use std::collections::VecDeque;
 
 use serde::Serialize;
 
-use crate::types::{
-    ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, RuntimeStatus,
-};
+use crate::types::{ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, RuntimeStatus};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum EventCategory {
