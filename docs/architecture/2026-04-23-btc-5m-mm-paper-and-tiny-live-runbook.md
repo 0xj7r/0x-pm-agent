@@ -369,8 +369,11 @@ Paper mode leaves these unset.
 Before tiny-live, fill:
 
 - `POLYMARKET_PRIVATE_KEY`
-- `POLYMARKET_SIGNATURE_TYPE=gnosis_safe` for a Gnosis Safe / proxy wallet
-- `POLYMARKET_FUNDER_ADDRESS=<Polymarket Safe/proxy wallet address>`
+- `POLYMARKET_SIGNATURE_TYPE=eoa` and no `POLYMARKET_FUNDER_ADDRESS` when the
+  funded account is the MetaMask signer address itself
+- `POLYMARKET_SIGNATURE_TYPE=gnosis_safe` and
+  `POLYMARKET_FUNDER_ADDRESS=<Polymarket Safe/proxy wallet address>` only when
+  the funded account is a Safe/proxy wallet
 - `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and
   `POLYMARKET_API_PASSPHRASE` if you want the user websocket enabled from
   process start
@@ -385,6 +388,7 @@ Before tiny-live, fill:
 And verify:
 
 - the live wallet is distinct from the research wallet
+- direct EOA live auth is used only for smoke/tiny-live and not for scaling
 - the live wallet is a Gnosis Safe / proxy wallet before scaling beyond smoke
 - approvals and balances are already staged
 - the user websocket is receiving live order / fill events
@@ -414,6 +418,16 @@ Gnosis Safe setup rules:
   state before enabling live.
 - Do not reuse the research whale wallet, collector wallet, or dashboard wallet
   as the live signer/funder.
+
+Validated smoke configuration:
+
+- On `2026-04-24`, live smoke succeeded on AWS using the funded MetaMask EOA
+  path.
+- `POLYMARKET_PRIVATE_KEY` was set from the MetaMask private key.
+- `POLYMARKET_SIGNATURE_TYPE=eoa`.
+- `POLYMARKET_FUNDER_ADDRESS` was unset.
+- The one-shot placed a `$1` far-touch order, cancelled it, and reconciled open
+  orders successfully.
 
 Live smoke mode:
 
