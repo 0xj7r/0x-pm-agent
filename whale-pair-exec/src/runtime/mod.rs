@@ -11,7 +11,7 @@ use crate::inventory::InventoryState;
 use crate::merge_executor::MergeExecutor;
 use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
 use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
-use crate::runtime::order_store::{OrderRecord, OrderStore};
+use crate::runtime::order_store::{OrderRecord, OrderStore, SignalSnapshotRecord};
 use crate::market_context::MarketContextStore;
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
 use crate::signals::{
@@ -41,6 +41,7 @@ const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_20M_MS: u64 = 20 * 60 * 1_000;
 const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
+const SIGNAL_SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Debug, Default)]
 struct BtcSignalStore {
@@ -264,6 +265,7 @@ pub struct Runtime<S: Strategy> {
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
+    last_persisted_unlawful_signal_by_market: HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
     order_store: Option<Box<dyn OrderStore>>,
 }
 
@@ -313,6 +315,7 @@ impl<S: Strategy> Runtime<S> {
             first_fill_by_market: HashMap::new(),
             first_merge_by_market: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
+            last_persisted_unlawful_signal_by_market: HashMap::new(),
             order_store,
         }
     }
@@ -601,7 +604,8 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             self.status,
         )));
-        let decision = self.strategy.on_start(&self.strategy_context(now_ms, None));
+        let context = self.strategy_context(now_ms, None);
+        let decision = self.strategy.on_start(&context);
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
         outcome
     }
@@ -855,9 +859,8 @@ impl<S: Strategy> Runtime<S> {
             }
         }
 
-        let decision = self
-            .strategy
-            .on_fill(&self.strategy_context(now_ms, Some(&fill.market_id)), &fill);
+        let context = self.strategy_context(now_ms, Some(&fill.market_id));
+        let decision = self.strategy.on_fill(&context, &fill);
         outcome.extend(self.accept_strategy_decision(decision, now_ms));
         self.maybe_clear_market_timing(&fill.market_id);
         Ok(outcome)
@@ -1169,9 +1172,14 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
-    fn strategy_context(&self, now_ms: EpochMillis, market_id: Option<&MarketId>) -> StrategyContext {
+    fn strategy_context(
+        &mut self,
+        now_ms: EpochMillis,
+        market_id: Option<&MarketId>,
+    ) -> StrategyContext {
         let market_context = market_id.and_then(|id| self.market_contexts.get(id).cloned());
-        let unlawful_signal = match (market_id, self.unlawful_gate_config.as_ref()) {
+        let unlawful_gate_config = self.unlawful_gate_config.clone();
+        let unlawful_signal = match (market_id, unlawful_gate_config.as_ref()) {
             (Some(id), Some(cfg)) => Some(self.build_unlawful_signal(
                 id,
                 market_context.as_ref(),
@@ -1185,13 +1193,16 @@ impl<S: Strategy> Runtime<S> {
             runtime_status: self.status,
             inventory: self.inventory.snapshot(),
             open_orders_total: self.open_orders.len(),
+            open_orders_for_market: market_id
+                .map(|id| self.open_orders_for_market(id))
+                .unwrap_or(0),
             market_context,
             unlawful_signal,
         }
     }
 
     fn build_unlawful_signal(
-        &self,
+        &mut self,
         market_id: &MarketId,
         market_context: Option<&crate::market_context::MarketContextRecord>,
         now_ms: EpochMillis,
@@ -1246,7 +1257,84 @@ impl<S: Strategy> Runtime<S> {
             ));
             signal.clip_scale = 0.0;
         }
-        self.map_signal_snapshot(signal)
+        let strategy_signal = self.map_signal_snapshot(signal);
+        self.persist_unlawful_signal_snapshot(market_id, now_ms, &strategy_signal);
+        strategy_signal
+    }
+
+    fn persist_unlawful_signal_snapshot(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        signal: &StrategyUnlawfulSignalSnapshot,
+    ) {
+        let should_persist = match self.last_persisted_unlawful_signal_by_market.get(market_id) {
+            Some((last_ms, last_mode)) => {
+                signal.mode != *last_mode
+                    || now_ms.saturating_sub(*last_ms) >= SIGNAL_SNAPSHOT_PERSIST_INTERVAL_MS
+            }
+            None => true,
+        };
+        if !should_persist {
+            return;
+        }
+
+        let Some(store) = self.order_store.as_mut() else {
+            return;
+        };
+
+        let record = SignalSnapshotRecord {
+            run_id: self.run_id.clone(),
+            market_id: market_id.clone(),
+            observed_at_ms: now_ms,
+            session_bucket: format!("{:?}", signal.session_bucket),
+            mode: format!("{:?}", signal.mode),
+            aggression_tier: None,
+            cheap_instrument_id: signal.book.cheap_instrument_id.clone(),
+            expensive_instrument_id: signal.book.expensive_instrument_id.clone(),
+            cheap_bid: signal.book.cheap_bid.as_ref().map(|level| level.price),
+            cheap_ask: signal.book.cheap_ask.as_ref().map(|level| level.price),
+            expensive_bid: signal.book.expensive_bid.as_ref().map(|level| level.price),
+            expensive_ask: signal.book.expensive_ask.as_ref().map(|level| level.price),
+            price_gap: signal.book.price_gap,
+            books_fresh: signal.book.books_fresh,
+            both_sides_present: signal.book.both_sides_present,
+            btc_last_price: signal.btc.last_price,
+            btc_realized_vol_5m_bps: signal.btc.realized_vol_5m_bps,
+            btc_realized_vol_15m_bps: signal.btc.realized_vol_15m_bps,
+            btc_trade_count_5m: signal.btc.trade_count_5m,
+            btc_trade_count_15m: signal.btc.trade_count_15m,
+            btc_return_30s_bps: signal.btc.return_30s_bps,
+            btc_return_60s_bps: signal.btc.return_60s_bps,
+            btc_observed_at_ms: signal.btc.observed_at_ms,
+            activity_10s: signal.activity.last_trade_event_count_10s,
+            activity_30s: signal.activity.last_trade_event_count_30s,
+            activity_60s: signal.activity.last_trade_event_count_60s,
+            activity_age_ms: signal.activity.last_trade_event_age_ms,
+            first_fill_ms: signal.first_fill_ms,
+            first_merge_ms: signal.first_merge_ms,
+            elapsed_s: signal.elapsed_s,
+            time_remaining_s: signal.time_remaining_s,
+            clip_scale: signal.clip_scale,
+            gate_reasons: if signal.gate_reasons.is_empty() {
+                "none".to_string()
+            } else {
+                signal.gate_reasons.join(";")
+            },
+        };
+
+        if let Err(error) = store.insert_signal_snapshot(record) {
+            warn!(
+                error = ?error,
+                run_id = %self.run_id,
+                market_id = %market_id,
+                "failed to persist unlawful signal snapshot"
+            );
+            return;
+        }
+
+        self.last_persisted_unlawful_signal_by_market
+            .insert(market_id.clone(), (now_ms, signal.mode));
     }
 
     fn classify_session_bucket(
@@ -1354,19 +1442,14 @@ impl<S: Strategy> Runtime<S> {
             .unwrap_or(0);
         let books_fresh = observed_at_ms > 0
             && now_ms.saturating_sub(observed_at_ms) <= cfg.entry_book_max_age_ms;
-        let both_sides_present = cheap_bid
+        let both_sides_present = cheap_ask
             .as_ref()
-            .zip(cheap_ask.as_ref())
-            .zip(expensive_bid.as_ref().zip(expensive_ask.as_ref()))
-            .is_some_and(|((cb, ca), (eb, ea))| {
-                cb.price > 0.0
-                    && ca.price > 0.0
-                    && eb.price > 0.0
-                    && ea.price > 0.0
-                    && cb.quantity > 0.0
-                    && ca.quantity > 0.0
-                    && eb.quantity > 0.0
-                    && ea.quantity > 0.0
+            .zip(expensive_ask.as_ref())
+            .is_some_and(|(cheap, expensive)| {
+                cheap.price > 0.0
+                    && expensive.price > 0.0
+                    && cheap.quantity > 0.0
+                    && expensive.quantity > 0.0
             });
 
         let price_gap = cheap_ask
