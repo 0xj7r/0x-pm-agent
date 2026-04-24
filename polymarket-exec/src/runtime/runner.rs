@@ -1559,7 +1559,10 @@ async fn execute_execution_adapter(
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected submit".to_string());
-                        if submit_rejection_counts_against_live_budget(&reason) {
+                        if submit_rejection_counts_against_live_budget(
+                            &reason,
+                            execution_policy.live_post_only,
+                        ) {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
                         } else {
@@ -2067,8 +2070,11 @@ fn apply_sync_report(
     }
 }
 
-fn submit_rejection_counts_against_live_budget(reason: &str) -> bool {
+fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) -> bool {
     let lower = reason.to_ascii_lowercase();
+    if post_only && lower == "execution venue rejected submit" {
+        return false;
+    }
     !(lower.contains("post-only")
         || lower.contains("crosses book")
         || lower.contains("would cross")
@@ -2643,6 +2649,22 @@ mod tests {
         assert!(request.post_only);
         assert_eq!(request.time_in_force, TimeInForce::Gtd);
         assert_eq!(request.expires_at_ms, Some(21_000));
+    }
+
+    #[test]
+    fn generic_post_only_submit_reject_does_not_consume_live_budget() {
+        assert!(!submit_rejection_counts_against_live_budget(
+            "execution venue rejected submit",
+            true
+        ));
+        assert!(submit_rejection_counts_against_live_budget(
+            "execution venue rejected submit",
+            false
+        ));
+        assert!(submit_rejection_counts_against_live_budget(
+            "insufficient balance",
+            true
+        ));
     }
 
     #[test]

@@ -1629,6 +1629,7 @@ impl Btc5mMmStrategy {
         reason: String,
         now_ms: EpochMillis,
     ) -> OrderIntent {
+        let client_order_tag = format!("{quote_level_tag}:attempt-{}", now_ms);
         OrderIntent {
             client_order_id: deterministic_client_order_id(
                 "btc-5m-mm",
@@ -1636,7 +1637,7 @@ impl Btc5mMmStrategy {
                 &instrument_id,
                 side,
                 reduce_only,
-                &quote_level_tag,
+                &client_order_tag,
                 price,
                 quantity,
             ),
@@ -4399,6 +4400,35 @@ mod tests {
             second.intents.len(),
             2,
             "cooldown must not clear desired quotes; the reconciler handles churn control"
+        );
+    }
+
+    #[test]
+    fn btc_5m_mm_retry_ids_change_without_changing_quote_match_tag() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let ctx = context(Vec::new());
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+        let first =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 10));
+        let later_ctx = StrategyContext {
+            now_ms: 1_010,
+            ..ctx
+        };
+        let second = strategy.on_market_snapshot(
+            &later_ctx,
+            &snapshot("down", "market-mm", 0.48, 0.52, 1_010),
+        );
+
+        assert_eq!(first.intents.len(), 2);
+        assert_eq!(second.intents.len(), 2);
+        assert_eq!(
+            first.intents[0].quote_level_tag,
+            second.intents[0].quote_level_tag
+        );
+        assert_ne!(
+            first.intents[0].client_order_id,
+            second.intents[0].client_order_id
         );
     }
 
