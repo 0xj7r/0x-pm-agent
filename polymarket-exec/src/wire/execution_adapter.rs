@@ -1,6 +1,6 @@
 //! Live CLOB execution adapter contract (Section 8.1).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -305,6 +305,7 @@ pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
     client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
+    trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
 }
 
@@ -320,6 +321,14 @@ impl PolymarketExecutionAdapter {
     pub async fn connect_with_l1(
         credentials: PolymarketL1Credentials,
     ) -> Result<Self, ExecutionError> {
+        Self::connect_with_l1_url("https://clob.polymarket.com", credentials).await
+    }
+
+    pub async fn connect_with_l1_url(
+        api_url: impl Into<String>,
+        credentials: PolymarketL1Credentials,
+    ) -> Result<Self, ExecutionError> {
+        let api_url = api_url.into();
         let signer = PrivateKeySigner::from_str(credentials.private_key.trim())
             .map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_PRIVATE_KEY: {error}"))
@@ -327,30 +336,37 @@ impl PolymarketExecutionAdapter {
             .with_chain_id(Some(POLYGON));
 
         let mut auth_builder = SdkClobClient::new(
-            "https://clob.polymarket.com",
+            api_url.as_str(),
             SdkClobConfig::builder().use_server_time(true).build(),
         )
         .map_err(map_sdk_error)?
         .authentication_builder(&signer)
         .signature_type(credentials.signature_type.as_sdk());
 
+        let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
             .funder_address
             .as_ref()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         {
-            auth_builder = auth_builder.funder(SdkAddress::from_str(funder).map_err(|error| {
+            let funder = SdkAddress::from_str(funder).map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
-            })?);
+            })?;
+            trade_address = Some(funder);
+            auth_builder = auth_builder.funder(funder);
         }
 
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
 
         Ok(Self {
-            _config: PolymarketConfig::default(),
+            _config: PolymarketConfig {
+                api_url,
+                credentials: None,
+            },
             signer,
             client,
+            trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
     }
@@ -382,15 +398,18 @@ impl PolymarketExecutionAdapter {
         .credentials(sdk_credentials)
         .signature_type(credentials.signature_type.as_sdk());
 
+        let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
             .funder_address
             .as_ref()
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         {
-            auth_builder = auth_builder.funder(SdkAddress::from_str(funder).map_err(|error| {
+            let funder = SdkAddress::from_str(funder).map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
-            })?);
+            })?;
+            trade_address = Some(funder);
+            auth_builder = auth_builder.funder(funder);
         }
 
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
@@ -399,6 +418,7 @@ impl PolymarketExecutionAdapter {
             _config: config,
             signer,
             client,
+            trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
     }
@@ -529,78 +549,94 @@ impl PolymarketExecutionAdapter {
         &self,
         after_ms: EpochMillis,
     ) -> Result<Vec<VenueFill>, ExecutionError> {
-        let request = ClobTradesRequest::builder()
+        let Some(trade_address) = self.trade_address else {
+            return Ok(Vec::new());
+        };
+        let mut fills = Vec::new();
+
+        let maker_request = ClobTradesRequest::builder()
+            .maker_address(trade_address)
             .after((after_ms / 1_000) as i64)
             .build();
-        let page = self
+        let maker_page = self
             .client
-            .trades(&request, None)
+            .trades(&maker_request, None)
             .await
             .map_err(map_sdk_error)?;
-        let mut fills = Vec::new();
-        for trade in page.data {
+        for trade in maker_page.data {
             let observed_at_ms = trade.match_time.timestamp_millis().max(0) as u64;
             let market_id = MarketId::from(format!("{:#x}", trade.market));
-            match trade.trader_side {
-                TraderSide::Maker => {
-                    for maker in trade.maker_orders {
-                        fills.push(VenueFill {
-                            venue_order_id: OrderId::from(maker.order_id),
-                            client_order_id: None,
-                            market_id: market_id.clone(),
-                            instrument_id: InstrumentId::from(maker.asset_id.to_string()),
-                            side: match maker.side {
-                                SdkSide::Buy => TradeSide::Buy,
-                                _ => TradeSide::Sell,
-                            },
-                            price: maker.price.to_string().parse::<f64>().unwrap_or(0.0),
-                            quantity: maker
-                                .matched_amount
-                                .to_string()
-                                .parse::<f64>()
-                                .unwrap_or(0.0),
-                            fee_usd: 0.0,
-                            liquidity: FillLiquidity::Maker,
-                            observed_at_ms,
-                        });
-                    }
-                }
-                TraderSide::Taker | TraderSide::Unknown(_) => {
-                    fills.push(VenueFill {
-                        venue_order_id: OrderId::from(trade.taker_order_id),
-                        client_order_id: None,
-                        market_id,
-                        instrument_id: InstrumentId::from(trade.asset_id.to_string()),
-                        side: match trade.side {
-                            SdkSide::Buy => TradeSide::Buy,
-                            _ => TradeSide::Sell,
-                        },
-                        price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
-                        quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
-                        fee_usd: 0.0,
-                        liquidity: FillLiquidity::Taker,
-                        observed_at_ms,
-                    });
-                }
-                _ => {
-                    fills.push(VenueFill {
-                        venue_order_id: OrderId::from(trade.taker_order_id),
-                        client_order_id: None,
-                        market_id,
-                        instrument_id: InstrumentId::from(trade.asset_id.to_string()),
-                        side: match trade.side {
-                            SdkSide::Buy => TradeSide::Buy,
-                            _ => TradeSide::Sell,
-                        },
-                        price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
-                        quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
-                        fee_usd: 0.0,
-                        liquidity: FillLiquidity::Unknown,
-                        observed_at_ms,
-                    });
-                }
+            for maker in trade
+                .maker_orders
+                .into_iter()
+                .filter(|maker| maker.maker_address == trade_address)
+            {
+                fills.push(VenueFill {
+                    venue_order_id: OrderId::from(maker.order_id),
+                    client_order_id: None,
+                    market_id: market_id.clone(),
+                    instrument_id: InstrumentId::from(maker.asset_id.to_string()),
+                    side: match maker.side {
+                        SdkSide::Buy => TradeSide::Buy,
+                        _ => TradeSide::Sell,
+                    },
+                    price: maker.price.to_string().parse::<f64>().unwrap_or(0.0),
+                    quantity: maker
+                        .matched_amount
+                        .to_string()
+                        .parse::<f64>()
+                        .unwrap_or(0.0),
+                    fee_usd: 0.0,
+                    liquidity: FillLiquidity::Maker,
+                    observed_at_ms,
+                });
             }
         }
+
+        let taker_request = ClobTradesRequest::builder()
+            .taker_address(trade_address)
+            .after((after_ms / 1_000) as i64)
+            .build();
+        let taker_page = self
+            .client
+            .trades(&taker_request, None)
+            .await
+            .map_err(map_sdk_error)?;
+        for trade in taker_page.data {
+            let observed_at_ms = trade.match_time.timestamp_millis().max(0) as u64;
+            fills.push(VenueFill {
+                venue_order_id: OrderId::from(trade.taker_order_id),
+                client_order_id: None,
+                market_id: MarketId::from(format!("{:#x}", trade.market)),
+                instrument_id: InstrumentId::from(trade.asset_id.to_string()),
+                side: match trade.side {
+                    SdkSide::Buy => TradeSide::Buy,
+                    _ => TradeSide::Sell,
+                },
+                price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
+                quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
+                fee_usd: 0.0,
+                liquidity: match trade.trader_side {
+                    TraderSide::Maker => FillLiquidity::Maker,
+                    TraderSide::Taker => FillLiquidity::Taker,
+                    TraderSide::Unknown(_) | _ => FillLiquidity::Unknown,
+                },
+                observed_at_ms,
+            });
+        }
+
+        let mut seen = HashSet::new();
+        fills.retain(|fill| {
+            seen.insert(format!(
+                "{}:{}:{}:{:?}:{}:{}",
+                fill.venue_order_id,
+                fill.market_id,
+                fill.instrument_id,
+                fill.side,
+                fill.price,
+                fill.quantity
+            ))
+        });
         Ok(fills)
     }
 }

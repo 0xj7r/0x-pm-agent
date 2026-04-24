@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::config::{AppConfig, UserWsAuth};
 use crate::wire::execution_adapter::{
-    PolymarketCredentials, PolymarketExecutionAdapter, PolymarketL1Credentials,
+    PolymarketConfig, PolymarketCredentials, PolymarketExecutionAdapter, PolymarketL1Credentials,
     PolymarketSignatureType,
 };
 
@@ -57,13 +57,17 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
     let funder_address = live_funder_from_env(auth);
 
     if let Some(auth) = auth {
-        let adapter = PolymarketExecutionAdapter::connect(PolymarketCredentials {
+        let credentials = PolymarketCredentials {
             api_key: auth.api_key.clone(),
             api_secret: auth.api_secret.clone(),
             api_passphrase: auth.api_passphrase.clone(),
             private_key,
             signature_type,
             funder_address,
+        };
+        let adapter = PolymarketExecutionAdapter::connect_with_config(PolymarketConfig {
+            api_url: config.clob_api_url.clone(),
+            credentials: Some(credentials),
         })
         .await?;
         Ok(LiveConnection {
@@ -71,11 +75,14 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             user_auth: Some(auth.clone()),
         })
     } else {
-        let adapter = PolymarketExecutionAdapter::connect_with_l1(PolymarketL1Credentials {
-            private_key,
-            signature_type,
-            funder_address: funder_address.clone(),
-        })
+        let adapter = PolymarketExecutionAdapter::connect_with_l1_url(
+            config.clob_api_url.clone(),
+            PolymarketL1Credentials {
+                private_key,
+                signature_type,
+                funder_address: funder_address.clone(),
+            },
+        )
         .await?;
         let (api_key, api_secret, api_passphrase) = adapter.api_credentials();
         Ok(LiveConnection {
