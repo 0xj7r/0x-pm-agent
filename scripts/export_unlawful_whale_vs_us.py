@@ -46,9 +46,9 @@ class SleeveConfig:
 
 
 DEFAULT_SLEEVES = [
-    SleeveConfig("unlawful_baseline", Path("whale-pair-exec/env/unlawful_baseline.env")),
-    SleeveConfig("unlawful_broad_hours", Path("whale-pair-exec/env/unlawful_broad_hours.env")),
-    SleeveConfig("unlawful_press", Path("whale-pair-exec/env/unlawful_press.env")),
+    SleeveConfig("unlawful_baseline", Path("polymarket-exec/env/unlawful_baseline.env")),
+    SleeveConfig("unlawful_broad_hours", Path("polymarket-exec/env/unlawful_broad_hours.env")),
+    SleeveConfig("unlawful_press", Path("polymarket-exec/env/unlawful_press.env")),
 ]
 
 
@@ -112,7 +112,7 @@ def resolve_sleeve_paths(repo_root: Path, sleeve: SleeveConfig) -> dict[str, Pat
         crate_candidate = crate_root / candidate
         repo_candidate = repo_root / candidate
 
-        # Runtime env paths are resolved from `whale-pair-exec/` because the
+        # Runtime env paths are resolved from `polymarket-exec/` because the
         # sleeve launcher `cd`s into the crate directory before starting the
         # process. Prefer that interpretation even if stale root-level artifacts
         # happen to exist too.
@@ -1672,7 +1672,7 @@ def main() -> int:
             "signal_snapshot_rows": len(signal_rows),
             "journal_exists": bool(journal_path and journal_path.exists()),
             "order_store_exists": bool(order_store_path and order_store_path.exists()),
-            "current_runtime_artifact_root": str((repo_root / "whale-pair-exec/data").resolve()),
+            "current_runtime_artifact_root": str((repo_root / "polymarket-exec/data").resolve()),
             "journal_source_mode": journal_source_mode,
             "journal_window_rows": len(journal_windows),
         }

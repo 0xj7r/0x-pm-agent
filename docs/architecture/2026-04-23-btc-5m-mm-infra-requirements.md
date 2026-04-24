@@ -194,8 +194,8 @@ This now needs to be a rolling-window exporter, not a one-market exporter.
 Current operator entrypoints:
 
 - `scripts/export_btc_5m_runtime.py`
-- `whale-pair-exec/scripts/run_sleeve.sh`
-- `whale-pair-exec/scripts/run_unlawful_shear_paper.sh`
+- `polymarket-exec/scripts/run_sleeve.sh`
+- `polymarket-exec/scripts/run_unlawful_shear_paper.sh`
 
 ## 5.3 Merge / redeem worker
 
@@ -279,13 +279,13 @@ Current live-auth and ops env surface:
 These now exist in-repo:
 
 - generic sleeve launcher:
-  - `whale-pair-exec/scripts/run_sleeve.sh`
+  - `polymarket-exec/scripts/run_sleeve.sh`
 - base runtime bootstrap:
-  - `whale-pair-exec/scripts/run_unlawful_shear_paper.sh`
+  - `polymarket-exec/scripts/run_unlawful_shear_paper.sh`
 - sleeve env presets:
-  - `whale-pair-exec/env/*.env`
+  - `polymarket-exec/env/*.env`
 - systemd template:
-  - `whale-pair-exec/ops/systemd/whale-pair-exec@.service`
+  - `polymarket-exec/ops/systemd/whale-pair-exec@.service`
 - runbook:
   - `docs/architecture/2026-04-23-btc-5m-mm-paper-and-tiny-live-runbook.md`
 

@@ -35,15 +35,15 @@ This spec is intended to be implementable without further reverse engineering.
 
 Current `unlawful_shear` behavior is concentrated in:
 
-- [strategy.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/strategy.rs)
+- [strategy.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/strategy.rs)
 
 Current runtime/config surfaces are:
 
-- [config/mod.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/config/mod.rs)
-- [runtime/mod.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/runtime/mod.rs)
-- [runtime/runner.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/runtime/runner.rs)
-- [book.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/book.rs)
-- [types.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/types.rs)
+- [config/mod.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/config/mod.rs)
+- [runtime/mod.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/runtime/mod.rs)
+- [runtime/runner.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/runtime/runner.rs)
+- [book.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/book.rs)
+- [types.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/types.rs)
 This spec should be implemented by extending those surfaces, not by replacing them.
 
 Notes:
@@ -493,7 +493,7 @@ Add the following new structs.
 
 New file:
 
-- `whale-pair-exec/src/signals/btc_regime.rs`
+- `polymarket-exec/src/signals/btc_regime.rs`
 
 ```rust
 pub struct BtcRegimeSnapshot {
@@ -512,7 +512,7 @@ pub struct BtcRegimeSnapshot {
 
 New file:
 
-- `whale-pair-exec/src/signals/unlawful_gate.rs`
+- `polymarket-exec/src/signals/unlawful_gate.rs`
 
 ```rust
 pub struct PairedBookSignal {
@@ -533,7 +533,7 @@ pub struct PairedBookSignal {
 
 New file:
 
-- `whale-pair-exec/src/signals/market_activity.rs`
+- `polymarket-exec/src/signals/market_activity.rs`
 
 ```rust
 pub struct MarketActivitySignal {
@@ -550,7 +550,7 @@ This is informational in v1. Do not hard-block on these counts yet.
 
 New file:
 
-- `whale-pair-exec/src/signals/unlawful_gate.rs`
+- `polymarket-exec/src/signals/unlawful_gate.rs`
 
 ```rust
 pub struct UnlawfulSignalSnapshot {
@@ -571,43 +571,43 @@ pub struct UnlawfulSignalSnapshot {
 
 ### New files
 
-- `whale-pair-exec/src/signals/mod.rs`
-- `whale-pair-exec/src/signals/btc_regime.rs`
-- `whale-pair-exec/src/signals/market_activity.rs`
-- `whale-pair-exec/src/signals/unlawful_gate.rs`
-- `whale-pair-exec/src/wire/spot_ws.rs`
+- `polymarket-exec/src/signals/mod.rs`
+- `polymarket-exec/src/signals/btc_regime.rs`
+- `polymarket-exec/src/signals/market_activity.rs`
+- `polymarket-exec/src/signals/unlawful_gate.rs`
+- `polymarket-exec/src/wire/spot_ws.rs`
 
 ### Existing files to modify
 
-- `whale-pair-exec/src/lib.rs`
+- `polymarket-exec/src/lib.rs`
   - export the new `signals` and `wire::spot_ws` modules
 
-- `whale-pair-exec/src/book.rs`
+- `polymarket-exec/src/book.rs`
   - add helper methods for depth and freshness if needed
   - do not place regime logic here
 
-- `whale-pair-exec/src/config/mod.rs`
+- `polymarket-exec/src/config/mod.rs`
   - add spot feed config:
     - `WHALE_PAIR_EXEC_SPOT_WS_URL`
     - `WHALE_PAIR_EXEC_SPOT_SYMBOL`
   - load them into `AppConfig`
 
-- `whale-pair-exec/src/strategy.rs`
+- `polymarket-exec/src/strategy.rs`
   - extend `UnlawfulShearProfile` with new regime-gate fields
   - extend `StrategyContext` with `unlawful_signal: Option<UnlawfulSignalSnapshot>`
   - modify `UnlawfulShearStrategy::on_market_snapshot` to honor mode
   - current execution policy remains; gate decides whether execution branches are allowed
 
-- `whale-pair-exec/src/runtime/mod.rs`
+- `polymarket-exec/src/runtime/mod.rs`
   - build `UnlawfulSignalSnapshot` before calling strategy
   - cancel working quotes when mode drops to `Cleanup` or `Flatten`
   - track `first_fill_ms` and `first_merge_ms` per market
 
-- `whale-pair-exec/src/runtime/runner.rs`
+- `polymarket-exec/src/runtime/runner.rs`
   - spawn the BTC spot websocket client
   - plumb the signal stores into the runtime loop
 
-- `whale-pair-exec/src/wire/market_ws.rs`
+- `polymarket-exec/src/wire/market_ws.rs`
   - increment market activity counters on `last_trade_price`
   - optionally count `price_change` as a softer flow signal
 
@@ -786,8 +786,8 @@ fn evaluate_unlawful_mode(inputs: UnlawfulGateInputs) -> UnlawfulSignalSnapshot 
 
 Add tests in:
 
-- `whale-pair-exec/src/signals/unlawful_gate.rs`
-- `whale-pair-exec/src/strategy.rs`
+- `polymarket-exec/src/signals/unlawful_gate.rs`
+- `polymarket-exec/src/strategy.rs`
 
 Required cases:
 
@@ -805,7 +805,7 @@ Required cases:
 
 Add or extend:
 
-- [btc_5m_mm_scenarios.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/tests/btc_5m_mm_scenarios.rs)
+- [btc_5m_mm_scenarios.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/tests/btc_5m_mm_scenarios.rs)
 
 Required scenario fixtures:
 

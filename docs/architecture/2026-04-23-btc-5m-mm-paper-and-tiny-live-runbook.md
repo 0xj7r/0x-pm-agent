@@ -42,10 +42,10 @@ Tiny-live may only start after:
 
 Current checked-in sleeve env files:
 
-- `whale-pair-exec/env/unlawful_baseline.env`
-- `whale-pair-exec/env/unlawful_broad_hours.env`
-- `whale-pair-exec/env/unlawful_press.env`
-- `whale-pair-exec/env/goat_pair_baseline.env`
+- `polymarket-exec/env/unlawful_baseline.env`
+- `polymarket-exec/env/unlawful_broad_hours.env`
+- `polymarket-exec/env/unlawful_press.env`
+- `polymarket-exec/env/goat_pair_baseline.env`
 
 Each sleeve owns:
 
@@ -56,32 +56,32 @@ Each sleeve owns:
 - a dedicated JSONL audit path
 
 The checked-in sleeve paths are relative to the Rust crate working directory
-because the launcher starts the binary from `whale-pair-exec/`. On the current
+because the launcher starts the binary from `polymarket-exec/`. On the current
 Hetzner host, `data/runtime/...` therefore resolves to
-`/root/go/polymarket-agent/whale-pair-exec/data/runtime/...`.
+`/root/go/polymarket-agent/polymarket-exec/data/runtime/...`.
 
 ## 3. Default paper launcher
 
 The generic operator entrypoint is:
 
 ```bash
-whale-pair-exec/scripts/run_sleeve.sh <sleeve-name>
+polymarket-exec/scripts/run_sleeve.sh <sleeve-name>
 ```
 
 Examples:
 
 ```bash
-whale-pair-exec/scripts/run_sleeve.sh unlawful_baseline
-whale-pair-exec/scripts/run_sleeve.sh unlawful_broad_hours
-whale-pair-exec/scripts/run_sleeve.sh unlawful_press
-whale-pair-exec/scripts/run_sleeve.sh goat_pair_baseline
+polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
+polymarket-exec/scripts/run_sleeve.sh unlawful_broad_hours
+polymarket-exec/scripts/run_sleeve.sh unlawful_press
+polymarket-exec/scripts/run_sleeve.sh goat_pair_baseline
 ```
 
 What it does:
 
-- resolves `whale-pair-exec/env/<name>.env`
+- resolves `polymarket-exec/env/<name>.env`
 - exports `WHALE_PAIR_SLEEVE_ENV_PATH`
-- calls `whale-pair-exec/scripts/run_unlawful_shear_paper.sh`
+- calls `polymarket-exec/scripts/run_unlawful_shear_paper.sh`
 - regenerates:
   - `data/research/wallet_research/unlawful-shear/rust_runtime.env`
   - `data/research/wallet_research/unlawful-shear/rust_market_context.json`
@@ -105,9 +105,9 @@ Run each sleeve in its own terminal, tmux pane, or service unit.
 Example:
 
 ```bash
-whale-pair-exec/scripts/run_sleeve.sh unlawful_baseline
-whale-pair-exec/scripts/run_sleeve.sh unlawful_broad_hours
-whale-pair-exec/scripts/run_sleeve.sh unlawful_press
+polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
+polymarket-exec/scripts/run_sleeve.sh unlawful_broad_hours
+polymarket-exec/scripts/run_sleeve.sh unlawful_press
 ```
 
 Metrics ports:
@@ -119,24 +119,24 @@ Metrics ports:
 
 Persistent state:
 
-- `whale-pair-exec/data/runtime/unlawful-baseline/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
-- `whale-pair-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
-- `whale-pair-exec/data/runtime/unlawful-press/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-press/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-press/audit.jsonl`
-- `whale-pair-exec/data/runtime/goat-baseline/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/goat-baseline/journal.jsonl`
+- `polymarket-exec/data/runtime/unlawful-baseline/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
+- `polymarket-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
+- `polymarket-exec/data/runtime/unlawful-press/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-press/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-press/audit.jsonl`
+- `polymarket-exec/data/runtime/goat-baseline/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/goat-baseline/journal.jsonl`
 
 ## 5. Bootstrap-only validation
 
 To verify the export/env/bootstrap path without starting Rust:
 
 ```bash
-WHALE_PAIR_SKIP_CARGO_RUN=true whale-pair-exec/scripts/run_sleeve.sh unlawful_baseline
+WHALE_PAIR_SKIP_CARGO_RUN=true polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
 ```
 
 For offline fallback:
@@ -144,7 +144,7 @@ For offline fallback:
 ```bash
 WHALE_PAIR_CONTEXT_SOURCE=db \
 WHALE_PAIR_SKIP_CARGO_RUN=true \
-whale-pair-exec/scripts/run_sleeve.sh unlawful_baseline
+polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
 ```
 
 ## 6. Health checks
@@ -216,19 +216,19 @@ journalctl --user -u whale-pair-exec@unlawful_baseline -f
 
 Template file:
 
-- `whale-pair-exec/ops/systemd/whale-pair-exec@.service`
+- `polymarket-exec/ops/systemd/whale-pair-exec@.service`
 
 Host install helpers:
 
-- `whale-pair-exec/ops/systemd/install_user_paper_services.sh`
-- `whale-pair-exec/ops/systemd/manage_unlawful_paper_services.sh`
+- `polymarket-exec/ops/systemd/install_user_paper_services.sh`
+- `polymarket-exec/ops/systemd/manage_unlawful_paper_services.sh`
 
 Host env surfaces:
 
-- `~/.config/whale-pair-exec/common.env`
-- `~/.config/whale-pair-exec/paper.d/unlawful_baseline.env`
-- `~/.config/whale-pair-exec/paper.d/unlawful_broad_hours.env`
-- `~/.config/whale-pair-exec/paper.d/unlawful_press.env`
+- `~/.config/polymarket-exec/common.env`
+- `~/.config/polymarket-exec/paper.d/unlawful_baseline.env`
+- `~/.config/polymarket-exec/paper.d/unlawful_broad_hours.env`
+- `~/.config/polymarket-exec/paper.d/unlawful_press.env`
 
 The systemd template reads those env files if present, then executes the checked-in
 repo launcher. That means repo updates remain the source of truth for the sleeves,
@@ -301,15 +301,15 @@ Paper mode does not require:
 
 Journal and state paths remain sleeve-local and come from the checked-in env files:
 
-- `whale-pair-exec/data/runtime/unlawful-baseline/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
-- `whale-pair-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
-- `whale-pair-exec/data/runtime/unlawful-press/order-store.sqlite`
-- `whale-pair-exec/data/execution/paper/unlawful-press/journal.jsonl`
-- `whale-pair-exec/data/execution/audit/unlawful-press/audit.jsonl`
+- `polymarket-exec/data/runtime/unlawful-baseline/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
+- `polymarket-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
+- `polymarket-exec/data/runtime/unlawful-press/order-store.sqlite`
+- `polymarket-exec/data/execution/paper/unlawful-press/journal.jsonl`
+- `polymarket-exec/data/execution/audit/unlawful-press/audit.jsonl`
 
 Process logs for always-on runs live in journald:
 
@@ -337,7 +337,7 @@ Off-disk policy:
 Run a local candidate listing before trusting credentials:
 
 ```bash
-WHALE_PAIR_ARCHIVE_LIST_ONLY=true whale-pair-exec/scripts/archive_paper_artifacts.sh
+WHALE_PAIR_ARCHIVE_LIST_ONLY=true polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Detailed archive procedure:
@@ -491,10 +491,10 @@ An always-on paper deploy should be:
 4. Run:
 
 ```bash
-whale-pair-exec/ops/systemd/install_user_paper_services.sh
+polymarket-exec/ops/systemd/install_user_paper_services.sh
 ```
 
-5. Edit `~/.config/whale-pair-exec/common.env`:
+5. Edit `~/.config/polymarket-exec/common.env`:
    - set `WHALE_PAIR_ROOT_DIR`
    - confirm BTC spot WS URL and symbol
    - keep `WHALE_PAIR_CONTEXT_SOURCE=live`
