@@ -507,7 +507,7 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             ))
         })?;
         let order_type = Self::map_order_type(&req)?;
-        let price = Self::decimal_from_f64(req.limit_price, 4, "limit_price")?;
+        let price = Self::decimal_from_f64(req.limit_price, 2, "limit_price")?;
         let size = Self::decimal_from_f64(req.quantity, 2, "quantity")?;
         let mut builder = self
             .client
@@ -724,5 +724,11 @@ mod tests {
             PolymarketSignatureType::GnosisSafe
         );
         assert!(PolymarketSignatureType::parse("bad").is_err());
+    }
+
+    #[test]
+    fn live_price_decimal_matches_polymarket_cent_tick() {
+        let price = PolymarketExecutionAdapter::decimal_from_f64(0.01, 2, "limit_price").unwrap();
+        assert_eq!(price.to_string(), "0.01");
     }
 }
