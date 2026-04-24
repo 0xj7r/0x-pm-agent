@@ -14,7 +14,10 @@ use polymarket_client_sdk::clob::types::{
     OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
 };
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
-use polymarket_client_sdk::types::{Address as SdkAddress, Decimal as SdkDecimal, U256 as SdkU256};
+use polymarket_client_sdk::types::{
+    Address as SdkAddress, DateTime as SdkDateTime, Decimal as SdkDecimal, Utc as SdkUtc,
+    U256 as SdkU256,
+};
 use polymarket_client_sdk::{auth, POLYGON};
 use tokio::sync::RwLock;
 
@@ -32,6 +35,7 @@ pub struct SubmitOrderRequest {
     pub quantity: f64,
     pub post_only: bool,
     pub time_in_force: TimeInForce,
+    pub expires_at_ms: Option<EpochMillis>,
     pub strategy_tag: String,
     pub quote_level_tag: Option<String>,
     pub submitted_at_ms: EpochMillis,
@@ -130,6 +134,13 @@ pub struct PolymarketCredentials {
     pub api_key: String,
     pub api_secret: String,
     pub api_passphrase: String,
+    pub private_key: String,
+    pub signature_type: PolymarketSignatureType,
+    pub funder_address: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolymarketL1Credentials {
     pub private_key: String,
     pub signature_type: PolymarketSignatureType,
     pub funder_address: Option<String>,
@@ -293,6 +304,44 @@ impl PolymarketExecutionAdapter {
         .await
     }
 
+    pub async fn connect_with_l1(
+        credentials: PolymarketL1Credentials,
+    ) -> Result<Self, ExecutionError> {
+        let signer = PrivateKeySigner::from_str(credentials.private_key.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid POLYMARKET_PRIVATE_KEY: {error}"))
+            })?
+            .with_chain_id(Some(POLYGON));
+
+        let mut auth_builder = SdkClobClient::new(
+            "https://clob.polymarket.com",
+            SdkClobConfig::builder().use_server_time(true).build(),
+        )
+        .map_err(map_sdk_error)?
+        .authentication_builder(&signer)
+        .signature_type(credentials.signature_type.as_sdk());
+
+        if let Some(funder) = credentials
+            .funder_address
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            auth_builder = auth_builder.funder(SdkAddress::from_str(funder).map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
+            })?);
+        }
+
+        let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+
+        Ok(Self {
+            _config: PolymarketConfig::default(),
+            signer,
+            client,
+            state: Arc::new(RwLock::new(AdapterState::default())),
+        })
+    }
+
     pub async fn connect_with_config(config: PolymarketConfig) -> Result<Self, ExecutionError> {
         let credentials = config.credentials.clone().ok_or_else(|| {
             ExecutionError::AuthFailure("missing Polymarket live credentials".to_string())
@@ -362,10 +411,7 @@ impl PolymarketExecutionAdapter {
                     Ok(SdkOrderType::FOK)
                 }
             }
-            TimeInForce::Gtd => Err(ExecutionError::BadRequest(
-                "GTD live order expiration is not wired; use GTC until expiration is supplied"
-                    .to_string(),
-            )),
+            TimeInForce::Gtd => Ok(SdkOrderType::GTD),
         }
     }
 
@@ -463,7 +509,7 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         let order_type = Self::map_order_type(&req)?;
         let price = Self::decimal_from_f64(req.limit_price, 4, "limit_price")?;
         let size = Self::decimal_from_f64(req.quantity, 2, "quantity")?;
-        let order = self
+        let mut builder = self
             .client
             .limit_order()
             .token_id(token_id)
@@ -471,10 +517,25 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             .post_only(req.post_only)
             .price(price)
             .size(size)
-            .side(Self::sdk_side(req.side))
-            .build()
-            .await
-            .map_err(map_sdk_error)?;
+            .side(Self::sdk_side(req.side));
+        if matches!(req.time_in_force, TimeInForce::Gtd) {
+            let expires_at_ms = req.expires_at_ms.ok_or_else(|| {
+                ExecutionError::BadRequest(
+                    "GTD live order requires expires_at_ms on submit request".to_string(),
+                )
+            })?;
+            let expires_at = SdkDateTime::<SdkUtc>::from_timestamp(
+                (expires_at_ms / 1_000) as i64,
+                ((expires_at_ms % 1_000) * 1_000_000) as u32,
+            )
+            .ok_or_else(|| {
+                ExecutionError::BadRequest(format!(
+                    "invalid GTD expiration timestamp {expires_at_ms}"
+                ))
+            })?;
+            builder = builder.expiration(expires_at);
+        }
+        let order = builder.build().await.map_err(map_sdk_error)?;
         let signed_order = self
             .client
             .sign(&self.signer, order)
@@ -615,6 +676,7 @@ mod tests {
             quantity: 1.0,
             post_only,
             time_in_force,
+            expires_at_ms: None,
             strategy_tag: "strategy-a".to_string(),
             quote_level_tag: None,
             submitted_at_ms: now_unix_ms(),
@@ -642,6 +704,9 @@ mod tests {
             PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Fok, true)),
             Err(ExecutionError::BadRequest(_))
         ));
+        assert!(
+            PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Gtd, true)).is_ok()
+        );
     }
 
     #[test]

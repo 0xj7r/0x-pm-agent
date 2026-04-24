@@ -31,10 +31,12 @@ Do not work around this with unsigned/raw HTTP calls or paper adapter semantics.
 Tiny-live may only start after:
 
 - `WHALE_PAIR_PAPER_MODE=false` is deliberate and reviewed
-- signed CLOB credentials are present and scoped to the tiny-live wallet
+- signed CLOB credentials or L1 private-key auth are present and scoped to the tiny-live wallet
 - the user websocket is authenticated and producing order/fill events
 - startup reconciliation has been tested against the venue open-order source
 - the first funded run uses one sleeve, one host, and the smallest practical size
+- `WHALE_PAIR_EXEC_MODE=live_smoke` has completed submit, visible-open-order sync,
+  cancel, and post-cancel sync before any strategy sleeve is allowed to trade
 
 ## 2. Available sleeve presets
 
@@ -284,6 +286,9 @@ Paper mode does not require:
 - `POLYMARKET_API_KEY`
 - `POLYMARKET_API_SECRET`
 - `POLYMARKET_API_PASSPHRASE`
+- `POLYMARKET_PRIVATE_KEY`
+- `POLYMARKET_SIGNATURE_TYPE`
+- `POLYMARKET_FUNDER_ADDRESS`
 
 Journal and state paths remain sleeve-local and come from the checked-in env files:
 
@@ -351,9 +356,12 @@ Paper mode leaves these unset.
 
 Before tiny-live, fill:
 
-- `POLYMARKET_API_KEY`
-- `POLYMARKET_API_SECRET`
-- `POLYMARKET_API_PASSPHRASE`
+- `POLYMARKET_PRIVATE_KEY`
+- `POLYMARKET_SIGNATURE_TYPE=gnosis_safe` for a Gnosis Safe / proxy wallet
+- `POLYMARKET_FUNDER_ADDRESS=<Polymarket Safe/proxy wallet address>`
+- `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and
+  `POLYMARKET_API_PASSPHRASE` if you want the user websocket enabled from
+  process start
 - `WHALE_PAIR_PAPER_MODE=false`
 - `POLYMARKET_MARKET_WS_URL`
 - `POLYMARKET_USER_WS_URL`
@@ -365,10 +373,55 @@ Before tiny-live, fill:
 And verify:
 
 - the live wallet is distinct from the research wallet
+- the live wallet is a Gnosis Safe / proxy wallet before scaling beyond smoke
 - approvals and balances are already staged
 - the user websocket is receiving live order / fill events
-- signed CLOB API/SDK submit/cancel/open-order sync is confirmed before capital
+- signed CLOB API/SDK submit/cancel/open-order sync is confirmed before strategy capital
 - startup reconciliation agrees with venue open orders before new risk is allowed
+
+Live-auth model:
+
+- Polymarket public market data and CLOB read endpoints do not need auth.
+- CLOB trading requires L1 private-key signing plus L2 API authentication.
+- The Rust SDK path can derive/create L2 credentials from `POLYMARKET_PRIVATE_KEY`
+  at startup. This is acceptable for REST submit/cancel/open-order sync.
+- The user websocket should still be given explicit `POLYMARKET_API_KEY`,
+  `POLYMARKET_API_SECRET`, and `POLYMARKET_API_PASSPHRASE`; otherwise live fill
+  tracking falls back to polling/reconciliation and the sleeve should remain in
+  smoke or paper.
+- `METAMASK_PRIVATE_KEY` is accepted only as a local fallback alias when
+  `POLYMARKET_PRIVATE_KEY` is unset. Do not set both to different wallets.
+
+Gnosis Safe setup rules:
+
+- Use the private key for the signer that controls the Polymarket account.
+- Set `POLYMARKET_SIGNATURE_TYPE=gnosis_safe`.
+- Set `POLYMARKET_FUNDER_ADDRESS` to the Polymarket Safe/proxy address that
+  holds USDC and conditional-token positions.
+- Confirm the same funder address appears in Polymarket profile / account
+  state before enabling live.
+- Do not reuse the research whale wallet, collector wallet, or dashboard wallet
+  as the live signer/funder.
+
+Live smoke mode:
+
+```bash
+WHALE_PAIR_EXEC_MODE=live_smoke \
+WHALE_PAIR_PAPER_MODE=false \
+WHALE_PAIR_LIVE_SMOKE_ASSET_ID=<outcome-token-id> \
+WHALE_PAIR_LIVE_SMOKE_MARKET_ID=<market-id> \
+WHALE_PAIR_LIVE_SMOKE_PRICE=0.01 \
+WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD=1.0 \
+cargo run -p whale-pair-exec
+```
+
+Success criteria:
+
+- one post-only GTD order is accepted
+- the order appears in CLOB open-order sync
+- cancel is accepted
+- the order no longer appears after post-cancel sync
+- no local order remains `Open`, `CancelRequested`, or `NeedsReconcile`
 
 ## 13. Tiny-live checklist
 
@@ -383,6 +436,7 @@ Do not start tiny-live until all of these are true:
 - microstructure controller is enabled and visible in decision notes
 - `WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH=true` is set for live
 - signed CLOB API/SDK is the only live order submission/cancel path
+- `WHALE_PAIR_EXEC_MODE=live_smoke` has passed on the live host
 - startup reconciliation against venue open orders is manually verified
 - top-3 ask notional caps are tighter than max order notional
 - stale `CancelRequested` orders transition to `NeedsReconcile`

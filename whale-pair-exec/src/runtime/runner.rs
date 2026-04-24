@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -29,15 +32,356 @@ use crate::wire::api::{
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, PolymarketCredentials,
-    PolymarketExecutionAdapter, PolymarketSignatureType, SubmitOrderRequest, TimeInForce,
+    PolymarketExecutionAdapter, PolymarketL1Credentials, PolymarketSignatureType,
+    SubmitOrderRequest, TimeInForce,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
+struct AuditWriter {
+    path: std::path::PathBuf,
+    file: File,
+    last_seq: u64,
+    rotate_bytes: Option<u64>,
+    current_size_bytes: u64,
+}
+
+impl AuditWriter {
+    fn open(path: &Path, rotate_bytes: Option<u64>) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create audit directory {}", parent.display())
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed to open audit path {}", path.display()))?;
+        let current_size_bytes = file
+            .metadata()
+            .with_context(|| format!("failed to stat audit path {}", path.display()))?
+            .len();
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            last_seq: 0,
+            rotate_bytes,
+            current_size_bytes,
+        })
+    }
+
+    fn append_outcome(
+        &mut self,
+        source: &str,
+        runtime: &Runtime<StrategyMode>,
+        outcome: &RuntimeOutcome,
+    ) -> Result<()> {
+        let from_seq = outcome
+            .event_seqs
+            .first()
+            .copied()
+            .unwrap_or(self.last_seq.saturating_add(1));
+        let after_seq = from_seq.saturating_sub(1).max(self.last_seq);
+        for record in runtime.event_log().snapshot_since(after_seq) {
+            let row = serde_json::json!({
+                "kind": "event",
+                "source": source,
+                "run_id": runtime.run_id(),
+                "record": record,
+            });
+            self.append_json_line(&row)?;
+            self.last_seq = self.last_seq.max(record.seq);
+        }
+        for command in &outcome.commands {
+            let row = serde_json::json!({
+                "kind": "command",
+                "source": source,
+                "run_id": runtime.run_id(),
+                "command": command,
+            });
+            self.append_json_line(&row)?;
+        }
+        self.file.flush()?;
+        Ok(())
+    }
+
+    fn append_json_line(&mut self, value: &serde_json::Value) -> Result<()> {
+        self.rotate_if_needed()?;
+        let line = serde_json::to_string(value)?;
+        self.file
+            .write_all(line.as_bytes())
+            .with_context(|| format!("failed to write audit line {}", self.path.display()))?;
+        self.file
+            .write_all(b"\n")
+            .with_context(|| format!("failed to write audit newline {}", self.path.display()))?;
+        self.current_size_bytes = self
+            .current_size_bytes
+            .saturating_add(line.len() as u64)
+            .saturating_add(1);
+        Ok(())
+    }
+
+    fn rotate_if_needed(&mut self) -> Result<()> {
+        let Some(limit_bytes) = self.rotate_bytes else {
+            return Ok(());
+        };
+        if self.current_size_bytes < limit_bytes {
+            return Ok(());
+        }
+        self.file
+            .flush()
+            .with_context(|| format!("failed to flush audit path {}", self.path.display()))?;
+        let rotated_path = rotated_audit_path(&self.path);
+        std::fs::rename(&self.path, &rotated_path).with_context(|| {
+            format!(
+                "failed to rotate audit {} -> {}",
+                self.path.display(),
+                rotated_path.display()
+            )
+        })?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to reopen audit path {}", self.path.display()))?;
+        self.current_size_bytes = 0;
+        Ok(())
+    }
+}
+
+fn rotated_audit_path(path: &Path) -> std::path::PathBuf {
+    let ts = now_unix_ms() / 1_000;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audit");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("jsonl");
+    parent.join(format!("{stem}.{ts}.{ext}"))
+}
+
+#[derive(Debug, Default)]
+struct LiveSafetyState {
+    consecutive_submit_errors: usize,
+    consecutive_cancel_errors: usize,
+    consecutive_reconcile_mismatches: usize,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionSyncReport {
+    open_order_count: usize,
+    balance_synced: bool,
+    errors: usize,
+    missing_local_orders: Vec<ClientOrderId>,
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionPolicy {
+    paper_mode: bool,
+    live_post_only: bool,
+    live_order_ttl_ms: u64,
+    live_order_max_age_ms: u64,
+    live_max_submit_errors: usize,
+    live_max_cancel_errors: usize,
+    live_kill_on_reconcile_mismatch: bool,
+    paper_min_fill_notional_usd: f64,
+    paper_max_fills_per_order: usize,
+    paper_min_fill_interval_ms: u64,
+}
+
+impl ExecutionPolicy {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            paper_mode: config.paper_mode,
+            live_post_only: config.live_post_only,
+            live_order_ttl_ms: config.live_order_ttl.as_millis() as u64,
+            live_order_max_age_ms: config.live_order_max_age.as_millis() as u64,
+            live_max_submit_errors: config.live_max_submit_errors,
+            live_max_cancel_errors: config.live_max_cancel_errors,
+            live_kill_on_reconcile_mismatch: config.live_kill_on_reconcile_mismatch,
+            paper_min_fill_notional_usd: config.paper_min_fill_notional_usd,
+            paper_max_fills_per_order: config.paper_max_fills_per_order,
+            paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     let config = AppConfig::from_env()?;
+    if std::env::var("WHALE_PAIR_EXEC_MODE")
+        .map(|value| value == "live_smoke")
+        .unwrap_or(false)
+    {
+        return run_live_smoke(config).await;
+    }
     run_with_config(config).await
+}
+
+async fn run_live_smoke(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    if config.paper_mode {
+        anyhow::bail!("live smoke mode requires WHALE_PAIR_PAPER_MODE=false");
+    }
+    let adapter = connect_live_adapter(&config).await?;
+
+    let asset_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_ASSET_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| config.market_assets.first().cloned())
+        .ok_or_else(|| anyhow::anyhow!("live smoke mode requires an asset id"))?;
+    let market_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_MARKET_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config.market_id_for_asset(&asset_id));
+    let price = std::env::var("WHALE_PAIR_LIVE_SMOKE_PRICE")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.01);
+    let notional = std::env::var("WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    if price <= 0.0 || notional <= 0.0 {
+        anyhow::bail!("live smoke price and notional must be positive");
+    }
+    let now_ms = now_unix_ms();
+    let ttl_ms = config.live_order_ttl.as_millis().max(5_000) as u64;
+    let client_order_id = ClientOrderId::from(format!("live-smoke:{now_ms}:{asset_id}"));
+    let submit = SubmitOrderRequest {
+        client_order_id: client_order_id.clone(),
+        market_id: MarketId::from(market_id),
+        instrument_id: InstrumentId::from(asset_id),
+        side: TradeSide::Buy,
+        limit_price: price,
+        quantity: notional / price,
+        post_only: true,
+        time_in_force: TimeInForce::Gtd,
+        expires_at_ms: Some(now_ms.saturating_add(ttl_ms)),
+        strategy_tag: "live-smoke".to_string(),
+        quote_level_tag: Some("far-touch-smoke".to_string()),
+        submitted_at_ms: now_ms,
+    };
+    info!(
+        client_order_id = %submit.client_order_id,
+        instrument_id = %submit.instrument_id,
+        price = submit.limit_price,
+        quantity = submit.quantity,
+        "submitting live smoke order"
+    );
+    let ack = adapter.submit(submit).await?;
+    if !ack.accepted {
+        anyhow::bail!(
+            "live smoke submit rejected by venue: {}",
+            ack.venue_message.unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    let open_orders = adapter.sync_open_orders().await?;
+    let venue_order_id = ack.venue_order_id.clone();
+    let visible = venue_order_id.as_ref().is_some_and(|order_id| {
+        open_orders
+            .iter()
+            .any(|order| &order.venue_order_id == order_id)
+    });
+    if !visible {
+        anyhow::bail!(
+            "live smoke order was accepted but not visible in open-order sync; venue_order_id={:?}",
+            venue_order_id
+        );
+    }
+    let cancel = adapter
+        .cancel(CancelOrderRequest {
+            client_order_id: client_order_id.clone(),
+            venue_order_id,
+            reason: "live smoke cancel".to_string(),
+            submitted_at_ms: now_unix_ms(),
+        })
+        .await?;
+    if !cancel.accepted {
+        anyhow::bail!(
+            "live smoke cancel rejected by venue: {}",
+            cancel
+                .venue_message
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+    }
+    let open_after = adapter.sync_open_orders().await?;
+    if let Some(order_id) = cancel.venue_order_id.as_ref() {
+        if open_after
+            .iter()
+            .any(|order| &order.venue_order_id == order_id)
+        {
+            anyhow::bail!("live smoke order still visible after cancel: {order_id}");
+        }
+    }
+    info!("live smoke submit/cancel/reconcile completed");
+    Ok(())
+}
+
+fn live_private_key_from_env() -> Option<String> {
+    std::env::var("POLYMARKET_PRIVATE_KEY")
+        .ok()
+        .or_else(|| std::env::var("METAMASK_PRIVATE_KEY").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn live_signature_type_from_env(
+    auth: Option<&crate::config::UserWsAuth>,
+) -> Result<PolymarketSignatureType> {
+    let raw = auth
+        .and_then(|auth| auth.signature_type.clone())
+        .or_else(|| std::env::var("POLYMARKET_SIGNATURE_TYPE").ok());
+    raw.as_deref()
+        .map(PolymarketSignatureType::parse)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map(|value| value.unwrap_or_default())
+}
+
+fn live_funder_from_env(auth: Option<&crate::config::UserWsAuth>) -> Option<String> {
+    auth.and_then(|auth| auth.funder_address.clone())
+        .or_else(|| std::env::var("POLYMARKET_FUNDER_ADDRESS").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn connect_live_adapter(config: &AppConfig) -> Result<PolymarketExecutionAdapter> {
+    let auth = config.user_auth.as_ref();
+    let private_key = auth
+        .and_then(|auth| auth.private_key.clone())
+        .or_else(live_private_key_from_env)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "live execution requires POLYMARKET_PRIVATE_KEY (or METAMASK_PRIVATE_KEY alias)"
+            )
+        })?;
+    let signature_type = live_signature_type_from_env(auth)?;
+    let funder_address = live_funder_from_env(auth);
+
+    if let Some(auth) = auth {
+        PolymarketExecutionAdapter::connect(PolymarketCredentials {
+            api_key: auth.api_key.clone(),
+            api_secret: auth.api_secret.clone(),
+            api_passphrase: auth.api_passphrase.clone(),
+            private_key,
+            signature_type,
+            funder_address,
+        })
+        .await
+        .map_err(Into::into)
+    } else {
+        PolymarketExecutionAdapter::connect_with_l1(PolymarketL1Credentials {
+            private_key,
+            signature_type,
+            funder_address,
+        })
+        .await
+        .map_err(Into::into)
+    }
 }
 
 pub async fn run_with_config(config: AppConfig) -> Result<()> {
@@ -92,6 +436,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .clone()
         .map(|path| JournalWriter::open_with_rotation(path, config.journal_rotate_bytes))
         .transpose()?;
+    let mut audit = config
+        .audit_path
+        .as_deref()
+        .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
+        .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -102,39 +451,14 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut journal,
         runtime.event_log(),
         "startup",
-        startup_outcome,
+        startup_outcome.clone(),
     )?;
+    persist_audit_outcome(&mut audit, "startup", &runtime, &startup_outcome)?;
     persist_runtime_checkpoint(&mut journal, &runtime, now_unix_ms(), "startup")?;
-    let execution_adapter: Arc<dyn ExecutionAdapter> = match (config.paper_mode, &config.user_auth) {
+    let execution_adapter: Arc<dyn ExecutionAdapter> = match (config.paper_mode, &config.user_auth)
+    {
         (true, _) => Arc::new(PaperExecutionAdapter::new()),
-        (false, None) => anyhow::bail!(
-            "WHALE_PAIR_PAPER_MODE=false requires POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE, and POLYMARKET_PRIVATE_KEY"
-        ),
-        (false, Some(auth)) => {
-            let private_key = auth.private_key.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "WHALE_PAIR_PAPER_MODE=false requires POLYMARKET_PRIVATE_KEY for signed CLOB orders"
-                )
-            })?;
-            let signature_type = auth
-                .signature_type
-                .as_deref()
-                .map(PolymarketSignatureType::parse)
-                .transpose()
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?
-                .unwrap_or_default();
-            Arc::new(
-                PolymarketExecutionAdapter::connect(PolymarketCredentials {
-                    api_key: auth.api_key.clone(),
-                    api_secret: auth.api_secret.clone(),
-                    api_passphrase: auth.api_passphrase.clone(),
-                    private_key,
-                    signature_type,
-                    funder_address: auth.funder_address.clone(),
-                })
-                .await?,
-            )
-        }
+        (false, _) => Arc::new(connect_live_adapter(&config).await?),
     };
     metrics.set_execution_adapter_connected(true);
     let dashboard_state = Arc::new(RwLock::new(DashboardSnapshot::default()));
@@ -199,17 +523,22 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     );
     let mut paper_order_ctx = HashMap::<ClientOrderId, PaperOrderContext>::new();
     let mut execution_venue_map = HashMap::<ClientOrderId, Option<OrderId>>::new();
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = ExecutionPolicy::from_config(&config);
 
     run_runtime_loop(
         &config,
+        &execution_policy,
         &books,
         paper_fee_coeff,
         metrics.clone(),
         shutdown.clone(),
         &mut runtime,
         &mut journal,
+        &mut audit,
         &mut paper_order_ctx,
         &mut execution_venue_map,
+        &mut live_safety,
         execution_adapter,
         spot_trade_rx,
         user_order_rx,
@@ -315,14 +644,17 @@ fn spawn_user_ws(
 
 async fn run_runtime_loop(
     config: &AppConfig,
+    execution_policy: &ExecutionPolicy,
     books: &Arc<BookStore>,
     paper_fee_coeff: f64,
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
     runtime: &mut Runtime<StrategyMode>,
     journal: &mut Option<JournalWriter>,
+    audit: &mut Option<AuditWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    live_safety: &mut LiveSafetyState,
     execution_adapter: Arc<dyn ExecutionAdapter>,
     mut spot_events: mpsc::UnboundedReceiver<SpotTradeEvent>,
     mut user_events: mpsc::UnboundedReceiver<UserOrderEvent>,
@@ -378,8 +710,9 @@ async fn run_runtime_loop(
                             journal,
                             runtime.event_log(),
                             "user-ws",
-                            user_outcome,
+                            user_outcome.clone(),
                         )?;
+                        persist_audit_outcome(audit, "user-ws", runtime, &user_outcome)?;
                         refresh_dashboard_state(
                             runtime,
                             &books,
@@ -401,6 +734,36 @@ async fn run_runtime_loop(
             _ = ticks.tick() => {
                 let _timer = metrics.runtime_loop_timer();
                 metrics.refresh_stream_ages();
+                if !config.paper_mode {
+                    let health_outcome = enforce_live_health(
+                        runtime,
+                        metrics.as_ref(),
+                        config,
+                        now_unix_ms(),
+                    );
+                    if !health_outcome.event_seqs.is_empty() || !health_outcome.commands.is_empty() {
+                        let combined = execute_execution_adapter(
+                            runtime,
+                            books,
+                            paper_fee_coeff,
+                            metrics.as_ref(),
+                            health_outcome,
+                            paper_order_ctx,
+                            execution_venue_map,
+                            live_safety,
+                            execution_adapter.clone(),
+                            execution_policy,
+                        )
+                        .await?;
+                        persist_runtime_outcome(
+                            journal,
+                            runtime.event_log(),
+                            "live-health",
+                            combined.clone(),
+                        )?;
+                        persist_audit_outcome(audit, "live-health", runtime, &combined)?;
+                    }
+                }
                 for asset_id in &config.market_assets {
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
@@ -429,16 +792,18 @@ async fn run_runtime_loop(
                                 outcome,
                                 paper_order_ctx,
                                 execution_venue_map,
+                                live_safety,
                                 execution_adapter.clone(),
-                                config.paper_mode,
+                                execution_policy,
                             )
                             .await?;
                             persist_runtime_outcome(
                                 journal,
                                 runtime.event_log(),
                                 "book",
-                                combined,
+                                combined.clone(),
                             )?;
+                            persist_audit_outcome(audit, "book", runtime, &combined)?;
                             refresh_dashboard_state(
                                 runtime,
                                 books,
@@ -469,8 +834,9 @@ async fn run_runtime_loop(
                     journal,
                     runtime.event_log(),
                     "reconcile",
-                    reconcile_outcome,
+                    reconcile_outcome.clone(),
                 )?;
+                persist_audit_outcome(audit, "reconcile", runtime, &reconcile_outcome)?;
                 metrics.touch_reconcile();
                 metrics.refresh_stream_ages();
                 persist_runtime_checkpoint(
@@ -972,33 +1338,29 @@ struct PaperOrderContext {
     arrival_ms: u64,
     queue_bias: f64,
     last_attempt_ms: u64,
+    last_fill_ms: u64,
+    last_fill_book_update_ms: u64,
+    fill_count: usize,
 }
 
-fn paper_order_context(
-    paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
+fn paper_order_context_mut<'a>(
+    paper_order_ctx: &'a mut HashMap<ClientOrderId, PaperOrderContext>,
     intent: &OrderIntent,
     now_ms: u64,
-) -> PaperOrderContext {
-    if let Some(existing) = paper_order_ctx.get(&intent.client_order_id) {
-        return existing.clone();
-    }
+) -> &'a mut PaperOrderContext {
     let state = PaperOrderContext {
         arrival_ms: intent.created_at_ms.min(now_ms),
         queue_bias: deterministic_hash_0_95(intent.client_order_id.as_str()),
         last_attempt_ms: now_ms,
+        last_fill_ms: 0,
+        last_fill_book_update_ms: 0,
+        fill_count: 0,
     };
-    paper_order_ctx.insert(intent.client_order_id.clone(), state.clone());
-    state
-}
-
-fn mark_paper_attempt(
-    paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
-    intent: &OrderIntent,
-    now_ms: u64,
-) {
-    if let Some(state) = paper_order_ctx.get_mut(&intent.client_order_id) {
-        state.last_attempt_ms = now_ms;
-    }
+    let ctx = paper_order_ctx
+        .entry(intent.client_order_id.clone())
+        .or_insert(state);
+    ctx.last_attempt_ms = now_ms;
+    ctx
 }
 
 fn parse_fill_liquidity(raw: &Option<String>) -> FillLiquidity {
@@ -1057,6 +1419,18 @@ fn persist_runtime_outcome(
     Ok(())
 }
 
+fn persist_audit_outcome(
+    audit: &mut Option<AuditWriter>,
+    source: &str,
+    runtime: &Runtime<StrategyMode>,
+    outcome: &RuntimeOutcome,
+) -> Result<()> {
+    if let Some(writer) = audit.as_mut() {
+        writer.append_outcome(source, runtime, outcome)?;
+    }
+    Ok(())
+}
+
 fn persist_runtime_checkpoint(
     journal: &mut Option<JournalWriter>,
     runtime: &Runtime<StrategyMode>,
@@ -1091,8 +1465,9 @@ async fn execute_execution_adapter(
     outcome: RuntimeOutcome,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    live_safety: &mut LiveSafetyState,
     execution_adapter: Arc<dyn ExecutionAdapter>,
-    paper_mode: bool,
+    execution_policy: &ExecutionPolicy,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -1102,8 +1477,23 @@ async fn execute_execution_adapter(
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
 
-    if !paper_mode {
-        sync_execution_state(execution_adapter.as_ref(), runtime, execution_venue_map).await;
+    if !execution_policy.paper_mode {
+        let report =
+            sync_execution_state(execution_adapter.as_ref(), runtime, execution_venue_map).await;
+        apply_sync_report(
+            runtime,
+            metrics,
+            live_safety,
+            execution_policy,
+            report,
+            observed_at_ms,
+            &mut combined,
+        );
+        combined.extend(cancel_stale_live_orders(
+            runtime,
+            observed_at_ms,
+            execution_policy.live_order_max_age_ms,
+        ));
         let mut dedupe = HashSet::new();
         for managed in runtime.open_order_snapshots() {
             if managed.remaining_qty() <= 0.0 {
@@ -1135,20 +1525,20 @@ async fn execute_execution_adapter(
         combined.commands.push(command.clone());
         match command {
             RuntimeCommand::Submit(intent) => {
-                if paper_mode {
+                if execution_policy.paper_mode {
                     let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
                         continue;
                     };
-                    let ctx = paper_order_context(paper_order_ctx, &intent, observed_at_ms);
-                    mark_paper_attempt(paper_order_ctx, &intent, observed_at_ms);
+                    let ctx = paper_order_context_mut(paper_order_ctx, &intent, observed_at_ms);
 
                     if let Some(fill) = paper_fill_from_book_snapshot(
                         &book,
                         &intent,
                         observed_at_ms,
                         paper_fee_coeff,
-                        &ctx,
+                        ctx,
                         intent.quantity,
+                        execution_policy,
                     ) {
                         metrics.record_fill(
                             &fill,
@@ -1164,13 +1554,19 @@ async fn execute_execution_adapter(
                         for command in chained_commands {
                             queue.push_back(command);
                         }
+                    } else {
+                        combined.extend(
+                            runtime.on_order_opened(&intent.client_order_id, observed_at_ms),
+                        );
                     }
                     continue;
                 }
 
-                let submit_req = submit_request_from_intent(&intent, observed_at_ms);
+                let submit_req =
+                    submit_request_from_intent(&intent, observed_at_ms, execution_policy);
                 match execution_adapter.submit(submit_req).await {
                     Ok(ack) if ack.accepted => {
+                        live_safety.consecutive_submit_errors = 0;
                         if let Some(order_id) = ack.venue_order_id.clone() {
                             execution_venue_map
                                 .insert(intent.client_order_id.clone(), Some(order_id));
@@ -1178,8 +1574,25 @@ async fn execute_execution_adapter(
                         let opened_outcome =
                             runtime.on_order_opened(&intent.client_order_id, observed_at_ms);
                         combined.extend(opened_outcome);
+                        let report = sync_execution_state(
+                            execution_adapter.as_ref(),
+                            runtime,
+                            execution_venue_map,
+                        )
+                        .await;
+                        apply_sync_report(
+                            runtime,
+                            metrics,
+                            live_safety,
+                            execution_policy,
+                            report,
+                            observed_at_ms,
+                            &mut combined,
+                        );
                     }
                     Ok(ack) => {
+                        live_safety.consecutive_submit_errors =
+                            live_safety.consecutive_submit_errors.saturating_add(1);
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected submit".to_string());
@@ -1192,6 +1605,8 @@ async fn execute_execution_adapter(
                         combined.extend(rejected_outcome);
                     }
                     Err(error) => {
+                        live_safety.consecutive_submit_errors =
+                            live_safety.consecutive_submit_errors.saturating_add(1);
                         if error.is_retryable() {
                             warn!(
                                 mode = "live",
@@ -1220,12 +1635,20 @@ async fn execute_execution_adapter(
                         }
                     }
                 }
+                enforce_live_error_budget(
+                    runtime,
+                    metrics,
+                    live_safety,
+                    execution_policy,
+                    observed_at_ms,
+                    &mut combined,
+                );
             }
             RuntimeCommand::Cancel {
                 client_order_id,
                 reason,
             } => {
-                if paper_mode {
+                if execution_policy.paper_mode {
                     let cancelled_outcome = runtime.on_order_cancelled(
                         &client_order_id,
                         reason.clone(),
@@ -1250,6 +1673,7 @@ async fn execute_execution_adapter(
                 };
                 match execution_adapter.cancel(cancel_req).await {
                     Ok(ack) if ack.accepted => {
+                        live_safety.consecutive_cancel_errors = 0;
                         execution_venue_map.remove(&client_order_id);
                         let cancelled_outcome = runtime.on_order_cancelled(
                             &client_order_id,
@@ -1258,8 +1682,25 @@ async fn execute_execution_adapter(
                             ack.accepted_at_ms,
                         );
                         combined.extend(cancelled_outcome);
+                        let report = sync_execution_state(
+                            execution_adapter.as_ref(),
+                            runtime,
+                            execution_venue_map,
+                        )
+                        .await;
+                        apply_sync_report(
+                            runtime,
+                            metrics,
+                            live_safety,
+                            execution_policy,
+                            report,
+                            observed_at_ms,
+                            &mut combined,
+                        );
                     }
                     Ok(ack) => {
+                        live_safety.consecutive_cancel_errors =
+                            live_safety.consecutive_cancel_errors.saturating_add(1);
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected cancel".to_string());
@@ -1268,6 +1709,8 @@ async fn execute_execution_adapter(
                         combined.extend(rejected_outcome);
                     }
                     Err(error) => {
+                        live_safety.consecutive_cancel_errors =
+                            live_safety.consecutive_cancel_errors.saturating_add(1);
                         if error.is_retryable() {
                             warn!(
                                 mode = "live",
@@ -1286,12 +1729,20 @@ async fn execute_execution_adapter(
                         }
                     }
                 }
+                enforce_live_error_budget(
+                    runtime,
+                    metrics,
+                    live_safety,
+                    execution_policy,
+                    observed_at_ms,
+                    &mut combined,
+                );
             }
             RuntimeCommand::Noop => {}
         }
     }
 
-    if !paper_mode {
+    if !execution_policy.paper_mode {
         return Ok(combined);
     }
 
@@ -1309,15 +1760,15 @@ async fn execute_execution_adapter(
         let Some(book) = books.snapshot(managed.intent.instrument_id.as_str()).await else {
             continue;
         };
-        let ctx = paper_order_context(paper_order_ctx, &managed.intent, observed_at_ms);
-        mark_paper_attempt(paper_order_ctx, &managed.intent, observed_at_ms);
+        let ctx = paper_order_context_mut(paper_order_ctx, &managed.intent, observed_at_ms);
         if let Some(fill) = paper_fill_from_book_snapshot(
             &book,
             &managed.intent,
             observed_at_ms,
             paper_fee_coeff,
-            &ctx,
+            ctx,
             managed.remaining_qty(),
+            execution_policy,
         ) {
             metrics.record_fill(
                 &fill,
@@ -1352,7 +1803,14 @@ fn needs_reconcile_order_count(runtime: &Runtime<StrategyMode>) -> usize {
         .count()
 }
 
-fn submit_request_from_intent(intent: &OrderIntent, observed_at_ms: u64) -> SubmitOrderRequest {
+fn submit_request_from_intent(
+    intent: &OrderIntent,
+    observed_at_ms: u64,
+    execution_policy: &ExecutionPolicy,
+) -> SubmitOrderRequest {
+    let live_expires_at_ms = (!execution_policy.paper_mode
+        && execution_policy.live_order_ttl_ms > 0)
+        .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms));
     SubmitOrderRequest {
         client_order_id: intent.client_order_id.clone(),
         market_id: intent.market_id.clone(),
@@ -1360,8 +1818,13 @@ fn submit_request_from_intent(intent: &OrderIntent, observed_at_ms: u64) -> Subm
         side: intent.side,
         limit_price: intent.limit_price,
         quantity: intent.quantity,
-        post_only: false,
-        time_in_force: TimeInForce::Gtc,
+        post_only: !execution_policy.paper_mode && execution_policy.live_post_only,
+        time_in_force: if live_expires_at_ms.is_some() {
+            TimeInForce::Gtd
+        } else {
+            TimeInForce::Gtc
+        },
+        expires_at_ms: live_expires_at_ms,
         strategy_tag: "runtime".to_string(),
         quote_level_tag: intent.quote_level_tag.clone(),
         submitted_at_ms: observed_at_ms,
@@ -1372,15 +1835,41 @@ async fn sync_execution_state(
     execution_adapter: &dyn ExecutionAdapter,
     runtime: &Runtime<StrategyMode>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
-) {
+) -> ExecutionSyncReport {
+    let mut report = ExecutionSyncReport::default();
     match execution_adapter.sync_open_orders().await {
         Ok(open_orders) => {
             let open_order_count = open_orders.len();
+            report.open_order_count = open_order_count;
+            let venue_ids = open_orders
+                .iter()
+                .map(|order| order.venue_order_id.clone())
+                .collect::<HashSet<_>>();
             for order in open_orders {
                 if let Some(client_order_id) = order.client_order_id.clone() {
                     execution_venue_map
                         .entry(client_order_id)
                         .or_insert(Some(order.venue_order_id.clone()));
+                }
+            }
+            for managed in runtime.open_order_snapshots() {
+                if !matches!(
+                    managed.status,
+                    ManagedOrderStatus::Submitted
+                        | ManagedOrderStatus::Working
+                        | ManagedOrderStatus::CancelRequested
+                ) {
+                    continue;
+                }
+                let Some(Some(venue_order_id)) =
+                    execution_venue_map.get(&managed.intent.client_order_id)
+                else {
+                    continue;
+                };
+                if !venue_ids.contains(venue_order_id) {
+                    report
+                        .missing_local_orders
+                        .push(managed.intent.client_order_id.clone());
                 }
             }
             debug!(
@@ -1390,12 +1879,14 @@ async fn sync_execution_state(
             );
         }
         Err(error) => {
+            report.errors = report.errors.saturating_add(1);
             warn!(error = %error, "execution open orders sync failed");
         }
     }
 
     match execution_adapter.sync_balances().await {
         Ok(balances) => {
+            report.balance_synced = true;
             debug!(
                 cash_usd = balances.cash_usd,
                 positions = balances.positions.len(),
@@ -1404,8 +1895,174 @@ async fn sync_execution_state(
             );
         }
         Err(error) => {
+            report.errors = report.errors.saturating_add(1);
             warn!(error = %error, "execution balances sync failed");
         }
+    }
+    report
+}
+
+fn apply_sync_report(
+    runtime: &mut Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    live_safety: &mut LiveSafetyState,
+    execution_policy: &ExecutionPolicy,
+    report: ExecutionSyncReport,
+    now_ms: u64,
+    combined: &mut RuntimeOutcome,
+) {
+    if execution_policy.paper_mode {
+        return;
+    }
+    if report.errors > 0 || !report.missing_local_orders.is_empty() {
+        live_safety.consecutive_reconcile_mismatches = live_safety
+            .consecutive_reconcile_mismatches
+            .saturating_add(1);
+        metrics.observe_reconcile_failure();
+    } else {
+        live_safety.consecutive_reconcile_mismatches = 0;
+    }
+
+    for client_order_id in report.missing_local_orders {
+        combined.extend(runtime.mark_order_needs_reconcile(
+            &client_order_id,
+            now_ms,
+            "venue sync missing locally tracked live order",
+        ));
+    }
+
+    if execution_policy.live_kill_on_reconcile_mismatch
+        && live_safety.consecutive_reconcile_mismatches > 0
+    {
+        let reason = "live reconciliation mismatch; fail-closed risk-off";
+        metrics.observe_riskoff_transition();
+        combined.extend(runtime.degrade_and_cancel_all(now_ms, reason));
+    }
+}
+
+fn enforce_live_error_budget(
+    runtime: &mut Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    live_safety: &LiveSafetyState,
+    execution_policy: &ExecutionPolicy,
+    now_ms: u64,
+    combined: &mut RuntimeOutcome,
+) {
+    if execution_policy.paper_mode {
+        return;
+    }
+    let submit_limit_hit =
+        live_safety.consecutive_submit_errors >= execution_policy.live_max_submit_errors.max(1);
+    let cancel_limit_hit =
+        live_safety.consecutive_cancel_errors >= execution_policy.live_max_cancel_errors.max(1);
+    if submit_limit_hit || cancel_limit_hit {
+        let reason = format!(
+            "live execution error budget exhausted submit_errors={} cancel_errors={}",
+            live_safety.consecutive_submit_errors, live_safety.consecutive_cancel_errors
+        );
+        metrics.observe_riskoff_transition();
+        combined.extend(runtime.degrade_and_cancel_all(now_ms, reason));
+    }
+}
+
+fn cancel_stale_live_orders(
+    runtime: &mut Runtime<StrategyMode>,
+    now_ms: u64,
+    max_age_ms: u64,
+) -> RuntimeOutcome {
+    let mut outcome = RuntimeOutcome::default();
+    if max_age_ms == 0 {
+        return outcome;
+    }
+    let stale_ids = runtime
+        .open_order_snapshots()
+        .into_iter()
+        .filter(|managed| {
+            matches!(
+                managed.status,
+                ManagedOrderStatus::Submitted | ManagedOrderStatus::Working
+            ) && now_ms.saturating_sub(managed.intent.created_at_ms) >= max_age_ms
+        })
+        .map(|managed| managed.intent.client_order_id)
+        .collect::<Vec<_>>();
+    for client_order_id in stale_ids {
+        outcome.extend(runtime.request_cancel_order(
+            &client_order_id,
+            now_ms,
+            format!("live order max age exceeded {max_age_ms}ms"),
+        ));
+    }
+    outcome
+}
+
+fn enforce_live_health(
+    runtime: &mut Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    config: &AppConfig,
+    now_ms: u64,
+) -> RuntimeOutcome {
+    if config.paper_mode || runtime.status() != RuntimeStatus::Running {
+        return RuntimeOutcome::default();
+    }
+    let snapshot = metrics.snapshot();
+    let market_stale_ms = config
+        .strategy_profile
+        .as_ref()
+        .and_then(|profile| profile.health.market_ws_stale_ms)
+        .unwrap_or(config.book_stale_after.as_millis() as u64 * 3);
+    let user_stale_ms = config
+        .strategy_profile
+        .as_ref()
+        .and_then(|profile| profile.health.user_ws_stale_ms)
+        .unwrap_or(30_000);
+    let mut failures = Vec::new();
+    if !snapshot.market_ws_connected {
+        failures.push("market websocket disconnected".to_string());
+    }
+    if snapshot.market_last_message_age_ms >= 0.0
+        && snapshot.market_last_message_age_ms > market_stale_ms as f64
+    {
+        failures.push(format!(
+            "market websocket stale age_ms={:.0} max_ms={market_stale_ms}",
+            snapshot.market_last_message_age_ms
+        ));
+    }
+    if !snapshot.user_ws_connected && snapshot.user_last_message_age_ms >= 0.0 {
+        failures.push("user websocket disconnected".to_string());
+    }
+    if snapshot.user_last_message_age_ms >= 0.0
+        && snapshot.user_last_message_age_ms > user_stale_ms as f64
+    {
+        failures.push(format!(
+            "user websocket stale age_ms={:.0} max_ms={user_stale_ms}",
+            snapshot.user_last_message_age_ms
+        ));
+    }
+    if !snapshot.execution_adapter_connected {
+        failures.push("execution adapter disconnected".to_string());
+    }
+    let needs_reconcile = needs_reconcile_order_count(runtime);
+    if needs_reconcile > 0 {
+        failures.push(format!(
+            "orders need reconciliation count={needs_reconcile}"
+        ));
+    }
+    if runtime.inventory().gross_exposure_usd() > config.risk_limits.max_gross_notional_usd {
+        failures.push(format!(
+            "gross exposure exceeded cap exposure={:.4} cap={:.4}",
+            runtime.inventory().gross_exposure_usd(),
+            config.risk_limits.max_gross_notional_usd
+        ));
+    }
+
+    if failures.is_empty() {
+        RuntimeOutcome::default()
+    } else {
+        metrics.observe_riskoff_transition();
+        runtime.degrade_and_cancel_all(
+            now_ms,
+            format!("live health failure: {}", failures.join("; ")),
+        )
     }
 }
 
@@ -1414,10 +2071,25 @@ fn paper_fill_from_book_snapshot(
     intent: &OrderIntent,
     observed_at_ms: u64,
     paper_fee_coeff: f64,
-    order_ctx: &PaperOrderContext,
+    order_ctx: &mut PaperOrderContext,
     remaining_qty: f64,
+    execution_policy: &ExecutionPolicy,
 ) -> Option<FillReport> {
     if remaining_qty <= 0.0 || intent.limit_price <= 0.0 {
+        return None;
+    }
+    if order_ctx.fill_count >= execution_policy.paper_max_fills_per_order {
+        return None;
+    }
+    if order_ctx.last_fill_ms > 0
+        && observed_at_ms.saturating_sub(order_ctx.last_fill_ms)
+            < execution_policy.paper_min_fill_interval_ms
+    {
+        return None;
+    }
+    if book.last_update_unix_ms > 0
+        && order_ctx.last_fill_book_update_ms == book.last_update_unix_ms
+    {
         return None;
     }
 
@@ -1441,9 +2113,26 @@ fn paper_fill_from_book_snapshot(
         return None;
     }
 
-    let crossing = candidate_levels.len() > 1
-        || ((candidate_levels[0].price - intent.limit_price).abs() > f64::EPSILON);
-    let best_fill_price = candidate_levels[0].price;
+    let best_opposite = candidate_levels[0].price;
+    let crossing = if matches!(intent.side, TradeSide::Buy) {
+        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
+    } else {
+        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
+    };
+    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
+        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
+    } else {
+        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
+    };
+    if !crossing {
+        let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
+        if observed_at_ms.saturating_sub(order_ctx.arrival_ms) < queue_wait_ms
+            || !maker_trade_through
+        {
+            return None;
+        }
+    }
+    let best_fill_price = best_opposite;
     let fill_ratio = paper_fill_ratio(
         remaining_qty,
         total_available,
@@ -1506,7 +2195,15 @@ fn paper_fill_from_book_snapshot(
         FillLiquidity::Maker
     };
     let notional = qty_filled * price;
+    if notional < execution_policy.paper_min_fill_notional_usd
+        && (remaining_qty * price) >= execution_policy.paper_min_fill_notional_usd
+    {
+        return None;
+    }
     let fee = notional * paper_fee_coeff * price * (1.0 - price);
+    order_ctx.last_fill_ms = observed_at_ms;
+    order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
+    order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
 
     Some(FillReport {
         order_id: None,
@@ -1538,9 +2235,9 @@ fn paper_fill_ratio(
 
     let age_ms = now_unix_ms().saturating_sub(order_ctx.arrival_ms.max(order_ctx.last_attempt_ms));
     let age_pressure = if crossing {
-        0.50 + 0.50 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
+        0.15 + 0.30 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
     } else {
-        0.20 + 0.75 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
+        0.02 + 0.18 * ((age_ms as f64 / 5_000.0).clamp(0.0, 1.0))
     };
     let size_pressure = 0.25 + 0.75 * (available_qty / (available_qty + order_qty));
     let queue_pressure = 0.08 + order_ctx.queue_bias * 0.52;
@@ -1549,12 +2246,12 @@ fn paper_fill_ratio(
             * ((now_unix_ms().saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
     let premium = ((limit_price - fill_price) / fill_price).max(0.0).min(1.0);
     let limit_pressure = if crossing {
-        0.95
+        0.65
     } else {
-        0.45 + (premium * 0.35)
+        0.20 + (premium * 0.20)
     };
     (age_pressure * size_pressure * queue_pressure * staleness_pressure * limit_pressure)
-        .clamp(0.02, if crossing { 1.0 } else { 0.9 })
+        .clamp(0.0, if crossing { 0.65 } else { 0.20 })
 }
 
 fn deterministic_hash_0_95(value: &str) -> f64 {
@@ -1662,6 +2359,8 @@ mod tests {
         let books = Arc::new(BookStore::new(&assets));
         let mut paper_order_ctx = HashMap::new();
         let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
 
         let outcome = execute_execution_adapter(
             &mut runtime,
@@ -1671,8 +2370,9 @@ mod tests {
             RuntimeOutcome::default(),
             &mut paper_order_ctx,
             &mut execution_venue_map,
+            &mut live_safety,
             adapter.clone(),
-            false,
+            &execution_policy,
         )
         .await
         .expect("execute");
@@ -1687,6 +2387,97 @@ mod tests {
             })
             .expect("managed order");
         assert_eq!(order.status, ManagedOrderStatus::NeedsReconcile);
+    }
+
+    #[test]
+    fn live_submit_request_uses_post_only_gtd_with_expiry() {
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-ttl"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.40,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test live lifecycle".to_string(),
+            quote_level_tag: Some("lvl-1:test".to_string()),
+            created_at_ms: 10,
+        };
+        let policy = live_test_policy();
+        let request = submit_request_from_intent(&intent, 1_000, &policy);
+        assert!(request.post_only);
+        assert_eq!(request.time_in_force, TimeInForce::Gtd);
+        assert_eq!(request.expires_at_ms, Some(21_000));
+    }
+
+    #[test]
+    fn conservative_paper_fill_does_not_refill_same_book_update() {
+        let now_ms = now_unix_ms();
+        let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-paper"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 20.0,
+            reduce_only: false,
+            reason: "test paper fill".to_string(),
+            quote_level_tag: None,
+            created_at_ms: now_ms,
+        };
+        let policy = paper_test_policy();
+        let mut ctx = PaperOrderContext {
+            arrival_ms: now_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: now_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+        };
+        let first = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        )
+        .expect("first fill");
+        assert!(first.notional_usd() >= policy.paper_min_fill_notional_usd);
+        let second = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms + 1_000,
+            0.0,
+            &mut ctx,
+            intent.quantity - first.quantity,
+            &policy,
+        );
+        assert!(second.is_none());
+    }
+
+    fn live_test_policy() -> ExecutionPolicy {
+        ExecutionPolicy {
+            paper_mode: false,
+            live_post_only: true,
+            live_order_ttl_ms: 20_000,
+            live_order_max_age_ms: 25_000,
+            live_max_submit_errors: 1,
+            live_max_cancel_errors: 1,
+            live_kill_on_reconcile_mismatch: true,
+            paper_min_fill_notional_usd: 0.05,
+            paper_max_fills_per_order: 3,
+            paper_min_fill_interval_ms: 750,
+        }
+    }
+
+    fn paper_test_policy() -> ExecutionPolicy {
+        ExecutionPolicy {
+            paper_mode: true,
+            ..live_test_policy()
+        }
     }
 
     fn runtime_with_recovered_needs_reconcile_order() -> Runtime<StrategyMode> {
