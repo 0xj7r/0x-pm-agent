@@ -238,6 +238,7 @@ impl ManagedOrderStatus {
             ManagedOrderStatus::Filled
                 | ManagedOrderStatus::Cancelled
                 | ManagedOrderStatus::Rejected
+                | ManagedOrderStatus::Quarantined
         )
     }
 
@@ -257,17 +258,29 @@ impl ManagedOrderStatus {
                     | Cancelled
                     | Rejected
                     | NeedsReconcile
+                    | Quarantined
             ),
             Submitted => matches!(
                 next,
-                Working | CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile
+                Working
+                    | CancelRequested
+                    | Filled
+                    | Cancelled
+                    | Rejected
+                    | NeedsReconcile
+                    | Quarantined
             ),
             Working => matches!(
                 next,
-                CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile
+                CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile | Quarantined
             ),
-            CancelRequested => matches!(next, Cancelled | Filled | Rejected | NeedsReconcile),
-            Filled | Cancelled | Rejected => false,
+            CancelRequested => {
+                matches!(
+                    next,
+                    Cancelled | Filled | Rejected | NeedsReconcile | Quarantined
+                )
+            }
+            Filled | Cancelled | Rejected | Quarantined => false,
             NeedsReconcile => matches!(
                 next,
                 PendingSubmit
@@ -277,6 +290,7 @@ impl ManagedOrderStatus {
                     | Filled
                     | Cancelled
                     | Rejected
+                    | Quarantined
             ),
         }
     }
@@ -1460,12 +1474,9 @@ impl<S: Strategy> Runtime<S> {
             return false;
         }
 
-        let mut same_market_positions = self
-            .inventory
-            .positions()
-            .filter(|position| {
-                position.market_id == managed.intent.market_id && position.quantity > 1e-9
-            });
+        let mut same_market_positions = self.inventory.positions().filter(|position| {
+            position.market_id == managed.intent.market_id && position.quantity > 1e-9
+        });
         let Some(position) = same_market_positions.next() else {
             return false;
         };
@@ -2156,6 +2167,45 @@ impl<S: Strategy> Runtime<S> {
         )
     }
 
+    pub fn quarantine_stale_needs_reconcile_orders(
+        &mut self,
+        now_ms: EpochMillis,
+        min_age_ms: u64,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+        let to_quarantine = self
+            .open_orders
+            .values()
+            .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+            .filter(|managed| now_ms.saturating_sub(managed.last_update_ms) >= min_age_ms)
+            .map(|managed| managed.intent.client_order_id.clone())
+            .collect::<Vec<_>>();
+
+        for client_order_id in to_quarantine {
+            outcome.extend(self.set_order_status(
+                &client_order_id,
+                ManagedOrderStatus::Quarantined,
+                now_ms,
+                "stale needs-reconcile order moved to execution DLQ",
+            ));
+            if let Some(managed) = self.open_orders.remove(&client_order_id) {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            "quarantined stale needs-reconcile order and removed from active memory",
+                        )
+                        .with_market(managed.intent.market_id)
+                        .with_instrument(managed.intent.instrument_id)
+                        .with_client_order(client_order_id),
+                    ),
+                );
+            }
+        }
+        outcome
+    }
+
     fn checkpoint_status_to_string(status: ManagedOrderStatus) -> String {
         format!("{status:?}")
     }
@@ -2170,6 +2220,7 @@ impl<S: Strategy> Runtime<S> {
             "Cancelled" => ManagedOrderStatus::Cancelled,
             "Rejected" => ManagedOrderStatus::Rejected,
             "NeedsReconcile" => ManagedOrderStatus::NeedsReconcile,
+            "Quarantined" => ManagedOrderStatus::Quarantined,
             other => {
                 warn!(status = %other, "unknown checkpoint order status, defaulting to NeedsReconcile");
                 ManagedOrderStatus::NeedsReconcile
@@ -2457,12 +2508,7 @@ mod tests {
         );
     }
 
-    fn btc_mm_intent(
-        market_id: &str,
-        instrument_id: &str,
-        level: &str,
-        price: f64,
-    ) -> OrderIntent {
+    fn btc_mm_intent(market_id: &str, instrument_id: &str, level: &str, price: f64) -> OrderIntent {
         OrderIntent {
             client_order_id: ClientOrderId::from(format!(
                 "btc-5m-mm:{market_id}:{instrument_id}:b:n:{level}:{price:.8}:6.50000000"
@@ -2537,10 +2583,8 @@ mod tests {
             MarketContextStore::empty(),
         );
 
-        let first = runtime.accept_intent(
-            btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44),
-            1,
-        );
+        let first =
+            runtime.accept_intent(btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44), 1);
         assert_eq!(first.commands.len(), 1);
 
         let duplicate = runtime.accept_intent(

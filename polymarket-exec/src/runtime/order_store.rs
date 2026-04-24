@@ -371,6 +371,7 @@ impl SqliteOrderStore {
             ManagedOrderStatus::Cancelled => "Cancelled",
             ManagedOrderStatus::Rejected => "Rejected",
             ManagedOrderStatus::NeedsReconcile => "NeedsReconcile",
+            ManagedOrderStatus::Quarantined => "Quarantined",
         }
     }
 
@@ -384,6 +385,7 @@ impl SqliteOrderStore {
             "Cancelled" => Ok(ManagedOrderStatus::Cancelled),
             "Rejected" => Ok(ManagedOrderStatus::Rejected),
             "NeedsReconcile" => Ok(ManagedOrderStatus::NeedsReconcile),
+            "Quarantined" => Ok(ManagedOrderStatus::Quarantined),
             value => Err(OrderStoreError::Serialization(format!(
                 "invalid status `{value}`"
             ))),
@@ -614,7 +616,8 @@ impl OrderStore for SqliteOrderStore {
             ManagedOrderStatus::NeedsReconcile => ManagedOrderStatus::Working,
             ManagedOrderStatus::Filled
             | ManagedOrderStatus::Cancelled
-            | ManagedOrderStatus::Rejected => {
+            | ManagedOrderStatus::Rejected
+            | ManagedOrderStatus::Quarantined => {
                 return Err(OrderStoreError::Conflict(format!(
                     "invalid venue attachment for terminal order {}: {:?}",
                     client_order_id, current_status
@@ -685,6 +688,8 @@ impl OrderStore for SqliteOrderStore {
             ManagedOrderStatus::Working | ManagedOrderStatus::NeedsReconcile
         ) {
             ManagedOrderStatus::Working
+        } else if matches!(record.status, ManagedOrderStatus::Quarantined) {
+            ManagedOrderStatus::Quarantined
         } else {
             record.status
         };

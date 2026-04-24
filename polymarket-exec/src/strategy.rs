@@ -1640,7 +1640,6 @@ impl Btc5mMmStrategy {
             now_ms,
         ))
     }
-
 }
 
 impl Strategy for Btc5mMmStrategy {
