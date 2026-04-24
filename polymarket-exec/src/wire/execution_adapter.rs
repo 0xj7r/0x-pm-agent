@@ -767,7 +767,18 @@ fn now_unix_ms() -> u64 {
 fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {
     let message = error.to_string();
     let lower = message.to_ascii_lowercase();
-    if lower.contains("401") || lower.contains("403") || lower.contains("auth") {
+    if lower.contains("400")
+        || lower.contains("422")
+        || lower.contains("validation")
+        || lower.contains("lower than the minimum")
+        || lower.contains(" is invalid")
+    {
+        ExecutionError::BadRequest(message)
+    } else if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
         ExecutionError::AuthFailure(message)
     } else if lower.contains("429") || lower.contains("rate limit") {
         ExecutionError::RateLimit {
@@ -783,8 +794,6 @@ fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {
         ExecutionError::TransientNetwork(message)
     } else if lower.contains("409") || lower.contains("uncertain") {
         ExecutionError::UncertainOutcome(message)
-    } else if lower.contains("400") || lower.contains("422") || lower.contains("validation") {
-        ExecutionError::BadRequest(message)
     } else {
         ExecutionError::VenueRejection(message)
     }
@@ -876,5 +885,20 @@ mod tests {
         assert!(
             (PolymarketExecutionAdapter::usdc_balance_to_usd("106.48414") - 106.48414).abs() < 1e-9
         );
+    }
+
+    #[test]
+    fn sdk_validation_errors_are_not_auth_failures() {
+        let error = polymarket_client_sdk::error::Error::status(
+            polymarket_client_sdk::error::StatusCode::BAD_REQUEST,
+            polymarket_client_sdk::error::Method::POST,
+            "/order".to_string(),
+            "{\"error\":\"order 0xabc is invalid. Size (1.64) lower than the minimum: 5\"}",
+        );
+
+        assert!(matches!(
+            map_sdk_error(error),
+            ExecutionError::BadRequest(_)
+        ));
     }
 }
