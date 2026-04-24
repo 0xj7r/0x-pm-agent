@@ -6,9 +6,11 @@ This is the readiness report for the Rust live executor before the Polymarket CL
 
 ## Decision
 
-Do not restart tiny-live or place live orders through the current Rust SDK for CLOB V2 until Polymarket publishes or confirms a Rust SDK build that signs V2 orders.
+Do not restart tiny-live or place live orders through the current Rust SDK's V1 order builder for CLOB V2.
 
 The current dependency, `polymarket-client-sdk = 0.4.4`, is the latest version visible from local crate metadata/docs.rs, but its order-signing surface still matches CLOB V1. It still has `nonce`, `taker`, `expiration`, and `feeRateBps` in the signed order path and does not expose the V2 `timestamp`, `metadata`, or `builder` fields required by the migration guide.
+
+The repo now has a narrow raw Rust V2 prototype behind `POLYMARKET_CLOB_VERSION=v2`. It builds the V2 EIP-712 order shape directly, signs against exchange domain version `"2"`, serializes the V2 `/order` payload without `nonce`, `feeRateBps`, or user-set `taker`, and posts with L2 HMAC headers. This path is intentionally opt-in and still requires preprod smoke testing before funded use.
 
 ## Evidence Checked
 
@@ -39,17 +41,20 @@ Required changes called out by the official docs:
 
 Ready:
 
-- `POLYMARKET_CLOB_API_URL` is configurable, so the process can point at `https://clob-v2.polymarket.com` for preprod once the SDK is compatible.
+- `POLYMARKET_CLOB_API_URL` is configurable, so the process can point at `https://clob-v2.polymarket.com` for preprod.
+- `POLYMARKET_CLOB_VERSION=v2` selects the raw Rust V2 submitter instead of the SDK V1 order builder.
+- `POLYMARKET_CLOB_V2_BUILDER_CODE`, `POLYMARKET_CLOB_V2_METADATA`, and `POLYMARKET_CLOB_V2_NEG_RISK` are explicit environment switches.
 - Market and user websocket URLs are configurable.
 - Live auth can derive/create API credentials and pass signature type/funder into the SDK.
 
 Not ready:
 
-- The Rust SDK dependency available to this repo still appears to sign CLOB V1 order structs.
+- The Rust SDK dependency available to this repo still appears to sign CLOB V1 order structs, so V2 order submission must use the raw Rust V2 path or an official V2 SDK/sidecar.
 - We do not have a verified Rust V2 SDK package/revision to upgrade to.
 - We do not yet pull V2 CLOB market info into live sizing/risk. Static tick/min-size/fee defaults must not be treated as authoritative for V2 live trading.
 - pUSD wrapping/allowance requirements are not automated or smoke-tested for API-only trading.
-- Builder code support is not wired, which is fine unless we join the Builder Program, but it should not be confused with old builder HMAC headers.
+- Builder code support is wired as a bytes32 config value, but should remain zero unless we join the Builder Program.
+- `POLYMARKET_CLOB_V2_NEG_RISK` is manual. The next step is to derive the correct V2 exchange address per token from CLOB market metadata.
 
 ## Cutover Runbook
 
@@ -58,10 +63,11 @@ Before 2026-04-28 11:00 UTC:
 1. Keep tiny-live stopped.
 2. Verify no open orders on the CLOB from the trading wallet.
 3. Confirm whether Polymarket has published a Rust CLOB V2 SDK release or a V2 git revision for `polymarket-client-sdk`.
-4. Do not use the current `0.4.4` crate for live CLOB V2 order submission unless Polymarket explicitly confirms it hot-swaps order signing despite the V1 public structs.
-5. If a V2-compatible Rust SDK is available, upgrade in `polymarket-exec/Cargo.toml`, compile, and run a live-smoke test against `https://clob-v2.polymarket.com` with a burner or tiny funded account.
-6. Confirm pUSD balance/allowance/wrapping before any production order.
-7. Refresh market metadata from V2 and verify minimum tick size, minimum order size, fee details, and token IDs.
+4. Do not use the current `0.4.4` SDK order builder for live CLOB V2 order submission.
+5. If a V2-compatible Rust SDK is available, upgrade in `polymarket-exec/Cargo.toml`, compile, and compare its serialized order payload against `wire::clob_v2`.
+6. If no V2 Rust SDK is available, test the raw Rust path against `https://clob-v2.polymarket.com` with `POLYMARKET_CLOB_VERSION=v2`, a burner/tiny funded account, and one far-from-fair post-only order.
+7. Confirm pUSD balance/allowance/wrapping before any production order.
+8. Refresh market metadata from V2 and verify minimum tick size, minimum order size, fee details, token IDs, and neg-risk exchange selection.
 
 During cutover:
 
@@ -77,14 +83,17 @@ After cutover:
 
 ## Minimal Next Implementation Step
 
-The next code change should be one of:
+The next code change should be:
 
-- Upgrade to the official Rust V2 SDK once published/confirmed, then adapt compile errors deliberately.
-- If no Rust V2 SDK is published, implement a narrow internal V2 order signer only after reviewing the final official V2 contract addresses and wire schemas. This is higher risk and should not be mixed into strategy changes.
+- Add CLOB market-info ingestion for V2 tick size, min size, fee metadata, token IDs, and per-token neg-risk exchange selection.
+- Add a preprod live-smoke command that runs `POLYMARKET_CLOB_VERSION=v2` in submit/cancel-only mode without enabling strategy trading.
+- Replace the raw Rust path with the official Rust V2 SDK if Polymarket publishes one before cutover.
 
 ## Sources
 
 - Polymarket CLOB V2 migration: https://docs.polymarket.com/v2-migration
 - Polymarket Clients & SDKs: https://docs.polymarket.com/api-reference/clients-sdks
+- Official TypeScript CLOB V2 client: https://github.com/Polymarket/clob-client-v2
+- Official Python CLOB V2 client: https://github.com/Polymarket/py-clob-client-v2
 - Rust crate docs: https://docs.rs/polymarket-client-sdk/0.4.4
 - Published Rust SDK repo metadata: https://github.com/Polymarket/rs-clob-client
