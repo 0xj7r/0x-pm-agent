@@ -1548,11 +1548,20 @@ async fn execute_execution_adapter(
                         );
                     }
                     Ok(ack) => {
-                        live_safety.consecutive_submit_errors =
-                            live_safety.consecutive_submit_errors.saturating_add(1);
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected submit".to_string());
+                        if submit_rejection_counts_against_live_budget(&reason) {
+                            live_safety.consecutive_submit_errors =
+                                live_safety.consecutive_submit_errors.saturating_add(1);
+                        } else {
+                            debug!(
+                                mode = "live",
+                                client_order_id = %intent.client_order_id,
+                                reason = %reason,
+                                "submit rejected by venue without consuming live error budget"
+                            );
+                        }
                         let rejected_outcome = runtime.on_order_rejected(
                             &intent.client_order_id,
                             reason,
@@ -2048,6 +2057,14 @@ fn apply_sync_report(
         metrics.observe_riskoff_transition();
         combined.extend(runtime.degrade_and_cancel_all(now_ms, reason));
     }
+}
+
+fn submit_rejection_counts_against_live_budget(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    !(lower.contains("post-only")
+        || lower.contains("crosses book")
+        || lower.contains("would cross")
+        || lower.contains("would take liquidity"))
 }
 
 fn enforce_live_error_budget(

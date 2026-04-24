@@ -248,7 +248,6 @@ pub trait ExecutionAdapter: Send + Sync {
 
 #[derive(Default)]
 struct AdapterState {
-    submitted_orders: HashMap<ClientOrderId, SubmitOrderAck>,
     venue_order_map: HashMap<ClientOrderId, OrderId>,
 }
 
@@ -609,17 +608,6 @@ impl PolymarketExecutionAdapter {
 #[async_trait]
 impl ExecutionAdapter for PolymarketExecutionAdapter {
     async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
-        if let Some(cached) = self
-            .state
-            .read()
-            .await
-            .submitted_orders
-            .get(&req.client_order_id)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-
         let token_id = SdkU256::from_str(req.instrument_id.as_str()).map_err(|error| {
             ExecutionError::BadRequest(format!(
                 "invalid Polymarket token id `{}`: {error}",
@@ -683,9 +671,6 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
 
         if accepted {
             let mut state = self.state.write().await;
-            state
-                .submitted_orders
-                .insert(req.client_order_id.clone(), ack.clone());
             if let Some(order_id) = ack.venue_order_id.clone() {
                 state
                     .venue_order_map
@@ -734,7 +719,6 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
 
         if accepted {
             let mut state = self.state.write().await;
-            state.submitted_orders.remove(&req.client_order_id);
             state.venue_order_map.remove(&req.client_order_id);
         }
 
