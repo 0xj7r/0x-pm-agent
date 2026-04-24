@@ -17,6 +17,9 @@ use polymarket_client_sdk::clob::types::{
     TraderSide,
 };
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
+use polymarket_client_sdk::data::types::request::PositionsRequest as DataPositionsRequest;
+use polymarket_client_sdk::data::types::response::Position as DataPosition;
+use polymarket_client_sdk::data::Client as SdkDataClient;
 use polymarket_client_sdk::types::{
     Address as SdkAddress, DateTime as SdkDateTime, Decimal as SdkDecimal, Utc as SdkUtc,
     U256 as SdkU256,
@@ -107,6 +110,7 @@ pub struct VenueOpenOrder {
 pub struct VenueBalances {
     pub cash_usd: f64,
     pub positions: Vec<VenuePosition>,
+    pub positions_authoritative: bool,
     pub observed_at_ms: EpochMillis,
 }
 
@@ -181,6 +185,8 @@ impl PolymarketSignatureType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolymarketConfig {
     pub api_url: String,
+    pub data_api_url: String,
+    pub market_id_by_asset: HashMap<String, String>,
     pub credentials: Option<PolymarketCredentials>,
 }
 
@@ -188,6 +194,8 @@ impl Default for PolymarketConfig {
     fn default() -> Self {
         Self {
             api_url: "https://clob.polymarket.com".to_string(),
+            data_api_url: "https://data-api.polymarket.com".to_string(),
+            market_id_by_asset: HashMap::new(),
             credentials: None,
         }
     }
@@ -289,6 +297,7 @@ impl ExecutionAdapter for PaperExecutionAdapter {
         Ok(VenueBalances {
             cash_usd: 0.0,
             positions: Vec::new(),
+            positions_authoritative: false,
             observed_at_ms: now_unix_ms(),
         })
     }
@@ -305,6 +314,7 @@ pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
     client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
+    data_client: SdkDataClient,
     trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
 }
@@ -313,6 +323,8 @@ impl PolymarketExecutionAdapter {
     pub async fn connect(credentials: PolymarketCredentials) -> Result<Self, ExecutionError> {
         Self::connect_with_config(PolymarketConfig {
             api_url: "https://clob.polymarket.com".to_string(),
+            data_api_url: "https://data-api.polymarket.com".to_string(),
+            market_id_by_asset: HashMap::new(),
             credentials: Some(credentials),
         })
         .await
@@ -328,7 +340,23 @@ impl PolymarketExecutionAdapter {
         api_url: impl Into<String>,
         credentials: PolymarketL1Credentials,
     ) -> Result<Self, ExecutionError> {
+        Self::connect_with_l1_urls(
+            api_url,
+            "https://data-api.polymarket.com",
+            HashMap::new(),
+            credentials,
+        )
+        .await
+    }
+
+    pub async fn connect_with_l1_urls(
+        api_url: impl Into<String>,
+        data_api_url: impl Into<String>,
+        market_id_by_asset: HashMap<String, String>,
+        credentials: PolymarketL1Credentials,
+    ) -> Result<Self, ExecutionError> {
         let api_url = api_url.into();
+        let data_api_url = data_api_url.into();
         let signer = PrivateKeySigner::from_str(credentials.private_key.trim())
             .map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_PRIVATE_KEY: {error}"))
@@ -358,14 +386,18 @@ impl PolymarketExecutionAdapter {
         }
 
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+        let data_client = SdkDataClient::new(data_api_url.as_str()).map_err(map_sdk_error)?;
 
         Ok(Self {
             _config: PolymarketConfig {
                 api_url,
+                data_api_url,
+                market_id_by_asset,
                 credentials: None,
             },
             signer,
             client,
+            data_client,
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
@@ -413,11 +445,14 @@ impl PolymarketExecutionAdapter {
         }
 
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+        let data_client =
+            SdkDataClient::new(config.data_api_url.as_str()).map_err(map_sdk_error)?;
 
         Ok(Self {
             _config: config,
             signer,
             client,
+            data_client,
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
@@ -496,6 +531,52 @@ impl PolymarketExecutionAdapter {
         }
     }
 
+    fn venue_position_from_data_position(
+        position: &DataPosition,
+        market_id_by_asset: &HashMap<String, String>,
+    ) -> VenuePosition {
+        let asset = position.asset.to_string();
+        VenuePosition {
+            market_id: MarketId::from(
+                market_id_by_asset
+                    .get(&asset)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{:#x}", position.condition_id)),
+            ),
+            instrument_id: InstrumentId::from(asset),
+            quantity: position.size.to_string().parse::<f64>().unwrap_or(0.0),
+            average_cost_usd: position.avg_price.to_string().parse::<f64>().unwrap_or(0.0),
+        }
+    }
+
+    async fn sync_positions_from_data_api(&self) -> Result<Vec<VenuePosition>, ExecutionError> {
+        let Some(trade_address) = self.trade_address else {
+            return Err(ExecutionError::AuthFailure(
+                "cannot sync positions without signer or funder address".to_string(),
+            ));
+        };
+        let request = DataPositionsRequest::builder()
+            .user(trade_address)
+            .size_threshold(SdkDecimal::ZERO)
+            .limit(500)
+            .map_err(|error| {
+                ExecutionError::BadRequest(format!("invalid Data API positions request: {error}"))
+            })?
+            .build();
+        let positions = self
+            .data_client
+            .positions(&request)
+            .await
+            .map_err(map_sdk_error)?;
+        Ok(positions
+            .iter()
+            .map(|position| {
+                Self::venue_position_from_data_position(position, &self._config.market_id_by_asset)
+            })
+            .filter(|position| position.quantity > 1e-9)
+            .collect())
+    }
+
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         let page = self
             .client
@@ -538,9 +619,11 @@ impl PolymarketExecutionAdapter {
             .await
             .map_err(map_sdk_error)?;
         let raw_balance = response.balance.to_string();
+        let positions = self.sync_positions_from_data_api().await?;
         Ok(VenueBalances {
             cash_usd: Self::usdc_balance_to_usd(&raw_balance),
-            positions: Vec::new(),
+            positions,
+            positions_authoritative: true,
             observed_at_ms: now_unix_ms(),
         })
     }
@@ -838,6 +921,102 @@ mod tests {
             quote_level_tag: None,
             submitted_at_ms: now_unix_ms(),
         }
+    }
+
+    #[test]
+    fn data_api_position_maps_to_runtime_venue_position() {
+        let raw = serde_json::json!({
+            "proxyWallet": "0x1234567890abcdef1234567890abcdef12345678",
+            "asset": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "conditionId": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "size": 6.5,
+            "avgPrice": 0.80,
+            "initialValue": 5.20,
+            "currentValue": 6.50,
+            "cashPnl": 1.30,
+            "percentPnl": 25.0,
+            "totalBought": 6.5,
+            "realizedPnl": 0.0,
+            "percentRealizedPnl": 0.0,
+            "curPrice": 1.0,
+            "redeemable": false,
+            "mergeable": false,
+            "title": "Bitcoin Up or Down",
+            "slug": "btc-updown-5m",
+            "icon": "https://example.com/btc.png",
+            "eventSlug": "btc-updown",
+            "outcome": "Down",
+            "outcomeIndex": 1,
+            "oppositeOutcome": "Up",
+            "oppositeAsset": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "endDate": "2026-04-24",
+            "negativeRisk": false
+        });
+        let position: DataPosition = serde_json::from_value(raw).expect("data position");
+        let venue = PolymarketExecutionAdapter::venue_position_from_data_position(
+            &position,
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            venue.instrument_id,
+            InstrumentId::from(
+                "7719472615821079694904732333912527190217998977709370935963838933860875309329"
+            )
+        );
+        assert_eq!(
+            venue.market_id,
+            MarketId::from("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890")
+        );
+        assert_eq!(venue.quantity, 6.5);
+        assert_eq!(venue.average_cost_usd, 0.80);
+    }
+
+    #[test]
+    fn data_api_position_prefers_runtime_market_id_by_asset() {
+        let raw = serde_json::json!({
+            "proxyWallet": "0x1234567890abcdef1234567890abcdef12345678",
+            "asset": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "conditionId": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "size": 2.25,
+            "avgPrice": 0.33,
+            "initialValue": 0.7425,
+            "currentValue": 1.0,
+            "cashPnl": 0.2575,
+            "percentPnl": 34.68,
+            "totalBought": 2.25,
+            "realizedPnl": 0.0,
+            "percentRealizedPnl": 0.0,
+            "curPrice": 0.44,
+            "redeemable": false,
+            "mergeable": false,
+            "title": "Bitcoin Up or Down",
+            "slug": "btc-updown-5m",
+            "icon": "https://example.com/btc.png",
+            "eventSlug": "btc-updown",
+            "outcome": "Down",
+            "outcomeIndex": 1,
+            "oppositeOutcome": "Up",
+            "oppositeAsset": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "endDate": "2026-04-24",
+            "negativeRisk": false
+        });
+        let position: DataPosition = serde_json::from_value(raw).expect("data position");
+        let mut market_id_by_asset = HashMap::new();
+        market_id_by_asset.insert(
+            "7719472615821079694904732333912527190217998977709370935963838933860875309329"
+                .to_string(),
+            "runtime-market-1".to_string(),
+        );
+
+        let venue = PolymarketExecutionAdapter::venue_position_from_data_position(
+            &position,
+            &market_id_by_asset,
+        );
+
+        assert_eq!(venue.market_id, MarketId::from("runtime-market-1"));
+        assert_eq!(venue.quantity, 2.25);
+        assert_eq!(venue.average_cost_usd, 0.33);
     }
 
     #[test]

@@ -67,6 +67,8 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
         };
         let adapter = PolymarketExecutionAdapter::connect_with_config(PolymarketConfig {
             api_url: config.clob_api_url.clone(),
+            data_api_url: config.data_api_url.clone(),
+            market_id_by_asset: config.market_id_by_asset.clone(),
             credentials: Some(credentials),
         })
         .await?;
@@ -75,8 +77,10 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             user_auth: Some(auth.clone()),
         })
     } else {
-        let adapter = PolymarketExecutionAdapter::connect_with_l1_url(
+        let adapter = PolymarketExecutionAdapter::connect_with_l1_urls(
             config.clob_api_url.clone(),
+            config.data_api_url.clone(),
+            config.market_id_by_asset.clone(),
             PolymarketL1Credentials {
                 private_key,
                 signature_type,

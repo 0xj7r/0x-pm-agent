@@ -20,4 +20,4 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-polymarket-client-sdk = { version = "0.4.4", features = ["clob", "heartbeats"] }
+polymarket-client-sdk = { version = "0.4.4", features = ["clob", "data", "heartbeats"] }

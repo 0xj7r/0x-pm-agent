@@ -43,6 +43,7 @@ pub struct AppConfig {
     pub log_format: LogFormat,
     pub metrics_bind: SocketAddr,
     pub clob_api_url: String,
+    pub data_api_url: String,
     pub market_ws_url: String,
     pub user_ws_url: String,
     pub spot_ws_url: String,
@@ -102,6 +103,7 @@ impl AppConfig {
         let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
         let metrics_bind = parse_socket_addr("WHALE_PAIR_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
         let clob_api_url = env_or("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com");
+        let data_api_url = env_or("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com");
         let market_ws_url = env_or(
             "POLYMARKET_MARKET_WS_URL",
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -231,6 +233,7 @@ impl AppConfig {
             log_format,
             metrics_bind,
             clob_api_url,
+            data_api_url,
             market_ws_url,
             user_ws_url,
             spot_ws_url,
