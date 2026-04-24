@@ -100,6 +100,13 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     if config.paper_mode {
         anyhow::bail!("live smoke mode requires WHALE_PAIR_PAPER_MODE=false");
     }
+    if config
+        .live_kill_switch_path
+        .as_ref()
+        .is_some_and(|path| path.exists())
+    {
+        anyhow::bail!("live smoke blocked by active kill switch");
+    }
     let adapter = connect_live_adapter(&config).await?;
 
     let asset_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_ASSET_ID")
@@ -1864,6 +1871,14 @@ fn enforce_live_health(
             runtime.inventory().gross_exposure_usd(),
             config.risk_limits.max_gross_notional_usd
         ));
+    }
+    if let Some(path) = config.live_kill_switch_path.as_ref() {
+        if path.exists() {
+            failures.push(format!(
+                "operator kill switch active path={}",
+                path.display()
+            ));
+        }
     }
 
     if failures.is_empty() {

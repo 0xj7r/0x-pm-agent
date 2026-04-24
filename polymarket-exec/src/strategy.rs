@@ -243,6 +243,9 @@ pub struct UnlawfulShearConfig {
     pub core_clip_usd: f64,
     pub hedge_clip_usd: f64,
     pub rebalance_clip_usd: f64,
+    pub micro_clip_target_usd: f64,
+    pub micro_clip_min_usd: f64,
+    pub micro_clip_max_children: usize,
     pub trim_clip_fraction: f64,
     pub max_gross_cost_usd: f64,
     pub target_hedge_ratio_min: f64,
@@ -306,6 +309,15 @@ impl UnlawfulShearConfig {
             core_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_CORE_CLIP_USD", 20.0),
             hedge_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_HEDGE_CLIP_USD", 6.0),
             rebalance_clip_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_REBALANCE_CLIP_USD", 12.0),
+            micro_clip_target_usd: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_TARGET_USD",
+                8.0,
+            ),
+            micro_clip_min_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_MIN_USD", 1.0),
+            micro_clip_max_children: parse_usize(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_MAX_CHILDREN",
+                1,
+            ),
             trim_clip_fraction: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_TRIM_CLIP_FRACTION", 0.30),
             max_gross_cost_usd: parse_f64("WHALE_PAIR_UNLAWFUL_SHEAR_MAX_GROSS_COST_USD", 120.0),
             target_hedge_ratio_min: parse_f64(
@@ -646,6 +658,21 @@ impl StrategyProfile {
                 "WHALE_PAIR_UNLAWFUL_SHEAR_REBALANCE_CLIP_USD",
                 self.strategies.unlawful_shear.rebalance_clip_usd,
                 12.0,
+            ),
+            micro_clip_target_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_TARGET_USD",
+                self.strategies.unlawful_shear.micro_clip_target_usd,
+                8.0,
+            ),
+            micro_clip_min_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_MIN_USD",
+                self.strategies.unlawful_shear.micro_clip_min_usd,
+                1.0,
+            ),
+            micro_clip_max_children: env_or_profile_usize(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICRO_CLIP_MAX_CHILDREN",
+                self.strategies.unlawful_shear.micro_clip_max_children,
+                1,
             ),
             trim_clip_fraction: env_or_profile_f64(
                 "WHALE_PAIR_UNLAWFUL_SHEAR_TRIM_CLIP_FRACTION",
@@ -1083,6 +1110,9 @@ pub struct UnlawfulShearProfile {
     pub core_clip_usd: Option<f64>,
     pub hedge_clip_usd: Option<f64>,
     pub rebalance_clip_usd: Option<f64>,
+    pub micro_clip_target_usd: Option<f64>,
+    pub micro_clip_min_usd: Option<f64>,
+    pub micro_clip_max_children: Option<usize>,
     pub trim_clip_fraction: Option<f64>,
     pub max_gross_cost_usd: Option<f64>,
     pub target_hedge_ratio_min: Option<f64>,
@@ -1868,22 +1898,71 @@ impl UnlawfulShearStrategy {
         if notional < 1e-3 {
             return;
         }
-        let quantity = notional / price;
-        if quantity <= 0.0 {
-            return;
+        let child_notional = self.micro_clip_children(notional);
+        let child_count = child_notional.len();
+        for (idx, child_usd) in child_notional.into_iter().enumerate() {
+            if child_usd <= 0.0 || *remaining_gross <= 0.0 {
+                continue;
+            }
+            let child_usd = child_usd.min(*remaining_gross);
+            if child_usd < 1e-3 {
+                continue;
+            }
+            let quantity = child_usd / price;
+            if quantity <= 0.0 {
+                continue;
+            }
+            let child_quote_level_tag = if child_count > 1 {
+                format!("{quote_level_tag}:child-{}/{}", idx + 1, child_count)
+            } else {
+                quote_level_tag.clone()
+            };
+            let child_reason = if child_count > 1 {
+                format!(
+                    "{reason} child={}/{} notional_usd={:.2}",
+                    idx + 1,
+                    child_count,
+                    child_usd
+                )
+            } else {
+                reason.clone()
+            };
+            intents.push(self.build_order(
+                market_id.clone(),
+                instrument_id.clone(),
+                TradeSide::Buy,
+                price,
+                quantity,
+                false,
+                child_quote_level_tag,
+                child_reason,
+                now_ms,
+            ));
+            *remaining_gross -= quantity * price;
         }
-        intents.push(self.build_order(
-            market_id.clone(),
-            instrument_id.clone(),
-            TradeSide::Buy,
-            price,
-            quantity,
-            false,
-            quote_level_tag,
-            reason,
-            now_ms,
-        ));
-        *remaining_gross -= quantity * price;
+    }
+
+    fn micro_clip_children(&self, notional_usd: f64) -> Vec<f64> {
+        if notional_usd <= 0.0 {
+            return Vec::new();
+        }
+        let target_usd = self.config.micro_clip_target_usd.max(0.01);
+        let min_usd = self.config.micro_clip_min_usd.max(0.01);
+        let max_children = self.config.micro_clip_max_children.max(1);
+        if max_children == 1 || notional_usd <= target_usd {
+            return vec![notional_usd];
+        }
+
+        let mut children = ((notional_usd / target_usd).ceil() as usize).clamp(1, max_children);
+        while children > 1 && notional_usd / children as f64 <= min_usd {
+            children -= 1;
+        }
+        if children <= 1 {
+            return vec![notional_usd];
+        }
+
+        let base = notional_usd / children as f64;
+        vec![base; children]
     }
 
     fn push_sell(
@@ -3273,6 +3352,12 @@ fn normalize_unlawful_invariants(mut config: UnlawfulShearConfig) -> UnlawfulShe
     config.merge_stall_seconds = config.merge_stall_seconds.max(1);
     config.entry_book_max_age_ms = config.entry_book_max_age_ms.max(1);
     config.entry_btc_signal_max_age_ms = config.entry_btc_signal_max_age_ms.max(1);
+    config.micro_clip_target_usd = config.micro_clip_target_usd.max(0.01);
+    config.micro_clip_min_usd = config.micro_clip_min_usd.max(0.01);
+    config.micro_clip_max_children = config.micro_clip_max_children.max(1);
+    if config.micro_clip_min_usd > config.micro_clip_target_usd {
+        config.micro_clip_target_usd = config.micro_clip_min_usd;
+    }
     config.microstructure_max_spread = config.microstructure_max_spread.max(0.001);
     config.microstructure_min_ask_notional_top3_usd =
         config.microstructure_min_ask_notional_top3_usd.max(0.0);
@@ -3416,6 +3501,9 @@ mod tests {
         cfg.core_clip_usd = 35.0;
         cfg.hedge_clip_usd = 15.0;
         cfg.rebalance_clip_usd = 20.0;
+        cfg.micro_clip_target_usd = 8.0;
+        cfg.micro_clip_min_usd = 1.0;
+        cfg.micro_clip_max_children = 1;
         cfg.trim_clip_fraction = 0.25;
         cfg.max_gross_cost_usd = 120.0;
         cfg.target_hedge_ratio_min = 0.20;
@@ -3554,6 +3642,48 @@ mod tests {
             .intents
             .iter()
             .any(|intent| intent.side == TradeSide::Buy));
+    }
+
+    #[test]
+    fn unlawful_shear_micro_clips_split_approved_buy_intents() {
+        let mut config = unlawful_shear_test_config();
+        config.core_clip_usd = 40.0;
+        config.hedge_clip_usd = 12.0;
+        config.micro_clip_target_usd = 8.0;
+        config.micro_clip_min_usd = 1.0;
+        config.micro_clip_max_children = 4;
+        let mut strategy = UnlawfulShearStrategy::new(config, 0);
+        let ctx = context_with_unlawful_signal(
+            Vec::new(),
+            10,
+            0,
+            0,
+            Some(unlawful_signal_snapshot(
+                UnlawfulExecutionMode::Entry,
+                1.0,
+                10,
+            )),
+        );
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
+
+        let core_orders: Vec<_> = decision
+            .intents
+            .iter()
+            .filter(|intent| intent.instrument_id == InstrumentId::from("up"))
+            .collect();
+        assert_eq!(core_orders.len(), 4);
+        assert!(core_orders.iter().all(|intent| {
+            intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.contains("core-entry:child-"))
+        }));
+        assert!(core_orders
+            .iter()
+            .all(|intent| intent.reason.contains("child=")));
     }
 
     #[test]
