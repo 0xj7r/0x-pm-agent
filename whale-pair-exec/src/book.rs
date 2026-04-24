@@ -27,6 +27,7 @@ pub struct BookState {
     pub spread: f64,
     pub last_trade_price: f64,
     pub last_update_unix_ms: u64,
+    pub depth_update_unix_ms: u64,
     last_update_mono: Option<Instant>,
     trade_events_unix_ms: VecDeque<u64>,
 }
@@ -44,6 +45,7 @@ impl Default for BookState {
             spread: 0.0,
             last_trade_price: 0.0,
             last_update_unix_ms: 0,
+            depth_update_unix_ms: 0,
             last_update_mono: None,
             trade_events_unix_ms: VecDeque::new(),
         }
@@ -82,6 +84,7 @@ impl BookState {
             spread,
             last_trade_price,
             last_update_unix_ms,
+            depth_update_unix_ms: last_update_unix_ms,
             last_update_mono: None,
             trade_events_unix_ms: VecDeque::new(),
         }
@@ -161,6 +164,13 @@ impl BookState {
         &self.asks
     }
 
+    pub fn depth_age_ms(&self) -> Option<u64> {
+        if self.depth_update_unix_ms == 0 {
+            return None;
+        }
+        Some(now_unix_ms().saturating_sub(self.depth_update_unix_ms))
+    }
+
     fn update_levels(&mut self, bids: &[Level], asks: &[Level]) {
         if !bids.is_empty() {
             let mut sorted = normalize_levels(bids, true);
@@ -218,6 +228,9 @@ impl BookStore {
         });
         book.update_levels(bids, asks);
         book.touch();
+        if !bids.is_empty() || !asks.is_empty() {
+            book.depth_update_unix_ms = book.last_update_unix_ms;
+        }
         book.clone()
     }
 
@@ -394,6 +407,7 @@ mod tests {
         assert_eq!(state.best_ask, 0.43);
         assert_eq!(state.best_bid_size, 120.0);
         assert_eq!(state.best_ask_size, 75.0);
+        assert!(state.depth_update_unix_ms > 0);
         assert!(!state.is_stale(Duration::from_secs(1)));
     }
 
@@ -401,7 +415,7 @@ mod tests {
     async fn best_bid_ask_update_preserves_existing_sizes() {
         let seed_assets: Vec<String> = Vec::new();
         let store = BookStore::new(&seed_assets);
-        store
+        let snapshot_state = store
             .apply_snapshot(
                 "asset-2",
                 &[Level {
@@ -414,6 +428,7 @@ mod tests {
                 }],
             )
             .await;
+        let depth_update_unix_ms = snapshot_state.depth_update_unix_ms;
         let state = store
             .apply_best_bid_ask("asset-2", Some(0.21), Some(0.25))
             .await;
@@ -422,5 +437,6 @@ mod tests {
         assert_eq!(state.best_ask, 0.25);
         assert_eq!(state.best_bid_size, 10.0);
         assert_eq!(state.best_ask_size, 8.0);
+        assert_eq!(state.depth_update_unix_ms, depth_update_unix_ms);
     }
 }

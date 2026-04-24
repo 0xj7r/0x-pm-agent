@@ -352,6 +352,7 @@ mod tests {
                 best_ask: None,
                 bid_levels: Vec::new(),
                 ask_levels: Vec::new(),
+                depth_observed_at_ms: None,
                 last_trade_price: None,
                 observed_at_ms: 1,
             },
