@@ -183,6 +183,54 @@ def fetch_json_via_curl(url: str) -> Any:
 
 
 def build_whale_windows(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    def phase_name(window_start_ms: int, observed_at_ms: int) -> str:
+        elapsed_s = max(0, (observed_at_ms - window_start_ms) // 1000)
+        if elapsed_s < 30:
+            return "early"
+        if elapsed_s < 210:
+            return "mid"
+        return "late"
+
+    def accumulate_buy_stats(store: dict[str, dict[str, Any]], outcome: str, price: float, size: float, usdc_size: float) -> None:
+        bucket = store.setdefault(
+            outcome,
+            {
+                "trade_count": 0,
+                "size_total": 0.0,
+                "usdc_total": 0.0,
+                "min_buy_price": None,
+                "max_buy_price": None,
+            },
+        )
+        bucket["trade_count"] += 1
+        bucket["size_total"] += size
+        bucket["usdc_total"] += usdc_size
+        bucket["min_buy_price"] = (
+            price if bucket["min_buy_price"] is None else min(bucket["min_buy_price"], price)
+        )
+        bucket["max_buy_price"] = (
+            price if bucket["max_buy_price"] is None else max(bucket["max_buy_price"], price)
+        )
+
+    def finalize_buy_stats(store: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        finalized: dict[str, dict[str, Any]] = {}
+        for outcome, stats in store.items():
+            size_total = float(stats["size_total"])
+            avg_buy_price = stats["usdc_total"] / size_total if size_total > 0 else None
+            finalized[outcome] = {
+                "trade_count": int(stats["trade_count"]),
+                "size_total": round(size_total, 6),
+                "usdc_total": round(float(stats["usdc_total"]), 6),
+                "avg_buy_price": round(avg_buy_price, 6) if avg_buy_price is not None else None,
+                "min_buy_price": round(float(stats["min_buy_price"]), 6)
+                if stats["min_buy_price"] is not None
+                else None,
+                "max_buy_price": round(float(stats["max_buy_price"]), 6)
+                if stats["max_buy_price"] is not None
+                else None,
+            }
+        return finalized
+
     windows: dict[int, dict[str, Any]] = {}
     for row in rows:
         timestamp_s = row.get("timestamp")
@@ -211,6 +259,8 @@ def build_whale_windows(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]
                 "rough_notional_usd": 0.0,
                 "outcomes": [],
                 "sides": [],
+                "_buy_stats_by_outcome": {},
+                "_phase_buy_stats": {"early": {}, "mid": {}, "late": {}},
             },
         )
         window["participated"] = True
@@ -232,7 +282,32 @@ def build_whale_windows(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]
         activity_type = str(row.get("type") or "").upper()
         if activity_type == "TRADE":
             window["trade_count"] += 1
-            window["rough_notional_usd"] += safe_float(row.get("usdcSize")) or 0.0
+            usdc_size = safe_float(row.get("usdcSize")) or 0.0
+            price = safe_float(row.get("price")) or 0.0
+            size = safe_float(row.get("size")) or 0.0
+            window["rough_notional_usd"] += usdc_size
+            if (
+                str(row.get("side") or "").upper() == "BUY"
+                and price > 0.0
+                and size > 0.0
+                and usdc_size > 0.0
+            ):
+                outcome_name = str(row.get("outcome") or "").strip()
+                if outcome_name:
+                    accumulate_buy_stats(
+                        window["_buy_stats_by_outcome"],
+                        outcome_name,
+                        price,
+                        size,
+                        usdc_size,
+                    )
+                    accumulate_buy_stats(
+                        window["_phase_buy_stats"][phase_name(window_start_ms, observed_at_ms)],
+                        outcome_name,
+                        price,
+                        size,
+                        usdc_size,
+                    )
         elif activity_type == "MERGE":
             window["merge_count"] += 1
         elif activity_type == "REDEEM":
@@ -244,6 +319,28 @@ def build_whale_windows(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]
         side = str(row.get("side") or "").strip()
         if side and side not in window["sides"]:
             window["sides"].append(side)
+
+    for window in windows.values():
+        buy_summary_by_outcome = finalize_buy_stats(window.pop("_buy_stats_by_outcome"))
+        phase_buy_summary_by_outcome = {
+            phase: finalize_buy_stats(stats)
+            for phase, stats in window.pop("_phase_buy_stats").items()
+        }
+        ordered_legs = sorted(
+            (
+                {
+                    "outcome": outcome,
+                    **summary,
+                }
+                for outcome, summary in buy_summary_by_outcome.items()
+                if summary.get("avg_buy_price") is not None
+            ),
+            key=lambda item: item["avg_buy_price"],
+        )
+        window["buy_summary_by_outcome"] = buy_summary_by_outcome
+        window["phase_buy_summary_by_outcome"] = phase_buy_summary_by_outcome
+        window["cheap_leg"] = ordered_legs[0] if len(ordered_legs) >= 2 else None
+        window["expensive_leg"] = ordered_legs[-1] if len(ordered_legs) >= 2 else None
 
     return windows
 
@@ -854,6 +951,10 @@ def build_comparison_windows(
                 "rough_notional_usd": 0.0,
                 "outcomes": [],
                 "sides": [],
+                "buy_summary_by_outcome": {},
+                "phase_buy_summary_by_outcome": {"early": {}, "mid": {}, "late": {}},
+                "cheap_leg": None,
+                "expensive_leg": None,
             },
         )
         per_sleeve: dict[str, Any] = {}
@@ -937,6 +1038,26 @@ def flatten_for_csv(windows: list[dict[str, Any]], sleeve_names: list[str]) -> l
             "whale_merge_count": window["whale"]["merge_count"],
             "whale_redeem_count": window["whale"]["redeem_count"],
             "whale_rough_notional_usd": window["whale"]["rough_notional_usd"],
+            "whale_cheap_outcome": (
+                window["whale"]["cheap_leg"]["outcome"]
+                if isinstance(window["whale"].get("cheap_leg"), dict)
+                else ""
+            ),
+            "whale_cheap_avg_buy_price": (
+                window["whale"]["cheap_leg"]["avg_buy_price"]
+                if isinstance(window["whale"].get("cheap_leg"), dict)
+                else ""
+            ),
+            "whale_expensive_outcome": (
+                window["whale"]["expensive_leg"]["outcome"]
+                if isinstance(window["whale"].get("expensive_leg"), dict)
+                else ""
+            ),
+            "whale_expensive_avg_buy_price": (
+                window["whale"]["expensive_leg"]["avg_buy_price"]
+                if isinstance(window["whale"].get("expensive_leg"), dict)
+                else ""
+            ),
         }
         for sleeve_name in sleeve_names:
             sleeve = window["sleeves"][sleeve_name]
