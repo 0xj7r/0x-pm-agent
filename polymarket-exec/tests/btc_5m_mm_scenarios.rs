@@ -682,6 +682,14 @@ fn run_fixture(name: &str) {
                                 &mut last_seq,
                             );
                         }
+                        RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) => {
+                            drain_event_log(
+                                &runtime,
+                                &mut journal,
+                                &mut seen_categories,
+                                &mut last_seq,
+                            );
+                        }
                     }
                 }
                 if submitted_decisions.len() != decisions.len() {

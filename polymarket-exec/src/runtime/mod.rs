@@ -2913,9 +2913,12 @@ mod tests {
         );
 
         assert!(outcome.commands.is_empty());
-        assert!(runtime
-            .open_orders()
-            .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1")));
+        assert!(
+            runtime
+                .open_orders()
+                .all(|managed| managed.intent.client_order_id
+                    != ClientOrderId::from("cleanup-sell-1"))
+        );
     }
 
     #[test]
@@ -2979,9 +2982,14 @@ mod tests {
             })
             .expect("merge event");
 
-        assert_eq!(runtime.inventory().position_qty(&InstrumentId::from("up")), 0.0);
         assert_eq!(
-            runtime.inventory().position_qty(&InstrumentId::from("down")),
+            runtime.inventory().position_qty(&InstrumentId::from("up")),
+            0.0
+        );
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("down")),
             0.0
         );
         assert!((runtime.inventory().free_cash_usd() - 100.65).abs() < 1e-9);
