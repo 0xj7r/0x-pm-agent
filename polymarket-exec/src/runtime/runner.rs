@@ -17,6 +17,7 @@ use crate::event_log::EventLog;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
+use crate::quote_reconciler::ReconcilerConfig;
 use crate::runtime::audit::AuditWriter;
 use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
@@ -33,6 +34,7 @@ use crate::wire::api::{
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, SubmitOrderRequest, TimeInForce,
+    VenueFill,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -45,14 +47,22 @@ struct LiveSafetyState {
     consecutive_submit_errors: usize,
     consecutive_cancel_errors: usize,
     consecutive_reconcile_mismatches: usize,
+    last_venue_cash_usd: Option<f64>,
+    last_venue_position_count: usize,
+    last_venue_balance_observed_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Default)]
 struct ExecutionSyncReport {
     open_order_count: usize,
     balance_synced: bool,
+    venue_cash_usd: Option<f64>,
+    venue_position_count: usize,
+    venue_balance_observed_at_ms: Option<u64>,
+    venue_fills: Vec<VenueFill>,
     errors: usize,
     missing_local_orders: Vec<ClientOrderId>,
+    pending_missing_local_orders: Vec<ClientOrderId>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +71,7 @@ struct ExecutionPolicy {
     live_post_only: bool,
     live_order_ttl_ms: u64,
     live_order_max_age_ms: u64,
+    live_reconcile_missing_grace_ms: u64,
     live_max_submit_errors: usize,
     live_max_cancel_errors: usize,
     live_kill_on_reconcile_mismatch: bool,
@@ -76,6 +87,7 @@ impl ExecutionPolicy {
             live_post_only: config.live_post_only,
             live_order_ttl_ms: config.live_order_ttl.as_millis() as u64,
             live_order_max_age_ms: config.live_order_max_age.as_millis() as u64,
+            live_reconcile_missing_grace_ms: config.live_reconcile_missing_grace.as_millis() as u64,
             live_max_submit_errors: config.live_max_submit_errors,
             live_max_cancel_errors: config.live_max_cancel_errors,
             live_kill_on_reconcile_mismatch: config.live_kill_on_reconcile_mismatch,
@@ -88,11 +100,13 @@ impl ExecutionPolicy {
 
 pub async fn run() -> Result<()> {
     let config = AppConfig::from_env()?;
-    if std::env::var("WHALE_PAIR_EXEC_MODE")
-        .map(|value| value == "live_smoke")
-        .unwrap_or(false)
+    match std::env::var("WHALE_PAIR_EXEC_MODE")
+        .unwrap_or_default()
+        .as_str()
     {
-        return run_live_smoke(config).await;
+        "live_smoke" => return run_live_smoke(config).await,
+        "live_cancel" => return run_live_cancel(config).await,
+        _ => {}
     }
     run_with_config(config).await
 }
@@ -204,6 +218,62 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
+async fn run_live_cancel(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    if config.paper_mode {
+        anyhow::bail!("live cancel mode requires WHALE_PAIR_PAPER_MODE=false");
+    }
+    let raw_order_ids = std::env::var("WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("live cancel mode requires WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
+        })?;
+    let order_ids = raw_order_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(OrderId::from)
+        .collect::<Vec<_>>();
+    if order_ids.is_empty() {
+        anyhow::bail!("live cancel mode received no order ids");
+    }
+
+    let adapter = connect_live_adapter(&config).await?;
+    for order_id in order_ids {
+        let client_order_id = ClientOrderId::from(format!("manual-cancel:{order_id}"));
+        info!(venue_order_id = %order_id, "submitting manual live cancel");
+        let ack = adapter
+            .cancel(CancelOrderRequest {
+                client_order_id,
+                venue_order_id: Some(order_id.clone()),
+                reason: "operator live_cancel".to_string(),
+                submitted_at_ms: now_unix_ms(),
+            })
+            .await?;
+        if !ack.accepted {
+            anyhow::bail!(
+                "manual live cancel rejected for {}: {}",
+                order_id,
+                ack.venue_message.unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+        info!(venue_order_id = %order_id, "manual live cancel accepted");
+    }
+
+    let open_after = adapter.sync_open_orders().await?;
+    let visible_after = open_after
+        .iter()
+        .map(|order| order.venue_order_id.to_string())
+        .collect::<Vec<_>>();
+    info!(
+        remaining_open_orders = visible_after.len(),
+        remaining_venue_order_ids = ?visible_after,
+        "manual live cancel reconciliation complete"
+    );
+    Ok(())
+}
+
 pub async fn run_with_config(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
 
@@ -251,6 +321,10 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("run-{}", now_unix_ms())),
     );
+    runtime.set_quote_reconciler_config(ReconcilerConfig {
+        min_order_age_ms: config.quote_min_order_age.as_millis() as u64,
+        ..ReconcilerConfig::default()
+    });
     let mut journal = config
         .journal_path
         .clone()
@@ -266,7 +340,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         now_unix_ms(),
         config.order_reconcile_stale_window.as_millis() as u64,
     );
-    startup_outcome.extend(runtime.start(now_unix_ms()));
+    if !config.paper_mode && runtime.has_needs_reconcile_orders() {
+        startup_outcome.extend(
+            runtime.degrade_and_cancel_all(
+                now_unix_ms(),
+                "startup has orders requiring reconciliation",
+            ),
+        );
+    } else {
+        startup_outcome.extend(runtime.start(now_unix_ms()));
+    }
     persist_runtime_outcome(
         &mut journal,
         runtime.event_log(),
@@ -502,6 +585,7 @@ async fn run_runtime_loop(
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spot_events_open = true;
     let mut user_events_open = true;
+    let mut seen_venue_fill_keys = HashSet::<String>::new();
 
     loop {
         tokio::select! {
@@ -566,6 +650,7 @@ async fn run_runtime_loop(
                         runtime,
                         metrics.as_ref(),
                         config,
+                        live_safety,
                         now_unix_ms(),
                         live_health_started_at_ms,
                     );
@@ -581,6 +666,7 @@ async fn run_runtime_loop(
                             live_safety,
                             execution_adapter.clone(),
                             execution_policy,
+                            &mut seen_venue_fill_keys,
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -623,6 +709,7 @@ async fn run_runtime_loop(
                                 live_safety,
                                 execution_adapter.clone(),
                                 execution_policy,
+                                &mut seen_venue_fill_keys,
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -986,6 +1073,8 @@ async fn refresh_dashboard_state(
                 market_ws_connected: control_plane_metrics.market_ws_connected,
                 user_ws_connected: control_plane_metrics.user_ws_connected,
                 execution_adapter_connected: control_plane_metrics.execution_adapter_connected,
+                venue_cash_usd: control_plane_metrics.venue_cash_usd,
+                venue_position_count: control_plane_metrics.venue_position_count,
                 last_market_message_age_ms: control_plane_metrics.market_last_message_age_ms,
                 last_user_message_age_ms: control_plane_metrics.user_last_message_age_ms,
                 last_reconcile_age_ms: control_plane_metrics.last_reconcile_age_ms,
@@ -1058,7 +1147,12 @@ fn handle_user_event(
             close_method,
             observed_at_ms,
         } => {
-            if quantity <= 0.0 || price <= 0.0 || client_order_id.is_none() {
+            let resolved_client_order_id = resolve_user_event_client_order_id(
+                client_order_id,
+                order_id.as_deref(),
+                execution_venue_map,
+            );
+            if quantity <= 0.0 || price <= 0.0 || resolved_client_order_id.is_none() {
                 RuntimeOutcome::default()
             } else {
                 let fill_side = parse_trade_side(&side);
@@ -1067,7 +1161,8 @@ fn handle_user_event(
                 let instrument_id = asset_id.map(InstrumentId::from);
                 let fill = FillReport {
                     order_id: order_id.map(crate::types::OrderId::from),
-                    client_order_id: client_order_id.map(crate::types::ClientOrderId::from),
+                    client_order_id: resolved_client_order_id
+                        .map(crate::types::ClientOrderId::from),
                     market_id: market_id.unwrap_or_else(|| MarketId::from("unknown")),
                     instrument_id: instrument_id.unwrap_or_else(|| InstrumentId::from("unknown")),
                     side: fill_side,
@@ -1151,6 +1246,28 @@ fn handle_user_event(
         }
     };
     Ok(outcome)
+}
+
+fn resolve_user_event_client_order_id(
+    client_order_id: Option<String>,
+    venue_order_id: Option<&str>,
+    execution_venue_map: &HashMap<ClientOrderId, Option<OrderId>>,
+) -> Option<String> {
+    if client_order_id
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return client_order_id;
+    }
+    let venue_order_id = venue_order_id?;
+    execution_venue_map
+        .iter()
+        .find_map(|(client_id, mapped_venue_id)| {
+            mapped_venue_id
+                .as_ref()
+                .filter(|order_id| order_id.as_str() == venue_order_id)
+                .map(|_| client_id.to_string())
+        })
 }
 
 fn parse_trade_side(raw: &str) -> TradeSide {
@@ -1296,6 +1413,7 @@ async fn execute_execution_adapter(
     live_safety: &mut LiveSafetyState,
     execution_adapter: Arc<dyn ExecutionAdapter>,
     execution_policy: &ExecutionPolicy,
+    seen_venue_fill_keys: &mut HashSet<String>,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -1306,8 +1424,15 @@ async fn execute_execution_adapter(
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
 
     if !execution_policy.paper_mode {
-        let report =
-            sync_execution_state(execution_adapter.as_ref(), runtime, execution_venue_map).await;
+        let report = sync_execution_state(
+            execution_adapter.as_ref(),
+            runtime,
+            execution_venue_map,
+            execution_policy,
+            seen_venue_fill_keys,
+            observed_at_ms,
+        )
+        .await;
         apply_sync_report(
             runtime,
             metrics,
@@ -1335,7 +1460,7 @@ async fn execute_execution_adapter(
                 ManagedOrderStatus::PendingSubmit => {
                     queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
                 }
-                ManagedOrderStatus::NeedsReconcile => warn!(
+                ManagedOrderStatus::NeedsReconcile => debug!(
                     mode = "live",
                     client_order_id = %client_order_id,
                     "order requires reconciliation; skipping automatic submit replay"
@@ -1395,17 +1520,21 @@ async fn execute_execution_adapter(
                 match execution_adapter.submit(submit_req).await {
                     Ok(ack) if ack.accepted => {
                         live_safety.consecutive_submit_errors = 0;
-                        if let Some(order_id) = ack.venue_order_id.clone() {
-                            execution_venue_map
-                                .insert(intent.client_order_id.clone(), Some(order_id));
-                        }
-                        let opened_outcome =
-                            runtime.on_order_opened(&intent.client_order_id, observed_at_ms);
+                        execution_venue_map
+                            .insert(intent.client_order_id.clone(), ack.venue_order_id.clone());
+                        let opened_outcome = runtime.on_order_opened_with_venue(
+                            &intent.client_order_id,
+                            ack.venue_order_id.clone(),
+                            observed_at_ms,
+                        );
                         combined.extend(opened_outcome);
                         let report = sync_execution_state(
                             execution_adapter.as_ref(),
                             runtime,
                             execution_venue_map,
+                            execution_policy,
+                            seen_venue_fill_keys,
+                            observed_at_ms,
                         )
                         .await;
                         apply_sync_report(
@@ -1514,6 +1643,9 @@ async fn execute_execution_adapter(
                             execution_adapter.as_ref(),
                             runtime,
                             execution_venue_map,
+                            execution_policy,
+                            seen_venue_fill_keys,
+                            observed_at_ms,
                         )
                         .await;
                         apply_sync_report(
@@ -1527,14 +1659,53 @@ async fn execute_execution_adapter(
                         );
                     }
                     Ok(ack) => {
-                        live_safety.consecutive_cancel_errors =
-                            live_safety.consecutive_cancel_errors.saturating_add(1);
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected cancel".to_string());
-                        let rejected_outcome =
-                            runtime.on_order_rejected(&client_order_id, reason, ack.accepted_at_ms);
-                        combined.extend(rejected_outcome);
+                        let lower_reason = reason.to_ascii_lowercase();
+                        let uncertain_cancel = lower_reason.contains("matched")
+                            || lower_reason.contains("already canceled")
+                            || lower_reason.contains("can't be found");
+                        if !uncertain_cancel {
+                            live_safety.consecutive_cancel_errors =
+                                live_safety.consecutive_cancel_errors.saturating_add(1);
+                        }
+                        warn!(
+                            mode = "live",
+                            client_order_id = %client_order_id,
+                            venue_order_id = ?ack.venue_order_id,
+                            reason = %reason,
+                            "cancel rejected by venue; treating order state as uncertain"
+                        );
+                        metrics.observe_uncertain_submit();
+                        combined.extend(runtime.mark_order_needs_reconcile(
+                            &client_order_id,
+                            ack.accepted_at_ms,
+                            format!("cancel rejected by venue; uncertain state: {reason}"),
+                        ));
+                        metrics.observe_riskoff_transition();
+                        combined.extend(runtime.degrade_and_cancel_all(
+                            ack.accepted_at_ms,
+                            format!("cancel rejected by venue; risk-off until venue fill state is reconciled: {reason}"),
+                        ));
+                        let report = sync_execution_state(
+                            execution_adapter.as_ref(),
+                            runtime,
+                            execution_venue_map,
+                            execution_policy,
+                            seen_venue_fill_keys,
+                            ack.accepted_at_ms,
+                        )
+                        .await;
+                        apply_sync_report(
+                            runtime,
+                            metrics,
+                            live_safety,
+                            execution_policy,
+                            report,
+                            ack.accepted_at_ms,
+                            &mut combined,
+                        );
                     }
                     Err(error) => {
                         live_safety.consecutive_cancel_errors =
@@ -1663,6 +1834,9 @@ async fn sync_execution_state(
     execution_adapter: &dyn ExecutionAdapter,
     runtime: &Runtime<StrategyMode>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
+    execution_policy: &ExecutionPolicy,
+    seen_venue_fill_keys: &mut HashSet<String>,
+    now_ms: u64,
 ) -> ExecutionSyncReport {
     let mut report = ExecutionSyncReport::default();
     match execution_adapter.sync_open_orders().await {
@@ -1680,6 +1854,46 @@ async fn sync_execution_state(
                         .or_insert(Some(order.venue_order_id.clone()));
                 }
             }
+            let fill_after_ms = now_ms.saturating_sub(15 * 60 * 1_000);
+            let filled_client_ids = match execution_adapter.sync_recent_fills(fill_after_ms).await {
+                Ok(fills) => {
+                    let mut filled_client_ids = HashSet::new();
+                    for mut fill in fills {
+                        let fill_key = venue_fill_key(&fill);
+                        if seen_venue_fill_keys.contains(&fill_key) {
+                            continue;
+                        }
+                        let resolved_client_order_id = fill.client_order_id.clone().or_else(|| {
+                            resolve_user_event_client_order_id(
+                                None,
+                                Some(fill.venue_order_id.as_str()),
+                                execution_venue_map,
+                            )
+                            .map(ClientOrderId::from)
+                        });
+                        let Some(client_order_id) = resolved_client_order_id else {
+                            continue;
+                        };
+                        if !runtime
+                            .open_order_snapshots()
+                            .iter()
+                            .any(|managed| managed.intent.client_order_id == client_order_id)
+                        {
+                            continue;
+                        }
+                        fill.client_order_id = Some(client_order_id.clone());
+                        filled_client_ids.insert(client_order_id);
+                        report.venue_fills.push(fill);
+                        seen_venue_fill_keys.insert(fill_key);
+                    }
+                    filled_client_ids
+                }
+                Err(error) => {
+                    report.errors = report.errors.saturating_add(1);
+                    warn!(error = %error, "execution recent fills sync failed");
+                    HashSet::new()
+                }
+            };
             for managed in runtime.open_order_snapshots() {
                 if !matches!(
                     managed.status,
@@ -1694,15 +1908,28 @@ async fn sync_execution_state(
                 else {
                     continue;
                 };
+                if filled_client_ids.contains(&managed.intent.client_order_id) {
+                    continue;
+                }
                 if !venue_ids.contains(venue_order_id) {
-                    report
-                        .missing_local_orders
-                        .push(managed.intent.client_order_id.clone());
+                    let age_ms = now_ms.saturating_sub(managed.last_update_ms);
+                    if age_ms < execution_policy.live_reconcile_missing_grace_ms {
+                        report
+                            .pending_missing_local_orders
+                            .push(managed.intent.client_order_id.clone());
+                    } else {
+                        report
+                            .missing_local_orders
+                            .push(managed.intent.client_order_id.clone());
+                    }
                 }
             }
             debug!(
                 open_orders = open_order_count,
+                venue_fills = report.venue_fills.len(),
                 local_open_orders = runtime.open_order_snapshots().len(),
+                pending_missing_local_orders = report.pending_missing_local_orders.len(),
+                missing_local_orders = report.missing_local_orders.len(),
                 "synced execution open orders"
             );
         }
@@ -1715,6 +1942,9 @@ async fn sync_execution_state(
     match execution_adapter.sync_balances().await {
         Ok(balances) => {
             report.balance_synced = true;
+            report.venue_cash_usd = Some(balances.cash_usd);
+            report.venue_position_count = balances.positions.len();
+            report.venue_balance_observed_at_ms = Some(balances.observed_at_ms);
             debug!(
                 cash_usd = balances.cash_usd,
                 positions = balances.positions.len(),
@@ -1749,6 +1979,58 @@ fn apply_sync_report(
         metrics.observe_reconcile_failure();
     } else {
         live_safety.consecutive_reconcile_mismatches = 0;
+    }
+    if report.balance_synced {
+        live_safety.last_venue_cash_usd = report.venue_cash_usd;
+        live_safety.last_venue_position_count = report.venue_position_count;
+        live_safety.last_venue_balance_observed_at_ms = report.venue_balance_observed_at_ms;
+        if let Some(cash_usd) = report.venue_cash_usd {
+            metrics.set_venue_balance_metrics(cash_usd, report.venue_position_count);
+            info!(
+                mode = "live",
+                venue_cash_usd = cash_usd,
+                venue_position_count = report.venue_position_count,
+                "synced venue balance state"
+            );
+        }
+    }
+
+    for fill in report.venue_fills {
+        let fill_report = FillReport {
+            order_id: Some(fill.venue_order_id),
+            client_order_id: fill.client_order_id,
+            market_id: fill.market_id,
+            instrument_id: fill.instrument_id,
+            side: fill.side,
+            price: fill.price,
+            quantity: fill.quantity,
+            fee_usd: fill.fee_usd,
+            liquidity: fill.liquidity,
+            close_method: None,
+            observed_at_ms: fill.observed_at_ms,
+        };
+        if fill_report.quantity <= 0.0 || fill_report.price <= 0.0 {
+            continue;
+        }
+        metrics.record_fill(&fill_report, None);
+        match runtime.on_fill(fill_report) {
+            Ok(fill_outcome) => combined.extend(fill_outcome),
+            Err(error) => {
+                live_safety.consecutive_reconcile_mismatches = live_safety
+                    .consecutive_reconcile_mismatches
+                    .saturating_add(1);
+                metrics.observe_reconcile_failure();
+                warn!(error = ?error, "failed to apply venue fill during live reconciliation");
+            }
+        }
+    }
+
+    for client_order_id in report.pending_missing_local_orders {
+        debug!(
+            mode = "live",
+            client_order_id = %client_order_id,
+            "live order temporarily absent from open-order sync within grace; deferring reconcile"
+        );
     }
 
     for client_order_id in report.missing_local_orders {
@@ -1827,6 +2109,7 @@ fn enforce_live_health(
     runtime: &mut Runtime<StrategyMode>,
     metrics: &AppMetrics,
     config: &AppConfig,
+    live_safety: &LiveSafetyState,
     now_ms: u64,
     started_at_ms: u64,
 ) -> RuntimeOutcome {
@@ -1872,6 +2155,16 @@ fn enforce_live_health(
     }
     if !snapshot.execution_adapter_connected {
         failures.push("execution adapter disconnected".to_string());
+    }
+    match live_safety.last_venue_cash_usd {
+        Some(cash_usd) if cash_usd < config.risk_limits.min_free_cash_usd => {
+            failures.push(format!(
+                "venue cash below floor cash={cash_usd:.4} floor={:.4}",
+                config.risk_limits.min_free_cash_usd
+            ));
+        }
+        Some(_) => {}
+        None => failures.push("venue balance has not synced".to_string()),
     }
     let needs_reconcile = needs_reconcile_order_count(runtime);
     if needs_reconcile > 0 {
@@ -2104,6 +2397,13 @@ fn deterministic_hash_0_95(value: &str) -> f64 {
     (0.05 + (normalized * 0.95)).min(1.0)
 }
 
+fn venue_fill_key(fill: &VenueFill) -> String {
+    format!(
+        "{}:{}:{:.8}:{:.8}:{}",
+        fill.venue_order_id, fill.instrument_id, fill.price, fill.quantity, fill.observed_at_ms
+    )
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2122,7 +2422,7 @@ mod tests {
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::strategy::NoopStrategy;
     use crate::wire::execution_adapter::{
-        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances,
+        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances, VenueFill,
     };
 
     #[derive(Default)]
@@ -2175,6 +2475,13 @@ mod tests {
                 observed_at_ms: 0,
             })
         }
+
+        async fn sync_recent_fills(
+            &self,
+            _after_ms: u64,
+        ) -> Result<Vec<VenueFill>, ExecutionError> {
+            Ok(Vec::new())
+        }
     }
 
     #[tokio::test]
@@ -2201,6 +2508,7 @@ mod tests {
         let mut execution_venue_map = HashMap::new();
         let mut live_safety = LiveSafetyState::default();
         let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
 
         let outcome = execute_execution_adapter(
             &mut runtime,
@@ -2213,6 +2521,7 @@ mod tests {
             &mut live_safety,
             adapter.clone(),
             &execution_policy,
+            &mut seen_venue_fill_keys,
         )
         .await
         .expect("execute");
@@ -2227,6 +2536,69 @@ mod tests {
             })
             .expect("managed order");
         assert_eq!(order.status, ManagedOrderStatus::NeedsReconcile);
+    }
+
+    #[tokio::test]
+    async fn live_sync_defers_recent_missing_working_order() {
+        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
+        let adapter = Arc::new(RecordingAdapter::default());
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::from([(
+            ClientOrderId::from("client-working"),
+            Some(OrderId::from("venue-1")),
+        )]);
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+        assert!(adapter.cancelled.lock().expect("cancelled lock").is_empty());
+        let order = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .find(|managed| managed.intent.client_order_id == ClientOrderId::from("client-working"))
+            .expect("managed order");
+        assert_eq!(order.status, ManagedOrderStatus::Working);
+    }
+
+    #[test]
+    fn user_fill_resolves_client_order_from_venue_order_id() {
+        let execution_venue_map = HashMap::from([(
+            ClientOrderId::from("client-1"),
+            Some(OrderId::from("venue-1")),
+        )]);
+
+        assert_eq!(
+            resolve_user_event_client_order_id(None, Some("venue-1"), &execution_venue_map),
+            Some("client-1".to_string())
+        );
+        assert_eq!(
+            resolve_user_event_client_order_id(
+                Some("client-direct".to_string()),
+                Some("venue-1"),
+                &execution_venue_map,
+            ),
+            Some("client-direct".to_string())
+        );
     }
 
     #[test]
@@ -2304,6 +2676,7 @@ mod tests {
             live_post_only: true,
             live_order_ttl_ms: 20_000,
             live_order_max_age_ms: 25_000,
+            live_reconcile_missing_grace_ms: 5_000,
             live_max_submit_errors: 1,
             live_max_cancel_errors: 1,
             live_kill_on_reconcile_mismatch: true,
@@ -2321,30 +2694,53 @@ mod tests {
     }
 
     fn runtime_with_recovered_needs_reconcile_order() -> Runtime<StrategyMode> {
+        runtime_with_recovered_order(
+            ClientOrderId::from("client-reconcile"),
+            ManagedOrderStatus::NeedsReconcile,
+            1,
+            "polymarket-exec-live-reconcile-replay",
+        )
+    }
+
+    fn runtime_with_recovered_working_order(last_update_ms: u64) -> Runtime<StrategyMode> {
+        runtime_with_recovered_order(
+            ClientOrderId::from("client-working"),
+            ManagedOrderStatus::Working,
+            last_update_ms,
+            "polymarket-exec-live-working-replay",
+        )
+    }
+
+    fn runtime_with_recovered_order(
+        client_order_id: ClientOrderId,
+        status: ManagedOrderStatus,
+        last_update_ms: u64,
+        path_prefix: &str,
+    ) -> Runtime<StrategyMode> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("polymarket-exec-live-reconcile-replay-{ts}.sqlite"));
+        let path = std::env::temp_dir().join(format!("{path_prefix}-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(&path).expect("store");
         let mut record = OrderRecord::from_intent(
             "run-test",
             &OrderIntent {
-                client_order_id: ClientOrderId::from("client-reconcile"),
+                client_order_id,
                 market_id: MarketId::from("market-1"),
                 instrument_id: InstrumentId::from("token-1"),
                 side: TradeSide::Buy,
                 limit_price: 0.40,
                 quantity: 5.0,
                 reduce_only: false,
-                reason: "test recovered uncertain submit".to_string(),
+                reason: "test recovered live order".to_string(),
                 quote_level_tag: None,
-                created_at_ms: 1,
+                created_at_ms: last_update_ms,
             },
             "noop",
         );
-        record.last_update_ms = 1;
+        record.status = status;
+        record.last_update_ms = last_update_ms;
         store.insert(record).expect("insert order");
 
         let mut runtime = Runtime::new_with_order_store(

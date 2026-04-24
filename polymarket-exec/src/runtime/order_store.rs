@@ -10,6 +10,9 @@ use crate::types::{
     ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, TradeSide,
 };
 
+const DUST_REMAINING_QTY: f64 = 0.01;
+const DUST_REMAINING_NOTIONAL_USD: f64 = 0.01;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderRecord {
     pub run_id: String,
@@ -603,10 +606,25 @@ impl OrderStore for SqliteOrderStore {
         updated_at_ms: EpochMillis,
     ) -> std::result::Result<(), OrderStoreError> {
         let current_status = self.current_status(client_order_id)?;
-        if !current_status.can_transition_to(ManagedOrderStatus::Submitted) {
+        let next_status = match current_status {
+            ManagedOrderStatus::PendingSubmit | ManagedOrderStatus::Submitted => {
+                ManagedOrderStatus::Submitted
+            }
+            ManagedOrderStatus::Working | ManagedOrderStatus::CancelRequested => current_status,
+            ManagedOrderStatus::NeedsReconcile => ManagedOrderStatus::Working,
+            ManagedOrderStatus::Filled
+            | ManagedOrderStatus::Cancelled
+            | ManagedOrderStatus::Rejected => {
+                return Err(OrderStoreError::Conflict(format!(
+                    "invalid venue attachment for terminal order {}: {:?}",
+                    client_order_id, current_status
+                )));
+            }
+        };
+        if !current_status.can_transition_to(next_status) {
             return Err(OrderStoreError::Conflict(format!(
-                "invalid venue attachment transition for {}: {:?} -> Submitted",
-                client_order_id, current_status
+                "invalid venue attachment transition for {}: {:?} -> {:?}",
+                client_order_id, current_status, next_status
             )));
         }
         let updated = self
@@ -617,7 +635,7 @@ impl OrderStore for SqliteOrderStore {
                  WHERE client_order_id = ?4",
                 params![
                     venue_order_id.as_str(),
-                    Self::status_to_db(ManagedOrderStatus::Submitted),
+                    Self::status_to_db(next_status),
                     updated_at_ms,
                     client_order_id.as_str(),
                 ],
@@ -648,10 +666,15 @@ impl OrderStore for SqliteOrderStore {
             .ok_or_else(|| OrderStoreError::NotFound(client_order_id.clone()))?;
 
         let mut remaining_qty = (record.remaining_qty - fill_qty).max(0.0);
-        let filled_qty = record.filled_qty + fill_qty.min(record.remaining_qty);
+        let mut filled_qty = record.filled_qty + fill_qty.min(record.remaining_qty);
 
-        if remaining_qty <= 1e-9 {
+        let remaining_notional = remaining_qty * record.limit_price;
+        if remaining_qty <= 1e-9
+            || remaining_qty <= DUST_REMAINING_QTY
+            || remaining_notional <= DUST_REMAINING_NOTIONAL_USD
+        {
             remaining_qty = 0.0;
+            filled_qty = record.original_qty;
         }
         let status = if remaining_qty <= 1e-9 {
             ManagedOrderStatus::Filled
@@ -936,12 +959,134 @@ mod tests {
     }
 
     #[test]
+    fn attach_venue_id_preserves_working_state() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "polymarket-exec-order-store-working-attach-{ts}.sqlite"
+        ));
+        let mut store = SqliteOrderStore::open(path)?;
+        let now: EpochMillis = 1;
+        let client_order_id = ClientOrderId::from("coid-working");
+
+        store.insert(crate::runtime::order_store::OrderRecord::from_intent(
+            "run-1",
+            &OrderIntent {
+                client_order_id: client_order_id.clone(),
+                market_id: MarketId::from("mkt-1"),
+                instrument_id: InstrumentId::from("inst-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.72,
+                quantity: 5.0,
+                reduce_only: false,
+                reason: "test".to_string(),
+                quote_level_tag: None,
+                created_at_ms: now,
+            },
+            "strat",
+        ))?;
+        store.update_status(&client_order_id, ManagedOrderStatus::Working, now + 1)?;
+
+        store.attach_venue_id(&client_order_id, OrderId::from("venue-working"), now + 2)?;
+
+        let row = store.get(&client_order_id)?.expect("row");
+        assert_eq!(row.venue_order_id, Some(OrderId::from("venue-working")));
+        assert_eq!(row.status, ManagedOrderStatus::Working);
+        Ok(())
+    }
+
+    #[test]
+    fn attach_venue_id_recovers_needs_reconcile_to_working() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "polymarket-exec-order-store-needs-reconcile-attach-{ts}.sqlite"
+        ));
+        let mut store = SqliteOrderStore::open(path)?;
+        let now: EpochMillis = 1;
+        let client_order_id = ClientOrderId::from("coid-reconcile");
+
+        store.insert(crate::runtime::order_store::OrderRecord::from_intent(
+            "run-1",
+            &OrderIntent {
+                client_order_id: client_order_id.clone(),
+                market_id: MarketId::from("mkt-1"),
+                instrument_id: InstrumentId::from("inst-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.72,
+                quantity: 5.0,
+                reduce_only: false,
+                reason: "test".to_string(),
+                quote_level_tag: None,
+                created_at_ms: now,
+            },
+            "strat",
+        ))?;
+        store.update_status(
+            &client_order_id,
+            ManagedOrderStatus::NeedsReconcile,
+            now + 1,
+        )?;
+
+        store.attach_venue_id(&client_order_id, OrderId::from("venue-recovered"), now + 2)?;
+
+        let row = store.get(&client_order_id)?.expect("row");
+        assert_eq!(row.venue_order_id, Some(OrderId::from("venue-recovered")));
+        assert_eq!(row.status, ManagedOrderStatus::Working);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_fill_treats_sub_cent_remainder_as_filled() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path =
+            env::temp_dir().join(format!("polymarket-exec-order-store-dust-fill-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(path)?;
+        let now: EpochMillis = 1;
+        let client_order_id = ClientOrderId::from("coid-dust");
+
+        store.insert(crate::runtime::order_store::OrderRecord::from_intent(
+            "run-1",
+            &OrderIntent {
+                client_order_id: client_order_id.clone(),
+                market_id: MarketId::from("mkt-1"),
+                instrument_id: InstrumentId::from("inst-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.73,
+                quantity: 5.0,
+                reduce_only: false,
+                reason: "test".to_string(),
+                quote_level_tag: None,
+                created_at_ms: now,
+            },
+            "strat",
+        ))?;
+        store.update_status(&client_order_id, ManagedOrderStatus::Working, now + 1)?;
+
+        store.apply_fill(&client_order_id, 4.990369, now + 2)?;
+
+        let row = store.get(&client_order_id)?.expect("row");
+        assert_eq!(row.status, ManagedOrderStatus::Filled);
+        assert_eq!(row.remaining_qty, 0.0);
+        assert_eq!(row.filled_qty, 5.0);
+        Ok(())
+    }
+
+    #[test]
     fn duplicate_insert_is_conflict() -> anyhow::Result<()> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("polymarket-exec-order-store-conflict-{ts}.sqlite"));
+        let path =
+            env::temp_dir().join(format!("polymarket-exec-order-store-conflict-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
         let now: EpochMillis = 10;
         let intent = OrderIntent {

@@ -1,6 +1,6 @@
 # TODO: Execution Roadmap (Rust `polymarket-exec` is now primary)
 
-_Last updated: 2026-04-23_
+_Last updated: 2026-04-24_
 
 ## What is already in place
 
@@ -60,6 +60,13 @@ _Last updated: 2026-04-23_
   - safer mode switches for pair strategy variants and emergency kill-path.
 - [ ] Centralize per-strategy config contract.
   - `config.rs` still reads strategy parameters from many env variables; this has risk of drift.
+- [ ] Before scaling beyond tiny-live, move live auth/funding to the intended Polymarket profile wallet.
+  - Tiny-live may temporarily use the funded MetaMask EOA path while we validate execution behavior.
+  - Before increasing capital, set the correct `POLYMARKET_SIGNATURE_TYPE` and `POLYMARKET_FUNDER_ADDRESS` for the Polymarket Safe/proxy wallet, then rerun live smoke and balance/open-order reconciliation.
+  - Do not treat EOA smoke success as proof that profile-wallet/Safe execution is configured correctly.
+- [ ] Add settlement/redeem operations for resolved market positions.
+  - Current live safety now tracks venue cash, but unresolved/redeemable positions can still tie up capital.
+  - Add an explicit post-settlement redeem worker or operator command before scaling capital.
 
 ## Notes
 

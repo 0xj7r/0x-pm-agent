@@ -213,6 +213,8 @@ pub struct HealthControlPlaneState {
     pub market_ws_connected: bool,
     pub user_ws_connected: bool,
     pub execution_adapter_connected: bool,
+    pub venue_cash_usd: f64,
+    pub venue_position_count: usize,
     pub last_market_message_age_ms: f64,
     pub last_user_message_age_ms: f64,
     pub last_reconcile_age_ms: f64,

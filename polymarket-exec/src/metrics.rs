@@ -66,6 +66,8 @@ pub struct AppMetrics {
     reconcile_failures_total: IntCounter,
     runtime_riskoff_transitions_total: IntCounter,
     uncertain_submit_total: IntCounter,
+    venue_cash_usd: Gauge,
+    venue_position_count: IntGauge,
     inventory_skew_usd: Gauge,
     realized_pnl_usd: Gauge,
     unrealized_pnl_usd: Gauge,
@@ -106,6 +108,8 @@ pub struct ControlPlaneMetricsSnapshot {
     pub reconcile_failures_total: u64,
     pub runtime_riskoff_transitions_total: u64,
     pub uncertain_submit_total: u64,
+    pub venue_cash_usd: f64,
+    pub venue_position_count: usize,
     pub inventory_skew_usd: f64,
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
@@ -256,6 +260,14 @@ impl AppMetrics {
             "uncertain_submit_total",
             "Count of uncertain submit outcomes",
         )?;
+        let venue_cash_usd = Gauge::with_opts(Opts::new(
+            "venue_cash_usd",
+            "Latest synced venue cash balance in USD",
+        ))?;
+        let venue_position_count = IntGauge::with_opts(Opts::new(
+            "venue_position_count",
+            "Latest synced venue position count",
+        ))?;
         let inventory_skew_usd = Gauge::with_opts(Opts::new(
             "inventory_skew_usd",
             "Current inventory skew in USD",
@@ -305,6 +317,8 @@ impl AppMetrics {
         registry.register(Box::new(reconcile_failures_total.clone()))?;
         registry.register(Box::new(runtime_riskoff_transitions_total.clone()))?;
         registry.register(Box::new(uncertain_submit_total.clone()))?;
+        registry.register(Box::new(venue_cash_usd.clone()))?;
+        registry.register(Box::new(venue_position_count.clone()))?;
         registry.register(Box::new(inventory_skew_usd.clone()))?;
         registry.register(Box::new(realized_pnl_usd.clone()))?;
         registry.register(Box::new(unrealized_pnl_usd.clone()))?;
@@ -350,6 +364,8 @@ impl AppMetrics {
             reconcile_failures_total,
             runtime_riskoff_transitions_total,
             uncertain_submit_total,
+            venue_cash_usd,
+            venue_position_count,
             inventory_skew_usd,
             realized_pnl_usd,
             unrealized_pnl_usd,
@@ -532,6 +548,11 @@ impl AppMetrics {
         self.inventory_skew_usd.set(inventory_skew_usd);
     }
 
+    pub fn set_venue_balance_metrics(&self, cash_usd: f64, position_count: usize) {
+        self.venue_cash_usd.set(cash_usd);
+        self.venue_position_count.set(position_count as i64);
+    }
+
     pub fn set_economics_metrics(
         &self,
         realized_pnl_usd: f64,
@@ -582,6 +603,8 @@ impl AppMetrics {
             reconcile_failures_total: self.reconcile_failures_total.get(),
             runtime_riskoff_transitions_total: self.runtime_riskoff_transitions_total.get(),
             uncertain_submit_total: self.uncertain_submit_total.get(),
+            venue_cash_usd: self.venue_cash_usd.get(),
+            venue_position_count: self.venue_position_count.get().max(0) as usize,
             inventory_skew_usd: self.inventory_skew_usd.get(),
             realized_pnl_usd: self.realized_pnl_usd.get(),
             unrealized_pnl_usd: self.unrealized_pnl_usd.get(),

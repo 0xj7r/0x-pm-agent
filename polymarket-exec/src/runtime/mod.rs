@@ -36,7 +36,7 @@ use crate::strategy::{
 };
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot,
-    OrderIntent, TradeSide,
+    OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 use serde::Serialize;
@@ -362,6 +362,19 @@ impl<S: Strategy> Runtime<S> {
         self.status
     }
 
+    pub fn has_needs_reconcile_orders(&self) -> bool {
+        self.open_orders
+            .values()
+            .any(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+    }
+
+    pub fn set_quote_reconciler_config(
+        &mut self,
+        config: crate::quote_reconciler::ReconcilerConfig,
+    ) {
+        self.quote_reconciler = QuoteReconciler::new(config);
+    }
+
     pub fn run_id(&self) -> &str {
         self.run_id.as_str()
     }
@@ -645,6 +658,20 @@ impl<S: Strategy> Runtime<S> {
     }
 
     pub fn start(&mut self, now_ms: EpochMillis) -> RuntimeOutcome {
+        if self.status == RuntimeStatus::Degraded {
+            let mut outcome = RuntimeOutcome::default();
+            outcome.push_event(self.event_log.push(EventRecord::new(
+                EventCategory::Runtime,
+                now_ms,
+                "runtime start skipped because runtime is degraded",
+            )));
+            outcome.push_event(
+                self.event_log
+                    .push(EventRecord::runtime_status(now_ms, self.status)),
+            );
+            return outcome;
+        }
+
         self.status = RuntimeStatus::Running;
         let mut outcome = RuntimeOutcome::default();
         outcome.push_event(
@@ -948,7 +975,59 @@ impl<S: Strategy> Runtime<S> {
         client_order_id: &ClientOrderId,
         now_ms: EpochMillis,
     ) -> RuntimeOutcome {
+        self.on_order_opened_with_venue(client_order_id, None, now_ms)
+    }
+
+    pub fn on_order_opened_with_venue(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        venue_order_id: Option<OrderId>,
+        now_ms: EpochMillis,
+    ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        if let Some(venue_order_id) = venue_order_id {
+            if let Some(store) = self.order_store.as_mut() {
+                if let Err(error) =
+                    store.attach_venue_id(client_order_id, venue_order_id.clone(), now_ms)
+                {
+                    warn!(
+                        run_id = %self.run_id,
+                        error = ?error,
+                        client_order_id = %client_order_id,
+                        venue_order_id = %venue_order_id,
+                        "failed to persist venue order id after submit acknowledgement"
+                    );
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Execution,
+                                now_ms,
+                                format!(
+                                    "failed to persist venue order id after submit acknowledgement: {error}"
+                                ),
+                            )
+                            .with_client_order(client_order_id.clone()),
+                        ),
+                    );
+                    outcome.extend(self.mark_order_needs_reconcile(
+                        client_order_id,
+                        now_ms,
+                        "failed to persist venue order id after submit acknowledgement",
+                    ));
+                    return outcome;
+                }
+            }
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!("attached venue order id {venue_order_id}"),
+                    )
+                    .with_client_order(client_order_id.clone()),
+                ),
+            );
+        }
         outcome.extend(self.set_order_status(
             client_order_id,
             ManagedOrderStatus::Working,
@@ -1088,11 +1167,39 @@ impl<S: Strategy> Runtime<S> {
     ) -> RuntimeOutcome {
         let reason = reason.into();
         let mut outcome = RuntimeOutcome::default();
-        let (market_id, instrument_id) = match self.open_orders.get(client_order_id) {
-            Some(managed) => (
-                managed.intent.market_id.clone(),
-                managed.intent.instrument_id.clone(),
-            ),
+        let (market_id, instrument_id, status) = match self.open_orders.get(client_order_id) {
+            Some(managed) => {
+                if matches!(
+                    managed.status,
+                    ManagedOrderStatus::NeedsReconcile
+                        | ManagedOrderStatus::CancelRequested
+                        | ManagedOrderStatus::Filled
+                        | ManagedOrderStatus::Cancelled
+                        | ManagedOrderStatus::Rejected
+                ) {
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Runtime,
+                                now_ms,
+                                format!(
+                                    "skipped duplicate/unsafe cancel for status {:?}: {}",
+                                    managed.status, reason
+                                ),
+                            )
+                            .with_market(managed.intent.market_id.clone())
+                            .with_instrument(managed.intent.instrument_id.clone())
+                            .with_client_order(client_order_id.clone()),
+                        ),
+                    );
+                    return outcome;
+                }
+                (
+                    managed.intent.market_id.clone(),
+                    managed.intent.instrument_id.clone(),
+                    managed.status,
+                )
+            }
             None => return outcome,
         };
 
@@ -1111,7 +1218,7 @@ impl<S: Strategy> Runtime<S> {
                 EventRecord::new(
                     EventCategory::Runtime,
                     now_ms,
-                    "requested order cancellation",
+                    format!("requested order cancellation from {:?}", status),
                 )
                 .with_market(market_id)
                 .with_instrument(instrument_id)
@@ -1933,17 +2040,17 @@ impl<S: Strategy> Runtime<S> {
                         .with_instrument(managed.intent.instrument_id.clone()),
                     ),
                 );
+                self.record_status_persist(client_order_id, status, now_ms);
             }
             None => {
                 warn!(
                     run_id = %self.run_id,
                     client_order_id = %client_order_id,
                     status = ?status,
-                    "status transition requested for unknown active order"
+                    "status transition requested for unknown active order; ignoring local late event"
                 );
             }
         };
-        self.record_status_persist(client_order_id, status, now_ms);
         outcome
     }
 
@@ -2509,7 +2616,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("polymarket-exec-order-store-startup-{ts}.sqlite"));
+        let path =
+            std::env::temp_dir().join(format!("polymarket-exec-order-store-startup-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(&path).unwrap();
         let now_ms: u64 = 10;
         let record = OrderRecord::from_intent(
@@ -2697,6 +2805,67 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("fail-closed stale submit state Submitted")),
             "missing fail-closed submit event in {recent_messages:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_runtime_does_not_restart_or_cancel_needs_reconcile_orders() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
+        );
+        runtime.start(1);
+
+        let snapshot = MarketSnapshot {
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.39, 100.0)),
+                best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
+                last_trade_price: Some(0.40),
+                observed_at_ms: 2,
+            },
+        };
+        runtime.on_market_snapshot(snapshot).expect("quote");
+        runtime.mark_order_needs_reconcile(
+            &ClientOrderId::from("client-1"),
+            3,
+            "uncertain live state",
+        );
+
+        let degraded =
+            runtime.degrade_and_cancel_all(4, "startup has orders requiring reconciliation");
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert!(runtime.has_needs_reconcile_orders());
+        assert!(
+            degraded.commands.is_empty(),
+            "NeedsReconcile orders must not produce venue cancel commands"
+        );
+
+        let restarted = runtime.start(5);
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert!(restarted.commands.is_empty());
+        let recent_messages = runtime
+            .event_log()
+            .recent(8)
+            .into_iter()
+            .map(|event| event.message)
+            .collect::<Vec<_>>();
+        assert!(
+            recent_messages.iter().any(
+                |message| message.contains("runtime start skipped because runtime is degraded")
+            ),
+            "missing degraded-start guard event in {recent_messages:?}"
         );
     }
 }

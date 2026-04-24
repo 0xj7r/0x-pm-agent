@@ -242,46 +242,75 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    let trader_side = event
+        .get("trader_side")
+        .and_then(Value::as_str)
+        .map(|value| value.to_ascii_lowercase());
+    let maker_order = (trader_side.as_deref() == Some("maker"))
+        .then(|| first_maker_order(event))
+        .flatten();
+
     let market_id = event
         .get("market")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let asset_id = event
-        .get("asset_id")
-        .and_then(Value::as_str)
+    let asset_id = maker_order
+        .and_then(|order| parse_str(order, &["asset_id", "assetId"]))
+        .or_else(|| event.get("asset_id").and_then(Value::as_str))
         .or_else(|| event.get("assetId").and_then(Value::as_str))
         .map(ToOwned::to_owned);
 
-    let order_id = event
-        .get("id")
-        .and_then(Value::as_str)
+    let order_id = maker_order
+        .and_then(|order| parse_str(order, &["order_id", "orderId"]))
+        .or_else(|| {
+            event
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("order_id").and_then(Value::as_str))
+                .or_else(|| event.get("orderId").and_then(Value::as_str))
+                .or_else(|| event.get("maker_order_id").and_then(Value::as_str))
+                .or_else(|| event.get("makerOrderId").and_then(Value::as_str))
+        })
         .map(ToOwned::to_owned);
     let client_order_id = event
         .get("client_order_id")
         .and_then(Value::as_str)
+        .or_else(|| event.get("clientOrderId").and_then(Value::as_str))
+        .or_else(|| event.get("maker_client_order_id").and_then(Value::as_str))
+        .or_else(|| event.get("makerClientOrderId").and_then(Value::as_str))
         .or_else(|| event.get("taker_order_id").and_then(Value::as_str))
         .map(ToOwned::to_owned);
 
-    let side = event
-        .get("side")
-        .and_then(Value::as_str)
+    let side = maker_order
+        .and_then(|order| order.get("side").and_then(Value::as_str))
+        .or_else(|| event.get("side").and_then(Value::as_str))
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let price = event
-        .get("price")
-        .and_then(value_as_f64_opt)
+    let price = maker_order
+        .and_then(|order| order.get("price").and_then(value_as_f64_opt))
+        .or_else(|| event.get("price").and_then(value_as_f64_opt))
         .or_else(|| event.get("match_price").and_then(value_as_f64_opt))
         .unwrap_or(0.0);
-    let qty = event
-        .get("size")
-        .or_else(|| event.get("matched_amount"))
-        .and_then(value_as_f64_opt)
+    let qty = maker_order
+        .and_then(|order| {
+            order
+                .get("matched_amount")
+                .or_else(|| order.get("matchedAmount"))
+                .and_then(value_as_f64_opt)
+        })
+        .or_else(|| {
+            event
+                .get("size")
+                .or_else(|| event.get("matched_amount"))
+                .and_then(value_as_f64_opt)
+        })
         .unwrap_or(0.0);
     let liquidity = event
         .get("liquidity")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+        .or_else(|| trader_side.clone())
         .or_else(|| {
             event
                 .get("maker_or_taker")
@@ -438,6 +467,14 @@ fn parse_str<'a>(event: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
+fn first_maker_order(event: &Value) -> Option<&Value> {
+    event
+        .get("maker_orders")
+        .or_else(|| event.get("makerOrders"))
+        .and_then(Value::as_array)
+        .and_then(|orders| orders.first())
+}
+
 fn build_subscribe_payload(auth: &UserWsAuth, markets: &[String]) -> Value {
     if markets.is_empty() {
         json!({
@@ -483,4 +520,52 @@ fn now_millis_fallback() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maker_trade_event_resolves_fill_from_maker_order() {
+        let event = json!({
+            "event_type": "trade",
+            "status": "matched",
+            "id": "trade-1",
+            "market": "0xmarket",
+            "asset_id": "taker-asset",
+            "side": "SELL",
+            "size": "99",
+            "price": "0.01",
+            "trader_side": "MAKER",
+            "timestamp": "1771770900000",
+            "maker_orders": [{
+                "order_id": "0xmaker-order",
+                "asset_id": "maker-asset",
+                "side": "BUY",
+                "matched_amount": "6.47",
+                "price": "0.17"
+            }]
+        });
+
+        match classify_user_event(&event).expect("classified") {
+            UserOrderEvent::OrderFilled {
+                order_id,
+                asset_id,
+                side,
+                price,
+                quantity,
+                liquidity,
+                ..
+            } => {
+                assert_eq!(order_id.as_deref(), Some("0xmaker-order"));
+                assert_eq!(asset_id.as_deref(), Some("maker-asset"));
+                assert_eq!(side, "buy");
+                assert_eq!(price, 0.17);
+                assert_eq!(quantity, 6.47);
+                assert_eq!(liquidity.as_deref(), Some("maker"));
+            }
+            other => panic!("expected maker fill, got {other:?}"),
+        }
+    }
 }
