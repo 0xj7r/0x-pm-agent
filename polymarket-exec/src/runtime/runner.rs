@@ -38,6 +38,8 @@ use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
+const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
+
 #[derive(Debug, Default)]
 struct LiveSafetyState {
     consecutive_submit_errors: usize,
@@ -480,6 +482,7 @@ async fn run_runtime_loop(
     dashboard_event_limit: usize,
     strategy_name: &str,
 ) -> Result<()> {
+    let live_health_started_at_ms = now_unix_ms();
     let mut ticks = interval(config.runtime_loop_interval);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -558,6 +561,7 @@ async fn run_runtime_loop(
                         metrics.as_ref(),
                         config,
                         now_unix_ms(),
+                        live_health_started_at_ms,
                     );
                     if !health_outcome.event_seqs.is_empty() || !health_outcome.commands.is_empty() {
                         let combined = execute_execution_adapter(
@@ -1818,8 +1822,12 @@ fn enforce_live_health(
     metrics: &AppMetrics,
     config: &AppConfig,
     now_ms: u64,
+    started_at_ms: u64,
 ) -> RuntimeOutcome {
     if config.paper_mode || runtime.status() != RuntimeStatus::Running {
+        return RuntimeOutcome::default();
+    }
+    if now_ms.saturating_sub(started_at_ms) < LIVE_HEALTH_STARTUP_GRACE_MS {
         return RuntimeOutcome::default();
     }
     let snapshot = metrics.snapshot();
