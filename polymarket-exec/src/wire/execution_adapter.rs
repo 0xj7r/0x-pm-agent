@@ -437,6 +437,13 @@ impl PolymarketExecutionAdapter {
             .map_err(|error| ExecutionError::BadRequest(format!("invalid {field}: {error}")))
     }
 
+    fn venue_gtd_expiration_ms(intended_expires_at_ms: EpochMillis) -> EpochMillis {
+        // Polymarket requires the submitted GTD expiration to include a one
+        // minute security threshold. The executor still cancels locally at the
+        // intended max age; this only satisfies the venue's signing contract.
+        intended_expires_at_ms.saturating_add(60_000)
+    }
+
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         let page = self
             .client
@@ -524,13 +531,14 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
                     "GTD live order requires expires_at_ms on submit request".to_string(),
                 )
             })?;
+            let venue_expires_at_ms = Self::venue_gtd_expiration_ms(expires_at_ms);
             let expires_at = SdkDateTime::<SdkUtc>::from_timestamp(
-                (expires_at_ms / 1_000) as i64,
-                ((expires_at_ms % 1_000) * 1_000_000) as u32,
+                (venue_expires_at_ms / 1_000) as i64,
+                ((venue_expires_at_ms % 1_000) * 1_000_000) as u32,
             )
             .ok_or_else(|| {
                 ExecutionError::BadRequest(format!(
-                    "invalid GTD expiration timestamp {expires_at_ms}"
+                    "invalid GTD expiration timestamp {venue_expires_at_ms}"
                 ))
             })?;
             builder = builder.expiration(expires_at);
@@ -730,5 +738,13 @@ mod tests {
     fn live_price_decimal_matches_polymarket_cent_tick() {
         let price = PolymarketExecutionAdapter::decimal_from_f64(0.01, 2, "limit_price").unwrap();
         assert_eq!(price.to_string(), "0.01");
+    }
+
+    #[test]
+    fn gtd_expiration_includes_polymarket_security_threshold() {
+        assert_eq!(
+            PolymarketExecutionAdapter::venue_gtd_expiration_ms(1_000),
+            61_000
+        );
     }
 }
