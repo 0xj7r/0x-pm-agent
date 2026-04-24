@@ -1194,6 +1194,24 @@ impl<S: Strategy> Runtime<S> {
                     );
                     return outcome;
                 }
+                if self.should_keep_btc_mm_hedge_order(managed, reason.as_str()) {
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Runtime,
+                                now_ms,
+                                format!(
+                                    "kept active btc hedge order during one-sided inventory: {}",
+                                    reason
+                                ),
+                            )
+                            .with_market(managed.intent.market_id.clone())
+                            .with_instrument(managed.intent.instrument_id.clone())
+                            .with_client_order(client_order_id.clone()),
+                        ),
+                    );
+                    return outcome;
+                }
                 (
                     managed.intent.market_id.clone(),
                     managed.intent.instrument_id.clone(),
@@ -1314,6 +1332,21 @@ impl<S: Strategy> Runtime<S> {
         // TODO(2026-04-23): integrate execution acknowledgements/fill events from a downstream
         // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
+        if self.has_active_btc_mm_buy_for_instrument(&intent) {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "duplicate active btc buy intent rejected before risk",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         if self.open_orders.contains_key(&intent.client_order_id) {
             outcome.push_event(
                 self.event_log.push(
@@ -1412,6 +1445,60 @@ impl<S: Strategy> Runtime<S> {
             }
         }
         outcome
+    }
+
+    fn should_keep_btc_mm_hedge_order(&self, managed: &ManagedOrder, reason: &str) -> bool {
+        if reason != "no longer desired" || !Self::is_btc_mm_buy_intent(&managed.intent) {
+            return false;
+        }
+        if !matches!(
+            managed.status,
+            ManagedOrderStatus::PendingSubmit
+                | ManagedOrderStatus::Submitted
+                | ManagedOrderStatus::Working
+        ) {
+            return false;
+        }
+
+        let mut same_market_positions = self
+            .inventory
+            .positions()
+            .filter(|position| {
+                position.market_id == managed.intent.market_id && position.quantity > 1e-9
+            });
+        let Some(position) = same_market_positions.next() else {
+            return false;
+        };
+        if same_market_positions.next().is_some() {
+            return false;
+        }
+        position.instrument_id != managed.intent.instrument_id
+    }
+
+    fn has_active_btc_mm_buy_for_instrument(&self, intent: &OrderIntent) -> bool {
+        if !Self::is_btc_mm_buy_intent(intent) {
+            return false;
+        }
+        self.open_orders.values().any(|managed| {
+            managed.intent.client_order_id != intent.client_order_id
+                && Self::is_btc_mm_buy_intent(&managed.intent)
+                && managed.intent.market_id == intent.market_id
+                && managed.intent.instrument_id == intent.instrument_id
+                && matches!(
+                    managed.status,
+                    ManagedOrderStatus::PendingSubmit
+                        | ManagedOrderStatus::Submitted
+                        | ManagedOrderStatus::Working
+                        | ManagedOrderStatus::CancelRequested
+                        | ManagedOrderStatus::NeedsReconcile
+                )
+        })
+    }
+
+    fn is_btc_mm_buy_intent(intent: &OrderIntent) -> bool {
+        intent.client_order_id.as_str().starts_with("btc-5m-mm:")
+            && intent.side == TradeSide::Buy
+            && !intent.reduce_only
     }
 
     fn strategy_context(
@@ -2203,7 +2290,7 @@ mod tests {
     use crate::risk::RiskLimits;
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::signals::unlawful_gate::UnlawfulGateConfig;
-    use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
+    use crate::strategy::{NoopStrategy, Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
         BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId,
         MarketSnapshot, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, TradeSide,
@@ -2368,6 +2455,100 @@ mod tests {
                 .position_qty(&InstrumentId::from("token-1")),
             4.0
         );
+    }
+
+    fn btc_mm_intent(
+        market_id: &str,
+        instrument_id: &str,
+        level: &str,
+        price: f64,
+    ) -> OrderIntent {
+        OrderIntent {
+            client_order_id: ClientOrderId::from(format!(
+                "btc-5m-mm:{market_id}:{instrument_id}:b:n:{level}:{price:.8}:6.50000000"
+            )),
+            market_id: MarketId::from(market_id),
+            instrument_id: InstrumentId::from(instrument_id),
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: 6.5,
+            reduce_only: false,
+            reason: format!("btc-5m-mm {level}"),
+            quote_level_tag: Some(level.to_string()),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn btc_mm_keeps_existing_opposite_buy_when_one_leg_fills() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let hedge_order = btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44);
+        let hedge_client_order_id = hedge_order.client_order_id.clone();
+        let accepted = runtime.accept_intent(hedge_order, 1);
+        assert_eq!(accepted.commands.len(), 1);
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.50,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 2,
+            })
+            .expect("one leg fill");
+
+        let cancel = runtime.request_cancel(&hedge_client_order_id, "no longer desired", 3);
+        assert!(cancel.commands.is_empty());
+        let remaining = runtime
+            .open_orders()
+            .find(|managed| managed.intent.client_order_id == hedge_client_order_id)
+            .expect("hedge order kept");
+        assert_eq!(remaining.status, ManagedOrderStatus::PendingSubmit);
+    }
+
+    #[test]
+    fn btc_mm_rejects_duplicate_active_buy_for_same_instrument() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let first = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44),
+            1,
+        );
+        assert_eq!(first.commands.len(), 1);
+
+        let duplicate = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-hedge-rescue", 0.48),
+            2,
+        );
+        assert!(duplicate.commands.is_empty());
+        assert_eq!(runtime.open_orders().count(), 1);
     }
 
     #[test]
