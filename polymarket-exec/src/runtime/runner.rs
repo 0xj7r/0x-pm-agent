@@ -12,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::book::{BookState, BookStore};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, UserWsAuth};
 use crate::event_log::EventLog;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::runtime::audit::AuditWriter;
-use crate::runtime::live_auth::connect_live_adapter;
+use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
@@ -275,10 +275,14 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     )?;
     persist_audit_outcome(&mut audit, "startup", &runtime, &startup_outcome)?;
     persist_runtime_checkpoint(&mut journal, &runtime, now_unix_ms(), "startup")?;
-    let execution_adapter: Arc<dyn ExecutionAdapter> = match (config.paper_mode, &config.user_auth)
-    {
-        (true, _) => Arc::new(PaperExecutionAdapter::new()),
-        (false, _) => Arc::new(connect_live_adapter(&config).await?),
+    let mut effective_user_auth = config.user_auth.clone();
+    let execution_adapter: Arc<dyn ExecutionAdapter> = match config.paper_mode {
+        true => Arc::new(PaperExecutionAdapter::new()),
+        false => {
+            let live_connection = connect_live_session(&config).await?;
+            effective_user_auth = live_connection.user_auth;
+            Arc::new(live_connection.adapter)
+        }
     };
     metrics.set_execution_adapter_connected(true);
     let dashboard_state = Arc::new(RwLock::new(DashboardSnapshot::default()));
@@ -338,6 +342,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let user_ws_handle = spawn_user_ws(
         metrics.clone(),
         &config,
+        effective_user_auth,
         Some(user_order_tx),
         shutdown.child_token(),
     );
@@ -439,10 +444,11 @@ fn spawn_spot_ws(
 fn spawn_user_ws(
     metrics: Arc<AppMetrics>,
     config: &AppConfig,
+    user_auth: Option<UserWsAuth>,
     event_tx: Option<mpsc::UnboundedSender<UserOrderEvent>>,
     shutdown: CancellationToken,
 ) -> Option<JoinHandle<()>> {
-    let auth = match config.user_auth.clone() {
+    let auth = match user_auth {
         Some(auth) => auth,
         None => {
             warn!("POLYMARKET_API_KEY/SECRET/PASSPHRASE not set; user websocket disabled");

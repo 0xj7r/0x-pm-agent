@@ -8,6 +8,11 @@ use crate::wire::execution_adapter::{
     PolymarketSignatureType,
 };
 
+pub(super) struct LiveConnection {
+    pub adapter: PolymarketExecutionAdapter,
+    pub user_auth: Option<UserWsAuth>,
+}
+
 fn live_private_key_from_env() -> Option<String> {
     std::env::var("POLYMARKET_PRIVATE_KEY")
         .ok()
@@ -33,6 +38,12 @@ fn live_funder_from_env(auth: Option<&UserWsAuth>) -> Option<String> {
 }
 
 pub(super) async fn connect_live_adapter(config: &AppConfig) -> Result<PolymarketExecutionAdapter> {
+    connect_live_session(config)
+        .await
+        .map(|connection| connection.adapter)
+}
+
+pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConnection> {
     let auth = config.user_auth.as_ref();
     let private_key = auth
         .and_then(|auth| auth.private_key.clone())
@@ -46,7 +57,7 @@ pub(super) async fn connect_live_adapter(config: &AppConfig) -> Result<Polymarke
     let funder_address = live_funder_from_env(auth);
 
     if let Some(auth) = auth {
-        PolymarketExecutionAdapter::connect(PolymarketCredentials {
+        let adapter = PolymarketExecutionAdapter::connect(PolymarketCredentials {
             api_key: auth.api_key.clone(),
             api_secret: auth.api_secret.clone(),
             api_passphrase: auth.api_passphrase.clone(),
@@ -54,15 +65,35 @@ pub(super) async fn connect_live_adapter(config: &AppConfig) -> Result<Polymarke
             signature_type,
             funder_address,
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+        Ok(LiveConnection {
+            adapter,
+            user_auth: Some(auth.clone()),
+        })
     } else {
-        PolymarketExecutionAdapter::connect_with_l1(PolymarketL1Credentials {
+        let adapter = PolymarketExecutionAdapter::connect_with_l1(PolymarketL1Credentials {
             private_key,
             signature_type,
-            funder_address,
+            funder_address: funder_address.clone(),
         })
-        .await
-        .map_err(Into::into)
+        .await?;
+        let (api_key, api_secret, api_passphrase) = adapter.api_credentials();
+        Ok(LiveConnection {
+            adapter,
+            user_auth: Some(UserWsAuth {
+                api_key,
+                api_secret,
+                api_passphrase,
+                private_key: None,
+                signature_type: Some(std::env::var("POLYMARKET_SIGNATURE_TYPE").unwrap_or_else(
+                    |_| match signature_type {
+                        PolymarketSignatureType::Eoa => "eoa".to_string(),
+                        PolymarketSignatureType::Proxy => "proxy".to_string(),
+                        PolymarketSignatureType::GnosisSafe => "gnosis_safe".to_string(),
+                    },
+                )),
+                funder_address,
+            }),
+        })
     }
 }
