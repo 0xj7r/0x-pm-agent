@@ -31,7 +31,8 @@ ssh_base() {
     -o ConnectTimeout=10 \
     -p "$REMOTE_PORT" \
     -i "$REMOTE_KEY" \
-    "${REMOTE_USER}@${REMOTE_HOST}"
+    "${REMOTE_USER}@${REMOTE_HOST}" \
+    "$@"
 }
 
 rsync_base() {
@@ -66,7 +67,7 @@ log "verifying remote toolchain"
 ssh_base "
   command -v bash >/dev/null &&
   command -v python3 >/dev/null &&
-  command -v cargo >/dev/null &&
+  (command -v cargo >/dev/null || test -x \"\$HOME/.cargo/bin/cargo\") &&
   command -v systemctl >/dev/null
 "
 
@@ -75,6 +76,9 @@ ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_se
 
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
+
+log "setting host cargo path for rustup toolchain"
+ssh_base "mkdir -p ~/.config/polymarket-exec && grep -q '^WHALE_PAIR_CARGO_BIN=' ~/.config/polymarket-exec/common.env && sed -i 's|^WHALE_PAIR_CARGO_BIN=.*|WHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo|' ~/.config/polymarket-exec/common.env || printf '\nWHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo\n' >> ~/.config/polymarket-exec/common.env"
 
 log "enabling linger for ${REMOTE_USER}"
 ssh_base "sudo loginctl enable-linger '${REMOTE_USER}' || true"

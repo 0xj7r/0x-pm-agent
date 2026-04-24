@@ -35,7 +35,8 @@ ssh_base() {
     -o ConnectTimeout=10 \
     -p "$REMOTE_PORT" \
     -i "$REMOTE_KEY" \
-    "${REMOTE_USER}@${REMOTE_HOST}"
+    "${REMOTE_USER}@${REMOTE_HOST}" \
+    "$@"
 }
 
 rsync_base() {
