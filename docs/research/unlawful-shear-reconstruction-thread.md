@@ -200,8 +200,8 @@ The current Rust paper implementation already encodes this reconstruction in rou
 
 References:
 
-- [whale-pair-exec/README.md](/Users/jackreid/go/polymarket-agent/whale-pair-exec/README.md)
-- [whale-pair-exec/src/strategy.rs](/Users/jackreid/go/polymarket-agent/whale-pair-exec/src/strategy.rs)
+- [polymarket-exec/README.md](/Users/jackreid/go/polymarket-agent/polymarket-exec/README.md)
+- [polymarket-exec/src/strategy.rs](/Users/jackreid/go/polymarket-agent/polymarket-exec/src/strategy.rs)
 - the current `unlawful_shear` runtime path is best treated as built-in Rust defaults plus env overrides; the older JSON profile path is no longer canonical on this branch
 
 Current encoded profile:

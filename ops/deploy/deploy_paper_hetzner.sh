@@ -59,8 +59,8 @@ rsync_base \
   --exclude 'target/' \
   --exclude 'reports/' \
   --exclude 'data/' \
-  --exclude 'whale-pair-exec/data/' \
-  --exclude 'whale-pair-exec/.env' \
+  --exclude 'polymarket-exec/data/' \
+  --exclude 'polymarket-exec/.env' \
   --exclude '*.sqlite-shm' \
   --exclude '*.sqlite-wal' \
   "$ROOT_DIR/" "${REMOTE_USER}@${REMOTE_HOST}:$REMOTE_ROOT/"
@@ -74,7 +74,7 @@ ssh_base "
 "
 
 log "installing user service templates"
-ssh_base "cd '$REMOTE_ROOT' && whale-pair-exec/ops/systemd/install_user_paper_services.sh"
+ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
 
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
@@ -88,7 +88,7 @@ for sleeve in "${SLEEVES[@]}"; do
 done
 
 log "paper services status"
-ssh_base "cd '$REMOTE_ROOT' && whale-pair-exec/ops/systemd/manage_unlawful_paper_services.sh status || true"
+ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/manage_unlawful_paper_services.sh status || true"
 
 log "health checks"
 ssh_base "
@@ -106,8 +106,8 @@ Remote root:
 
 Useful follow-ups:
   ssh -i $REMOTE_KEY -p $REMOTE_PORT ${REMOTE_USER}@${REMOTE_HOST} \\
-    'cd $REMOTE_ROOT && whale-pair-exec/ops/systemd/manage_unlawful_paper_services.sh logs'
+    'cd $REMOTE_ROOT && polymarket-exec/ops/systemd/manage_unlawful_paper_services.sh logs'
 
   ssh -i $REMOTE_KEY -p $REMOTE_PORT ${REMOTE_USER}@${REMOTE_HOST} \\
-    'cat ~/.config/whale-pair-exec/common.env'
+    'cat ~/.config/polymarket-exec/common.env'
 EOF

@@ -26,10 +26,10 @@ That means the journal is no longer the only calibration source.
 ### Cold path
 
 - new archive script:
-  - `whale-pair-exec/scripts/archive_paper_artifacts.sh`
+  - `polymarket-exec/scripts/archive_paper_artifacts.sh`
 - new user-service artifacts:
-  - `whale-pair-exec/ops/systemd/whale-pair-archive.service`
-  - `whale-pair-exec/ops/systemd/whale-pair-archive.timer`
+  - `polymarket-exec/ops/systemd/whale-pair-archive.service`
+  - `polymarket-exec/ops/systemd/whale-pair-archive.timer`
 
 The script archives:
 
@@ -46,7 +46,7 @@ rotation may not actually be enabled in the live launcher environment.
 ### Local
 
 - keep:
-  - `whale-pair-exec/data/runtime/*.sqlite`
+  - `polymarket-exec/data/runtime/*.sqlite`
   - active `journal.jsonl`
   - recent rotated segments waiting for upload
 
@@ -62,7 +62,7 @@ rotation may not actually be enabled in the live launcher environment.
 
 ## Environment
 
-Set in `~/.config/whale-pair-exec/common.env` or `.env`:
+Set in `~/.config/polymarket-exec/common.env` or `.env`:
 
 ```bash
 WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES=268435456
@@ -95,27 +95,27 @@ Dry-run archive pass:
 ```bash
 WHALE_PAIR_ARCHIVE_DRY_RUN=true \
 WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
-whale-pair-exec/scripts/archive_paper_artifacts.sh
+polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Cheap local candidate listing with no AWS dependency:
 
 ```bash
 WHALE_PAIR_ARCHIVE_LIST_ONLY=true \
-whale-pair-exec/scripts/archive_paper_artifacts.sh
+polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Manual archive pass:
 
 ```bash
 WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
-whale-pair-exec/scripts/archive_paper_artifacts.sh
+polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Enable periodic archive:
 
 ```bash
-whale-pair-exec/ops/systemd/install_user_paper_services.sh
+polymarket-exec/ops/systemd/install_user_paper_services.sh
 systemctl --user daemon-reload
 systemctl --user enable --now whale-pair-archive.timer
 ```
@@ -140,7 +140,7 @@ Before trusting the archive path, verify both of these:
 1. `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES` is present in the real host env
    that systemd or the launcher is using, not just in `.env.example`.
 2. Rotated segments are actually appearing under
-   `whale-pair-exec/data/execution/paper/*/journal.<ts>.jsonl`.
+   `polymarket-exec/data/execution/paper/*/journal.<ts>.jsonl`.
 
 If the archive script logs:
 
@@ -157,7 +157,7 @@ Use this order:
 
 ```bash
 WHALE_PAIR_ARCHIVE_LIST_ONLY=true \
-whale-pair-exec/scripts/archive_paper_artifacts.sh
+polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 2. Fix AWS auth until this works:
@@ -171,7 +171,7 @@ aws sts get-caller-identity
 ```bash
 WHALE_PAIR_ARCHIVE_DRY_RUN=true \
 WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
-whale-pair-exec/scripts/archive_paper_artifacts.sh
+polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 4. Only after that, run the real archive pass.

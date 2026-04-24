@@ -11,7 +11,7 @@ This crate is a standalone execution-side scaffold for the whale-pair strategy. 
 ## Workspace
 
 - `rust/Cargo.toml`: local Rust workspace root
-- `rust/whale-pair-exec/Cargo.toml`: binary crate definition
+- `rust/polymarket-exec/Cargo.toml`: binary crate definition
 
 ## Module map
 

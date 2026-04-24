@@ -20,14 +20,14 @@ This is not a fresh architecture rewrite.
 
 It is a contract over the existing implementation surfaces:
 
-- `whale-pair-exec/src/signals/unlawful_gate.rs`
-- `whale-pair-exec/src/strategy.rs`
-- `whale-pair-exec/src/runtime/mod.rs`
-- `whale-pair-exec/src/runtime/reconcile.rs`
-- `whale-pair-exec/src/runtime/order_store.rs`
-- `whale-pair-exec/src/inventory.rs`
-- `whale-pair-exec/src/mm/quote_reconciler.rs`
-- `whale-pair-exec/tests/btc_5m_mm_scenarios.rs`
+- `polymarket-exec/src/signals/unlawful_gate.rs`
+- `polymarket-exec/src/strategy.rs`
+- `polymarket-exec/src/runtime/mod.rs`
+- `polymarket-exec/src/runtime/reconcile.rs`
+- `polymarket-exec/src/runtime/order_store.rs`
+- `polymarket-exec/src/inventory.rs`
+- `polymarket-exec/src/mm/quote_reconciler.rs`
+- `polymarket-exec/tests/btc_5m_mm_scenarios.rs`
 
 This doc should be used as the acceptance contract for future fixes in this thread. If behavior changes, this doc should change with it and the test suite should tighten accordingly.
 
@@ -612,7 +612,7 @@ From the repo as it exists now, the unlawful contract has these concrete proofs 
 | one-sided fill reversal / cleanup path | `tests/fixtures/btc_5m_mm/one_sided_fill_reversal.json` | covered |
 | uncertain submit recovery | `tests/fixtures/btc_5m_mm/uncertain_submit.json` | covered |
 | reconnect / replay recovery | `tests/fixtures/btc_5m_mm/reconnect_partial_fills.json`, `tests/fixtures/btc_5m_mm/replay_reconcile_merge_recovery.json` | covered |
-| focused unlawful gate state transitions | `whale-pair-exec/src/signals/unlawful_gate.rs` scenarios 1-9 and invariants | covered |
+| focused unlawful gate state transitions | `polymarket-exec/src/signals/unlawful_gate.rs` scenarios 1-9 and invariants | covered |
 | unlawful eval note completeness | `unlawful_shear_signal_reason_and_aggression_logged_in_decision_notes` | covered |
 
 These are still not proven strongly enough from the current repo state:

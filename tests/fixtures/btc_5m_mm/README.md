@@ -4,7 +4,7 @@ This directory is the runtime-scenario surface for the unlawful BTC 5m sleeve.
 
 Use it as the fixture contract for:
 
-- `whale-pair-exec/tests/btc_5m_mm_scenarios.rs`
+- `polymarket-exec/tests/btc_5m_mm_scenarios.rs`
 - `docs/architecture/2026-04-24-btc-5m-behavior-contract.md`
 
 ## Current fixture set

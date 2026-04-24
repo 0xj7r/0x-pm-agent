@@ -14,7 +14,7 @@ This workspace contains the Rust execution scaffold for whale-pair.
 - Infra requirements: `docs/architecture/2026-04-23-btc-5m-mm-infra-requirements.md`
 - Paper storage/archive plan: `docs/architecture/2026-04-24-paper-storage-archive-plan.md`
 - Hetzner paper deploy helper: `ops/deploy/deploy_paper_hetzner.sh`
-- Systemd env template: `whale-pair-exec/ops/systemd/common.env.example`
+- Systemd env template: `polymarket-exec/ops/systemd/common.env.example`
 
 Live mode must use the signed Polymarket CLOB API/SDK path for submit, cancel,
 open-order sync, and balance sync before any capital is deployed. Do not treat

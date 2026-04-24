@@ -92,18 +92,18 @@ This spec does not aim to replicate any single observed wallet exactly. It aims 
 
 Current crate:
 
-- `whale-pair-exec/src/config.rs`
-- `whale-pair-exec/src/book.rs`
-- `whale-pair-exec/src/market_ws.rs`
-- `whale-pair-exec/src/user_ws.rs`
-- `whale-pair-exec/src/runtime.rs`
-- `whale-pair-exec/src/inventory.rs`
-- `whale-pair-exec/src/risk.rs`
-- `whale-pair-exec/src/strategy.rs`
-- `whale-pair-exec/src/runner.rs`
-- `whale-pair-exec/src/journal.rs`
-- `whale-pair-exec/src/metrics.rs`
-- `whale-pair-exec/src/api.rs`
+- `polymarket-exec/src/config.rs`
+- `polymarket-exec/src/book.rs`
+- `polymarket-exec/src/market_ws.rs`
+- `polymarket-exec/src/user_ws.rs`
+- `polymarket-exec/src/runtime.rs`
+- `polymarket-exec/src/inventory.rs`
+- `polymarket-exec/src/risk.rs`
+- `polymarket-exec/src/strategy.rs`
+- `polymarket-exec/src/runner.rs`
+- `polymarket-exec/src/journal.rs`
+- `polymarket-exec/src/metrics.rs`
+- `polymarket-exec/src/api.rs`
 
 ### Baseline strengths
 
@@ -219,7 +219,7 @@ The sections below specify the target shape, not just suggestions.
 
 New module:
 
-- `whale-pair-exec/src/execution_adapter.rs`
+- `polymarket-exec/src/execution_adapter.rs`
 
 Responsibilities:
 
@@ -272,7 +272,7 @@ Uncertain submission outcome must trigger reconciliation, not blind retry.
 
 New module:
 
-- `whale-pair-exec/src/order_store.rs`
+- `polymarket-exec/src/order_store.rs`
 
 Responsibilities:
 
@@ -312,7 +312,7 @@ Required persisted fields:
 
 Current module exists:
 
-- `whale-pair-exec/src/journal.rs`
+- `polymarket-exec/src/journal.rs`
 
 It must be upgraded to support:
 
@@ -345,7 +345,7 @@ Journal invariants:
 
 New module:
 
-- `whale-pair-exec/src/pair_ledger.rs`
+- `polymarket-exec/src/pair_ledger.rs`
 
 Purpose:
 
@@ -388,7 +388,7 @@ Pairing model:
 
 New module:
 
-- `whale-pair-exec/src/quote_engine.rs`
+- `polymarket-exec/src/quote_engine.rs`
 
 Responsibilities:
 
@@ -439,7 +439,7 @@ Required decision fields per quote:
 
 New module:
 
-- `whale-pair-exec/src/quote_reconciler.rs`
+- `polymarket-exec/src/quote_reconciler.rs`
 
 Responsibilities:
 
@@ -461,7 +461,7 @@ Rules:
 
 New module:
 
-- `whale-pair-exec/src/merge_executor.rs`
+- `polymarket-exec/src/merge_executor.rs`
 
 Responsibilities:
 
@@ -492,7 +492,7 @@ Rules:
 
 New module:
 
-- `whale-pair-exec/src/reconcile.rs`
+- `polymarket-exec/src/reconcile.rs`
 
 Responsibilities:
 
@@ -558,7 +558,7 @@ Required schema:
 
 Optional for v1, but module boundary should exist now:
 
-- `whale-pair-exec/src/signal_overlay.rs`
+- `polymarket-exec/src/signal_overlay.rs`
 
 Responsibilities:
 
@@ -945,9 +945,9 @@ Each task below should have one owner and a disjoint write scope where possible.
 
 Write scope:
 
-- `whale-pair-exec/src/execution_adapter.rs`
-- `whale-pair-exec/src/types.rs`
-- `whale-pair-exec/src/runner.rs`
+- `polymarket-exec/src/execution_adapter.rs`
+- `polymarket-exec/src/types.rs`
+- `polymarket-exec/src/runner.rs`
 
 Deliverables:
 
@@ -966,10 +966,10 @@ Acceptance:
 
 Write scope:
 
-- `whale-pair-exec/src/order_store.rs`
-- `whale-pair-exec/src/reconcile.rs`
-- `whale-pair-exec/src/journal.rs`
-- `whale-pair-exec/src/runtime.rs`
+- `polymarket-exec/src/order_store.rs`
+- `polymarket-exec/src/reconcile.rs`
+- `polymarket-exec/src/journal.rs`
+- `polymarket-exec/src/runtime.rs`
 
 Deliverables:
 
@@ -987,10 +987,10 @@ Acceptance:
 
 Write scope:
 
-- `whale-pair-exec/src/pair_ledger.rs`
-- `whale-pair-exec/src/merge_executor.rs`
-- `whale-pair-exec/src/inventory.rs`
-- `whale-pair-exec/src/runtime.rs`
+- `polymarket-exec/src/pair_ledger.rs`
+- `polymarket-exec/src/merge_executor.rs`
+- `polymarket-exec/src/inventory.rs`
+- `polymarket-exec/src/runtime.rs`
 
 Deliverables:
 
@@ -1007,10 +1007,10 @@ Acceptance:
 
 Write scope:
 
-- `whale-pair-exec/src/quote_engine.rs`
-- `whale-pair-exec/src/quote_reconciler.rs`
-- `whale-pair-exec/src/strategy.rs`
-- `whale-pair-exec/src/risk.rs`
+- `polymarket-exec/src/quote_engine.rs`
+- `polymarket-exec/src/quote_reconciler.rs`
+- `polymarket-exec/src/strategy.rs`
+- `polymarket-exec/src/risk.rs`
 
 Deliverables:
 
@@ -1027,9 +1027,9 @@ Acceptance:
 
 Write scope:
 
-- `whale-pair-exec/src/config.rs`
-- `whale-pair-exec/src/metrics.rs`
-- `whale-pair-exec/src/api.rs`
+- `polymarket-exec/src/config.rs`
+- `polymarket-exec/src/metrics.rs`
+- `polymarket-exec/src/api.rs`
 - `execution/clients/*` or `scripts/*` for market context generation
 
 Deliverables:
@@ -1048,7 +1048,7 @@ Acceptance:
 Write scope:
 
 - `tests/*`
-- `whale-pair-exec/tests/*` if added
+- `polymarket-exec/tests/*` if added
 - `tests/fixtures/btc_5m_mm/*`
 
 Deliverables:

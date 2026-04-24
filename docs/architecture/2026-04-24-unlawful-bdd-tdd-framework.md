@@ -21,19 +21,19 @@ Use four layers.
 
 1. `Behavior specs`
 - Goal: prove the sleeve behaves correctly at the decision-policy layer.
-- Primary file: `whale-pair-exec/src/signals/unlawful_gate.rs`
+- Primary file: `polymarket-exec/src/signals/unlawful_gate.rs`
 - Shape: scenario-style tests with explicit market state, BTC regime, and expected mode/aggression.
 
 2. `Implementation tests`
 - Goal: prove the config, state, and plumbing behind the behavior are correct.
 - Primary files:
-  - `whale-pair-exec/src/strategy.rs`
-  - `whale-pair-exec/src/runtime/mod.rs`
-  - `whale-pair-exec/src/runtime/order_store.rs`
+  - `polymarket-exec/src/strategy.rs`
+  - `polymarket-exec/src/runtime/mod.rs`
+  - `polymarket-exec/src/runtime/order_store.rs`
 
 3. `Runtime scenarios`
 - Goal: prove the runtime behaves correctly across multi-step flows.
-- Primary file: `whale-pair-exec/tests/btc_5m_mm_scenarios.rs`
+- Primary file: `polymarket-exec/tests/btc_5m_mm_scenarios.rs`
 - Fixture manifest: `tests/fixtures/btc_5m_mm/README.md`
 - Shape: fixture-driven scenarios covering submits, fills, cancels, restart, reconcile, flatten, cleanup.
 
@@ -223,7 +223,7 @@ If we skip step 1, the same class of bug will return.
 Primary focused suite:
 
 ```bash
-whale-pair-exec/scripts/test_unlawful_stack.sh
+polymarket-exec/scripts/test_unlawful_stack.sh
 ```
 
 Direct commands:

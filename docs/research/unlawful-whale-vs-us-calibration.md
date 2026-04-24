@@ -6,14 +6,14 @@ paper sleeves window-by-window.
 It is designed for calibration, not final truth accounting. The live whale side
 comes from `data-api.polymarket.com/activity`. The local side comes from:
 
-- sleeve envs in `whale-pair-exec/env/`
-- current runtime journals in `whale-pair-exec/data/execution/paper/`
-- current runtime SQLite stores in `whale-pair-exec/data/runtime/`
+- sleeve envs in `polymarket-exec/env/`
+- current runtime journals in `polymarket-exec/data/execution/paper/`
+- current runtime SQLite stores in `polymarket-exec/data/runtime/`
 - signal snapshots from the same SQLite stores when the runtime has persisted
   them
 
 The exporter prefers the crate-local runtime artifacts above because the sleeve
-launcher runs from `whale-pair-exec/`. If only older root-level `data/...`
+launcher runs from `polymarket-exec/`. If only older root-level `data/...`
 artifacts exist, the env-based path resolution still falls back cleanly.
 
 If a local journal or order store is missing or empty, the exporter treats that
