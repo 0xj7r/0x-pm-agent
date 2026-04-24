@@ -1594,6 +1594,16 @@ async fn execute_execution_adapter(
 
                 let submit_req =
                     submit_request_from_intent(&intent, observed_at_ms, execution_policy);
+                if !runtime_has_active_order(runtime, &intent.client_order_id) {
+                    debug!(
+                        mode = "live",
+                        client_order_id = %intent.client_order_id,
+                        "skipping stale submit command for order no longer active"
+                    );
+                    paper_order_ctx.remove(&intent.client_order_id);
+                    execution_venue_map.remove(&intent.client_order_id);
+                    continue;
+                }
                 match execution_adapter.submit(submit_req).await {
                     Ok(ack) if ack.accepted => {
                         live_safety.consecutive_submit_errors = 0;
@@ -1629,10 +1639,14 @@ async fn execute_execution_adapter(
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected submit".to_string());
-                        if submit_rejection_counts_against_live_budget(
-                            &reason,
-                            execution_policy.live_post_only,
-                        ) {
+                        let active_order =
+                            runtime_has_active_order(runtime, &intent.client_order_id);
+                        if active_order
+                            && submit_rejection_counts_against_live_budget(
+                                &reason,
+                                execution_policy.live_post_only,
+                            )
+                        {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
                         } else {
@@ -1643,17 +1657,32 @@ async fn execute_execution_adapter(
                                 "submit rejected by venue without consuming live error budget"
                             );
                         }
-                        let rejected_outcome = runtime.on_order_rejected(
-                            &intent.client_order_id,
-                            reason,
-                            ack.accepted_at_ms,
-                        );
                         paper_order_ctx.remove(&intent.client_order_id);
-                        combined.extend(rejected_outcome);
+                        if active_order {
+                            let rejected_outcome = runtime.on_order_rejected(
+                                &intent.client_order_id,
+                                reason,
+                                ack.accepted_at_ms,
+                            );
+                            combined.extend(rejected_outcome);
+                        } else {
+                            execution_venue_map.remove(&intent.client_order_id);
+                        }
                     }
                     Err(error) => {
-                        live_safety.consecutive_submit_errors =
-                            live_safety.consecutive_submit_errors.saturating_add(1);
+                        let active_order =
+                            runtime_has_active_order(runtime, &intent.client_order_id);
+                        if active_order {
+                            live_safety.consecutive_submit_errors =
+                                live_safety.consecutive_submit_errors.saturating_add(1);
+                        } else {
+                            debug!(
+                                mode = "live",
+                                client_order_id = %intent.client_order_id,
+                                error = %error,
+                                "submit error ignored for order no longer active"
+                            );
+                        }
                         if error.is_retryable() {
                             warn!(
                                 mode = "live",
@@ -1671,7 +1700,7 @@ async fn execute_execution_adapter(
                                     "submission uncertain; moving to needs-reconcile",
                                 ));
                             }
-                        } else {
+                        } else if active_order {
                             let rejected_outcome = runtime.on_order_rejected(
                                 &intent.client_order_id,
                                 error.to_string(),
@@ -1679,6 +1708,9 @@ async fn execute_execution_adapter(
                             );
                             paper_order_ctx.remove(&intent.client_order_id);
                             combined.extend(rejected_outcome);
+                        } else {
+                            paper_order_ctx.remove(&intent.client_order_id);
+                            execution_venue_map.remove(&intent.client_order_id);
                         }
                     }
                 }
@@ -2276,6 +2308,15 @@ fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) ->
         || lower.contains("would take liquidity"))
 }
 
+fn runtime_has_active_order(
+    runtime: &Runtime<StrategyMode>,
+    client_order_id: &ClientOrderId,
+) -> bool {
+    runtime
+        .open_orders()
+        .any(|managed| &managed.intent.client_order_id == client_order_id)
+}
+
 fn enforce_live_error_budget(
     runtime: &mut Runtime<StrategyMode>,
     metrics: &AppMetrics,
@@ -2655,6 +2696,7 @@ mod tests {
     struct RecordingAdapter {
         submitted: Mutex<Vec<ClientOrderId>>,
         cancelled: Mutex<Vec<ClientOrderId>>,
+        submit_reject_message: Option<String>,
         cancel_reject_message: Option<String>,
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
         fills: Vec<VenueFill>,
@@ -2668,6 +2710,15 @@ mod tests {
                 .lock()
                 .expect("submitted lock")
                 .push(req.client_order_id.clone());
+            if let Some(message) = self.submit_reject_message.clone() {
+                return Ok(SubmitOrderAck {
+                    client_order_id: req.client_order_id,
+                    venue_order_id: Some(OrderId::from("venue-submit")),
+                    accepted: false,
+                    accepted_at_ms: req.submitted_at_ms,
+                    venue_message: Some(message),
+                });
+            }
             Ok(SubmitOrderAck {
                 client_order_id: req.client_order_id,
                 venue_order_id: Some(OrderId::from("venue-submit")),
@@ -2774,6 +2825,71 @@ mod tests {
             .all(
                 |managed| managed.intent.client_order_id != ClientOrderId::from("client-reconcile")
             ));
+    }
+
+    #[tokio::test]
+    async fn live_execution_ignores_stale_submit_after_order_left_memory() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        let stale_client_id = ClientOrderId::from("client-filled-before-submit-ack");
+        let stale_intent = OrderIntent {
+            client_order_id: stale_client_id,
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.40,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "stale queued submit".to_string(),
+            quote_level_tag: None,
+            created_at_ms: now_unix_ms(),
+        };
+        let mut initial_outcome = RuntimeOutcome::default();
+        initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
+
+        let adapter = Arc::new(RecordingAdapter {
+            submit_reject_message: Some("execution venue rejected submit".to_string()),
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            initial_outcome,
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
+        assert_eq!(live_safety.consecutive_submit_errors, 0);
+        assert_ne!(runtime.status(), RuntimeStatus::Degraded);
+        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
     }
 
     #[tokio::test]
