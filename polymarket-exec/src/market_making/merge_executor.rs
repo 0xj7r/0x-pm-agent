@@ -2,7 +2,7 @@
 
 use crate::inventory::{InventoryAdjustment, InventoryError, InventoryState};
 use crate::pair_ledger::{MarketPairLedger, MergeCandidate, MergePlan};
-use crate::types::{CloseMethod, EpochMillis, FillReport, MarketId};
+use crate::types::{ClientOrderId, CloseMethod, EpochMillis, FillReport, MarketId, MergeIntent};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MergeExecution {
@@ -51,6 +51,37 @@ impl MergeExecutor {
     pub fn merge_candidate(&self, market_id: &MarketId) -> Option<MergeCandidate> {
         self.ledger
             .merge_candidate(market_id, self.taker_fee_rate, self.gas_fee_usd)
+    }
+
+    pub fn merge_intent(
+        &self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> Option<MergeIntent> {
+        let candidate = self.merge_candidate(market_id)?;
+        let yes_instrument_id = candidate.yes_instrument_id?;
+        let no_instrument_id = candidate.no_instrument_id?;
+        if candidate.paired_qty <= 1e-9 {
+            return None;
+        }
+
+        Some(MergeIntent {
+            command_id: ClientOrderId::from(format!(
+                "merge:{}:{:.8}:{}",
+                market_id, candidate.paired_qty, now_ms
+            )),
+            market_id: market_id.clone(),
+            yes_instrument_id,
+            no_instrument_id,
+            quantity: candidate.paired_qty,
+            expected_cash_usd: candidate.expected_cash_usd,
+            expected_cost_usd: candidate.expected_cost_usd,
+            expected_fee_usd: candidate.expected_fee_usd,
+            expected_gas_usd: candidate.expected_gas_usd,
+            reason: reason.into(),
+            created_at_ms: now_ms,
+        })
     }
 
     pub fn apply_merge(

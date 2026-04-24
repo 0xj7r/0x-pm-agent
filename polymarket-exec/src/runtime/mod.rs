@@ -38,7 +38,7 @@ use crate::strategy::{
 };
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot,
-    OrderId, OrderIntent, TradeSide,
+    MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 use serde::Serialize;
@@ -317,6 +317,7 @@ pub struct Runtime<S: Strategy> {
     market_activity: HashMap<InstrumentId, GateMarketActivitySignal>,
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
+    pending_merge_by_market: HashMap<MarketId, MergeIntent>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
@@ -368,6 +369,7 @@ impl<S: Strategy> Runtime<S> {
             market_activity: HashMap::new(),
             first_fill_by_market: HashMap::new(),
             first_merge_by_market: HashMap::new(),
+            pending_merge_by_market: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             order_store,
@@ -513,6 +515,92 @@ impl<S: Strategy> Runtime<S> {
 
     pub fn stranded_inventory(&self) -> Vec<StrandedMarketInventory> {
         self.inventory.stranded_market_inventory()
+    }
+
+    pub fn plan_merge_command_for_market(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+        if self.pending_merge_by_market.contains_key(market_id) {
+            return outcome;
+        }
+
+        let reason = reason.into();
+        let Some(intent) = self
+            .merge_executor
+            .merge_intent(market_id, now_ms, reason.clone())
+            .or_else(|| self.inventory_merge_intent(market_id, now_ms, reason.clone()))
+        else {
+            return outcome;
+        };
+
+        self.pending_merge_by_market
+            .insert(market_id.clone(), intent.clone());
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Execution,
+                    now_ms,
+                    format!(
+                        "merge intent planned: qty={:.8} cash={:.4} cost={:.4} net_gain={:.4} reason={}",
+                        intent.quantity,
+                        intent.expected_cash_usd,
+                        intent.expected_cost_usd,
+                        intent.expected_net_gain_usd(),
+                        intent.reason
+                    ),
+                )
+                .with_market(intent.market_id.clone())
+                .with_instrument(intent.yes_instrument_id.clone())
+                .with_client_order(intent.command_id.clone()),
+            ),
+        );
+        outcome.push_command(RuntimeCommand::Merge(intent));
+        outcome
+    }
+
+    fn inventory_merge_intent(
+        &self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: String,
+    ) -> Option<MergeIntent> {
+        let mut positions = self
+            .inventory
+            .positions()
+            .filter(|position| position.market_id == *market_id && position.quantity > 1e-9)
+            .collect::<Vec<_>>();
+        positions.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+        if positions.len() != 2 {
+            return None;
+        }
+
+        let quantity = positions[0].quantity.min(positions[1].quantity);
+        if quantity <= 1e-9 {
+            return None;
+        }
+        let expected_cost_usd =
+            quantity * positions[0].avg_price + quantity * positions[1].avg_price;
+
+        Some(MergeIntent {
+            command_id: ClientOrderId::from(format!(
+                "merge:{}:{:.8}:{}",
+                market_id, quantity, now_ms
+            )),
+            market_id: market_id.clone(),
+            yes_instrument_id: positions[0].instrument_id.clone(),
+            no_instrument_id: positions[1].instrument_id.clone(),
+            quantity,
+            expected_cash_usd: quantity,
+            expected_cost_usd,
+            expected_fee_usd: 0.0,
+            expected_gas_usd: 0.0,
+            reason,
+            created_at_ms: now_ms,
+        })
     }
 
     pub fn risk(&self) -> &RiskEngine {
@@ -892,6 +980,7 @@ impl<S: Strategy> Runtime<S> {
 
         let mut executed_qty = 0.0;
         if merge_flow {
+            self.pending_merge_by_market.remove(&fill.market_id);
             if let Some(execution) = self
                 .merge_executor
                 .apply_merge(&fill, &mut self.inventory)?
@@ -981,6 +1070,11 @@ impl<S: Strategy> Runtime<S> {
                 self.event_log
                     .push(adjustment.to_event("inventory updated from fill")),
             );
+            outcome.extend(self.plan_merge_command_for_market(
+                &fill.market_id,
+                now_ms,
+                "paired inventory after fill",
+            ));
         }
 
         if executed_qty > 0.0 {
@@ -1446,6 +1540,47 @@ impl<S: Strategy> Runtime<S> {
                 ),
             );
             return outcome;
+        }
+        if intent.side == TradeSide::Sell && intent.reduce_only {
+            if self.pending_merge_by_market.contains_key(&intent.market_id) {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            "reduce-only sell suppressed because merge is already pending",
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+            let merge_outcome = self.plan_merge_command_for_market(
+                &intent.market_id,
+                now_ms,
+                format!(
+                    "suppressed sell cleanup {}; mergeable paired inventory exists",
+                    intent.client_order_id
+                ),
+            );
+            if !merge_outcome.commands.is_empty() {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            "reduce-only sell suppressed because paired inventory is mergeable",
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                outcome.extend(merge_outcome);
+                return outcome;
+            }
         }
 
         let risk_context = RiskContext {
@@ -2134,6 +2269,7 @@ impl<S: Strategy> Runtime<S> {
         }
         self.first_fill_by_market.remove(market_id);
         self.first_merge_by_market.remove(market_id);
+        self.pending_merge_by_market.remove(market_id);
         self.unlawful_mode_by_market.remove(market_id);
     }
 
@@ -2654,6 +2790,201 @@ mod tests {
             0.0
         );
         assert!((runtime.inventory().free_cash_usd() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paired_inventory_fill_emits_explicit_merge_command() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.20,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("first leg");
+        let outcome = runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.70,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("second leg");
+
+        let merge = outcome
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                RuntimeCommand::Merge(intent) => Some(intent),
+                _ => None,
+            })
+            .expect("merge command");
+        assert_eq!(merge.market_id, MarketId::from("market-mm"));
+        assert!((merge.quantity - 6.5).abs() < 1e-9);
+        assert!((merge.expected_cash_usd - 6.5).abs() < 1e-9);
+        assert!((merge.expected_cost_usd - 5.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reduce_only_sell_cleanup_is_suppressed_when_merge_is_pending() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.20,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("first leg");
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.70,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("second leg");
+
+        let outcome = runtime.accept_intent(
+            OrderIntent {
+                client_order_id: ClientOrderId::from("cleanup-sell-1"),
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Sell,
+                limit_price: 0.19,
+                quantity: 1.0,
+                reduce_only: true,
+                reason: "fallback cleanup".to_string(),
+                quote_level_tag: Some("fallback-cleanup".to_string()),
+                created_at_ms: 12,
+            },
+            12,
+        );
+
+        assert!(outcome.commands.is_empty());
+        assert!(runtime
+            .open_orders()
+            .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1")));
+    }
+
+    #[test]
+    fn merge_close_event_applies_pending_merge_lifecycle() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.20,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("first leg");
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.70,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("second leg");
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: Some(ClientOrderId::from("merge:market-mm:6.50000000:11")),
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 1.0,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Unknown,
+                close_method: Some(CloseMethod::Merge),
+                observed_at_ms: 12,
+            })
+            .expect("merge event");
+
+        assert_eq!(runtime.inventory().position_qty(&InstrumentId::from("up")), 0.0);
+        assert_eq!(
+            runtime.inventory().position_qty(&InstrumentId::from("down")),
+            0.0
+        );
+        assert!((runtime.inventory().free_cash_usd() - 100.65).abs() < 1e-9);
     }
 
     #[test]

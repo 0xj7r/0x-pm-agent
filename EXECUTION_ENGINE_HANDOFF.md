@@ -254,6 +254,17 @@ Selling losing inventory to avoid a -100% UI mark is not necessarily the right
 behavior. The correct behavior depends on whether the position is paired,
 mergeable, hedgeable, or genuinely stranded.
 
+Current implementation boundary:
+
+- paired inventory can emit an explicit `RuntimeCommand::Merge(MergeIntent)`;
+- redeem is represented as `RuntimeCommand::Redeem(RedeemIntent)`;
+- paper execution can apply a merge command through the same merge close-event
+  lifecycle used by user-WS close events;
+- live merge/redeem relayer submission is intentionally a typed TODO boundary,
+  not hidden inside normal order submit/cancel;
+- reduce-only sell cleanup is suppressed while mergeable paired inventory already
+  has a merge command pending.
+
 ## Historical Issues Identified
 
 ### Unpaired Live Position
