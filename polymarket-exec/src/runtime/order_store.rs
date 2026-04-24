@@ -889,7 +889,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("whale-pair-order-store-{ts}.sqlite"));
+        let path = env::temp_dir().join(format!("polymarket-exec-order-store-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
         let now: EpochMillis = 1;
 
@@ -941,7 +941,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("whale-pair-order-store-conflict-{ts}.sqlite"));
+        let path = env::temp_dir().join(format!("polymarket-exec-order-store-conflict-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
         let now: EpochMillis = 10;
         let intent = OrderIntent {
@@ -969,7 +969,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = env::temp_dir().join(format!("whale-pair-signal-store-{ts}.sqlite"));
+        let path = env::temp_dir().join(format!("polymarket-exec-signal-store-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
 
         store.insert_signal_snapshot(SignalSnapshotRecord {

@@ -194,7 +194,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("whale-pair-journal-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!("polymarket-exec-journal-{unique}.jsonl"));
 
         let mut journal = JournalWriter::open(&path).unwrap();
         journal
@@ -232,7 +232,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("whale-pair-journal-checkpoint-{unique}.jsonl"));
+            std::env::temp_dir().join(format!("polymarket-exec-journal-checkpoint-{unique}.jsonl"));
 
         let mut journal = JournalWriter::open(&path).unwrap();
         journal
@@ -254,7 +254,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("whale-pair-journal-rotate-{unique}"));
+        let dir = std::env::temp_dir().join(format!("polymarket-exec-journal-rotate-{unique}"));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("journal.jsonl");
 

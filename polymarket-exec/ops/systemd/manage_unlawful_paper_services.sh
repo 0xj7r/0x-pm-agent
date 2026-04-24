@@ -3,9 +3,9 @@ set -euo pipefail
 
 ACTION="${1:-status}"
 SERVICES=(
-  whale-pair-exec@unlawful_baseline
-  whale-pair-exec@unlawful_broad_hours
-  whale-pair-exec@unlawful_press
+  polymarket-exec@unlawful_baseline
+  polymarket-exec@unlawful_broad_hours
+  polymarket-exec@unlawful_press
 )
 
 usage() {

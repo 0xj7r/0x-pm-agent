@@ -2509,7 +2509,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("whale-pair-order-store-startup-{ts}.sqlite"));
+        let path = std::env::temp_dir().join(format!("polymarket-exec-order-store-startup-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(&path).unwrap();
         let now_ms: u64 = 10;
         let record = OrderRecord::from_intent(

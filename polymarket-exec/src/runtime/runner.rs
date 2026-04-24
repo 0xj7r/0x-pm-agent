@@ -2297,7 +2297,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("whale-pair-live-reconcile-replay-{ts}.sqlite"));
+            std::env::temp_dir().join(format!("polymarket-exec-live-reconcile-replay-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(&path).expect("store");
         let mut record = OrderRecord::from_intent(
             "run-test",

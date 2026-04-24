@@ -86,7 +86,7 @@ impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
-        let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "whale-pair-exec");
+        let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "polymarket-exec");
         let strategy_name = env_or("WHALE_PAIR_STRATEGY", "unlawful_shear");
         let strategy_profile_path = parse_path_optional("WHALE_PAIR_STRATEGY_PROFILE_PATH");
         let strategy_profile = strategy_profile_path

@@ -1,5 +1,5 @@
 [Unit]
-Description=whale-pair-exec sleeve %i
+Description=polymarket-exec sleeve %i
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -26,7 +26,7 @@ TimeoutStopSec=20
 KillSignal=SIGINT
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=whale-pair-exec-%i
+SyslogIdentifier=polymarket-exec-%i
 
 [Install]
 WantedBy=default.target

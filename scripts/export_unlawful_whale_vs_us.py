@@ -101,7 +101,7 @@ def resolve_sleeve_paths(repo_root: Path, sleeve: SleeveConfig) -> dict[str, Pat
     env_values = load_env_assignments(repo_root / sleeve.env_path)
     order_store = env_values.get("WHALE_PAIR_ORDER_STORE_PATH")
     journal_path = env_values.get("WHALE_PAIR_EXEC_JOURNAL_PATH")
-    crate_root = repo_root / "whale-pair-exec"
+    crate_root = repo_root / "polymarket-exec"
 
     def resolve_runtime_path(raw: str | None) -> Path | None:
         if not raw:

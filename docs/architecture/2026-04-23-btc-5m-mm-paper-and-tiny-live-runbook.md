@@ -2,7 +2,7 @@
 
 Status: operator runbook
 Date: 2026-04-24
-Primary runtime: `whale-pair-exec`
+Primary runtime: `polymarket-exec`
 
 ## 1. Scope
 
@@ -208,15 +208,15 @@ systemd:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable whale-pair-exec@unlawful_baseline
-systemctl --user start whale-pair-exec@unlawful_baseline
-systemctl --user status whale-pair-exec@unlawful_baseline
-journalctl --user -u whale-pair-exec@unlawful_baseline -f
+systemctl --user enable polymarket-exec@unlawful_baseline
+systemctl --user start polymarket-exec@unlawful_baseline
+systemctl --user status polymarket-exec@unlawful_baseline
+journalctl --user -u polymarket-exec@unlawful_baseline -f
 ```
 
 Template file:
 
-- `polymarket-exec/ops/systemd/whale-pair-exec@.service`
+- `polymarket-exec/ops/systemd/polymarket-exec@.service`
 
 Host install helpers:
 
@@ -248,9 +248,9 @@ Default remote surfaces:
 - remote user: `root`
 - remote checkout: `/root/go/polymarket-agent`
 - managed services:
-  - `whale-pair-exec@unlawful_baseline`
-  - `whale-pair-exec@unlawful_broad_hours`
-  - `whale-pair-exec@unlawful_press`
+  - `polymarket-exec@unlawful_baseline`
+  - `polymarket-exec@unlawful_broad_hours`
+  - `polymarket-exec@unlawful_press`
 
 The deploy script syncs the repo, installs user services, enables lingering,
 starts the three paper sleeves, and probes ports `9108`, `9109`, and `9110`.
@@ -313,9 +313,9 @@ Journal and state paths remain sleeve-local and come from the checked-in env fil
 
 Process logs for always-on runs live in journald:
 
-- `journalctl --user -u whale-pair-exec@unlawful_baseline`
-- `journalctl --user -u whale-pair-exec@unlawful_broad_hours`
-- `journalctl --user -u whale-pair-exec@unlawful_press`
+- `journalctl --user -u polymarket-exec@unlawful_baseline`
+- `journalctl --user -u polymarket-exec@unlawful_broad_hours`
+- `journalctl --user -u polymarket-exec@unlawful_press`
 
 ## 10. Data retention and off-disk storage
 
@@ -424,7 +424,7 @@ WHALE_PAIR_LIVE_SMOKE_ASSET_ID=<outcome-token-id> \
 WHALE_PAIR_LIVE_SMOKE_MARKET_ID=<market-id> \
 WHALE_PAIR_LIVE_SMOKE_PRICE=0.01 \
 WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD=1.0 \
-cargo run -p whale-pair-exec
+cargo run -p polymarket-exec
 ```
 
 Success criteria:
@@ -452,7 +452,7 @@ Do not start tiny-live until all of these are true:
 - startup reconciliation against venue open orders is manually verified
 - top-3 ask notional caps are tighter than max order notional
 - stale `CancelRequested` orders transition to `NeedsReconcile`
-- operator kill path has been tested with `systemctl --user stop whale-pair-exec@<sleeve>`
+- operator kill path has been tested with `systemctl --user stop polymarket-exec@<sleeve>`
 
 First tiny-live run should be:
 
@@ -508,13 +508,13 @@ sudo loginctl enable-linger "$USER"
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now whale-pair-exec@unlawful_baseline
-systemctl --user enable --now whale-pair-exec@unlawful_broad_hours
-systemctl --user enable --now whale-pair-exec@unlawful_press
+systemctl --user enable --now polymarket-exec@unlawful_baseline
+systemctl --user enable --now polymarket-exec@unlawful_broad_hours
+systemctl --user enable --now polymarket-exec@unlawful_press
 ```
 
 8. Verify:
-   - `systemctl --user status whale-pair-exec@unlawful_baseline`
+   - `systemctl --user status polymarket-exec@unlawful_baseline`
    - `curl -sS http://127.0.0.1:9108/healthz`
    - `curl -sS http://127.0.0.1:9109/healthz`
    - `curl -sS http://127.0.0.1:9110/healthz`

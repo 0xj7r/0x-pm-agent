@@ -2,7 +2,7 @@
 
 Status: implementation-grade QA contract  
 Date: 2026-04-24  
-Primary target: `whale-pair-exec`  
+Primary target: `polymarket-exec`  
 Scope: `unlawful_shear` signal and runtime behavior, plus shared BTC 5m execution semantics that should stay true across strategy, runtime, reconcile, and paper calibration.
 
 ## 1. Purpose

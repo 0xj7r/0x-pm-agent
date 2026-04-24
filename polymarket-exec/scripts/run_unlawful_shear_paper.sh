@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CRATE_DIR="$ROOT_DIR/whale-pair-exec"
+CRATE_DIR="$ROOT_DIR/polymarket-exec"
 DATA_DIR="$ROOT_DIR/data/research/wallet_research/unlawful-shear"
 CONTEXT_PATH="$DATA_DIR/rust_market_context.json"
 RUNTIME_ENV_PATH="$DATA_DIR/rust_runtime.env"

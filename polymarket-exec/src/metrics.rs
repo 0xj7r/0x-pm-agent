@@ -116,7 +116,7 @@ pub struct ControlPlaneMetricsSnapshot {
 
 impl AppMetrics {
     pub fn new() -> Result<Self> {
-        let registry = Registry::new_custom(Some("whale_pair_exec".to_string()), None)
+        let registry = Registry::new_custom(Some("polymarket_exec".to_string()), None)
             .context("failed to construct prometheus registry")?;
 
         let market_ws_connected = IntGauge::with_opts(Opts::new(

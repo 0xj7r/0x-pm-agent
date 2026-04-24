@@ -1,5 +1,5 @@
 [package]
-name = "whale-pair-exec"
+name = "polymarket-exec"
 version = "0.1.0"
 edition = "2021"
 

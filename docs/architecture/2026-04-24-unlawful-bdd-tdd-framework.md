@@ -229,10 +229,10 @@ polymarket-exec/scripts/test_unlawful_stack.sh
 Direct commands:
 
 ```bash
-cargo test -p whale-pair-exec unlawful_gate -- --nocapture
-cargo test -p whale-pair-exec unlawful_shear_from_env_respects_offhour_override_flag -- --nocapture
-cargo test -p whale-pair-exec unlawful_shear_signal_reason_and_aggression_logged_in_decision_notes -- --nocapture
-cargo test -p whale-pair-exec --test btc_5m_mm_scenarios -- --nocapture
+cargo test -p polymarket-exec unlawful_gate -- --nocapture
+cargo test -p polymarket-exec unlawful_shear_from_env_respects_offhour_override_flag -- --nocapture
+cargo test -p polymarket-exec unlawful_shear_signal_reason_and_aggression_logged_in_decision_notes -- --nocapture
+cargo test -p polymarket-exec --test btc_5m_mm_scenarios -- --nocapture
 python3 -m py_compile scripts/export_unlawful_whale_vs_us.py
 ```
 

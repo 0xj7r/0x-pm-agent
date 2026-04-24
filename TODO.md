@@ -1,10 +1,10 @@
-# TODO: Execution Roadmap (Rust `whale-pair-exec` is now primary)
+# TODO: Execution Roadmap (Rust `polymarket-exec` is now primary)
 
 _Last updated: 2026-04-23_
 
 ## What is already in place
 
-- Execution scaffold for paired strategies is implemented in Rust via `execution/rust/whale-pair-exec`.
+- Execution scaffold for paired strategies is implemented in Rust via `execution/rust/polymarket-exec`.
 - Runtime/event architecture exists:
   - `execution/rust/polymarket-exec/src/runtime.rs`
   - `execution/rust/polymarket-exec/src/inventory.rs`
