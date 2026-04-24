@@ -106,9 +106,71 @@ pub async fn run() -> Result<()> {
     {
         "live_smoke" => return run_live_smoke(config).await,
         "live_cancel" => return run_live_cancel(config).await,
+        "live_reconcile" => return run_live_reconcile(config).await,
         _ => {}
     }
     run_with_config(config).await
+}
+
+async fn run_live_reconcile(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    if config.paper_mode {
+        anyhow::bail!("live reconcile mode requires WHALE_PAIR_PAPER_MODE=false");
+    }
+    let adapter = connect_live_adapter(&config).await?;
+    let now_ms = now_unix_ms();
+    let after_ms = std::env::var("WHALE_PAIR_LIVE_RECONCILE_AFTER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| now_ms.saturating_sub(60 * 60 * 1_000));
+
+    let open_orders = adapter.sync_open_orders().await?;
+    info!(
+        open_order_count = open_orders.len(),
+        "live reconcile open orders synced"
+    );
+    for order in open_orders {
+        info!(
+            venue_order_id = %order.venue_order_id,
+            client_order_id = ?order.client_order_id,
+            market_id = %order.market_id,
+            instrument_id = %order.instrument_id,
+            side = ?order.side,
+            price = order.limit_price,
+            original_qty = order.original_qty,
+            remaining_qty = order.remaining_qty,
+            "live reconcile open order"
+        );
+    }
+
+    let fills = adapter.sync_recent_fills(after_ms).await?;
+    info!(
+        fill_count = fills.len(),
+        after_ms, "live reconcile recent fills synced"
+    );
+    for fill in fills {
+        info!(
+            venue_order_id = %fill.venue_order_id,
+            client_order_id = ?fill.client_order_id,
+            market_id = %fill.market_id,
+            instrument_id = %fill.instrument_id,
+            side = ?fill.side,
+            price = fill.price,
+            quantity = fill.quantity,
+            liquidity = ?fill.liquidity,
+            observed_at_ms = fill.observed_at_ms,
+            "live reconcile recent fill"
+        );
+    }
+
+    let balances = adapter.sync_balances().await?;
+    info!(
+        cash_usd = balances.cash_usd,
+        position_count = balances.positions.len(),
+        observed_at_ms = balances.observed_at_ms,
+        "live reconcile balances synced"
+    );
+    Ok(())
 }
 
 async fn run_live_smoke(config: AppConfig) -> Result<()> {
@@ -1894,13 +1956,6 @@ async fn sync_execution_state(
                         let Some(client_order_id) = resolved_client_order_id else {
                             continue;
                         };
-                        if !runtime
-                            .open_order_snapshots()
-                            .iter()
-                            .any(|managed| managed.intent.client_order_id == client_order_id)
-                        {
-                            continue;
-                        }
                         fill.client_order_id = Some(client_order_id.clone());
                         filled_client_ids.insert(client_order_id);
                         report.venue_fills.push(fill);
@@ -2461,6 +2516,7 @@ mod tests {
         submitted: Mutex<Vec<ClientOrderId>>,
         cancelled: Mutex<Vec<ClientOrderId>>,
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
+        fills: Vec<VenueFill>,
     }
 
     #[async_trait]
@@ -2511,7 +2567,7 @@ mod tests {
             &self,
             _after_ms: u64,
         ) -> Result<Vec<VenueFill>, ExecutionError> {
-            Ok(Vec::new())
+            Ok(self.fills.clone())
         }
     }
 
@@ -2607,6 +2663,64 @@ mod tests {
             .find(|managed| managed.intent.client_order_id == ClientOrderId::from("client-working"))
             .expect("managed order");
         assert_eq!(order.status, ManagedOrderStatus::Working);
+    }
+
+    #[tokio::test]
+    async fn live_sync_applies_late_fill_after_order_left_open_memory() {
+        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
+        let client_order_id = ClientOrderId::from("client-working");
+        runtime.on_order_cancelled(&client_order_id, "test cancel before fill", now_unix_ms());
+        assert!(runtime.open_order_snapshots().is_empty());
+
+        let adapter = Arc::new(RecordingAdapter {
+            fills: vec![VenueFill {
+                venue_order_id: OrderId::from("venue-1"),
+                client_order_id: None,
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                price: 0.40,
+                quantity: 5.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                observed_at_ms: now_unix_ms(),
+            }],
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map =
+            HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        let position = runtime
+            .inventory()
+            .position(&InstrumentId::from("token-1"))
+            .expect("late fill should create inventory");
+        assert_eq!(position.quantity, 5.0);
+        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+        assert_eq!(metrics.snapshot().fill_total, 1);
+        assert_eq!(metrics.snapshot().fill_maker_total, 1);
     }
 
     #[test]
