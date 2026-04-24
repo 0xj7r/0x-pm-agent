@@ -252,6 +252,8 @@ pub struct Btc5mMmConfig {
     pub venue_min_order_quantity: f64,
     pub entry_min_size_multiplier: f64,
     pub min_order_quantity: f64,
+    pub maker_price_tick: f64,
+    pub maker_safety_ticks: f64,
     pub cooldown_ms: u64,
     pub taker_fee_coeff: f64,
     pub allow_single_leg_entry: bool,
@@ -291,6 +293,8 @@ impl Btc5mMmConfig {
                 1.0,
             ),
             min_order_quantity: parse_f64("WHALE_PAIR_BTC_5M_MM_TARGET_MIN_ORDER_QUANTITY", 0.01),
+            maker_price_tick: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_PRICE_TICK", 0.01),
+            maker_safety_ticks: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS", 2.0),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
             allow_single_leg_entry: parse_bool(
@@ -321,6 +325,8 @@ impl Btc5mMmConfig {
             venue_min_order_quantity: config.venue_min_order_quantity.max(0.01),
             entry_min_size_multiplier: config.entry_min_size_multiplier.max(1.0),
             min_order_quantity: config.min_order_quantity.max(0.01),
+            maker_price_tick: config.maker_price_tick.clamp(0.001, 0.05),
+            maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
             allow_single_leg_entry: config.allow_single_leg_entry,
@@ -1456,6 +1462,42 @@ impl Btc5mMmStrategy {
             .filter(|price| price.is_finite() && *price > 0.0)
     }
 
+    fn floor_to_tick(value: f64, tick: f64) -> f64 {
+        if value <= 0.0 || tick <= 0.0 {
+            return 0.0;
+        }
+        deterministic_quote_unit((value / tick).floor() * tick)
+    }
+
+    fn ceil_to_tick(value: f64, tick: f64) -> f64 {
+        if value <= 0.0 || tick <= 0.0 {
+            return 0.0;
+        }
+        deterministic_quote_unit((value / tick).ceil() * tick)
+    }
+
+    fn maker_bid_price(&self, quote: &QuoteSnapshot, max_bid: f64) -> Option<f64> {
+        let best_bid = Self::best_bid(quote)?;
+        let best_ask = Self::best_ask(quote)?;
+        let maker_cap = best_ask - self.config.maker_price_tick * self.config.maker_safety_ticks;
+        let price = Self::floor_to_tick(
+            best_bid.min(max_bid).min(maker_cap),
+            self.config.maker_price_tick,
+        );
+        (price >= 0.01 && price < best_ask).then_some(price)
+    }
+
+    fn maker_ask_price(&self, quote: &QuoteSnapshot, min_ask: f64) -> Option<f64> {
+        let best_bid = Self::best_bid(quote)?;
+        let best_ask = Self::best_ask(quote)?;
+        let maker_floor = best_bid + self.config.maker_price_tick * self.config.maker_safety_ticks;
+        let price = Self::ceil_to_tick(
+            best_ask.max(min_ask).max(maker_floor),
+            self.config.maker_price_tick,
+        );
+        (price <= 0.99 && price > best_bid).then_some(price)
+    }
+
     fn top_notional(levels: &[BookLevel], take: usize) -> f64 {
         levels
             .iter()
@@ -1618,12 +1660,15 @@ impl Btc5mMmStrategy {
         if best_bid <= 0.0 || best_bid > max_bid {
             return None;
         }
+        let Some(bid_price) = self.maker_bid_price(quote, max_bid) else {
+            return None;
+        };
         if quantity < self.config.min_order_quantity
             || quantity + 1e-9 < self.config.venue_min_order_quantity
         {
             return None;
         }
-        let notional = quantity * best_bid;
+        let notional = quantity * bid_price;
         if notional < self.config.min_order_notional_usd
             || notional > self.config.max_leg_cost_usd - leg_cost + 1e-9
             || notional > self.config.max_gross_cost_usd - gross_cost + 1e-9
@@ -1634,12 +1679,12 @@ impl Btc5mMmStrategy {
             market_id.clone(),
             instrument_id.clone(),
             TradeSide::Buy,
-            best_bid,
+            bid_price,
             quantity,
             false,
             quote_level_tag.to_string(),
             format!(
-                "{reason_prefix} fair={fair:.4} bid={best_bid:.4} max_bid={max_bid:.4} leg_cost={leg_cost:.2}"
+                "{reason_prefix} fair={fair:.4} bid={bid_price:.4} max_bid={max_bid:.4} leg_cost={leg_cost:.2}"
             ),
             now_ms,
         ))
@@ -1678,26 +1723,23 @@ impl Btc5mMmStrategy {
         if position_qty <= 0.0 {
             return;
         }
-        let Some(best_ask) = Self::best_ask(quote) else {
-            return;
-        };
         let min_ask =
             deterministic_quote_unit((fair + self.config.min_edge_bps / 10_000.0).clamp(0.01, 1.0));
-        if best_ask < min_ask {
+        let Some(ask_price) = self.maker_ask_price(quote, min_ask) else {
             return;
-        }
-        let Some(quantity) = self.reduce_quantity(position_qty, best_ask) else {
+        };
+        let Some(quantity) = self.reduce_quantity(position_qty, ask_price) else {
             return;
         };
         intents.push(Self::build_order(
             market_id.clone(),
             instrument_id.clone(),
             TradeSide::Sell,
-            best_ask,
+            ask_price,
             quantity,
             true,
             "mm-ask-reduce".to_string(),
-            format!("btc-5m-mm reduce ask fair={fair:.4} ask={best_ask:.4} min_ask={min_ask:.4}"),
+            format!("btc-5m-mm reduce ask fair={fair:.4} ask={ask_price:.4} min_ask={min_ask:.4}"),
             now_ms,
         ));
     }
@@ -1717,26 +1759,23 @@ impl Btc5mMmStrategy {
         if position_qty <= 0.0 {
             return;
         }
-        let Some(best_ask) = Self::best_ask(quote) else {
-            return;
-        };
         let min_ask =
             deterministic_quote_unit((fair + self.config.min_edge_bps / 10_000.0).clamp(0.01, 1.0));
-        if best_ask < min_ask {
+        let Some(ask_price) = self.maker_ask_price(quote, min_ask) else {
             return;
-        }
-        let Some(quantity) = self.reduce_quantity(position_qty, best_ask) else {
+        };
+        let Some(quantity) = self.reduce_quantity(position_qty, ask_price) else {
             return;
         };
         intents.push(Self::build_order(
             market_id.clone(),
             instrument_id.clone(),
             TradeSide::Sell,
-            best_ask,
+            ask_price,
             quantity,
             true,
             quote_level_tag.to_string(),
-            format!("{reason_prefix} fair={fair:.4} ask={best_ask:.4} min_ask={min_ask:.4}"),
+            format!("{reason_prefix} fair={fair:.4} ask={ask_price:.4} min_ask={min_ask:.4}"),
             now_ms,
         ));
     }
@@ -4212,6 +4251,8 @@ mod tests {
             venue_min_order_quantity: 5.0,
             entry_min_size_multiplier: 1.0,
             min_order_quantity: 0.01,
+            maker_price_tick: 0.01,
+            maker_safety_ticks: 2.0,
             cooldown_ms: 0,
             taker_fee_coeff: 0.072,
             allow_single_leg_entry: false,
@@ -4419,6 +4460,29 @@ mod tests {
             .intents
             .iter()
             .all(|intent| intent.quantity >= strategy.config.venue_min_order_quantity));
+    }
+
+    #[test]
+    fn btc_5m_mm_bids_do_not_cross_book_with_post_only_buffer() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.45, 0.46, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.53, 0.54, 10));
+
+        assert_eq!(decision.intents.len(), 2);
+        let up = decision
+            .intents
+            .iter()
+            .find(|intent| intent.instrument_id == InstrumentId::from("up"))
+            .expect("up bid");
+        let down = decision
+            .intents
+            .iter()
+            .find(|intent| intent.instrument_id == InstrumentId::from("down"))
+            .expect("down bid");
+        assert_eq!(up.limit_price, 0.44);
+        assert_eq!(down.limit_price, 0.52);
     }
 
     #[test]
