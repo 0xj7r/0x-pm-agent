@@ -233,6 +233,91 @@ impl GoatPairConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Btc5mMmConfig {
+    pub base_clip_usd: f64,
+    pub min_clip_usd: f64,
+    pub max_clip_usd: f64,
+    pub liquidity_clip_fraction: f64,
+    pub sell_clip_usd: f64,
+    pub hedge_rescue_clip_usd: f64,
+    pub max_gross_cost_usd: f64,
+    pub max_leg_cost_usd: f64,
+    pub min_edge_bps: f64,
+    pub hedge_rescue_edge_bps: f64,
+    pub inventory_skew_bps: f64,
+    pub max_spread: f64,
+    pub min_top_depth_notional_usd: f64,
+    pub min_order_notional_usd: f64,
+    pub min_order_quantity: f64,
+    pub cooldown_ms: u64,
+    pub taker_fee_coeff: f64,
+    pub allow_single_leg_entry: bool,
+    pub loser_cut_mark_ratio: f64,
+    pub loser_cut_min_remaining_s: u64,
+}
+
+impl Btc5mMmConfig {
+    pub fn from_env() -> Self {
+        let config = Self {
+            base_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_BASE_CLIP_USD", 1.10),
+            min_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_CLIP_USD", 0.25),
+            max_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_CLIP_USD", 5.0),
+            liquidity_clip_fraction: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_LIQUIDITY_CLIP_FRACTION",
+                0.02,
+            ),
+            sell_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_SELL_CLIP_USD", 1.10),
+            hedge_rescue_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_CLIP_USD", 2.50),
+            max_gross_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_GROSS_COST_USD", 20.0),
+            max_leg_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_USD", 10.0),
+            min_edge_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS", 75.0),
+            hedge_rescue_edge_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS", 25.0),
+            inventory_skew_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_INVENTORY_SKEW_BPS", 150.0),
+            max_spread: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_SPREAD", 0.08),
+            min_top_depth_notional_usd: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MIN_TOP_DEPTH_NOTIONAL_USD",
+                2.0,
+            ),
+            min_order_notional_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_ORDER_NOTIONAL_USD", 1.0),
+            min_order_quantity: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_ORDER_QUANTITY", 5.0),
+            cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
+            taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
+            allow_single_leg_entry: parse_bool(
+                "WHALE_PAIR_BTC_5M_MM_ALLOW_SINGLE_LEG_ENTRY",
+                false,
+            ),
+            loser_cut_mark_ratio: parse_f64("WHALE_PAIR_BTC_5M_MM_LOSER_CUT_MARK_RATIO", 0.70),
+            loser_cut_min_remaining_s: parse_u64(
+                "WHALE_PAIR_BTC_5M_MM_LOSER_CUT_MIN_REMAINING_S",
+                20,
+            ),
+        };
+        Self {
+            base_clip_usd: config.base_clip_usd.max(0.01),
+            min_clip_usd: config.min_clip_usd.max(0.01),
+            max_clip_usd: config.max_clip_usd.max(config.min_clip_usd.max(0.01)),
+            liquidity_clip_fraction: config.liquidity_clip_fraction.clamp(0.0, 1.0),
+            sell_clip_usd: config.sell_clip_usd.max(0.01),
+            hedge_rescue_clip_usd: config.hedge_rescue_clip_usd.max(0.01),
+            max_gross_cost_usd: config.max_gross_cost_usd.max(0.01),
+            max_leg_cost_usd: config.max_leg_cost_usd.max(0.01),
+            min_edge_bps: config.min_edge_bps.max(0.0),
+            hedge_rescue_edge_bps: config.hedge_rescue_edge_bps.max(0.0),
+            inventory_skew_bps: config.inventory_skew_bps.max(0.0),
+            max_spread: config.max_spread.max(0.001),
+            min_top_depth_notional_usd: config.min_top_depth_notional_usd.max(0.0),
+            min_order_notional_usd: config.min_order_notional_usd.max(0.01),
+            min_order_quantity: config.min_order_quantity.max(0.01),
+            cooldown_ms: config.cooldown_ms,
+            taker_fee_coeff: config.taker_fee_coeff.max(0.0),
+            allow_single_leg_entry: config.allow_single_leg_entry,
+            loser_cut_mark_ratio: config.loser_cut_mark_ratio.clamp(0.0, 1.0),
+            loser_cut_min_remaining_s: config.loser_cut_min_remaining_s,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UnlawfulShearConfig {
     pub cheap_hedge_price_max: f64,
@@ -262,6 +347,7 @@ pub struct UnlawfulShearConfig {
     pub microstructure_imbalance_threshold: f64,
     pub microstructure_weak_bid_scale: f64,
     pub microstructure_thin_ask_scale: f64,
+    pub maker_entry_pricing: bool,
 
     pub regime_primary_hours_utc: Vec<u32>,
     pub regime_secondary_hours_utc: Vec<u32>,
@@ -372,6 +458,10 @@ impl UnlawfulShearConfig {
                 "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_THIN_ASK_SCALE",
                 0.85,
             ),
+            maker_entry_pricing: env::var("WHALE_PAIR_UNLAWFUL_SHEAR_MAKER_ENTRY_PRICING")
+                .ok()
+                .and_then(|raw| raw.parse::<bool>().ok())
+                .unwrap_or(false),
 
             regime_primary_hours_utc: vec![10, 11, 19, 22, 23],
             regime_secondary_hours_utc: vec![0, 9, 12, 20, 21],
@@ -485,6 +575,12 @@ struct GoatMarketState {
     asks: HashMap<InstrumentId, f64>,
     last_seq: u64,
     last_fill_ms: Option<EpochMillis>,
+}
+
+#[derive(Debug, Default)]
+struct Btc5mMmMarketState {
+    quotes: HashMap<InstrumentId, QuoteSnapshot>,
+    last_action_ms: Option<EpochMillis>,
 }
 
 #[derive(Debug, Default)]
@@ -759,6 +855,11 @@ impl StrategyProfile {
                 "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_THIN_ASK_SCALE",
                 self.strategies.unlawful_shear.microstructure_thin_ask_scale,
                 0.85,
+            ),
+            maker_entry_pricing: env_or_profile_bool(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MAKER_ENTRY_PRICING",
+                self.strategies.unlawful_shear.maker_entry_pricing,
+                false,
             ),
             regime_primary_hours_utc: sorted_unique_u32_vec(
                 self.strategies
@@ -1129,6 +1230,7 @@ pub struct UnlawfulShearProfile {
     pub microstructure_imbalance_threshold: Option<f64>,
     pub microstructure_weak_bid_scale: Option<f64>,
     pub microstructure_thin_ask_scale: Option<f64>,
+    pub maker_entry_pricing: Option<bool>,
     pub cooldown_ms: Option<u64>,
 
     pub regime_primary_hours_utc: Option<Vec<u32>>,
@@ -1194,6 +1296,7 @@ pub trait Strategy {
 #[derive(Debug)]
 pub enum StrategyMode {
     Goat(GoatPairStrategy),
+    Btc5mMm(Btc5mMmStrategy),
     UnlawfulShear(UnlawfulShearStrategy),
     Noop(NoopStrategy),
 }
@@ -1201,6 +1304,7 @@ pub enum StrategyMode {
 impl StrategyMode {
     pub fn from_name(name: &str, profile: Option<&StrategyProfile>) -> Self {
         match name {
+            "btc_5m_mm" => Self::Btc5mMm(Btc5mMmStrategy::with_defaults()),
             "goat_pair" => Self::Goat(GoatPairStrategy::with_profile(profile)),
             "noop" => Self::Noop(NoopStrategy),
             "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile)),
@@ -1210,6 +1314,7 @@ impl StrategyMode {
 
     pub fn taker_fee_coeff(&self) -> f64 {
         match self {
+            Self::Btc5mMm(strategy) => strategy.taker_fee_coeff(),
             Self::Goat(strategy) => strategy.taker_fee_coeff(),
             Self::UnlawfulShear(strategy) => strategy.taker_fee_coeff(),
             Self::Noop(_) => 0.0,
@@ -1218,6 +1323,7 @@ impl StrategyMode {
 
     pub fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
         match self {
+            Self::Btc5mMm(_) => None,
             Self::Goat(_) => None,
             Self::Noop(_) => None,
             Self::UnlawfulShear(strategy) => Some(strategy.unlawful_gate_config()),
@@ -1228,6 +1334,7 @@ impl StrategyMode {
 impl Strategy for StrategyMode {
     fn name(&self) -> &str {
         match self {
+            Self::Btc5mMm(strategy) => strategy.name(),
             Self::Goat(strategy) => strategy.name(),
             Self::UnlawfulShear(strategy) => strategy.name(),
             Self::Noop(strategy) => strategy.name(),
@@ -1240,6 +1347,7 @@ impl Strategy for StrategyMode {
 
     fn on_start(&mut self, context: &StrategyContext) -> StrategyDecision {
         match self {
+            Self::Btc5mMm(strategy) => strategy.on_start(context),
             Self::Goat(strategy) => strategy.on_start(context),
             Self::UnlawfulShear(strategy) => strategy.on_start(context),
             Self::Noop(strategy) => strategy.on_start(context),
@@ -1252,6 +1360,7 @@ impl Strategy for StrategyMode {
         snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
         match self {
+            Self::Btc5mMm(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Goat(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::UnlawfulShear(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Noop(strategy) => strategy.on_market_snapshot(context, snapshot),
@@ -1264,9 +1373,588 @@ impl Strategy for StrategyMode {
         fill: &crate::types::FillReport,
     ) -> StrategyDecision {
         match self {
+            Self::Btc5mMm(strategy) => strategy.on_fill(context, fill),
             Self::Goat(strategy) => strategy.on_fill(context, fill),
             Self::UnlawfulShear(strategy) => strategy.on_fill(context, fill),
             Self::Noop(strategy) => strategy.on_fill(context, fill),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Btc5mMmStrategy {
+    config: Btc5mMmConfig,
+    market_states: HashMap<MarketId, Btc5mMmMarketState>,
+}
+
+impl Btc5mMmStrategy {
+    pub fn new(config: Btc5mMmConfig) -> Self {
+        Self {
+            config,
+            market_states: HashMap::new(),
+        }
+    }
+
+    pub fn with_defaults() -> Self {
+        Self::new(Btc5mMmConfig::from_env())
+    }
+
+    pub fn taker_fee_coeff(&self) -> f64 {
+        self.config.taker_fee_coeff
+    }
+
+    fn position_for(
+        inventory: &InventorySnapshot,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+    ) -> (f64, f64, Option<f64>) {
+        inventory
+            .positions
+            .iter()
+            .find(|position| {
+                &position.market_id == market_id && &position.instrument_id == instrument_id
+            })
+            .map_or((0.0, 0.0, None), |position| {
+                (position.quantity, position.avg_price, position.mark_price)
+            })
+    }
+
+    fn gross_cost_usd(inventory: &InventorySnapshot, market_id: &MarketId) -> f64 {
+        inventory
+            .positions
+            .iter()
+            .filter(|position| &position.market_id == market_id)
+            .map(|position| position.quantity.abs() * position.avg_price)
+            .sum()
+    }
+
+    fn best_bid(quote: &QuoteSnapshot) -> Option<f64> {
+        quote
+            .best_bid
+            .as_ref()
+            .map(|level| level.price)
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    fn best_ask(quote: &QuoteSnapshot) -> Option<f64> {
+        quote
+            .best_ask
+            .as_ref()
+            .map(|level| level.price)
+            .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    fn top_notional(levels: &[BookLevel], take: usize) -> f64 {
+        levels
+            .iter()
+            .take(take)
+            .filter(|level| level.price.is_finite() && level.quantity.is_finite())
+            .filter(|level| level.price > 0.0 && level.quantity > 0.0)
+            .map(|level| level.price * level.quantity)
+            .sum()
+    }
+
+    fn dynamic_bid_clip_usd(&self, quote: &QuoteSnapshot, requested_clip_usd: f64) -> f64 {
+        let visible_bid_notional = Self::top_notional(&quote.bid_levels, 3);
+        let liquidity_cap =
+            if visible_bid_notional > 0.0 && self.config.liquidity_clip_fraction > 0.0 {
+                visible_bid_notional * self.config.liquidity_clip_fraction
+            } else {
+                self.config.max_clip_usd
+            };
+        requested_clip_usd
+            .min(self.config.max_clip_usd)
+            .min(liquidity_cap)
+            .max(self.config.min_clip_usd)
+    }
+
+    fn paired_entry_clip_usd(
+        &self,
+        left_quote: &QuoteSnapshot,
+        right_quote: &QuoteSnapshot,
+        requested_clip_usd: f64,
+    ) -> f64 {
+        self.dynamic_bid_clip_usd(left_quote, requested_clip_usd)
+            .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd))
+    }
+
+    fn quote_is_usable(&self, quote: &QuoteSnapshot) -> bool {
+        let (Some(bid), Some(ask)) = (Self::best_bid(quote), Self::best_ask(quote)) else {
+            return false;
+        };
+        if ask <= bid || ask - bid > self.config.max_spread {
+            return false;
+        }
+        let bid_depth = Self::top_notional(&quote.bid_levels, 3);
+        let ask_depth = Self::top_notional(&quote.ask_levels, 3);
+        bid_depth >= self.config.min_top_depth_notional_usd
+            && ask_depth >= self.config.min_top_depth_notional_usd
+    }
+
+    fn fair_values(&self, left: &QuoteSnapshot, right: &QuoteSnapshot) -> Option<(f64, f64)> {
+        let left_mid = (Self::best_bid(left)? + Self::best_ask(left)?) * 0.5;
+        let right_mid = (Self::best_bid(right)? + Self::best_ask(right)?) * 0.5;
+        let sum = left_mid + right_mid;
+        if sum.is_finite() && sum > 0.0 {
+            Some((left_mid / sum, right_mid / sum))
+        } else {
+            None
+        }
+    }
+
+    fn inventory_skew(&self, leg_cost: f64, gross_cost: f64) -> f64 {
+        if self.config.inventory_skew_bps <= 0.0 {
+            return 0.0;
+        }
+        let leg_pressure = (leg_cost / self.config.max_leg_cost_usd).clamp(0.0, 1.5);
+        let gross_pressure = (gross_cost / self.config.max_gross_cost_usd).clamp(0.0, 1.5);
+        (leg_pressure + gross_pressure) * self.config.inventory_skew_bps / 10_000.0
+    }
+
+    fn build_order(
+        market_id: MarketId,
+        instrument_id: InstrumentId,
+        side: TradeSide,
+        price: f64,
+        quantity: f64,
+        reduce_only: bool,
+        quote_level_tag: String,
+        reason: String,
+        now_ms: EpochMillis,
+    ) -> OrderIntent {
+        OrderIntent {
+            client_order_id: deterministic_client_order_id(
+                "btc-5m-mm",
+                &market_id,
+                &instrument_id,
+                side,
+                reduce_only,
+                &quote_level_tag,
+                price,
+                quantity,
+            ),
+            market_id,
+            instrument_id,
+            side,
+            limit_price: price,
+            quantity,
+            reduce_only,
+            reason,
+            quote_level_tag: Some(quote_level_tag),
+            created_at_ms: now_ms,
+        }
+    }
+
+    fn build_bid_intent(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        quote: &QuoteSnapshot,
+        fair: f64,
+        leg_cost: f64,
+        gross_cost: f64,
+        clip_usd: f64,
+        edge_bps: f64,
+        quote_level_tag: &str,
+        reason_prefix: &str,
+        now_ms: EpochMillis,
+    ) -> Option<OrderIntent> {
+        let best_bid = Self::best_bid(quote)?;
+        let edge = edge_bps / 10_000.0;
+        let max_bid = deterministic_quote_unit(
+            (fair - edge - self.inventory_skew(leg_cost, gross_cost)).clamp(0.0, 0.99),
+        );
+        if best_bid <= 0.0 || best_bid > max_bid {
+            return None;
+        }
+        let notional = clip_usd
+            .max(self.config.min_order_quantity * best_bid)
+            .min((self.config.max_leg_cost_usd - leg_cost).max(0.0))
+            .min((self.config.max_gross_cost_usd - gross_cost).max(0.0));
+        if notional < self.config.min_order_notional_usd {
+            return None;
+        }
+        let quantity = notional / best_bid;
+        if quantity < self.config.min_order_quantity {
+            return None;
+        }
+        Some(Self::build_order(
+            market_id.clone(),
+            instrument_id.clone(),
+            TradeSide::Buy,
+            best_bid,
+            quantity,
+            false,
+            quote_level_tag.to_string(),
+            format!(
+                "{reason_prefix} fair={fair:.4} bid={best_bid:.4} max_bid={max_bid:.4} leg_cost={leg_cost:.2}"
+            ),
+            now_ms,
+        ))
+    }
+
+    fn should_cut_loser(
+        &self,
+        avg_price: f64,
+        mark_price: Option<f64>,
+        time_remaining_s: Option<u64>,
+    ) -> bool {
+        let Some(mark_price) = mark_price else {
+            return false;
+        };
+        if avg_price <= 0.0 || mark_price <= 0.0 {
+            return false;
+        }
+        if time_remaining_s
+            .is_some_and(|remaining| remaining < self.config.loser_cut_min_remaining_s)
+        {
+            return false;
+        }
+        mark_price <= avg_price * self.config.loser_cut_mark_ratio
+    }
+
+    fn push_reduce_ask(
+        &self,
+        intents: &mut Vec<OrderIntent>,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        quote: &QuoteSnapshot,
+        fair: f64,
+        position_qty: f64,
+        now_ms: EpochMillis,
+    ) {
+        if position_qty <= 0.0 {
+            return;
+        }
+        let Some(best_ask) = Self::best_ask(quote) else {
+            return;
+        };
+        let min_ask =
+            deterministic_quote_unit((fair + self.config.min_edge_bps / 10_000.0).clamp(0.01, 1.0));
+        if best_ask < min_ask {
+            return;
+        }
+        let target_notional = self.config.sell_clip_usd.min(position_qty * best_ask);
+        if target_notional < self.config.min_order_notional_usd {
+            return;
+        }
+        let quantity = (target_notional / best_ask).min(position_qty);
+        if quantity <= 0.0 {
+            return;
+        }
+        intents.push(Self::build_order(
+            market_id.clone(),
+            instrument_id.clone(),
+            TradeSide::Sell,
+            best_ask,
+            quantity,
+            true,
+            "mm-ask-reduce".to_string(),
+            format!("btc-5m-mm reduce ask fair={fair:.4} ask={best_ask:.4} min_ask={min_ask:.4}"),
+            now_ms,
+        ));
+    }
+
+    fn push_reduce_ask_with_reason(
+        &self,
+        intents: &mut Vec<OrderIntent>,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        quote: &QuoteSnapshot,
+        fair: f64,
+        position_qty: f64,
+        quote_level_tag: &str,
+        reason_prefix: &str,
+        now_ms: EpochMillis,
+    ) {
+        if position_qty <= 0.0 {
+            return;
+        }
+        let Some(best_ask) = Self::best_ask(quote) else {
+            return;
+        };
+        let min_ask =
+            deterministic_quote_unit((fair + self.config.min_edge_bps / 10_000.0).clamp(0.01, 1.0));
+        if best_ask < min_ask {
+            return;
+        }
+        let target_notional = self.config.sell_clip_usd.min(position_qty * best_ask);
+        if target_notional < self.config.min_order_notional_usd {
+            return;
+        }
+        let quantity = (target_notional / best_ask).min(position_qty);
+        let quantity = quantity.max(0.0);
+        intents.push(Self::build_order(
+            market_id.clone(),
+            instrument_id.clone(),
+            TradeSide::Sell,
+            best_ask,
+            quantity,
+            true,
+            quote_level_tag.to_string(),
+            format!("{reason_prefix} fair={fair:.4} ask={best_ask:.4} min_ask={min_ask:.4}"),
+            now_ms,
+        ));
+    }
+}
+
+impl Strategy for Btc5mMmStrategy {
+    fn name(&self) -> &str {
+        "btc_5m_mm"
+    }
+
+    fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
+        StrategyDecision::none()
+    }
+
+    fn on_market_snapshot(
+        &mut self,
+        context: &StrategyContext,
+        snapshot: &MarketSnapshot,
+    ) -> StrategyDecision {
+        if context.runtime_status != RuntimeStatus::Running {
+            return StrategyDecision::none();
+        }
+        if self.config.cooldown_ms > 0
+            && self
+                .market_states
+                .get(&snapshot.market_id)
+                .and_then(|state| state.last_action_ms)
+                .is_some_and(|last_ms| {
+                    context.now_ms.saturating_sub(last_ms) < self.config.cooldown_ms
+                })
+        {
+            return StrategyDecision::none();
+        }
+
+        let (left_id, left_quote, right_id, right_quote) = {
+            let state = self
+                .market_states
+                .entry(snapshot.market_id.clone())
+                .or_default();
+            state
+                .quotes
+                .insert(snapshot.instrument_id.clone(), snapshot.quote.clone());
+            if state.quotes.len() < 2 {
+                return StrategyDecision::none();
+            }
+            let mut sides = state
+                .quotes
+                .iter()
+                .map(|(id, quote)| (id.clone(), quote.clone()))
+                .collect::<Vec<_>>();
+            sides.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+            let (left_id, left_quote) = sides[0].clone();
+            let (right_id, right_quote) = sides[1].clone();
+            (left_id, left_quote, right_id, right_quote)
+        };
+
+        if !self.quote_is_usable(&left_quote) || !self.quote_is_usable(&right_quote) {
+            return StrategyDecision::none();
+        }
+        let Some((left_fair, right_fair)) = self.fair_values(&left_quote, &right_quote) else {
+            return StrategyDecision::none();
+        };
+
+        let gross_cost = Self::gross_cost_usd(&context.inventory, &snapshot.market_id);
+        let (left_qty, left_avg, left_mark) =
+            Self::position_for(&context.inventory, &snapshot.market_id, &left_id);
+        let (right_qty, right_avg, right_mark) =
+            Self::position_for(&context.inventory, &snapshot.market_id, &right_id);
+        let left_cost = (left_qty * left_avg).max(0.0);
+        let right_cost = (right_qty * right_avg).max(0.0);
+
+        let mut intents = Vec::new();
+        let left_has_inventory = left_qty > 1e-9;
+        let right_has_inventory = right_qty > 1e-9;
+
+        match (left_has_inventory, right_has_inventory) {
+            (false, false) => {
+                let entry_clip_usd = self.paired_entry_clip_usd(
+                    &left_quote,
+                    &right_quote,
+                    self.config.base_clip_usd,
+                );
+                let left_bid = self.build_bid_intent(
+                    &snapshot.market_id,
+                    &left_id,
+                    &left_quote,
+                    left_fair,
+                    left_cost,
+                    gross_cost,
+                    entry_clip_usd,
+                    self.config.min_edge_bps,
+                    "mm-paired-bid",
+                    "btc-5m-mm paired bid",
+                    context.now_ms,
+                );
+                let right_bid = self.build_bid_intent(
+                    &snapshot.market_id,
+                    &right_id,
+                    &right_quote,
+                    right_fair,
+                    right_cost,
+                    gross_cost,
+                    entry_clip_usd,
+                    self.config.min_edge_bps,
+                    "mm-paired-bid",
+                    "btc-5m-mm paired bid",
+                    context.now_ms,
+                );
+                match (left_bid, right_bid) {
+                    (Some(left), Some(right)) => {
+                        intents.push(left);
+                        intents.push(right);
+                    }
+                    (Some(single), None) | (None, Some(single))
+                        if self.config.allow_single_leg_entry =>
+                    {
+                        intents.push(single);
+                    }
+                    _ => {}
+                }
+            }
+            (true, false) => {
+                let hedge_clip_usd =
+                    self.dynamic_bid_clip_usd(&right_quote, self.config.hedge_rescue_clip_usd);
+                if let Some(hedge) = self.build_bid_intent(
+                    &snapshot.market_id,
+                    &right_id,
+                    &right_quote,
+                    right_fair,
+                    right_cost,
+                    gross_cost,
+                    hedge_clip_usd,
+                    self.config.hedge_rescue_edge_bps,
+                    "mm-hedge-rescue",
+                    "btc-5m-mm hedge rescue",
+                    context.now_ms,
+                ) {
+                    intents.push(hedge);
+                } else {
+                    self.push_reduce_ask_with_reason(
+                        &mut intents,
+                        &snapshot.market_id,
+                        &left_id,
+                        &left_quote,
+                        left_fair,
+                        left_qty,
+                        "mm-accidental-reduce",
+                        "btc-5m-mm reduce accidental left-only inventory",
+                        context.now_ms,
+                    );
+                }
+            }
+            (false, true) => {
+                let hedge_clip_usd =
+                    self.dynamic_bid_clip_usd(&left_quote, self.config.hedge_rescue_clip_usd);
+                if let Some(hedge) = self.build_bid_intent(
+                    &snapshot.market_id,
+                    &left_id,
+                    &left_quote,
+                    left_fair,
+                    left_cost,
+                    gross_cost,
+                    hedge_clip_usd,
+                    self.config.hedge_rescue_edge_bps,
+                    "mm-hedge-rescue",
+                    "btc-5m-mm hedge rescue",
+                    context.now_ms,
+                ) {
+                    intents.push(hedge);
+                } else {
+                    self.push_reduce_ask_with_reason(
+                        &mut intents,
+                        &snapshot.market_id,
+                        &right_id,
+                        &right_quote,
+                        right_fair,
+                        right_qty,
+                        "mm-accidental-reduce",
+                        "btc-5m-mm reduce accidental right-only inventory",
+                        context.now_ms,
+                    );
+                }
+            }
+            (true, true) => {
+                self.push_reduce_ask(
+                    &mut intents,
+                    &snapshot.market_id,
+                    &left_id,
+                    &left_quote,
+                    left_fair,
+                    left_qty,
+                    context.now_ms,
+                );
+                self.push_reduce_ask(
+                    &mut intents,
+                    &snapshot.market_id,
+                    &right_id,
+                    &right_quote,
+                    right_fair,
+                    right_qty,
+                    context.now_ms,
+                );
+            }
+        }
+
+        let time_remaining_s = context
+            .unlawful_signal
+            .as_ref()
+            .and_then(|signal| signal.time_remaining_s);
+        if left_has_inventory && self.should_cut_loser(left_avg, left_mark, time_remaining_s) {
+            self.push_reduce_ask_with_reason(
+                &mut intents,
+                &snapshot.market_id,
+                &left_id,
+                &left_quote,
+                left_fair,
+                left_qty,
+                "mm-loser-cut",
+                "btc-5m-mm cut deteriorating left inventory",
+                context.now_ms,
+            );
+        }
+        if right_has_inventory && self.should_cut_loser(right_avg, right_mark, time_remaining_s) {
+            self.push_reduce_ask_with_reason(
+                &mut intents,
+                &snapshot.market_id,
+                &right_id,
+                &right_quote,
+                right_fair,
+                right_qty,
+                "mm-loser-cut",
+                "btc-5m-mm cut deteriorating right inventory",
+                context.now_ms,
+            );
+        }
+
+        if intents.is_empty() {
+            return StrategyDecision::none();
+        }
+        if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
+            state.last_action_ms = Some(context.now_ms);
+        }
+        StrategyDecision {
+            notes: vec![format!(
+                "btc-5m-mm quotes left={} fair={left_fair:.4} right={} fair={right_fair:.4} gross_cost={gross_cost:.2}",
+                left_id, right_id
+            )],
+            intents,
+        }
+    }
+
+    fn on_fill(
+        &mut self,
+        _context: &StrategyContext,
+        fill: &crate::types::FillReport,
+    ) -> StrategyDecision {
+        StrategyDecision {
+            intents: Vec::new(),
+            notes: vec![format!(
+                "btc-5m-mm fill {} {:?} qty={:.4}@{:.4}",
+                fill.instrument_id, fill.side, fill.quantity, fill.price
+            )],
         }
     }
 }
@@ -1817,6 +2505,14 @@ impl UnlawfulShearStrategy {
             .as_ref()
             .map(|level| level.price)
             .filter(|price| price.is_finite() && *price > 0.0)
+    }
+
+    fn buy_limit_price(&self, quote: &QuoteSnapshot, fallback_ask: f64) -> f64 {
+        if self.config.maker_entry_pricing {
+            Self::best_bid(quote).unwrap_or(fallback_ask)
+        } else {
+            fallback_ask
+        }
     }
 
     fn position_state<'a>(
@@ -2667,6 +3363,8 @@ impl Strategy for UnlawfulShearStrategy {
         let suppressed_by_gate_reasons = !gate_reasons.is_empty();
         let expensive_bid = Self::best_bid(expensive_quote).unwrap_or(0.0);
         let cheap_bid = Self::best_bid(cheap_quote).unwrap_or(0.0);
+        let expensive_buy_price = self.buy_limit_price(expensive_quote, expensive_ask);
+        let cheap_buy_price = self.buy_limit_price(cheap_quote, cheap_ask);
         let mut notes = vec![self.format_unlawful_eval_summary(
             context,
             snapshot,
@@ -2906,12 +3604,12 @@ impl Strategy for UnlawfulShearStrategy {
                         &mut remaining_gross,
                         &snapshot.market_id,
                         expensive_id,
-                        expensive_ask,
+                        expensive_buy_price,
                         clip_usd,
                         next_quote_tag("core-entry"),
                         format!(
-                            "unlawful-shear core-entry gap={:.4} ask={:.4}",
-                            price_gap, expensive_ask
+                            "unlawful-shear core-entry gap={:.4} ask={:.4} limit={:.4}",
+                            price_gap, expensive_ask, expensive_buy_price
                         ),
                         context.now_ms,
                     );
@@ -2954,12 +3652,12 @@ impl Strategy for UnlawfulShearStrategy {
                         &mut remaining_gross,
                         &snapshot.market_id,
                         cheap_id,
-                        cheap_ask,
+                        cheap_buy_price,
                         clip_usd,
                         next_quote_tag("hedge-probe"),
                         format!(
-                            "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
-                            price_gap, cheap_ask
+                            "unlawful-shear hedge-probe gap={:.4} ask={:.4} limit={:.4}",
+                            price_gap, cheap_ask, cheap_buy_price
                         ),
                         context.now_ms,
                     );
@@ -3003,12 +3701,12 @@ impl Strategy for UnlawfulShearStrategy {
                             &mut remaining_gross,
                             &snapshot.market_id,
                             cheap_id,
-                            cheap_ask,
+                            cheap_buy_price,
                             clip_usd,
                             next_quote_tag("add-hedge"),
                             format!(
-                                "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
-                                hedge_ratio, cheap_ask
+                                "unlawful-shear add-hedge ratio={:.4} ask={:.4} limit={:.4}",
+                                hedge_ratio, cheap_ask, cheap_buy_price
                             ),
                             context.now_ms,
                         );
@@ -3049,12 +3747,12 @@ impl Strategy for UnlawfulShearStrategy {
                             &mut remaining_gross,
                             &snapshot.market_id,
                             expensive_id,
-                            expensive_ask,
+                            expensive_buy_price,
                             clip_usd,
                             next_quote_tag("rebalance-core"),
                             format!(
-                                "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
-                                hedge_ratio, expensive_ask
+                                "unlawful-shear rebalance-core ratio={:.4} ask={:.4} limit={:.4}",
+                                hedge_ratio, expensive_ask, expensive_buy_price
                             ),
                             context.now_ms,
                         );
@@ -3081,9 +3779,9 @@ impl Strategy for UnlawfulShearStrategy {
                     cheap_id
                 };
                 let target_price = if target_id == expensive_id {
-                    expensive_ask
+                    expensive_buy_price
                 } else {
-                    cheap_ask
+                    cheap_buy_price
                 };
                 if Self::can_launch_mode_action(mode, "rebalance-flip") && buy_clip_scale > 0.0 {
                     let requested_clip = match phase {
@@ -3165,12 +3863,12 @@ impl Strategy for UnlawfulShearStrategy {
                         &mut remaining_gross,
                         &snapshot.market_id,
                         cheap_id,
-                        cheap_ask,
+                        cheap_buy_price,
                         clip_usd,
                         next_quote_tag("early-probe"),
                         format!(
-                            "unlawful-shear early-probe ask={:.4} gap={:.4}",
-                            cheap_ask, price_gap
+                            "unlawful-shear early-probe ask={:.4} limit={:.4} gap={:.4}",
+                            cheap_ask, cheap_buy_price, price_gap
                         ),
                         context.now_ms,
                     );
@@ -3288,6 +3986,17 @@ fn parse_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 fn parse_usize(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
@@ -3377,13 +4086,13 @@ fn normalize_unlawful_invariants(mut config: UnlawfulShearConfig) -> UnlawfulShe
 #[cfg(test)]
 mod tests {
     use super::{
+        Btc5mMmConfig, Btc5mMmStrategy, GoatPairConfig, GoatPairStrategy, NoopStrategy,
+        QuoteSnapshot, Strategy, StrategyContext, StrategyDecision,
+    };
+    use super::{
         BtcRegimeSnapshot, MarketActivitySignal, PairedBookSignal, SessionBucket,
         UnlawfulAggressionTier, UnlawfulExecutionMode, UnlawfulShearConfig, UnlawfulShearStrategy,
         UnlawfulSignalSnapshot,
-    };
-    use super::{
-        GoatPairConfig, GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext,
-        StrategyDecision,
     };
     use crate::inventory::{InventorySnapshot, PositionState};
     use crate::types::{
@@ -3435,6 +4144,31 @@ mod tests {
             open_orders_for_market,
             market_context: None,
             unlawful_signal,
+        }
+    }
+
+    fn btc_5m_mm_test_config() -> Btc5mMmConfig {
+        Btc5mMmConfig {
+            base_clip_usd: 1.10,
+            min_clip_usd: 0.25,
+            max_clip_usd: 5.0,
+            liquidity_clip_fraction: 0.02,
+            sell_clip_usd: 1.10,
+            hedge_rescue_clip_usd: 2.50,
+            max_gross_cost_usd: 20.0,
+            max_leg_cost_usd: 10.0,
+            min_edge_bps: 75.0,
+            hedge_rescue_edge_bps: 25.0,
+            inventory_skew_bps: 150.0,
+            max_spread: 0.08,
+            min_top_depth_notional_usd: 2.0,
+            min_order_notional_usd: 1.0,
+            min_order_quantity: 5.0,
+            cooldown_ms: 0,
+            taker_fee_coeff: 0.072,
+            allow_single_leg_entry: false,
+            loser_cut_mark_ratio: 0.70,
+            loser_cut_min_remaining_s: 20,
         }
     }
 
@@ -3618,6 +4352,63 @@ mod tests {
             .intents
             .windows(2)
             .all(|window| window[0].limit_price >= window[1].limit_price));
+    }
+
+    #[test]
+    fn btc_5m_mm_quotes_maker_bids_on_both_outcomes() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 10));
+
+        assert_eq!(decision.intents.len(), 2);
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| intent.side == TradeSide::Buy && !intent.reduce_only));
+        assert!(decision.intents.iter().all(|intent| intent.quantity >= 5.0));
+    }
+
+    #[test]
+    fn btc_5m_mm_suppresses_unpaired_flat_entry_by_default() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.52, 0.56, 10));
+
+        assert!(decision.intents.is_empty());
+    }
+
+    #[test]
+    fn btc_5m_mm_hedge_rescues_one_sided_inventory() {
+        let mut config = btc_5m_mm_test_config();
+        config.inventory_skew_bps = 0.0;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        let positions = vec![PositionState {
+            market_id: MarketId::from("market-mm"),
+            instrument_id: InstrumentId::from("up"),
+            quantity: 5.0,
+            avg_price: 0.33,
+            mark_price: Some(0.33),
+            updated_at_ms: 1,
+        }];
+        let ctx = context(positions);
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.32, 0.34, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+
+        assert_eq!(decision.intents.len(), 1);
+        assert_eq!(
+            decision.intents[0].instrument_id,
+            InstrumentId::from("down")
+        );
+        assert_eq!(decision.intents[0].side, TradeSide::Buy);
+        assert_eq!(
+            decision.intents[0].quote_level_tag.as_deref(),
+            Some("mm-hedge-rescue")
+        );
     }
 
     #[test]

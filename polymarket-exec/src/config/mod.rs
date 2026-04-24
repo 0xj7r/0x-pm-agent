@@ -74,6 +74,8 @@ pub struct AppConfig {
     pub live_post_only: bool,
     pub live_order_ttl: Duration,
     pub live_order_max_age: Duration,
+    pub live_reconcile_missing_grace: Duration,
+    pub quote_min_order_age: Duration,
     pub live_max_submit_errors: usize,
     pub live_max_cancel_errors: usize,
     pub live_kill_on_reconcile_mismatch: bool,
@@ -201,6 +203,13 @@ impl AppConfig {
         let live_post_only = parse_bool("WHALE_PAIR_LIVE_POST_ONLY", true)?;
         let live_order_ttl = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_TTL_MS", 20_000)?;
         let live_order_max_age = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_MAX_AGE_MS", 25_000)?;
+        let live_reconcile_missing_grace =
+            parse_duration_ms("WHALE_PAIR_LIVE_RECONCILE_MISSING_GRACE_MS", 5_000)?;
+        let quote_min_order_age_default_ms = if paper_mode { 750 } else { 5_000 };
+        let quote_min_order_age = parse_duration_ms(
+            "WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS",
+            quote_min_order_age_default_ms,
+        )?;
         let live_max_submit_errors = parse_usize("WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS", 1)?;
         let live_max_cancel_errors = parse_usize("WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS", 1)?;
         let live_kill_on_reconcile_mismatch =
@@ -251,6 +260,8 @@ impl AppConfig {
             live_post_only,
             live_order_ttl,
             live_order_max_age,
+            live_reconcile_missing_grace,
+            quote_min_order_age,
             live_max_submit_errors,
             live_max_cancel_errors,
             live_kill_on_reconcile_mismatch,

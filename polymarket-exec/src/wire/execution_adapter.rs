@@ -9,9 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use polymarket_client_sdk::auth::{Credentials as SdkCredentials, ExposeSecret, Signer, Uuid};
-use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
+use polymarket_client_sdk::clob::types::request::{
+    BalanceAllowanceRequest, OrdersRequest, TradesRequest as ClobTradesRequest,
+};
 use polymarket_client_sdk::clob::types::{
     OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
+    TraderSide,
 };
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
 use polymarket_client_sdk::types::{
@@ -237,6 +240,10 @@ pub trait ExecutionAdapter: Send + Sync {
     async fn cancel(&self, req: CancelOrderRequest) -> Result<CancelOrderAck, ExecutionError>;
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError>;
     async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError>;
+    async fn sync_recent_fills(
+        &self,
+        after_ms: EpochMillis,
+    ) -> Result<Vec<VenueFill>, ExecutionError>;
 }
 
 #[derive(Default)]
@@ -285,6 +292,13 @@ impl ExecutionAdapter for PaperExecutionAdapter {
             positions: Vec::new(),
             observed_at_ms: now_unix_ms(),
         })
+    }
+
+    async fn sync_recent_fills(
+        &self,
+        _after_ms: EpochMillis,
+    ) -> Result<Vec<VenueFill>, ExecutionError> {
+        Ok(Vec::new())
     }
 }
 
@@ -453,6 +467,16 @@ impl PolymarketExecutionAdapter {
         intended_expires_at_ms.saturating_add(60_000)
     }
 
+    fn usdc_balance_to_usd(raw: &str) -> f64 {
+        let trimmed = raw.trim();
+        let value = trimmed.parse::<f64>().unwrap_or(0.0);
+        if trimmed.contains('.') {
+            value
+        } else {
+            value / 1_000_000.0
+        }
+    }
+
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         let page = self
             .client
@@ -494,11 +518,91 @@ impl PolymarketExecutionAdapter {
             .balance_allowance(BalanceAllowanceRequest::default())
             .await
             .map_err(map_sdk_error)?;
+        let raw_balance = response.balance.to_string();
         Ok(VenueBalances {
-            cash_usd: response.balance.to_string().parse::<f64>().unwrap_or(0.0),
+            cash_usd: Self::usdc_balance_to_usd(&raw_balance),
             positions: Vec::new(),
             observed_at_ms: now_unix_ms(),
         })
+    }
+
+    async fn sync_recent_fills_from_client(
+        &self,
+        after_ms: EpochMillis,
+    ) -> Result<Vec<VenueFill>, ExecutionError> {
+        let request = ClobTradesRequest::builder()
+            .after((after_ms / 1_000) as i64)
+            .build();
+        let page = self
+            .client
+            .trades(&request, None)
+            .await
+            .map_err(map_sdk_error)?;
+        let mut fills = Vec::new();
+        for trade in page.data {
+            let observed_at_ms = trade.match_time.timestamp_millis().max(0) as u64;
+            let market_id = MarketId::from(format!("{:#x}", trade.market));
+            match trade.trader_side {
+                TraderSide::Maker => {
+                    for maker in trade.maker_orders {
+                        fills.push(VenueFill {
+                            venue_order_id: OrderId::from(maker.order_id),
+                            client_order_id: None,
+                            market_id: market_id.clone(),
+                            instrument_id: InstrumentId::from(maker.asset_id.to_string()),
+                            side: match maker.side {
+                                SdkSide::Buy => TradeSide::Buy,
+                                _ => TradeSide::Sell,
+                            },
+                            price: maker.price.to_string().parse::<f64>().unwrap_or(0.0),
+                            quantity: maker
+                                .matched_amount
+                                .to_string()
+                                .parse::<f64>()
+                                .unwrap_or(0.0),
+                            fee_usd: 0.0,
+                            liquidity: FillLiquidity::Maker,
+                            observed_at_ms,
+                        });
+                    }
+                }
+                TraderSide::Taker | TraderSide::Unknown(_) => {
+                    fills.push(VenueFill {
+                        venue_order_id: OrderId::from(trade.taker_order_id),
+                        client_order_id: None,
+                        market_id,
+                        instrument_id: InstrumentId::from(trade.asset_id.to_string()),
+                        side: match trade.side {
+                            SdkSide::Buy => TradeSide::Buy,
+                            _ => TradeSide::Sell,
+                        },
+                        price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
+                        quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
+                        fee_usd: 0.0,
+                        liquidity: FillLiquidity::Taker,
+                        observed_at_ms,
+                    });
+                }
+                _ => {
+                    fills.push(VenueFill {
+                        venue_order_id: OrderId::from(trade.taker_order_id),
+                        client_order_id: None,
+                        market_id,
+                        instrument_id: InstrumentId::from(trade.asset_id.to_string()),
+                        side: match trade.side {
+                            SdkSide::Buy => TradeSide::Buy,
+                            _ => TradeSide::Sell,
+                        },
+                        price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
+                        quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
+                        fee_usd: 0.0,
+                        liquidity: FillLiquidity::Unknown,
+                        observed_at_ms,
+                    });
+                }
+            }
+        }
+        Ok(fills)
     }
 }
 
@@ -644,6 +748,13 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
     async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError> {
         self.sync_balances_from_client().await
     }
+
+    async fn sync_recent_fills(
+        &self,
+        after_ms: EpochMillis,
+    ) -> Result<Vec<VenueFill>, ExecutionError> {
+        self.sync_recent_fills_from_client(after_ms).await
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -754,6 +865,16 @@ mod tests {
         assert_eq!(
             PolymarketExecutionAdapter::venue_gtd_expiration_ms(1_000),
             61_000
+        );
+    }
+
+    #[test]
+    fn usdc_balance_parser_handles_base_units_and_decimal_units() {
+        assert!(
+            (PolymarketExecutionAdapter::usdc_balance_to_usd("106484140") - 106.48414).abs() < 1e-9
+        );
+        assert!(
+            (PolymarketExecutionAdapter::usdc_balance_to_usd("106.48414") - 106.48414).abs() < 1e-9
         );
     }
 }
