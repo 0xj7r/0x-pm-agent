@@ -249,6 +249,14 @@ pub struct UnlawfulShearConfig {
     pub salvage_bid_floor: f64,
     pub max_open_orders_total: usize,
     pub taker_fee_coeff: f64,
+    pub microstructure_enabled: bool,
+    pub microstructure_require_depth: bool,
+    pub microstructure_max_spread: f64,
+    pub microstructure_min_ask_notional_top3_usd: f64,
+    pub microstructure_max_clip_ask_notional_fraction: f64,
+    pub microstructure_imbalance_threshold: f64,
+    pub microstructure_weak_bid_scale: f64,
+    pub microstructure_thin_ask_scale: f64,
 
     pub regime_primary_hours_utc: Vec<u32>,
     pub regime_secondary_hours_utc: Vec<u32>,
@@ -316,6 +324,40 @@ impl UnlawfulShearConfig {
                 6,
             ),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
+            microstructure_enabled: env::var("WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_ENABLED")
+                .ok()
+                .and_then(|raw| raw.parse::<bool>().ok())
+                .unwrap_or(true),
+            microstructure_require_depth: env::var(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH",
+            )
+            .ok()
+            .and_then(|raw| raw.parse::<bool>().ok())
+            .unwrap_or(false),
+            microstructure_max_spread: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MAX_SPREAD",
+                0.05,
+            ),
+            microstructure_min_ask_notional_top3_usd: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MIN_ASK_NOTIONAL_TOP3_USD",
+                2.0,
+            ),
+            microstructure_max_clip_ask_notional_fraction: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MAX_CLIP_ASK_NOTIONAL_FRACTION",
+                0.10,
+            ),
+            microstructure_imbalance_threshold: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_IMBALANCE_THRESHOLD",
+                0.55,
+            ),
+            microstructure_weak_bid_scale: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_WEAK_BID_SCALE",
+                0.65,
+            ),
+            microstructure_thin_ask_scale: parse_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_THIN_ASK_SCALE",
+                0.85,
+            ),
 
             regime_primary_hours_utc: vec![10, 11, 19, 22, 23],
             regime_secondary_hours_utc: vec![0, 9, 12, 20, 21],
@@ -445,6 +487,12 @@ enum UnlawfulShearPhase {
     Late,
     VeryLate,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UnlawfulMicrostructureLeg {
+    Cheap,
+    Expensive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +684,52 @@ impl StrategyProfile {
                 "WHALE_PAIR_TAKER_FEE_COEFF",
                 self.strategies.unlawful_shear.taker_fee_coeff,
                 0.072,
+            ),
+            microstructure_enabled: env_or_profile_bool(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_ENABLED",
+                self.strategies.unlawful_shear.microstructure_enabled,
+                true,
+            ),
+            microstructure_require_depth: env_or_profile_bool(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH",
+                self.strategies.unlawful_shear.microstructure_require_depth,
+                false,
+            ),
+            microstructure_max_spread: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MAX_SPREAD",
+                self.strategies.unlawful_shear.microstructure_max_spread,
+                0.05,
+            ),
+            microstructure_min_ask_notional_top3_usd: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MIN_ASK_NOTIONAL_TOP3_USD",
+                self.strategies
+                    .unlawful_shear
+                    .microstructure_min_ask_notional_top3_usd,
+                2.0,
+            ),
+            microstructure_max_clip_ask_notional_fraction: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_MAX_CLIP_ASK_NOTIONAL_FRACTION",
+                self.strategies
+                    .unlawful_shear
+                    .microstructure_max_clip_ask_notional_fraction,
+                0.10,
+            ),
+            microstructure_imbalance_threshold: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_IMBALANCE_THRESHOLD",
+                self.strategies
+                    .unlawful_shear
+                    .microstructure_imbalance_threshold,
+                0.55,
+            ),
+            microstructure_weak_bid_scale: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_WEAK_BID_SCALE",
+                self.strategies.unlawful_shear.microstructure_weak_bid_scale,
+                0.65,
+            ),
+            microstructure_thin_ask_scale: env_or_profile_f64(
+                "WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_THIN_ASK_SCALE",
+                self.strategies.unlawful_shear.microstructure_thin_ask_scale,
+                0.85,
             ),
             regime_primary_hours_utc: sorted_unique_u32_vec(
                 self.strategies
@@ -995,6 +1089,14 @@ pub struct UnlawfulShearProfile {
     pub salvage_bid_floor: Option<f64>,
     pub max_open_orders_total: Option<usize>,
     pub taker_fee_coeff: Option<f64>,
+    pub microstructure_enabled: Option<bool>,
+    pub microstructure_require_depth: Option<bool>,
+    pub microstructure_max_spread: Option<f64>,
+    pub microstructure_min_ask_notional_top3_usd: Option<f64>,
+    pub microstructure_max_clip_ask_notional_fraction: Option<f64>,
+    pub microstructure_imbalance_threshold: Option<f64>,
+    pub microstructure_weak_bid_scale: Option<f64>,
+    pub microstructure_thin_ask_scale: Option<f64>,
     pub cooldown_ms: Option<u64>,
 
     pub regime_primary_hours_utc: Option<Vec<u32>>,
@@ -1942,11 +2044,7 @@ impl UnlawfulShearStrategy {
         // changes in late-window salvage and fallback-close mode.
         let bucket = 0.25;
         let quantized = (raw_qty / bucket).floor() * bucket;
-        if quantized >= bucket {
-            quantized
-        } else {
-            0.0
-        }
+        if quantized >= bucket { quantized } else { 0.0 }
     }
 
     fn winning_instrument_id(
@@ -2111,11 +2209,7 @@ impl UnlawfulShearStrategy {
             && price_gap >= self.config.preferred_price_gap_min;
 
         if hard_band {
-            if preferred_band {
-                1.0
-            } else {
-                0.6
-            }
+            if preferred_band { 1.0 } else { 0.6 }
         } else {
             0.0
         }
@@ -2130,11 +2224,128 @@ impl UnlawfulShearStrategy {
         }
     }
 
+    fn microstructure_adjusted_clip(
+        &self,
+        signal: Option<&UnlawfulSignalSnapshot>,
+        leg: UnlawfulMicrostructureLeg,
+        action: &str,
+        requested_clip_usd: f64,
+    ) -> (f64, Vec<String>) {
+        if !self.config.microstructure_enabled || requested_clip_usd <= 0.0 {
+            return (requested_clip_usd.max(0.0), Vec::new());
+        }
+
+        let Some(signal) = signal else {
+            if self.config.microstructure_require_depth {
+                return (
+                    0.0,
+                    vec![format!(
+                        "microstructure blocked action={action} reason=missing signal"
+                    )],
+                );
+            }
+            return (requested_clip_usd, Vec::new());
+        };
+
+        let (label, spread, ask_notional_top3, imbalance) = match leg {
+            UnlawfulMicrostructureLeg::Cheap => (
+                "cheap",
+                signal.book.cheap_spread,
+                signal.book.cheap_ask_notional_top3,
+                signal.book.cheap_depth_imbalance_top3,
+            ),
+            UnlawfulMicrostructureLeg::Expensive => (
+                "expensive",
+                signal.book.expensive_spread,
+                signal.book.expensive_ask_notional_top3,
+                signal.book.expensive_depth_imbalance_top3,
+            ),
+        };
+
+        let mut reasons = Vec::new();
+        if spread
+            .is_some_and(|value| value.is_finite() && value > self.config.microstructure_max_spread)
+        {
+            return (
+                0.0,
+                vec![format!(
+                    "microstructure blocked action={action} leg={label} spread={} max={}",
+                    Self::fmt_opt_f64(spread, 4),
+                    self.config.microstructure_max_spread
+                )],
+            );
+        }
+
+        let Some(ask_notional_top3) =
+            ask_notional_top3.filter(|value| value.is_finite() && *value > 0.0)
+        else {
+            if self.config.microstructure_require_depth {
+                return (
+                    0.0,
+                    vec![format!(
+                        "microstructure blocked action={action} leg={label} reason=missing ask depth"
+                    )],
+                );
+            }
+            return (requested_clip_usd, reasons);
+        };
+
+        if ask_notional_top3 < self.config.microstructure_min_ask_notional_top3_usd {
+            return (
+                0.0,
+                vec![format!(
+                    "microstructure blocked action={action} leg={label} ask_notional_top3={ask_notional_top3:.2} min={:.2}",
+                    self.config.microstructure_min_ask_notional_top3_usd
+                )],
+            );
+        }
+
+        let mut adjusted_clip = requested_clip_usd.min(
+            ask_notional_top3
+                * self
+                    .config
+                    .microstructure_max_clip_ask_notional_fraction
+                    .clamp(0.0, 1.0),
+        );
+        if adjusted_clip < requested_clip_usd {
+            reasons.push(format!(
+                "microstructure scaled action={action} leg={label} requested={requested_clip_usd:.2} adjusted={adjusted_clip:.2} ask_notional_top3={ask_notional_top3:.2}"
+            ));
+        }
+
+        if let Some(imbalance) = imbalance.filter(|value| value.is_finite()) {
+            let threshold = self.config.microstructure_imbalance_threshold.abs();
+            if threshold > 0.0 && imbalance <= -threshold {
+                let before = adjusted_clip;
+                adjusted_clip *= self.config.microstructure_weak_bid_scale.clamp(0.0, 1.0);
+                if adjusted_clip < before {
+                    reasons.push(format!(
+                        "microstructure weak-bid scale action={action} leg={label} imbalance={imbalance:.3} adjusted={adjusted_clip:.2}"
+                    ));
+                }
+            } else if threshold > 0.0 && imbalance >= threshold {
+                let before = adjusted_clip;
+                adjusted_clip *= self.config.microstructure_thin_ask_scale.clamp(0.0, 1.0);
+                if adjusted_clip < before {
+                    reasons.push(format!(
+                        "microstructure thin-ask scale action={action} leg={label} imbalance={imbalance:.3} adjusted={adjusted_clip:.2}"
+                    ));
+                }
+            }
+        }
+
+        if adjusted_clip < 1e-3 {
+            reasons.push(format!(
+                "microstructure blocked action={action} leg={label} reason=adjusted clip below floor"
+            ));
+            return (0.0, reasons);
+        }
+
+        (adjusted_clip, reasons)
+    }
+
     fn fmt_opt_f64(value: Option<f64>, decimals: usize) -> String {
-        value.map_or_else(
-            || "na".to_string(),
-            |value| format!("{value:.decimals$}"),
-        )
+        value.map_or_else(|| "na".to_string(), |value| format!("{value:.decimals$}"))
     }
 
     fn fmt_opt_u64(value: Option<u64>) -> String {
@@ -2388,6 +2599,7 @@ impl Strategy for UnlawfulShearStrategy {
             has_inventory,
             &gate_reasons,
         )];
+        let mut controller_blocked = false;
         let near_end =
             self.window_at_or_past_end(context) || progress.is_some_and(|value| value >= 0.96);
         let close_fraction = self.fallback_close_fraction(phase, progress);
@@ -2466,9 +2678,8 @@ impl Strategy for UnlawfulShearStrategy {
                 ));
             }
             if intents.is_empty() {
-                let close_qty = |qty: f64, fraction: f64| {
-                    Self::quantize_cleanup_qty((qty * fraction).min(qty))
-                };
+                let close_qty =
+                    |qty: f64, fraction: f64| Self::quantize_cleanup_qty((qty * fraction).min(qty));
                 if cheap_qty > 0.0 && cheap_bid > 0.0 {
                     let amount = close_qty(cheap_qty, close_fraction);
                     if amount > 0.0 {
@@ -2588,20 +2799,34 @@ impl Strategy for UnlawfulShearStrategy {
                 _ => core_clip_base,
             };
             if Self::can_launch_mode_action(mode, "core-entry") && buy_clip_scale > 0.0 {
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                    &snapshot.market_id,
-                    expensive_id,
-                    expensive_ask,
-                    core_clip_usd * buy_clip_scale,
-                    next_quote_tag("core-entry"),
-                    format!(
-                        "unlawful-shear core-entry gap={:.4} ask={:.4}",
-                        price_gap, expensive_ask
-                    ),
-                    context.now_ms,
+                let requested_clip = core_clip_usd * buy_clip_scale;
+                let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                    context.unlawful_signal.as_ref(),
+                    UnlawfulMicrostructureLeg::Expensive,
+                    "core-entry",
+                    requested_clip,
                 );
+                if clip_usd <= 0.0 {
+                    controller_blocked = true;
+                    notes.extend(micro_notes);
+                    record_action_block("core-entry", "microstructure blocked", &mut notes);
+                } else {
+                    notes.extend(micro_notes);
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        expensive_id,
+                        expensive_ask,
+                        clip_usd,
+                        next_quote_tag("core-entry"),
+                        format!(
+                            "unlawful-shear core-entry gap={:.4} ask={:.4}",
+                            price_gap, expensive_ask
+                        ),
+                        context.now_ms,
+                    );
+                }
             } else {
                 record_action_block(
                     "core-entry",
@@ -2622,20 +2847,34 @@ impl Strategy for UnlawfulShearStrategy {
                 (self.config.hedge_clip_usd * phase_clip_scale).min(self.config.hedge_clip_usd)
             };
             if Self::can_launch_mode_action(mode, "hedge-probe") && buy_clip_scale > 0.0 {
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                    &snapshot.market_id,
-                    cheap_id,
-                    cheap_ask,
-                    hedge_probe_usd * buy_clip_scale,
-                    next_quote_tag("hedge-probe"),
-                    format!(
-                        "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
-                        price_gap, cheap_ask
-                    ),
-                    context.now_ms,
+                let requested_clip = hedge_probe_usd * buy_clip_scale;
+                let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                    context.unlawful_signal.as_ref(),
+                    UnlawfulMicrostructureLeg::Cheap,
+                    "hedge-probe",
+                    requested_clip,
                 );
+                if clip_usd <= 0.0 {
+                    controller_blocked = true;
+                    notes.extend(micro_notes);
+                    record_action_block("hedge-probe", "microstructure blocked", &mut notes);
+                } else {
+                    notes.extend(micro_notes);
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        cheap_id,
+                        cheap_ask,
+                        clip_usd,
+                        next_quote_tag("hedge-probe"),
+                        format!(
+                            "unlawful-shear hedge-probe gap={:.4} ask={:.4}",
+                            price_gap, cheap_ask
+                        ),
+                        context.now_ms,
+                    );
+                }
             } else {
                 record_action_block(
                     "hedge-probe",
@@ -2657,20 +2896,34 @@ impl Strategy for UnlawfulShearStrategy {
                     _ => self.config.hedge_clip_usd * phase_clip_scale,
                 };
                 if Self::can_launch_mode_action(mode, "add-hedge") && buy_clip_scale > 0.0 {
-                    self.push_buy(
-                        &mut intents,
-                        &mut remaining_gross,
-                        &snapshot.market_id,
-                        cheap_id,
-                        cheap_ask,
-                        hedge_clip_usd * buy_clip_scale,
-                        next_quote_tag("add-hedge"),
-                        format!(
-                            "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
-                            hedge_ratio, cheap_ask
-                        ),
-                        context.now_ms,
+                    let requested_clip = hedge_clip_usd * buy_clip_scale;
+                    let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                        context.unlawful_signal.as_ref(),
+                        UnlawfulMicrostructureLeg::Cheap,
+                        "add-hedge",
+                        requested_clip,
                     );
+                    if clip_usd <= 0.0 {
+                        controller_blocked = true;
+                        notes.extend(micro_notes);
+                        record_action_block("add-hedge", "microstructure blocked", &mut notes);
+                    } else {
+                        notes.extend(micro_notes);
+                        self.push_buy(
+                            &mut intents,
+                            &mut remaining_gross,
+                            &snapshot.market_id,
+                            cheap_id,
+                            cheap_ask,
+                            clip_usd,
+                            next_quote_tag("add-hedge"),
+                            format!(
+                                "unlawful-shear add-hedge ratio={:.4} ask={:.4}",
+                                hedge_ratio, cheap_ask
+                            ),
+                            context.now_ms,
+                        );
+                    }
                 } else {
                     record_action_block(
                         "add-hedge",
@@ -2689,20 +2942,34 @@ impl Strategy for UnlawfulShearStrategy {
                     _ => self.config.rebalance_clip_usd * phase_clip_scale,
                 };
                 if Self::can_launch_mode_action(mode, "rebalance-core") && buy_clip_scale > 0.0 {
-                    self.push_buy(
-                        &mut intents,
-                        &mut remaining_gross,
-                        &snapshot.market_id,
-                        expensive_id,
-                        expensive_ask,
-                        rebalance_clip_usd * buy_clip_scale,
-                        next_quote_tag("rebalance-core"),
-                        format!(
-                            "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
-                            hedge_ratio, expensive_ask
-                        ),
-                        context.now_ms,
+                    let requested_clip = rebalance_clip_usd * buy_clip_scale;
+                    let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                        context.unlawful_signal.as_ref(),
+                        UnlawfulMicrostructureLeg::Expensive,
+                        "rebalance-core",
+                        requested_clip,
                     );
+                    if clip_usd <= 0.0 {
+                        controller_blocked = true;
+                        notes.extend(micro_notes);
+                        record_action_block("rebalance-core", "microstructure blocked", &mut notes);
+                    } else {
+                        notes.extend(micro_notes);
+                        self.push_buy(
+                            &mut intents,
+                            &mut remaining_gross,
+                            &snapshot.market_id,
+                            expensive_id,
+                            expensive_ask,
+                            clip_usd,
+                            next_quote_tag("rebalance-core"),
+                            format!(
+                                "unlawful-shear rebalance-core ratio={:.4} ask={:.4}",
+                                hedge_ratio, expensive_ask
+                            ),
+                            context.now_ms,
+                        );
+                    }
                 } else {
                     record_action_block(
                         "rebalance-core",
@@ -2730,28 +2997,47 @@ impl Strategy for UnlawfulShearStrategy {
                     cheap_ask
                 };
                 if Self::can_launch_mode_action(mode, "rebalance-flip") && buy_clip_scale > 0.0 {
-                    self.push_buy(
-                        &mut intents,
-                        &mut remaining_gross,
-                        &snapshot.market_id,
-                        target_id,
-                        target_price,
-                        match phase {
-                            UnlawfulShearPhase::VeryLate => {
-                                self.config.rebalance_clip_usd * 1.35 * buy_clip_scale
-                            }
-                            UnlawfulShearPhase::Late => {
-                                self.config.rebalance_clip_usd * 1.2 * buy_clip_scale
-                            }
-                            _ => self.config.rebalance_clip_usd * phase_clip_scale * buy_clip_scale,
-                        },
-                        next_quote_tag("rebalance-flip"),
-                        format!(
-                            "unlawful-shear high-flip rebalance gap={:.4} target={}",
-                            price_gap, target_id
-                        ),
-                        context.now_ms,
+                    let requested_clip = match phase {
+                        UnlawfulShearPhase::VeryLate => {
+                            self.config.rebalance_clip_usd * 1.35 * buy_clip_scale
+                        }
+                        UnlawfulShearPhase::Late => {
+                            self.config.rebalance_clip_usd * 1.2 * buy_clip_scale
+                        }
+                        _ => self.config.rebalance_clip_usd * phase_clip_scale * buy_clip_scale,
+                    };
+                    let target_leg = if target_id == expensive_id {
+                        UnlawfulMicrostructureLeg::Expensive
+                    } else {
+                        UnlawfulMicrostructureLeg::Cheap
+                    };
+                    let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                        context.unlawful_signal.as_ref(),
+                        target_leg,
+                        "rebalance-flip",
+                        requested_clip,
                     );
+                    if clip_usd <= 0.0 {
+                        controller_blocked = true;
+                        notes.extend(micro_notes);
+                        record_action_block("rebalance-flip", "microstructure blocked", &mut notes);
+                    } else {
+                        notes.extend(micro_notes);
+                        self.push_buy(
+                            &mut intents,
+                            &mut remaining_gross,
+                            &snapshot.market_id,
+                            target_id,
+                            target_price,
+                            clip_usd,
+                            next_quote_tag("rebalance-flip"),
+                            format!(
+                                "unlawful-shear high-flip rebalance gap={:.4} target={}",
+                                price_gap, target_id
+                            ),
+                            context.now_ms,
+                        );
+                    }
                 } else {
                     record_action_block(
                         "rebalance-flip",
@@ -2771,20 +3057,35 @@ impl Strategy for UnlawfulShearStrategy {
                 .any(|intent| intent.side == TradeSide::Buy && intent.instrument_id == *cheap_id)
         {
             if Self::can_launch_mode_action(mode, "early-probe") && buy_clip_scale > 0.0 {
-                self.push_buy(
-                    &mut intents,
-                    &mut remaining_gross,
-                    &snapshot.market_id,
-                    cheap_id,
-                    cheap_ask,
-                    (self.config.probe_clip_usd * phase_clip_scale).max(1.0) * buy_clip_scale,
-                    next_quote_tag("early-probe"),
-                    format!(
-                        "unlawful-shear early-probe ask={:.4} gap={:.4}",
-                        cheap_ask, price_gap
-                    ),
-                    context.now_ms,
+                let requested_clip =
+                    (self.config.probe_clip_usd * phase_clip_scale).max(1.0) * buy_clip_scale;
+                let (clip_usd, micro_notes) = self.microstructure_adjusted_clip(
+                    context.unlawful_signal.as_ref(),
+                    UnlawfulMicrostructureLeg::Cheap,
+                    "early-probe",
+                    requested_clip,
                 );
+                if clip_usd <= 0.0 {
+                    controller_blocked = true;
+                    notes.extend(micro_notes);
+                    record_action_block("early-probe", "microstructure blocked", &mut notes);
+                } else {
+                    notes.extend(micro_notes);
+                    self.push_buy(
+                        &mut intents,
+                        &mut remaining_gross,
+                        &snapshot.market_id,
+                        cheap_id,
+                        cheap_ask,
+                        clip_usd,
+                        next_quote_tag("early-probe"),
+                        format!(
+                            "unlawful-shear early-probe ask={:.4} gap={:.4}",
+                            cheap_ask, price_gap
+                        ),
+                        context.now_ms,
+                    );
+                }
             } else {
                 record_action_block(
                     "early-probe",
@@ -2813,6 +3114,13 @@ impl Strategy for UnlawfulShearStrategy {
             if suppressed_by_gate_reasons || suppression_mode || suppression_due_to_scaling {
                 notes.push(format!(
                     "unlawful gate suppressed market mode={:?} actions_blocked",
+                    mode
+                ));
+                return StrategyDecision { intents, notes };
+            }
+            if controller_blocked {
+                notes.push(format!(
+                    "unlawful microstructure controller suppressed market mode={:?}",
                     mode
                 ));
                 return StrategyDecision { intents, notes };
@@ -2955,6 +3263,18 @@ fn normalize_unlawful_invariants(mut config: UnlawfulShearConfig) -> UnlawfulShe
     config.merge_stall_seconds = config.merge_stall_seconds.max(1);
     config.entry_book_max_age_ms = config.entry_book_max_age_ms.max(1);
     config.entry_btc_signal_max_age_ms = config.entry_btc_signal_max_age_ms.max(1);
+    config.microstructure_max_spread = config.microstructure_max_spread.max(0.001);
+    config.microstructure_min_ask_notional_top3_usd =
+        config.microstructure_min_ask_notional_top3_usd.max(0.0);
+    config.microstructure_max_clip_ask_notional_fraction = config
+        .microstructure_max_clip_ask_notional_fraction
+        .clamp(0.0, 1.0);
+    config.microstructure_imbalance_threshold = config
+        .microstructure_imbalance_threshold
+        .abs()
+        .clamp(0.0, 1.0);
+    config.microstructure_weak_bid_scale = config.microstructure_weak_bid_scale.clamp(0.0, 1.0);
+    config.microstructure_thin_ask_scale = config.microstructure_thin_ask_scale.clamp(0.0, 1.0);
 
     config
 }
@@ -3060,6 +3380,21 @@ mod tests {
         }
     }
 
+    fn with_microstructure(
+        mut signal: UnlawfulSignalSnapshot,
+        cheap_ask_notional_top3: f64,
+        expensive_ask_notional_top3: f64,
+    ) -> UnlawfulSignalSnapshot {
+        signal.gate_reasons.clear();
+        signal.book.cheap_spread = Some(0.02);
+        signal.book.expensive_spread = Some(0.02);
+        signal.book.cheap_ask_notional_top3 = Some(cheap_ask_notional_top3);
+        signal.book.expensive_ask_notional_top3 = Some(expensive_ask_notional_top3);
+        signal.book.cheap_depth_imbalance_top3 = Some(0.0);
+        signal.book.expensive_depth_imbalance_top3 = Some(0.0);
+        signal
+    }
+
     fn unlawful_shear_test_config() -> UnlawfulShearConfig {
         let mut cfg = UnlawfulShearConfig::from_env();
         cfg.cheap_hedge_price_max = 0.40;
@@ -3078,6 +3413,14 @@ mod tests {
         cfg.salvage_bid_floor = 0.05;
         cfg.max_open_orders_total = 8;
         cfg.taker_fee_coeff = 0.072;
+        cfg.microstructure_enabled = true;
+        cfg.microstructure_require_depth = false;
+        cfg.microstructure_max_spread = 0.05;
+        cfg.microstructure_min_ask_notional_top3_usd = 2.0;
+        cfg.microstructure_max_clip_ask_notional_fraction = 0.10;
+        cfg.microstructure_imbalance_threshold = 0.55;
+        cfg.microstructure_weak_bid_scale = 0.65;
+        cfg.microstructure_thin_ask_scale = 0.85;
         cfg
     }
 
@@ -3168,14 +3511,18 @@ mod tests {
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-b", 0.50, 0.52, 10));
         assert_eq!(decision.intents.len(), 3);
-        assert!(decision
-            .intents
-            .iter()
-            .all(|intent| intent.side == TradeSide::Buy));
-        assert!(decision
-            .intents
-            .windows(2)
-            .all(|window| window[0].limit_price >= window[1].limit_price));
+        assert!(
+            decision
+                .intents
+                .iter()
+                .all(|intent| intent.side == TradeSide::Buy)
+        );
+        assert!(
+            decision
+                .intents
+                .windows(2)
+                .all(|window| window[0].limit_price >= window[1].limit_price)
+        );
     }
 
     #[test]
@@ -3196,10 +3543,77 @@ mod tests {
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
         assert_eq!(decision.intents.len(), 2);
-        assert!(decision
+        assert!(
+            decision
+                .intents
+                .iter()
+                .any(|intent| intent.side == TradeSide::Buy)
+        );
+    }
+
+    #[test]
+    fn unlawful_shear_microstructure_caps_clip_to_visible_depth() {
+        let mut config = unlawful_shear_test_config();
+        config.microstructure_require_depth = true;
+        config.microstructure_max_clip_ask_notional_fraction = 0.10;
+        config.microstructure_imbalance_threshold = 1.0;
+        let mut strategy = UnlawfulShearStrategy::new(config, 0);
+        let signal = with_microstructure(
+            unlawful_signal_snapshot(UnlawfulExecutionMode::Entry, 1.0, 10),
+            1_000.0,
+            50.0,
+        );
+        let ctx = context_with_unlawful_signal(Vec::new(), 10, 0, 0, Some(signal));
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
+
+        let core = decision
             .intents
             .iter()
-            .any(|intent| intent.side == TradeSide::Buy));
+            .find(|intent| intent.instrument_id == InstrumentId::from("up"))
+            .expect("core order");
+        assert!((core.quantity * core.limit_price - 5.0).abs() < 1e-9);
+        assert!(
+            decision
+                .notes
+                .iter()
+                .any(|note| note.contains("microstructure scaled action=core-entry"))
+        );
+    }
+
+    #[test]
+    fn unlawful_shear_microstructure_blocks_wide_spread_entry() {
+        let mut config = unlawful_shear_test_config();
+        config.microstructure_require_depth = true;
+        config.microstructure_max_spread = 0.03;
+        let mut strategy = UnlawfulShearStrategy::new(config, 0);
+        let mut signal = with_microstructure(
+            unlawful_signal_snapshot(UnlawfulExecutionMode::Entry, 1.0, 10),
+            1_000.0,
+            1_000.0,
+        );
+        signal.book.cheap_spread = Some(0.04);
+        signal.book.expensive_spread = Some(0.04);
+        let ctx = context_with_unlawful_signal(Vec::new(), 10, 0, 0, Some(signal));
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.70, 0.74, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
+
+        assert!(decision.intents.is_empty());
+        assert!(
+            decision
+                .notes
+                .iter()
+                .any(|note| note.contains("microstructure blocked action=core-entry"))
+        );
+        assert!(
+            decision.notes.iter().any(|note| {
+                note.contains("unlawful microstructure controller suppressed market")
+            })
+        );
     }
 
     #[test]
@@ -3221,10 +3635,12 @@ mod tests {
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.18, 0.22, 10));
 
         assert_eq!(decision.intents.len(), 2);
-        assert!(decision
-            .intents
-            .iter()
-            .all(|intent| intent.market_id == MarketId::from("market-a")));
+        assert!(
+            decision
+                .intents
+                .iter()
+                .all(|intent| intent.market_id == MarketId::from("market-a"))
+        );
     }
 
     #[test]
@@ -3254,10 +3670,12 @@ mod tests {
         strategy.on_market_snapshot(&ctx, &snapshot("up", "market-a", 0.55, 0.60, 10));
         let decision =
             strategy.on_market_snapshot(&ctx, &snapshot("down", "market-a", 0.22, 0.25, 10));
-        assert!(decision
-            .intents
-            .iter()
-            .any(|intent| intent.side == TradeSide::Sell && intent.reduce_only));
+        assert!(
+            decision
+                .intents
+                .iter()
+                .any(|intent| intent.side == TradeSide::Sell && intent.reduce_only)
+        );
     }
 
     #[test]

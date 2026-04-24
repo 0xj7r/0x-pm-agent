@@ -2277,4 +2277,47 @@ mod tests {
         assert!(outcome.event_seqs.is_empty());
         assert!(outcome.commands.is_empty());
     }
+
+    #[test]
+    fn reconcile_open_orders_marks_stale_cancel_requested_orders() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
+        );
+        runtime.start(1);
+
+        let snapshot = MarketSnapshot {
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.39, 100.0)),
+                best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                last_trade_price: Some(0.40),
+                observed_at_ms: 2,
+            },
+        };
+        runtime.on_market_snapshot(snapshot).expect("quote");
+        runtime.request_cancel(&ClientOrderId::from("client-1"), "test cancel", 3);
+
+        let outcome = runtime.reconcile_open_orders(2_000, 500);
+        assert!(!outcome.event_seqs.is_empty());
+        let order = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .find(|managed| managed.intent.client_order_id == ClientOrderId::from("client-1"))
+            .expect("managed order");
+        assert_eq!(
+            order.status,
+            crate::runtime::types::ManagedOrderStatus::NeedsReconcile
+        );
+    }
 }
