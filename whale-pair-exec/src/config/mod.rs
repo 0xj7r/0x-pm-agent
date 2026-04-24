@@ -27,6 +27,9 @@ pub struct UserWsAuth {
     pub api_key: String,
     pub api_secret: String,
     pub api_passphrase: String,
+    pub private_key: Option<String>,
+    pub signature_type: Option<String>,
+    pub funder_address: Option<String>,
 }
 
 #[derive(Debug, Clone)]

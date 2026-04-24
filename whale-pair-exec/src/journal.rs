@@ -13,8 +13,12 @@ use crate::types::RuntimeCommand;
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JournalLine<'a> {
-    RuntimeEvent { record: &'a EventRecord },
-    RuntimeCommand { command: &'a RuntimeCommand },
+    RuntimeEvent {
+        record: &'a EventRecord,
+    },
+    RuntimeCommand {
+        command: &'a RuntimeCommand,
+    },
     RuntimeCheckpoint {
         observed_at_ms: u64,
         run_id: &'a str,
@@ -95,10 +99,7 @@ impl JournalWriter {
         })
     }
 
-    pub fn append_runtime_checkpoint(
-        &mut self,
-        checkpoint: &RuntimeCheckpoint,
-    ) -> Result<()> {
+    pub fn append_runtime_checkpoint(&mut self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
         self.append_line(&JournalLine::RuntimeReplayCheckpoint { checkpoint })
     }
 
@@ -111,7 +112,10 @@ impl JournalWriter {
     fn append_line(&mut self, line: &JournalLine<'_>) -> Result<()> {
         self.rotate_if_needed()?;
         serde_json::to_writer(&mut self.writer, line).with_context(|| {
-            format!("failed to serialize journal line to {}", self.path.display())
+            format!(
+                "failed to serialize journal line to {}",
+                self.path.display()
+            )
         })?;
         self.writer
             .write_all(b"\n")
@@ -163,7 +167,10 @@ fn rotated_journal_path(path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("journal");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("jsonl");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("jsonl");
     parent.join(format!("{stem}.{ts}.{ext}"))
 }
 
@@ -173,7 +180,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::event_log::{EventCategory, EventRecord};
-    use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, RuntimeCommand, TradeSide};
+    use crate::types::{
+        ClientOrderId, InstrumentId, MarketId, OrderIntent, RuntimeCommand, TradeSide,
+    };
 
     use super::JournalWriter;
 
@@ -260,7 +269,13 @@ mod tests {
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
-            .filter(|entry| entry.file_name().and_then(|v| v.to_str()).unwrap_or("").starts_with("journal."))
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("")
+                    .starts_with("journal.")
+            })
             .collect::<Vec<_>>();
         assert!(!rotated.is_empty());
 

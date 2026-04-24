@@ -97,6 +97,15 @@ pub fn load_user_auth() -> Option<UserWsAuth> {
         api_key,
         api_secret,
         api_passphrase,
+        private_key: env::var("POLYMARKET_PRIVATE_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        signature_type: env::var("POLYMARKET_SIGNATURE_TYPE")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        funder_address: env::var("POLYMARKET_FUNDER_ADDRESS")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
     })
 }
 

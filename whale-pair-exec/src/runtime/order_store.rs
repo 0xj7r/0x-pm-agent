@@ -215,7 +215,9 @@ impl SqliteOrderStore {
                 )",
                 (),
             )
-            .map_err(|error| OrderStoreError::Sqlite(format!("failed to create orders table: {error}")))?;
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to create orders table: {error}"))
+            })?;
 
         self.connection
             .execute(
@@ -288,9 +290,7 @@ impl SqliteOrderStore {
                 (),
             )
             .map_err(|error| {
-                OrderStoreError::Sqlite(format!(
-                    "failed to create signal_snapshots table: {error}"
-                ))
+                OrderStoreError::Sqlite(format!("failed to create signal_snapshots table: {error}"))
             })?;
 
         self.connection
@@ -379,7 +379,9 @@ impl SqliteOrderStore {
             "Cancelled" => Ok(ManagedOrderStatus::Cancelled),
             "Rejected" => Ok(ManagedOrderStatus::Rejected),
             "NeedsReconcile" => Ok(ManagedOrderStatus::NeedsReconcile),
-            value => Err(OrderStoreError::Serialization(format!("invalid status `{value}`"))),
+            value => Err(OrderStoreError::Serialization(format!(
+                "invalid status `{value}`"
+            ))),
         }
     }
 
@@ -394,7 +396,9 @@ impl SqliteOrderStore {
         match raw {
             "Buy" => Ok(TradeSide::Buy),
             "Sell" => Ok(TradeSide::Sell),
-            value => Err(OrderStoreError::Serialization(format!("invalid side `{value}`"))),
+            value => Err(OrderStoreError::Serialization(format!(
+                "invalid side `{value}`"
+            ))),
         }
     }
 
@@ -408,9 +412,8 @@ impl SqliteOrderStore {
 
     fn row_to_record(row: &Row<'_>) -> rusqlite::Result<OrderRecord> {
         let status_raw: String = row.get(11)?;
-        let status = Self::status_from_db(&status_raw).map_err(|error| {
-            Self::sqlite_conversion_error(11, Type::Text, error)
-        })?;
+        let status = Self::status_from_db(&status_raw)
+            .map_err(|error| Self::sqlite_conversion_error(11, Type::Text, error))?;
         let side_raw: String = row.get(5)?;
         let side = Self::side_from_db(&side_raw)
             .map_err(|error| Self::sqlite_conversion_error(5, Type::Text, error))?;
@@ -451,13 +454,14 @@ impl SqliteOrderStore {
                 params![client_order_id.as_str()],
                 |row| {
                     let raw: String = row.get(0)?;
-                    Self::status_from_db(&raw).map_err(|error| {
-                        Self::sqlite_conversion_error(0, Type::Text, error)
-                    })
+                    Self::status_from_db(&raw)
+                        .map_err(|error| Self::sqlite_conversion_error(0, Type::Text, error))
                 },
             )
             .optional()
-            .map_err(|error| OrderStoreError::Sqlite(format!("failed to load order status: {error}")))?
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to load order status: {error}"))
+            })?
             .ok_or_else(|| OrderStoreError::NotFound(client_order_id.clone()))
     }
 
@@ -573,9 +577,15 @@ impl OrderStore for SqliteOrderStore {
                 "UPDATE orders
                  SET status = ?1, last_update_ms = ?2
                  WHERE client_order_id = ?3",
-                params![Self::status_to_db(status), updated_at_ms, client_order_id.as_str()],
+                params![
+                    Self::status_to_db(status),
+                    updated_at_ms,
+                    client_order_id.as_str()
+                ],
             )
-            .map_err(|error| OrderStoreError::Sqlite(format!("failed to update status: {error}")))?;
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to update status: {error}"))
+            })?;
 
         if updated == 0 {
             return Err(OrderStoreError::NotFound(client_order_id.clone()));
@@ -645,7 +655,10 @@ impl OrderStore for SqliteOrderStore {
             ManagedOrderStatus::Filled
         } else if matches!(record.status, ManagedOrderStatus::PendingSubmit) {
             ManagedOrderStatus::Submitted
-        } else if matches!(record.status, ManagedOrderStatus::Working | ManagedOrderStatus::NeedsReconcile) {
+        } else if matches!(
+            record.status,
+            ManagedOrderStatus::Working | ManagedOrderStatus::NeedsReconcile
+        ) {
             ManagedOrderStatus::Working
         } else {
             record.status
@@ -700,14 +713,15 @@ impl OrderStore for SqliteOrderStore {
 
     fn list_open(&self) -> std::result::Result<Vec<OrderRecord>, OrderStoreError> {
         let query = Self::list_open_query(false);
-        let mut statement = self
-            .connection
-            .prepare(&query)
-            .map_err(|error| OrderStoreError::Sqlite(format!("failed to list open orders: {error}")))?;
+        let mut statement = self.connection.prepare(&query).map_err(|error| {
+            OrderStoreError::Sqlite(format!("failed to list open orders: {error}"))
+        })?;
 
         let rows = statement
             .query_map(params![], |row| Self::row_to_record(row))
-            .map_err(|error| OrderStoreError::Sqlite(format!("failed to execute list open query: {error}")))?;
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to execute list open query: {error}"))
+            })?;
 
         let mut records = Vec::new();
         for row in rows {
@@ -723,12 +737,9 @@ impl OrderStore for SqliteOrderStore {
         market_id: &MarketId,
     ) -> std::result::Result<Vec<OrderRecord>, OrderStoreError> {
         let query = Self::list_open_query_for_market(false);
-        let mut statement = self
-            .connection
-            .prepare(&query)
-            .map_err(|error| {
-                OrderStoreError::Sqlite(format!("failed to list by market query: {error}"))
-            })?;
+        let mut statement = self.connection.prepare(&query).map_err(|error| {
+            OrderStoreError::Sqlite(format!("failed to list by market query: {error}"))
+        })?;
 
         let rows = statement
             .query_map(params![market_id.as_str()], |row| Self::row_to_record(row))
@@ -861,7 +872,9 @@ impl OrderStore for SqliteOrderStore {
 #[cfg(test)]
 mod tests {
     use super::{OrderStore, OrderStoreError, SignalSnapshotRecord, SqliteOrderStore};
-    use crate::types::{ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, TradeSide};
+    use crate::types::{
+        ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, TradeSide,
+    };
 
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -876,7 +889,7 @@ mod tests {
             .as_nanos();
         let path = env::temp_dir().join(format!("whale-pair-order-store-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
-        let mut now: EpochMillis = 1;
+        let now: EpochMillis = 1;
 
         let record = crate::runtime::order_store::OrderRecord::from_intent(
             "run-1",
@@ -896,11 +909,13 @@ mod tests {
         );
 
         store.insert(record)?;
-        store.update_status(&ClientOrderId::from("coid-1"), ManagedOrderStatus::Submitted, now + 1)?;
+        store.update_status(
+            &ClientOrderId::from("coid-1"),
+            ManagedOrderStatus::Submitted,
+            now + 1,
+        )?;
         store.apply_fill(&ClientOrderId::from("coid-1"), 1.5, now + 2)?;
-        let row = store
-            .get(&ClientOrderId::from("coid-1"))?
-            .expect("row");
+        let row = store.get(&ClientOrderId::from("coid-1"))?.expect("row");
         assert_eq!(row.filled_qty, 1.5);
         assert_eq!(row.status, ManagedOrderStatus::Submitted);
 
@@ -926,7 +941,7 @@ mod tests {
             .as_nanos();
         let path = env::temp_dir().join(format!("whale-pair-order-store-conflict-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
-        let mut now: EpochMillis = 10;
+        let now: EpochMillis = 10;
         let intent = OrderIntent {
             client_order_id: ClientOrderId::from("coid-2"),
             market_id: MarketId::from("mkt-1"),
@@ -941,7 +956,6 @@ mod tests {
         };
         let record = crate::runtime::order_store::OrderRecord::from_intent("run", &intent, "strat");
         store.insert(record.clone())?;
-        now += 1;
         let result = store.insert(record);
         assert!(matches!(result, Err(OrderStoreError::Conflict(_))));
         Ok(())
@@ -1004,9 +1018,12 @@ mod tests {
             gate_reasons: "none".to_string(),
         })?;
 
-        let count: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM signal_snapshots", (), |row| row.get(0))?;
+        let count: i64 =
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM signal_snapshots", (), |row| {
+                    row.get(0)
+                })?;
         assert_eq!(count, 1);
         Ok(())
     }

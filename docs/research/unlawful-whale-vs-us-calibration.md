@@ -112,6 +112,30 @@ The top-level sleeve metadata also records:
 - whether journals were read in `full`, `tail:<n>`, `skip`, or `missing` mode
 - how many signal snapshot rows were available
 
+The JSON also includes a top-level `qa_summary` for dashboards and reports. It
+is the preferred high-level read surface; `windows` remains the drill-down
+surface.
+
+`qa_summary` includes:
+
+- `overall_bucket_counts`: total `whale_only`, `us_only`, `both`, and `neither`
+  windows across all sleeves
+- `whale.buy_levels`: weighted average whale buy levels by outcome, by
+  cheap/expensive role, and by early/mid/late phase
+- `buckets.<bucket>.windows`: compact window refs for `whale_only`, `us_only`,
+  `both`, and `neither`, with whale buy levels plus local sleeve metrics
+- `buckets.<bucket>.windows[].microstructure_context`: averaged latest signal
+  context across sleeves, including price gap, spreads, top-3 depth, BTC vol /
+  returns, activity counts, clip scale, book freshness, and gate reasons
+- `sleeves.<name>`: aggregate order, fill, cancel, status, rejection,
+  suppression, and signal-gate metrics for each sleeve
+- `sleeves.<name>.pnl_metrics`: currently marks PnL unavailable when the local
+  `order-store.sqlite` only exposes `orders` and `signal_snapshots`
+
+The CSV mirrors the main row-level fields and now includes per-sleeve
+`filled_order_count`, `canceled_order_count`, `submitted_qty`, `filled_qty`, and
+`status_counts` for quick spreadsheet triage.
+
 ## Bucket Semantics
 
 Per sleeve bucket:
@@ -143,6 +167,31 @@ The highest-signal rows are usually:
 
 `both` is useful for checking whether our local notional, order count, and fill
 behavior are converging toward the whale's tape.
+
+## Dashboard / Report Read Path
+
+Dashboard and report consumers should read the export in this order:
+
+1. Use `qa_summary.overall_bucket_counts` for the headline miss/overtrade/match
+   counts.
+2. Use `qa_summary.whale.buy_levels.by_role` and `.by_outcome` for the whale
+   reference buy levels. These are weighted by size, not simple window averages.
+3. Use `qa_summary.buckets.whale_only.windows` as the miss queue. For each row,
+   show the whale cheap/expensive legs next to `microstructure_context` and the
+   sleeve suppression / gate reasons.
+4. Use `qa_summary.buckets.us_only.windows` as the overtrade queue. Prioritize
+   rows with fills, high submitted notional, stale books, or thin depth.
+5. Use `qa_summary.buckets.both.windows` to check convergence: order count,
+   filled notional, fill rate, cancel count, BTC vol, activity, and whether the
+   latest signal mode/aggression matches the whale's observed buy geometry.
+6. Use `qa_summary.sleeves.<name>` for sleeve-level health: fill rate by
+   notional, cancel rate by order count, top status counts, rejection reasons,
+   suppression reasons, and signal-gate reasons.
+
+Do not infer PnL from submitted or filled notional. The current local stores do
+not persist realized/unrealized PnL in the calibration export source schema, so
+reports should display PnL as unavailable unless a future store adds explicit
+PnL fields.
 
 When `signal_snapshots` exist, the fastest calibration workflow is:
 

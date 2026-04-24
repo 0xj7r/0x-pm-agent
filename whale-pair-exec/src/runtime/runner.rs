@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::task::JoinHandle;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -15,21 +15,21 @@ use crate::event_log::EventLog;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
-use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::types::ManagedOrderStatus;
+use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use crate::strategy::{Strategy, StrategyMode};
 use crate::types::{
-    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, OrderId,
+    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
+};
+use crate::wire::api::{
+    serve_http, DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition,
+    DashboardSnapshot, DashboardUiState,
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, PolymarketCredentials,
-    PolymarketExecutionAdapter, SubmitOrderRequest, TimeInForce,
-};
-use crate::wire::api::{
-    DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot,
-    DashboardUiState, serve_http,
+    PolymarketExecutionAdapter, PolymarketSignatureType, SubmitOrderRequest, TimeInForce,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -56,9 +56,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let order_store = config
         .order_store_path
         .as_ref()
-        .map(|path| -> Result<Box<dyn crate::runtime::order_store::OrderStore>> {
-            Ok(Box::new(SqliteOrderStore::open(path)?))
-        })
+        .map(
+            |path| -> Result<Box<dyn crate::runtime::order_store::OrderStore>> {
+                Ok(Box::new(SqliteOrderStore::open(path)?))
+            },
+        )
         .transpose()?;
     let mut runtime = Runtime::new_with_order_store(
         RuntimeConfig {
@@ -80,7 +82,10 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         strategy,
         market_contexts,
         order_store,
-        config.runtime_run_id.clone().unwrap_or_else(|| format!("run-{}", now_unix_ms())),
+        config
+            .runtime_run_id
+            .clone()
+            .unwrap_or_else(|| format!("run-{}", now_unix_ms())),
     );
     let mut journal = config
         .journal_path
@@ -88,8 +93,10 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .map(|path| JournalWriter::open_with_rotation(path, config.journal_rotate_bytes))
         .transpose()?;
 
-    let mut startup_outcome =
-        runtime.recover_from_store(now_unix_ms(), config.order_reconcile_stale_window.as_millis() as u64);
+    let mut startup_outcome = runtime.recover_from_store(
+        now_unix_ms(),
+        config.order_reconcile_stale_window.as_millis() as u64,
+    );
     startup_outcome.extend(runtime.start(now_unix_ms()));
     persist_runtime_outcome(
         &mut journal,
@@ -97,25 +104,37 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         "startup",
         startup_outcome,
     )?;
-    persist_runtime_checkpoint(
-        &mut journal,
-        &runtime,
-        now_unix_ms(),
-        "startup",
-    )?;
+    persist_runtime_checkpoint(&mut journal, &runtime, now_unix_ms(), "startup")?;
     let execution_adapter: Arc<dyn ExecutionAdapter> = match (config.paper_mode, &config.user_auth) {
         (true, _) => Arc::new(PaperExecutionAdapter::new()),
-        (false, None) => {
-            warn!(
-                "POLYMARKET_API_KEY/SECRET/PASSPHRASE not set; falling back to paper mode execution"
-            );
-            Arc::new(PaperExecutionAdapter::new())
+        (false, None) => anyhow::bail!(
+            "WHALE_PAIR_PAPER_MODE=false requires POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE, and POLYMARKET_PRIVATE_KEY"
+        ),
+        (false, Some(auth)) => {
+            let private_key = auth.private_key.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "WHALE_PAIR_PAPER_MODE=false requires POLYMARKET_PRIVATE_KEY for signed CLOB orders"
+                )
+            })?;
+            let signature_type = auth
+                .signature_type
+                .as_deref()
+                .map(PolymarketSignatureType::parse)
+                .transpose()
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .unwrap_or_default();
+            Arc::new(
+                PolymarketExecutionAdapter::connect(PolymarketCredentials {
+                    api_key: auth.api_key.clone(),
+                    api_secret: auth.api_secret.clone(),
+                    api_passphrase: auth.api_passphrase.clone(),
+                    private_key,
+                    signature_type,
+                    funder_address: auth.funder_address.clone(),
+                })
+                .await?,
+            )
         }
-        (false, Some(auth)) => Arc::new(PolymarketExecutionAdapter::new(PolymarketCredentials {
-            api_key: auth.api_key.clone(),
-            api_secret: auth.api_secret.clone(),
-            api_passphrase: auth.api_passphrase.clone(),
-        })),
     };
     metrics.set_execution_adapter_connected(true);
     let dashboard_state = Arc::new(RwLock::new(DashboardSnapshot::default()));
@@ -158,8 +177,12 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         dashboard_state.clone(),
         shutdown.child_token(),
     );
-    let market_ws_handle =
-        spawn_market_ws(metrics.clone(), books.clone(), &config, shutdown.child_token());
+    let market_ws_handle = spawn_market_ws(
+        metrics.clone(),
+        books.clone(),
+        &config,
+        shutdown.child_token(),
+    );
     let (spot_trade_tx, spot_trade_rx) = mpsc::unbounded_channel();
     let spot_ws_handle = spawn_spot_ws(
         metrics.clone(),
@@ -433,10 +456,15 @@ async fn run_runtime_loop(
                 }
             }
             _ = reconcile_ticks.tick() => {
+                let needs_reconcile_before = needs_reconcile_order_count(runtime);
                 let reconcile_outcome = runtime.reconcile_open_orders(
                     now_unix_ms(),
                     config.order_reconcile_stale_window.as_millis() as u64,
                 );
+                let needs_reconcile_after = needs_reconcile_order_count(runtime);
+                for _ in needs_reconcile_before..needs_reconcile_after {
+                    metrics.observe_reconcile_failure();
+                }
                 persist_runtime_outcome(
                     journal,
                     runtime.event_log(),
@@ -604,7 +632,9 @@ async fn refresh_dashboard_state(
         })
         .collect();
 
-    let quote_snapshot = profile.map(|profile| profile.quote.clone()).unwrap_or_default();
+    let quote_snapshot = profile
+        .map(|profile| profile.quote.clone())
+        .unwrap_or_default();
     let quote_ladder_count = open_order_snapshots
         .iter()
         .filter(|managed| managed.remaining_qty() > 0.0 && managed.intent.quote_level_tag.is_some())
@@ -618,7 +648,8 @@ async fn refresh_dashboard_state(
             if managed.remaining_qty() <= 0.0 {
                 continue;
             }
-            let Some(mid_price) = book_mid_by_asset.get(managed.intent.instrument_id.as_str()) else {
+            let Some(mid_price) = book_mid_by_asset.get(managed.intent.instrument_id.as_str())
+            else {
                 continue;
             };
             if *mid_price <= 0.0 {
@@ -1086,9 +1117,11 @@ async fn execute_execution_adapter(
                 ManagedOrderStatus::PendingSubmit => {
                     queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
                 }
-                ManagedOrderStatus::NeedsReconcile => {
-                    queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
-                }
+                ManagedOrderStatus::NeedsReconcile => warn!(
+                    mode = "live",
+                    client_order_id = %client_order_id,
+                    "order requires reconciliation; skipping automatic submit replay"
+                ),
                 ManagedOrderStatus::CancelRequested => queue.push_back(RuntimeCommand::Cancel {
                     client_order_id,
                     reason: "recovering live order".to_string(),
@@ -1119,8 +1152,7 @@ async fn execute_execution_adapter(
                     ) {
                         metrics.record_fill(
                             &fill,
-                            if matches!(fill.close_method, Some(crate::types::CloseMethod::Merge))
-                            {
+                            if matches!(fill.close_method, Some(crate::types::CloseMethod::Merge)) {
                                 Some(observed_at_ms.saturating_sub(fill.observed_at_ms))
                             } else {
                                 None
@@ -1140,7 +1172,8 @@ async fn execute_execution_adapter(
                 match execution_adapter.submit(submit_req).await {
                     Ok(ack) if ack.accepted => {
                         if let Some(order_id) = ack.venue_order_id.clone() {
-                            execution_venue_map.insert(intent.client_order_id.clone(), Some(order_id));
+                            execution_venue_map
+                                .insert(intent.client_order_id.clone(), Some(order_id));
                         }
                         let opened_outcome =
                             runtime.on_order_opened(&intent.client_order_id, observed_at_ms);
@@ -1220,7 +1253,8 @@ async fn execute_execution_adapter(
                         execution_venue_map.remove(&client_order_id);
                         let cancelled_outcome = runtime.on_order_cancelled(
                             &client_order_id,
-                            ack.venue_message.unwrap_or_else(|| "execution cancelled".to_string()),
+                            ack.venue_message
+                                .unwrap_or_else(|| "execution cancelled".to_string()),
                             ack.accepted_at_ms,
                         );
                         combined.extend(cancelled_outcome);
@@ -1229,11 +1263,8 @@ async fn execute_execution_adapter(
                         let reason = ack
                             .venue_message
                             .unwrap_or_else(|| "execution venue rejected cancel".to_string());
-                        let rejected_outcome = runtime.on_order_rejected(
-                            &client_order_id,
-                            reason,
-                            ack.accepted_at_ms,
-                        );
+                        let rejected_outcome =
+                            runtime.on_order_rejected(&client_order_id, reason, ack.accepted_at_ms);
                         combined.extend(rejected_outcome);
                     }
                     Err(error) => {
@@ -1313,6 +1344,14 @@ async fn execute_execution_adapter(
     Ok(combined)
 }
 
+fn needs_reconcile_order_count(runtime: &Runtime<StrategyMode>) -> usize {
+    runtime
+        .open_order_snapshots()
+        .into_iter()
+        .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+        .count()
+}
+
 fn submit_request_from_intent(intent: &OrderIntent, observed_at_ms: u64) -> SubmitOrderRequest {
     SubmitOrderRequest {
         client_order_id: intent.client_order_id.clone(),
@@ -1383,14 +1422,12 @@ fn paper_fill_from_book_snapshot(
     }
 
     let candidate_levels: Vec<_> = if matches!(intent.side, TradeSide::Buy) {
-        book
-            .ask_levels()
+        book.ask_levels()
             .iter()
             .filter(|level| level.price > 0.0 && level.price <= intent.limit_price)
             .collect()
     } else {
-        book
-            .bid_levels()
+        book.bid_levels()
             .iter()
             .filter(|level| level.price > 0.0 && level.price >= intent.limit_price)
             .collect()
@@ -1416,7 +1453,9 @@ fn paper_fill_from_book_snapshot(
         order_ctx,
         crossing,
     );
-    let target_fill_qty = (remaining_qty * fill_ratio).min(total_available).min(remaining_qty);
+    let target_fill_qty = (remaining_qty * fill_ratio)
+        .min(total_available)
+        .min(remaining_qty);
     if target_fill_qty <= 0.0 {
         return None;
     }
@@ -1505,8 +1544,9 @@ fn paper_fill_ratio(
     };
     let size_pressure = 0.25 + 0.75 * (available_qty / (available_qty + order_qty));
     let queue_pressure = 0.08 + order_ctx.queue_bias * 0.52;
-    let staleness_pressure =
-        0.30 + 0.60 * ((now_unix_ms().saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
+    let staleness_pressure = 0.30
+        + 0.60
+            * ((now_unix_ms().saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
     let premium = ((limit_price - fill_price) / fill_price).max(0.0).min(1.0);
     let limit_pressure = if crossing {
         0.95
@@ -1532,4 +1572,165 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    use crate::market_context::MarketContextStore;
+    use crate::risk::RiskLimits;
+    use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
+    use crate::strategy::NoopStrategy;
+    use crate::wire::execution_adapter::{
+        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances,
+    };
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        submitted: Mutex<Vec<ClientOrderId>>,
+        cancelled: Mutex<Vec<ClientOrderId>>,
+        open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
+    }
+
+    #[async_trait]
+    impl ExecutionAdapter for RecordingAdapter {
+        async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
+            self.submitted
+                .lock()
+                .expect("submitted lock")
+                .push(req.client_order_id.clone());
+            Ok(SubmitOrderAck {
+                client_order_id: req.client_order_id,
+                venue_order_id: Some(OrderId::from("venue-submit")),
+                accepted: true,
+                accepted_at_ms: req.submitted_at_ms,
+                venue_message: None,
+            })
+        }
+
+        async fn cancel(&self, req: CancelOrderRequest) -> Result<CancelOrderAck, ExecutionError> {
+            self.cancelled
+                .lock()
+                .expect("cancelled lock")
+                .push(req.client_order_id.clone());
+            Ok(CancelOrderAck {
+                client_order_id: req.client_order_id,
+                venue_order_id: req.venue_order_id,
+                accepted: true,
+                accepted_at_ms: req.submitted_at_ms,
+                venue_message: Some("cancelled".to_string()),
+            })
+        }
+
+        async fn sync_open_orders(
+            &self,
+        ) -> Result<Vec<crate::wire::execution_adapter::VenueOpenOrder>, ExecutionError> {
+            Ok(self.open_orders.clone())
+        }
+
+        async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError> {
+            Ok(VenueBalances {
+                cash_usd: 0.0,
+                positions: Vec::new(),
+                observed_at_ms: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_execution_skips_needs_reconcile_submit_replay() {
+        let mut runtime = runtime_with_recovered_needs_reconcile_order();
+        let adapter = Arc::new(RecordingAdapter {
+            open_orders: vec![crate::wire::execution_adapter::VenueOpenOrder {
+                venue_order_id: OrderId::from("venue-1"),
+                client_order_id: Some(ClientOrderId::from("client-reconcile")),
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.40,
+                original_qty: 5.0,
+                remaining_qty: 5.0,
+                created_at_ms: 1,
+            }],
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+
+        let outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            adapter.clone(),
+            false,
+        )
+        .await
+        .expect("execute");
+
+        assert!(outcome.commands.is_empty());
+        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
+        let order = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .find(|managed| {
+                managed.intent.client_order_id == ClientOrderId::from("client-reconcile")
+            })
+            .expect("managed order");
+        assert_eq!(order.status, ManagedOrderStatus::NeedsReconcile);
+    }
+
+    fn runtime_with_recovered_needs_reconcile_order() -> Runtime<StrategyMode> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("whale-pair-live-reconcile-replay-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(&path).expect("store");
+        let mut record = OrderRecord::from_intent(
+            "run-test",
+            &OrderIntent {
+                client_order_id: ClientOrderId::from("client-reconcile"),
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.40,
+                quantity: 5.0,
+                reduce_only: false,
+                reason: "test recovered uncertain submit".to_string(),
+                quote_level_tag: None,
+                created_at_ms: 1,
+            },
+            "noop",
+        );
+        record.last_update_ms = 1;
+        store.insert(record).expect("insert order");
+
+        let mut runtime = Runtime::new_with_order_store(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+            Some(Box::new(store)),
+            "run-test".to_string(),
+        );
+        runtime.recover_from_store(10_000, 100);
+        let _ = std::fs::remove_file(path);
+        runtime
+    }
 }

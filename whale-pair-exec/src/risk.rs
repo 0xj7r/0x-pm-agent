@@ -106,7 +106,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "order price and quantity must be positive",
             );
         }
@@ -118,7 +120,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "order notional exceeds max_order_notional_usd",
             );
         }
@@ -129,7 +133,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "open order count exceeds max_open_orders_total",
             );
         }
@@ -140,7 +146,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "open order count exceeds max_open_orders_per_market",
             );
         }
@@ -153,7 +161,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "projected position quantity exceeds max_position_quantity_per_instrument",
             );
         }
@@ -164,7 +174,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 inventory.free_cash_usd(),
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "sell quantity exceeds current long inventory",
             );
         }
@@ -179,7 +191,9 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 projected_free_cash_usd,
                 inventory.gross_exposure_usd(),
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "projected free cash falls below min_free_cash_usd",
             );
         }
@@ -202,14 +216,15 @@ impl RiskEngine {
                 context.now_ms.max(order.created_at_ms),
                 projected_free_cash_usd,
                 projected_gross_notional_usd,
-                inventory.net_exposure_for_market_usd(&order.market_id).abs(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
                 "projected gross exposure exceeds max_gross_notional_usd",
             );
         }
 
         let projected_market_net_notional_usd =
-            (inventory.net_exposure_for_market_usd(&order.market_id)
-                + order.signed_notional_usd())
+            (inventory.net_exposure_for_market_usd(&order.market_id) + order.signed_notional_usd())
                 .abs();
         if projected_market_net_notional_usd > self.limits.max_net_notional_per_market_usd {
             return self.reject(
@@ -290,6 +305,9 @@ mod tests {
         );
 
         assert!(!decision.accepted);
-        assert_eq!(decision.reject_reason, Some(RiskRejectReason::FreeCashTooLow));
+        assert_eq!(
+            decision.reject_reason,
+            Some(RiskRejectReason::FreeCashTooLow)
+        );
     }
 }

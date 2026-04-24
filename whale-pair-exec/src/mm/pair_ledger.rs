@@ -230,7 +230,11 @@ impl MarketPairState {
         })
     }
 
-    pub fn apply_merge(&mut self, requested_qty: f64, observed_at_ms: EpochMillis) -> Option<MergePlan> {
+    pub fn apply_merge(
+        &mut self,
+        requested_qty: f64,
+        observed_at_ms: EpochMillis,
+    ) -> Option<MergePlan> {
         let mut plan = self.preview_merge_plan(requested_qty)?;
         let merged_qty = plan.merged_qty;
         if merged_qty <= EPSILON_QTY {
@@ -258,11 +262,7 @@ impl MarketPairState {
         Some(plan)
     }
 
-    pub fn merge_candidate(
-        &self,
-        taker_fee_rate: f64,
-        gas_fee_usd: f64,
-    ) -> Option<MergeCandidate> {
+    pub fn merge_candidate(&self, taker_fee_rate: f64, gas_fee_usd: f64) -> Option<MergeCandidate> {
         if self.yes_instrument_id.is_none() || self.no_instrument_id.is_none() {
             return None;
         }
@@ -428,7 +428,11 @@ fn remove_fifo(lots: &mut Vec<PairLot>, requested_qty: f64) -> Option<f64> {
     Some(removed)
 }
 
-fn consume_pairwise(yes_lots: &mut Vec<PairLot>, no_lots: &mut Vec<PairLot>, qty: f64) -> Option<f64> {
+fn consume_pairwise(
+    yes_lots: &mut Vec<PairLot>,
+    no_lots: &mut Vec<PairLot>,
+    qty: f64,
+) -> Option<f64> {
     if qty <= EPSILON_QTY {
         return Some(0.0);
     }
@@ -520,7 +524,12 @@ impl MarketPairLedger {
         }
     }
 
-    pub fn merge_candidate(&self, market_id: &MarketId, fee_rate: f64, gas_fee_usd: f64) -> Option<MergeCandidate> {
+    pub fn merge_candidate(
+        &self,
+        market_id: &MarketId,
+        fee_rate: f64,
+        gas_fee_usd: f64,
+    ) -> Option<MergeCandidate> {
         self.states
             .get(market_id)
             .and_then(|state| state.merge_candidate(fee_rate, gas_fee_usd))
@@ -635,7 +644,10 @@ mod tests {
         let yes_before = yes_lots.clone();
         let no_before = no_lots.clone();
 
-        assert_eq!(super::consume_pairwise(&mut yes_lots, &mut no_lots, 1.5), None);
+        assert_eq!(
+            super::consume_pairwise(&mut yes_lots, &mut no_lots, 1.5),
+            None
+        );
         assert_eq!(yes_lots, yes_before);
         assert_eq!(no_lots, no_before);
     }

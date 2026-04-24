@@ -460,6 +460,10 @@ def read_sqlite_signal_snapshots(path: Path) -> list[sqlite3.Row]:
         conn.close()
 
 
+def is_cancel_status(status: str) -> bool:
+    return "cancel" in status.lower()
+
+
 def summarize_order_rows(rows: list[sqlite3.Row]) -> dict[int, dict[str, Any]]:
     windows: dict[int, dict[str, Any]] = {}
     for row in rows:
@@ -475,6 +479,8 @@ def summarize_order_rows(rows: list[sqlite3.Row]) -> dict[int, dict[str, Any]]:
                 "filled_notional_usd": 0.0,
                 "submitted_qty": 0.0,
                 "filled_qty": 0.0,
+                "filled_order_count": 0,
+                "canceled_order_count": 0,
                 "statuses": Counter(),
                 "market_ids": set(),
                 "instrument_ids": set(),
@@ -495,6 +501,10 @@ def summarize_order_rows(rows: list[sqlite3.Row]) -> dict[int, dict[str, Any]]:
         window["filled_notional_usd"] += limit_price * filled_qty
         window["submitted_qty"] += original_qty
         window["filled_qty"] += filled_qty
+        if filled_qty > 0:
+            window["filled_order_count"] += 1
+        if is_cancel_status(status):
+            window["canceled_order_count"] += 1
         window["statuses"][status] += 1
         if reason:
             window["reasons"][reason] += 1
@@ -874,6 +884,8 @@ def merge_local_window_summaries(
             "filled_notional_usd": round(float(order_summary.get("filled_notional_usd", 0.0)), 6),
             "submitted_qty": round(float(order_summary.get("submitted_qty", 0.0)), 6),
             "filled_qty": round(float(order_summary.get("filled_qty", 0.0)), 6),
+            "filled_order_count": int(order_summary.get("filled_order_count", 0)),
+            "canceled_order_count": int(order_summary.get("canceled_order_count", 0)),
             "market_ids": sorted(market_ids),
             "instrument_ids": sorted(instrument_ids),
             "status_counts": dict(sorted(statuses.items())),
@@ -1008,6 +1020,8 @@ def build_comparison_windows(
                     "filled_notional_usd": 0.0,
                     "submitted_qty": 0.0,
                     "filled_qty": 0.0,
+                    "filled_order_count": 0,
+                    "canceled_order_count": 0,
                     "market_ids": [],
                     "instrument_ids": [],
                     "status_counts": {},
@@ -1057,6 +1071,324 @@ def build_comparison_windows(
     return windows
 
 
+def round_optional(value: float | None, digits: int = 6) -> float | None:
+    return round(value, digits) if value is not None else None
+
+
+def average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def summarize_buy_levels(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_outcome: dict[str, dict[str, float | int | None]] = {}
+    by_role = {
+        "cheap_leg": {"size_total": 0.0, "usdc_total": 0.0, "window_count": 0},
+        "expensive_leg": {"size_total": 0.0, "usdc_total": 0.0, "window_count": 0},
+    }
+    phase_by_outcome: dict[str, dict[str, dict[str, float | int | None]]] = {}
+
+    for window in windows:
+        whale = window["whale"]
+        for outcome, stats in whale.get("buy_summary_by_outcome", {}).items():
+            bucket = by_outcome.setdefault(
+                outcome,
+                {"trade_count": 0, "size_total": 0.0, "usdc_total": 0.0},
+            )
+            bucket["trade_count"] = int(bucket["trade_count"] or 0) + int(stats.get("trade_count", 0))
+            bucket["size_total"] = float(bucket["size_total"] or 0.0) + float(stats.get("size_total", 0.0))
+            bucket["usdc_total"] = float(bucket["usdc_total"] or 0.0) + float(stats.get("usdc_total", 0.0))
+
+        for phase, phase_stats in whale.get("phase_buy_summary_by_outcome", {}).items():
+            phase_bucket = phase_by_outcome.setdefault(phase, {})
+            for outcome, stats in phase_stats.items():
+                outcome_bucket = phase_bucket.setdefault(
+                    outcome,
+                    {"trade_count": 0, "size_total": 0.0, "usdc_total": 0.0},
+                )
+                outcome_bucket["trade_count"] = int(outcome_bucket["trade_count"] or 0) + int(stats.get("trade_count", 0))
+                outcome_bucket["size_total"] = float(outcome_bucket["size_total"] or 0.0) + float(stats.get("size_total", 0.0))
+                outcome_bucket["usdc_total"] = float(outcome_bucket["usdc_total"] or 0.0) + float(stats.get("usdc_total", 0.0))
+
+        for role in ("cheap_leg", "expensive_leg"):
+            leg = whale.get(role)
+            if not isinstance(leg, dict):
+                continue
+            size_total = float(leg.get("size_total", 0.0))
+            usdc_total = float(leg.get("usdc_total", 0.0))
+            if size_total <= 0:
+                continue
+            by_role[role]["size_total"] += size_total
+            by_role[role]["usdc_total"] += usdc_total
+            by_role[role]["window_count"] += 1
+
+    def finalize(store: dict[str, dict[str, float | int | None]]) -> dict[str, dict[str, Any]]:
+        finalized: dict[str, dict[str, Any]] = {}
+        for key, stats in store.items():
+            size_total = float(stats["size_total"] or 0.0)
+            usdc_total = float(stats["usdc_total"] or 0.0)
+            avg_buy_price = usdc_total / size_total if size_total > 0 else None
+            finalized[key] = {
+                **({"trade_count": int(stats["trade_count"] or 0)} if "trade_count" in stats else {}),
+                **({"window_count": int(stats["window_count"] or 0)} if "window_count" in stats else {}),
+                "size_total": round(size_total, 6),
+                "usdc_total": round(usdc_total, 6),
+                "avg_buy_price": round_optional(avg_buy_price),
+            }
+        return finalized
+
+    return {
+        "by_outcome": finalize(by_outcome),
+        "by_role": finalize(by_role),
+        "by_phase_and_outcome": {
+            phase: finalize(outcome_stats)
+            for phase, outcome_stats in sorted(phase_by_outcome.items())
+        },
+    }
+
+
+def summarize_microstructure_context(window: dict[str, Any], sleeve_names: list[str]) -> dict[str, Any]:
+    numeric_fields = {
+        "price_gap": [],
+        "cheap_spread": [],
+        "expensive_spread": [],
+        "cheap_bid_depth_top3_qty": [],
+        "cheap_ask_depth_top3_qty": [],
+        "expensive_bid_depth_top3_qty": [],
+        "expensive_ask_depth_top3_qty": [],
+        "btc_realized_vol_5m_bps": [],
+        "btc_realized_vol_15m_bps": [],
+        "btc_trade_count_5m": [],
+        "btc_trade_count_15m": [],
+        "btc_return_30s_bps": [],
+        "btc_return_60s_bps": [],
+        "activity_30s": [],
+        "activity_60s": [],
+        "clip_scale": [],
+    }
+    mode_counts: Counter[str] = Counter()
+    aggression_counts: Counter[str] = Counter()
+    gate_reasons: Counter[str] = Counter()
+    signal_snapshot_count = 0
+    books_fresh_count = 0
+    both_sides_present_count = 0
+
+    for sleeve_name in sleeve_names:
+        sleeve = window["sleeves"][sleeve_name]
+        signal_snapshot_count += int(sleeve.get("signal_snapshot_count", 0))
+        latest = sleeve.get("latest_signal")
+        if not isinstance(latest, dict):
+            continue
+        if latest.get("mode"):
+            mode_counts[str(latest["mode"])] += 1
+        if latest.get("aggression_tier"):
+            aggression_counts[str(latest["aggression_tier"])] += 1
+        if latest.get("books_fresh") is True:
+            books_fresh_count += 1
+        if latest.get("both_sides_present") is True:
+            both_sides_present_count += 1
+        for field, values in numeric_fields.items():
+            value = safe_float(latest.get(field))
+            if value is not None:
+                values.append(value)
+        for item in sleeve.get("signal_gate_reason_summary", []):
+            reason = str(item.get("reason") or "").strip()
+            if reason:
+                gate_reasons[reason] += int(item.get("count", 0))
+
+    return {
+        "available": any(numeric_fields[field] for field in numeric_fields) or signal_snapshot_count > 0,
+        "signal_snapshot_count": signal_snapshot_count,
+        "mode_summary": summarize_counter(mode_counts),
+        "aggression_tier_summary": summarize_counter(aggression_counts),
+        "books_fresh_sleeve_count": books_fresh_count,
+        "both_sides_present_sleeve_count": both_sides_present_count,
+        "avg_price_gap": round_optional(average(numeric_fields["price_gap"])),
+        "avg_cheap_spread": round_optional(average(numeric_fields["cheap_spread"])),
+        "avg_expensive_spread": round_optional(average(numeric_fields["expensive_spread"])),
+        "avg_cheap_bid_depth_top3_qty": round_optional(average(numeric_fields["cheap_bid_depth_top3_qty"])),
+        "avg_cheap_ask_depth_top3_qty": round_optional(average(numeric_fields["cheap_ask_depth_top3_qty"])),
+        "avg_expensive_bid_depth_top3_qty": round_optional(average(numeric_fields["expensive_bid_depth_top3_qty"])),
+        "avg_expensive_ask_depth_top3_qty": round_optional(average(numeric_fields["expensive_ask_depth_top3_qty"])),
+        "avg_btc_realized_vol_5m_bps": round_optional(average(numeric_fields["btc_realized_vol_5m_bps"])),
+        "avg_btc_realized_vol_15m_bps": round_optional(average(numeric_fields["btc_realized_vol_15m_bps"])),
+        "avg_btc_trade_count_5m": round_optional(average(numeric_fields["btc_trade_count_5m"])),
+        "avg_btc_trade_count_15m": round_optional(average(numeric_fields["btc_trade_count_15m"])),
+        "avg_btc_return_30s_bps": round_optional(average(numeric_fields["btc_return_30s_bps"])),
+        "avg_btc_return_60s_bps": round_optional(average(numeric_fields["btc_return_60s_bps"])),
+        "avg_activity_30s": round_optional(average(numeric_fields["activity_30s"])),
+        "avg_activity_60s": round_optional(average(numeric_fields["activity_60s"])),
+        "avg_clip_scale": round_optional(average(numeric_fields["clip_scale"])),
+        "gate_reason_summary": summarize_counter(gate_reasons),
+    }
+
+
+def summarize_local_sleeve_metrics(windows: list[dict[str, Any]], sleeve_name: str) -> dict[str, Any]:
+    bucket_counts: Counter[str] = Counter()
+    statuses: Counter[str] = Counter()
+    rejection_reasons: Counter[str] = Counter()
+    suppression_reasons: Counter[str] = Counter()
+    gate_reasons: Counter[str] = Counter()
+    price_gaps: list[float] = []
+    clip_scales: list[float] = []
+    btc_vol_5m: list[float] = []
+    totals = {
+        "order_count": 0,
+        "filled_order_count": 0,
+        "canceled_order_count": 0,
+        "submitted_notional_usd": 0.0,
+        "filled_notional_usd": 0.0,
+        "submitted_qty": 0.0,
+        "filled_qty": 0.0,
+        "signal_snapshot_count": 0,
+    }
+
+    for window in windows:
+        sleeve = window["sleeves"][sleeve_name]
+        bucket_counts[str(sleeve["bucket"])] += 1
+        for key in totals:
+            totals[key] += float(sleeve.get(key, 0.0))
+        statuses.update(sleeve.get("status_counts", {}))
+        for item in sleeve.get("rejection_reason_summary", []):
+            rejection_reasons[str(item["reason"])] += int(item["count"])
+        for item in sleeve.get("suppression_reason_summary", []):
+            suppression_reasons[str(item["reason"])] += int(item["count"])
+        for item in sleeve.get("signal_gate_reason_summary", []):
+            gate_reasons[str(item["reason"])] += int(item["count"])
+        latest = sleeve.get("latest_signal")
+        if isinstance(latest, dict):
+            for field, target in (
+                ("price_gap", price_gaps),
+                ("clip_scale", clip_scales),
+                ("btc_realized_vol_5m_bps", btc_vol_5m),
+            ):
+                value = safe_float(latest.get(field))
+                if value is not None:
+                    target.append(value)
+
+    submitted_notional = totals["submitted_notional_usd"]
+    order_count = totals["order_count"]
+    return {
+        "bucket_counts": dict(sorted(bucket_counts.items())),
+        "order_count": int(totals["order_count"]),
+        "filled_order_count": int(totals["filled_order_count"]),
+        "canceled_order_count": int(totals["canceled_order_count"]),
+        "submitted_notional_usd": round(totals["submitted_notional_usd"], 6),
+        "filled_notional_usd": round(totals["filled_notional_usd"], 6),
+        "submitted_qty": round(totals["submitted_qty"], 6),
+        "filled_qty": round(totals["filled_qty"], 6),
+        "fill_rate_by_notional": round_optional(totals["filled_notional_usd"] / submitted_notional if submitted_notional else None),
+        "cancel_rate_by_order_count": round_optional(totals["canceled_order_count"] / order_count if order_count else None),
+        "status_counts": dict(sorted(statuses.items())),
+        "rejection_reason_summary": summarize_counter(rejection_reasons),
+        "suppression_reason_summary": summarize_counter(suppression_reasons),
+        "signal_snapshot_count": int(totals["signal_snapshot_count"]),
+        "avg_signal_price_gap": round_optional(average(price_gaps)),
+        "avg_signal_clip_scale": round_optional(average(clip_scales)),
+        "avg_signal_btc_realized_vol_5m_bps": round_optional(average(btc_vol_5m)),
+        "signal_gate_reason_summary": summarize_counter(gate_reasons),
+        "pnl_metrics": {
+            "available": False,
+            "realized_pnl_usd": None,
+            "unrealized_pnl_usd": None,
+            "source": "not persisted in current order-store.sqlite schema",
+        },
+    }
+
+
+def compact_window_reference(window: dict[str, Any], sleeve_names: list[str]) -> dict[str, Any]:
+    whale = window["whale"]
+    sleeve_metrics = {}
+    for sleeve_name in sleeve_names:
+        sleeve = window["sleeves"][sleeve_name]
+        latest = sleeve.get("latest_signal")
+        sleeve_metrics[sleeve_name] = {
+            "bucket": sleeve["bucket"],
+            "any_orders_submitted": bool(sleeve["any_orders_submitted"]),
+            "any_fills": bool(sleeve["any_fills"]),
+            "order_count": int(sleeve["order_count"]),
+            "filled_order_count": int(sleeve["filled_order_count"]),
+            "canceled_order_count": int(sleeve["canceled_order_count"]),
+            "submitted_notional_usd": sleeve["submitted_notional_usd"],
+            "filled_notional_usd": sleeve["filled_notional_usd"],
+            "status_counts": sleeve["status_counts"],
+            "latest_signal": {
+                "mode": latest.get("mode"),
+                "aggression_tier": latest.get("aggression_tier"),
+                "price_gap": latest.get("price_gap"),
+                "clip_scale": latest.get("clip_scale"),
+                "btc_realized_vol_5m_bps": latest.get("btc_realized_vol_5m_bps"),
+                "activity_30s": latest.get("activity_30s"),
+                "books_fresh": latest.get("books_fresh"),
+                "both_sides_present": latest.get("both_sides_present"),
+            }
+            if isinstance(latest, dict)
+            else None,
+            "rejection_reason_summary": sleeve["rejection_reason_summary"],
+            "suppression_reason_summary": sleeve["suppression_reason_summary"],
+            "signal_gate_reason_summary": sleeve["signal_gate_reason_summary"],
+        }
+
+    return {
+        "window_start_ms": window["window_start_ms"],
+        "window_start_iso": window["window_start_iso"],
+        "market_slug": window["market_slug"],
+        "condition_id": window["condition_id"],
+        "overall_bucket": window["overall_bucket"],
+        "whale": {
+            "participated": bool(whale["participated"]),
+            "trade_count": int(whale["trade_count"]),
+            "merge_count": int(whale["merge_count"]),
+            "redeem_count": int(whale["redeem_count"]),
+            "rough_notional_usd": whale["rough_notional_usd"],
+            "cheap_leg": whale.get("cheap_leg"),
+            "expensive_leg": whale.get("expensive_leg"),
+        },
+        "microstructure_context": summarize_microstructure_context(window, sleeve_names),
+        "sleeves": sleeve_metrics,
+    }
+
+
+def build_qa_summary(windows: list[dict[str, Any]], sleeve_names: list[str]) -> dict[str, Any]:
+    overall_bucket_counts = Counter(window["overall_bucket"] for window in windows)
+    bucket_windows = {
+        bucket: [window for window in windows if window["overall_bucket"] == bucket]
+        for bucket in ("whale_only", "us_only", "both", "neither")
+    }
+    whale_participated_windows = [window for window in windows if window["whale"]["participated"]]
+
+    return {
+        "schema_version": 1,
+        "window_count": len(windows),
+        "overall_bucket_counts": dict(sorted(overall_bucket_counts.items())),
+        "whale": {
+            "participated_window_count": len(whale_participated_windows),
+            "trade_count": sum(int(window["whale"]["trade_count"]) for window in whale_participated_windows),
+            "merge_count": sum(int(window["whale"]["merge_count"]) for window in whale_participated_windows),
+            "redeem_count": sum(int(window["whale"]["redeem_count"]) for window in whale_participated_windows),
+            "rough_notional_usd": round(
+                sum(float(window["whale"].get("rough_notional_usd", 0.0)) for window in whale_participated_windows),
+                6,
+            ),
+            "buy_levels": summarize_buy_levels(whale_participated_windows),
+        },
+        "buckets": {
+            bucket: {
+                "count": len(bucket_rows),
+                "whale_buy_levels": summarize_buy_levels(bucket_rows),
+                "windows": [compact_window_reference(window, sleeve_names) for window in bucket_rows],
+            }
+            for bucket, bucket_rows in bucket_windows.items()
+        },
+        "sleeves": {
+            sleeve_name: summarize_local_sleeve_metrics(windows, sleeve_name)
+            for sleeve_name in sleeve_names
+        },
+        "pnl_note": "Current local order stores expose order/fill/cancel state and signal snapshots, but not realized/unrealized PnL columns.",
+    }
+
+
 def flatten_for_csv(windows: list[dict[str, Any]], sleeve_names: list[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for window in windows:
@@ -1103,6 +1435,14 @@ def flatten_for_csv(windows: list[dict[str, Any]], sleeve_names: list[str]) -> l
             row[f"{prefix}submit_count"] = sleeve["submit_count"]
             row[f"{prefix}submitted_notional_usd"] = sleeve["submitted_notional_usd"]
             row[f"{prefix}filled_notional_usd"] = sleeve["filled_notional_usd"]
+            row[f"{prefix}submitted_qty"] = sleeve["submitted_qty"]
+            row[f"{prefix}filled_qty"] = sleeve["filled_qty"]
+            row[f"{prefix}filled_order_count"] = sleeve["filled_order_count"]
+            row[f"{prefix}canceled_order_count"] = sleeve["canceled_order_count"]
+            row[f"{prefix}status_counts"] = "|".join(
+                f"{status}:{count}"
+                for status, count in sleeve["status_counts"].items()
+            )
             row[f"{prefix}market_ids"] = "|".join(sleeve["market_ids"])
             row[f"{prefix}signal_snapshot_count"] = sleeve["signal_snapshot_count"]
             row[f"{prefix}signal_mode"] = (
@@ -1343,17 +1683,20 @@ def main() -> int:
         start_ms=args.start_ms,
         end_ms=args.end_ms,
     )
-    csv_rows = flatten_for_csv(comparison_windows, [sleeve.name for sleeve in DEFAULT_SLEEVES])
+    sleeve_names = [sleeve.name for sleeve in DEFAULT_SLEEVES]
+    csv_rows = flatten_for_csv(comparison_windows, sleeve_names)
 
     bucket_counts = Counter(window["overall_bucket"] for window in comparison_windows)
+    generated_at_ms = now_ms()
     json_payload = {
-        "generated_at_ms": now_ms(),
-        "generated_at_iso": iso_utc(now_ms()),
+        "generated_at_ms": generated_at_ms,
+        "generated_at_iso": iso_utc(generated_at_ms),
         "whale_wallet": args.wallet,
         "activity_source": activity_source,
         "activity_row_count": len(activity_rows),
         "window_count": len(comparison_windows),
         "bucket_counts": dict(sorted(bucket_counts.items())),
+        "qa_summary": build_qa_summary(comparison_windows, sleeve_names),
         "journal_mode": args.journal_mode,
         "journal_tail_lines": args.journal_tail_lines,
         "sleeves": sleeve_meta,

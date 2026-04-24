@@ -1,5 +1,5 @@
 use crate::inventory::{InventoryAdjustment, InventoryError, InventoryState};
-use crate::pair_ledger::{MergeCandidate, MergePlan, MarketPairLedger};
+use crate::pair_ledger::{MarketPairLedger, MergeCandidate, MergePlan};
 use crate::types::{CloseMethod, EpochMillis, FillReport, MarketId};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,17 +51,18 @@ impl MergeExecutor {
             .merge_candidate(market_id, self.taker_fee_rate, self.gas_fee_usd)
     }
 
-    pub fn apply_merge(&mut self, fill: &FillReport, inventory: &mut InventoryState) -> Result<Option<MergeExecution>, InventoryError> {
+    pub fn apply_merge(
+        &mut self,
+        fill: &FillReport,
+        inventory: &mut InventoryState,
+    ) -> Result<Option<MergeExecution>, InventoryError> {
         match fill.close_method {
             Some(CloseMethod::Merge) => {}
             Some(CloseMethod::Settlement) | Some(CloseMethod::Settle) => {}
             _ => return Ok(None),
         }
 
-        let plan = match self
-            .ledger
-            .preview_merge(&fill.market_id, fill.quantity)
-        {
+        let plan = match self.ledger.preview_merge(&fill.market_id, fill.quantity) {
             Some(plan) => plan,
             None => return Ok(None),
         };
@@ -100,9 +101,12 @@ impl MergeExecutor {
             external_fee,
             fill.observed_at_ms,
         )?;
-        let applied = self.ledger.apply_merge(&fill.market_id, plan.merged_qty, fill.observed_at_ms).ok_or(
-            InventoryError::InvalidFill("merge failed due to unexpected state transition"),
-        )?;
+        let applied = self
+            .ledger
+            .apply_merge(&fill.market_id, plan.merged_qty, fill.observed_at_ms)
+            .ok_or(InventoryError::InvalidFill(
+                "merge failed due to unexpected state transition",
+            ))?;
         let plan_to_apply = applied;
         *inventory = next_inventory;
 

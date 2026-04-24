@@ -133,14 +133,11 @@ impl MarketContextStore {
 
     pub fn to_json_string(&self) -> Result<String> {
         let records = self.sorted_records();
-        let source_generated_at_ms = self
-            .source_generated_at_ms
-            .or_else(|| Some(now_unix_ms()));
+        let source_generated_at_ms = self.source_generated_at_ms.or_else(|| Some(now_unix_ms()));
         let active_btc_5m_windows = records
             .iter()
             .filter(|record| {
-                source_generated_at_ms
-                    .is_some_and(|now_ms| record.is_active_btc_5m_window(now_ms))
+                source_generated_at_ms.is_some_and(|now_ms| record.is_active_btc_5m_window(now_ms))
             })
             .cloned()
             .collect::<Vec<_>>();

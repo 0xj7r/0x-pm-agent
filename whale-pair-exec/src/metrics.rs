@@ -117,8 +117,10 @@ impl AppMetrics {
         let registry = Registry::new_custom(Some("whale_pair_exec".to_string()), None)
             .context("failed to construct prometheus registry")?;
 
-        let market_ws_connected =
-            IntGauge::with_opts(Opts::new("market_ws_connected", "Market websocket connected"))?;
+        let market_ws_connected = IntGauge::with_opts(Opts::new(
+            "market_ws_connected",
+            "Market websocket connected",
+        ))?;
         let user_ws_connected =
             IntGauge::with_opts(Opts::new("user_ws_connected", "User websocket connected"))?;
         let execution_adapter_connected = IntGauge::with_opts(Opts::new(
@@ -126,11 +128,17 @@ impl AppMetrics {
             "Execution adapter connected",
         ))?;
         let market_messages_total = IntCounterVec::new(
-            Opts::new("market_ws_messages_total", "Market websocket messages by event type"),
+            Opts::new(
+                "market_ws_messages_total",
+                "Market websocket messages by event type",
+            ),
             &["event_type"],
         )?;
         let user_messages_total = IntCounterVec::new(
-            Opts::new("user_ws_messages_total", "User websocket messages by event type and status"),
+            Opts::new(
+                "user_ws_messages_total",
+                "User websocket messages by event type and status",
+            ),
             &["event_type", "status"],
         )?;
         let reconnects_total = IntCounterVec::new(
@@ -236,10 +244,8 @@ impl AppMetrics {
             "merge_latency_ms",
             "Observed merge latency in milliseconds",
         ))?;
-        let reconcile_failures_total = IntCounter::new(
-            "reconcile_failures_total",
-            "Count of reconcile failures",
-        )?;
+        let reconcile_failures_total =
+            IntCounter::new("reconcile_failures_total", "Count of reconcile failures")?;
         let runtime_riskoff_transitions_total = IntCounter::new(
             "runtime_riskoff_transitions_total",
             "Count of runtime risk-off transitions",
@@ -252,21 +258,14 @@ impl AppMetrics {
             "inventory_skew_usd",
             "Current inventory skew in USD",
         ))?;
-        let realized_pnl_usd = Gauge::with_opts(Opts::new(
-            "realized_pnl_usd",
-            "Realized PnL in USD",
-        ))?;
-        let unrealized_pnl_usd = Gauge::with_opts(Opts::new(
-            "unrealized_pnl_usd",
-            "Unrealized PnL in USD",
-        ))?;
+        let realized_pnl_usd =
+            Gauge::with_opts(Opts::new("realized_pnl_usd", "Realized PnL in USD"))?;
+        let unrealized_pnl_usd =
+            Gauge::with_opts(Opts::new("unrealized_pnl_usd", "Unrealized PnL in USD"))?;
         let fees_usd_total = Gauge::with_opts(Opts::new("fees_usd_total", "Fees in USD"))?;
-        let rebates_usd_total =
-            Gauge::with_opts(Opts::new("rebates_usd_total", "Rebates in USD"))?;
-        let net_edge_usd_total = Gauge::with_opts(Opts::new(
-            "net_edge_usd_total",
-            "Net edge in USD",
-        ))?;
+        let rebates_usd_total = Gauge::with_opts(Opts::new("rebates_usd_total", "Rebates in USD"))?;
+        let net_edge_usd_total =
+            Gauge::with_opts(Opts::new("net_edge_usd_total", "Net edge in USD"))?;
 
         registry.register(Box::new(market_ws_connected.clone()))?;
         registry.register(Box::new(user_ws_connected.clone()))?;
@@ -422,10 +421,12 @@ impl AppMetrics {
     }
 
     pub fn refresh_stream_ages(&self) {
-        self.market_last_message_age_ms
-            .set(age_ms(self.market_last_message_unix_ms.load(Ordering::Relaxed)));
-        self.user_last_message_age_ms
-            .set(age_ms(self.user_last_message_unix_ms.load(Ordering::Relaxed)));
+        self.market_last_message_age_ms.set(age_ms(
+            self.market_last_message_unix_ms.load(Ordering::Relaxed),
+        ));
+        self.user_last_message_age_ms.set(age_ms(
+            self.user_last_message_unix_ms.load(Ordering::Relaxed),
+        ));
         self.last_reconcile_age_ms
             .set(age_ms(self.last_reconcile_unix_ms.load(Ordering::Relaxed)));
     }

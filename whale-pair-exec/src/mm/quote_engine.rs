@@ -41,7 +41,11 @@ impl DesiredQuote {
         self
     }
 
-    fn with_suppression(mut self, suppress_if_stale: bool, expires_at_ms: Option<EpochMillis>) -> Self {
+    fn with_suppression(
+        mut self,
+        suppress_if_stale: bool,
+        expires_at_ms: Option<EpochMillis>,
+    ) -> Self {
         self.suppress_if_stale = suppress_if_stale;
         self.expires_at_ms = expires_at_ms;
         self
@@ -148,10 +152,10 @@ impl DesiredQuoteSet {
                 if intent.limit_price <= 0.0 || intent.quantity <= 0.0 {
                     continue;
                 }
-                let current_tag = intent.quote_level_tag.clone().unwrap_or_else(|| format!(
-                    "level-{}",
-                    (level + 1)
-                ));
+                let current_tag = intent
+                    .quote_level_tag
+                    .clone()
+                    .unwrap_or_else(|| format!("level-{}", (level + 1)));
                 intent.quote_level_tag = Some(format!("{current_tag}:{level}"));
                 quotes.push(
                     DesiredQuote {
@@ -218,27 +222,23 @@ impl DesiredQuoteSet {
 
         let stale_quote_max_age_ms = self.stale_quote_max_age_ms;
         let quote_expiry_ms = self.quote_expiry_ms;
-        self.quotes
-            .retain(|desired| {
-                if desired.suppress_if_stale {
-                    return false;
-                }
-                if stale_quote_max_age_ms.is_some_and(|max_age_ms| {
-                    now_ms.saturating_sub(desired.intent.created_at_ms) > max_age_ms
-                }) {
-                    return false;
-                }
-                if quote_expiry_ms.is_some_and(|expiry_ms| {
-                    now_ms.saturating_sub(desired.intent.created_at_ms) > expiry_ms
-                }) {
-                    return false;
-                }
-                let stale = stale_check(
-                    market_quotes.get(&desired.intent.instrument_id),
-                    now_ms,
-                );
-                !stale
-            });
+        self.quotes.retain(|desired| {
+            if desired.suppress_if_stale {
+                return false;
+            }
+            if stale_quote_max_age_ms.is_some_and(|max_age_ms| {
+                now_ms.saturating_sub(desired.intent.created_at_ms) > max_age_ms
+            }) {
+                return false;
+            }
+            if quote_expiry_ms.is_some_and(|expiry_ms| {
+                now_ms.saturating_sub(desired.intent.created_at_ms) > expiry_ms
+            }) {
+                return false;
+            }
+            let stale = stale_check(market_quotes.get(&desired.intent.instrument_id), now_ms);
+            !stale
+        });
         self
     }
 
@@ -256,7 +256,10 @@ impl DesiredQuoteSet {
         }
 
         self.quotes.retain(|desired| {
-            if desired.expires_at_ms.is_some_and(|expires_at_ms| now_ms >= expires_at_ms) {
+            if desired
+                .expires_at_ms
+                .is_some_and(|expires_at_ms| now_ms >= expires_at_ms)
+            {
                 return false;
             }
             !expiry_check(desired, now_ms)
@@ -283,7 +286,9 @@ impl DesiredQuoteSet {
 #[cfg(test)]
 mod tests {
     use super::{DesiredQuote, DesiredQuoteSet, ExpiryMode, QuoteEngineConfig, StaleMode};
-    use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, QuoteSnapshot, TradeSide};
+    use crate::types::{
+        ClientOrderId, InstrumentId, MarketId, OrderIntent, QuoteSnapshot, TradeSide,
+    };
     use std::collections::HashMap;
 
     fn intent(instrument: &str, side: TradeSide, price: f64, tag: Option<&str>) -> OrderIntent {
@@ -361,12 +366,9 @@ mod tests {
             vec![intent("inst", TradeSide::Buy, 0.10, None)],
             &QuoteEngineConfig::default(),
         )
-        .with_stale_gate(
-            10_000,
-            &quotes,
-            StaleMode::Remove,
-            |snapshot, now| snapshot.is_none_or(|snapshot| now.saturating_sub(snapshot.observed_at_ms) > 1),
-        );
+        .with_stale_gate(10_000, &quotes, StaleMode::Remove, |snapshot, now| {
+            snapshot.is_none_or(|snapshot| now.saturating_sub(snapshot.observed_at_ms) > 1)
+        });
         assert!(desired.quotes.is_empty());
     }
 }
