@@ -74,6 +74,18 @@ pub struct SignalSnapshotRecord {
     pub price_gap: Option<f64>,
     pub books_fresh: bool,
     pub both_sides_present: bool,
+    pub cheap_spread: Option<f64>,
+    pub expensive_spread: Option<f64>,
+    pub cheap_bid_depth_top3_qty: Option<f64>,
+    pub cheap_ask_depth_top3_qty: Option<f64>,
+    pub expensive_bid_depth_top3_qty: Option<f64>,
+    pub expensive_ask_depth_top3_qty: Option<f64>,
+    pub cheap_bid_notional_top3: Option<f64>,
+    pub cheap_ask_notional_top3: Option<f64>,
+    pub expensive_bid_notional_top3: Option<f64>,
+    pub expensive_ask_notional_top3: Option<f64>,
+    pub cheap_depth_imbalance_top3: Option<f64>,
+    pub expensive_depth_imbalance_top3: Option<f64>,
     pub btc_last_price: Option<f64>,
     pub btc_realized_vol_5m_bps: Option<f64>,
     pub btc_realized_vol_15m_bps: Option<f64>,
@@ -242,6 +254,18 @@ impl SqliteOrderStore {
                     price_gap REAL,
                     books_fresh INTEGER NOT NULL,
                     both_sides_present INTEGER NOT NULL,
+                    cheap_spread REAL,
+                    expensive_spread REAL,
+                    cheap_bid_depth_top3_qty REAL,
+                    cheap_ask_depth_top3_qty REAL,
+                    expensive_bid_depth_top3_qty REAL,
+                    expensive_ask_depth_top3_qty REAL,
+                    cheap_bid_notional_top3 REAL,
+                    cheap_ask_notional_top3 REAL,
+                    expensive_bid_notional_top3 REAL,
+                    expensive_ask_notional_top3 REAL,
+                    cheap_depth_imbalance_top3 REAL,
+                    expensive_depth_imbalance_top3 REAL,
                     btc_last_price REAL,
                     btc_realized_vol_5m_bps REAL,
                     btc_realized_vol_15m_bps REAL,
@@ -281,6 +305,54 @@ impl SqliteOrderStore {
                 ))
             })?;
 
+        for (column, declaration) in [
+            ("cheap_spread", "REAL"),
+            ("expensive_spread", "REAL"),
+            ("cheap_bid_depth_top3_qty", "REAL"),
+            ("cheap_ask_depth_top3_qty", "REAL"),
+            ("expensive_bid_depth_top3_qty", "REAL"),
+            ("expensive_ask_depth_top3_qty", "REAL"),
+            ("cheap_bid_notional_top3", "REAL"),
+            ("cheap_ask_notional_top3", "REAL"),
+            ("expensive_bid_notional_top3", "REAL"),
+            ("expensive_ask_notional_top3", "REAL"),
+            ("cheap_depth_imbalance_top3", "REAL"),
+            ("expensive_depth_imbalance_top3", "REAL"),
+        ] {
+            self.ensure_column("signal_snapshots", column, declaration)?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_column(
+        &self,
+        table: &str,
+        column: &str,
+        declaration: &str,
+    ) -> std::result::Result<(), OrderStoreError> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let exists = self
+            .connection
+            .prepare(&pragma)
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                Ok(rows.filter_map(Result::ok).any(|name| name == column))
+            })
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to inspect sqlite table info for {table}: {error}"
+                ))
+            })?;
+        if exists {
+            return Ok(());
+        }
+        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}");
+        self.connection.execute(&alter, ()).map_err(|error| {
+            OrderStoreError::Sqlite(format!(
+                "failed to add sqlite column {table}.{column}: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -695,6 +767,18 @@ impl OrderStore for SqliteOrderStore {
                     price_gap,
                     books_fresh,
                     both_sides_present,
+                    cheap_spread,
+                    expensive_spread,
+                    cheap_bid_depth_top3_qty,
+                    cheap_ask_depth_top3_qty,
+                    expensive_bid_depth_top3_qty,
+                    expensive_ask_depth_top3_qty,
+                    cheap_bid_notional_top3,
+                    cheap_ask_notional_top3,
+                    expensive_bid_notional_top3,
+                    expensive_ask_notional_top3,
+                    cheap_depth_imbalance_top3,
+                    expensive_depth_imbalance_top3,
                     btc_last_price,
                     btc_realized_vol_5m_bps,
                     btc_realized_vol_15m_bps,
@@ -716,7 +800,8 @@ impl OrderStore for SqliteOrderStore {
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                    ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33
+                    ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
+                    ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45
                 )",
                 params![
                     record.run_id,
@@ -734,6 +819,18 @@ impl OrderStore for SqliteOrderStore {
                     record.price_gap,
                     if record.books_fresh { 1 } else { 0 },
                     if record.both_sides_present { 1 } else { 0 },
+                    record.cheap_spread,
+                    record.expensive_spread,
+                    record.cheap_bid_depth_top3_qty,
+                    record.cheap_ask_depth_top3_qty,
+                    record.expensive_bid_depth_top3_qty,
+                    record.expensive_ask_depth_top3_qty,
+                    record.cheap_bid_notional_top3,
+                    record.cheap_ask_notional_top3,
+                    record.expensive_bid_notional_top3,
+                    record.expensive_ask_notional_top3,
+                    record.cheap_depth_imbalance_top3,
+                    record.expensive_depth_imbalance_top3,
                     record.btc_last_price,
                     record.btc_realized_vol_5m_bps,
                     record.btc_realized_vol_15m_bps,
@@ -875,6 +972,18 @@ mod tests {
             price_gap: Some(0.20),
             books_fresh: true,
             both_sides_present: true,
+            cheap_spread: Some(0.01),
+            expensive_spread: Some(0.01),
+            cheap_bid_depth_top3_qty: Some(240.0),
+            cheap_ask_depth_top3_qty: Some(180.0),
+            expensive_bid_depth_top3_qty: Some(210.0),
+            expensive_ask_depth_top3_qty: Some(190.0),
+            cheap_bid_notional_top3: Some(93.0),
+            cheap_ask_notional_top3: Some(72.0),
+            expensive_bid_notional_top3: Some(123.9),
+            expensive_ask_notional_top3: Some(114.0),
+            cheap_depth_imbalance_top3: Some(0.142857),
+            expensive_depth_imbalance_top3: Some(0.05),
             btc_last_price: Some(77700.0),
             btc_realized_vol_5m_bps: Some(3.0),
             btc_realized_vol_15m_bps: Some(5.0),

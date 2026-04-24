@@ -350,6 +350,8 @@ mod tests {
             QuoteSnapshot {
                 best_bid: None,
                 best_ask: None,
+                bid_levels: Vec::new(),
+                ask_levels: Vec::new(),
                 last_trade_price: None,
                 observed_at_ms: 1,
             },

@@ -394,8 +394,18 @@ def read_sqlite_signal_snapshots(path: Path) -> list[sqlite3.Row]:
         ).fetchall()
         if not tables:
             return []
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(signal_snapshots)").fetchall()
+        }
+
+        def select_expr(column: str) -> str:
+            if column in columns:
+                return column
+            return f"NULL AS {column}"
+
         return conn.execute(
-            """
+            f"""
             SELECT
                 run_id,
                 market_id,
@@ -412,6 +422,18 @@ def read_sqlite_signal_snapshots(path: Path) -> list[sqlite3.Row]:
                 price_gap,
                 books_fresh,
                 both_sides_present,
+                {select_expr("cheap_spread")},
+                {select_expr("expensive_spread")},
+                {select_expr("cheap_bid_depth_top3_qty")},
+                {select_expr("cheap_ask_depth_top3_qty")},
+                {select_expr("expensive_bid_depth_top3_qty")},
+                {select_expr("expensive_ask_depth_top3_qty")},
+                {select_expr("cheap_bid_notional_top3")},
+                {select_expr("cheap_ask_notional_top3")},
+                {select_expr("expensive_bid_notional_top3")},
+                {select_expr("expensive_ask_notional_top3")},
+                {select_expr("cheap_depth_imbalance_top3")},
+                {select_expr("expensive_depth_imbalance_top3")},
                 btc_last_price,
                 btc_realized_vol_5m_bps,
                 btc_realized_vol_15m_bps,
@@ -581,6 +603,18 @@ def summarize_signal_snapshot_rows(rows: list[sqlite3.Row]) -> dict[int, dict[st
                 "price_gap": safe_float(row["price_gap"]),
                 "cheap_ask": safe_float(row["cheap_ask"]),
                 "expensive_ask": safe_float(row["expensive_ask"]),
+                "cheap_spread": safe_float(row["cheap_spread"]),
+                "expensive_spread": safe_float(row["expensive_spread"]),
+                "cheap_bid_depth_top3_qty": safe_float(row["cheap_bid_depth_top3_qty"]),
+                "cheap_ask_depth_top3_qty": safe_float(row["cheap_ask_depth_top3_qty"]),
+                "expensive_bid_depth_top3_qty": safe_float(row["expensive_bid_depth_top3_qty"]),
+                "expensive_ask_depth_top3_qty": safe_float(row["expensive_ask_depth_top3_qty"]),
+                "cheap_bid_notional_top3": safe_float(row["cheap_bid_notional_top3"]),
+                "cheap_ask_notional_top3": safe_float(row["cheap_ask_notional_top3"]),
+                "expensive_bid_notional_top3": safe_float(row["expensive_bid_notional_top3"]),
+                "expensive_ask_notional_top3": safe_float(row["expensive_ask_notional_top3"]),
+                "cheap_depth_imbalance_top3": safe_float(row["cheap_depth_imbalance_top3"]),
+                "expensive_depth_imbalance_top3": safe_float(row["expensive_depth_imbalance_top3"]),
                 "books_fresh": bool(int(row["books_fresh"])),
                 "both_sides_present": bool(int(row["both_sides_present"])),
                 "btc_last_price": safe_float(row["btc_last_price"]),
@@ -1096,6 +1130,25 @@ def flatten_for_csv(windows: list[dict[str, Any]], sleeve_names: list[str]) -> l
                 if isinstance(sleeve["latest_signal"], dict)
                 else ""
             )
+            for field in (
+                "cheap_spread",
+                "expensive_spread",
+                "cheap_bid_depth_top3_qty",
+                "cheap_ask_depth_top3_qty",
+                "expensive_bid_depth_top3_qty",
+                "expensive_ask_depth_top3_qty",
+                "cheap_bid_notional_top3",
+                "cheap_ask_notional_top3",
+                "expensive_bid_notional_top3",
+                "expensive_ask_notional_top3",
+                "cheap_depth_imbalance_top3",
+                "expensive_depth_imbalance_top3",
+            ):
+                row[f"{prefix}signal_{field}"] = (
+                    sleeve["latest_signal"][field]
+                    if isinstance(sleeve["latest_signal"], dict)
+                    else ""
+                )
             row[f"{prefix}signal_books_fresh"] = (
                 int(bool(sleeve["latest_signal"]["books_fresh"]))
                 if isinstance(sleeve["latest_signal"], dict)
