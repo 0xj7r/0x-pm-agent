@@ -17,6 +17,15 @@ venv/
 logs/
 .chronos_cache/
 data/
+reports/
+frontend/
+.playwright-mcp/
+dashboard-v3.png
+node_modules/
+.next/
+out/
+*.tsbuildinfo
 execution/
 **/target/
+whale-pair-exec/data/
 whale-pair-exec/.unlawful_shear_context.json
