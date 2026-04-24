@@ -1509,20 +1509,40 @@ impl Btc5mMmStrategy {
         &self,
         left_quote: &QuoteSnapshot,
         right_quote: &QuoteSnapshot,
+        left_bid_price: f64,
+        right_bid_price: f64,
         requested_clip_usd: f64,
     ) -> Option<f64> {
-        let left_bid = Self::best_bid(left_quote)?;
-        let right_bid = Self::best_bid(right_quote)?;
-        let reference_bid = left_bid.max(right_bid);
-        if reference_bid <= 0.0 {
+        let clip_reference_price = left_bid_price.max(right_bid_price);
+        let min_notional_reference_price = left_bid_price.min(right_bid_price);
+        if clip_reference_price <= 0.0
+            || !clip_reference_price.is_finite()
+            || min_notional_reference_price <= 0.0
+            || !min_notional_reference_price.is_finite()
+        {
             return None;
         }
         let clip_usd = self.paired_entry_clip_usd(left_quote, right_quote, requested_clip_usd);
-        let raw_quantity = clip_usd / reference_bid;
-        let min_quantity =
-            self.config.venue_min_order_quantity * self.config.entry_min_size_multiplier;
-        let max_quantity = self.config.max_clip_usd / reference_bid;
-        Some(raw_quantity.max(min_quantity).min(max_quantity).max(0.0))
+        let raw_quantity = clip_usd / clip_reference_price;
+        let required_quantity = self.required_order_quantity(min_notional_reference_price);
+        let max_quantity = self.config.max_clip_usd / clip_reference_price;
+        if required_quantity > max_quantity + 1e-9 {
+            return None;
+        }
+        let quantity = raw_quantity.max(required_quantity);
+        Some(quantity.min(max_quantity).max(0.0))
+    }
+
+    fn required_order_quantity(&self, reference_price: f64) -> f64 {
+        let min_notional_quantity = if reference_price > 0.0 {
+            self.config.min_order_notional_usd / reference_price
+        } else {
+            f64::INFINITY
+        };
+        self.config
+            .min_order_quantity
+            .max(self.config.venue_min_order_quantity)
+            .max(min_notional_quantity)
     }
 
     fn quote_is_usable(&self, quote: &QuoteSnapshot) -> bool {
@@ -1618,6 +1638,29 @@ impl Btc5mMmStrategy {
         (leg_pressure + gross_pressure) * self.config.inventory_skew_bps / 10_000.0
     }
 
+    fn max_bid_for(&self, fair: f64, leg_cost: f64, gross_cost: f64, edge_bps: f64) -> f64 {
+        deterministic_quote_unit(
+            (fair - edge_bps / 10_000.0 - self.inventory_skew(leg_cost, gross_cost))
+                .clamp(0.0, 0.99),
+        )
+    }
+
+    fn candidate_bid_price(
+        &self,
+        quote: &QuoteSnapshot,
+        fair: f64,
+        leg_cost: f64,
+        gross_cost: f64,
+        edge_bps: f64,
+    ) -> Option<f64> {
+        let best_bid = Self::best_bid(quote)?;
+        let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
+        if best_bid <= 0.0 || best_bid > max_bid {
+            return None;
+        }
+        self.maker_bid_price(quote, max_bid)
+    }
+
     fn build_order(
         market_id: MarketId,
         instrument_id: InstrumentId,
@@ -1667,17 +1710,8 @@ impl Btc5mMmStrategy {
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
-        let best_bid = Self::best_bid(quote)?;
-        let edge = edge_bps / 10_000.0;
-        let max_bid = deterministic_quote_unit(
-            (fair - edge - self.inventory_skew(leg_cost, gross_cost)).clamp(0.0, 0.99),
-        );
-        if best_bid <= 0.0 || best_bid > max_bid {
-            return None;
-        }
-        let Some(bid_price) = self.maker_bid_price(quote, max_bid) else {
-            return None;
-        };
+        let bid_price = self.candidate_bid_price(quote, fair, leg_cost, gross_cost, edge_bps)?;
+        let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
         if quantity < self.config.min_order_quantity
             || quantity + 1e-9 < self.config.venue_min_order_quantity
         {
@@ -1780,12 +1814,34 @@ impl Strategy for Btc5mMmStrategy {
 
         match (left_has_inventory, right_has_inventory) {
             (false, false) => {
+                let left_bid_price = self.candidate_bid_price(
+                    &left_quote,
+                    left_fair,
+                    left_cost,
+                    gross_cost,
+                    self.config.min_edge_bps,
+                );
+                let right_bid_price = self.candidate_bid_price(
+                    &right_quote,
+                    right_fair,
+                    right_cost,
+                    gross_cost,
+                    self.config.min_edge_bps,
+                );
                 let Some(entry_quantity) = self.paired_entry_quantity(
                     &left_quote,
                     &right_quote,
+                    left_bid_price.unwrap_or(0.0),
+                    right_bid_price.unwrap_or(0.0),
                     self.config.base_clip_usd,
                 ) else {
-                    return StrategyDecision::none();
+                    return self.no_quote_decision(
+                        &snapshot.market_id,
+                        context.now_ms,
+                        format!(
+                            "paired entry quantity unavailable left_bid={left_bid_price:?} right_bid={right_bid_price:?}"
+                        ),
+                    );
                 };
                 let left_bid = self.build_bid_intent_for_quantity(
                     &snapshot.market_id,
@@ -4456,7 +4512,7 @@ mod tests {
     }
 
     #[test]
-    fn btc_5m_mm_can_scale_parent_size_above_venue_minimum() {
+    fn btc_5m_mm_entry_multiplier_is_soft_not_a_hard_floor() {
         let mut config = btc_5m_mm_test_config();
         config.base_clip_usd = 1.10;
         config.max_clip_usd = 8.00;
@@ -4471,7 +4527,50 @@ mod tests {
         assert!(decision
             .intents
             .iter()
-            .all(|intent| (intent.quantity - 6.5).abs() < 1e-9));
+            .all(|intent| (intent.quantity - 6.25).abs() < 1e-9));
+    }
+
+    #[test]
+    fn btc_5m_mm_scales_parent_size_when_clip_supports_it() {
+        let mut config = btc_5m_mm_test_config();
+        config.base_clip_usd = 5.20;
+        config.max_clip_usd = 8.00;
+        config.liquidity_clip_fraction = 1.0;
+        config.entry_min_size_multiplier = 1.30;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.74, 0.76, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.16, 0.18, 10));
+
+        assert_eq!(decision.intents.len(), 2);
+        let expected_qty = 5.20 / 0.74;
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| (intent.quantity - expected_qty).abs() < 1e-9));
+    }
+
+    #[test]
+    fn btc_5m_mm_explains_market_minimum_sizing_without_venue_floor() {
+        let mut config = btc_5m_mm_test_config();
+        config.base_clip_usd = 0.25;
+        config.min_clip_usd = 0.25;
+        config.max_clip_usd = 2.00;
+        config.min_order_notional_usd = 0.50;
+        config.venue_min_order_quantity = 0.01;
+        config.min_order_quantity = 0.75;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        let ctx = context(Vec::new());
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 10));
+
+        assert_eq!(decision.intents.len(), 2);
+        assert!(decision
+            .intents
+            .iter()
+            .all(|intent| (intent.quantity - (0.50 / 0.48)).abs() < 1e-9));
     }
 
     #[test]
@@ -4512,6 +4611,39 @@ mod tests {
         assert_eq!(
             decision.intents[0].quote_level_tag.as_deref(),
             Some("mm-hedge-rescue")
+        );
+    }
+
+    #[test]
+    fn btc_5m_mm_one_sided_inventory_prioritizes_opposite_hedge_only() {
+        let mut config = btc_5m_mm_test_config();
+        config.inventory_skew_bps = 0.0;
+        config.base_clip_usd = 5.20;
+        config.max_clip_usd = 8.00;
+        config.min_order_notional_usd = 0.50;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        let positions = vec![PositionState {
+            market_id: MarketId::from("market-mm"),
+            instrument_id: InstrumentId::from("up"),
+            quantity: 6.5,
+            avg_price: 0.80,
+            mark_price: Some(0.80),
+            updated_at_ms: 1,
+        }];
+        let ctx = context(positions);
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.78, 0.82, 10));
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.11, 0.13, 10));
+
+        assert_eq!(decision.intents.len(), 1);
+        let hedge = &decision.intents[0];
+        assert_eq!(hedge.instrument_id, InstrumentId::from("down"));
+        assert_eq!(hedge.side, TradeSide::Buy);
+        assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
+        assert!(hedge.quantity <= 6.5 + 1e-9);
+        assert!(
+            hedge.quantity * hedge.limit_price <= config.max_clip_usd + 1e-9,
+            "hedge rescue must stay within configured clip budget"
         );
     }
 
