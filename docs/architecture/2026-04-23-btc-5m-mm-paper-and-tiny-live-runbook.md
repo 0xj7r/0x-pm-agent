@@ -53,6 +53,12 @@ Each sleeve owns:
 - a unique metrics port
 - a dedicated SQLite order-store path
 - a dedicated JSONL journal path
+- a dedicated JSONL audit path
+
+The checked-in sleeve paths are relative to the Rust crate working directory
+because the launcher starts the binary from `whale-pair-exec/`. On the current
+Hetzner host, `data/runtime/...` therefore resolves to
+`/root/go/polymarket-agent/whale-pair-exec/data/runtime/...`.
 
 ## 3. Default paper launcher
 
@@ -113,14 +119,17 @@ Metrics ports:
 
 Persistent state:
 
-- `data/runtime/unlawful-baseline/order-store.sqlite`
-- `data/execution/paper/unlawful-baseline/journal.jsonl`
-- `data/runtime/unlawful-broad-hours/order-store.sqlite`
-- `data/execution/paper/unlawful-broad-hours/journal.jsonl`
-- `data/runtime/unlawful-press/order-store.sqlite`
-- `data/execution/paper/unlawful-press/journal.jsonl`
-- `data/runtime/goat-baseline/order-store.sqlite`
-- `data/execution/paper/goat-baseline/journal.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-baseline/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-press/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-press/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-press/audit.jsonl`
+- `whale-pair-exec/data/runtime/goat-baseline/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/goat-baseline/journal.jsonl`
 
 ## 5. Bootstrap-only validation
 
@@ -292,12 +301,15 @@ Paper mode does not require:
 
 Journal and state paths remain sleeve-local and come from the checked-in env files:
 
-- `data/runtime/unlawful-baseline/order-store.sqlite`
-- `data/execution/paper/unlawful-baseline/journal.jsonl`
-- `data/runtime/unlawful-broad-hours/order-store.sqlite`
-- `data/execution/paper/unlawful-broad-hours/journal.jsonl`
-- `data/runtime/unlawful-press/order-store.sqlite`
-- `data/execution/paper/unlawful-press/journal.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-baseline/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-baseline/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-baseline/audit.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-broad-hours/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-broad-hours/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-broad-hours/audit.jsonl`
+- `whale-pair-exec/data/runtime/unlawful-press/order-store.sqlite`
+- `whale-pair-exec/data/execution/paper/unlawful-press/journal.jsonl`
+- `whale-pair-exec/data/execution/audit/unlawful-press/audit.jsonl`
 
 Process logs for always-on runs live in journald:
 
