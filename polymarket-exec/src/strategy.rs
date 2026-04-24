@@ -587,6 +587,7 @@ struct GoatMarketState {
 struct Btc5mMmMarketState {
     quotes: HashMap<InstrumentId, QuoteSnapshot>,
     last_action_ms: Option<EpochMillis>,
+    last_no_quote_note_ms: Option<EpochMillis>,
 }
 
 #[derive(Debug, Default)]
@@ -1394,6 +1395,8 @@ pub struct Btc5mMmStrategy {
 }
 
 impl Btc5mMmStrategy {
+    const NO_QUOTE_NOTE_INTERVAL_MS: u64 = 15_000;
+
     pub fn new(config: Btc5mMmConfig) -> Self {
         Self {
             config,
@@ -1535,6 +1538,66 @@ impl Btc5mMmStrategy {
             && ask_depth >= self.config.min_top_depth_notional_usd
     }
 
+    fn no_quote_decision(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: String,
+    ) -> StrategyDecision {
+        let state = self.market_states.entry(market_id.clone()).or_default();
+        if state
+            .last_no_quote_note_ms
+            .is_some_and(|last_ms| now_ms.saturating_sub(last_ms) < Self::NO_QUOTE_NOTE_INTERVAL_MS)
+        {
+            return StrategyDecision::none();
+        }
+        state.last_no_quote_note_ms = Some(now_ms);
+        StrategyDecision {
+            intents: Vec::new(),
+            notes: vec![format!("btc-5m-mm no quote: {reason}")],
+        }
+    }
+
+    fn quote_health(quote: &QuoteSnapshot) -> String {
+        let bid = Self::best_bid(quote)
+            .map(|price| format!("{price:.4}"))
+            .unwrap_or_else(|| "na".to_string());
+        let ask = Self::best_ask(quote)
+            .map(|price| format!("{price:.4}"))
+            .unwrap_or_else(|| "na".to_string());
+        let spread = match (Self::best_bid(quote), Self::best_ask(quote)) {
+            (Some(bid), Some(ask)) if ask >= bid => format!("{:.4}", ask - bid),
+            _ => "na".to_string(),
+        };
+        format!(
+            "bid={bid} ask={ask} spread={spread} bid_depth3={:.2} ask_depth3={:.2}",
+            Self::top_notional(&quote.bid_levels, 3),
+            Self::top_notional(&quote.ask_levels, 3)
+        )
+    }
+
+    fn bid_health(
+        &self,
+        quote: &QuoteSnapshot,
+        fair: f64,
+        leg_cost: f64,
+        gross_cost: f64,
+        edge_bps: f64,
+    ) -> String {
+        let best_bid = Self::best_bid(quote).unwrap_or(0.0);
+        let max_bid = deterministic_quote_unit(
+            (fair - edge_bps / 10_000.0 - self.inventory_skew(leg_cost, gross_cost))
+                .clamp(0.0, 0.99),
+        );
+        let maker_bid = self
+            .maker_bid_price(quote, max_bid)
+            .map(|price| format!("{price:.4}"))
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "fair={fair:.4} best_bid={best_bid:.4} max_bid={max_bid:.4} maker_bid={maker_bid} leg_cost={leg_cost:.2}"
+        )
+    }
+
     fn fair_values(&self, left: &QuoteSnapshot, right: &QuoteSnapshot) -> Option<(f64, f64)> {
         let left_mid = (Self::best_bid(left)? + Self::best_ask(left)?) * 0.5;
         let right_mid = (Self::best_bid(right)? + Self::best_ask(right)?) * 0.5;
@@ -1659,18 +1722,6 @@ impl Strategy for Btc5mMmStrategy {
         if context.runtime_status != RuntimeStatus::Running {
             return StrategyDecision::none();
         }
-        if self.config.cooldown_ms > 0
-            && self
-                .market_states
-                .get(&snapshot.market_id)
-                .and_then(|state| state.last_action_ms)
-                .is_some_and(|last_ms| {
-                    context.now_ms.saturating_sub(last_ms) < self.config.cooldown_ms
-                })
-        {
-            return StrategyDecision::none();
-        }
-
         let (left_id, left_quote, right_id, right_quote) = {
             let state = self
                 .market_states
@@ -1694,10 +1745,24 @@ impl Strategy for Btc5mMmStrategy {
         };
 
         if !self.quote_is_usable(&left_quote) || !self.quote_is_usable(&right_quote) {
-            return StrategyDecision::none();
+            return self.no_quote_decision(
+                &snapshot.market_id,
+                context.now_ms,
+                format!(
+                    "unusable book left={} {} right={} {}",
+                    left_id,
+                    Self::quote_health(&left_quote),
+                    right_id,
+                    Self::quote_health(&right_quote)
+                ),
+            );
         }
         let Some((left_fair, right_fair)) = self.fair_values(&left_quote, &right_quote) else {
-            return StrategyDecision::none();
+            return self.no_quote_decision(
+                &snapshot.market_id,
+                context.now_ms,
+                format!("fair value unavailable left={} right={}", left_id, right_id),
+            );
         };
 
         let gross_cost = Self::gross_cost_usd(&context.inventory, &snapshot.market_id);
@@ -1757,7 +1822,32 @@ impl Strategy for Btc5mMmStrategy {
                     {
                         intents.push(single);
                     }
-                    _ => {}
+                    _ => {
+                        return self.no_quote_decision(
+                            &snapshot.market_id,
+                            context.now_ms,
+                            format!(
+                                "paired entry rejected left={} {} right={} {} gross_cost={gross_cost:.2} single_leg_allowed={}",
+                                left_id,
+                                self.bid_health(
+                                    &left_quote,
+                                    left_fair,
+                                    left_cost,
+                                    gross_cost,
+                                    self.config.min_edge_bps
+                                ),
+                                right_id,
+                                self.bid_health(
+                                    &right_quote,
+                                    right_fair,
+                                    right_cost,
+                                    gross_cost,
+                                    self.config.min_edge_bps
+                                ),
+                                self.config.allow_single_leg_entry
+                            ),
+                        );
+                    }
                 }
             }
             (true, false) => {
@@ -1802,7 +1892,29 @@ impl Strategy for Btc5mMmStrategy {
         }
 
         if intents.is_empty() {
-            return StrategyDecision::none();
+            return self.no_quote_decision(
+                &snapshot.market_id,
+                context.now_ms,
+                format!(
+                    "inventory management rejected left_qty={left_qty:.4} right_qty={right_qty:.4} left={} {} right={} {} gross_cost={gross_cost:.2}",
+                    left_id,
+                    self.bid_health(
+                        &left_quote,
+                        left_fair,
+                        left_cost,
+                        gross_cost,
+                        self.config.hedge_rescue_edge_bps
+                    ),
+                    right_id,
+                    self.bid_health(
+                        &right_quote,
+                        right_fair,
+                        right_cost,
+                        gross_cost,
+                        self.config.hedge_rescue_edge_bps
+                    ),
+                ),
+            );
         }
         if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
             state.last_action_ms = Some(context.now_ms);
@@ -4267,6 +4379,27 @@ mod tests {
             .expect("down bid");
         assert_eq!(up.limit_price, 0.44);
         assert_eq!(down.limit_price, 0.52);
+    }
+
+    #[test]
+    fn btc_5m_mm_cooldown_does_not_emit_empty_quote_set() {
+        let mut config = btc_5m_mm_test_config();
+        config.cooldown_ms = 60_000;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        let ctx = context(Vec::new());
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+        let first =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 10));
+        let second =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 11));
+
+        assert_eq!(first.intents.len(), 2);
+        assert_eq!(
+            second.intents.len(),
+            2,
+            "cooldown must not clear desired quotes; the reconciler handles churn control"
+        );
     }
 
     #[test]
