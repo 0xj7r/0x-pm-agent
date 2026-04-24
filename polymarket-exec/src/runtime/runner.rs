@@ -1769,16 +1769,18 @@ async fn execute_execution_adapter(
                             "cancel rejected by venue; treating order state as uncertain"
                         );
                         metrics.observe_uncertain_submit();
-                        combined.extend(runtime.mark_order_needs_reconcile(
-                            &client_order_id,
-                            ack.accepted_at_ms,
-                            format!("cancel rejected by venue; uncertain state: {reason}"),
-                        ));
-                        metrics.observe_riskoff_transition();
-                        combined.extend(runtime.degrade_and_cancel_all(
-                            ack.accepted_at_ms,
-                            format!("cancel rejected by venue; risk-off until venue fill state is reconciled: {reason}"),
-                        ));
+                        if !uncertain_cancel {
+                            combined.extend(runtime.mark_order_needs_reconcile(
+                                &client_order_id,
+                                ack.accepted_at_ms,
+                                format!("cancel rejected by venue; uncertain state: {reason}"),
+                            ));
+                            metrics.observe_riskoff_transition();
+                            combined.extend(runtime.degrade_and_cancel_all(
+                                ack.accepted_at_ms,
+                                format!("cancel rejected by venue; risk-off until venue fill state is reconciled: {reason}"),
+                            ));
+                        }
                         let report = sync_execution_state(
                             execution_adapter.as_ref(),
                             runtime,
@@ -2653,6 +2655,7 @@ mod tests {
     struct RecordingAdapter {
         submitted: Mutex<Vec<ClientOrderId>>,
         cancelled: Mutex<Vec<ClientOrderId>>,
+        cancel_reject_message: Option<String>,
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
         fills: Vec<VenueFill>,
         balances: Option<VenueBalances>,
@@ -2679,6 +2682,15 @@ mod tests {
                 .lock()
                 .expect("cancelled lock")
                 .push(req.client_order_id.clone());
+            if let Some(message) = self.cancel_reject_message.clone() {
+                return Ok(CancelOrderAck {
+                    client_order_id: req.client_order_id,
+                    venue_order_id: req.venue_order_id,
+                    accepted: false,
+                    accepted_at_ms: req.submitted_at_ms,
+                    venue_message: Some(message),
+                });
+            }
             Ok(CancelOrderAck {
                 client_order_id: req.client_order_id,
                 venue_order_id: req.venue_order_id,
@@ -3002,6 +3014,67 @@ mod tests {
         );
         assert_eq!(runtime.inventory().gross_exposure_usd(), 0.0);
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+    }
+
+    #[tokio::test]
+    async fn matched_cancel_reject_reconciles_without_risk_off() {
+        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
+        let client_order_id = ClientOrderId::from("client-working");
+        let cancel_outcome =
+            runtime.request_cancel_order(&client_order_id, now_unix_ms(), "test cancel race");
+
+        let adapter = Arc::new(RecordingAdapter {
+            cancel_reject_message: Some("matched orders can't be canceled".to_string()),
+            fills: vec![VenueFill {
+                venue_order_id: OrderId::from("venue-1"),
+                client_order_id: None,
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                price: 0.40,
+                quantity: 5.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                observed_at_ms: now_unix_ms(),
+            }],
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets = vec!["token-1".to_string()];
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map =
+            HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            cancel_outcome,
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter,
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert_ne!(runtime.status(), RuntimeStatus::Degraded);
+        assert_eq!(live_safety.consecutive_cancel_errors, 0);
+        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("token-1")),
+            5.0
+        );
     }
 
     #[tokio::test]
