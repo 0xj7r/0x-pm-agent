@@ -68,6 +68,16 @@ pub struct AppConfig {
     pub dashboard_whale_events_path: Option<std::path::PathBuf>,
     pub dashboard_refresh_ms: u64,
     pub dashboard_event_limit: usize,
+    pub audit_path: Option<PathBuf>,
+    pub live_post_only: bool,
+    pub live_order_ttl: Duration,
+    pub live_order_max_age: Duration,
+    pub live_max_submit_errors: usize,
+    pub live_max_cancel_errors: usize,
+    pub live_kill_on_reconcile_mismatch: bool,
+    pub paper_min_fill_notional_usd: f64,
+    pub paper_max_fills_per_order: usize,
+    pub paper_min_fill_interval: Duration,
 }
 
 impl AppConfig {
@@ -184,6 +194,19 @@ impl AppConfig {
         let dashboard_refresh_ms =
             parse_duration_ms("WHALE_PAIR_DASHBOARD_REFRESH_MS", 2_000)?.as_millis() as u64;
         let dashboard_event_limit = parse_usize("WHALE_PAIR_DASHBOARD_EVENT_LIMIT", 200)?;
+        let audit_path = parse_path_optional("WHALE_PAIR_EXEC_AUDIT_PATH");
+        let live_post_only = parse_bool("WHALE_PAIR_LIVE_POST_ONLY", true)?;
+        let live_order_ttl = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_TTL_MS", 20_000)?;
+        let live_order_max_age = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_MAX_AGE_MS", 25_000)?;
+        let live_max_submit_errors = parse_usize("WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS", 1)?;
+        let live_max_cancel_errors = parse_usize("WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS", 1)?;
+        let live_kill_on_reconcile_mismatch =
+            parse_bool("WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
+        let paper_min_fill_notional_usd =
+            parse_f64("WHALE_PAIR_PAPER_MIN_FILL_NOTIONAL_USD", 0.05)?;
+        let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
+        let paper_min_fill_interval =
+            parse_duration_ms("WHALE_PAIR_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
 
         Ok(Self {
             service_name,
@@ -220,6 +243,16 @@ impl AppConfig {
             dashboard_whale_events_path,
             dashboard_refresh_ms,
             dashboard_event_limit,
+            audit_path,
+            live_post_only,
+            live_order_ttl,
+            live_order_max_age,
+            live_max_submit_errors,
+            live_max_cancel_errors,
+            live_kill_on_reconcile_mismatch,
+            paper_min_fill_notional_usd,
+            paper_max_fills_per_order,
+            paper_min_fill_interval,
         })
     }
 

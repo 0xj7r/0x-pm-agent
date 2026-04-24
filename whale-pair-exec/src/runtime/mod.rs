@@ -1044,6 +1044,38 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    pub fn request_cancel_order(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        self.request_cancel(client_order_id, reason, now_ms)
+    }
+
+    pub fn degrade_and_cancel_all(
+        &mut self,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let reason = reason.into();
+        let mut outcome = RuntimeOutcome::default();
+        if self.status != RuntimeStatus::Degraded {
+            self.status = RuntimeStatus::Degraded;
+            outcome.push_event(self.event_log.push(EventRecord::new(
+                EventCategory::Runtime,
+                now_ms,
+                format!("runtime degraded: {reason}"),
+            )));
+            outcome.push_event(
+                self.event_log
+                    .push(EventRecord::runtime_status(now_ms, self.status)),
+            );
+        }
+        outcome.extend(self.request_cancel_all(now_ms, reason));
+        outcome
+    }
+
     fn request_cancel(
         &mut self,
         client_order_id: &ClientOrderId,
