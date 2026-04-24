@@ -247,7 +247,7 @@ Required persisted entities:
 Required secret classes:
 
 - Polymarket private key / signing key
-- Polymarket signature type and funder address
+- Polymarket signature type and optional funder address
 - API credentials derived from wallet for user websocket and L2 CLOB auth
 - Polygon RPC credentials
 - optional market-data credentials
@@ -255,6 +255,8 @@ Required secret classes:
 Operational rules:
 
 - paper and live wallets must be separate
+- direct MetaMask EOA is acceptable for smoke/tiny-live only when the funded
+  signer address itself has CLOB balance/allowance
 - live should use a Gnosis Safe / proxy wallet before scaling beyond smoke
 - research scripts must not share the live wallet key
 - approvals and balances must be audited before tiny-live
@@ -266,8 +268,10 @@ Current live-auth and ops env surface:
 - `POLYMARKET_API_PASSPHRASE`
 - `POLYMARKET_PRIVATE_KEY`
 - `METAMASK_PRIVATE_KEY` as a local fallback alias only
-- `POLYMARKET_SIGNATURE_TYPE=gnosis_safe`
-- `POLYMARKET_FUNDER_ADDRESS`
+- `POLYMARKET_SIGNATURE_TYPE=eoa` with no `POLYMARKET_FUNDER_ADDRESS` for a
+  directly funded MetaMask EOA
+- `POLYMARKET_SIGNATURE_TYPE=gnosis_safe` plus `POLYMARKET_FUNDER_ADDRESS` only
+  when the funded account is a Safe/proxy wallet
 - `WHALE_PAIR_EXEC_SPOT_WS_URL`
 - `WHALE_PAIR_EXEC_SPOT_SYMBOL`
 - `WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH`

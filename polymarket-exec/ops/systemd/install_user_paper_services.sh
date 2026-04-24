@@ -41,6 +41,10 @@ if [[ ! -f "$LIVE_ENV" ]]; then
 #
 # Required before running polymarket-exec-live-smoke.service:
 # POLYMARKET_PRIVATE_KEY=
+# Direct MetaMask EOA with funds/allowance on the signer address:
+# POLYMARKET_SIGNATURE_TYPE=eoa
+# Leave POLYMARKET_FUNDER_ADDRESS unset.
+# Safe/proxy wallets only:
 # POLYMARKET_SIGNATURE_TYPE=gnosis_safe
 # POLYMARKET_FUNDER_ADDRESS=
 # POLYMARKET_API_KEY=
