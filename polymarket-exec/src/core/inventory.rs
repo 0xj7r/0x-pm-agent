@@ -1,6 +1,6 @@
 //! Position, cash, and exposure accounting with reservation and fill application helpers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 
@@ -102,6 +102,43 @@ pub struct InventorySnapshot {
     pub realized_pnl_usd: f64,
     pub gross_exposure_usd: f64,
     pub positions: Vec<PositionState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VenuePositionSnapshot {
+    pub market_id: MarketId,
+    pub instrument_id: InstrumentId,
+    pub quantity: f64,
+    pub average_cost_usd: f64,
+    pub mark_price: Option<f64>,
+    pub observed_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InventoryPositionReconciliation {
+    pub market_id: MarketId,
+    pub instrument_id: InstrumentId,
+    pub local_quantity_before: f64,
+    pub venue_quantity: f64,
+    pub quantity_delta: f64,
+    pub local_avg_price_before: Option<f64>,
+    pub venue_avg_price: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrandedMarketInventory {
+    pub market_id: MarketId,
+    pub paired_quantity: f64,
+    pub stranded_positions: Vec<PositionState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InventoryReconciliationReport {
+    pub observed_at_ms: EpochMillis,
+    pub position_count: usize,
+    pub deltas: Vec<InventoryPositionReconciliation>,
+    pub stranded_markets: Vec<StrandedMarketInventory>,
+    pub gross_exposure_after_usd: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -224,6 +261,129 @@ impl InventoryState {
             gross_exposure_usd: self.gross_exposure_usd(),
             positions,
         }
+    }
+
+    pub fn reconcile_venue_positions(
+        &mut self,
+        venue_positions: &[VenuePositionSnapshot],
+        observed_at_ms: EpochMillis,
+    ) -> Result<InventoryReconciliationReport, InventoryError> {
+        let mut deltas = Vec::new();
+
+        for venue_position in venue_positions {
+            if !venue_position.quantity.is_finite()
+                || !venue_position.average_cost_usd.is_finite()
+                || venue_position.quantity < -1e-9
+                || venue_position.average_cost_usd < 0.0
+                || venue_position
+                    .mark_price
+                    .is_some_and(|mark| !mark.is_finite() || mark < 0.0)
+            {
+                return Err(InventoryError::InvalidFill(
+                    "invalid venue position snapshot",
+                ));
+            }
+
+            let local = self.positions.get(&venue_position.instrument_id).cloned();
+            let local_quantity_before = local.as_ref().map_or(0.0, |position| position.quantity);
+            let local_avg_price_before = local.as_ref().map(|position| position.avg_price);
+            let venue_quantity = venue_position.quantity.max(0.0);
+            let quantity_delta = venue_quantity - local_quantity_before;
+
+            if quantity_delta.abs() <= 1e-9 {
+                if let Some(existing) = self.positions.get_mut(&venue_position.instrument_id) {
+                    existing.market_id = venue_position.market_id.clone();
+                    existing.avg_price = venue_position.average_cost_usd;
+                    existing.mark_price = venue_position.mark_price;
+                    existing.updated_at_ms = observed_at_ms;
+                }
+                continue;
+            }
+
+            if venue_quantity <= 1e-9 {
+                self.positions.remove(&venue_position.instrument_id);
+            } else {
+                self.positions.insert(
+                    venue_position.instrument_id.clone(),
+                    PositionState {
+                        market_id: venue_position.market_id.clone(),
+                        instrument_id: venue_position.instrument_id.clone(),
+                        quantity: venue_quantity,
+                        avg_price: venue_position.average_cost_usd,
+                        mark_price: venue_position.mark_price,
+                        updated_at_ms: observed_at_ms,
+                    },
+                );
+            }
+
+            deltas.push(InventoryPositionReconciliation {
+                market_id: venue_position.market_id.clone(),
+                instrument_id: venue_position.instrument_id.clone(),
+                local_quantity_before,
+                venue_quantity,
+                quantity_delta,
+                local_avg_price_before,
+                venue_avg_price: venue_position.average_cost_usd,
+            });
+        }
+
+        Ok(InventoryReconciliationReport {
+            observed_at_ms,
+            position_count: self.positions.len(),
+            deltas,
+            stranded_markets: self.stranded_market_inventory(),
+            gross_exposure_after_usd: self.gross_exposure_usd(),
+        })
+    }
+
+    pub fn stranded_market_inventory(&self) -> Vec<StrandedMarketInventory> {
+        let mut by_market = BTreeMap::<MarketId, Vec<PositionState>>::new();
+        for position in self.positions.values() {
+            if position.quantity > 1e-9 {
+                by_market
+                    .entry(position.market_id.clone())
+                    .or_default()
+                    .push(position.clone());
+            }
+        }
+
+        by_market
+            .into_iter()
+            .filter_map(|(market_id, mut positions)| {
+                positions.sort_by(|left, right| left.instrument_id.cmp(&right.instrument_id));
+                let paired_quantity = if positions.len() >= 2 {
+                    positions
+                        .iter()
+                        .map(|position| position.quantity)
+                        .fold(f64::INFINITY, f64::min)
+                } else {
+                    0.0
+                };
+                let paired_quantity = if paired_quantity.is_finite() && paired_quantity > 1e-9 {
+                    paired_quantity
+                } else {
+                    0.0
+                };
+                let stranded_positions = positions
+                    .into_iter()
+                    .filter_map(|mut position| {
+                        let stranded_qty = position.quantity - paired_quantity;
+                        if stranded_qty > 1e-9 {
+                            position.quantity = stranded_qty;
+                            Some(position)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                (!stranded_positions.is_empty()).then_some(StrandedMarketInventory {
+                    market_id,
+                    paired_quantity,
+                    stranded_positions,
+                })
+            })
+            .collect()
     }
 
     pub fn reserve_for_order(
@@ -581,7 +741,7 @@ impl InventoryState {
 
 #[cfg(test)]
 mod tests {
-    use super::InventoryState;
+    use super::{InventoryState, VenuePositionSnapshot};
     use crate::types::{
         ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide,
     };
@@ -649,5 +809,80 @@ mod tests {
         assert_eq!(inventory.position_qty(&instrument_id), 0.0);
         assert!((inventory.free_cash_usd() - 100.9).abs() < 1e-9);
         assert!((inventory.realized_pnl_usd() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn venue_position_snapshot_recovers_local_flat_inventory() {
+        let mut inventory = InventoryState::new(100.0);
+        let report = inventory
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: MarketId::from("market-a"),
+                    instrument_id: InstrumentId::from("token-down"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.80,
+                    mark_price: Some(1.0),
+                    observed_at_ms: 100,
+                }],
+                110,
+            )
+            .expect("venue reconciliation");
+
+        let position = inventory
+            .position(&InstrumentId::from("token-down"))
+            .expect("venue position should be represented locally");
+        assert_eq!(position.quantity, 6.5);
+        assert_eq!(position.avg_price, 0.80);
+        assert_eq!(position.mark_price, Some(1.0));
+        assert_eq!(report.deltas.len(), 1);
+        assert_eq!(report.deltas[0].local_quantity_before, 0.0);
+        assert_eq!(report.deltas[0].venue_quantity, 6.5);
+        assert_eq!(report.stranded_markets.len(), 1);
+        assert_eq!(
+            report.stranded_markets[0].market_id,
+            MarketId::from("market-a")
+        );
+        assert_eq!(
+            report.stranded_markets[0].stranded_positions[0].quantity,
+            6.5
+        );
+    }
+
+    #[test]
+    fn venue_position_snapshot_marks_stranded_imbalance_explicitly() {
+        let mut inventory = InventoryState::new(100.0);
+        inventory
+            .reconcile_venue_positions(
+                &[
+                    VenuePositionSnapshot {
+                        market_id: MarketId::from("market-a"),
+                        instrument_id: InstrumentId::from("token-up"),
+                        quantity: 5.0,
+                        average_cost_usd: 0.80,
+                        mark_price: Some(0.5),
+                        observed_at_ms: 100,
+                    },
+                    VenuePositionSnapshot {
+                        market_id: MarketId::from("market-a"),
+                        instrument_id: InstrumentId::from("token-down"),
+                        quantity: 6.5,
+                        average_cost_usd: 0.18,
+                        mark_price: Some(0.5),
+                        observed_at_ms: 100,
+                    },
+                ],
+                110,
+            )
+            .expect("venue reconciliation");
+
+        let stranded = inventory.stranded_market_inventory();
+        assert_eq!(stranded.len(), 1);
+        assert_eq!(stranded[0].paired_quantity, 5.0);
+        assert_eq!(stranded[0].stranded_positions.len(), 1);
+        assert_eq!(
+            stranded[0].stranded_positions[0].instrument_id,
+            InstrumentId::from("token-down")
+        );
+        assert!((stranded[0].stranded_positions[0].quantity - 1.5).abs() < 1e-9);
     }
 }

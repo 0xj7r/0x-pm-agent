@@ -11,7 +11,9 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
-use crate::inventory::InventoryState;
+use crate::inventory::{
+    InventoryReconciliationReport, InventoryState, StrandedMarketInventory, VenuePositionSnapshot,
+};
 use crate::market_context::MarketContextStore;
 use crate::merge_executor::MergeExecutor;
 use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
@@ -460,6 +462,59 @@ impl<S: Strategy> Runtime<S> {
         &self.inventory
     }
 
+    pub fn reconcile_venue_positions(
+        &mut self,
+        venue_positions: &[VenuePositionSnapshot],
+        observed_at_ms: EpochMillis,
+    ) -> Result<InventoryReconciliationReport, RuntimeError> {
+        let report = self
+            .inventory
+            .reconcile_venue_positions(venue_positions, observed_at_ms)?;
+        for delta in &report.deltas {
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Inventory,
+                    observed_at_ms,
+                    format!(
+                        "venue position reconciled: local_qty={:.8} venue_qty={:.8} delta={:.8}",
+                        delta.local_quantity_before, delta.venue_quantity, delta.quantity_delta
+                    ),
+                )
+                .with_market(delta.market_id.clone())
+                .with_instrument(delta.instrument_id.clone())
+                .with_metrics(EventMetrics {
+                    price: Some(delta.venue_avg_price),
+                    quantity: Some(delta.venue_quantity),
+                    notional_usd: Some(delta.venue_quantity * delta.venue_avg_price),
+                    cash_delta_usd: None,
+                    position_delta: Some(delta.quantity_delta),
+                    free_cash_after_usd: Some(self.inventory.free_cash_usd()),
+                    gross_exposure_after_usd: Some(report.gross_exposure_after_usd),
+                    risk_reject_reason: None,
+                }),
+            );
+        }
+        for stranded in &report.stranded_markets {
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Inventory,
+                    observed_at_ms,
+                    format!(
+                        "venue reconciliation found stranded inventory: paired_qty={:.8} stranded_legs={}",
+                        stranded.paired_quantity,
+                        stranded.stranded_positions.len()
+                    ),
+                )
+                .with_market(stranded.market_id.clone()),
+            );
+        }
+        Ok(report)
+    }
+
+    pub fn stranded_inventory(&self) -> Vec<StrandedMarketInventory> {
+        self.inventory.stranded_market_inventory()
+    }
+
     pub fn risk(&self) -> &RiskEngine {
         &self.risk
     }
@@ -789,6 +844,7 @@ impl<S: Strategy> Runtime<S> {
             fill.close_method,
             Some(CloseMethod::Merge) | Some(CloseMethod::Settle) | Some(CloseMethod::Settlement)
         );
+        let redeem_flow = matches!(fill.close_method, Some(CloseMethod::Redeem));
         let mut outcome = RuntimeOutcome::default();
         outcome.push_event(
             self.event_log.push(
@@ -818,6 +874,21 @@ impl<S: Strategy> Runtime<S> {
                 }),
             ),
         );
+
+        if redeem_flow {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Inventory,
+                        now_ms,
+                        "redeem close event observed; awaiting venue position snapshot reconciliation",
+                    )
+                    .with_market(fill.market_id)
+                    .with_instrument(fill.instrument_id),
+                ),
+            );
+            return Ok(outcome);
+        }
 
         let mut executed_qty = 0.0;
         if merge_flow {
@@ -2337,13 +2408,14 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{ManagedOrderStatus, Runtime, RuntimeConfig};
+    use crate::inventory::VenuePositionSnapshot;
     use crate::market_context::{MarketContextRecord, MarketContextStore};
     use crate::risk::RiskLimits;
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::signals::unlawful_gate::UnlawfulGateConfig;
     use crate::strategy::{NoopStrategy, Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
-        BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId,
+        BookLevel, ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId,
         MarketSnapshot, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, TradeSide,
     };
 
@@ -2506,6 +2578,119 @@ mod tests {
                 .position_qty(&InstrumentId::from("token-1")),
             4.0
         );
+    }
+
+    #[test]
+    fn venue_position_reconciliation_creates_runtime_inventory_without_fill() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let report = runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: MarketId::from("market-mm"),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.80,
+                    mark_price: Some(1.0),
+                    observed_at_ms: 10,
+                }],
+                11,
+            )
+            .expect("runtime venue reconciliation");
+
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("down")),
+            6.5
+        );
+        assert_eq!(report.deltas.len(), 1);
+        assert_eq!(runtime.stranded_inventory().len(), 1);
+        assert_eq!(runtime.open_orders().count(), 0);
+    }
+
+    #[test]
+    fn redeem_close_event_does_not_apply_as_trade_fill() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 1.0,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Unknown,
+                close_method: Some(CloseMethod::Redeem),
+                observed_at_ms: 10,
+            })
+            .expect("redeem event");
+
+        assert_eq!(
+            runtime.inventory().position_qty(&InstrumentId::from("up")),
+            0.0
+        );
+        assert!((runtime.inventory().free_cash_usd() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn merge_close_event_without_pair_does_not_apply_as_trade_fill() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 1.0,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Unknown,
+                close_method: Some(CloseMethod::Merge),
+                observed_at_ms: 10,
+            })
+            .expect("merge event");
+
+        assert_eq!(
+            runtime.inventory().position_qty(&InstrumentId::from("up")),
+            0.0
+        );
+        assert!((runtime.inventory().free_cash_usd() - 100.0).abs() < 1e-9);
     }
 
     fn btc_mm_intent(market_id: &str, instrument_id: &str, level: &str, price: f64) -> OrderIntent {
