@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use base64::Engine as _;
+use hmac::{Hmac, Mac};
 use polymarket_client_sdk::auth::{Credentials as SdkCredentials, ExposeSecret, Signer, Uuid};
 use polymarket_client_sdk::clob::types::request::{
     BalanceAllowanceRequest, OrdersRequest, TradesRequest as ClobTradesRequest,
@@ -25,10 +27,18 @@ use polymarket_client_sdk::types::{
     U256 as SdkU256,
 };
 use polymarket_client_sdk::{auth, POLYGON};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::Method;
+use serde::Deserialize;
+use sha2::Sha256;
 use tokio::sync::RwLock;
 
 use crate::types::{
     ClientOrderId, EpochMillis, FillLiquidity, InstrumentId, MarketId, OrderId, TradeSide,
+};
+use crate::wire::clob_v2::{
+    parse_bytes32, V2OrderBuildParams, V2OrderDraft, BYTES32_ZERO, CLOB_V2_EXCHANGE,
+    CLOB_V2_NEG_RISK_EXCHANGE,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +197,10 @@ pub struct PolymarketConfig {
     pub api_url: String,
     pub data_api_url: String,
     pub market_id_by_asset: HashMap<String, String>,
+    pub protocol: ClobProtocolVersion,
+    pub v2_builder_code: String,
+    pub v2_metadata: String,
+    pub v2_neg_risk: bool,
     pub credentials: Option<PolymarketCredentials>,
 }
 
@@ -196,7 +210,30 @@ impl Default for PolymarketConfig {
             api_url: "https://clob.polymarket.com".to_string(),
             data_api_url: "https://data-api.polymarket.com".to_string(),
             market_id_by_asset: HashMap::new(),
+            protocol: ClobProtocolVersion::V1,
+            v2_builder_code: BYTES32_ZERO.to_string(),
+            v2_metadata: BYTES32_ZERO.to_string(),
+            v2_neg_risk: false,
             credentials: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClobProtocolVersion {
+    #[default]
+    V1,
+    V2,
+}
+
+impl ClobProtocolVersion {
+    pub fn parse(raw: &str) -> Result<Self, ExecutionError> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "1" | "v1" | "clob_v1" | "clob-v1" => Ok(Self::V1),
+            "2" | "v2" | "clob_v2" | "clob-v2" => Ok(Self::V2),
+            other => Err(ExecutionError::BadRequest(format!(
+                "unsupported POLYMARKET_CLOB_VERSION `{other}`"
+            ))),
         }
     }
 }
@@ -313,8 +350,10 @@ impl ExecutionAdapter for PaperExecutionAdapter {
 pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
+    signature_type: PolymarketSignatureType,
     client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
     data_client: SdkDataClient,
+    raw_http: reqwest::Client,
     trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
 }
@@ -325,6 +364,10 @@ impl PolymarketExecutionAdapter {
             api_url: "https://clob.polymarket.com".to_string(),
             data_api_url: "https://data-api.polymarket.com".to_string(),
             market_id_by_asset: HashMap::new(),
+            protocol: ClobProtocolVersion::V1,
+            v2_builder_code: BYTES32_ZERO.to_string(),
+            v2_metadata: BYTES32_ZERO.to_string(),
+            v2_neg_risk: false,
             credentials: Some(credentials),
         })
         .await
@@ -357,6 +400,24 @@ impl PolymarketExecutionAdapter {
     ) -> Result<Self, ExecutionError> {
         let api_url = api_url.into();
         let data_api_url = data_api_url.into();
+        Self::connect_with_l1_config(
+            PolymarketConfig {
+                api_url,
+                data_api_url,
+                market_id_by_asset,
+                ..PolymarketConfig::default()
+            },
+            credentials,
+        )
+        .await
+    }
+
+    pub async fn connect_with_l1_config(
+        config: PolymarketConfig,
+        credentials: PolymarketL1Credentials,
+    ) -> Result<Self, ExecutionError> {
+        let api_url = config.api_url.clone();
+        let data_api_url = config.data_api_url.clone();
         let signer = PrivateKeySigner::from_str(credentials.private_key.trim())
             .map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_PRIVATE_KEY: {error}"))
@@ -390,14 +451,14 @@ impl PolymarketExecutionAdapter {
 
         Ok(Self {
             _config: PolymarketConfig {
-                api_url,
-                data_api_url,
-                market_id_by_asset,
                 credentials: None,
+                ..config
             },
             signer,
+            signature_type: credentials.signature_type,
             client,
             data_client,
+            raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
@@ -451,11 +512,159 @@ impl PolymarketExecutionAdapter {
         Ok(Self {
             _config: config,
             signer,
+            signature_type: credentials.signature_type,
             client,
             data_client,
+            raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
         })
+    }
+
+    async fn submit_v2(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
+        let order_type = Self::v2_order_type(&req)?;
+        let builder_code = parse_bytes32(&self._config.v2_builder_code, "builder")?;
+        let metadata = parse_bytes32(&self._config.v2_metadata, "metadata")?;
+        let maker = self.trade_address.unwrap_or_else(|| self.signer.address());
+        let signer = self.signer.address();
+        let now_ms = now_unix_ms();
+        let expiration_s = if matches!(req.time_in_force, TimeInForce::Gtd) {
+            let expires_at_ms = req.expires_at_ms.ok_or_else(|| {
+                ExecutionError::BadRequest(
+                    "GTD CLOB V2 order requires expires_at_ms on submit request".to_string(),
+                )
+            })?;
+            Self::venue_gtd_expiration_ms(expires_at_ms) / 1_000
+        } else {
+            0
+        };
+        let draft = V2OrderDraft::from_submit_request(
+            &req,
+            V2OrderBuildParams {
+                maker,
+                signer,
+                signature_type: self.signature_type as u8,
+                timestamp_ms: now_ms,
+                builder_code,
+                metadata,
+                salt: v2_salt(),
+                expiration_s,
+            },
+        )?;
+        let exchange = if self._config.v2_neg_risk {
+            SdkAddress::from_str(CLOB_V2_NEG_RISK_EXCHANGE)
+        } else {
+            SdkAddress::from_str(CLOB_V2_EXCHANGE)
+        }
+        .map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid configured CLOB V2 exchange: {error}"))
+        })?;
+        let signature = draft.sign(&self.signer, POLYGON, exchange).await?;
+        let credentials = self.client.credentials();
+        let body = draft.post_body(
+            credentials.key().to_string(),
+            order_type,
+            req.post_only,
+            signature,
+        )?;
+        let body_json = serde_json::to_string(&body).map_err(|error| {
+            ExecutionError::BadRequest(format!("failed to serialize CLOB V2 order body: {error}"))
+        })?;
+        let url = join_url(&self._config.api_url, "order");
+        let timestamp_s = (now_ms / 1_000) as i64;
+        let headers = self.v2_l2_headers(Method::POST, &url, &body_json, timestamp_s)?;
+        let response = self
+            .raw_http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body_json)
+            .send()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        if !status.is_success() {
+            return Err(ExecutionError::VenueRejection(format!(
+                "CLOB V2 order POST failed {status}: {response_text}"
+            )));
+        }
+        let response: RawPostOrderResponse =
+            serde_json::from_str(&response_text).map_err(|error| {
+                ExecutionError::VenueRejection(format!(
+                    "failed to decode CLOB V2 order response `{response_text}`: {error}"
+                ))
+            })?;
+        let ack = SubmitOrderAck {
+            client_order_id: req.client_order_id.clone(),
+            venue_order_id: if response.order_id.is_empty() {
+                None
+            } else {
+                Some(OrderId::from(response.order_id.clone()))
+            },
+            accepted: response.success,
+            accepted_at_ms: now_unix_ms(),
+            venue_message: response.error_msg,
+        };
+        if ack.accepted {
+            if let Some(order_id) = ack.venue_order_id.clone() {
+                self.state
+                    .write()
+                    .await
+                    .venue_order_map
+                    .insert(req.client_order_id, order_id);
+            }
+        }
+        Ok(ack)
+    }
+
+    fn v2_l2_headers(
+        &self,
+        method: Method,
+        url: &str,
+        body: &str,
+        timestamp_s: i64,
+    ) -> Result<HeaderMap, ExecutionError> {
+        let request = self
+            .raw_http
+            .request(method.clone(), url)
+            .body(body.to_string())
+            .build()
+            .map_err(|error| ExecutionError::BadRequest(error.to_string()))?;
+        let path = request.url().path();
+        let message = format!("{timestamp_s}{method}{path}{body}");
+        let credentials = self.client.credentials();
+        let signature = l2_hmac(credentials.secret().expose_secret(), &message)?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "POLY_ADDRESS",
+            HeaderValue::from_str(&self.signer.address().to_string())
+                .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
+        );
+        headers.insert(
+            "POLY_API_KEY",
+            HeaderValue::from_str(&credentials.key().to_string())
+                .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
+        );
+        headers.insert(
+            "POLY_PASSPHRASE",
+            HeaderValue::from_str(credentials.passphrase().expose_secret())
+                .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
+        );
+        headers.insert(
+            "POLY_SIGNATURE",
+            HeaderValue::from_str(&signature)
+                .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
+        );
+        headers.insert(
+            "POLY_TIMESTAMP",
+            HeaderValue::from_str(&timestamp_s.to_string())
+                .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
+        );
+        Ok(headers)
     }
 
     pub fn api_credentials(&self) -> (String, String, String) {
@@ -489,6 +698,31 @@ impl PolymarketExecutionAdapter {
                 }
             }
             TimeInForce::Gtd => Ok(SdkOrderType::GTD),
+        }
+    }
+
+    fn v2_order_type(req: &SubmitOrderRequest) -> Result<&'static str, ExecutionError> {
+        match req.time_in_force {
+            TimeInForce::Gtc => Ok("GTC"),
+            TimeInForce::Gtd => Ok("GTD"),
+            TimeInForce::Ioc => {
+                if req.post_only {
+                    Err(ExecutionError::BadRequest(
+                        "post-only IOC/FAK orders are invalid on Polymarket CLOB V2".to_string(),
+                    ))
+                } else {
+                    Ok("FAK")
+                }
+            }
+            TimeInForce::Fok => {
+                if req.post_only {
+                    Err(ExecutionError::BadRequest(
+                        "post-only FOK orders are invalid on Polymarket CLOB V2".to_string(),
+                    ))
+                } else {
+                    Ok("FOK")
+                }
+            }
         }
     }
 
@@ -727,6 +961,10 @@ impl PolymarketExecutionAdapter {
 #[async_trait]
 impl ExecutionAdapter for PolymarketExecutionAdapter {
     async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
+        if matches!(self._config.protocol, ClobProtocolVersion::V2) {
+            return self.submit_v2(req).await;
+        }
+
         let token_id = SdkU256::from_str(req.instrument_id.as_str()).map_err(|error| {
             ExecutionError::BadRequest(format!(
                 "invalid Polymarket token id `{}`: {error}",
@@ -865,6 +1103,43 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn v2_salt() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn l2_hmac(secret: &str, message: &str) -> Result<String, ExecutionError> {
+    let decoded_secret = base64::engine::general_purpose::URL_SAFE
+        .decode(secret)
+        .map_err(|error| {
+            ExecutionError::AuthFailure(format!("invalid CLOB API secret: {error}"))
+        })?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&decoded_secret).map_err(|error| {
+        ExecutionError::AuthFailure(format!("invalid CLOB API secret: {error}"))
+    })?;
+    mac.update(message.as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE.encode(mac.finalize().into_bytes()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPostOrderResponse {
+    pub error_msg: Option<String>,
+    #[serde(rename = "orderID")]
+    pub order_id: String,
+    pub success: bool,
 }
 
 fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {

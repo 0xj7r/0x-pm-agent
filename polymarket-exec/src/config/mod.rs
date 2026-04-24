@@ -73,6 +73,10 @@ pub struct AppConfig {
     pub dashboard_refresh_ms: u64,
     pub dashboard_event_limit: usize,
     pub audit_path: Option<PathBuf>,
+    pub clob_version: String,
+    pub clob_v2_builder_code: String,
+    pub clob_v2_metadata: String,
+    pub clob_v2_neg_risk: bool,
     pub live_post_only: bool,
     pub live_order_ttl: Duration,
     pub live_order_max_age: Duration,
@@ -104,6 +108,16 @@ impl AppConfig {
         let metrics_bind = parse_socket_addr("WHALE_PAIR_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
         let clob_api_url = env_or("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com");
         let data_api_url = env_or("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com");
+        let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v1");
+        let clob_v2_builder_code = env_or(
+            "POLYMARKET_CLOB_V2_BUILDER_CODE",
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let clob_v2_metadata = env_or(
+            "POLYMARKET_CLOB_V2_METADATA",
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let clob_v2_neg_risk = parse_bool("POLYMARKET_CLOB_V2_NEG_RISK", false)?;
         let market_ws_url = env_or(
             "POLYMARKET_MARKET_WS_URL",
             "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -263,6 +277,10 @@ impl AppConfig {
             dashboard_refresh_ms,
             dashboard_event_limit,
             audit_path,
+            clob_version,
+            clob_v2_builder_code,
+            clob_v2_metadata,
+            clob_v2_neg_risk,
             live_post_only,
             live_order_ttl,
             live_order_max_age,
