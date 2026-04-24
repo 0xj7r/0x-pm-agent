@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
 use crate::event_log::EventLog;
+use crate::inventory::VenuePositionSnapshot;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
@@ -34,7 +35,7 @@ use crate::wire::api::{
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, SubmitOrderRequest, TimeInForce,
-    VenueFill,
+    VenueFill, VenuePosition,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -60,6 +61,7 @@ struct ExecutionSyncReport {
     venue_position_count: usize,
     venue_balance_observed_at_ms: Option<u64>,
     venue_fills: Vec<VenueFill>,
+    venue_positions: Vec<VenuePosition>,
     errors: usize,
     missing_local_orders: Vec<ClientOrderId>,
     pending_missing_local_orders: Vec<ClientOrderId>,
@@ -2020,9 +2022,10 @@ async fn sync_execution_state(
             report.venue_cash_usd = Some(balances.cash_usd);
             report.venue_position_count = balances.positions.len();
             report.venue_balance_observed_at_ms = Some(balances.observed_at_ms);
+            report.venue_positions = balances.positions;
             debug!(
                 cash_usd = balances.cash_usd,
-                positions = balances.positions.len(),
+                positions = report.venue_position_count,
                 observed_at_ms = balances.observed_at_ms,
                 "synced execution balances"
             );
@@ -2067,6 +2070,45 @@ fn apply_sync_report(
                 venue_position_count = report.venue_position_count,
                 "synced venue balance state"
             );
+        }
+        if !report.venue_positions.is_empty() {
+            let observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
+            let snapshots = report
+                .venue_positions
+                .iter()
+                .map(|position| VenuePositionSnapshot {
+                    market_id: position.market_id.clone(),
+                    instrument_id: position.instrument_id.clone(),
+                    quantity: position.quantity,
+                    average_cost_usd: position.average_cost_usd,
+                    mark_price: None,
+                    observed_at_ms,
+                })
+                .collect::<Vec<_>>();
+            match runtime.reconcile_venue_positions(&snapshots, observed_at_ms) {
+                Ok(reconcile_report) => {
+                    for stranded in reconcile_report.stranded_markets {
+                        warn!(
+                            mode = "live",
+                            market_id = %stranded.market_id,
+                            paired_quantity = stranded.paired_quantity,
+                            stranded_legs = stranded.stranded_positions.len(),
+                            "venue reconciliation found stranded inventory"
+                        );
+                    }
+                }
+                Err(error) => {
+                    live_safety.consecutive_reconcile_mismatches = live_safety
+                        .consecutive_reconcile_mismatches
+                        .saturating_add(1);
+                    metrics.observe_reconcile_failure();
+                    warn!(error = ?error, "failed to reconcile venue position snapshot");
+                }
+            }
+        } else {
+            // The current live adapter does not yet mark empty position snapshots as authoritative.
+            // Do not flatten local inventory on an empty Vec until the adapter exposes that contract.
+            debug!("venue balance sync returned no positions; local inventory left unchanged");
         }
     }
 
@@ -2508,7 +2550,7 @@ mod tests {
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::strategy::NoopStrategy;
     use crate::wire::execution_adapter::{
-        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances, VenueFill,
+        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances, VenueFill, VenuePosition,
     };
 
     #[derive(Default)]
@@ -2517,6 +2559,7 @@ mod tests {
         cancelled: Mutex<Vec<ClientOrderId>>,
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
         fills: Vec<VenueFill>,
+        balances: Option<VenueBalances>,
     }
 
     #[async_trait]
@@ -2556,11 +2599,11 @@ mod tests {
         }
 
         async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError> {
-            Ok(VenueBalances {
+            Ok(self.balances.clone().unwrap_or(VenueBalances {
                 cash_usd: 0.0,
                 positions: Vec::new(),
                 observed_at_ms: 0,
-            })
+            }))
         }
 
         async fn sync_recent_fills(
@@ -2721,6 +2764,76 @@ mod tests {
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
         assert_eq!(metrics.snapshot().fill_total, 1);
         assert_eq!(metrics.snapshot().fill_maker_total, 1);
+    }
+
+    #[tokio::test]
+    async fn live_sync_reconciles_non_empty_venue_position_snapshot() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("down")),
+            0.0
+        );
+
+        let now_ms = now_unix_ms();
+        let adapter = Arc::new(RecordingAdapter {
+            balances: Some(VenueBalances {
+                cash_usd: 74.89,
+                positions: vec![VenuePosition {
+                    market_id: MarketId::from("market-mm"),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.80,
+                }],
+                observed_at_ms: now_ms,
+            }),
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets: Vec<String> = Vec::new();
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        let position = runtime
+            .inventory()
+            .position(&InstrumentId::from("down"))
+            .expect("venue position should reconcile into runtime inventory");
+        assert_eq!(position.quantity, 6.5);
+        assert_eq!(position.avg_price, 0.80);
+        assert_eq!(runtime.stranded_inventory().len(), 1);
+        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+        assert_eq!(metrics.snapshot().venue_position_count, 1);
     }
 
     #[test]
