@@ -723,6 +723,7 @@ async fn run_runtime_loop(
                         let combined = execute_execution_adapter(
                             runtime,
                             books,
+                            &config.market_assets,
                             paper_fee_coeff,
                             metrics.as_ref(),
                             health_outcome,
@@ -766,6 +767,7 @@ async fn run_runtime_loop(
                             let combined = execute_execution_adapter(
                                 runtime,
                                 books,
+                                &config.market_assets,
                                 paper_fee_coeff,
                                 metrics.as_ref(),
                                 outcome,
@@ -1470,6 +1472,7 @@ fn persist_runtime_checkpoint(
 async fn execute_execution_adapter(
     runtime: &mut Runtime<StrategyMode>,
     books: &Arc<BookStore>,
+    market_assets: &[String],
     paper_fee_coeff: f64,
     metrics: &AppMetrics,
     outcome: RuntimeOutcome,
@@ -1503,6 +1506,7 @@ async fn execute_execution_adapter(
             metrics,
             live_safety,
             execution_policy,
+            market_assets,
             report,
             observed_at_ms,
             &mut combined,
@@ -1615,6 +1619,7 @@ async fn execute_execution_adapter(
                             metrics,
                             live_safety,
                             execution_policy,
+                            market_assets,
                             report,
                             observed_at_ms,
                             &mut combined,
@@ -1738,6 +1743,7 @@ async fn execute_execution_adapter(
                             metrics,
                             live_safety,
                             execution_policy,
+                            market_assets,
                             report,
                             observed_at_ms,
                             &mut combined,
@@ -1787,6 +1793,7 @@ async fn execute_execution_adapter(
                             metrics,
                             live_safety,
                             execution_policy,
+                            market_assets,
                             report,
                             ack.accepted_at_ms,
                             &mut combined,
@@ -2092,6 +2099,7 @@ fn apply_sync_report(
     metrics: &AppMetrics,
     live_safety: &mut LiveSafetyState,
     execution_policy: &ExecutionPolicy,
+    market_assets: &[String],
     report: ExecutionSyncReport,
     now_ms: u64,
     combined: &mut RuntimeOutcome,
@@ -2122,9 +2130,14 @@ fn apply_sync_report(
         }
         if report.venue_positions_authoritative || !report.venue_positions.is_empty() {
             let observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
+            let active_instruments = market_assets
+                .iter()
+                .map(|asset| InstrumentId::from(asset.as_str()))
+                .collect::<HashSet<_>>();
             let mut snapshots = report
                 .venue_positions
                 .iter()
+                .filter(|position| active_instruments.contains(&position.instrument_id))
                 .map(|position| VenuePositionSnapshot {
                     market_id: position.market_id.clone(),
                     instrument_id: position.instrument_id.clone(),
@@ -2143,7 +2156,10 @@ fn apply_sync_report(
                     runtime
                         .inventory()
                         .positions()
-                        .filter(|position| !venue_instruments.contains(&position.instrument_id))
+                        .filter(|position| {
+                            !venue_instruments.contains(&position.instrument_id)
+                                || !active_instruments.contains(&position.instrument_id)
+                        })
                         .map(|position| VenuePositionSnapshot {
                             market_id: position.market_id.clone(),
                             instrument_id: position.instrument_id.clone(),
@@ -2724,6 +2740,7 @@ mod tests {
         let outcome = execute_execution_adapter(
             &mut runtime,
             &books,
+            &assets,
             0.0,
             &metrics,
             RuntimeOutcome::default(),
@@ -2766,6 +2783,7 @@ mod tests {
         let _outcome = execute_execution_adapter(
             &mut runtime,
             &books,
+            &assets,
             0.0,
             &metrics,
             RuntimeOutcome::default(),
@@ -2824,6 +2842,7 @@ mod tests {
         let _outcome = execute_execution_adapter(
             &mut runtime,
             &books,
+            &assets,
             0.0,
             &metrics,
             RuntimeOutcome::default(),
@@ -2883,7 +2902,7 @@ mod tests {
             ..RecordingAdapter::default()
         });
         let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
+        let assets = vec!["down".to_string()];
         let books = Arc::new(BookStore::new(&assets));
         let mut paper_order_ctx = HashMap::new();
         let mut execution_venue_map = HashMap::new();
@@ -2894,6 +2913,7 @@ mod tests {
         let _outcome = execute_execution_adapter(
             &mut runtime,
             &books,
+            &assets,
             0.0,
             &metrics,
             RuntimeOutcome::default(),
@@ -2916,6 +2936,72 @@ mod tests {
         assert_eq!(runtime.stranded_inventory().len(), 1);
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
         assert_eq!(metrics.snapshot().venue_position_count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_sync_excludes_inactive_venue_positions_from_strategy_inventory() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+
+        let now_ms = now_unix_ms();
+        let adapter = Arc::new(RecordingAdapter {
+            balances: Some(VenueBalances {
+                cash_usd: 74.89,
+                positions: vec![VenuePosition {
+                    market_id: MarketId::from("old-market"),
+                    instrument_id: InstrumentId::from("old-token"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.80,
+                }],
+                positions_authoritative: true,
+                observed_at_ms: now_ms,
+            }),
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets = vec!["active-token".to_string()];
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let _outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter,
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(metrics.snapshot().venue_position_count, 1);
+        assert_eq!(
+            runtime
+                .inventory()
+                .position_qty(&InstrumentId::from("old-token")),
+            0.0
+        );
+        assert_eq!(runtime.inventory().gross_exposure_usd(), 0.0);
+        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
     }
 
     #[tokio::test]
@@ -2973,6 +3059,7 @@ mod tests {
         let _outcome = execute_execution_adapter(
             &mut runtime,
             &books,
+            &assets,
             0.0,
             &metrics,
             RuntimeOutcome::default(),
