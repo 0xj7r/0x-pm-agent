@@ -1442,6 +1442,14 @@ async fn execute_execution_adapter(
             observed_at_ms,
             &mut combined,
         );
+        let needs_reconcile_quarantine_age_ms = execution_policy
+            .live_reconcile_missing_grace_ms
+            .saturating_mul(2)
+            .max(10_000);
+        combined.extend(runtime.quarantine_stale_needs_reconcile_orders(
+            observed_at_ms,
+            needs_reconcile_quarantine_age_ms,
+        ));
         combined.extend(cancel_stale_live_orders(
             runtime,
             observed_at_ms,
@@ -2545,14 +2553,12 @@ mod tests {
 
         assert!(outcome.commands.is_empty());
         assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
-        let order = runtime
+        assert!(runtime
             .open_order_snapshots()
             .into_iter()
-            .find(|managed| {
-                managed.intent.client_order_id == ClientOrderId::from("client-reconcile")
-            })
-            .expect("managed order");
-        assert_eq!(order.status, ManagedOrderStatus::NeedsReconcile);
+            .all(
+                |managed| managed.intent.client_order_id != ClientOrderId::from("client-reconcile")
+            ));
     }
 
     #[tokio::test]

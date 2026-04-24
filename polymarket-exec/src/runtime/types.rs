@@ -38,6 +38,7 @@ pub enum ManagedOrderStatus {
     Cancelled,
     Rejected,
     NeedsReconcile,
+    Quarantined,
 }
 
 #[derive(Clone, Debug, PartialEq)]
