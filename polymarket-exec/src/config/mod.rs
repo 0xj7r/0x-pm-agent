@@ -77,6 +77,7 @@ pub struct AppConfig {
     pub live_max_submit_errors: usize,
     pub live_max_cancel_errors: usize,
     pub live_kill_on_reconcile_mismatch: bool,
+    pub live_kill_switch_path: Option<PathBuf>,
     pub paper_min_fill_notional_usd: f64,
     pub paper_max_fills_per_order: usize,
     pub paper_min_fill_interval: Duration,
@@ -204,6 +205,7 @@ impl AppConfig {
         let live_max_cancel_errors = parse_usize("WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS", 1)?;
         let live_kill_on_reconcile_mismatch =
             parse_bool("WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
+        let live_kill_switch_path = parse_path_optional("WHALE_PAIR_LIVE_KILL_SWITCH_PATH");
         let paper_min_fill_notional_usd =
             parse_f64("WHALE_PAIR_PAPER_MIN_FILL_NOTIONAL_USD", 0.05)?;
         let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
@@ -252,6 +254,7 @@ impl AppConfig {
             live_max_submit_errors,
             live_max_cancel_errors,
             live_kill_on_reconcile_mismatch,
+            live_kill_switch_path,
             paper_min_fill_notional_usd,
             paper_max_fills_per_order,
             paper_min_fill_interval,

@@ -84,6 +84,7 @@ Primary unit names:
 - `polymarket-exec@unlawful_baseline`
 - `polymarket-exec@unlawful_broad_hours`
 - `polymarket-exec@unlawful_press`
+- `polymarket-exec-live-smoke.service`
 - `polymarket-exec-archive.service`
 - `polymarket-exec-archive.timer`
 
@@ -91,6 +92,21 @@ User config path:
 
 - `~/.config/polymarket-exec/common.env`
 - `~/.config/polymarket-exec/paper.d/*.env`
+- `~/.config/polymarket-exec/live.env`
+- `~/.config/polymarket-exec/live.kill`
+
+AWS live host sync:
+
+```bash
+AWS_LIVE_HOST=<ec2-public-ip-or-dns> ops/deploy/deploy_live_aws_ec2.sh
+```
+
+The AWS helper installs the live-smoke one-shot service but does not start it.
+Edit `~/.config/polymarket-exec/live.env` on the host first, then run:
+
+```bash
+systemctl --user start polymarket-exec-live-smoke.service
+```
 
 ## Data paths
 
