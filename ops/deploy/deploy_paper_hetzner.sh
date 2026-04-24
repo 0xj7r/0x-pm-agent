@@ -84,7 +84,7 @@ ssh_base "loginctl enable-linger '${REMOTE_USER}' || true"
 
 for sleeve in "${SLEEVES[@]}"; do
   log "restarting $sleeve"
-  ssh_base "systemctl --user enable --now whale-pair-exec@${sleeve}"
+  ssh_base "systemctl --user enable --now polymarket-exec@${sleeve}"
 done
 
 log "paper services status"

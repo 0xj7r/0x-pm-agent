@@ -2,7 +2,7 @@
 
 Status: draft for implementation handoff  
 Date: 2026-04-23  
-Primary target: `whale-pair-exec`  
+Primary target: `polymarket-exec`  
 Secondary targets: Python discovery/control-plane helpers under `execution/` and `scripts/`  
 Execution posture: dual-sleeve platform
 
@@ -26,7 +26,7 @@ This spec is intentionally concrete. It should be possible to assign sections of
 
 ## 2. Executive Summary
 
-The repo already contains a substantial Rust execution scaffold in `whale-pair-exec`:
+The repo already contains a substantial Rust execution scaffold in `polymarket-exec`:
 
 - market websocket ingestion
 - user websocket ingestion
@@ -190,7 +190,7 @@ One warm standby process:
 
 ### Process boundaries
 
-Process A: `whale-pair-exec`
+Process A: `polymarket-exec`
 
 - owns quote generation
 - owns order lifecycle

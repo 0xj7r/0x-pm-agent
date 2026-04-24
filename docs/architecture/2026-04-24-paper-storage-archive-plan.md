@@ -15,7 +15,7 @@ Do **not** use Postgres/Supabase for raw paper journal storage in v1.
 
 ### Hot path
 
-- `whale-pair-exec` can now rotate journals locally with:
+- `polymarket-exec` can now rotate journals locally with:
   - `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES`
 - the runtime SQLite now stores:
   - durable orders
@@ -28,8 +28,8 @@ That means the journal is no longer the only calibration source.
 - new archive script:
   - `polymarket-exec/scripts/archive_paper_artifacts.sh`
 - new user-service artifacts:
-  - `polymarket-exec/ops/systemd/whale-pair-archive.service`
-  - `polymarket-exec/ops/systemd/whale-pair-archive.timer`
+  - `polymarket-exec/ops/systemd/polymarket-exec-archive.service`
+  - `polymarket-exec/ops/systemd/polymarket-exec-archive.timer`
 
 The script archives:
 
@@ -117,7 +117,7 @@ Enable periodic archive:
 ```bash
 polymarket-exec/ops/systemd/install_user_paper_services.sh
 systemctl --user daemon-reload
-systemctl --user enable --now whale-pair-archive.timer
+systemctl --user enable --now polymarket-exec-archive.timer
 ```
 
 ## Immediate Cleanup Order

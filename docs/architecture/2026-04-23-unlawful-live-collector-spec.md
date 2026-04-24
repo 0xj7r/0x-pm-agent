@@ -132,7 +132,7 @@ Per day:
 
 ## 7. Runtime Relationship
 
-The collector should be separate from `whale-pair-exec`.
+The collector should be separate from `polymarket-exec`.
 
 It may write context artifacts the runtime consumes later, but it must not block the runtime loop.
 

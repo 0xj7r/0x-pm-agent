@@ -2,12 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-SYSTEMD_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/whale-pair-exec@.service"
-ARCHIVE_SERVICE_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/whale-pair-archive.service"
-ARCHIVE_TIMER_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/whale-pair-archive.timer"
+SYSTEMD_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/polymarket-exec@.service"
+ARCHIVE_SERVICE_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/polymarket-exec-archive.service"
+ARCHIVE_TIMER_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/polymarket-exec-archive.timer"
 COMMON_ENV_SRC="$ROOT_DIR/polymarket-exec/ops/systemd/common.env.example"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/whale-pair-exec"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/polymarket-exec"
 PAPER_DIR="$CONFIG_DIR/paper.d"
 
 log() {
@@ -16,12 +16,12 @@ log() {
 
 mkdir -p "$SYSTEMD_USER_DIR" "$PAPER_DIR"
 
-install -m 0644 "$SYSTEMD_SRC" "$SYSTEMD_USER_DIR/whale-pair-exec@.service"
-log "installed systemd template -> $SYSTEMD_USER_DIR/whale-pair-exec@.service"
-install -m 0644 "$ARCHIVE_SERVICE_SRC" "$SYSTEMD_USER_DIR/whale-pair-archive.service"
-log "installed archive service -> $SYSTEMD_USER_DIR/whale-pair-archive.service"
-install -m 0644 "$ARCHIVE_TIMER_SRC" "$SYSTEMD_USER_DIR/whale-pair-archive.timer"
-log "installed archive timer -> $SYSTEMD_USER_DIR/whale-pair-archive.timer"
+install -m 0644 "$SYSTEMD_SRC" "$SYSTEMD_USER_DIR/polymarket-exec@.service"
+log "installed systemd template -> $SYSTEMD_USER_DIR/polymarket-exec@.service"
+install -m 0644 "$ARCHIVE_SERVICE_SRC" "$SYSTEMD_USER_DIR/polymarket-exec-archive.service"
+log "installed archive service -> $SYSTEMD_USER_DIR/polymarket-exec-archive.service"
+install -m 0644 "$ARCHIVE_TIMER_SRC" "$SYSTEMD_USER_DIR/polymarket-exec-archive.timer"
+log "installed archive timer -> $SYSTEMD_USER_DIR/polymarket-exec-archive.timer"
 
 if [[ ! -f "$CONFIG_DIR/common.env" ]]; then
   install -m 0644 "$COMMON_ENV_SRC" "$CONFIG_DIR/common.env"
@@ -54,9 +54,9 @@ Next steps:
 4. Enable lingering so paper keeps running after logout:
    sudo loginctl enable-linger "$USER"
 5. Enable/start the unlawful sleeves:
-   systemctl --user enable --now whale-pair-exec@unlawful_baseline
-   systemctl --user enable --now whale-pair-exec@unlawful_broad_hours
-   systemctl --user enable --now whale-pair-exec@unlawful_press
+   systemctl --user enable --now polymarket-exec@unlawful_baseline
+   systemctl --user enable --now polymarket-exec@unlawful_broad_hours
+   systemctl --user enable --now polymarket-exec@unlawful_press
 6. Optional low-cost archive timer:
-   systemctl --user enable --now whale-pair-archive.timer
+   systemctl --user enable --now polymarket-exec-archive.timer
 EOF

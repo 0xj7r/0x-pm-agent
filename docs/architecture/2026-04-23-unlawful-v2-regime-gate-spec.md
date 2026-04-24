@@ -2,7 +2,7 @@
 
 Status: implementation handoff  
 Date: 2026-04-23  
-Target: `whale-pair-exec`  
+Target: `polymarket-exec`  
 Strategy sleeve: `unlawful_shear`
 
 ## 1. Purpose

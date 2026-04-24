@@ -4,7 +4,7 @@ This workspace contains the Rust execution scaffold for whale-pair.
 
 ## Current shape
 
-- `whale-pair-exec` is now a real library + binary crate.
+- `polymarket-exec` is now a real library + binary crate.
 - The binary owns websocket intake, metrics, and a minimal runtime loop.
 - The hot path now feeds top-of-book updates into the deterministic execution runtime instead of only logging book summaries.
 

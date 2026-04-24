@@ -1,0 +1,12 @@
+[Unit]
+Description=Run polymarket-exec paper archive uploader every hour
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=1h
+Unit=polymarket-exec-archive.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

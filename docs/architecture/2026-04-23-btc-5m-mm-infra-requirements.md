@@ -2,7 +2,7 @@
 
 Status: implementation handoff  
 Date: 2026-04-23  
-Primary target: `whale-pair-exec`  
+Primary target: `polymarket-exec`  
 Secondary target: control-plane helpers under `scripts/`
 
 ## 1. Purpose
@@ -285,7 +285,7 @@ These now exist in-repo:
 - sleeve env presets:
   - `polymarket-exec/env/*.env`
 - systemd template:
-  - `polymarket-exec/ops/systemd/whale-pair-exec@.service`
+  - `polymarket-exec/ops/systemd/polymarket-exec@.service`
 - runbook:
   - `docs/architecture/2026-04-23-btc-5m-mm-paper-and-tiny-live-runbook.md`
 

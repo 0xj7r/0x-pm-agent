@@ -2,16 +2,16 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CRATE_DIR="$ROOT_DIR/whale-pair-exec"
+CRATE_DIR="$ROOT_DIR/polymarket-exec"
 BASE_LAUNCHER="$CRATE_DIR/scripts/run_unlawful_shear_paper.sh"
 SLEEVE_INPUT="${1:-${WHALE_PAIR_SLEEVE:-}}"
 
 log() {
-  echo "[whale-pair-sleeve] $1"
+  echo "[polymarket-exec-sleeve] $1"
 }
 
 fail() {
-  echo "[whale-pair-sleeve] ERROR: $1"
+  echo "[polymarket-exec-sleeve] ERROR: $1"
   exit 1
 }
 

@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use whale_pair_exec::journal::JournalWriter;
-use whale_pair_exec::market_context::MarketContextStore;
-use whale_pair_exec::risk::RiskLimits;
-use whale_pair_exec::runtime::order_store::SqliteOrderStore;
-use whale_pair_exec::runtime::{ManagedOrderStatus, Runtime, RuntimeConfig};
-use whale_pair_exec::strategy::{Strategy, StrategyContext, StrategyDecision};
-use whale_pair_exec::types::{
+use polymarket_exec::journal::JournalWriter;
+use polymarket_exec::market_context::MarketContextStore;
+use polymarket_exec::risk::RiskLimits;
+use polymarket_exec::runtime::order_store::SqliteOrderStore;
+use polymarket_exec::runtime::{ManagedOrderStatus, Runtime, RuntimeConfig};
+use polymarket_exec::strategy::{Strategy, StrategyContext, StrategyDecision};
+use polymarket_exec::types::{
     ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId, MarketSnapshot,
     OrderIntent, RuntimeCommand, RuntimeStatus, TradeSide,
 };
@@ -463,7 +463,7 @@ fn handle_submit_ack(
     command: &RuntimeCommand,
     outcome: &AdapterSubmitOutcome,
     at_ms: u64,
-) -> Option<whale_pair_exec::runtime::RuntimeOutcome> {
+) -> Option<polymarket_exec::runtime::RuntimeOutcome> {
     let RuntimeCommand::Submit(intent) = command else {
         return None;
     };
@@ -494,7 +494,7 @@ fn handle_cancel_ack(
     command: &RuntimeCommand,
     outcome: &AdapterCancelOutcome,
     at_ms: u64,
-) -> Option<whale_pair_exec::runtime::RuntimeOutcome> {
+) -> Option<polymarket_exec::runtime::RuntimeOutcome> {
     let RuntimeCommand::Cancel {
         client_order_id, ..
     } = command
@@ -519,8 +519,8 @@ fn handle_cancel_ack(
 
 fn run_fixture(name: &str) {
     let fixture = load_fixture(name);
-    let store_path = unique_workspace_path(&format!("whale-pair-{name}"), ".sqlite");
-    let journal_path = unique_workspace_path(&format!("whale-pair-{name}"), ".jsonl");
+    let store_path = unique_workspace_path(&format!("polymarket-exec-{name}"), ".sqlite");
+    let journal_path = unique_workspace_path(&format!("polymarket-exec-{name}"), ".jsonl");
     let mut journal = JournalWriter::open(&journal_path).unwrap();
     let mut runtime = build_runtime(&fixture, &store_path, fixture.starting_cash_usd);
     let mut last_seq = 0_u64;
@@ -562,7 +562,7 @@ fn run_fixture(name: &str) {
                     .on_book_state(
                         MarketId::from(market_id.clone()),
                         InstrumentId::from(instrument_id.clone()),
-                        &whale_pair_exec::book::BookState::from_top_of_book(
+                        &polymarket_exec::book::BookState::from_top_of_book(
                             instrument_id.clone(),
                             best_bid.price,
                             best_bid.quantity,

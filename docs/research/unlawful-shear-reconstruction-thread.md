@@ -10,7 +10,7 @@ Wallet: `0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82`
 
 - at the wallet/economic level it is clearly maker-active
 - locally we still have real microstructure data for it
-- the current paper strategy in `whale-pair-exec` is already partly modeled around its execution geometry
+- the current paper strategy in `polymarket-exec` is already partly modeled around its execution geometry
 
 This thread is the canonical local summary of what we still know and what we can re-derive.
 
