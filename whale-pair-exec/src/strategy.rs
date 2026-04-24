@@ -79,6 +79,18 @@ pub struct PairedBookSignal {
     pub observed_at_ms: u64,
     pub books_fresh: bool,
     pub both_sides_present: bool,
+    pub cheap_spread: Option<f64>,
+    pub expensive_spread: Option<f64>,
+    pub cheap_bid_depth_top3_qty: Option<f64>,
+    pub cheap_ask_depth_top3_qty: Option<f64>,
+    pub expensive_bid_depth_top3_qty: Option<f64>,
+    pub expensive_ask_depth_top3_qty: Option<f64>,
+    pub cheap_bid_notional_top3: Option<f64>,
+    pub cheap_ask_notional_top3: Option<f64>,
+    pub expensive_bid_notional_top3: Option<f64>,
+    pub expensive_ask_notional_top3: Option<f64>,
+    pub cheap_depth_imbalance_top3: Option<f64>,
+    pub expensive_depth_imbalance_top3: Option<f64>,
 }
 
 impl PairedBookSignal {
@@ -112,6 +124,18 @@ impl PairedBookSignal {
             observed_at_ms,
             books_fresh,
             both_sides_present,
+            cheap_spread: None,
+            expensive_spread: None,
+            cheap_bid_depth_top3_qty: None,
+            cheap_ask_depth_top3_qty: None,
+            expensive_bid_depth_top3_qty: None,
+            expensive_ask_depth_top3_qty: None,
+            cheap_bid_notional_top3: None,
+            cheap_ask_notional_top3: None,
+            expensive_bid_notional_top3: None,
+            expensive_ask_notional_top3: None,
+            cheap_depth_imbalance_top3: None,
+            expensive_depth_imbalance_top3: None,
         }
     }
 }
@@ -2958,6 +2982,8 @@ mod tests {
             quote: QuoteSnapshot {
                 best_bid: Some(BookLevel::new(bid, 1000.0)),
                 best_ask: Some(BookLevel::new(ask, 1000.0)),
+                bid_levels: vec![BookLevel::new(bid, 1000.0)],
+                ask_levels: vec![BookLevel::new(ask, 1000.0)],
                 last_trade_price: Some(ask),
                 observed_at_ms: ts,
             },

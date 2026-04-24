@@ -129,6 +129,8 @@ impl BookLevel {
 pub struct QuoteSnapshot {
     pub best_bid: Option<BookLevel>,
     pub best_ask: Option<BookLevel>,
+    pub bid_levels: Vec<BookLevel>,
+    pub ask_levels: Vec<BookLevel>,
     pub last_trade_price: Option<f64>,
     pub observed_at_ms: EpochMillis,
 }

@@ -37,6 +37,18 @@ pub struct PairedBookSignal {
     pub observed_at_ms: u64,
     pub books_fresh: bool,
     pub both_sides_present: bool,
+    pub cheap_spread: Option<f64>,
+    pub expensive_spread: Option<f64>,
+    pub cheap_bid_depth_top3_qty: Option<f64>,
+    pub cheap_ask_depth_top3_qty: Option<f64>,
+    pub expensive_bid_depth_top3_qty: Option<f64>,
+    pub expensive_ask_depth_top3_qty: Option<f64>,
+    pub cheap_bid_notional_top3: Option<f64>,
+    pub cheap_ask_notional_top3: Option<f64>,
+    pub expensive_bid_notional_top3: Option<f64>,
+    pub expensive_ask_notional_top3: Option<f64>,
+    pub cheap_depth_imbalance_top3: Option<f64>,
+    pub expensive_depth_imbalance_top3: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -574,6 +586,18 @@ mod tests {
             observed_at_ms: 10_000,
             books_fresh: fresh,
             both_sides_present: true,
+            cheap_spread: Some(0.01),
+            expensive_spread: Some(0.01),
+            cheap_bid_depth_top3_qty: Some(100.0),
+            cheap_ask_depth_top3_qty: Some(100.0),
+            expensive_bid_depth_top3_qty: Some(100.0),
+            expensive_ask_depth_top3_qty: Some(100.0),
+            cheap_bid_notional_top3: Some((cheap_ask - 0.01).max(0.0) * 100.0),
+            cheap_ask_notional_top3: Some(cheap_ask * 100.0),
+            expensive_bid_notional_top3: Some((expensive_ask - 0.01).max(0.0) * 100.0),
+            expensive_ask_notional_top3: Some(expensive_ask * 100.0),
+            cheap_depth_imbalance_top3: Some(0.0),
+            expensive_depth_imbalance_top3: Some(0.0),
         }
     }
 

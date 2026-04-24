@@ -43,6 +43,35 @@ const BTC_SIGNAL_WINDOW_20M_MS: u64 = 20 * 60 * 1_000;
 const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
 const SIGNAL_SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 5_000;
 
+fn top_n_depth_qty(levels: &[crate::types::BookLevel], n: usize) -> Option<f64> {
+    let total: f64 = levels
+        .iter()
+        .take(n)
+        .filter(|level| level.price.is_finite() && level.quantity.is_finite())
+        .filter(|level| level.price > 0.0 && level.quantity > 0.0)
+        .map(|level| level.quantity)
+        .sum();
+    (total > 0.0).then_some(total)
+}
+
+fn top_n_depth_notional(levels: &[crate::types::BookLevel], n: usize) -> Option<f64> {
+    let total: f64 = levels
+        .iter()
+        .take(n)
+        .filter(|level| level.price.is_finite() && level.quantity.is_finite())
+        .filter(|level| level.price > 0.0 && level.quantity > 0.0)
+        .map(|level| level.price * level.quantity)
+        .sum();
+    (total > 0.0).then_some(total)
+}
+
+fn depth_imbalance(bid_depth_qty: Option<f64>, ask_depth_qty: Option<f64>) -> Option<f64> {
+    let bid = bid_depth_qty?;
+    let ask = ask_depth_qty?;
+    let denom = bid + ask;
+    (denom > 0.0).then_some((bid - ask) / denom)
+}
+
 #[derive(Debug, Default)]
 struct BtcSignalStore {
     last_price: Option<f64>,
@@ -668,6 +697,16 @@ impl<S: Strategy> Runtime<S> {
             quote: crate::types::QuoteSnapshot {
                 best_bid,
                 best_ask,
+                bid_levels: book
+                    .bid_levels()
+                    .iter()
+                    .map(|level| crate::types::BookLevel::new(level.price, level.size))
+                    .collect(),
+                ask_levels: book
+                    .ask_levels()
+                    .iter()
+                    .map(|level| crate::types::BookLevel::new(level.price, level.size))
+                    .collect(),
                 last_trade_price,
                 observed_at_ms: book.last_update_unix_ms,
             },
@@ -1299,6 +1338,18 @@ impl<S: Strategy> Runtime<S> {
             price_gap: signal.book.price_gap,
             books_fresh: signal.book.books_fresh,
             both_sides_present: signal.book.both_sides_present,
+            cheap_spread: signal.book.cheap_spread,
+            expensive_spread: signal.book.expensive_spread,
+            cheap_bid_depth_top3_qty: signal.book.cheap_bid_depth_top3_qty,
+            cheap_ask_depth_top3_qty: signal.book.cheap_ask_depth_top3_qty,
+            expensive_bid_depth_top3_qty: signal.book.expensive_bid_depth_top3_qty,
+            expensive_ask_depth_top3_qty: signal.book.expensive_ask_depth_top3_qty,
+            cheap_bid_notional_top3: signal.book.cheap_bid_notional_top3,
+            cheap_ask_notional_top3: signal.book.cheap_ask_notional_top3,
+            expensive_bid_notional_top3: signal.book.expensive_bid_notional_top3,
+            expensive_ask_notional_top3: signal.book.expensive_ask_notional_top3,
+            cheap_depth_imbalance_top3: signal.book.cheap_depth_imbalance_top3,
+            expensive_depth_imbalance_top3: signal.book.expensive_depth_imbalance_top3,
             btc_last_price: signal.btc.last_price,
             btc_realized_vol_5m_bps: signal.btc.realized_vol_5m_bps,
             btc_realized_vol_15m_bps: signal.btc.realized_vol_15m_bps,
@@ -1399,17 +1450,23 @@ impl<S: Strategy> Runtime<S> {
         let right_ask = right_quote.and_then(|quote| quote.best_ask.clone());
         let left_bid = left_quote.and_then(|quote| quote.best_bid.clone());
         let right_bid = right_quote.and_then(|quote| quote.best_bid.clone());
+        let left_bid_levels = left_quote.map(|quote| quote.bid_levels.as_slice()).unwrap_or(&[]);
+        let left_ask_levels = left_quote.map(|quote| quote.ask_levels.as_slice()).unwrap_or(&[]);
+        let right_bid_levels = right_quote.map(|quote| quote.bid_levels.as_slice()).unwrap_or(&[]);
+        let right_ask_levels = right_quote.map(|quote| quote.ask_levels.as_slice()).unwrap_or(&[]);
 
         let left_ask_price = left_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
         let right_ask_price = right_ask.as_ref().map(|level| level.price).unwrap_or(f64::MAX);
         let left_is_cheap = left_ask_price <= right_ask_price;
 
-        let (cheap_id, cheap_bid, cheap_ask, cheap_obs) = if left_is_cheap {
+        let (cheap_id, cheap_bid, cheap_ask, cheap_obs, cheap_bid_levels, cheap_ask_levels) = if left_is_cheap {
             (
                 left_id.clone(),
                 left_bid.clone(),
                 left_ask.clone(),
                 left_quote.map(|quote| quote.observed_at_ms),
+                left_bid_levels,
+                left_ask_levels,
             )
         } else {
             (
@@ -1417,14 +1474,25 @@ impl<S: Strategy> Runtime<S> {
                 right_bid.clone(),
                 right_ask.clone(),
                 right_quote.map(|quote| quote.observed_at_ms),
+                right_bid_levels,
+                right_ask_levels,
             )
         };
-        let (expensive_id, expensive_bid, expensive_ask, expensive_obs) = if left_is_cheap {
+        let (
+            expensive_id,
+            expensive_bid,
+            expensive_ask,
+            expensive_obs,
+            expensive_bid_levels,
+            expensive_ask_levels,
+        ) = if left_is_cheap {
             (
                 right_id,
                 right_bid.clone(),
                 right_ask.clone(),
                 right_quote.map(|quote| quote.observed_at_ms),
+                right_bid_levels,
+                right_ask_levels,
             )
         } else {
             (
@@ -1432,6 +1500,8 @@ impl<S: Strategy> Runtime<S> {
                 left_bid.clone(),
                 left_ask.clone(),
                 left_quote.map(|quote| quote.observed_at_ms),
+                left_bid_levels,
+                left_ask_levels,
             )
         };
 
@@ -1456,6 +1526,22 @@ impl<S: Strategy> Runtime<S> {
             .as_ref()
             .zip(expensive_ask.as_ref())
             .map(|(cheap, expensive)| expensive.price - cheap.price);
+        let cheap_bid_depth_top3_qty = top_n_depth_qty(cheap_bid_levels, 3);
+        let cheap_ask_depth_top3_qty = top_n_depth_qty(cheap_ask_levels, 3);
+        let expensive_bid_depth_top3_qty = top_n_depth_qty(expensive_bid_levels, 3);
+        let expensive_ask_depth_top3_qty = top_n_depth_qty(expensive_ask_levels, 3);
+        let cheap_bid_notional_top3 = top_n_depth_notional(cheap_bid_levels, 3);
+        let cheap_ask_notional_top3 = top_n_depth_notional(cheap_ask_levels, 3);
+        let expensive_bid_notional_top3 = top_n_depth_notional(expensive_bid_levels, 3);
+        let expensive_ask_notional_top3 = top_n_depth_notional(expensive_ask_levels, 3);
+        let cheap_spread = cheap_bid
+            .as_ref()
+            .zip(cheap_ask.as_ref())
+            .map(|(bid, ask)| ask.price - bid.price);
+        let expensive_spread = expensive_bid
+            .as_ref()
+            .zip(expensive_ask.as_ref())
+            .map(|(bid, ask)| ask.price - bid.price);
 
         GatePairedBookSignal {
             cheap_instrument_id: cheap_id.as_str().to_string(),
@@ -1468,6 +1554,24 @@ impl<S: Strategy> Runtime<S> {
             observed_at_ms,
             books_fresh,
             both_sides_present,
+            cheap_spread,
+            expensive_spread,
+            cheap_bid_depth_top3_qty,
+            cheap_ask_depth_top3_qty,
+            expensive_bid_depth_top3_qty,
+            expensive_ask_depth_top3_qty,
+            cheap_bid_notional_top3,
+            cheap_ask_notional_top3,
+            expensive_bid_notional_top3,
+            expensive_ask_notional_top3,
+            cheap_depth_imbalance_top3: depth_imbalance(
+                cheap_bid_depth_top3_qty,
+                cheap_ask_depth_top3_qty,
+            ),
+            expensive_depth_imbalance_top3: depth_imbalance(
+                expensive_bid_depth_top3_qty,
+                expensive_ask_depth_top3_qty,
+            ),
         }
     }
 
@@ -1530,6 +1634,18 @@ impl<S: Strategy> Runtime<S> {
                 observed_at_ms: signal.book.observed_at_ms,
                 books_fresh: signal.book.books_fresh,
                 both_sides_present: signal.book.both_sides_present,
+                cheap_spread: signal.book.cheap_spread,
+                expensive_spread: signal.book.expensive_spread,
+                cheap_bid_depth_top3_qty: signal.book.cheap_bid_depth_top3_qty,
+                cheap_ask_depth_top3_qty: signal.book.cheap_ask_depth_top3_qty,
+                expensive_bid_depth_top3_qty: signal.book.expensive_bid_depth_top3_qty,
+                expensive_ask_depth_top3_qty: signal.book.expensive_ask_depth_top3_qty,
+                cheap_bid_notional_top3: signal.book.cheap_bid_notional_top3,
+                cheap_ask_notional_top3: signal.book.cheap_ask_notional_top3,
+                expensive_bid_notional_top3: signal.book.expensive_bid_notional_top3,
+                expensive_ask_notional_top3: signal.book.expensive_ask_notional_top3,
+                cheap_depth_imbalance_top3: signal.book.cheap_depth_imbalance_top3,
+                expensive_depth_imbalance_top3: signal.book.expensive_depth_imbalance_top3,
             },
             activity: StrategyMarketActivitySignal {
                 last_trade_event_count_10s: signal.activity.last_trade_event_count_10s,
@@ -1850,9 +1966,10 @@ fn generate_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{Runtime, RuntimeConfig};
-    use crate::market_context::MarketContextStore;
+    use crate::market_context::{MarketContextRecord, MarketContextStore};
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::risk::RiskLimits;
+    use crate::signals::unlawful_gate::UnlawfulGateConfig;
     use crate::strategy::{Strategy, StrategyContext, StrategyDecision};
     use crate::types::{
         BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId,
@@ -1917,6 +2034,8 @@ mod tests {
             quote: QuoteSnapshot {
                 best_bid: Some(BookLevel::new(0.39, 100.0)),
                 best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 last_trade_price: Some(0.40),
                 observed_at_ms: 2,
             },
@@ -1994,6 +2113,101 @@ mod tests {
         assert_eq!(quote.observed_at_ms, 25);
         assert_eq!(quote.best_bid.as_ref().unwrap().price, 0.41);
         assert_eq!(quote.best_ask.as_ref().unwrap().price, 0.44);
+        assert_eq!(quote.bid_levels.len(), 1);
+        assert_eq!(quote.ask_levels.len(), 1);
+        assert_eq!(quote.bid_levels[0].quantity, 12.0);
+        assert_eq!(quote.ask_levels[0].quantity, 7.0);
+    }
+
+    #[test]
+    fn paired_book_signal_derives_top3_depth_features() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 0.0,
+                event_log_capacity: 32,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            crate::strategy::NoopStrategy,
+            MarketContextStore::empty(),
+        );
+        runtime.start(1);
+
+        let market_id = MarketId::from("market-1");
+        let cheap_id = InstrumentId::from("cheap-token");
+        let expensive_id = InstrumentId::from("expensive-token");
+
+        let mut cheap_book = crate::book::BookState::from_top_of_book(
+            cheap_id.as_str(),
+            0.37,
+            100.0,
+            0.39,
+            200.0,
+            0.38,
+            10,
+        );
+        cheap_book.bids = vec![
+            crate::book::Level { price: 0.37, size: 100.0 },
+            crate::book::Level { price: 0.36, size: 50.0 },
+            crate::book::Level { price: 0.35, size: 25.0 },
+            crate::book::Level { price: 0.34, size: 10.0 },
+        ];
+        cheap_book.asks = vec![
+            crate::book::Level { price: 0.39, size: 200.0 },
+            crate::book::Level { price: 0.40, size: 100.0 },
+            crate::book::Level { price: 0.41, size: 50.0 },
+        ];
+
+        let mut expensive_book = crate::book::BookState::from_top_of_book(
+            expensive_id.as_str(),
+            0.58,
+            10.0,
+            0.60,
+            40.0,
+            0.59,
+            10,
+        );
+        expensive_book.bids = vec![
+            crate::book::Level { price: 0.58, size: 10.0 },
+            crate::book::Level { price: 0.57, size: 20.0 },
+            crate::book::Level { price: 0.56, size: 30.0 },
+        ];
+        expensive_book.asks = vec![
+            crate::book::Level { price: 0.60, size: 40.0 },
+            crate::book::Level { price: 0.61, size: 50.0 },
+            crate::book::Level { price: 0.62, size: 60.0 },
+        ];
+
+        runtime
+            .on_book_state(market_id.clone(), cheap_id.clone(), &cheap_book)
+            .expect("cheap book");
+        runtime
+            .on_book_state(market_id.clone(), expensive_id.clone(), &expensive_book)
+            .expect("expensive book");
+
+        let market_context = MarketContextRecord {
+            market_id: market_id.as_str().to_string(),
+            instrument_ids: vec![cheap_id.as_str().to_string(), expensive_id.as_str().to_string()],
+            ..MarketContextRecord::default()
+        };
+        let signal = runtime.build_paired_book_signal(
+            &market_id,
+            Some(&market_context),
+            100,
+            &UnlawfulGateConfig::default(),
+        );
+
+        assert!((signal.cheap_spread.unwrap() - 0.02).abs() < 1e-9);
+        assert!((signal.expensive_spread.unwrap() - 0.02).abs() < 1e-9);
+        assert_eq!(signal.cheap_bid_depth_top3_qty, Some(175.0));
+        assert_eq!(signal.cheap_ask_depth_top3_qty, Some(350.0));
+        assert_eq!(signal.expensive_bid_depth_top3_qty, Some(60.0));
+        assert_eq!(signal.expensive_ask_depth_top3_qty, Some(150.0));
+        assert!((signal.cheap_bid_notional_top3.unwrap() - 63.75).abs() < 1e-9);
+        assert!((signal.cheap_ask_notional_top3.unwrap() - 138.5).abs() < 1e-9);
+        assert!((signal.cheap_depth_imbalance_top3.unwrap() + (1.0 / 3.0)).abs() < 1e-9);
+        assert!((signal.expensive_depth_imbalance_top3.unwrap() + (3.0 / 7.0)).abs() < 1e-9);
     }
 
     #[test]
