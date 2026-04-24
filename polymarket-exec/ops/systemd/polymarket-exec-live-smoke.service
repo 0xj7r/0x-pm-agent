@@ -20,7 +20,9 @@ EnvironmentFile=-%h/.config/polymarket-exec/common.env
 EnvironmentFile=-%h/.config/polymarket-exec/live.env
 ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/live" "$HOME/.config/polymarket-exec"'
 ExecStart=/usr/bin/env bash -lc 'cd "${WHALE_PAIR_ROOT_DIR}" && "${WHALE_PAIR_CARGO_BIN:-cargo}" run -p polymarket-exec'
-TimeoutStartSec=120
+# First-run cargo builds on a fresh live host can exceed two minutes. Keep the
+# smoke bounded, but do not kill it before the order lifecycle check starts.
+TimeoutStartSec=600
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=polymarket-exec-live-smoke
