@@ -138,6 +138,31 @@ runtime_ready_for_refresh() {
   curl -fsS --max-time 1 "$(runtime_health_url)" >/dev/null 2>&1
 }
 
+market_context_equivalent() {
+  local left="$1"
+  local right="$2"
+  "$PYTHON_BIN" - "$left" "$right" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+left = Path(sys.argv[1])
+right = Path(sys.argv[2])
+if not left.exists() or not right.exists():
+    raise SystemExit(1)
+
+def normalized(path: Path):
+    payload = json.loads(path.read_text())
+    if isinstance(payload, dict):
+        # This timestamp changes on every Gamma export and must not trigger a
+        # live process restart when the market slate itself is unchanged.
+        payload.pop("source_generated_at_ms", None)
+    return payload
+
+raise SystemExit(0 if normalized(left) == normalized(right) else 1)
+PY
+}
+
 cleanup() {
   stop_child "script-exit"
 }
@@ -164,7 +189,8 @@ refresh_artifacts_if_needed() {
     fail "market context artifact is empty: $temp_context_path"
   fi
 
-  if cmp -s "$temp_runtime_env_path" "$RUNTIME_ENV_PATH" && cmp -s "$temp_context_path" "$CONTEXT_PATH"; then
+  if cmp -s "$temp_runtime_env_path" "$RUNTIME_ENV_PATH" \
+    && market_context_equivalent "$temp_context_path" "$CONTEXT_PATH"; then
     rm -f "$temp_runtime_env_path" "$temp_context_path"
     return 1
   fi
