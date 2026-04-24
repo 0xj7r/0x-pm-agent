@@ -221,6 +221,16 @@ fn btc_gate_ok(
     }
 }
 
+fn strong_market_activity(inputs: &UnlawfulGateInputs) -> bool {
+    let age_ok = inputs
+        .activity
+        .last_trade_event_age_ms
+        .is_none_or(|age_ms| age_ms <= 2_500);
+    age_ok
+        && inputs.activity.last_trade_event_count_10s >= 500
+        && inputs.activity.last_trade_event_count_30s >= 1_500
+}
+
 fn geometry_ok(inputs: &UnlawfulGateInputs, cfg: &UnlawfulGateConfig) -> (bool, bool) {
     let cheap = inputs.cheap_ask();
     let expensive = inputs.expensive_ask();
@@ -410,23 +420,6 @@ pub fn evaluate_unlawful_mode(
         );
     }
 
-    if !btc_gate_ok(inputs.session_bucket, inputs, cfg) {
-        reasons.push("btc gate rejected".to_string());
-        return baseline_result(
-            inputs,
-            if inputs.has_inventory {
-                UnlawfulExecutionMode::Cleanup
-            } else {
-                UnlawfulExecutionMode::Standby
-            },
-            UnlawfulAggressionTier::Suppressed,
-            0.0,
-            elapsed_s,
-            time_remaining_s,
-            reasons,
-        );
-    }
-
     let (hard_geometry, preferred_geometry) = geometry_ok(inputs, cfg);
     if !hard_geometry {
         reasons.push("geometry rejected".to_string());
@@ -443,6 +436,35 @@ pub fn evaluate_unlawful_mode(
             time_remaining_s,
             reasons,
         );
+    }
+
+    let btc_gate_passed = btc_gate_ok(inputs.session_bucket, inputs, cfg);
+    let microstructure_override = !btc_gate_passed
+        && strong_market_activity(inputs)
+        && matches!(
+            inputs.session_bucket,
+            SessionBucket::Preferred | SessionBucket::Neutral
+        );
+
+    if !btc_gate_passed && !microstructure_override {
+        reasons.push("btc gate rejected".to_string());
+        return baseline_result(
+            inputs,
+            if inputs.has_inventory {
+                UnlawfulExecutionMode::Cleanup
+            } else {
+                UnlawfulExecutionMode::Standby
+            },
+            UnlawfulAggressionTier::Suppressed,
+            0.0,
+            elapsed_s,
+            time_remaining_s,
+            reasons,
+        );
+    }
+
+    if microstructure_override {
+        reasons.push("btc gate softened by market activity".to_string());
     }
 
     let mut mode = if elapsed_s <= cfg.entry_window_seconds {
@@ -498,14 +520,22 @@ pub fn evaluate_unlawful_mode(
 
     let (aggression_tier, clip_scale) = match mode {
         UnlawfulExecutionMode::Entry => {
-            if preferred_geometry {
+            if microstructure_override && preferred_geometry {
+                (UnlawfulAggressionTier::Light, 0.6)
+            } else if microstructure_override {
+                (UnlawfulAggressionTier::Light, 0.45)
+            } else if preferred_geometry {
                 (UnlawfulAggressionTier::Normal, 1.0)
             } else {
                 (UnlawfulAggressionTier::Light, 0.6)
             }
         }
         UnlawfulExecutionMode::Manage => {
-            if preferred_geometry {
+            if microstructure_override && preferred_geometry {
+                (UnlawfulAggressionTier::Light, 0.6)
+            } else if microstructure_override {
+                (UnlawfulAggressionTier::Light, 0.45)
+            } else if preferred_geometry {
                 (UnlawfulAggressionTier::Normal, 1.0)
             } else {
                 (UnlawfulAggressionTier::Light, 0.6)
@@ -553,6 +583,15 @@ mod tests {
             last_trade_event_count_30s: 310,
             last_trade_event_count_60s: 900,
             last_trade_event_age_ms: None,
+        }
+    }
+
+    fn hot_activity() -> MarketActivitySignal {
+        MarketActivitySignal {
+            last_trade_event_count_10s: 800,
+            last_trade_event_count_30s: 2_400,
+            last_trade_event_count_60s: 6_000,
+            last_trade_event_age_ms: Some(150),
         }
     }
 
@@ -694,6 +733,23 @@ mod tests {
     }
 
     #[test]
+    fn scenario_2b_preferred_hour_weak_btc_but_hot_market_enters_light() {
+        let cfg = UnlawfulGateConfig::default();
+        let mut input = scenario(SessionBucket::Preferred, 10, false, None, None);
+        input.btc = btc(0.2, 0.5, 250);
+        input.btc.observed_at_ms = input.now_ms;
+        input.activity = hot_activity();
+        let result = evaluate_unlawful_mode(&input, &cfg);
+        assert_eq!(result.mode, UnlawfulExecutionMode::Entry);
+        assert_eq!(result.aggression_tier, UnlawfulAggressionTier::Light);
+        assert_eq!(result.clip_scale, 0.45);
+        assert!(result
+            .gate_reasons
+            .iter()
+            .any(|reason| reason.contains("btc gate softened by market activity")));
+    }
+
+    #[test]
     fn scenario_3_off_hour_without_override_stays_standby() {
         let cfg = UnlawfulGateConfig::default();
         let mut input = scenario(SessionBucket::Opportunistic, 10, false, None, None);
@@ -702,6 +758,21 @@ mod tests {
         let result = evaluate_unlawful_mode(&input, &cfg);
         assert_eq!(result.mode, UnlawfulExecutionMode::Standby);
         assert_eq!(result.aggression_tier, UnlawfulAggressionTier::Suppressed);
+    }
+
+    #[test]
+    fn scenario_3b_off_hour_hot_market_without_override_still_standby() {
+        let cfg = UnlawfulGateConfig::default();
+        let mut input = scenario(SessionBucket::Opportunistic, 10, false, None, None);
+        input.btc = btc(0.2, 0.5, 250);
+        input.btc.observed_at_ms = input.now_ms;
+        input.activity = hot_activity();
+        let result = evaluate_unlawful_mode(&input, &cfg);
+        assert_eq!(result.mode, UnlawfulExecutionMode::Standby);
+        assert!(result
+            .gate_reasons
+            .iter()
+            .any(|reason| reason.contains("btc gate rejected")));
     }
 
     #[test]
