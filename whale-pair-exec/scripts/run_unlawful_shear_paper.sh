@@ -81,6 +81,9 @@ load_runtime_env() {
   if [[ -n "${WHALE_PAIR_EXEC_JOURNAL_PATH:-}" ]]; then
     mkdir -p "$(dirname "$WHALE_PAIR_EXEC_JOURNAL_PATH")"
   fi
+  if [[ -n "${WHALE_PAIR_EXEC_AUDIT_PATH:-}" ]]; then
+    mkdir -p "$(dirname "$WHALE_PAIR_EXEC_AUDIT_PATH")"
+  fi
   if [[ -n "${WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH:-}" ]]; then
     mkdir -p "$(dirname "$WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH")"
   fi
@@ -95,6 +98,9 @@ launch_child() {
   fi
   if [[ -n "${WHALE_PAIR_EXEC_JOURNAL_PATH:-}" ]]; then
     log_section "journal: $WHALE_PAIR_EXEC_JOURNAL_PATH"
+  fi
+  if [[ -n "${WHALE_PAIR_EXEC_AUDIT_PATH:-}" ]]; then
+    log_section "audit: $WHALE_PAIR_EXEC_AUDIT_PATH"
   fi
   log_section "unlawful gate config: allow_extreme_offhour_override=${WHALE_PAIR_UNLAWFUL_SHEAR_ALLOW_EXTREME_OFFHOUR_OVERRIDE:-<unset>} primary_btc=(${WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_5M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_REALIZED_VOL_15M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_PRIMARY_MIN_BTC_TRADE_COUNT_5M:-<unset>}) secondary_btc=(${WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_5M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_REALIZED_VOL_15M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_SECONDARY_MIN_BTC_TRADE_COUNT_5M:-<unset>}) override_btc=(${WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_5M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_REALIZED_VOL_15M_BPS:-<unset>},${WHALE_PAIR_UNLAWFUL_SHEAR_OVERRIDE_MIN_BTC_TRADE_COUNT_5M:-<unset>})"
   if [[ -n "${WHALE_PAIR_STRATEGY_PROFILE_PATH:-}" ]]; then
