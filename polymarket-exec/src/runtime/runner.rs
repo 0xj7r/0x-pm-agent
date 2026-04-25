@@ -186,6 +186,11 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
         &config.strategy_name,
         config.strategy_profile.as_ref(),
     );
+    // Capture fee coefficient before strategy is moved into Runtime so
+    // replay's paper_fill_from_book_snapshot calls model fees correctly.
+    // Bug fix: was passing 0.0, which made every replay-mode taker fill
+    // appear fee-free and inflated reported P&L.
+    let replay_taker_fee_coeff = strategy.taker_fee_coeff();
     let mut runtime = Runtime::new(
         crate::runtime::types::RuntimeConfig {
             starting_cash_usd: config.starting_cash_usd,
@@ -244,7 +249,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
                 &book,
                 &intent,
                 record.t,
-                0.0,
+                replay_taker_fee_coeff,
                 ctx,
                 managed.remaining_qty(),
                 &execution_policy,
@@ -298,7 +303,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
                         &book,
                         &intent,
                         record.t,
-                        0.0,
+                        replay_taker_fee_coeff,
                         ctx,
                         intent.quantity,
                         &execution_policy,
@@ -350,6 +355,11 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
     if !config.paper_mode {
         config.paper_mode = true;
     }
+    // NOTE: deliberately NOT resetting quote_min_order_age. The whole point
+    // of shadow_live is to mirror LIVE behavior with paper safety; the
+    // operator's live-tier quote churn timing (often 5000ms in tinylive)
+    // is what we want to validate. Forcing a paper default here would
+    // defeat the realism goal.
     info!(
         target: "shadow_live.startup",
         clob_api_url = %config.clob_api_url,
@@ -836,6 +846,13 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                     .notional_usd
                     .or_else(|| ev.price.and_then(|p| ev.quantity.map(|q| p * q)))
                     .unwrap_or(0.0);
+                // Bug fix: skip events with no derivable notional rather
+                // than recording a $0 fill. Otherwise the vs_whale section
+                // looks like the whale traded at $0 and double-counts in
+                // the maker_fraction / capture-ratio math.
+                if notional <= 0.0 {
+                    continue;
+                }
                 report.record_whale_fill_observed(
                     ev.observed_at_ms,
                     ev.side.as_deref(),
