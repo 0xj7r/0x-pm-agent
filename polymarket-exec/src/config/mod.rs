@@ -96,6 +96,17 @@ pub struct AppConfig {
     pub paper_min_fill_notional_usd: f64,
     pub paper_max_fills_per_order: usize,
     pub paper_min_fill_interval: Duration,
+    /// Optional UTC ms timestamp at which the paper market resolves. When
+    /// `paper_mode` is true and the runtime clock crosses this value, the
+    /// paper environment forces settlement: cancels open orders, applies
+    /// merge for paired inventory, and applies redeem at
+    /// `paper_market_resolution_price` for stranded inventory.
+    pub paper_market_close_at_ms: Option<u64>,
+    /// Optional resolution price in [0.0, 1.0] used when settling stranded
+    /// inventory at `paper_market_close_at_ms`. 0.0 = "no" wins, 1.0 =
+    /// "yes" wins, 0.5 = unknown / split. Required only if there is
+    /// stranded (non-paired) inventory at close.
+    pub paper_market_resolution_price: Option<f64>,
 }
 
 impl AppConfig {
@@ -269,6 +280,38 @@ impl AppConfig {
         let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
         let paper_min_fill_interval =
             parse_duration_ms("WHALE_PAIR_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
+        let paper_market_close_at_ms = std::env::var("WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                v.trim()
+                    .parse::<u64>()
+                    .map_err(|err| anyhow::anyhow!(
+                        "invalid WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS: {err}"
+                    ))
+            })
+            .transpose()?;
+        let paper_market_resolution_price =
+            std::env::var("WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    v.trim()
+                        .parse::<f64>()
+                        .map_err(|err| anyhow::anyhow!(
+                            "invalid WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE: {err}"
+                        ))
+                        .and_then(|p| {
+                            if (0.0..=1.0).contains(&p) {
+                                Ok(p)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE must be in [0.0, 1.0], got {p}"
+                                ))
+                            }
+                        })
+                })
+                .transpose()?;
 
         Ok(Self {
             service_name,
@@ -331,6 +374,8 @@ impl AppConfig {
             paper_min_fill_notional_usd,
             paper_max_fills_per_order,
             paper_min_fill_interval,
+            paper_market_close_at_ms,
+            paper_market_resolution_price,
         })
     }
 
