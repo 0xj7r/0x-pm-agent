@@ -7,7 +7,7 @@ pub mod reconcile;
 pub mod runner;
 pub mod types;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event_log::{EventCategory, EventLog, EventMetrics, EventRecord};
@@ -322,6 +322,7 @@ pub struct Runtime<S: Strategy> {
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
+    markets_with_unresolved_drift: HashSet<MarketId>,
     order_store: Option<Box<dyn OrderStore>>,
 }
 
@@ -374,6 +375,7 @@ impl<S: Strategy> Runtime<S> {
             condition_id_by_market: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
+            markets_with_unresolved_drift: HashSet::new(),
             order_store,
         }
     }
@@ -484,7 +486,45 @@ impl<S: Strategy> Runtime<S> {
         let report = self
             .inventory
             .reconcile_venue_positions(venue_positions, observed_at_ms)?;
+        const DRIFT_QTY_EPSILON: f64 = 1e-6;
         for delta in &report.deltas {
+            let local_was_flat = delta.local_quantity_before.abs() < DRIFT_QTY_EPSILON;
+            let venue_has_position = delta.venue_quantity.abs() > DRIFT_QTY_EPSILON;
+            if local_was_flat && venue_has_position {
+                if self
+                    .markets_with_unresolved_drift
+                    .insert(delta.market_id.clone())
+                {
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Inventory,
+                            observed_at_ms,
+                            format!(
+                                "drift block engaged: local was flat but venue qty={:.8}; \
+                                 fresh entry suppressed in this market until drift clears \
+                                 (incident #1 guard)",
+                                delta.venue_quantity
+                            ),
+                        )
+                        .with_market(delta.market_id.clone())
+                        .with_instrument(delta.instrument_id.clone()),
+                    );
+                }
+            } else if delta.quantity_delta.abs() < DRIFT_QTY_EPSILON
+                && self
+                    .markets_with_unresolved_drift
+                    .remove(&delta.market_id)
+            {
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Inventory,
+                        observed_at_ms,
+                        "drift block cleared: local now matches venue",
+                    )
+                    .with_market(delta.market_id.clone())
+                    .with_instrument(delta.instrument_id.clone()),
+                );
+            }
             self.event_log.push(
                 EventRecord::new(
                     EventCategory::Inventory,
@@ -1549,6 +1589,26 @@ impl<S: Strategy> Runtime<S> {
                         EventCategory::Runtime,
                         now_ms,
                         "duplicate client_order_id rejected before risk",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if !intent.reduce_only
+            && self
+                .markets_with_unresolved_drift
+                .contains(&intent.market_id)
+        {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "fresh entry suppressed: market has unresolved local-flat/venue-nonflat \
+                         drift (incident #1 guard)",
                     )
                     .with_market(intent.market_id.clone())
                     .with_instrument(intent.instrument_id.clone())
