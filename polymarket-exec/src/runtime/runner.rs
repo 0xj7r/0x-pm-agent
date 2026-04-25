@@ -81,6 +81,8 @@ struct ExecutionPolicy {
     paper_min_fill_notional_usd: f64,
     paper_max_fills_per_order: usize,
     paper_min_fill_interval_ms: u64,
+    paper_market_close_at_ms: Option<u64>,
+    paper_market_resolution_price: Option<f64>,
 }
 
 impl ExecutionPolicy {
@@ -97,6 +99,8 @@ impl ExecutionPolicy {
             paper_min_fill_notional_usd: config.paper_min_fill_notional_usd,
             paper_max_fills_per_order: config.paper_max_fills_per_order,
             paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
+            paper_market_close_at_ms: config.paper_market_close_at_ms,
+            paper_market_resolution_price: config.paper_market_resolution_price,
         }
     }
 }
