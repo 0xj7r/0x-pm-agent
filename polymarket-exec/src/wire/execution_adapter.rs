@@ -171,6 +171,16 @@ pub struct VenueFill {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MarketMetadata {
+    pub condition_id: String,
+    pub minimum_order_size: f64,
+    pub minimum_tick_size: f64,
+    pub neg_risk: bool,
+    pub active: bool,
+    pub closed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct PolymarketCredentials {
     pub api_key: String,
     pub api_secret: String,
@@ -922,6 +932,41 @@ impl PolymarketExecutionAdapter {
             .collect())
     }
 
+    /// Fetch venue-authoritative metadata (minimum_order_size, minimum_tick_size,
+    /// neg_risk, lifecycle flags) for a market by `condition_id`. Closes Q6 of the
+    /// handoff audit: surfaces the truth that the strategy's hardcoded sizing
+    /// multipliers should be reconciled against. Operator-visible only; does not
+    /// modify strategy behavior.
+    pub async fn fetch_market_metadata(
+        &self,
+        condition_id: &str,
+    ) -> Result<MarketMetadata, ExecutionError> {
+        let trimmed = condition_id.trim();
+        if trimmed.is_empty() {
+            return Err(ExecutionError::BadRequest(
+                "condition_id required for fetch_market_metadata".to_string(),
+            ));
+        }
+        let url = join_url(&self._config.api_url, &format!("markets/{trimmed}"));
+        let response = self
+            .raw_http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        if !status.is_success() {
+            return Err(ExecutionError::VenueRejection(format!(
+                "GET {url} failed {status}: {response_text}"
+            )));
+        }
+        parse_market_metadata(&response_text)
+    }
+
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         let page = self
             .client
@@ -1282,6 +1327,46 @@ fn join_url(base: &str, path: &str) -> String {
     )
 }
 
+fn parse_market_metadata(body: &str) -> Result<MarketMetadata, ExecutionError> {
+    let raw: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        ExecutionError::VenueRejection(format!(
+            "failed to decode market metadata response `{body}`: {error}"
+        ))
+    })?;
+    let condition_id = raw
+        .get("condition_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let minimum_order_size = raw
+        .get("minimum_order_size")
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Number(n) => n.as_f64(),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    let minimum_tick_size = raw
+        .get("minimum_tick_size")
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => s.parse::<f64>().ok(),
+            serde_json::Value::Number(n) => n.as_f64(),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    let neg_risk = raw.get("neg_risk").and_then(|v| v.as_bool()).unwrap_or(false);
+    let active = raw.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+    let closed = raw.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(MarketMetadata {
+        condition_id,
+        minimum_order_size,
+        minimum_tick_size,
+        neg_risk,
+        active,
+        closed,
+    })
+}
+
 fn l2_hmac(secret: &str, message: &str) -> Result<String, ExecutionError> {
     let decoded_secret = base64::engine::general_purpose::URL_SAFE
         .decode(secret)
@@ -1357,6 +1442,56 @@ mod tests {
             strategy_tag: "strategy-a".to_string(),
             quote_level_tag: None,
             submitted_at_ms: now_unix_ms(),
+        }
+    }
+
+    #[test]
+    fn parse_market_metadata_extracts_min_size_tick_and_flags() {
+        let body = serde_json::json!({
+            "condition_id": "0xabc123",
+            "question": "Will BTC be up at 5pm UTC?",
+            "minimum_order_size": "5",
+            "minimum_tick_size": "0.001",
+            "neg_risk": false,
+            "active": true,
+            "closed": false,
+            "tokens": []
+        })
+        .to_string();
+        let parsed = parse_market_metadata(&body).expect("parse ok");
+        assert_eq!(parsed.condition_id, "0xabc123");
+        assert!((parsed.minimum_order_size - 5.0).abs() < 1e-9);
+        assert!((parsed.minimum_tick_size - 0.001).abs() < 1e-9);
+        assert!(!parsed.neg_risk);
+        assert!(parsed.active);
+        assert!(!parsed.closed);
+    }
+
+    #[test]
+    fn parse_market_metadata_tolerates_numeric_min_fields() {
+        let body = serde_json::json!({
+            "condition_id": "0xdef456",
+            "minimum_order_size": 10,
+            "minimum_tick_size": 0.01,
+            "neg_risk": true,
+            "active": false,
+            "closed": true
+        })
+        .to_string();
+        let parsed = parse_market_metadata(&body).expect("parse ok");
+        assert!((parsed.minimum_order_size - 10.0).abs() < 1e-9);
+        assert!((parsed.minimum_tick_size - 0.01).abs() < 1e-9);
+        assert!(parsed.neg_risk);
+        assert!(!parsed.active);
+        assert!(parsed.closed);
+    }
+
+    #[test]
+    fn parse_market_metadata_rejects_invalid_json() {
+        let err = parse_market_metadata("not-json").unwrap_err();
+        match err {
+            ExecutionError::VenueRejection(msg) => assert!(msg.contains("failed to decode")),
+            other => panic!("expected VenueRejection, got {other:?}"),
         }
     }
 
