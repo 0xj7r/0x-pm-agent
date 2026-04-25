@@ -7,6 +7,7 @@ pub mod journal;
 pub mod logging;
 pub mod market_making;
 pub mod metrics;
+pub mod paper;
 pub mod runtime;
 pub mod signals;
 pub mod strategy;

@@ -494,6 +494,7 @@ mod tests {
             reason: "test".to_string(),
             quote_level_tag: Some("lvl-1".to_string()),
             created_at_ms: 1,
+            pair_id: None,
         }
     }
 

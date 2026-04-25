@@ -305,6 +305,7 @@ mod tests {
             reason: "test".to_string(),
             quote_level_tag: tag.map(ToString::to_string),
             created_at_ms: 1,
+            pair_id: None,
         }
     }
 
