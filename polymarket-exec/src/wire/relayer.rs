@@ -143,12 +143,33 @@ impl CtfRelayerClient {
 
         let from = request.signer.address();
         let relay_payload = self.relay_payload(from, "PROXY").await?;
+        let body = self
+            .build_proxy_merge_transaction_request(
+                &request.signer,
+                relay_payload,
+                &request.condition_id,
+                request.quantity,
+                request.metadata,
+            )
+            .await?;
+        self.submit(body).await
+    }
+
+    async fn build_proxy_merge_transaction_request(
+        &self,
+        signer: &PrivateKeySigner,
+        relay_payload: RelayPayload,
+        condition_id_raw: &str,
+        quantity: f64,
+        metadata: String,
+    ) -> Result<TransactionRequest, ExecutionError> {
+        let from = signer.address();
         let relay = parse_address(&relay_payload.address, "relayer relay address")?;
         let nonce = relay_payload.nonce;
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
         let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
-        let condition_id = parse_b256(&request.condition_id, "condition id")?;
-        let amount = scaled_token_amount(request.quantity, self.config.collateral_decimals)?;
+        let condition_id = parse_b256(condition_id_raw, "condition id")?;
+        let amount = scaled_token_amount(quantity, self.config.collateral_decimals)?;
         let merge_data = mergePositionsCall {
             collateralToken: collateral,
             parentCollectionId: B256::ZERO,
@@ -175,8 +196,7 @@ impl CtfRelayerClient {
             POLYMARKET_RELAY_HUB,
             relay,
         )?;
-        let signature = request
-            .signer
+        let signature = signer
             .sign_message(tx_hash.as_slice())
             .await
             .map_err(|error| {
@@ -184,7 +204,7 @@ impl CtfRelayerClient {
             })?
             .to_string();
 
-        let body = TransactionRequest {
+        Ok(TransactionRequest {
             tx_type: "PROXY".to_string(),
             from: from.to_string(),
             to: POLYMARKET_PROXY_FACTORY.to_string(),
@@ -199,9 +219,8 @@ impl CtfRelayerClient {
                 relay_hub: POLYMARKET_RELAY_HUB.to_string(),
                 relay: relay.to_string(),
             },
-            metadata: request.metadata,
-        };
-        self.submit(body).await
+            metadata,
+        })
     }
 
     async fn relay_payload(
@@ -441,5 +460,44 @@ mod tests {
             client.proxy_wallet(owner).unwrap().to_string(),
             "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_merge_builds_expected_relayer_transaction_request() {
+        let mut config = test_config();
+        config.proxy_wallet_address =
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string());
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+
+        let body = client
+            .build_proxy_merge_transaction_request(
+                &signer,
+                RelayPayload {
+                    address: "0x1234567890123456789012345678901234567890".to_string(),
+                    nonce: "7".to_string(),
+                },
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+                6.5,
+                "{\"test\":true}".to_string(),
+            )
+            .await
+            .expect("merge transaction request");
+
+        assert_eq!(body.tx_type, "PROXY");
+        assert_eq!(
+            body.proxy_wallet,
+            "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
+        );
+        assert_eq!(body.nonce, "7");
+        assert_eq!(body.signature_params.gas_limit, "10000000");
+        assert_eq!(body.signature_params.gas_price, "0");
+        assert_eq!(body.signature_params.relayer_fee, "0");
+        assert_eq!(body.metadata, "{\"test\":true}");
+        assert!(body.data.starts_with("0x"));
+        assert!(body.signature.starts_with("0x"));
     }
 }
