@@ -35,7 +35,7 @@ use crate::wire::api::{
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
-    SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
+    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -126,6 +126,7 @@ pub async fn run() -> Result<()> {
         "live_smoke" => return run_live_smoke(config).await,
         "live_cancel" => return run_live_cancel(config).await,
         "live_reconcile" => return run_live_reconcile(config).await,
+        "live_redeem" => return run_live_redeem(config).await,
         "shadow_live" => return run_shadow_live(config).await,
         "replay" => return run_replay_cli(config).await,
         _ => {}
@@ -628,6 +629,149 @@ async fn run_live_cancel(config: AppConfig) -> Result<()> {
         remaining_venue_order_ids = ?visible_after,
         "manual live cancel reconciliation complete"
     );
+    Ok(())
+}
+
+/// Live redeem mode: scans the wallet's positions via the Polymarket
+/// Data API, filters to positions whose underlying market has resolved
+/// (`redeemable: true`), and submits one CTF redeem per unique
+/// `condition_id` through the relayer. Recovers stranded collateral
+/// from expired positions that would otherwise tie up capital.
+///
+/// Honors `WHALE_PAIR_LIVE_REDEEM_DRY_RUN=true` to log the planned
+/// redemptions without submitting (useful before risking gas).
+async fn run_live_redeem(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    if config.paper_mode {
+        anyhow::bail!("live redeem mode requires WHALE_PAIR_PAPER_MODE=false");
+    }
+    if config
+        .live_kill_switch_path
+        .as_ref()
+        .is_some_and(|path| path.exists())
+    {
+        anyhow::bail!("live redeem blocked by active kill switch");
+    }
+    let dry_run = std::env::var("WHALE_PAIR_LIVE_REDEEM_DRY_RUN")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+
+    let adapter = connect_live_adapter(&config).await?;
+    let balances = adapter.sync_balances().await?;
+    info!(
+        position_count = balances.positions.len(),
+        cash_usd = balances.cash_usd,
+        positions_authoritative = balances.positions_authoritative,
+        "live redeem: fetched venue positions"
+    );
+
+    // Group redeemable positions by condition_id. Both legs of a
+    // resolved binary market share one condition_id; we want one
+    // redeem call per condition that claims both legs (winning side
+    // pays out, losing side returns 0 atomically).
+    let mut redeemable_by_condition: std::collections::BTreeMap<String, Vec<&VenuePosition>> =
+        std::collections::BTreeMap::new();
+    let mut total_value_usd = 0.0;
+    for position in &balances.positions {
+        if !position.redeemable {
+            continue;
+        }
+        let Some(condition_id) = position.condition_id.as_ref() else {
+            warn!(
+                instrument_id = %position.instrument_id,
+                "redeemable position missing condition_id; skipping"
+            );
+            continue;
+        };
+        total_value_usd += position.current_value_usd;
+        redeemable_by_condition
+            .entry(condition_id.clone())
+            .or_default()
+            .push(position);
+    }
+
+    info!(
+        condition_count = redeemable_by_condition.len(),
+        total_value_usd,
+        dry_run,
+        "live redeem: identified redeemable positions"
+    );
+    if redeemable_by_condition.is_empty() {
+        info!("live redeem: no redeemable positions found; nothing to do");
+        return Ok(());
+    }
+
+    let mut submitted = 0_usize;
+    let mut failed = 0_usize;
+    for (condition_id, positions) in &redeemable_by_condition {
+        let market_id = positions
+            .first()
+            .map(|p| p.market_id.clone())
+            .unwrap_or_else(|| MarketId::from(condition_id.as_str()));
+        let value_usd: f64 = positions.iter().map(|p| p.current_value_usd).sum();
+        let leg_summary: Vec<String> = positions
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}={:.2}sh@${:.2}",
+                    p.instrument_id, p.quantity, p.current_value_usd
+                )
+            })
+            .collect();
+        info!(
+            condition_id = %condition_id,
+            market_id = %market_id,
+            legs = ?leg_summary,
+            value_usd,
+            dry_run,
+            "live redeem: planning redemption"
+        );
+        if dry_run {
+            continue;
+        }
+        let now_ms = now_unix_ms();
+        let request = RedeemPositionsRequest {
+            command_id: ClientOrderId::from(format!("manual-redeem:{condition_id}:{now_ms}")),
+            market_id,
+            condition_id: condition_id.clone(),
+            // [1, 2] redeems both binary outcomes atomically; loss leg
+            // returns 0 collateral but the call succeeds.
+            index_sets: vec![1, 2],
+            submitted_at_ms: now_ms,
+        };
+        match adapter.redeem_positions(request).await {
+            Ok(ack) => {
+                submitted += 1;
+                info!(
+                    condition_id = %condition_id,
+                    venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
+                    "live redeem: submitted"
+                );
+            }
+            Err(error) => {
+                failed += 1;
+                warn!(
+                    condition_id = %condition_id,
+                    error = %error,
+                    "live redeem: submission failed"
+                );
+            }
+        }
+    }
+
+    info!(
+        planned = redeemable_by_condition.len(),
+        submitted,
+        failed,
+        dry_run,
+        "live redeem: complete"
+    );
+    if failed > 0 && !dry_run {
+        anyhow::bail!(
+            "live redeem: {failed} of {} submissions failed (see logs)",
+            redeemable_by_condition.len()
+        );
+    }
     Ok(())
 }
 
@@ -3781,6 +3925,9 @@ mod tests {
                     instrument_id: InstrumentId::from("down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
+                    redeemable: false,
+                    mergeable: false,
+                    current_value_usd: 0.0,
                 }],
                 positions_authoritative: true,
                 observed_at_ms: now_ms,
@@ -3853,6 +4000,9 @@ mod tests {
                         instrument_id: InstrumentId::from("up"),
                         quantity: 6.5,
                         average_cost_usd: 0.20,
+                        redeemable: false,
+                        mergeable: true,
+                        current_value_usd: 1.30,
                     },
                     VenuePosition {
                         market_id: MarketId::from("market-mm"),
@@ -3863,6 +4013,9 @@ mod tests {
                         instrument_id: InstrumentId::from("down"),
                         quantity: 6.5,
                         average_cost_usd: 0.79,
+                        redeemable: false,
+                        mergeable: true,
+                        current_value_usd: 5.13,
                     },
                 ],
                 positions_authoritative: true,
@@ -3936,6 +4089,9 @@ mod tests {
                     instrument_id: InstrumentId::from("old-token"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
+                    redeemable: false,
+                    mergeable: false,
+                    current_value_usd: 0.0,
                 }],
                 positions_authoritative: true,
                 observed_at_ms: now_ms,

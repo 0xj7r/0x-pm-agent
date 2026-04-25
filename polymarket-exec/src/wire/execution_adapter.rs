@@ -41,7 +41,8 @@ use crate::wire::clob_v2::{
     CLOB_V2_NEG_RISK_EXCHANGE,
 };
 use crate::wire::relayer::{
-    CtfMergeRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
+    CtfMergeRequest, CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
+    DEFAULT_RELAYER_URL,
     DEFAULT_USDCE_ADDRESS,
 };
 
@@ -127,6 +128,26 @@ pub struct MergePositionsAck {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RedeemPositionsRequest {
+    pub command_id: ClientOrderId,
+    pub market_id: MarketId,
+    pub condition_id: String,
+    /// CTF index sets to redeem. For binary markets pass `vec![1, 2]`
+    /// to claim both legs (winning leg pays, losing leg returns nothing
+    /// but the call still succeeds atomically).
+    pub index_sets: Vec<u64>,
+    pub submitted_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RedeemPositionsAck {
+    pub command_id: ClientOrderId,
+    pub accepted: bool,
+    pub accepted_at_ms: EpochMillis,
+    pub venue_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VenueOpenOrder {
     pub venue_order_id: OrderId,
     pub client_order_id: Option<ClientOrderId>,
@@ -154,6 +175,19 @@ pub struct VenuePosition {
     pub instrument_id: InstrumentId,
     pub quantity: f64,
     pub average_cost_usd: f64,
+    /// True when the underlying market has resolved and the position
+    /// can be redeemed for collateral (winning side pays $1/share,
+    /// losing side returns 0). Set from the Polymarket Data API
+    /// `redeemable` flag; defaults to false in synthetic constructions.
+    pub redeemable: bool,
+    /// True when the holder also has the opposite-outcome position in
+    /// matching size, allowing a CTF merge to recover collateral
+    /// without waiting for resolution.
+    pub mergeable: bool,
+    /// Current market value of the position (for ranking which to
+    /// redeem first). $0 doesn't mean unredeemable — losing-side legs
+    /// of resolved markets still need to be redeemed to clear inventory.
+    pub current_value_usd: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -351,6 +385,15 @@ pub trait ExecutionAdapter: Send + Sync {
     ) -> Result<MergePositionsAck, ExecutionError> {
         Err(ExecutionError::BadRequest(format!(
             "merge positions not implemented for execution adapter command_id={}",
+            req.command_id
+        )))
+    }
+    async fn redeem_positions(
+        &self,
+        req: RedeemPositionsRequest,
+    ) -> Result<RedeemPositionsAck, ExecutionError> {
+        Err(ExecutionError::BadRequest(format!(
+            "redeem positions not implemented for execution adapter command_id={}",
             req.command_id
         )))
     }
@@ -901,6 +944,13 @@ impl PolymarketExecutionAdapter {
             instrument_id: InstrumentId::from(asset),
             quantity: position.size.to_string().parse::<f64>().unwrap_or(0.0),
             average_cost_usd: position.avg_price.to_string().parse::<f64>().unwrap_or(0.0),
+            redeemable: position.redeemable,
+            mergeable: position.mergeable,
+            current_value_usd: position
+                .current_value
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0),
         }
     }
 
@@ -1282,6 +1332,40 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             accepted_at_ms: now_unix_ms(),
             venue_message: Some(format!(
                 "relayer merge submitted transaction_id={} state={} hash={}",
+                ack.transaction_id.as_deref().unwrap_or("unknown"),
+                ack.state.as_deref().unwrap_or("unknown"),
+                ack.transaction_hash.as_deref().unwrap_or("unknown")
+            )),
+        })
+    }
+
+    async fn redeem_positions(
+        &self,
+        req: RedeemPositionsRequest,
+    ) -> Result<RedeemPositionsAck, ExecutionError> {
+        let metadata = serde_json::json!({
+            "source": "polymarket-exec",
+            "command_id": req.command_id.as_str(),
+            "market_id": req.market_id.as_str(),
+            "condition_id": req.condition_id,
+            "index_sets": req.index_sets,
+        })
+        .to_string();
+        let ack = self
+            .relayer_client
+            .redeem_positions(CtfRedeemRequest {
+                signer: self.signer.clone(),
+                condition_id: req.condition_id.clone(),
+                index_sets: req.index_sets.clone(),
+                metadata,
+            })
+            .await?;
+        Ok(RedeemPositionsAck {
+            command_id: req.command_id,
+            accepted: true,
+            accepted_at_ms: now_unix_ms(),
+            venue_message: Some(format!(
+                "relayer redeem submitted transaction_id={} state={} hash={}",
                 ack.transaction_id.as_deref().unwrap_or("unknown"),
                 ack.state.as_deref().unwrap_or("unknown"),
                 ack.transaction_hash.as_deref().unwrap_or("unknown")
