@@ -51,6 +51,7 @@ pub struct PaperReportSummary {
     pub fills: FillStats,
     pub edge: EdgeStats,
     pub queue: QueueStats,
+    pub vs_whale: VsWhaleStats,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -89,6 +90,26 @@ pub struct QueueStats {
     pub late_fill_after_cancel_count: usize,
 }
 
+/// Comparison against an external whale-fill stream (e.g. unlawful-shear's
+/// on-chain fills) over the same time window as this paper session.
+/// Populated by `record_whale_fill_observed` calls; emitted in the
+/// summary so operators can spot under/over-fill vs. the whale.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct VsWhaleStats {
+    pub whale_fill_count: usize,
+    pub whale_buy_count: usize,
+    pub whale_sell_count: usize,
+    pub whale_total_notional_usd: f64,
+    pub our_total_notional_usd: f64,
+    /// our_total_notional_usd / whale_total_notional_usd. None when the
+    /// whale stream is empty (no comparison possible).
+    pub notional_capture_ratio: Option<f64>,
+    /// Our fills minus whale fills in the same direction (rough proxy for
+    /// "did we do roughly what the whale did"). Larger absolute value =
+    /// more divergence.
+    pub directional_imbalance_count: i64,
+}
+
 /// Accumulator + writer. Build it at run start; record events as they
 /// happen; call `flush()` on shutdown to persist a JSON summary.
 pub struct PaperReportWriter {
@@ -101,6 +122,10 @@ pub struct PaperReportWriter {
     rejects: Vec<PaperRejectRecord>,
     expected_edge_usd: f64,
     late_fill_after_cancel_count: usize,
+    whale_fill_count: usize,
+    whale_buy_count: usize,
+    whale_sell_count: usize,
+    whale_total_notional_usd: f64,
 }
 
 impl PaperReportWriter {
@@ -120,6 +145,33 @@ impl PaperReportWriter {
             rejects: Vec::new(),
             expected_edge_usd: 0.0,
             late_fill_after_cancel_count: 0,
+            whale_fill_count: 0,
+            whale_buy_count: 0,
+            whale_sell_count: 0,
+            whale_total_notional_usd: 0.0,
+        }
+    }
+
+    /// Record a whale fill observed in the same session window. Used by
+    /// the runtime to feed the `vs_whale` section so the report shows
+    /// "we'd have filled X notional; whale filled Y" side-by-side. Side
+    /// is matched on a best-effort basis from the whale event payload
+    /// ("buy"/"sell" case-insensitive).
+    pub fn record_whale_fill_observed(
+        &mut self,
+        observed_at_ms: u64,
+        side: Option<&str>,
+        notional_usd: f64,
+    ) {
+        self.last_observed_at_ms = self.last_observed_at_ms.max(observed_at_ms);
+        self.whale_fill_count += 1;
+        match side.map(|s| s.to_ascii_lowercase()) {
+            Some(s) if s == "buy" => self.whale_buy_count += 1,
+            Some(s) if s == "sell" => self.whale_sell_count += 1,
+            _ => {}
+        }
+        if notional_usd > 0.0 {
+            self.whale_total_notional_usd += notional_usd;
         }
     }
 
@@ -268,6 +320,36 @@ impl PaperReportWriter {
                 post_only_reject_count: self.rejects.len(),
                 late_fill_after_cancel_count: self.late_fill_after_cancel_count,
             },
+            vs_whale: {
+                let our_buys = self
+                    .fills
+                    .iter()
+                    .filter(|f| matches!(f.side, TradeSide::Buy))
+                    .count() as i64;
+                let our_sells = self
+                    .fills
+                    .iter()
+                    .filter(|f| matches!(f.side, TradeSide::Sell))
+                    .count() as i64;
+                let whale_buys = self.whale_buy_count as i64;
+                let whale_sells = self.whale_sell_count as i64;
+                let directional_imbalance_count =
+                    (our_buys - whale_buys).abs() + (our_sells - whale_sells).abs();
+                let notional_capture_ratio = if self.whale_total_notional_usd > 0.0 {
+                    Some(total_notional / self.whale_total_notional_usd)
+                } else {
+                    None
+                };
+                VsWhaleStats {
+                    whale_fill_count: self.whale_fill_count,
+                    whale_buy_count: self.whale_buy_count,
+                    whale_sell_count: self.whale_sell_count,
+                    whale_total_notional_usd: self.whale_total_notional_usd,
+                    our_total_notional_usd: total_notional,
+                    notional_capture_ratio,
+                    directional_imbalance_count,
+                }
+            },
         }
     }
 
@@ -303,6 +385,10 @@ impl PaperReportWriter {
 
     pub fn output_path(&self) -> &Path {
         &self.output_path
+    }
+
+    pub fn started_at_ms(&self) -> u64 {
+        self.started_at_ms
     }
 }
 
@@ -363,6 +449,51 @@ mod tests {
         assert_eq!(summary.fills.maker_fraction, 0.0);
         assert_eq!(summary.edge.expected_edge_usd, 0.0);
         assert!(summary.edge.edge_capture_ratio.is_none());
+    }
+
+    #[test]
+    fn vs_whale_section_aggregates_whale_fills_and_capture_ratio() {
+        let mut writer = PaperReportWriter::new(
+            "vs-whale-test",
+            "shadow_live",
+            PathBuf::from("/tmp/_unused"),
+            1_000,
+        );
+        // Our fills: 2 buys, total notional 0.5*10 + 0.55*5 = 7.75
+        writer.record_fill(
+            &fill(TradeSide::Buy, 0.50, 10.0, FillLiquidity::Maker, 1_100),
+            None,
+        );
+        writer.record_fill(
+            &fill(TradeSide::Buy, 0.55, 5.0, FillLiquidity::Taker, 1_200),
+            None,
+        );
+        // Whale fills: 3 buys + 1 sell, total notional 100.0
+        writer.record_whale_fill_observed(1_050, Some("buy"), 30.0);
+        writer.record_whale_fill_observed(1_150, Some("Buy"), 40.0);
+        writer.record_whale_fill_observed(1_180, Some("buy"), 20.0);
+        writer.record_whale_fill_observed(1_220, Some("sell"), 10.0);
+
+        let summary = writer.summary();
+        assert_eq!(summary.vs_whale.whale_fill_count, 4);
+        assert_eq!(summary.vs_whale.whale_buy_count, 3);
+        assert_eq!(summary.vs_whale.whale_sell_count, 1);
+        assert!((summary.vs_whale.whale_total_notional_usd - 100.0).abs() < 1e-9);
+        assert!((summary.vs_whale.our_total_notional_usd - 7.75).abs() < 1e-9);
+        let cap = summary.vs_whale.notional_capture_ratio.expect("set");
+        assert!((cap - 0.0775).abs() < 1e-9);
+        // Our sells = 0 vs whale sells = 1; our buys = 2 vs whale buys = 3
+        // imbalance = |2-3| + |0-1| = 2
+        assert_eq!(summary.vs_whale.directional_imbalance_count, 2);
+    }
+
+    #[test]
+    fn vs_whale_section_handles_no_whale_data() {
+        let mut writer = PaperReportWriter::new("no-whale", "paper", PathBuf::from("/tmp/_unused"), 0);
+        writer.record_fill(&fill(TradeSide::Buy, 0.5, 1.0, FillLiquidity::Maker, 1), None);
+        let summary = writer.summary();
+        assert_eq!(summary.vs_whale.whale_fill_count, 0);
+        assert!(summary.vs_whale.notional_capture_ratio.is_none());
     }
 
     #[test]

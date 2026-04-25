@@ -135,6 +135,16 @@ pub struct AppConfig {
     /// snapshot record. Bigger = bigger files; smaller = less faithful
     /// replay. Default 10.
     pub book_snapshot_max_levels: usize,
+    /// Maker rebate coefficient. Applied as a negative fee on maker fills
+    /// in paper mode: `fee_usd = -notional * coeff * p * (1-p)`. Default
+    /// 0.0 (no rebate). Set to V2's actual maker-rebate value to model
+    /// economics realistically.
+    pub paper_maker_rebate_coeff: f64,
+    /// Taker fee coefficient override for paper mode. When None, the
+    /// strategy's `taker_fee_coeff()` is used (current behavior). When
+    /// Some, overrides for paper-mode fills only — useful for A/B
+    /// testing fee scenarios.
+    pub paper_taker_fee_coeff_override: Option<f64>,
 }
 
 impl AppConfig {
@@ -367,6 +377,14 @@ impl AppConfig {
         let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
         let book_snapshot_max_levels =
             parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
+        let paper_maker_rebate_coeff =
+            parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
+        let paper_taker_fee_coeff_override = std::env::var("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().parse::<f64>())
+            .transpose()
+            .map_err(|err| anyhow::anyhow!("invalid WHALE_PAIR_PAPER_TAKER_FEE_COEFF: {err}"))?;
 
         Ok(Self {
             service_name,
@@ -438,6 +456,8 @@ impl AppConfig {
             paper_report_path,
             book_snapshot_log_path,
             book_snapshot_max_levels,
+            paper_maker_rebate_coeff,
+            paper_taker_fee_coeff_override,
         })
     }
 

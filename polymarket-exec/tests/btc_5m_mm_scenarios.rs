@@ -142,6 +142,23 @@ enum ScenarioEvent {
         min_lines: usize,
         must_contain_kinds: Vec<String>,
     },
+    /// Cancel an outstanding order at the recorded timestamp. Used by the
+    /// late-fill-after-cancel scenario to exercise terminal_fill_correction
+    /// (Cancelled -> Filled when a late Fill event follows a Cancel).
+    Cancel {
+        at_ms: u64,
+        client_order_id: String,
+        #[serde(default)]
+        reason: String,
+    },
+    /// Phase 1 paper market close: drives runtime.plan_paper_close at the
+    /// recorded timestamp with the supplied resolution price. Exercises
+    /// the cancel-all + merge-paired + redeem-stranded settlement path.
+    PaperMarketClose {
+        at_ms: u64,
+        #[serde(default)]
+        resolution_price: Option<f64>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,6 +750,35 @@ fn run_fixture(name: &str) {
                 }
                 drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
             }
+            ScenarioEvent::Cancel {
+                at_ms,
+                client_order_id,
+                reason,
+            } => {
+                let coid = ClientOrderId::from(client_order_id.clone());
+                let outcome = runtime.on_order_cancelled(
+                    &coid,
+                    if reason.is_empty() { "scenario cancel" } else { reason.as_str() }
+                        .to_string(),
+                    *at_ms,
+                );
+                drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
+                for command in outcome.commands {
+                    journal.append_command(&command).unwrap();
+                }
+                drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
+            }
+            ScenarioEvent::PaperMarketClose {
+                at_ms,
+                resolution_price,
+            } => {
+                let outcome = runtime.plan_paper_close(*at_ms, *resolution_price);
+                drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
+                for command in outcome.commands {
+                    journal.append_command(&command).unwrap();
+                }
+                drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
+            }
             ScenarioEvent::Crash { at_ms: _, label: _ } => {}
             ScenarioEvent::Restart {
                 at_ms,
@@ -956,4 +1002,14 @@ fn unlawful_merge_stall_drives_cleanup_only_actions() {
 #[test]
 fn unlawful_late_window_only_reduce_only_cleanup() {
     run_fixture("unlawful_late_window_cleanup_only");
+}
+
+#[test]
+fn late_fill_after_cancel_applies_via_terminal_fill_correction() {
+    run_fixture("late_fill_after_cancel");
+}
+
+#[test]
+fn paper_market_close_with_redeem_settles_stranded_inventory() {
+    run_fixture("paper_market_close_with_redeem");
 }
