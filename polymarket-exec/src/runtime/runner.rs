@@ -114,7 +114,7 @@ impl ExecutionPolicy {
 }
 
 pub async fn run() -> Result<()> {
-    let config = AppConfig::from_env()?;
+    let mut config = AppConfig::from_env()?;
     match std::env::var("WHALE_PAIR_EXEC_MODE")
         .unwrap_or_default()
         .as_str()
@@ -122,8 +122,37 @@ pub async fn run() -> Result<()> {
         "live_smoke" => return run_live_smoke(config).await,
         "live_cancel" => return run_live_cancel(config).await,
         "live_reconcile" => return run_live_reconcile(config).await,
+        "shadow_live" => return run_shadow_live(config).await,
         _ => {}
     }
+    // Suppress unused-must-use mut warning when no shadow path is taken.
+    let _ = &mut config;
+    run_with_config(config).await
+}
+
+/// Phase 4 paper env: shadow-live mode. Connects live market_ws + spot_ws +
+/// (optional) user_ws and runs the full strategy decisioning loop, but
+/// forces paper_mode=true so every submit goes through PaperExecutionAdapter
+/// rather than the live CLOB. Operators use this to validate strategy
+/// behavior against the real book without exposing capital.
+///
+/// Per the design doc, the safety contract is: paper_mode is forced true
+/// at this entry point regardless of WHALE_PAIR_PAPER_MODE — even if the
+/// operator misconfigures the env, no live order can leave the engine.
+async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
+    if !config.paper_mode {
+        config.paper_mode = true;
+    }
+    info!(
+        target: "shadow_live.startup",
+        clob_api_url = %config.clob_api_url,
+        market_ws_url = %config.market_ws_url,
+        spot_ws_url = %config.spot_ws_url,
+        user_ws_url = %config.user_ws_url,
+        user_auth_present = config.user_auth.is_some(),
+        paper_report_path = ?config.paper_report_path,
+        "shadow-live mode engaged: live feeds, paper submits"
+    );
     run_with_config(config).await
 }
 
