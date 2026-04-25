@@ -121,6 +121,11 @@ pub struct AppConfig {
     /// Phase 2 paper env: window after a cancel request during which a late
     /// fill may still be applied. Default 500 ms.
     pub paper_cancel_race_window_ms: u64,
+    /// Phase 3 paper env: optional path for the per-session JSON report
+    /// card (`PaperReportSummary`). When set and `paper_mode` is true, the
+    /// runtime instantiates a `PaperReportWriter`, accumulates fill / edge
+    /// / reject metrics, and flushes on shutdown. None disables.
+    pub paper_report_path: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -349,6 +354,7 @@ impl AppConfig {
         }
         let paper_cancel_race_window_ms =
             parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
+        let paper_report_path = parse_path_optional("WHALE_PAIR_PAPER_REPORT_PATH");
 
         Ok(Self {
             service_name,
@@ -417,6 +423,7 @@ impl AppConfig {
             paper_queue_depth_fraction,
             paper_post_only_reject_probability,
             paper_cancel_race_window_ms,
+            paper_report_path,
         })
     }
 

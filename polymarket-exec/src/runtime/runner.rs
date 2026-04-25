@@ -446,6 +446,19 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
         .transpose()?;
+    let mut paper_report: Option<crate::paper::report::PaperReportWriter> =
+        if config.paper_mode {
+            config.paper_report_path.clone().map(|path| {
+                crate::paper::report::PaperReportWriter::new(
+                    runtime.run_id().to_string(),
+                    "paper",
+                    path,
+                    now_unix_ms(),
+                )
+            })
+        } else {
+            None
+        };
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -555,6 +568,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut runtime,
         &mut journal,
         &mut audit,
+        &mut paper_report,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -566,6 +580,22 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         strategy_name.as_str(),
     )
     .await?;
+    if let Some(report) = paper_report.as_ref() {
+        if let Err(error) = report.flush() {
+            warn!(
+                target: "paper_report.flush",
+                output = %report.output_path().display(),
+                error = %error,
+                "failed to flush paper report on shutdown"
+            );
+        } else {
+            info!(
+                target: "paper_report.flush",
+                output = %report.output_path().display(),
+                "paper report written"
+            );
+        }
+    }
 
     shutdown.cancel();
     join_task("market-ws", market_ws_handle).await;
@@ -672,6 +702,7 @@ async fn run_runtime_loop(
     runtime: &mut Runtime<StrategyMode>,
     journal: &mut Option<JournalWriter>,
     audit: &mut Option<AuditWriter>,
+    paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -786,6 +817,7 @@ async fn run_runtime_loop(
                                 execution_adapter.clone(),
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
+                                paper_report.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -832,6 +864,7 @@ async fn run_runtime_loop(
                             execution_adapter.clone(),
                             execution_policy,
                             &mut seen_venue_fill_keys,
+                            paper_report.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -876,6 +909,7 @@ async fn run_runtime_loop(
                                 execution_adapter.clone(),
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
+                                paper_report.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1589,6 +1623,7 @@ async fn execute_execution_adapter(
     execution_adapter: Arc<dyn ExecutionAdapter>,
     execution_policy: &ExecutionPolicy,
     seen_venue_fill_keys: &mut HashSet<String>,
+    paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -1597,6 +1632,15 @@ async fn execute_execution_adapter(
 
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+    let mut paper_report = paper_report;
+
+    fn book_mid(book: &BookState) -> Option<f64> {
+        if book.best_bid > 0.0 && book.best_ask > 0.0 {
+            Some((book.best_bid + book.best_ask) * 0.5)
+        } else {
+            None
+        }
+    }
 
     if !execution_policy.paper_mode {
         let report = sync_execution_state(
@@ -1669,6 +1713,16 @@ async fn execute_execution_adapter(
                         continue;
                     };
                     if paper_post_only_should_reject(&intent, &book, execution_policy) {
+                        if let Some(reporter) = paper_report.as_deref_mut() {
+                            reporter.record_reject(
+                                &intent.client_order_id,
+                                &intent.market_id,
+                                &intent.instrument_id,
+                                intent.limit_price,
+                                "post-only-cross-paper",
+                                observed_at_ms,
+                            );
+                        }
                         paper_order_ctx.remove(&intent.client_order_id);
                         let reject_outcome = runtime.on_order_rejected(
                             &intent.client_order_id,
@@ -1681,6 +1735,18 @@ async fn execute_execution_adapter(
                             queue.push_back(command);
                         }
                         continue;
+                    }
+                    let mid_at_submit = book_mid(&book);
+                    if let (Some(reporter), Some(mid)) =
+                        (paper_report.as_deref_mut(), mid_at_submit)
+                    {
+                        reporter.record_submit_edge(
+                            intent.side,
+                            intent.limit_price,
+                            intent.quantity,
+                            mid,
+                            observed_at_ms,
+                        );
                     }
                     let ctx = paper_order_context_mut(paper_order_ctx, &intent, observed_at_ms);
 
@@ -1701,6 +1767,9 @@ async fn execute_execution_adapter(
                                 None
                             },
                         );
+                        if let Some(reporter) = paper_report.as_deref_mut() {
+                            reporter.record_fill(&fill, mid_at_submit);
+                        }
                         let fill_outcome = runtime.on_fill(fill)?;
                         let chained_commands = fill_outcome.commands.clone();
                         combined.extend(fill_outcome);
@@ -3133,6 +3202,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3203,6 +3273,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3242,6 +3313,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3301,6 +3373,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3373,6 +3446,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3455,6 +3529,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3526,6 +3601,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3587,6 +3663,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3668,6 +3745,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
