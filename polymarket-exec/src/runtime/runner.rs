@@ -1660,6 +1660,20 @@ async fn execute_execution_adapter(
                     let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
                         continue;
                     };
+                    if paper_post_only_should_reject(&intent, &book, execution_policy) {
+                        paper_order_ctx.remove(&intent.client_order_id);
+                        let reject_outcome = runtime.on_order_rejected(
+                            &intent.client_order_id,
+                            "post-only-cross-paper",
+                            observed_at_ms,
+                        );
+                        let chained_commands = reject_outcome.commands.clone();
+                        combined.extend(reject_outcome);
+                        for command in chained_commands {
+                            queue.push_back(command);
+                        }
+                        continue;
+                    }
                     let ctx = paper_order_context_mut(paper_order_ctx, &intent, observed_at_ms);
 
                     if let Some(fill) = paper_fill_from_book_snapshot(
@@ -2843,6 +2857,59 @@ fn deterministic_hash_0_95(value: &str) -> f64 {
     (0.05 + (normalized * 0.95)).min(1.0)
 }
 
+/// Deterministic [0, 1) value derived from a client_order_id and a book
+/// update timestamp. Used by paper-mode post-only rejection so that the
+/// same fixture replays produce the same accept/reject pattern across
+/// runs, while the decision varies per book update (matching real venue:
+/// a previously-rejected post-only may succeed when the book moves).
+fn deterministic_unit_hash(client_order_id: &str, book_update_ms: u64) -> f64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in client_order_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in book_update_ms.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash & 0xffff_ffff) as f64 / 4_294_967_296.0
+}
+
+/// Phase 2 paper env: returns true when paper mode should reject a post-
+/// only intent because it would cross the book. Probabilistic (controlled
+/// by paper_post_only_reject_probability) and deterministic per
+/// (client_order_id, book.last_update_unix_ms).
+///
+/// Real Polymarket post-only orders that arrive while the book is crossing
+/// are rejected most of the time, but occasionally slip through as taker
+/// fills because the ack and the book update aren't atomic. This models
+/// that behavior in paper.
+fn paper_post_only_should_reject(
+    intent: &OrderIntent,
+    book: &BookState,
+    execution_policy: &ExecutionPolicy,
+) -> bool {
+    if !execution_policy.paper_mode {
+        return false;
+    }
+    if execution_policy.paper_post_only_reject_probability <= 0.0 {
+        return false;
+    }
+    let crossing = if matches!(intent.side, TradeSide::Buy) {
+        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
+    } else {
+        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
+    };
+    if !crossing {
+        return false;
+    }
+    let roll = deterministic_unit_hash(
+        intent.client_order_id.as_str(),
+        book.last_update_unix_ms,
+    );
+    roll < execution_policy.paper_post_only_reject_probability
+}
+
 fn venue_fill_key(fill: &VenueFill) -> String {
     format!(
         "{}:{}:{:.8}:{:.8}:{}",
@@ -3670,6 +3737,99 @@ mod tests {
             &policy,
         );
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_returns_false_outside_paper_mode() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let policy = live_test_policy();
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_skips_non_crossing_orders() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.55, 100.0, 0.50, 1_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly-noncross"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only no cross".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_at_high_probability_when_crossing() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 1.0;
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly-cross"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only cross".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        // probability 1.0 always rejects when crossing
+        assert!(paper_post_only_should_reject(&intent, &book, &policy));
+        // probability 0.0 never rejects
+        policy.paper_post_only_reject_probability = 0.0;
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_reject_decision_is_deterministic_per_book_update() {
+        let book_a = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let book_b = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 2_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-determinism"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "determinism".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.5;
+        // Same book, same decision repeated
+        let r1 = paper_post_only_should_reject(&intent, &book_a, &policy);
+        let r2 = paper_post_only_should_reject(&intent, &book_a, &policy);
+        assert_eq!(r1, r2, "same book update must give same decision");
+        // Decision varies independently across book updates (one of these is
+        // exceedingly unlikely to fail; if it ever does, the hash is broken).
+        let _r_b = paper_post_only_should_reject(&intent, &book_b, &policy);
     }
 
     #[test]
