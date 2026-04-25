@@ -83,6 +83,10 @@ struct ExecutionPolicy {
     paper_min_fill_interval_ms: u64,
     paper_market_close_at_ms: Option<u64>,
     paper_market_resolution_price: Option<f64>,
+    paper_submit_latency_ms: u64,
+    paper_queue_depth_fraction: f64,
+    paper_post_only_reject_probability: f64,
+    paper_cancel_race_window_ms: u64,
 }
 
 impl ExecutionPolicy {
@@ -101,6 +105,10 @@ impl ExecutionPolicy {
             paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
             paper_market_close_at_ms: config.paper_market_close_at_ms,
             paper_market_resolution_price: config.paper_market_resolution_price,
+            paper_submit_latency_ms: config.paper_submit_latency_ms,
+            paper_queue_depth_fraction: config.paper_queue_depth_fraction,
+            paper_post_only_reject_probability: config.paper_post_only_reject_probability,
+            paper_cancel_race_window_ms: config.paper_cancel_race_window_ms,
         }
     }
 }
@@ -2640,6 +2648,12 @@ fn paper_fill_from_book_snapshot(
     if order_ctx.fill_count >= execution_policy.paper_max_fills_per_order {
         return None;
     }
+    if execution_policy.paper_submit_latency_ms > 0
+        && observed_at_ms.saturating_sub(order_ctx.arrival_ms)
+            < execution_policy.paper_submit_latency_ms
+    {
+        return None;
+    }
     if order_ctx.last_fill_ms > 0
         && observed_at_ms.saturating_sub(order_ctx.last_fill_ms)
             < execution_policy.paper_min_fill_interval_ms
@@ -3627,10 +3641,12 @@ mod tests {
             last_fill_book_update_ms: 0,
             fill_count: 0,
         };
+        // Past the paper_submit_latency_ms gate (Phase 2 conservative model).
+        let after_latency_ms = now_ms + policy.paper_submit_latency_ms + 50;
         let first = paper_fill_from_book_snapshot(
             &book,
             &intent,
-            now_ms,
+            after_latency_ms,
             0.0,
             &mut ctx,
             intent.quantity,
@@ -3641,13 +3657,80 @@ mod tests {
         let second = paper_fill_from_book_snapshot(
             &book,
             &intent,
-            now_ms + 1_000,
+            after_latency_ms + 1_000,
             0.0,
             &mut ctx,
             intent.quantity - first.quantity,
             &policy,
         );
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn paper_submit_latency_gate_suppresses_fill_until_window_passes() {
+        let now_ms = now_unix_ms();
+        let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-latency"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 20.0,
+            reduce_only: false,
+            reason: "test latency gate".to_string(),
+            quote_level_tag: None,
+            created_at_ms: now_ms,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        assert!(
+            policy.paper_submit_latency_ms >= 100,
+            "test assumes default >= 100ms; got {}",
+            policy.paper_submit_latency_ms
+        );
+        let mut ctx = PaperOrderContext {
+            arrival_ms: now_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: now_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+        };
+        // Within latency window: suppressed.
+        let inside = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms + policy.paper_submit_latency_ms - 1,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(
+            inside.is_none(),
+            "expected no fill inside latency window, got {inside:?}"
+        );
+        // Past latency window with fresh book update: allowed.
+        let later_book = BookState::from_top_of_book(
+            "token-1",
+            0.48,
+            100.0,
+            0.50,
+            100.0,
+            0.50,
+            now_ms + policy.paper_submit_latency_ms + 50,
+        );
+        let outside = paper_fill_from_book_snapshot(
+            &later_book,
+            &intent,
+            now_ms + policy.paper_submit_latency_ms + 50,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(outside.is_some(), "expected fill past latency window");
     }
 
     fn live_test_policy() -> ExecutionPolicy {
@@ -3665,6 +3748,10 @@ mod tests {
             paper_min_fill_interval_ms: 750,
             paper_market_close_at_ms: None,
             paper_market_resolution_price: None,
+            paper_submit_latency_ms: 150,
+            paper_queue_depth_fraction: 0.75,
+            paper_post_only_reject_probability: 0.85,
+            paper_cancel_race_window_ms: 500,
         }
     }
 
