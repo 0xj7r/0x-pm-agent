@@ -411,6 +411,21 @@ impl<S: Strategy> Runtime<S> {
         stale_after_ms: u64,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        // Bug fix: drift block (markets_with_unresolved_drift) is in-memory
+        // only and is reinitialized empty on every restart. Until the next
+        // venue reconcile fires, the engine could accept fresh entries in
+        // markets where the venue has stranded inventory. Log a warning so
+        // operators know the drift state is uninitialized, and the
+        // existing live-mode startup gating remains the primary safeguard
+        // (live_smoke / live_reconcile / has_needs_reconcile_orders fail-
+        // closed paths in run_with_config).
+        warn!(
+            run_id = %self.run_id,
+            "recover_from_store: drift block state is in-memory and not \
+             persisted; first reconcile_venue_positions call after restart \
+             will repopulate it. Until then, fresh entry in drifted markets \
+             is gated only by live-mode startup checks, not by drift block."
+        );
         let Some(order_store) = self.order_store.as_mut() else {
             return outcome;
         };
