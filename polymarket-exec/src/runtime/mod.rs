@@ -37,8 +37,8 @@ use crate::strategy::{
     UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot,
 };
 use crate::types::{
-    ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot,
-    MergeIntent, OrderId, OrderIntent, TradeSide,
+    ClientOrderId, CloseMethod, EpochMillis, FillLiquidity, FillReport, InstrumentId, MarketId,
+    MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 use serde::Serialize;
@@ -567,6 +567,153 @@ impl<S: Strategy> Runtime<S> {
 
     pub fn stranded_inventory(&self) -> Vec<StrandedMarketInventory> {
         self.inventory.stranded_market_inventory()
+    }
+
+    /// Paper-mode market close handler. When the runtime clock crosses
+    /// `paper_market_close_at_ms`, the runner calls this once. It returns a
+    /// `RuntimeOutcome` containing:
+    ///
+    /// 1. `RuntimeCommand::Cancel` for every currently-open order.
+    /// 2. `RuntimeCommand::Merge` for every market with paired inventory
+    ///    (via `plan_merge_command_for_market`).
+    /// 3. Synthetic `FillReport`s with `CloseMethod::Redeem` applied for each
+    ///    stranded position at `resolution_price` (0.0 = "no" wins, 1.0 = "yes"
+    ///    wins, 0.5 = unknown). When `resolution_price` is None and stranded
+    ///    inventory exists, an Inventory event is logged but the inventory is
+    ///    NOT settled (operator must intervene).
+    /// 4. A single Runtime event marking the close.
+    ///
+    /// Phase 1 of the paper environment design doc
+    /// (docs/architecture/2026-04-25-paper-env-design.md).
+    pub fn plan_paper_close(
+        &mut self,
+        now_ms: EpochMillis,
+        resolution_price: Option<f64>,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+
+        let open_coids: Vec<(ClientOrderId, MarketId, InstrumentId)> = self
+            .open_orders
+            .iter()
+            .map(|(coid, managed)| {
+                (
+                    coid.clone(),
+                    managed.intent.market_id.clone(),
+                    managed.intent.instrument_id.clone(),
+                )
+            })
+            .collect();
+        for (coid, market_id, instrument_id) in open_coids {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "paper market close: cancelling open order",
+                    )
+                    .with_market(market_id)
+                    .with_instrument(instrument_id)
+                    .with_client_order(coid.clone()),
+                ),
+            );
+            outcome.push_command(RuntimeCommand::Cancel {
+                client_order_id: coid,
+                reason: "paper market close".to_string(),
+            });
+        }
+
+        let paired_market_ids: Vec<MarketId> = self
+            .inventory
+            .stranded_market_inventory()
+            .iter()
+            .filter(|s| s.paired_quantity > 1e-9)
+            .map(|s| s.market_id.clone())
+            .collect();
+        let mut all_market_ids: std::collections::HashSet<MarketId> =
+            self.inventory.positions().map(|p| p.market_id.clone()).collect();
+        for mid in paired_market_ids {
+            outcome.extend(self.plan_merge_command_for_market(
+                &mid,
+                now_ms,
+                "paper market close",
+            ));
+            all_market_ids.remove(&mid);
+        }
+
+        let stranded = self.inventory.stranded_market_inventory();
+        for strand in stranded {
+            for position in &strand.stranded_positions {
+                if position.quantity.abs() <= 1e-9 {
+                    continue;
+                }
+                match resolution_price {
+                    Some(price) => {
+                        let synthetic_fill = FillReport {
+                            order_id: None,
+                            client_order_id: None,
+                            market_id: strand.market_id.clone(),
+                            instrument_id: position.instrument_id.clone(),
+                            side: TradeSide::Sell,
+                            price,
+                            quantity: position.quantity,
+                            fee_usd: 0.0,
+                            liquidity: FillLiquidity::Unknown,
+                            close_method: Some(CloseMethod::Redeem),
+                            observed_at_ms: now_ms,
+                        };
+                        match self.on_fill(synthetic_fill) {
+                            Ok(fill_outcome) => outcome.extend(fill_outcome),
+                            Err(error) => {
+                                outcome.push_event(
+                                    self.event_log.push(
+                                        EventRecord::new(
+                                            EventCategory::Inventory,
+                                            now_ms,
+                                            format!(
+                                                "paper market close: redeem fill rejected: {error}"
+                                            ),
+                                        )
+                                        .with_market(strand.market_id.clone())
+                                        .with_instrument(position.instrument_id.clone()),
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        outcome.push_event(
+                            self.event_log.push(
+                                EventRecord::new(
+                                    EventCategory::Inventory,
+                                    now_ms,
+                                    format!(
+                                        "paper market close: stranded position requires \
+                                         resolution_price (qty={:.8}); operator must settle manually",
+                                        position.quantity
+                                    ),
+                                )
+                                .with_market(strand.market_id.clone())
+                                .with_instrument(position.instrument_id.clone()),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        outcome.push_event(
+            self.event_log.push(EventRecord::new(
+                EventCategory::Runtime,
+                now_ms,
+                format!(
+                    "paper market close at_ms={now_ms} resolution_price={:?} \
+                     (Phase 1 paper env)",
+                    resolution_price
+                ),
+            )),
+        );
+
+        outcome
     }
 
     pub fn plan_merge_command_for_market(
@@ -3213,6 +3360,52 @@ mod tests {
             .find(|managed| managed.intent.client_order_id == hedge_client_order_id)
             .expect("hedge order kept");
         assert_eq!(remaining.status, ManagedOrderStatus::PendingSubmit);
+    }
+
+    #[test]
+    fn plan_paper_close_cancels_open_orders_and_logs_close_event() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let order_a = btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.55);
+        let order_b = btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44);
+        let coid_a = order_a.client_order_id.clone();
+        let coid_b = order_b.client_order_id.clone();
+        runtime.accept_intent(order_a, 1);
+        runtime.accept_intent(order_b, 1);
+        assert_eq!(runtime.open_orders().count(), 2);
+
+        let close_outcome = runtime.plan_paper_close(1_500, Some(0.5));
+
+        let cancels: Vec<&ClientOrderId> = close_outcome
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RuntimeCommand::Cancel { client_order_id, .. } => Some(client_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancels.len(),
+            2,
+            "expected cancel for both open orders, got commands {:?}",
+            close_outcome.commands
+        );
+        assert!(cancels.contains(&&coid_a));
+        assert!(cancels.contains(&&coid_b));
+        assert!(
+            !close_outcome.event_seqs.is_empty(),
+            "expected at least the paper-market-close summary event"
+        );
     }
 
     #[test]

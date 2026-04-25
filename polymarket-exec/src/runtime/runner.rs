@@ -689,6 +689,7 @@ async fn run_runtime_loop(
     let mut spot_events_open = true;
     let mut user_events_open = true;
     let mut seen_venue_fill_keys = HashSet::<String>::new();
+    let mut paper_market_closed = false;
 
     loop {
         tokio::select! {
@@ -748,6 +749,58 @@ async fn run_runtime_loop(
             _ = ticks.tick() => {
                 let _timer = metrics.runtime_loop_timer();
                 metrics.refresh_stream_ages();
+                if execution_policy.paper_mode && !paper_market_closed {
+                    if let Some(close_at_ms) = execution_policy.paper_market_close_at_ms {
+                        let now = now_unix_ms();
+                        if now >= close_at_ms {
+                            paper_market_closed = true;
+                            info!(
+                                target: "paper_env.market_close",
+                                close_at_ms,
+                                now_ms = now,
+                                resolution_price = ?execution_policy.paper_market_resolution_price,
+                                "paper market close triggered"
+                            );
+                            let close_outcome = runtime.plan_paper_close(
+                                now,
+                                execution_policy.paper_market_resolution_price,
+                            );
+                            let combined = execute_execution_adapter(
+                                runtime,
+                                books,
+                                &config.market_assets,
+                                paper_fee_coeff,
+                                metrics.as_ref(),
+                                close_outcome,
+                                paper_order_ctx,
+                                execution_venue_map,
+                                live_safety,
+                                execution_adapter.clone(),
+                                execution_policy,
+                                &mut seen_venue_fill_keys,
+                            )
+                            .await?;
+                            persist_runtime_outcome(
+                                journal,
+                                runtime.event_log(),
+                                "paper-market-close",
+                                combined.clone(),
+                            )?;
+                            persist_audit_outcome(audit, "paper-market-close", runtime, &combined)?;
+                            refresh_dashboard_state(
+                                runtime,
+                                books,
+                                metrics.as_ref(),
+                                &config,
+                                dashboard.clone(),
+                                &config.market_assets,
+                                strategy_name,
+                                dashboard_event_limit,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 if !config.paper_mode {
                     let health_outcome = enforce_live_health(
                         runtime,
@@ -3610,6 +3663,8 @@ mod tests {
             paper_min_fill_notional_usd: 0.05,
             paper_max_fills_per_order: 3,
             paper_min_fill_interval_ms: 750,
+            paper_market_close_at_ms: None,
+            paper_market_resolution_price: None,
         }
     }
 
