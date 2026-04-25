@@ -106,6 +106,7 @@ pub fn load_user_auth() -> Option<UserWsAuth> {
             .ok()
             .filter(|value| !value.trim().is_empty()),
         funder_address: env::var("POLYMARKET_FUNDER_ADDRESS")
+            .or_else(|_| env::var("POLYMARKET_FUNDER"))
             .ok()
             .filter(|value| !value.trim().is_empty()),
     })

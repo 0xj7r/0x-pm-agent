@@ -88,6 +88,7 @@ transaction with `POLYMARKET_PRIVATE_KEY`; the relayer key authenticates the
 app/builder submission. The inventory-holding wallet must be correct:
 `POLYMARKET_FUNDER_ADDRESS` or `POLYMARKET_PROXY_WALLET_ADDRESS` should point
 at the Polymarket proxy wallet that owns the outcome tokens.
+The legacy env alias `POLYMARKET_FUNDER` is also accepted.
 
 Optional venue overrides:
 
