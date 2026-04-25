@@ -173,6 +173,40 @@ async fn run_live_reconcile(config: AppConfig) -> Result<()> {
         observed_at_ms = balances.observed_at_ms,
         "live reconcile balances synced"
     );
+
+    let mut seen_conditions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for position in &balances.positions {
+        let Some(condition_id) = position
+            .condition_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !seen_conditions.insert(condition_id.to_string()) {
+            continue;
+        }
+        match adapter.fetch_market_metadata(condition_id).await {
+            Ok(md) => info!(
+                target: "live_reconcile.venue_metadata",
+                condition_id = %md.condition_id,
+                minimum_order_size = md.minimum_order_size,
+                minimum_tick_size = md.minimum_tick_size,
+                neg_risk = md.neg_risk,
+                active = md.active,
+                closed = md.closed,
+                "venue metadata (compare against strategy hardcoded sizing — Q6)"
+            ),
+            Err(error) => warn!(
+                target: "live_reconcile.venue_metadata",
+                condition_id = %condition_id,
+                error = %error,
+                "failed to fetch venue metadata for known position"
+            ),
+        }
+    }
     Ok(())
 }
 
