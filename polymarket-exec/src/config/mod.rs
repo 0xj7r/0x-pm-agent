@@ -107,6 +107,20 @@ pub struct AppConfig {
     /// "yes" wins, 0.5 = unknown / split. Required only if there is
     /// stranded (non-paired) inventory at close.
     pub paper_market_resolution_price: Option<f64>,
+    /// Phase 2 paper env: minimum ms between submit ack and the first fill
+    /// attempt. Forces the book to update at least once after the simulated
+    /// round-trip before a fill can be considered. Default 150 ms.
+    pub paper_submit_latency_ms: u64,
+    /// Phase 2 paper env: assumed queue position as a fraction of top-of-book
+    /// size. 0.75 means we assume we are 75% back in the queue (conservative).
+    /// Default 0.75.
+    pub paper_queue_depth_fraction: f64,
+    /// Phase 2 paper env: probability of post-only rejection in paper mode
+    /// when the order would cross the book. Default 0.85.
+    pub paper_post_only_reject_probability: f64,
+    /// Phase 2 paper env: window after a cancel request during which a late
+    /// fill may still be applied. Default 500 ms.
+    pub paper_cancel_race_window_ms: u64,
 }
 
 impl AppConfig {
@@ -317,6 +331,24 @@ impl AppConfig {
                         })
                 })
                 .transpose()?;
+        let paper_submit_latency_ms =
+            parse_duration_ms("WHALE_PAIR_PAPER_SUBMIT_LATENCY_MS", 150)?.as_millis() as u64;
+        let paper_queue_depth_fraction =
+            parse_f64("WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
+        if !(0.0..=1.0).contains(&paper_queue_depth_fraction) {
+            anyhow::bail!(
+                "WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION must be in [0.0, 1.0], got {paper_queue_depth_fraction}"
+            );
+        }
+        let paper_post_only_reject_probability =
+            parse_f64("WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY", 0.85)?;
+        if !(0.0..=1.0).contains(&paper_post_only_reject_probability) {
+            anyhow::bail!(
+                "WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY must be in [0.0, 1.0], got {paper_post_only_reject_probability}"
+            );
+        }
+        let paper_cancel_race_window_ms =
+            parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
 
         Ok(Self {
             service_name,
@@ -381,6 +413,10 @@ impl AppConfig {
             paper_min_fill_interval,
             paper_market_close_at_ms,
             paper_market_resolution_price,
+            paper_submit_latency_ms,
+            paper_queue_depth_fraction,
+            paper_post_only_reject_probability,
+            paper_cancel_race_window_ms,
         })
     }
 
