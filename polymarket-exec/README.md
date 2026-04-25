@@ -65,6 +65,42 @@ cargo check -p polymarket-exec
 cargo test -p polymarket-exec
 ```
 
+## Tiny-Live Merge/Recycling
+
+The strategy is not live-faithful unless paired inventory can be recycled. The
+live adapter now carries `condition_id` from Polymarket Data API positions into
+merge intents and submits proxy-wallet CTF `mergePositions` through the
+Polymarket builder relayer when configured.
+
+Required live env for proxy-wallet merge:
+
+```bash
+POLYMARKET_SIGNATURE_TYPE=proxy
+POLYMARKET_PRIVATE_KEY=...
+POLYMARKET_FUNDER_ADDRESS=...
+RELAYER_API_KEY=...
+RELAYER_API_KEY_ADDRESS=...
+```
+
+`RELAYER_API_KEY_ADDRESS` is the address that owns the relayer key. It does
+not have to be the same as the bot signer. The bot still signs the relayed CTF
+transaction with `POLYMARKET_PRIVATE_KEY`; the relayer key authenticates the
+app/builder submission. The inventory-holding wallet must be correct:
+`POLYMARKET_FUNDER_ADDRESS` or `POLYMARKET_PROXY_WALLET_ADDRESS` should point
+at the Polymarket proxy wallet that owns the outcome tokens.
+
+Optional venue overrides:
+
+```bash
+POLYMARKET_RELAYER_URL=https://relayer-v2.polymarket.com
+POLYMARKET_CTF_CONTRACT_ADDRESS=0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+POLYMARKET_COLLATERAL_TOKEN_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+POLYMARKET_COLLATERAL_DECIMALS=6
+```
+
+If relayer credentials or `condition_id` are missing, live merge fails closed
+and the runtime degrades rather than continuing to add exposure.
+
 ## Systemd operation
 
 Install templates and env scaffolding:

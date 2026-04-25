@@ -44,6 +44,13 @@ pub struct AppConfig {
     pub metrics_bind: SocketAddr,
     pub clob_api_url: String,
     pub data_api_url: String,
+    pub relayer_url: String,
+    pub relayer_api_key: Option<String>,
+    pub relayer_api_key_address: Option<String>,
+    pub ctf_contract_address: String,
+    pub collateral_token_address: String,
+    pub collateral_decimals: u8,
+    pub proxy_wallet_address: Option<String>,
     pub market_ws_url: String,
     pub user_ws_url: String,
     pub spot_ws_url: String,
@@ -108,6 +115,30 @@ impl AppConfig {
         let metrics_bind = parse_socket_addr("WHALE_PAIR_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
         let clob_api_url = env_or("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com");
         let data_api_url = env_or("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com");
+        let relayer_url = env_or(
+            "POLYMARKET_RELAYER_URL",
+            crate::wire::relayer::DEFAULT_RELAYER_URL,
+        );
+        let relayer_api_key = env::var("RELAYER_API_KEY")
+            .or_else(|_| env::var("POLYMARKET_RELAYER_API_KEY"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let relayer_api_key_address = env::var("RELAYER_API_KEY_ADDRESS")
+            .or_else(|_| env::var("POLYMARKET_RELAYER_API_KEY_ADDRESS"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let ctf_contract_address = env_or(
+            "POLYMARKET_CTF_CONTRACT_ADDRESS",
+            crate::wire::relayer::DEFAULT_CTF_ADDRESS,
+        );
+        let collateral_token_address = env_or(
+            "POLYMARKET_COLLATERAL_TOKEN_ADDRESS",
+            crate::wire::relayer::DEFAULT_USDCE_ADDRESS,
+        );
+        let collateral_decimals = parse_usize("POLYMARKET_COLLATERAL_DECIMALS", 6)? as u8;
+        let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
         let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v1");
         let clob_v2_builder_code = env_or(
             "POLYMARKET_CLOB_V2_BUILDER_CODE",
@@ -248,6 +279,13 @@ impl AppConfig {
             metrics_bind,
             clob_api_url,
             data_api_url,
+            relayer_url,
+            relayer_api_key,
+            relayer_api_key_address,
+            ctf_contract_address,
+            collateral_token_address,
+            collateral_decimals,
+            proxy_wallet_address,
             market_ws_url,
             user_ws_url,
             spot_ws_url,

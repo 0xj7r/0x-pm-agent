@@ -107,6 +107,7 @@ pub struct InventorySnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VenuePositionSnapshot {
     pub market_id: MarketId,
+    pub condition_id: Option<String>,
     pub instrument_id: InstrumentId,
     pub quantity: f64,
     pub average_cost_usd: f64,
@@ -818,6 +819,7 @@ mod tests {
             .reconcile_venue_positions(
                 &[VenuePositionSnapshot {
                     market_id: MarketId::from("market-a"),
+                    condition_id: None,
                     instrument_id: InstrumentId::from("token-down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
@@ -856,6 +858,7 @@ mod tests {
                 &[
                     VenuePositionSnapshot {
                         market_id: MarketId::from("market-a"),
+                        condition_id: None,
                         instrument_id: InstrumentId::from("token-up"),
                         quantity: 5.0,
                         average_cost_usd: 0.80,
@@ -864,6 +867,7 @@ mod tests {
                     },
                     VenuePositionSnapshot {
                         market_id: MarketId::from("market-a"),
+                        condition_id: None,
                         instrument_id: InstrumentId::from("token-down"),
                         quantity: 6.5,
                         average_cost_usd: 0.18,

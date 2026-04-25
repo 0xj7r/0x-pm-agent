@@ -72,6 +72,7 @@ impl MergeExecutor {
                 market_id, candidate.paired_qty, now_ms
             )),
             market_id: market_id.clone(),
+            condition_id: None,
             yes_instrument_id,
             no_instrument_id,
             quantity: candidate.paired_qty,
