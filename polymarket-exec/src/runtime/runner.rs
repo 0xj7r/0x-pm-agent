@@ -2729,10 +2729,16 @@ fn paper_fill_from_book_snapshot(
         if remaining <= 0.0 {
             break;
         }
+        // Phase 2 paper env: replace opaque queue_bias with explicit
+        // queue-depth-fraction model. Non-crossing maker orders can claim
+        // (1.0 - paper_queue_depth_fraction) of top-level size, representing
+        // the fraction of the queue ahead of us that has already cleared.
+        // Default 0.75 → we claim 25% of top-of-book per fill attempt.
+        // Reference: Moallemi-Yuan queue position valuation.
         let level_ratio = if crossing {
             1.0
         } else if idx == 0 {
-            0.9 * order_ctx.queue_bias
+            (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0)
         } else {
             0.0
         };
