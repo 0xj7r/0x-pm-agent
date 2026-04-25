@@ -223,6 +223,37 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
             last_trade: record.last_trade,
         }
         .into_book_state();
+        // Retry-fill loop: attempt fills against this book on any existing
+        // open order in the same instrument that hasn't filled yet.
+        // Mirrors the production retry loop in execute_execution_adapter.
+        let asset_instrument = InstrumentId::from(asset.as_str());
+        let retry_targets: Vec<crate::runtime::types::ManagedOrder> = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .filter(|m| m.intent.instrument_id == asset_instrument && m.remaining_qty() > 1e-9)
+            .collect();
+        for managed in retry_targets {
+            let intent = managed.intent.clone();
+            let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+                Some((book.best_bid + book.best_ask) * 0.5)
+            } else {
+                None
+            };
+            let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
+            if let Some(fill) = paper_fill_from_book_snapshot(
+                &book,
+                &intent,
+                record.t,
+                0.0,
+                ctx,
+                managed.remaining_qty(),
+                &execution_policy,
+            ) {
+                report.record_fill(&fill, mid_at_submit);
+                fills += 1;
+                runtime.on_fill(fill)?;
+            }
+        }
         let market_id = MarketId::from(config.market_id_for_asset(&asset));
         let instrument_id = InstrumentId::from(asset.as_str());
 
