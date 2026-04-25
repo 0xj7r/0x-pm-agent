@@ -34,8 +34,8 @@ use crate::wire::api::{
     DashboardSnapshot, DashboardUiState,
 };
 use crate::wire::execution_adapter::{
-    CancelOrderRequest, ExecutionAdapter, PaperExecutionAdapter, SubmitOrderRequest, TimeInForce,
-    VenueFill, VenuePosition,
+    CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
+    SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -1501,7 +1501,7 @@ async fn execute_execution_adapter(
             observed_at_ms,
         )
         .await;
-        apply_sync_report(
+        let sync_outcome = apply_sync_report(
             runtime,
             metrics,
             live_safety,
@@ -1509,21 +1509,23 @@ async fn execute_execution_adapter(
             market_assets,
             report,
             observed_at_ms,
-            &mut combined,
         );
+        stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
         let needs_reconcile_quarantine_age_ms = execution_policy
             .live_reconcile_missing_grace_ms
             .saturating_mul(2)
             .max(10_000);
-        combined.extend(runtime.quarantine_stale_needs_reconcile_orders(
+        let quarantine_outcome = runtime.quarantine_stale_needs_reconcile_orders(
             observed_at_ms,
             needs_reconcile_quarantine_age_ms,
-        ));
-        combined.extend(cancel_stale_live_orders(
+        );
+        stage_outcome_commands(&mut combined, &mut queue, quarantine_outcome);
+        let stale_cancel_outcome = cancel_stale_live_orders(
             runtime,
             observed_at_ms,
             execution_policy.live_order_max_age_ms,
-        ));
+        );
+        stage_outcome_commands(&mut combined, &mut queue, stale_cancel_outcome);
         let mut dedupe = HashSet::new();
         for managed in runtime.open_order_snapshots() {
             if managed.remaining_qty() <= 0.0 {
@@ -1624,7 +1626,7 @@ async fn execute_execution_adapter(
                             observed_at_ms,
                         )
                         .await;
-                        apply_sync_report(
+                        let sync_outcome = apply_sync_report(
                             runtime,
                             metrics,
                             live_safety,
@@ -1632,8 +1634,8 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             observed_at_ms,
-                            &mut combined,
                         );
+                        stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
                         let reason = ack
@@ -1770,7 +1772,7 @@ async fn execute_execution_adapter(
                             observed_at_ms,
                         )
                         .await;
-                        apply_sync_report(
+                        let sync_outcome = apply_sync_report(
                             runtime,
                             metrics,
                             live_safety,
@@ -1778,8 +1780,8 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             observed_at_ms,
-                            &mut combined,
                         );
+                        stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
                         let reason = ack
@@ -1822,7 +1824,7 @@ async fn execute_execution_adapter(
                             ack.accepted_at_ms,
                         )
                         .await;
-                        apply_sync_report(
+                        let sync_outcome = apply_sync_report(
                             runtime,
                             metrics,
                             live_safety,
@@ -1830,8 +1832,8 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             ack.accepted_at_ms,
-                            &mut combined,
                         );
+                        stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Err(error) => {
                         live_safety.consecutive_cancel_errors =
@@ -1891,15 +1893,68 @@ async fn execute_execution_adapter(
                     continue;
                 }
 
-                warn!(
-                    mode = "live",
-                    market_id = %intent.market_id,
-                    yes_instrument_id = %intent.yes_instrument_id,
-                    no_instrument_id = %intent.no_instrument_id,
-                    quantity = intent.quantity,
-                    command_id = %intent.command_id,
-                    "merge command planned but live relayer submission is not implemented"
-                );
+                let merge_req = MergePositionsRequest {
+                    command_id: intent.command_id.clone(),
+                    market_id: intent.market_id.clone(),
+                    yes_instrument_id: intent.yes_instrument_id.clone(),
+                    no_instrument_id: intent.no_instrument_id.clone(),
+                    quantity: intent.quantity,
+                    submitted_at_ms: observed_at_ms,
+                };
+                match execution_adapter.merge_positions(merge_req).await {
+                    Ok(ack) if ack.accepted => {
+                        info!(
+                            mode = "live",
+                            market_id = %intent.market_id,
+                            yes_instrument_id = %intent.yes_instrument_id,
+                            no_instrument_id = %intent.no_instrument_id,
+                            quantity = intent.quantity,
+                            command_id = %intent.command_id,
+                            message = ?ack.venue_message,
+                            "merge command accepted by execution adapter; awaiting venue reconciliation"
+                        );
+                        let report = sync_execution_state(
+                            execution_adapter.as_ref(),
+                            runtime,
+                            execution_venue_map,
+                            execution_policy,
+                            seen_venue_fill_keys,
+                            ack.accepted_at_ms,
+                        )
+                        .await;
+                        let sync_outcome = apply_sync_report(
+                            runtime,
+                            metrics,
+                            live_safety,
+                            execution_policy,
+                            market_assets,
+                            report,
+                            ack.accepted_at_ms,
+                        );
+                        stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
+                    }
+                    Ok(ack) => {
+                        let reason = ack.venue_message.unwrap_or_else(|| {
+                            "execution venue rejected merge positions".to_string()
+                        });
+                        metrics.observe_riskoff_transition();
+                        let degrade_outcome = runtime.degrade_and_cancel_all(
+                            ack.accepted_at_ms,
+                            format!("live merge rejected; risk-off until recycle path is fixed: {reason}"),
+                        );
+                        stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
+                    }
+                    Err(error) => {
+                        metrics.observe_riskoff_transition();
+                        let degrade_outcome = runtime.degrade_and_cancel_all(
+                            observed_at_ms,
+                            format!(
+                                "live merge failed; risk-off until recycle path is fixed: {error}"
+                            ),
+                        );
+                        stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
+                    }
+                }
             }
             RuntimeCommand::Redeem(intent) => {
                 warn!(
@@ -1964,6 +2019,15 @@ async fn execute_execution_adapter(
     }
 
     Ok(combined)
+}
+
+fn stage_outcome_commands(
+    combined: &mut RuntimeOutcome,
+    queue: &mut VecDeque<RuntimeCommand>,
+    mut outcome: RuntimeOutcome,
+) {
+    queue.extend(outcome.commands.drain(..));
+    combined.event_seqs.extend(outcome.event_seqs);
 }
 
 fn needs_reconcile_order_count(runtime: &Runtime<StrategyMode>) -> usize {
@@ -2136,10 +2200,10 @@ fn apply_sync_report(
     market_assets: &[String],
     report: ExecutionSyncReport,
     now_ms: u64,
-    combined: &mut RuntimeOutcome,
-) {
+) -> RuntimeOutcome {
+    let mut outcome = RuntimeOutcome::default();
     if execution_policy.paper_mode {
-        return;
+        return outcome;
     }
     if report.errors > 0 || !report.missing_local_orders.is_empty() {
         live_safety.consecutive_reconcile_mismatches = live_safety
@@ -2222,7 +2286,7 @@ fn apply_sync_report(
                         );
                     }
                     for market_id in merge_markets {
-                        combined.extend(runtime.plan_merge_command_for_market(
+                        outcome.extend(runtime.plan_merge_command_for_market(
                             &market_id,
                             observed_at_ms,
                             "paired inventory after venue reconciliation",
@@ -2261,7 +2325,7 @@ fn apply_sync_report(
         }
         metrics.record_fill(&fill_report, None);
         match runtime.on_fill(fill_report) {
-            Ok(fill_outcome) => combined.extend(fill_outcome),
+            Ok(fill_outcome) => outcome.extend(fill_outcome),
             Err(error) => {
                 live_safety.consecutive_reconcile_mismatches = live_safety
                     .consecutive_reconcile_mismatches
@@ -2281,7 +2345,7 @@ fn apply_sync_report(
     }
 
     for client_order_id in report.missing_local_orders {
-        combined.extend(runtime.mark_order_needs_reconcile(
+        outcome.extend(runtime.mark_order_needs_reconcile(
             &client_order_id,
             now_ms,
             "venue sync missing locally tracked live order",
@@ -2293,8 +2357,9 @@ fn apply_sync_report(
     {
         let reason = "live reconciliation mismatch; fail-closed risk-off";
         metrics.observe_riskoff_transition();
-        combined.extend(runtime.degrade_and_cancel_all(now_ms, reason));
+        outcome.extend(runtime.degrade_and_cancel_all(now_ms, reason));
     }
+    outcome
 }
 
 fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) -> bool {
@@ -3064,6 +3129,78 @@ mod tests {
         assert_eq!(runtime.stranded_inventory().len(), 1);
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
         assert_eq!(metrics.snapshot().venue_position_count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merge() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+
+        let now_ms = now_unix_ms();
+        let adapter = Arc::new(RecordingAdapter {
+            balances: Some(VenueBalances {
+                cash_usd: 80.0,
+                positions: vec![
+                    VenuePosition {
+                        market_id: MarketId::from("market-mm"),
+                        instrument_id: InstrumentId::from("up"),
+                        quantity: 6.5,
+                        average_cost_usd: 0.20,
+                    },
+                    VenuePosition {
+                        market_id: MarketId::from("market-mm"),
+                        instrument_id: InstrumentId::from("down"),
+                        quantity: 6.5,
+                        average_cost_usd: 0.79,
+                    },
+                ],
+                positions_authoritative: true,
+                observed_at_ms: now_ms,
+            }),
+            ..RecordingAdapter::default()
+        });
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets = vec!["up".to_string(), "down".to_string()];
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+        )
+        .await
+        .expect("execute");
+
+        assert!(outcome
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
+        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
     }
 
     #[tokio::test]

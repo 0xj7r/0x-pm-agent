@@ -104,6 +104,24 @@ pub struct CancelOrderAck {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct MergePositionsRequest {
+    pub command_id: ClientOrderId,
+    pub market_id: MarketId,
+    pub yes_instrument_id: InstrumentId,
+    pub no_instrument_id: InstrumentId,
+    pub quantity: f64,
+    pub submitted_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergePositionsAck {
+    pub command_id: ClientOrderId,
+    pub accepted: bool,
+    pub accepted_at_ms: EpochMillis,
+    pub venue_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VenueOpenOrder {
     pub venue_order_id: OrderId,
     pub client_order_id: Option<ClientOrderId>,
@@ -283,6 +301,15 @@ impl std::error::Error for ExecutionError {}
 pub trait ExecutionAdapter: Send + Sync {
     async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError>;
     async fn cancel(&self, req: CancelOrderRequest) -> Result<CancelOrderAck, ExecutionError>;
+    async fn merge_positions(
+        &self,
+        req: MergePositionsRequest,
+    ) -> Result<MergePositionsAck, ExecutionError> {
+        Err(ExecutionError::BadRequest(format!(
+            "merge positions not implemented for execution adapter command_id={}",
+            req.command_id
+        )))
+    }
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError>;
     async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError>;
     async fn sync_recent_fills(
@@ -323,6 +350,18 @@ impl ExecutionAdapter for PaperExecutionAdapter {
             accepted: true,
             accepted_at_ms: req.submitted_at_ms,
             venue_message: Some("paper adapter cancel accepted".to_string()),
+        })
+    }
+
+    async fn merge_positions(
+        &self,
+        req: MergePositionsRequest,
+    ) -> Result<MergePositionsAck, ExecutionError> {
+        Ok(MergePositionsAck {
+            command_id: req.command_id,
+            accepted: true,
+            accepted_at_ms: req.submitted_at_ms,
+            venue_message: Some("paper adapter merge accepted".to_string()),
         })
     }
 
