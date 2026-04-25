@@ -126,6 +126,15 @@ pub struct AppConfig {
     /// runtime instantiates a `PaperReportWriter`, accumulates fill / edge
     /// / reject metrics, and flushes on shutdown. None disables.
     pub paper_report_path: Option<PathBuf>,
+    /// Phase 5 paper env: optional JSONL path for compact book-state
+    /// snapshots. When set, every book update is appended; the resulting
+    /// file is the input to `WHALE_PAIR_EXEC_MODE=replay`. Useful in any
+    /// mode (paper, shadow_live, even live) for forensic post-hoc replay.
+    pub book_snapshot_log_path: Option<PathBuf>,
+    /// Phase 5 paper env: max depth levels per side captured in each book
+    /// snapshot record. Bigger = bigger files; smaller = less faithful
+    /// replay. Default 10.
+    pub book_snapshot_max_levels: usize,
 }
 
 impl AppConfig {
@@ -355,6 +364,9 @@ impl AppConfig {
         let paper_cancel_race_window_ms =
             parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
         let paper_report_path = parse_path_optional("WHALE_PAIR_PAPER_REPORT_PATH");
+        let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
+        let book_snapshot_max_levels =
+            parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
 
         Ok(Self {
             service_name,
@@ -424,6 +436,8 @@ impl AppConfig {
             paper_post_only_reject_probability,
             paper_cancel_race_window_ms,
             paper_report_path,
+            book_snapshot_log_path,
+            book_snapshot_max_levels,
         })
     }
 
