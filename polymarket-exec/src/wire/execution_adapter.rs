@@ -197,7 +197,13 @@ pub enum PolymarketSignatureType {
 
 impl PolymarketSignatureType {
     pub fn parse(raw: &str) -> Result<Self, ExecutionError> {
-        match raw.trim().to_ascii_lowercase().as_str() {
+        let normalized = raw
+            .split_once('#')
+            .map(|(value, _)| value)
+            .unwrap_or(raw)
+            .trim()
+            .to_ascii_lowercase();
+        match normalized.as_str() {
             "0" | "eoa" => Ok(Self::Eoa),
             "1" | "proxy" | "poly_proxy" | "poly-proxy" => Ok(Self::Proxy),
             "2" | "safe" | "gnosis" | "gnosis_safe" | "gnosis-safe" => Ok(Self::GnosisSafe),
@@ -1484,6 +1490,10 @@ mod tests {
         );
         assert_eq!(
             PolymarketSignatureType::parse("POLY_PROXY").unwrap(),
+            PolymarketSignatureType::Proxy
+        );
+        assert_eq!(
+            PolymarketSignatureType::parse("1         # poly_proxy").unwrap(),
             PolymarketSignatureType::Proxy
         );
         assert_eq!(
