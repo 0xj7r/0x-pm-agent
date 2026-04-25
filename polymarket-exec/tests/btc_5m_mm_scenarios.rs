@@ -250,6 +250,7 @@ impl FixtureStrategy {
                         reason: decision.reason.clone(),
                         quote_level_tag: None,
                         created_at_ms: *at_ms,
+                        pair_id: None,
                     })
                     .collect::<Vec<_>>();
                 decisions_by_key.insert((*at_ms, instrument_id.clone()), intents);

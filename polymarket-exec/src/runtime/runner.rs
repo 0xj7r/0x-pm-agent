@@ -2941,6 +2941,7 @@ mod tests {
             reason: "stale queued submit".to_string(),
             quote_level_tag: None,
             created_at_ms: now_unix_ms(),
+            pair_id: None,
         };
         let mut initial_outcome = RuntimeOutcome::default();
         initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
@@ -3484,6 +3485,7 @@ mod tests {
             reason: "test live lifecycle".to_string(),
             quote_level_tag: Some("lvl-1:test".to_string()),
             created_at_ms: 10,
+            pair_id: None,
         };
         let policy = live_test_policy();
         let request = submit_request_from_intent(&intent, 1_000, &policy);
@@ -3523,6 +3525,7 @@ mod tests {
             reason: "test paper fill".to_string(),
             quote_level_tag: None,
             created_at_ms: now_ms,
+            pair_id: None,
         };
         let policy = paper_test_policy();
         let mut ctx = PaperOrderContext {
@@ -3622,6 +3625,7 @@ mod tests {
                 reason: "test recovered live order".to_string(),
                 quote_level_tag: None,
                 created_at_ms: last_update_ms,
+                pair_id: None,
             },
             "noop",
         );

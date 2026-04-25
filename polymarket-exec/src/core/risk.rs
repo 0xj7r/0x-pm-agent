@@ -295,6 +295,7 @@ mod tests {
             reason: "test".into(),
             quote_level_tag: None,
             created_at_ms: 1,
+            pair_id: None,
         };
 
         let decision = risk.evaluate(

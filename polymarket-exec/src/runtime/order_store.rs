@@ -939,6 +939,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now,
+                pair_id: None,
             },
             "strat",
         );
@@ -994,6 +995,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now,
+                pair_id: None,
             },
             "strat",
         ))?;
@@ -1033,6 +1035,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now,
+                pair_id: None,
             },
             "strat",
         ))?;
@@ -1075,6 +1078,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now,
+                pair_id: None,
             },
             "strat",
         ))?;
@@ -1114,6 +1118,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now,
+                pair_id: None,
             },
             "strat",
         ))?;
@@ -1150,6 +1155,7 @@ mod tests {
             reason: "dup".to_string(),
             quote_level_tag: None,
             created_at_ms: now,
+            pair_id: None,
         };
         let record = crate::runtime::order_store::OrderRecord::from_intent("run", &intent, "strat");
         store.insert(record.clone())?;
