@@ -1452,6 +1452,13 @@ struct PaperOrderContext {
     last_fill_ms: u64,
     last_fill_book_update_ms: u64,
     fill_count: usize,
+    /// Phase 2 paper env cancel race window: when a Cancel command is
+    /// received in paper mode, this is set to observed_at_ms instead of
+    /// removing the context. Subsequent ticks within the configured
+    /// window may still apply a fill (mirrors the live race between
+    /// venue cancel ack and an in-flight fill). Once the window
+    /// elapses without a fill, the deferred cancel is applied.
+    cancel_requested_at_ms: Option<u64>,
 }
 
 fn paper_order_context_mut<'a>(
@@ -1466,6 +1473,7 @@ fn paper_order_context_mut<'a>(
         last_fill_ms: 0,
         last_fill_book_update_ms: 0,
         fill_count: 0,
+        cancel_requested_at_ms: None,
     };
     let ctx = paper_order_ctx
         .entry(intent.client_order_id.clone())
@@ -1843,6 +1851,22 @@ async fn execute_execution_adapter(
                 reason,
             } => {
                 if execution_policy.paper_mode {
+                    if execution_policy.paper_cancel_race_window_ms > 0 {
+                        if let Some(ctx) = paper_order_ctx.get_mut(&client_order_id) {
+                            if ctx.cancel_requested_at_ms.is_none() {
+                                ctx.cancel_requested_at_ms = Some(observed_at_ms);
+                                debug!(
+                                    source = "execution_bridge",
+                                    client_order_id = %client_order_id,
+                                    mode = "paper",
+                                    cancel_race_window_ms =
+                                        execution_policy.paper_cancel_race_window_ms,
+                                    "cancel deferred for paper race window"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let cancelled_outcome = runtime.on_order_cancelled(
                         &client_order_id,
                         reason.clone(),
@@ -2130,6 +2154,35 @@ async fn execute_execution_adapter(
         .filter(|managed| managed.remaining_qty() <= 1e-9)
     {
         paper_order_ctx.remove(&finished_order.intent.client_order_id);
+    }
+
+    // Phase 2 paper env cancel race: any deferred cancel whose race window
+    // has elapsed without a fill is now finalized. If a fill arrived during
+    // the window, the order's paper context was already removed by the
+    // finished-order sweep above, so we skip it.
+    if execution_policy.paper_mode && execution_policy.paper_cancel_race_window_ms > 0 {
+        let expired_cancels: Vec<ClientOrderId> = paper_order_ctx
+            .iter()
+            .filter_map(|(coid, ctx)| {
+                let req_ms = ctx.cancel_requested_at_ms?;
+                if observed_at_ms.saturating_sub(req_ms)
+                    >= execution_policy.paper_cancel_race_window_ms
+                {
+                    Some(coid.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for coid in expired_cancels {
+            let cancelled_outcome = runtime.on_order_cancelled(
+                &coid,
+                "paper cancel race window elapsed without fill",
+                observed_at_ms,
+            );
+            combined.extend(cancelled_outcome);
+            paper_order_ctx.remove(&coid);
+        }
     }
 
     Ok(combined)
@@ -3713,6 +3766,7 @@ mod tests {
             last_fill_ms: 0,
             last_fill_book_update_ms: 0,
             fill_count: 0,
+            cancel_requested_at_ms: None,
         };
         // Past the paper_submit_latency_ms gate (Phase 2 conservative model).
         let after_latency_ms = now_ms + policy.paper_submit_latency_ms + 50;
@@ -3862,6 +3916,7 @@ mod tests {
             last_fill_ms: 0,
             last_fill_book_update_ms: 0,
             fill_count: 0,
+            cancel_requested_at_ms: None,
         };
         // Within latency window: suppressed.
         let inside = paper_fill_from_book_snapshot(
