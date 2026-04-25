@@ -96,6 +96,55 @@ pub struct AppConfig {
     pub paper_min_fill_notional_usd: f64,
     pub paper_max_fills_per_order: usize,
     pub paper_min_fill_interval: Duration,
+    /// Optional UTC ms timestamp at which the paper market resolves. When
+    /// `paper_mode` is true and the runtime clock crosses this value, the
+    /// paper environment forces settlement: cancels open orders, applies
+    /// merge for paired inventory, and applies redeem at
+    /// `paper_market_resolution_price` for stranded inventory.
+    pub paper_market_close_at_ms: Option<u64>,
+    /// Optional resolution price in [0.0, 1.0] used when settling stranded
+    /// inventory at `paper_market_close_at_ms`. 0.0 = "no" wins, 1.0 =
+    /// "yes" wins, 0.5 = unknown / split. Required only if there is
+    /// stranded (non-paired) inventory at close.
+    pub paper_market_resolution_price: Option<f64>,
+    /// Phase 2 paper env: minimum ms between submit ack and the first fill
+    /// attempt. Forces the book to update at least once after the simulated
+    /// round-trip before a fill can be considered. Default 150 ms.
+    pub paper_submit_latency_ms: u64,
+    /// Phase 2 paper env: assumed queue position as a fraction of top-of-book
+    /// size. 0.75 means we assume we are 75% back in the queue (conservative).
+    /// Default 0.75.
+    pub paper_queue_depth_fraction: f64,
+    /// Phase 2 paper env: probability of post-only rejection in paper mode
+    /// when the order would cross the book. Default 0.85.
+    pub paper_post_only_reject_probability: f64,
+    /// Phase 2 paper env: window after a cancel request during which a late
+    /// fill may still be applied. Default 500 ms.
+    pub paper_cancel_race_window_ms: u64,
+    /// Phase 3 paper env: optional path for the per-session JSON report
+    /// card (`PaperReportSummary`). When set and `paper_mode` is true, the
+    /// runtime instantiates a `PaperReportWriter`, accumulates fill / edge
+    /// / reject metrics, and flushes on shutdown. None disables.
+    pub paper_report_path: Option<PathBuf>,
+    /// Phase 5 paper env: optional JSONL path for compact book-state
+    /// snapshots. When set, every book update is appended; the resulting
+    /// file is the input to `WHALE_PAIR_EXEC_MODE=replay`. Useful in any
+    /// mode (paper, shadow_live, even live) for forensic post-hoc replay.
+    pub book_snapshot_log_path: Option<PathBuf>,
+    /// Phase 5 paper env: max depth levels per side captured in each book
+    /// snapshot record. Bigger = bigger files; smaller = less faithful
+    /// replay. Default 10.
+    pub book_snapshot_max_levels: usize,
+    /// Maker rebate coefficient. Applied as a negative fee on maker fills
+    /// in paper mode: `fee_usd = -notional * coeff * p * (1-p)`. Default
+    /// 0.0 (no rebate). Set to V2's actual maker-rebate value to model
+    /// economics realistically.
+    pub paper_maker_rebate_coeff: f64,
+    /// Taker fee coefficient override for paper mode. When None, the
+    /// strategy's `taker_fee_coeff()` is used (current behavior). When
+    /// Some, overrides for paper-mode fills only — useful for A/B
+    /// testing fee scenarios.
+    pub paper_taker_fee_coeff_override: Option<f64>,
 }
 
 impl AppConfig {
@@ -139,7 +188,12 @@ impl AppConfig {
         let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v1");
+        // Polymarket CLOB V2 cutover: 2026-04-28. Default to V2; operators can
+        // override with POLYMARKET_CLOB_VERSION=v1 if they need legacy behavior
+        // for a specific reason (e.g. comparing pre-cutover behavior). The V2
+        // signing path is in wire/clob_v2.rs and verified at startup by
+        // log_live_venue_config.
+        let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v2");
         let clob_v2_builder_code = env_or(
             "POLYMARKET_CLOB_V2_BUILDER_CODE",
             "0x0000000000000000000000000000000000000000000000000000000000000000",
@@ -269,6 +323,68 @@ impl AppConfig {
         let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
         let paper_min_fill_interval =
             parse_duration_ms("WHALE_PAIR_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
+        let paper_market_close_at_ms = std::env::var("WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| {
+                v.trim()
+                    .parse::<u64>()
+                    .map_err(|err| anyhow::anyhow!(
+                        "invalid WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS: {err}"
+                    ))
+            })
+            .transpose()?;
+        let paper_market_resolution_price =
+            std::env::var("WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| {
+                    v.trim()
+                        .parse::<f64>()
+                        .map_err(|err| anyhow::anyhow!(
+                            "invalid WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE: {err}"
+                        ))
+                        .and_then(|p| {
+                            if (0.0..=1.0).contains(&p) {
+                                Ok(p)
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE must be in [0.0, 1.0], got {p}"
+                                ))
+                            }
+                        })
+                })
+                .transpose()?;
+        let paper_submit_latency_ms =
+            parse_duration_ms("WHALE_PAIR_PAPER_SUBMIT_LATENCY_MS", 150)?.as_millis() as u64;
+        let paper_queue_depth_fraction =
+            parse_f64("WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
+        if !(0.0..=1.0).contains(&paper_queue_depth_fraction) {
+            anyhow::bail!(
+                "WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION must be in [0.0, 1.0], got {paper_queue_depth_fraction}"
+            );
+        }
+        let paper_post_only_reject_probability =
+            parse_f64("WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY", 0.85)?;
+        if !(0.0..=1.0).contains(&paper_post_only_reject_probability) {
+            anyhow::bail!(
+                "WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY must be in [0.0, 1.0], got {paper_post_only_reject_probability}"
+            );
+        }
+        let paper_cancel_race_window_ms =
+            parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
+        let paper_report_path = parse_path_optional("WHALE_PAIR_PAPER_REPORT_PATH");
+        let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
+        let book_snapshot_max_levels =
+            parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
+        let paper_maker_rebate_coeff =
+            parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
+        let paper_taker_fee_coeff_override = std::env::var("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().parse::<f64>())
+            .transpose()
+            .map_err(|err| anyhow::anyhow!("invalid WHALE_PAIR_PAPER_TAKER_FEE_COEFF: {err}"))?;
 
         Ok(Self {
             service_name,
@@ -331,6 +447,17 @@ impl AppConfig {
             paper_min_fill_notional_usd,
             paper_max_fills_per_order,
             paper_min_fill_interval,
+            paper_market_close_at_ms,
+            paper_market_resolution_price,
+            paper_submit_latency_ms,
+            paper_queue_depth_fraction,
+            paper_post_only_reject_probability,
+            paper_cancel_race_window_ms,
+            paper_report_path,
+            book_snapshot_log_path,
+            book_snapshot_max_levels,
+            paper_maker_rebate_coeff,
+            paper_taker_fee_coeff_override,
         })
     }
 

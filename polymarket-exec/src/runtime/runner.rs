@@ -81,6 +81,14 @@ struct ExecutionPolicy {
     paper_min_fill_notional_usd: f64,
     paper_max_fills_per_order: usize,
     paper_min_fill_interval_ms: u64,
+    paper_market_close_at_ms: Option<u64>,
+    paper_market_resolution_price: Option<f64>,
+    paper_submit_latency_ms: u64,
+    paper_queue_depth_fraction: f64,
+    paper_post_only_reject_probability: f64,
+    paper_cancel_race_window_ms: u64,
+    paper_maker_rebate_coeff: f64,
+    paper_taker_fee_coeff_override: Option<f64>,
 }
 
 impl ExecutionPolicy {
@@ -97,12 +105,20 @@ impl ExecutionPolicy {
             paper_min_fill_notional_usd: config.paper_min_fill_notional_usd,
             paper_max_fills_per_order: config.paper_max_fills_per_order,
             paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
+            paper_market_close_at_ms: config.paper_market_close_at_ms,
+            paper_market_resolution_price: config.paper_market_resolution_price,
+            paper_submit_latency_ms: config.paper_submit_latency_ms,
+            paper_queue_depth_fraction: config.paper_queue_depth_fraction,
+            paper_post_only_reject_probability: config.paper_post_only_reject_probability,
+            paper_cancel_race_window_ms: config.paper_cancel_race_window_ms,
+            paper_maker_rebate_coeff: config.paper_maker_rebate_coeff,
+            paper_taker_fee_coeff_override: config.paper_taker_fee_coeff_override,
         }
     }
 }
 
 pub async fn run() -> Result<()> {
-    let config = AppConfig::from_env()?;
+    let mut config = AppConfig::from_env()?;
     match std::env::var("WHALE_PAIR_EXEC_MODE")
         .unwrap_or_default()
         .as_str()
@@ -110,8 +126,250 @@ pub async fn run() -> Result<()> {
         "live_smoke" => return run_live_smoke(config).await,
         "live_cancel" => return run_live_cancel(config).await,
         "live_reconcile" => return run_live_reconcile(config).await,
+        "shadow_live" => return run_shadow_live(config).await,
+        "replay" => return run_replay_cli(config).await,
         _ => {}
     }
+    // Suppress unused-must-use mut warning when no shadow path is taken.
+    let _ = &mut config;
+    run_with_config(config).await
+}
+
+/// Phase 5 paper env: replay mode. Reads a recorded book snapshot log
+/// (the JSONL produced by `BookSnapshotWriter` during a prior live or
+/// shadow_live run), drives `Runtime<StrategyMode>` through it
+/// deterministically, routes any submits the strategy emits through
+/// `paper_fill_from_book_snapshot` using the recorded timestamp as the
+/// replay clock, and writes a `PaperReportSummary` JSON.
+///
+/// Inputs:
+/// - `WHALE_PAIR_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
+/// - `WHALE_PAIR_PAPER_REPORT_PATH`: optional. Where to write the
+///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
+///
+/// This is the foundation for A/B parameter calibration: change a paper
+/// fill knob (queue depth, post-only reject prob, latency), re-run
+/// replay against the same recorded log, and compare two report cards.
+async fn run_replay_cli(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    let input_path = std::env::var("WHALE_PAIR_REPLAY_INPUT_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH"
+            )
+        })?;
+    let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
+        let mut p = input_path.clone();
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "replay".to_string());
+        p.set_file_name(format!("{stem}.replay.json"));
+        p
+    });
+    info!(
+        target: "replay.startup",
+        input = %input_path.display(),
+        output = %output_path.display(),
+        starting_cash_usd = config.starting_cash_usd,
+        "replay mode engaged (strategy-driven)"
+    );
+    let records = crate::paper::replay::read_snapshot_log(&input_path)?;
+    let started_at_ms = records.first().map(|r| r.t).unwrap_or_else(now_unix_ms);
+
+    // Build runtime with the same shape as live, but no order_store /
+    // journal / live adapter. Replay is in-memory only.
+    let strategy = crate::strategy::StrategyMode::from_name(
+        &config.strategy_name,
+        config.strategy_profile.as_ref(),
+    );
+    // Capture fee coefficient before strategy is moved into Runtime so
+    // replay's paper_fill_from_book_snapshot calls model fees correctly.
+    // Bug fix: was passing 0.0, which made every replay-mode taker fill
+    // appear fee-free and inflated reported P&L.
+    let replay_taker_fee_coeff = strategy.taker_fee_coeff();
+    let mut runtime = Runtime::new(
+        crate::runtime::types::RuntimeConfig {
+            starting_cash_usd: config.starting_cash_usd,
+            event_log_capacity: config.event_log_capacity,
+            initial_status: RuntimeStatus::Running,
+            quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
+            quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
+        },
+        config.risk_limits.clone(),
+        strategy,
+        MarketContextStore::empty(),
+    );
+
+    let execution_policy = ExecutionPolicy::from_config(&config);
+    let mut paper_order_ctx: HashMap<ClientOrderId, PaperOrderContext> = HashMap::new();
+    let mut report = crate::paper::report::PaperReportWriter::new(
+        format!("replay-{}", now_unix_ms()),
+        "replay",
+        output_path.clone(),
+        started_at_ms,
+    );
+
+    let mut submits = 0usize;
+    let mut fills = 0usize;
+    let mut rejects = 0usize;
+    let mut cancels = 0usize;
+
+    for record in records.iter() {
+        let asset = record.asset.clone();
+        let book = crate::paper::replay::ReplayBookRecord {
+            t: record.t,
+            asset: record.asset.clone(),
+            bids: record.bids.clone(),
+            asks: record.asks.clone(),
+            last_trade: record.last_trade,
+        }
+        .into_book_state();
+        // Retry-fill loop: attempt fills against this book on any existing
+        // open order in the same instrument that hasn't filled yet.
+        // Mirrors the production retry loop in execute_execution_adapter.
+        let asset_instrument = InstrumentId::from(asset.as_str());
+        let retry_targets: Vec<crate::runtime::types::ManagedOrder> = runtime
+            .open_order_snapshots()
+            .into_iter()
+            .filter(|m| m.intent.instrument_id == asset_instrument && m.remaining_qty() > 1e-9)
+            .collect();
+        for managed in retry_targets {
+            let intent = managed.intent.clone();
+            let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+                Some((book.best_bid + book.best_ask) * 0.5)
+            } else {
+                None
+            };
+            let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
+            if let Some(fill) = paper_fill_from_book_snapshot(
+                &book,
+                &intent,
+                record.t,
+                replay_taker_fee_coeff,
+                ctx,
+                managed.remaining_qty(),
+                &execution_policy,
+            ) {
+                report.record_fill(&fill, mid_at_submit);
+                fills += 1;
+                runtime.on_fill(fill)?;
+            }
+        }
+        let market_id = MarketId::from(config.market_id_for_asset(&asset));
+        let instrument_id = InstrumentId::from(asset.as_str());
+
+        let outcome = runtime.on_book_state(market_id.clone(), instrument_id.clone(), &book)?;
+        for command in outcome.commands {
+            match command {
+                RuntimeCommand::Submit(intent) => {
+                    submits += 1;
+                    if paper_post_only_should_reject(&intent, &book, &execution_policy) {
+                        report.record_reject(
+                            &intent.client_order_id,
+                            &intent.market_id,
+                            &intent.instrument_id,
+                            intent.limit_price,
+                            "post-only-cross-paper",
+                            record.t,
+                        );
+                        rejects += 1;
+                        runtime.on_order_rejected(
+                            &intent.client_order_id,
+                            "post-only-cross-paper",
+                            record.t,
+                        );
+                        continue;
+                    }
+                    let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+                        Some((book.best_bid + book.best_ask) * 0.5)
+                    } else {
+                        None
+                    };
+                    if let Some(mid) = mid_at_submit {
+                        report.record_submit_edge(
+                            intent.side,
+                            intent.limit_price,
+                            intent.quantity,
+                            mid,
+                            record.t,
+                        );
+                    }
+                    let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
+                    if let Some(fill) = paper_fill_from_book_snapshot(
+                        &book,
+                        &intent,
+                        record.t,
+                        replay_taker_fee_coeff,
+                        ctx,
+                        intent.quantity,
+                        &execution_policy,
+                    ) {
+                        report.record_fill(&fill, mid_at_submit);
+                        fills += 1;
+                        runtime.on_fill(fill)?;
+                    } else {
+                        runtime.on_order_opened(&intent.client_order_id, record.t);
+                    }
+                }
+                RuntimeCommand::Cancel { client_order_id, reason } => {
+                    cancels += 1;
+                    paper_order_ctx.remove(&client_order_id);
+                    runtime.on_order_cancelled(&client_order_id, reason, record.t);
+                }
+                RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
+                    // Replay does not exercise relayer/redeem in-process;
+                    // treated as no-ops. Production runs handle these via
+                    // execute_execution_adapter.
+                }
+            }
+        }
+    }
+    report.flush()?;
+    info!(
+        target: "replay.complete",
+        records_consumed = records.len(),
+        submits,
+        fills,
+        rejects,
+        cancels,
+        report = %output_path.display(),
+        "replay finished"
+    );
+    Ok(())
+}
+
+/// Phase 4 paper env: shadow-live mode. Connects live market_ws + spot_ws +
+/// (optional) user_ws and runs the full strategy decisioning loop, but
+/// forces paper_mode=true so every submit goes through PaperExecutionAdapter
+/// rather than the live CLOB. Operators use this to validate strategy
+/// behavior against the real book without exposing capital.
+///
+/// Per the design doc, the safety contract is: paper_mode is forced true
+/// at this entry point regardless of WHALE_PAIR_PAPER_MODE — even if the
+/// operator misconfigures the env, no live order can leave the engine.
+async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
+    if !config.paper_mode {
+        config.paper_mode = true;
+    }
+    // NOTE: deliberately NOT resetting quote_min_order_age. The whole point
+    // of shadow_live is to mirror LIVE behavior with paper safety; the
+    // operator's live-tier quote churn timing (often 5000ms in tinylive)
+    // is what we want to validate. Forcing a paper default here would
+    // defeat the realism goal.
+    info!(
+        target: "shadow_live.startup",
+        clob_api_url = %config.clob_api_url,
+        market_ws_url = %config.market_ws_url,
+        spot_ws_url = %config.spot_ws_url,
+        user_ws_url = %config.user_ws_url,
+        user_auth_present = config.user_auth.is_some(),
+        paper_report_path = ?config.paper_report_path,
+        "shadow-live mode engaged: live feeds, paper submits"
+    );
     run_with_config(config).await
 }
 
@@ -173,6 +431,40 @@ async fn run_live_reconcile(config: AppConfig) -> Result<()> {
         observed_at_ms = balances.observed_at_ms,
         "live reconcile balances synced"
     );
+
+    let mut seen_conditions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for position in &balances.positions {
+        let Some(condition_id) = position
+            .condition_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if !seen_conditions.insert(condition_id.to_string()) {
+            continue;
+        }
+        match adapter.fetch_market_metadata(condition_id).await {
+            Ok(md) => info!(
+                target: "live_reconcile.venue_metadata",
+                condition_id = %md.condition_id,
+                minimum_order_size = md.minimum_order_size,
+                minimum_tick_size = md.minimum_tick_size,
+                neg_risk = md.neg_risk,
+                active = md.active,
+                closed = md.closed,
+                "venue metadata (compare against strategy hardcoded sizing — Q6)"
+            ),
+            Err(error) => warn!(
+                target: "live_reconcile.venue_metadata",
+                condition_id = %condition_id,
+                error = %error,
+                "failed to fetch venue metadata for known position"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -400,6 +692,24 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
         .transpose()?;
+    let mut paper_report: Option<crate::paper::report::PaperReportWriter> =
+        if config.paper_mode {
+            config.paper_report_path.clone().map(|path| {
+                crate::paper::report::PaperReportWriter::new(
+                    runtime.run_id().to_string(),
+                    "paper",
+                    path,
+                    now_unix_ms(),
+                )
+            })
+        } else {
+            None
+        };
+    let mut book_snapshot: Option<crate::paper::snapshot::BookSnapshotWriter> = config
+        .book_snapshot_log_path
+        .as_deref()
+        .map(crate::paper::snapshot::BookSnapshotWriter::open)
+        .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -509,6 +819,8 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut runtime,
         &mut journal,
         &mut audit,
+        &mut paper_report,
+        &mut book_snapshot,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -520,6 +832,73 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         strategy_name.as_str(),
     )
     .await?;
+    if let Some(report) = paper_report.as_mut() {
+        if let Some(whale_path) = config.dashboard_whale_events_path.as_deref() {
+            let session_start = report.started_at_ms();
+            let session_end = now_unix_ms();
+            let whale_events = crate::wire::api::load_whale_events(whale_path, 100_000);
+            let mut ingested = 0usize;
+            for ev in whale_events {
+                if ev.observed_at_ms < session_start || ev.observed_at_ms > session_end {
+                    continue;
+                }
+                let notional = ev
+                    .notional_usd
+                    .or_else(|| ev.price.and_then(|p| ev.quantity.map(|q| p * q)))
+                    .unwrap_or(0.0);
+                // Bug fix: skip events with no derivable notional rather
+                // than recording a $0 fill. Otherwise the vs_whale section
+                // looks like the whale traded at $0 and double-counts in
+                // the maker_fraction / capture-ratio math.
+                if notional <= 0.0 {
+                    continue;
+                }
+                report.record_whale_fill_observed(
+                    ev.observed_at_ms,
+                    ev.side.as_deref(),
+                    notional,
+                );
+                ingested += 1;
+            }
+            info!(
+                target: "paper_report.vs_whale",
+                whale_events_ingested = ingested,
+                source = %whale_path.display(),
+                "whale events ingested into vs_whale section"
+            );
+        }
+        if let Err(error) = report.flush() {
+            warn!(
+                target: "paper_report.flush",
+                output = %report.output_path().display(),
+                error = %error,
+                "failed to flush paper report on shutdown"
+            );
+        } else {
+            info!(
+                target: "paper_report.flush",
+                output = %report.output_path().display(),
+                "paper report written"
+            );
+        }
+    }
+    if let Some(snap) = book_snapshot.as_mut() {
+        if let Err(error) = snap.flush() {
+            warn!(
+                target: "book_snapshot.flush",
+                output = %snap.path().display(),
+                error = %error,
+                "failed to flush book snapshot log on shutdown"
+            );
+        } else {
+            info!(
+                target: "book_snapshot.flush",
+                output = %snap.path().display(),
+                bytes_written = snap.bytes_written(),
+                "book snapshot log flushed"
+            );
+        }
+    }
 
     shutdown.cancel();
     join_task("market-ws", market_ws_handle).await;
@@ -626,6 +1005,8 @@ async fn run_runtime_loop(
     runtime: &mut Runtime<StrategyMode>,
     journal: &mut Option<JournalWriter>,
     audit: &mut Option<AuditWriter>,
+    paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
+    book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -651,6 +1032,7 @@ async fn run_runtime_loop(
     let mut spot_events_open = true;
     let mut user_events_open = true;
     let mut seen_venue_fill_keys = HashSet::<String>::new();
+    let mut paper_market_closed = false;
 
     loop {
         tokio::select! {
@@ -710,6 +1092,59 @@ async fn run_runtime_loop(
             _ = ticks.tick() => {
                 let _timer = metrics.runtime_loop_timer();
                 metrics.refresh_stream_ages();
+                if execution_policy.paper_mode && !paper_market_closed {
+                    if let Some(close_at_ms) = execution_policy.paper_market_close_at_ms {
+                        let now = now_unix_ms();
+                        if now >= close_at_ms {
+                            paper_market_closed = true;
+                            info!(
+                                target: "paper_env.market_close",
+                                close_at_ms,
+                                now_ms = now,
+                                resolution_price = ?execution_policy.paper_market_resolution_price,
+                                "paper market close triggered"
+                            );
+                            let close_outcome = runtime.plan_paper_close(
+                                now,
+                                execution_policy.paper_market_resolution_price,
+                            );
+                            let combined = execute_execution_adapter(
+                                runtime,
+                                books,
+                                &config.market_assets,
+                                paper_fee_coeff,
+                                metrics.as_ref(),
+                                close_outcome,
+                                paper_order_ctx,
+                                execution_venue_map,
+                                live_safety,
+                                execution_adapter.clone(),
+                                execution_policy,
+                                &mut seen_venue_fill_keys,
+                                paper_report.as_mut(),
+                            )
+                            .await?;
+                            persist_runtime_outcome(
+                                journal,
+                                runtime.event_log(),
+                                "paper-market-close",
+                                combined.clone(),
+                            )?;
+                            persist_audit_outcome(audit, "paper-market-close", runtime, &combined)?;
+                            refresh_dashboard_state(
+                                runtime,
+                                books,
+                                metrics.as_ref(),
+                                &config,
+                                dashboard.clone(),
+                                &config.market_assets,
+                                strategy_name,
+                                dashboard_event_limit,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 if !config.paper_mode {
                     let health_outcome = enforce_live_health(
                         runtime,
@@ -733,6 +1168,7 @@ async fn run_runtime_loop(
                             execution_adapter.clone(),
                             execution_policy,
                             &mut seen_venue_fill_keys,
+                            paper_report.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -747,6 +1183,18 @@ async fn run_runtime_loop(
                 for asset_id in &config.market_assets {
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
+                            if let Some(snap) = book_snapshot.as_mut() {
+                                if let Err(error) =
+                                    snap.record(&book, config.book_snapshot_max_levels)
+                                {
+                                    warn!(
+                                        target: "book_snapshot",
+                                        asset = %asset_id,
+                                        error = %error,
+                                        "failed to append book snapshot record"
+                                    );
+                                }
+                            }
                             metrics.observe_book(&book, config.book_stale_after);
                             let (c10, c30, c60, last_age_ms) =
                                 books.trade_activity(asset_id, now_unix_ms()).await;
@@ -777,6 +1225,7 @@ async fn run_runtime_loop(
                                 execution_adapter.clone(),
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
+                                paper_report.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1353,6 +1802,13 @@ struct PaperOrderContext {
     last_fill_ms: u64,
     last_fill_book_update_ms: u64,
     fill_count: usize,
+    /// Phase 2 paper env cancel race window: when a Cancel command is
+    /// received in paper mode, this is set to observed_at_ms instead of
+    /// removing the context. Subsequent ticks within the configured
+    /// window may still apply a fill (mirrors the live race between
+    /// venue cancel ack and an in-flight fill). Once the window
+    /// elapses without a fill, the deferred cancel is applied.
+    cancel_requested_at_ms: Option<u64>,
 }
 
 fn paper_order_context_mut<'a>(
@@ -1367,6 +1823,7 @@ fn paper_order_context_mut<'a>(
         last_fill_ms: 0,
         last_fill_book_update_ms: 0,
         fill_count: 0,
+        cancel_requested_at_ms: None,
     };
     let ctx = paper_order_ctx
         .entry(intent.client_order_id.clone())
@@ -1482,6 +1939,7 @@ async fn execute_execution_adapter(
     execution_adapter: Arc<dyn ExecutionAdapter>,
     execution_policy: &ExecutionPolicy,
     seen_venue_fill_keys: &mut HashSet<String>,
+    paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -1490,6 +1948,15 @@ async fn execute_execution_adapter(
 
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+    let mut paper_report = paper_report;
+
+    fn book_mid(book: &BookState) -> Option<f64> {
+        if book.best_bid > 0.0 && book.best_ask > 0.0 {
+            Some((book.best_bid + book.best_ask) * 0.5)
+        } else {
+            None
+        }
+    }
 
     if !execution_policy.paper_mode {
         let report = sync_execution_state(
@@ -1561,6 +2028,42 @@ async fn execute_execution_adapter(
                     let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
                         continue;
                     };
+                    if paper_post_only_should_reject(&intent, &book, execution_policy) {
+                        if let Some(reporter) = paper_report.as_deref_mut() {
+                            reporter.record_reject(
+                                &intent.client_order_id,
+                                &intent.market_id,
+                                &intent.instrument_id,
+                                intent.limit_price,
+                                "post-only-cross-paper",
+                                observed_at_ms,
+                            );
+                        }
+                        paper_order_ctx.remove(&intent.client_order_id);
+                        let reject_outcome = runtime.on_order_rejected(
+                            &intent.client_order_id,
+                            "post-only-cross-paper",
+                            observed_at_ms,
+                        );
+                        let chained_commands = reject_outcome.commands.clone();
+                        combined.extend(reject_outcome);
+                        for command in chained_commands {
+                            queue.push_back(command);
+                        }
+                        continue;
+                    }
+                    let mid_at_submit = book_mid(&book);
+                    if let (Some(reporter), Some(mid)) =
+                        (paper_report.as_deref_mut(), mid_at_submit)
+                    {
+                        reporter.record_submit_edge(
+                            intent.side,
+                            intent.limit_price,
+                            intent.quantity,
+                            mid,
+                            observed_at_ms,
+                        );
+                    }
                     let ctx = paper_order_context_mut(paper_order_ctx, &intent, observed_at_ms);
 
                     if let Some(fill) = paper_fill_from_book_snapshot(
@@ -1580,6 +2083,9 @@ async fn execute_execution_adapter(
                                 None
                             },
                         );
+                        if let Some(reporter) = paper_report.as_deref_mut() {
+                            reporter.record_fill(&fill, mid_at_submit);
+                        }
                         let fill_outcome = runtime.on_fill(fill)?;
                         let chained_commands = fill_outcome.commands.clone();
                         combined.extend(fill_outcome);
@@ -1730,6 +2236,22 @@ async fn execute_execution_adapter(
                 reason,
             } => {
                 if execution_policy.paper_mode {
+                    if execution_policy.paper_cancel_race_window_ms > 0 {
+                        if let Some(ctx) = paper_order_ctx.get_mut(&client_order_id) {
+                            if ctx.cancel_requested_at_ms.is_none() {
+                                ctx.cancel_requested_at_ms = Some(observed_at_ms);
+                                debug!(
+                                    source = "execution_bridge",
+                                    client_order_id = %client_order_id,
+                                    mode = "paper",
+                                    cancel_race_window_ms =
+                                        execution_policy.paper_cancel_race_window_ms,
+                                    "cancel deferred for paper race window"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     let cancelled_outcome = runtime.on_order_cancelled(
                         &client_order_id,
                         reason.clone(),
@@ -2017,6 +2539,35 @@ async fn execute_execution_adapter(
         .filter(|managed| managed.remaining_qty() <= 1e-9)
     {
         paper_order_ctx.remove(&finished_order.intent.client_order_id);
+    }
+
+    // Phase 2 paper env cancel race: any deferred cancel whose race window
+    // has elapsed without a fill is now finalized. If a fill arrived during
+    // the window, the order's paper context was already removed by the
+    // finished-order sweep above, so we skip it.
+    if execution_policy.paper_mode && execution_policy.paper_cancel_race_window_ms > 0 {
+        let expired_cancels: Vec<ClientOrderId> = paper_order_ctx
+            .iter()
+            .filter_map(|(coid, ctx)| {
+                let req_ms = ctx.cancel_requested_at_ms?;
+                if observed_at_ms.saturating_sub(req_ms)
+                    >= execution_policy.paper_cancel_race_window_ms
+                {
+                    Some(coid.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for coid in expired_cancels {
+            let cancelled_outcome = runtime.on_order_cancelled(
+                &coid,
+                "paper cancel race window elapsed without fill",
+                observed_at_ms,
+            );
+            combined.extend(cancelled_outcome);
+            paper_order_ctx.remove(&coid);
+        }
     }
 
     Ok(combined)
@@ -2549,6 +3100,12 @@ fn paper_fill_from_book_snapshot(
     if order_ctx.fill_count >= execution_policy.paper_max_fills_per_order {
         return None;
     }
+    if execution_policy.paper_submit_latency_ms > 0
+        && observed_at_ms.saturating_sub(order_ctx.arrival_ms)
+            < execution_policy.paper_submit_latency_ms
+    {
+        return None;
+    }
     if order_ctx.last_fill_ms > 0
         && observed_at_ms.saturating_sub(order_ctx.last_fill_ms)
             < execution_policy.paper_min_fill_interval_ms
@@ -2572,8 +3129,76 @@ fn paper_fill_from_book_snapshot(
             .filter(|level| level.price > 0.0 && level.price >= intent.limit_price)
             .collect()
     };
+
+    let order_age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms);
+    let is_resting = order_age_ms > execution_policy.paper_submit_latency_ms;
+    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
+        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
+    } else {
+        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
+    };
+
     if candidate_levels.is_empty() {
-        return None;
+        // No crossable book levels. The only fill path is maker-via-trade-through:
+        // we're resting at limit X, taker just swept our queue level at price ≤ X
+        // (for buys), and the book may have repriced past us. Without this branch,
+        // legitimate maker fills are silently dropped.
+        if !is_resting || !maker_trade_through {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = "no_crossable_levels",
+                side = ?intent.side,
+                limit = intent.limit_price,
+                best_bid = book.best_bid,
+                best_ask = book.best_ask,
+                last_trade = book.last_trade_price,
+                is_resting,
+                maker_trade_through,
+            );
+            return None;
+        }
+        let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
+        if order_age_ms < queue_wait_ms {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = "queue_wait_no_book",
+                order_age_ms,
+                queue_wait_ms,
+            );
+            return None;
+        }
+        let claim_ratio = (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0);
+        let qty_filled = (remaining_qty * claim_ratio).max(0.0);
+        if qty_filled <= 0.0 {
+            return None;
+        }
+        let price = intent.limit_price;
+        let notional = qty_filled * price;
+        if notional < execution_policy.paper_min_fill_notional_usd
+            && (remaining_qty * price) >= execution_policy.paper_min_fill_notional_usd
+        {
+            return None;
+        }
+        let fee_basis = price * (1.0 - price);
+        let fee = -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis);
+        order_ctx.last_fill_ms = observed_at_ms;
+        order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
+        order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
+        return Some(FillReport {
+            order_id: None,
+            client_order_id: Some(intent.client_order_id.clone()),
+            market_id: intent.market_id.clone(),
+            instrument_id: intent.instrument_id.clone(),
+            side: intent.side,
+            price,
+            quantity: qty_filled,
+            fee_usd: fee,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms,
+        });
     }
 
     let total_available: f64 = candidate_levels.iter().map(|level| level.size).sum();
@@ -2587,20 +3212,31 @@ fn paper_fill_from_book_snapshot(
     } else {
         book.best_bid > 0.0 && intent.limit_price <= book.best_bid
     };
-    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
-        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
-    } else {
-        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
-    };
+    let crosses_as_taker = crossing && !is_resting;
     if !crossing {
         let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
-        if observed_at_ms.saturating_sub(order_ctx.arrival_ms) < queue_wait_ms
-            || !maker_trade_through
-        {
+        if order_age_ms < queue_wait_ms || !maker_trade_through {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = if order_age_ms < queue_wait_ms { "queue_wait" } else { "no_trade_through" },
+                side = ?intent.side,
+                limit = intent.limit_price,
+                last_trade = book.last_trade_price,
+                order_age_ms,
+                queue_wait_ms,
+                maker_trade_through,
+            );
             return None;
         }
     }
-    let best_fill_price = best_opposite;
+    // Maker fills land at OUR limit (the resting price). Taker fills
+    // (fresh order crossing the book) land at the opposite-side touch.
+    let best_fill_price = if crosses_as_taker {
+        best_opposite
+    } else {
+        intent.limit_price
+    };
     let fill_ratio = paper_fill_ratio(
         remaining_qty,
         total_available,
@@ -2609,6 +3245,7 @@ fn paper_fill_from_book_snapshot(
         intent.limit_price,
         order_ctx,
         crossing,
+        observed_at_ms,
     );
     let target_fill_qty = (remaining_qty * fill_ratio)
         .min(total_available)
@@ -2624,24 +3261,42 @@ fn paper_fill_from_book_snapshot(
         if remaining <= 0.0 {
             break;
         }
+        // Phase 2 paper env: replace opaque queue_bias with explicit
+        // queue-depth-fraction model. Non-crossing maker orders can claim
+        // (1.0 - paper_queue_depth_fraction) of top-level size, representing
+        // the fraction of the queue ahead of us that has already cleared.
+        // Default 0.75 → we claim 25% of top-of-book per fill attempt.
+        // Reference: Moallemi-Yuan queue position valuation.
         let level_ratio = if crossing {
             1.0
         } else if idx == 0 {
-            0.9 * order_ctx.queue_bias
+            (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0)
         } else {
             0.0
         };
         let level_fill = (level.size * level_ratio).min(remaining);
         if level_fill > 0.0 {
             qty_filled += level_fill;
-            amount += level_fill * level.price;
+            // Maker fills land at OUR limit (the resting price); taker
+            // fills walk the book at level prices.
+            let price_at_level = if crosses_as_taker {
+                level.price
+            } else {
+                intent.limit_price
+            };
+            amount += level_fill * price_at_level;
             remaining -= level_fill;
         }
     }
 
     if qty_filled <= 0.0 {
         qty_filled = target_fill_qty.min(candidate_levels[0].size);
-        amount = qty_filled * candidate_levels[0].price;
+        let fallback_price = if crosses_as_taker {
+            candidate_levels[0].price
+        } else {
+            intent.limit_price
+        };
+        amount = qty_filled * fallback_price;
     }
 
     if qty_filled <= 0.0 {
@@ -2657,7 +3312,11 @@ fn paper_fill_from_book_snapshot(
         return None;
     }
 
-    let liquidity = if crossing || fill_ratio >= 0.75 {
+    // Same is_resting / crosses_as_taker invariant as the price assignment
+    // above. fill_ratio >= 0.75 alone does NOT make us a taker — a maker
+    // order can still claim a large fraction of top-of-book; it's just
+    // good queue position, not a crossing event.
+    let liquidity = if crosses_as_taker {
         FillLiquidity::Taker
     } else {
         FillLiquidity::Maker
@@ -2668,7 +3327,15 @@ fn paper_fill_from_book_snapshot(
     {
         return None;
     }
-    let fee = notional * paper_fee_coeff * price * (1.0 - price);
+    let effective_taker_coeff = execution_policy
+        .paper_taker_fee_coeff_override
+        .unwrap_or(paper_fee_coeff);
+    let fee_basis = price * (1.0 - price);
+    let fee = match liquidity {
+        FillLiquidity::Maker => -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis),
+        FillLiquidity::Taker => notional * effective_taker_coeff * fee_basis,
+        FillLiquidity::Unknown => notional * effective_taker_coeff * fee_basis,
+    };
     order_ctx.last_fill_ms = observed_at_ms;
     order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
     order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
@@ -2681,7 +3348,7 @@ fn paper_fill_from_book_snapshot(
         side: intent.side,
         price,
         quantity: qty_filled,
-        fee_usd: fee.max(0.0),
+        fee_usd: fee,
         liquidity,
         close_method: None,
         observed_at_ms,
@@ -2696,12 +3363,17 @@ fn paper_fill_ratio(
     limit_price: f64,
     order_ctx: &PaperOrderContext,
     crossing: bool,
+    observed_at_ms: u64,
 ) -> f64 {
     if order_qty <= 0.0 || available_qty <= 0.0 || fill_price <= 0.0 || limit_price <= 0.0 {
         return 0.0;
     }
 
-    let age_ms = now_unix_ms().saturating_sub(order_ctx.arrival_ms.max(order_ctx.last_attempt_ms));
+    // Use observed_at_ms (the simulated/replay clock) instead of wall
+    // clock so replays produce deterministic fill ratios. Was a hidden
+    // bug: now_unix_ms() inside this function caused replay results to
+    // depend on how fast the host machine ran the loop.
+    let age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms.max(order_ctx.last_attempt_ms));
     let age_pressure = if crossing {
         0.15 + 0.30 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
     } else {
@@ -2711,7 +3383,7 @@ fn paper_fill_ratio(
     let queue_pressure = 0.08 + order_ctx.queue_bias * 0.52;
     let staleness_pressure = 0.30
         + 0.60
-            * ((now_unix_ms().saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
+            * ((observed_at_ms.saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
     let premium = ((limit_price - fill_price) / fill_price).max(0.0).min(1.0);
     let limit_pressure = if crossing {
         0.65
@@ -2730,6 +3402,59 @@ fn deterministic_hash_0_95(value: &str) -> f64 {
     }
     let normalized = (hash & 0xffff) as f64 / 65_536.0;
     (0.05 + (normalized * 0.95)).min(1.0)
+}
+
+/// Deterministic [0, 1) value derived from a client_order_id and a book
+/// update timestamp. Used by paper-mode post-only rejection so that the
+/// same fixture replays produce the same accept/reject pattern across
+/// runs, while the decision varies per book update (matching real venue:
+/// a previously-rejected post-only may succeed when the book moves).
+fn deterministic_unit_hash(client_order_id: &str, book_update_ms: u64) -> f64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in client_order_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in book_update_ms.to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash & 0xffff_ffff) as f64 / 4_294_967_296.0
+}
+
+/// Phase 2 paper env: returns true when paper mode should reject a post-
+/// only intent because it would cross the book. Probabilistic (controlled
+/// by paper_post_only_reject_probability) and deterministic per
+/// (client_order_id, book.last_update_unix_ms).
+///
+/// Real Polymarket post-only orders that arrive while the book is crossing
+/// are rejected most of the time, but occasionally slip through as taker
+/// fills because the ack and the book update aren't atomic. This models
+/// that behavior in paper.
+fn paper_post_only_should_reject(
+    intent: &OrderIntent,
+    book: &BookState,
+    execution_policy: &ExecutionPolicy,
+) -> bool {
+    if !execution_policy.paper_mode {
+        return false;
+    }
+    if execution_policy.paper_post_only_reject_probability <= 0.0 {
+        return false;
+    }
+    let crossing = if matches!(intent.side, TradeSide::Buy) {
+        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
+    } else {
+        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
+    };
+    if !crossing {
+        return false;
+    }
+    let roll = deterministic_unit_hash(
+        intent.client_order_id.as_str(),
+        book.last_update_unix_ms,
+    );
+    roll < execution_policy.paper_post_only_reject_probability
 }
 
 fn venue_fill_key(fill: &VenueFill) -> String {
@@ -2752,6 +3477,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
+    use crate::book::Level;
     use crate::market_context::MarketContextStore;
     use crate::risk::RiskLimits;
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
@@ -2902,6 +3628,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -2941,6 +3668,7 @@ mod tests {
             reason: "stale queued submit".to_string(),
             quote_level_tag: None,
             created_at_ms: now_unix_ms(),
+            pair_id: None,
         };
         let mut initial_outcome = RuntimeOutcome::default();
         initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
@@ -2971,6 +3699,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3010,6 +3739,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3069,6 +3799,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3141,6 +3872,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3223,6 +3955,7 @@ mod tests {
             adapter.clone(),
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3294,6 +4027,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3355,6 +4089,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3436,6 +4171,7 @@ mod tests {
             adapter,
             &execution_policy,
             &mut seen_venue_fill_keys,
+            None,
         )
         .await
         .expect("execute");
@@ -3484,6 +4220,7 @@ mod tests {
             reason: "test live lifecycle".to_string(),
             quote_level_tag: Some("lvl-1:test".to_string()),
             created_at_ms: 10,
+            pair_id: None,
         };
         let policy = live_test_policy();
         let request = submit_request_from_intent(&intent, 1_000, &policy);
@@ -3523,6 +4260,7 @@ mod tests {
             reason: "test paper fill".to_string(),
             quote_level_tag: None,
             created_at_ms: now_ms,
+            pair_id: None,
         };
         let policy = paper_test_policy();
         let mut ctx = PaperOrderContext {
@@ -3532,11 +4270,14 @@ mod tests {
             last_fill_ms: 0,
             last_fill_book_update_ms: 0,
             fill_count: 0,
+            cancel_requested_at_ms: None,
         };
+        // Past the paper_submit_latency_ms gate (Phase 2 conservative model).
+        let after_latency_ms = now_ms + policy.paper_submit_latency_ms + 50;
         let first = paper_fill_from_book_snapshot(
             &book,
             &intent,
-            now_ms,
+            after_latency_ms,
             0.0,
             &mut ctx,
             intent.quantity,
@@ -3547,13 +4288,422 @@ mod tests {
         let second = paper_fill_from_book_snapshot(
             &book,
             &intent,
-            now_ms + 1_000,
+            after_latency_ms + 1_000,
             0.0,
             &mut ctx,
             intent.quantity - first.quantity,
             &policy,
         );
         assert!(second.is_none());
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_returns_false_outside_paper_mode() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let policy = live_test_policy();
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_skips_non_crossing_orders() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.55, 100.0, 0.50, 1_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly-noncross"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only no cross".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_should_reject_at_high_probability_when_crossing() {
+        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 1.0;
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-postonly-cross"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test post-only cross".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        // probability 1.0 always rejects when crossing
+        assert!(paper_post_only_should_reject(&intent, &book, &policy));
+        // probability 0.0 never rejects
+        policy.paper_post_only_reject_probability = 0.0;
+        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
+    }
+
+    #[test]
+    fn paper_post_only_reject_decision_is_deterministic_per_book_update() {
+        let book_a = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
+        let book_b = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 2_000);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-determinism"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.51,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "determinism".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1_000,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.5;
+        // Same book, same decision repeated
+        let r1 = paper_post_only_should_reject(&intent, &book_a, &policy);
+        let r2 = paper_post_only_should_reject(&intent, &book_a, &policy);
+        assert_eq!(r1, r2, "same book update must give same decision");
+        // Decision varies independently across book updates (one of these is
+        // exceedingly unlikely to fail; if it ever does, the hash is broken).
+        let _r_b = paper_post_only_should_reject(&intent, &book_b, &policy);
+    }
+
+    #[test]
+    fn resting_order_when_book_moves_into_us_fills_as_maker_at_limit() {
+        // Real venue: resting limit buy at 0.45; book moves so best_ask
+        // drops to 0.43; a new sell at 0.45 hits our resting buy → we
+        // fill at 0.45 (our limit) as MAKER (price improvement to seller).
+        // The paper model used to misclassify this as Taker at 0.43.
+        let now_ms = now_unix_ms();
+        // Arrival in the past so order is "resting" (past submit-latency).
+        let arrival_ms = now_ms - 5_000;
+        let mut book = BookState::from_top_of_book(
+            "token-1",
+            0.42,
+            150.0,
+            0.43,
+            150.0,
+            0.43,
+            now_ms,
+        );
+        book.bids = vec![Level { price: 0.42, size: 150.0 }];
+        book.asks = vec![Level { price: 0.43, size: 150.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-resting-maker"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.45,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test resting maker fill".to_string(),
+            quote_level_tag: None,
+            created_at_ms: arrival_ms,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.0; // skip reject path
+        let mut ctx = PaperOrderContext {
+            arrival_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: arrival_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        )
+        .expect("expected resting maker fill when book crossed into us");
+        assert!(
+            matches!(fill.liquidity, FillLiquidity::Maker),
+            "expected Maker liquidity for resting order book moved into us, got {:?}",
+            fill.liquidity
+        );
+        assert!(
+            (fill.price - 0.45).abs() < 1e-9,
+            "expected fill at our limit price 0.45, got {}",
+            fill.price
+        );
+    }
+
+    #[test]
+    fn resting_maker_fills_via_trade_through_when_book_has_no_crossable_levels() {
+        // Real venue: resting buy at 0.50; a taker sells through us at
+        // 0.50 (last_trade=0.50), and the bid level repriced past us so
+        // the snapshot now shows asks only above 0.50. Without the
+        // maker-via-trade-through branch, this fill is silently dropped.
+        let now_ms = now_unix_ms();
+        let arrival_ms = now_ms - 5_000; // resting (past submit-latency)
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.45, 200.0, 0.55, 200.0, 0.50, now_ms);
+        book.bids = vec![Level { price: 0.45, size: 200.0 }];
+        // No asks at or below our 0.50 limit; candidate_levels is empty.
+        book.asks = vec![Level { price: 0.55, size: 200.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-trade-through-maker"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "test trade-through maker".to_string(),
+            quote_level_tag: None,
+            created_at_ms: arrival_ms,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.0;
+        policy.paper_min_fill_notional_usd = 0.0;
+        let mut ctx = PaperOrderContext {
+            arrival_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: arrival_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        )
+        .expect("expected maker fill via trade-through when book has no crossable levels");
+        assert!(
+            matches!(fill.liquidity, FillLiquidity::Maker),
+            "expected Maker liquidity for trade-through fill, got {:?}",
+            fill.liquidity
+        );
+        assert!(
+            (fill.price - 0.50).abs() < 1e-9,
+            "expected fill at our limit price 0.50, got {}",
+            fill.price
+        );
+        let expected_qty =
+            intent.quantity * (1.0 - policy.paper_queue_depth_fraction).max(0.0);
+        assert!(
+            (fill.quantity - expected_qty).abs() < 1e-9,
+            "expected qty {} (queue_depth_fraction-driven), got {}",
+            expected_qty,
+            fill.quantity
+        );
+    }
+
+    #[test]
+    fn no_fill_when_no_crossable_levels_and_no_trade_through() {
+        // Sanity: if the book has no crossable levels AND last_trade is
+        // away from our limit, we must NOT synthesize a maker fill.
+        let now_ms = now_unix_ms();
+        let arrival_ms = now_ms - 5_000;
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.45, 200.0, 0.55, 200.0, 0.55, now_ms);
+        book.bids = vec![Level { price: 0.45, size: 200.0 }];
+        book.asks = vec![Level { price: 0.55, size: 200.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-no-trade-through"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "test no trade-through".to_string(),
+            quote_level_tag: None,
+            created_at_ms: arrival_ms,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        let mut ctx = PaperOrderContext {
+            arrival_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: arrival_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(fill.is_none(), "should not fill without trade-through evidence");
+    }
+
+    #[test]
+    fn fresh_submit_into_crossed_book_fills_as_taker_at_opposite() {
+        // Counterexample: a brand-new submit at 0.45 when book ask is
+        // already at 0.43 IS a taker scenario (we crossed at submit time).
+        // Fill at best_opposite 0.43 with Taker liquidity.
+        let now_ms = now_unix_ms();
+        let mut book = BookState::from_top_of_book(
+            "token-1",
+            0.42,
+            150.0,
+            0.43,
+            150.0,
+            0.43,
+            now_ms,
+        );
+        book.bids = vec![Level { price: 0.42, size: 150.0 }];
+        book.asks = vec![Level { price: 0.43, size: 150.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-fresh-taker"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.45,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test fresh taker".to_string(),
+            quote_level_tag: None,
+            created_at_ms: now_ms,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.0; // bypass reject for the test
+        policy.paper_min_fill_notional_usd = 0.0; // allow tiny initial fill ratio
+        // arrival_ms == now_ms; well within submit-latency window (default 150ms).
+        let mut ctx = PaperOrderContext {
+            arrival_ms: now_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: now_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        // submit-latency gate would normally suppress; advance the
+        // observed_at_ms by exactly the latency window so a fill is
+        // possible but order is still "fresh" (not aged past it).
+        let observed = now_ms + policy.paper_submit_latency_ms;
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            observed,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        )
+        .expect("expected taker fill at submit-latency boundary");
+        assert!(
+            matches!(fill.liquidity, FillLiquidity::Taker),
+            "expected Taker for fresh crossing submit, got {:?}",
+            fill.liquidity
+        );
+        assert!(
+            (fill.price - 0.43).abs() < 1e-9,
+            "expected fill at best_ask 0.43, got {}",
+            fill.price
+        );
+    }
+
+    #[test]
+    fn paper_submit_latency_gate_suppresses_fill_until_window_passes() {
+        let now_ms = now_unix_ms();
+        let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-latency"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 20.0,
+            reduce_only: false,
+            reason: "test latency gate".to_string(),
+            quote_level_tag: None,
+            created_at_ms: now_ms,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        assert!(
+            policy.paper_submit_latency_ms >= 100,
+            "test assumes default >= 100ms; got {}",
+            policy.paper_submit_latency_ms
+        );
+        let mut ctx = PaperOrderContext {
+            arrival_ms: now_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: now_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        // Within latency window: suppressed.
+        let inside = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms + policy.paper_submit_latency_ms - 1,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(
+            inside.is_none(),
+            "expected no fill inside latency window, got {inside:?}"
+        );
+        // Past latency window with fresh book update: allowed.
+        let later_book = BookState::from_top_of_book(
+            "token-1",
+            0.48,
+            100.0,
+            0.50,
+            100.0,
+            0.50,
+            now_ms + policy.paper_submit_latency_ms + 50,
+        );
+        let outside = paper_fill_from_book_snapshot(
+            &later_book,
+            &intent,
+            now_ms + policy.paper_submit_latency_ms + 50,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(outside.is_some(), "expected fill past latency window");
     }
 
     fn live_test_policy() -> ExecutionPolicy {
@@ -3569,6 +4719,14 @@ mod tests {
             paper_min_fill_notional_usd: 0.05,
             paper_max_fills_per_order: 3,
             paper_min_fill_interval_ms: 750,
+            paper_market_close_at_ms: None,
+            paper_market_resolution_price: None,
+            paper_submit_latency_ms: 150,
+            paper_queue_depth_fraction: 0.75,
+            paper_post_only_reject_probability: 0.85,
+            paper_cancel_race_window_ms: 500,
+            paper_maker_rebate_coeff: 0.0,
+            paper_taker_fee_coeff_override: None,
         }
     }
 
@@ -3622,6 +4780,7 @@ mod tests {
                 reason: "test recovered live order".to_string(),
                 quote_level_tag: None,
                 created_at_ms: last_update_ms,
+                pair_id: None,
             },
             "noop",
         );
