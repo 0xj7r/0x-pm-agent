@@ -488,6 +488,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         } else {
             None
         };
+    let mut book_snapshot: Option<crate::paper::snapshot::BookSnapshotWriter> = config
+        .book_snapshot_log_path
+        .as_deref()
+        .map(crate::paper::snapshot::BookSnapshotWriter::open)
+        .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -598,6 +603,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut journal,
         &mut audit,
         &mut paper_report,
+        &mut book_snapshot,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -622,6 +628,23 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 target: "paper_report.flush",
                 output = %report.output_path().display(),
                 "paper report written"
+            );
+        }
+    }
+    if let Some(snap) = book_snapshot.as_mut() {
+        if let Err(error) = snap.flush() {
+            warn!(
+                target: "book_snapshot.flush",
+                output = %snap.path().display(),
+                error = %error,
+                "failed to flush book snapshot log on shutdown"
+            );
+        } else {
+            info!(
+                target: "book_snapshot.flush",
+                output = %snap.path().display(),
+                bytes_written = snap.bytes_written(),
+                "book snapshot log flushed"
             );
         }
     }
@@ -732,6 +755,7 @@ async fn run_runtime_loop(
     journal: &mut Option<JournalWriter>,
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
+    book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -908,6 +932,18 @@ async fn run_runtime_loop(
                 for asset_id in &config.market_assets {
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
+                            if let Some(snap) = book_snapshot.as_mut() {
+                                if let Err(error) =
+                                    snap.record(&book, config.book_snapshot_max_levels)
+                                {
+                                    warn!(
+                                        target: "book_snapshot",
+                                        asset = %asset_id,
+                                        error = %error,
+                                        "failed to append book snapshot record"
+                                    );
+                                }
+                            }
                             metrics.observe_book(&book, config.book_stale_after);
                             let (c10, c30, c60, last_age_ms) =
                                 books.trade_activity(asset_id, now_unix_ms()).await;
