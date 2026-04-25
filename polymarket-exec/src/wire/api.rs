@@ -336,7 +336,7 @@ async fn api_whale_events(State(state): State<DashboardUiState>) -> Json<WhalePa
     })
 }
 
-fn load_whale_events(path: &std::path::Path, limit: usize) -> Vec<WhaleEvent> {
+pub fn load_whale_events(path: &std::path::Path, limit: usize) -> Vec<WhaleEvent> {
     let payload = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(_) => return Vec::new(),

@@ -87,6 +87,8 @@ struct ExecutionPolicy {
     paper_queue_depth_fraction: f64,
     paper_post_only_reject_probability: f64,
     paper_cancel_race_window_ms: u64,
+    paper_maker_rebate_coeff: f64,
+    paper_taker_fee_coeff_override: Option<f64>,
 }
 
 impl ExecutionPolicy {
@@ -109,6 +111,8 @@ impl ExecutionPolicy {
             paper_queue_depth_fraction: config.paper_queue_depth_fraction,
             paper_post_only_reject_probability: config.paper_post_only_reject_probability,
             paper_cancel_race_window_ms: config.paper_cancel_race_window_ms,
+            paper_maker_rebate_coeff: config.paper_maker_rebate_coeff,
+            paper_taker_fee_coeff_override: config.paper_taker_fee_coeff_override,
         }
     }
 }
@@ -787,7 +791,34 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         strategy_name.as_str(),
     )
     .await?;
-    if let Some(report) = paper_report.as_ref() {
+    if let Some(report) = paper_report.as_mut() {
+        if let Some(whale_path) = config.dashboard_whale_events_path.as_deref() {
+            let session_start = report.started_at_ms();
+            let session_end = now_unix_ms();
+            let whale_events = crate::wire::api::load_whale_events(whale_path, 100_000);
+            let mut ingested = 0usize;
+            for ev in whale_events {
+                if ev.observed_at_ms < session_start || ev.observed_at_ms > session_end {
+                    continue;
+                }
+                let notional = ev
+                    .notional_usd
+                    .or_else(|| ev.price.and_then(|p| ev.quantity.map(|q| p * q)))
+                    .unwrap_or(0.0);
+                report.record_whale_fill_observed(
+                    ev.observed_at_ms,
+                    ev.side.as_deref(),
+                    notional,
+                );
+                ingested += 1;
+            }
+            info!(
+                target: "paper_report.vs_whale",
+                whale_events_ingested = ingested,
+                source = %whale_path.display(),
+                "whale events ingested into vs_whale section"
+            );
+        }
         if let Err(error) = report.flush() {
             warn!(
                 target: "paper_report.flush",
@@ -3152,7 +3183,15 @@ fn paper_fill_from_book_snapshot(
     {
         return None;
     }
-    let fee = notional * paper_fee_coeff * price * (1.0 - price);
+    let effective_taker_coeff = execution_policy
+        .paper_taker_fee_coeff_override
+        .unwrap_or(paper_fee_coeff);
+    let fee_basis = price * (1.0 - price);
+    let fee = match liquidity {
+        FillLiquidity::Maker => -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis),
+        FillLiquidity::Taker => notional * effective_taker_coeff * fee_basis,
+        FillLiquidity::Unknown => notional * effective_taker_coeff * fee_basis,
+    };
     order_ctx.last_fill_ms = observed_at_ms;
     order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
     order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
@@ -3165,7 +3204,7 @@ fn paper_fill_from_book_snapshot(
         side: intent.side,
         price,
         quantity: qty_filled,
-        fee_usd: fee.max(0.0),
+        fee_usd: fee,
         liquidity,
         close_method: None,
         observed_at_ms,
@@ -4288,6 +4327,8 @@ mod tests {
             paper_queue_depth_fraction: 0.75,
             paper_post_only_reject_probability: 0.85,
             paper_cancel_race_window_ms: 500,
+            paper_maker_rebate_coeff: 0.0,
+            paper_taker_fee_coeff_override: None,
         }
     }
 
