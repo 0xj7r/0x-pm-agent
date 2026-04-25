@@ -133,8 +133,12 @@ pub async fn run() -> Result<()> {
 
 /// Phase 5 paper env: replay mode. Reads a recorded book snapshot log
 /// (the JSONL produced by `BookSnapshotWriter` during a prior live or
-/// shadow_live run) and produces a paper report summarising the recorded
-/// session. Inputs:
+/// shadow_live run), drives `Runtime<StrategyMode>` through it
+/// deterministically, routes any submits the strategy emits through
+/// `paper_fill_from_book_snapshot` using the recorded timestamp as the
+/// replay clock, and writes a `PaperReportSummary` JSON.
+///
+/// Inputs:
 /// - `WHALE_PAIR_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
 /// - `WHALE_PAIR_PAPER_REPORT_PATH`: optional. Where to write the
 ///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
@@ -166,19 +170,133 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
         target: "replay.startup",
         input = %input_path.display(),
         output = %output_path.display(),
-        "replay mode engaged"
+        starting_cash_usd = config.starting_cash_usd,
+        "replay mode engaged (strategy-driven)"
     );
-    let outcome = crate::paper::replay::replay_into_report(crate::paper::replay::ReplayConfig {
-        input_path,
-        output_report_path: output_path.clone(),
-        run_id: format!("replay-{}", now_unix_ms()),
-        market_id_by_asset: config.market_id_by_asset.clone(),
-    })?;
+    let records = crate::paper::replay::read_snapshot_log(&input_path)?;
+    let started_at_ms = records.first().map(|r| r.t).unwrap_or_else(now_unix_ms);
+
+    // Build runtime with the same shape as live, but no order_store /
+    // journal / live adapter. Replay is in-memory only.
+    let strategy = crate::strategy::StrategyMode::from_name(
+        &config.strategy_name,
+        config.strategy_profile.as_ref(),
+    );
+    let mut runtime = Runtime::new(
+        crate::runtime::types::RuntimeConfig {
+            starting_cash_usd: config.starting_cash_usd,
+            event_log_capacity: config.event_log_capacity,
+            initial_status: RuntimeStatus::Running,
+            quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
+            quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
+        },
+        config.risk_limits.clone(),
+        strategy,
+        MarketContextStore::empty(),
+    );
+
+    let execution_policy = ExecutionPolicy::from_config(&config);
+    let mut paper_order_ctx: HashMap<ClientOrderId, PaperOrderContext> = HashMap::new();
+    let mut report = crate::paper::report::PaperReportWriter::new(
+        format!("replay-{}", now_unix_ms()),
+        "replay",
+        output_path.clone(),
+        started_at_ms,
+    );
+
+    let mut submits = 0usize;
+    let mut fills = 0usize;
+    let mut rejects = 0usize;
+    let mut cancels = 0usize;
+
+    for record in records.iter() {
+        let asset = record.asset.clone();
+        let book = crate::paper::replay::ReplayBookRecord {
+            t: record.t,
+            asset: record.asset.clone(),
+            bids: record.bids.clone(),
+            asks: record.asks.clone(),
+            last_trade: record.last_trade,
+        }
+        .into_book_state();
+        let market_id = MarketId::from(config.market_id_for_asset(&asset));
+        let instrument_id = InstrumentId::from(asset.as_str());
+
+        let outcome = runtime.on_book_state(market_id.clone(), instrument_id.clone(), &book)?;
+        for command in outcome.commands {
+            match command {
+                RuntimeCommand::Submit(intent) => {
+                    submits += 1;
+                    if paper_post_only_should_reject(&intent, &book, &execution_policy) {
+                        report.record_reject(
+                            &intent.client_order_id,
+                            &intent.market_id,
+                            &intent.instrument_id,
+                            intent.limit_price,
+                            "post-only-cross-paper",
+                            record.t,
+                        );
+                        rejects += 1;
+                        runtime.on_order_rejected(
+                            &intent.client_order_id,
+                            "post-only-cross-paper",
+                            record.t,
+                        );
+                        continue;
+                    }
+                    let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
+                        Some((book.best_bid + book.best_ask) * 0.5)
+                    } else {
+                        None
+                    };
+                    if let Some(mid) = mid_at_submit {
+                        report.record_submit_edge(
+                            intent.side,
+                            intent.limit_price,
+                            intent.quantity,
+                            mid,
+                            record.t,
+                        );
+                    }
+                    let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
+                    if let Some(fill) = paper_fill_from_book_snapshot(
+                        &book,
+                        &intent,
+                        record.t,
+                        0.0,
+                        ctx,
+                        intent.quantity,
+                        &execution_policy,
+                    ) {
+                        report.record_fill(&fill, mid_at_submit);
+                        fills += 1;
+                        runtime.on_fill(fill)?;
+                    } else {
+                        runtime.on_order_opened(&intent.client_order_id, record.t);
+                    }
+                }
+                RuntimeCommand::Cancel { client_order_id, reason } => {
+                    cancels += 1;
+                    paper_order_ctx.remove(&client_order_id);
+                    runtime.on_order_cancelled(&client_order_id, reason, record.t);
+                }
+                RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
+                    // Replay does not exercise relayer/redeem in-process;
+                    // treated as no-ops. Production runs handle these via
+                    // execute_execution_adapter.
+                }
+            }
+        }
+    }
+    report.flush()?;
     info!(
         target: "replay.complete",
-        records_consumed = outcome.records_consumed,
-        assets_seen = outcome.assets_seen,
-        report = %outcome.report_path.display(),
+        records_consumed = records.len(),
+        submits,
+        fills,
+        rejects,
+        cancels,
+        report = %output_path.display(),
         "replay finished"
     );
     Ok(())
