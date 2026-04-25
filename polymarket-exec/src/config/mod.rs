@@ -150,7 +150,12 @@ impl AppConfig {
         let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
             .ok()
             .filter(|value| !value.trim().is_empty());
-        let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v1");
+        // Polymarket CLOB V2 cutover: 2026-04-28. Default to V2; operators can
+        // override with POLYMARKET_CLOB_VERSION=v1 if they need legacy behavior
+        // for a specific reason (e.g. comparing pre-cutover behavior). The V2
+        // signing path is in wire/clob_v2.rs and verified at startup by
+        // log_live_venue_config.
+        let clob_version = env_or("POLYMARKET_CLOB_VERSION", "v2");
         let clob_v2_builder_code = env_or(
             "POLYMARKET_CLOB_V2_BUILDER_CODE",
             "0x0000000000000000000000000000000000000000000000000000000000000000",
