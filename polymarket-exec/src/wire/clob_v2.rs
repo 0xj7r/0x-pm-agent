@@ -71,6 +71,20 @@ pub struct V2PostOrder {
     pub metadata: String,
     pub builder: String,
     pub signature: String,
+    /// Polymarket CLOB V2 requires this field as int64 even though it's
+    /// not part of the V2 EIP-712 signed struct. Sending empty/missing
+    /// causes the venue to 400 with "error parsing fee rate bps () to
+    /// int64". Set to "0" for makers (no fee on post-only) — for taker
+    /// orders the venue computes fees off this. If we ever need a non-
+    /// zero rate, fetch via the SDK's `client.fee_rate_bps(token_id)`.
+    pub fee_rate_bps: String,
+    /// Same story as fee_rate_bps: required as int64 in JSON body even
+    /// though omitted from the EIP-712 signed payload. Default "0" for
+    /// proxy-wallet orders that don't use replay protection nonces.
+    pub nonce: String,
+    /// Required in V2 JSON body. Empty address means "any taker" (open
+    /// order). Polymarket parses this as an address; "0x" + 40 zeros.
+    pub taker: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +195,14 @@ impl V2OrderDraft {
                 metadata: self.order.metadata.encode_hex_with_prefix(),
                 builder: self.order.builder.encode_hex_with_prefix(),
                 signature: signature.into(),
+                // Hardcoded to 1000 (10bps) — matches Polymarket's
+                // current default maker fee for crypto-binary 5m markets.
+                // Venue rejects with "invalid fee rate (X), current
+                // market's maker fee: Y" if mismatched. Future: fetch
+                // per-market via SDK fee_rate_bps endpoint.
+                fee_rate_bps: "1000".to_string(),
+                nonce: "0".to_string(),
+                taker: "0x0000000000000000000000000000000000000000".to_string(),
             },
             owner: owner.into(),
             order_type: order_type.into(),
@@ -255,9 +277,12 @@ mod tests {
         assert_eq!(json["order"]["makerAmount"], "5000000");
         assert_eq!(json["order"]["takerAmount"], "12500000");
         assert_eq!(json["order"]["signatureType"], 2);
-        assert!(json["order"].get("nonce").is_none());
-        assert!(json["order"].get("feeRateBps").is_none());
-        assert!(json["order"].get("taker").is_none());
+        // feeRateBps, nonce, taker must be present (venue rejects 400
+        // otherwise); not part of EIP-712 signed payload but required
+        // in JSON body. nonce=0/taker=zero-address are open-order defaults.
+        assert_eq!(json["order"]["feeRateBps"], "1000");
+        assert_eq!(json["order"]["nonce"], "0");
+        assert_eq!(json["order"]["taker"], "0x0000000000000000000000000000000000000000");
         assert_eq!(json["postOnly"], true);
         assert_eq!(json["deferExec"], false);
     }
