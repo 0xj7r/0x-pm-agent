@@ -318,6 +318,7 @@ pub struct Runtime<S: Strategy> {
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     pending_merge_by_market: HashMap<MarketId, MergeIntent>,
+    condition_id_by_market: HashMap<MarketId, String>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
@@ -370,6 +371,7 @@ impl<S: Strategy> Runtime<S> {
             first_fill_by_market: HashMap::new(),
             first_merge_by_market: HashMap::new(),
             pending_merge_by_market: HashMap::new(),
+            condition_id_by_market: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             order_store,
@@ -469,6 +471,16 @@ impl<S: Strategy> Runtime<S> {
         venue_positions: &[VenuePositionSnapshot],
         observed_at_ms: EpochMillis,
     ) -> Result<InventoryReconciliationReport, RuntimeError> {
+        for venue_position in venue_positions {
+            if let Some(condition_id) = venue_position
+                .condition_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                self.condition_id_by_market
+                    .insert(venue_position.market_id.clone(), condition_id.to_string());
+            }
+        }
         let report = self
             .inventory
             .reconcile_venue_positions(venue_positions, observed_at_ms)?;
@@ -529,13 +541,16 @@ impl<S: Strategy> Runtime<S> {
         }
 
         let reason = reason.into();
-        let Some(intent) = self
+        let Some(mut intent) = self
             .merge_executor
             .merge_intent(market_id, now_ms, reason.clone())
             .or_else(|| self.inventory_merge_intent(market_id, now_ms, reason.clone()))
         else {
             return outcome;
         };
+        if intent.condition_id.is_none() {
+            intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
+        }
 
         self.pending_merge_by_market
             .insert(market_id.clone(), intent.clone());
@@ -591,6 +606,7 @@ impl<S: Strategy> Runtime<S> {
                 market_id, quantity, now_ms
             )),
             market_id: market_id.clone(),
+            condition_id: self.condition_id_by_market.get(market_id).cloned(),
             yes_instrument_id: positions[0].instrument_id.clone(),
             no_instrument_id: positions[1].instrument_id.clone(),
             quantity,
@@ -2734,6 +2750,7 @@ mod tests {
             .reconcile_venue_positions(
                 &[VenuePositionSnapshot {
                     market_id: MarketId::from("market-mm"),
+                    condition_id: None,
                     instrument_id: InstrumentId::from("down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,

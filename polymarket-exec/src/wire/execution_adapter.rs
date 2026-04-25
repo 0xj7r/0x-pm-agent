@@ -40,6 +40,10 @@ use crate::wire::clob_v2::{
     parse_bytes32, V2OrderBuildParams, V2OrderDraft, BYTES32_ZERO, CLOB_V2_EXCHANGE,
     CLOB_V2_NEG_RISK_EXCHANGE,
 };
+use crate::wire::relayer::{
+    CtfMergeRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
+    DEFAULT_USDCE_ADDRESS,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmitOrderRequest {
@@ -107,6 +111,7 @@ pub struct CancelOrderAck {
 pub struct MergePositionsRequest {
     pub command_id: ClientOrderId,
     pub market_id: MarketId,
+    pub condition_id: Option<String>,
     pub yes_instrument_id: InstrumentId,
     pub no_instrument_id: InstrumentId,
     pub quantity: f64,
@@ -145,6 +150,7 @@ pub struct VenueBalances {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VenuePosition {
     pub market_id: MarketId,
+    pub condition_id: Option<String>,
     pub instrument_id: InstrumentId,
     pub quantity: f64,
     pub average_cost_usd: f64,
@@ -208,12 +214,27 @@ impl PolymarketSignatureType {
             Self::GnosisSafe => SdkSignatureType::GnosisSafe,
         }
     }
+
+    pub fn as_polymarket_code(self) -> u8 {
+        match self {
+            Self::Eoa => 0,
+            Self::Proxy => 1,
+            Self::GnosisSafe => 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolymarketConfig {
     pub api_url: String,
     pub data_api_url: String,
+    pub relayer_url: String,
+    pub relayer_api_key: Option<String>,
+    pub relayer_api_key_address: Option<String>,
+    pub ctf_contract_address: String,
+    pub collateral_token_address: String,
+    pub collateral_decimals: u8,
+    pub proxy_wallet_address: Option<String>,
     pub market_id_by_asset: HashMap<String, String>,
     pub protocol: ClobProtocolVersion,
     pub v2_builder_code: String,
@@ -227,6 +248,13 @@ impl Default for PolymarketConfig {
         Self {
             api_url: "https://clob.polymarket.com".to_string(),
             data_api_url: "https://data-api.polymarket.com".to_string(),
+            relayer_url: DEFAULT_RELAYER_URL.to_string(),
+            relayer_api_key: None,
+            relayer_api_key_address: None,
+            ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
+            collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
+            collateral_decimals: 6,
+            proxy_wallet_address: None,
             market_id_by_asset: HashMap::new(),
             protocol: ClobProtocolVersion::V1,
             v2_builder_code: BYTES32_ZERO.to_string(),
@@ -392,6 +420,7 @@ pub struct PolymarketExecutionAdapter {
     signature_type: PolymarketSignatureType,
     client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
     data_client: SdkDataClient,
+    relayer_client: CtfRelayerClient,
     raw_http: reqwest::Client,
     trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
@@ -402,6 +431,13 @@ impl PolymarketExecutionAdapter {
         Self::connect_with_config(PolymarketConfig {
             api_url: "https://clob.polymarket.com".to_string(),
             data_api_url: "https://data-api.polymarket.com".to_string(),
+            relayer_url: DEFAULT_RELAYER_URL.to_string(),
+            relayer_api_key: None,
+            relayer_api_key_address: None,
+            ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
+            collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
+            collateral_decimals: 6,
+            proxy_wallet_address: None,
             market_id_by_asset: HashMap::new(),
             protocol: ClobProtocolVersion::V1,
             v2_builder_code: BYTES32_ZERO.to_string(),
@@ -487,6 +523,19 @@ impl PolymarketExecutionAdapter {
 
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
         let data_client = SdkDataClient::new(data_api_url.as_str()).map_err(map_sdk_error)?;
+        let relayer_client = CtfRelayerClient::new(CtfRelayerConfig {
+            relayer_url: config.relayer_url.clone(),
+            api_key: config.relayer_api_key.clone(),
+            api_key_address: config.relayer_api_key_address.clone(),
+            ctf_contract_address: config.ctf_contract_address.clone(),
+            collateral_token_address: config.collateral_token_address.clone(),
+            collateral_decimals: config.collateral_decimals,
+            proxy_wallet_address: relayer_proxy_wallet_address(
+                &config,
+                &credentials.funder_address,
+            ),
+            signature_type_code: credentials.signature_type.as_polymarket_code(),
+        });
 
         Ok(Self {
             _config: PolymarketConfig {
@@ -497,6 +546,7 @@ impl PolymarketExecutionAdapter {
             signature_type: credentials.signature_type,
             client,
             data_client,
+            relayer_client,
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
@@ -547,6 +597,19 @@ impl PolymarketExecutionAdapter {
         let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
         let data_client =
             SdkDataClient::new(config.data_api_url.as_str()).map_err(map_sdk_error)?;
+        let relayer_client = CtfRelayerClient::new(CtfRelayerConfig {
+            relayer_url: config.relayer_url.clone(),
+            api_key: config.relayer_api_key.clone(),
+            api_key_address: config.relayer_api_key_address.clone(),
+            ctf_contract_address: config.ctf_contract_address.clone(),
+            collateral_token_address: config.collateral_token_address.clone(),
+            collateral_decimals: config.collateral_decimals,
+            proxy_wallet_address: relayer_proxy_wallet_address(
+                &config,
+                &credentials.funder_address,
+            ),
+            signature_type_code: credentials.signature_type.as_polymarket_code(),
+        });
 
         Ok(Self {
             _config: config,
@@ -554,6 +617,7 @@ impl PolymarketExecutionAdapter {
             signature_type: credentials.signature_type,
             client,
             data_client,
+            relayer_client,
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
@@ -809,13 +873,15 @@ impl PolymarketExecutionAdapter {
         market_id_by_asset: &HashMap<String, String>,
     ) -> VenuePosition {
         let asset = position.asset.to_string();
+        let condition_id = format!("{:#x}", position.condition_id);
         VenuePosition {
             market_id: MarketId::from(
                 market_id_by_asset
                     .get(&asset)
                     .cloned()
-                    .unwrap_or_else(|| format!("{:#x}", position.condition_id)),
+                    .unwrap_or_else(|| condition_id.clone()),
             ),
+            condition_id: Some(condition_id),
             instrument_id: InstrumentId::from(asset),
             quantity: position.size.to_string().parse::<f64>().unwrap_or(0.0),
             average_cost_usd: position.avg_price.to_string().parse::<f64>().unwrap_or(0.0),
@@ -997,6 +1063,16 @@ impl PolymarketExecutionAdapter {
     }
 }
 
+fn relayer_proxy_wallet_address(
+    config: &PolymarketConfig,
+    funder_address: &Option<String>,
+) -> Option<String> {
+    config
+        .proxy_wallet_address
+        .clone()
+        .or_else(|| funder_address.clone())
+}
+
 #[async_trait]
 impl ExecutionAdapter for PolymarketExecutionAdapter {
     async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
@@ -1119,6 +1195,47 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         }
 
         Ok(ack)
+    }
+
+    async fn merge_positions(
+        &self,
+        req: MergePositionsRequest,
+    ) -> Result<MergePositionsAck, ExecutionError> {
+        let condition_id = req.condition_id.clone().ok_or_else(|| {
+            ExecutionError::BadRequest(format!(
+                "cannot merge market={} without condition_id from venue position sync",
+                req.market_id
+            ))
+        })?;
+        let metadata = serde_json::json!({
+            "source": "polymarket-exec",
+            "command_id": req.command_id.as_str(),
+            "market_id": req.market_id.as_str(),
+            "yes_token_id": req.yes_instrument_id.as_str(),
+            "no_token_id": req.no_instrument_id.as_str(),
+            "quantity": req.quantity,
+        })
+        .to_string();
+        let ack = self
+            .relayer_client
+            .merge_positions(CtfMergeRequest {
+                signer: self.signer.clone(),
+                condition_id,
+                quantity: req.quantity,
+                metadata,
+            })
+            .await?;
+        Ok(MergePositionsAck {
+            command_id: req.command_id,
+            accepted: true,
+            accepted_at_ms: now_unix_ms(),
+            venue_message: Some(format!(
+                "relayer merge submitted transaction_id={} state={} hash={}",
+                ack.transaction_id.as_deref().unwrap_or("unknown"),
+                ack.state.as_deref().unwrap_or("unknown"),
+                ack.transaction_hash.as_deref().unwrap_or("unknown")
+            )),
+        })
     }
 
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
@@ -1374,6 +1491,25 @@ mod tests {
             PolymarketSignatureType::GnosisSafe
         );
         assert!(PolymarketSignatureType::parse("bad").is_err());
+    }
+
+    #[test]
+    fn relayer_config_prefers_explicit_proxy_wallet_over_funder() {
+        let config = PolymarketConfig {
+            proxy_wallet_address: Some("0x1111111111111111111111111111111111111111".to_string()),
+            ..PolymarketConfig::default()
+        };
+        let funder = Some("0x2222222222222222222222222222222222222222".to_string());
+        assert_eq!(
+            relayer_proxy_wallet_address(&config, &funder).as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+
+        let config = PolymarketConfig::default();
+        assert_eq!(
+            relayer_proxy_wallet_address(&config, &funder).as_deref(),
+            Some("0x2222222222222222222222222222222222222222")
+        );
     }
 
     #[test]

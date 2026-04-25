@@ -68,6 +68,13 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
         let adapter = PolymarketExecutionAdapter::connect_with_config(PolymarketConfig {
             api_url: config.clob_api_url.clone(),
             data_api_url: config.data_api_url.clone(),
+            relayer_url: config.relayer_url.clone(),
+            relayer_api_key: config.relayer_api_key.clone(),
+            relayer_api_key_address: config.relayer_api_key_address.clone(),
+            ctf_contract_address: config.ctf_contract_address.clone(),
+            collateral_token_address: config.collateral_token_address.clone(),
+            collateral_decimals: config.collateral_decimals,
+            proxy_wallet_address: config.proxy_wallet_address.clone(),
             market_id_by_asset: config.market_id_by_asset.clone(),
             protocol: ClobProtocolVersion::parse(&config.clob_version)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
@@ -86,6 +93,13 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             PolymarketConfig {
                 api_url: config.clob_api_url.clone(),
                 data_api_url: config.data_api_url.clone(),
+                relayer_url: config.relayer_url.clone(),
+                relayer_api_key: config.relayer_api_key.clone(),
+                relayer_api_key_address: config.relayer_api_key_address.clone(),
+                ctf_contract_address: config.ctf_contract_address.clone(),
+                collateral_token_address: config.collateral_token_address.clone(),
+                collateral_decimals: config.collateral_decimals,
+                proxy_wallet_address: config.proxy_wallet_address.clone(),
                 market_id_by_asset: config.market_id_by_asset.clone(),
                 protocol: ClobProtocolVersion::parse(&config.clob_version)
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?,

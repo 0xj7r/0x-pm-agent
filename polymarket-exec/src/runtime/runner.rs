@@ -1896,6 +1896,7 @@ async fn execute_execution_adapter(
                 let merge_req = MergePositionsRequest {
                     command_id: intent.command_id.clone(),
                     market_id: intent.market_id.clone(),
+                    condition_id: intent.condition_id.clone(),
                     yes_instrument_id: intent.yes_instrument_id.clone(),
                     no_instrument_id: intent.no_instrument_id.clone(),
                     quantity: intent.quantity,
@@ -2238,6 +2239,7 @@ fn apply_sync_report(
                 .filter(|position| active_instruments.contains(&position.instrument_id))
                 .map(|position| VenuePositionSnapshot {
                     market_id: position.market_id.clone(),
+                    condition_id: position.condition_id.clone(),
                     instrument_id: position.instrument_id.clone(),
                     quantity: position.quantity,
                     average_cost_usd: position.average_cost_usd,
@@ -2260,6 +2262,7 @@ fn apply_sync_report(
                         })
                         .map(|position| VenuePositionSnapshot {
                             market_id: position.market_id.clone(),
+                            condition_id: None,
                             instrument_id: position.instrument_id.clone(),
                             quantity: 0.0,
                             average_cost_usd: position.avg_price,
@@ -2754,15 +2757,18 @@ mod tests {
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::strategy::NoopStrategy;
     use crate::wire::execution_adapter::{
-        CancelOrderAck, ExecutionError, SubmitOrderAck, VenueBalances, VenueFill, VenuePosition,
+        CancelOrderAck, ExecutionError, MergePositionsAck, MergePositionsRequest, SubmitOrderAck,
+        VenueBalances, VenueFill, VenuePosition,
     };
 
     #[derive(Default)]
     struct RecordingAdapter {
         submitted: Mutex<Vec<ClientOrderId>>,
         cancelled: Mutex<Vec<ClientOrderId>>,
+        merged: Mutex<Vec<MergePositionsRequest>>,
         submit_reject_message: Option<String>,
         cancel_reject_message: Option<String>,
+        merge_accept: bool,
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
         fills: Vec<VenueFill>,
         balances: Option<VenueBalances>,
@@ -2813,6 +2819,24 @@ mod tests {
                 accepted: true,
                 accepted_at_ms: req.submitted_at_ms,
                 venue_message: Some("cancelled".to_string()),
+            })
+        }
+
+        async fn merge_positions(
+            &self,
+            req: MergePositionsRequest,
+        ) -> Result<MergePositionsAck, ExecutionError> {
+            self.merged.lock().expect("merged lock").push(req.clone());
+            if !self.merge_accept {
+                return Err(ExecutionError::BadRequest(
+                    "test adapter merge not implemented".to_string(),
+                ));
+            }
+            Ok(MergePositionsAck {
+                command_id: req.command_id,
+                accepted: true,
+                accepted_at_ms: req.submitted_at_ms,
+                venue_message: Some("test merge accepted".to_string()),
             })
         }
 
@@ -3085,6 +3109,7 @@ mod tests {
                 cash_usd: 74.89,
                 positions: vec![VenuePosition {
                     market_id: MarketId::from("market-mm"),
+                    condition_id: None,
                     instrument_id: InstrumentId::from("down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
@@ -3152,12 +3177,20 @@ mod tests {
                 positions: vec![
                     VenuePosition {
                         market_id: MarketId::from("market-mm"),
+                        condition_id: Some(
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        ),
                         instrument_id: InstrumentId::from("up"),
                         quantity: 6.5,
                         average_cost_usd: 0.20,
                     },
                     VenuePosition {
                         market_id: MarketId::from("market-mm"),
+                        condition_id: Some(
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        ),
                         instrument_id: InstrumentId::from("down"),
                         quantity: 6.5,
                         average_cost_usd: 0.79,
@@ -3201,6 +3234,12 @@ mod tests {
         assert_eq!(runtime.status(), RuntimeStatus::Degraded);
         assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
         assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
+        let merges = adapter.merged.lock().expect("merged lock");
+        assert_eq!(merges.len(), 1);
+        assert_eq!(
+            merges[0].condition_id.as_deref(),
+            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
     }
 
     #[tokio::test]
@@ -3223,6 +3262,7 @@ mod tests {
                 cash_usd: 74.89,
                 positions: vec![VenuePosition {
                     market_id: MarketId::from("old-market"),
+                    condition_id: None,
                     instrument_id: InstrumentId::from("old-token"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
@@ -3348,6 +3388,7 @@ mod tests {
             .reconcile_venue_positions(
                 &[VenuePositionSnapshot {
                     market_id: MarketId::from("market-mm"),
+                    condition_id: None,
                     instrument_id: InstrumentId::from("down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,

@@ -198,6 +198,7 @@ impl OrderIntent {
 pub struct MergeIntent {
     pub command_id: ClientOrderId,
     pub market_id: MarketId,
+    pub condition_id: Option<String>,
     pub yes_instrument_id: InstrumentId,
     pub no_instrument_id: InstrumentId,
     pub quantity: f64,
