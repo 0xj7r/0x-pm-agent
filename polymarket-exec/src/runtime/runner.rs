@@ -123,11 +123,65 @@ pub async fn run() -> Result<()> {
         "live_cancel" => return run_live_cancel(config).await,
         "live_reconcile" => return run_live_reconcile(config).await,
         "shadow_live" => return run_shadow_live(config).await,
+        "replay" => return run_replay_cli(config).await,
         _ => {}
     }
     // Suppress unused-must-use mut warning when no shadow path is taken.
     let _ = &mut config;
     run_with_config(config).await
+}
+
+/// Phase 5 paper env: replay mode. Reads a recorded book snapshot log
+/// (the JSONL produced by `BookSnapshotWriter` during a prior live or
+/// shadow_live run) and produces a paper report summarising the recorded
+/// session. Inputs:
+/// - `WHALE_PAIR_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
+/// - `WHALE_PAIR_PAPER_REPORT_PATH`: optional. Where to write the
+///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
+///
+/// This is the foundation for A/B parameter calibration: change a paper
+/// fill knob (queue depth, post-only reject prob, latency), re-run
+/// replay against the same recorded log, and compare two report cards.
+async fn run_replay_cli(config: AppConfig) -> Result<()> {
+    crate::logging::init(&config)?;
+    let input_path = std::env::var("WHALE_PAIR_REPLAY_INPUT_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH"
+            )
+        })?;
+    let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
+        let mut p = input_path.clone();
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "replay".to_string());
+        p.set_file_name(format!("{stem}.replay.json"));
+        p
+    });
+    info!(
+        target: "replay.startup",
+        input = %input_path.display(),
+        output = %output_path.display(),
+        "replay mode engaged"
+    );
+    let outcome = crate::paper::replay::replay_into_report(crate::paper::replay::ReplayConfig {
+        input_path,
+        output_report_path: output_path.clone(),
+        run_id: format!("replay-{}", now_unix_ms()),
+        market_id_by_asset: config.market_id_by_asset.clone(),
+    })?;
+    info!(
+        target: "replay.complete",
+        records_consumed = outcome.records_consumed,
+        assets_seen = outcome.assets_seen,
+        report = %outcome.report_path.display(),
+        "replay finished"
+    );
+    Ok(())
 }
 
 /// Phase 4 paper env: shadow-live mode. Connects live market_ws + spot_ws +
