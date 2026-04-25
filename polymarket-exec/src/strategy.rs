@@ -1722,6 +1722,7 @@ impl Btc5mMmStrategy {
             reason,
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
+            pair_id: None,
         }
     }
 
@@ -1900,7 +1901,11 @@ impl Strategy for Btc5mMmStrategy {
                     context.now_ms,
                 );
                 match (left_bid, right_bid) {
-                    (Some(left), Some(right)) => {
+                    (Some(mut left), Some(mut right)) => {
+                        let pair_id =
+                            format!("pair-{}-{}", snapshot.market_id, context.now_ms);
+                        left.pair_id = Some(pair_id.clone());
+                        right.pair_id = Some(pair_id);
                         intents.push(left);
                         intents.push(right);
                     }
@@ -2271,6 +2276,7 @@ impl GoatPairStrategy {
             reason,
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
+            pair_id: None,
         }
     }
 
@@ -2643,6 +2649,7 @@ impl UnlawfulShearStrategy {
             reason,
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
+            pair_id: None,
         }
     }
 

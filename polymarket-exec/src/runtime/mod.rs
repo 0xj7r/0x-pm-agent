@@ -1296,7 +1296,9 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             "order rejected by venue",
         ));
+        let mut rejected_pair_id: Option<String> = None;
         if let Some(managed) = self.open_orders.remove(client_order_id) {
+            rejected_pair_id = managed.intent.pair_id.clone();
             if let Some(release) = self.inventory.release_reservation(client_order_id, now_ms) {
                 outcome.push_event(
                     self.event_log
@@ -1311,6 +1313,44 @@ impl<S: Strategy> Runtime<S> {
                         .with_client_order(client_order_id.clone()),
                 ),
             );
+        }
+        if let Some(pair_id) = rejected_pair_id {
+            let mates: Vec<(ClientOrderId, MarketId, InstrumentId)> = self
+                .open_orders
+                .iter()
+                .filter_map(|(coid, managed)| {
+                    if managed.intent.pair_id.as_deref() == Some(pair_id.as_str()) {
+                        Some((
+                            coid.clone(),
+                            managed.intent.market_id.clone(),
+                            managed.intent.instrument_id.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (mate_coid, market_id, instrument_id) in mates {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "paired-entry guard: cancelling mate {mate_coid} after \
+                                 rejection of {client_order_id} (pair={pair_id}, incident #4)"
+                            ),
+                        )
+                        .with_market(market_id)
+                        .with_instrument(instrument_id)
+                        .with_client_order(mate_coid.clone()),
+                    ),
+                );
+                outcome.push_command(RuntimeCommand::Cancel {
+                    client_order_id: mate_coid,
+                    reason: format!("paired-entry guard: mate of rejected {client_order_id}"),
+                });
+            }
         }
         outcome
     }
@@ -2571,6 +2611,7 @@ impl<S: Strategy> Runtime<S> {
                     .unwrap_or_else(|| "checkpoint recovery".to_string()),
                 quote_level_tag: record.quote_level_tag,
                 created_at_ms: record.submitted_at_ms,
+                pair_id: None,
             },
             status: Self::checkpoint_status_from_string(&record.status),
             cumulative_filled_qty: record.filled_qty,
@@ -2596,6 +2637,7 @@ impl<S: Strategy> Runtime<S> {
                 reason: record.reason.unwrap_or_else(|| "recovered".to_string()),
                 quote_level_tag: record.quote_level_tag,
                 created_at_ms: record.submitted_at_ms,
+                pair_id: None,
             },
             status: record.status,
             cumulative_filled_qty: record.filled_qty,
@@ -2662,6 +2704,7 @@ mod tests {
                 reason: "enter".into(),
                 quote_level_tag: None,
                 created_at_ms: snapshot.quote.observed_at_ms,
+                pair_id: None,
             })
         }
     }
@@ -2985,6 +3028,7 @@ mod tests {
                 reason: "fallback cleanup".to_string(),
                 quote_level_tag: Some("fallback-cleanup".to_string()),
                 created_at_ms: 12,
+                pair_id: None,
             },
             12,
         );
@@ -3123,6 +3167,7 @@ mod tests {
             reason: format!("btc-5m-mm {level}"),
             quote_level_tag: Some(level.to_string()),
             created_at_ms: 1,
+            pair_id: None,
         }
     }
 
@@ -3168,6 +3213,54 @@ mod tests {
             .find(|managed| managed.intent.client_order_id == hedge_client_order_id)
             .expect("hedge order kept");
         assert_eq!(remaining.status, ManagedOrderStatus::PendingSubmit);
+    }
+
+    #[test]
+    fn paired_entry_rejection_cancels_mate_to_prevent_naked_exposure() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let pair_id = "pair-test-paired-entry-1".to_string();
+        let mut left = btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.55);
+        left.pair_id = Some(pair_id.clone());
+        let left_client_order_id = left.client_order_id.clone();
+        let mut right = btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44);
+        right.pair_id = Some(pair_id);
+        let right_client_order_id = right.client_order_id.clone();
+
+        let left_outcome = runtime.accept_intent(left, 1);
+        assert_eq!(left_outcome.commands.len(), 1);
+        let right_outcome = runtime.accept_intent(right, 1);
+        assert_eq!(right_outcome.commands.len(), 1);
+        assert_eq!(runtime.open_orders().count(), 2);
+
+        let reject_outcome =
+            runtime.on_order_rejected(&right_client_order_id, "venue rejected post-only", 2);
+
+        let cancels: Vec<&ClientOrderId> = reject_outcome
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                RuntimeCommand::Cancel { client_order_id, .. } => Some(client_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cancels.len(),
+            1,
+            "expected exactly one cancel command for the mate, got {:?}",
+            reject_outcome.commands
+        );
+        assert_eq!(cancels[0], &left_client_order_id);
     }
 
     #[test]
@@ -3459,6 +3552,7 @@ mod tests {
                 reason: "recover".to_string(),
                 quote_level_tag: None,
                 created_at_ms: now_ms,
+                pair_id: None,
             },
             "single-shot",
         );

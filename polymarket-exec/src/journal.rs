@@ -212,6 +212,7 @@ mod tests {
                 reason: "test".to_string(),
                 quote_level_tag: None,
                 created_at_ms: 2,
+                pair_id: None,
             }))
             .unwrap();
         journal.flush().unwrap();

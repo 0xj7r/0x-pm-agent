@@ -182,6 +182,11 @@ pub struct OrderIntent {
     pub reason: String,
     pub quote_level_tag: Option<String>,
     pub created_at_ms: EpochMillis,
+    /// Optional shared identifier across legs that must succeed/fail together.
+    /// When one leg of a pair gets rejected by the venue, the runtime cancels
+    /// the mate to prevent naked exposure (handoff incident #4 guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
 }
 
 impl OrderIntent {
