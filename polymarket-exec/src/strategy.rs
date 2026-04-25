@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::inventory::{InventorySnapshot, PositionState};
 use crate::market_context::MarketContextRecord;
@@ -1507,6 +1508,7 @@ impl Btc5mMmStrategy {
 
     fn paired_entry_quantity(
         &self,
+        market_id: &MarketId,
         left_quote: &QuoteSnapshot,
         right_quote: &QuoteSnapshot,
         left_bid_price: f64,
@@ -1527,10 +1529,37 @@ impl Btc5mMmStrategy {
         let required_quantity = self.required_order_quantity(min_notional_reference_price);
         let max_quantity = self.config.max_clip_usd / clip_reference_price;
         if required_quantity > max_quantity + 1e-9 {
+            info!(
+                target: "strategy.sizing",
+                market = %market_id,
+                requested_clip_usd,
+                clip_usd,
+                clip_reference_price,
+                min_notional_reference_price,
+                raw_quantity,
+                required_quantity,
+                max_quantity,
+                outcome = "rejected_required_exceeds_max",
+                "paired entry sizing aborted"
+            );
             return None;
         }
-        let quantity = raw_quantity.max(required_quantity);
-        Some(quantity.min(max_quantity).max(0.0))
+        let final_quantity = raw_quantity.max(required_quantity).min(max_quantity).max(0.0);
+        info!(
+            target: "strategy.sizing",
+            market = %market_id,
+            requested_clip_usd,
+            depth_capped_clip_usd = clip_usd,
+            min_floor_qty = required_quantity,
+            risk_cap_qty = max_quantity,
+            raw_quantity,
+            final_quantity,
+            left_bid_price,
+            right_bid_price,
+            outcome = "sized",
+            "paired entry sizing decision"
+        );
+        Some(final_quantity)
     }
 
     fn required_order_quantity(&self, reference_price: f64) -> f64 {
@@ -1829,6 +1858,7 @@ impl Strategy for Btc5mMmStrategy {
                     self.config.min_edge_bps,
                 );
                 let Some(entry_quantity) = self.paired_entry_quantity(
+                    &snapshot.market_id,
                     &left_quote,
                     &right_quote,
                     left_bid_price.unwrap_or(0.0),
