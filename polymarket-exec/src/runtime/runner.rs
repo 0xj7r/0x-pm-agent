@@ -2443,22 +2443,26 @@ async fn execute_execution_adapter(
                             .unwrap_or_else(|| "execution venue rejected submit".to_string());
                         let active_order =
                             runtime_has_active_order(runtime, &intent.client_order_id);
-                        if active_order
-                            && submit_rejection_counts_against_live_budget(
-                                &reason,
-                                execution_policy.live_post_only,
-                            )
-                        {
+                        let counts_against_budget = submit_rejection_counts_against_live_budget(
+                            &reason,
+                            execution_policy.live_post_only,
+                        );
+                        if active_order && counts_against_budget {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
-                        } else {
-                            debug!(
-                                mode = "live",
-                                client_order_id = %intent.client_order_id,
-                                reason = %reason,
-                                "submit rejected by venue without consuming live error budget"
-                            );
                         }
+                        warn!(
+                            target: "polymarket_exec::runtime::runner",
+                            mode = "live",
+                            client_order_id = %intent.client_order_id,
+                            instrument_id = %intent.instrument_id,
+                            price = intent.limit_price,
+                            qty = intent.quantity,
+                            reason = %reason,
+                            counts_against_budget,
+                            active_order,
+                            "submit ack-rejected by venue (full venue text)"
+                        );
                         paper_order_ctx.remove(&intent.client_order_id);
                         if active_order {
                             let rejected_outcome = runtime.on_order_rejected(
