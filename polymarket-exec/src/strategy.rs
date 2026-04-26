@@ -1996,7 +1996,7 @@ impl Strategy for Btc5mMmStrategy {
             (true, false) => {
                 // Stranded long on left → manufacture pair by IOC-lifting right's ask.
                 let hedge_qty = left_qty;
-                if let Some(hedge) = self.build_rescue_intent_for_quantity(
+                let intent = self.build_rescue_intent_for_quantity(
                     &snapshot.market_id,
                     &right_id,
                     &right_quote,
@@ -2005,14 +2005,24 @@ impl Strategy for Btc5mMmStrategy {
                     gross_cost,
                     "btc-5m-mm hedge rescue (lift right ask)",
                     context.now_ms,
-                ) {
+                );
+                tracing::info!(
+                    target: "strategy.rescue",
+                    market = %snapshot.market_id,
+                    side = "lift_right_ask",
+                    stranded_qty = hedge_qty,
+                    right_best_ask = ?Self::best_ask(&right_quote),
+                    intent_built = intent.is_some(),
+                    "hedge rescue branch entered (true, false)"
+                );
+                if let Some(hedge) = intent {
                     intents.push(hedge);
                 }
             }
             (false, true) => {
                 // Stranded long on right → manufacture pair by IOC-lifting left's ask.
                 let hedge_qty = right_qty;
-                if let Some(hedge) = self.build_rescue_intent_for_quantity(
+                let intent = self.build_rescue_intent_for_quantity(
                     &snapshot.market_id,
                     &left_id,
                     &left_quote,
@@ -2021,7 +2031,17 @@ impl Strategy for Btc5mMmStrategy {
                     gross_cost,
                     "btc-5m-mm hedge rescue (lift left ask)",
                     context.now_ms,
-                ) {
+                );
+                tracing::info!(
+                    target: "strategy.rescue",
+                    market = %snapshot.market_id,
+                    side = "lift_left_ask",
+                    stranded_qty = hedge_qty,
+                    left_best_ask = ?Self::best_ask(&left_quote),
+                    intent_built = intent.is_some(),
+                    "hedge rescue branch entered (false, true)"
+                );
+                if let Some(hedge) = intent {
                     intents.push(hedge);
                 }
             }
