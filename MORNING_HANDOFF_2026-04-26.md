@@ -32,19 +32,41 @@ Pick up here when you check tomorrow.
 - V2 SDK: keeps as alloy `Signature` and serializes via SignedOrder struct
 - Venue might want a specific encoding (r|s|v vs raw 65 bytes vs different v normalization)
 
-**Recommended fix path (30 min):**
+## Latest update (2026-04-26 ~07:00 UTC)
+
+Continued the loop overnight. **Schema fix committed (`6fca4d5`)** removes feeRateBps/nonce/taker from V2 JSON per the official docs (https://docs.polymarket.com/v2-migration). Verified via WebFetch on docs + reading polymarket_client_sdk_v2 v0.5.1 source — every config we send is now byte-identical to the official V2 SDK:
+- ✅ Domain name: "Polymarket CTF Exchange"
+- ✅ Domain version: "2"
+- ✅ chain_id: 137
+- ✅ Exchange: 0xE111180000d2663C0091e4f400237545B87B996B
+- ✅ EIP-712 Order struct (salt, maker, signer, tokenId, makerAmount, takerAmount, side, signatureType, timestamp, metadata, builder)
+- ✅ JSON body shape (above + expiration + signature)
+- ✅ maker = funder (proxy wallet 0xa57189...), signer = EOA, signatureType = 1 (proxy)
+
+**Tested against:**
+- Dublin EC2 (geo-block clean)
+- Both `clob.polymarket.com` and `clob-v2.polymarket.com` hosts
+- The user's confirmed-liquid test market `0xaf5e90...` (yo-fdv-above-50m)
+- Multiple current btc-updown-5m markets
+
+**All return "invalid signature".**
+
+The 30-min unblock path:
 1. Add `polymarket_client_sdk_v2 = "0.5.1"` to `polymarket-exec/Cargo.toml`
-2. Replace our custom `V2OrderDraft.sign()` + `post_body()` with calls into the SDK's `OrderBuilder::sign_v2_order()` (see SDK's `client.rs:1700-1740` and `order_builder.rs`)
+2. Replace our custom `V2OrderDraft.sign()` + `post_body()` with the SDK's `OrderBuilder::sign_v2_order()` (see SDK's `clob/client.rs:1700-1740` and `clob/order_builder.rs`)
 3. Run `live_smoke` from Dublin
 
-Alternative (15 min if confirmed): Inspect the actual signature string we produce vs what SDK produces. Both use alloy's `Signature` but may serialize differently. If our string includes/excludes the `v` byte differently, that's the bug.
+The bug is almost certainly in:
+- Signature wire serialization (we use `signature.to_string()`; verify what SDK does in `OrderV2WithSignature::serialize`)
+- OR some subtle EIP-712 encoding detail (alloy version mismatch? sol! macro hash differs from venue's contract?)
 
-Reference files (read these first):
-- V2 SDK Order schema: `~/.cargo/registry/src/index.crates.io-*/polymarket_client_sdk_v2-0.5.1/src/clob/types/mod.rs` (search "EIP-712 order struct for the Polymarket CTF Exchange V2")
+Reference files:
+- V2 SDK Order schema: `~/.cargo/registry/src/index.crates.io-*/polymarket_client_sdk_v2-0.5.1/src/clob/types/mod.rs`
 - V2 SDK signing: `~/.cargo/registry/src/index.crates.io-*/polymarket_client_sdk_v2-0.5.1/src/clob/client.rs:1700-1740`
+- V2 SDK wire serialization: `~/.cargo/registry/src/index.crates.io-*/polymarket_client_sdk_v2-0.5.1/src/clob/types/mod.rs:722` (Serialize impl for SignedOrder)
 - Our impl: `polymarket-exec/src/wire/clob_v2.rs`
 
-The partial fix is committed: `7143236 wip(clob_v2): partial fix for live order rejection`.
+Schema-fix commit `6fca4d5` is on main. Next session: drop in the SDK and use it directly.
 
 ## What's Built and Ready (after CLOB V2 unblock)
 
