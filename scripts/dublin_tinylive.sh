@@ -50,7 +50,7 @@ export POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com
 
 # Strategy + tuning
 export WHALE_PAIR_STRATEGY=btc_5m_mm
-export WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS=8000
+export WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS=2000
 export WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS=25
 export WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS=1
 export WHALE_PAIR_BTC_5M_MM_BASE_CLIP_USD=1.10
@@ -62,7 +62,7 @@ export WHALE_PAIR_BTC_5M_MM_LIQUIDITY_CLIP_FRACTION=0.02
 # Anti-churn: longer cooldown + more aggressive hedge rescue.
 # Without these the bot reposts every ~1s and chases the trending leg
 # (e.g. 4 UP fills as BTC ticked up while DOWN bid kept getting cancelled).
-export WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS=2000
+export WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS=500
 export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_CLIP_USD=5.00
 export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS=10
 
@@ -92,7 +92,14 @@ export WHALE_PAIR_PAPER_MODE=false
 unset WHALE_PAIR_EXEC_MODE
 
 # Refresh active markets (initial pull before launch).
+# Single-market focus: only the currently-live 5min bar (no prev/next).
+# Whales like unlawful concentrate capital on 1-2 markets, deploy bigger
+# clips, and earn meaningful per-pair edge. Spreading across 3 markets at
+# $94 capital = $25 per market = below the threshold for meaningful
+# rescue depth-sweep.
 python3 scripts/export_btc_5m_runtime.py \
+  --include-prev 0 \
+  --include-next 0 \
   --context-out /tmp/tinylive_ctx.json \
   --env-out /tmp/tinylive_runtime.env > /dev/null
 source /tmp/tinylive_runtime.env
