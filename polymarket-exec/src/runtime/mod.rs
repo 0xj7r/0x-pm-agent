@@ -1769,7 +1769,16 @@ impl<S: Strategy> Runtime<S> {
         // TODO(2026-04-23): integrate execution acknowledgements/fill events from a downstream
         // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
-        if self.has_active_btc_mm_buy_for_instrument(&intent) {
+        // Hedge-rescue intents are CLOSE operations that intentionally lift
+        // the OPPOSITE leg's ask via IOC. They are NOT duplicates of any
+        // existing maker paired-bid on that same instrument — different
+        // prices, different intent kind (taker vs maker), different goal.
+        // Suppressing them here leaves us stranded long. Bypass for rescue.
+        let is_rescue_intent = intent
+            .quote_level_tag
+            .as_deref()
+            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+        if !is_rescue_intent && self.has_active_btc_mm_buy_for_instrument(&intent) {
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
