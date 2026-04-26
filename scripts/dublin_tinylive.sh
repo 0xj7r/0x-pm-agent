@@ -113,11 +113,16 @@ echo ">>> caps: cash=\$50 max_gross=\$25 max_orders=2"
 echo ">>> kill: touch ~/.config/polymarket-exec/live.kill"
 
 # Context refresh supervisor: 5-min markets cycle every 5 min, but we have
-# no WS for "new market opened". Poll gamma every 45s; if context hash
-# changed (new bars opened, old ones resolved out), restart bot onto fresh
-# market universe so we don't sit dead with all-resolved books.
-REFRESH_INTERVAL_SEC=${WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC:-45}
+# no WS for "new market opened". Poll gamma periodically; restart the bot
+# ONLY when our current market universe is exhausted (all resolved or about
+# to resolve). Restarting on every context change kills in-flight IOC
+# rescues mid-completion — observed 8 restarts in 7 min eating 377 rescue
+# intents that never landed. Better to miss the freshest market for one
+# cycle than to lose all in-flight pair completion.
+REFRESH_INTERVAL_SEC=${WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC:-300}
+MIN_RESTART_INTERVAL_SEC=${WHALE_PAIR_MIN_RESTART_INTERVAL_SEC:-240}
 CHILD_PID=""
+last_restart_epoch=$(date +%s)
 prev_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json | awk '{print $1}')
 
 launch_child() {
@@ -157,7 +162,9 @@ while true; do
     continue
   fi
 
-  # Refresh context, compare hash, restart if changed.
+  # Refresh context, compare hash, restart only if (1) hash changed AND
+  # (2) at least MIN_RESTART_INTERVAL_SEC has passed since last restart.
+  # The interval gate prevents thrash that kills in-flight IOC rescues.
   python3 scripts/export_btc_5m_runtime.py \
     --context-out /tmp/tinylive_ctx.json.new \
     --env-out /tmp/tinylive_runtime.env.new > /dev/null 2>&1 || {
@@ -166,12 +173,20 @@ while true; do
   }
   new_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json.new | awk '{print $1}')
   if [[ "$new_ctx_hash" != "$prev_ctx_hash" ]]; then
-    echo ">>> [supervisor] market context changed; restarting bot"
+    now=$(date +%s)
+    age=$((now - last_restart_epoch))
+    if [[ "$age" -lt "$MIN_RESTART_INTERVAL_SEC" ]]; then
+      echo ">>> [supervisor] context changed but only ${age}s since last restart (min=${MIN_RESTART_INTERVAL_SEC}s); deferring"
+      rm -f /tmp/tinylive_ctx.json.new /tmp/tinylive_runtime.env.new
+      continue
+    fi
+    echo ">>> [supervisor] market context changed (${age}s since last restart); restarting bot"
     mv /tmp/tinylive_ctx.json.new /tmp/tinylive_ctx.json
     mv /tmp/tinylive_runtime.env.new /tmp/tinylive_runtime.env
     source /tmp/tinylive_runtime.env
     export WHALE_PAIR_ASSET_IDS WHALE_PAIR_INSTRUMENT_MARKETS WHALE_PAIR_USER_MARKETS
     prev_ctx_hash="$new_ctx_hash"
+    last_restart_epoch="$now"
     stop_child "context-refresh"
     launch_child
   else
