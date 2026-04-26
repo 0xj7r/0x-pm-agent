@@ -284,6 +284,7 @@ pub struct PolymarketConfig {
     pub collateral_token_address: String,
     pub collateral_decimals: u8,
     pub proxy_wallet_address: Option<String>,
+    pub polygon_rpc_url: Option<String>,
     pub market_id_by_asset: HashMap<String, String>,
     pub protocol: ClobProtocolVersion,
     pub v2_builder_code: String,
@@ -304,6 +305,7 @@ impl Default for PolymarketConfig {
             collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
+            polygon_rpc_url: None,
             market_id_by_asset: HashMap::new(),
             protocol: ClobProtocolVersion::V1,
             v2_builder_code: BYTES32_ZERO.to_string(),
@@ -523,6 +525,7 @@ impl PolymarketExecutionAdapter {
             collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
+            polygon_rpc_url: None,
             market_id_by_asset: HashMap::new(),
             protocol: ClobProtocolVersion::V1,
             v2_builder_code: BYTES32_ZERO.to_string(),
@@ -620,6 +623,7 @@ impl PolymarketExecutionAdapter {
                 &credentials.funder_address,
             ),
             signature_type_code: credentials.signature_type.as_polymarket_code(),
+            polygon_rpc_url: config.polygon_rpc_url.clone(),
         });
 
         Ok(Self {
@@ -696,6 +700,7 @@ impl PolymarketExecutionAdapter {
                 &credentials.funder_address,
             ),
             signature_type_code: credentials.signature_type.as_polymarket_code(),
+            polygon_rpc_url: config.polygon_rpc_url.clone(),
         });
 
         Ok(Self {

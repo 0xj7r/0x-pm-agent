@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod clob_v2;
+pub mod eoa_polygon;
 pub mod execution_adapter;
 pub mod market_ws;
 pub mod relayer;

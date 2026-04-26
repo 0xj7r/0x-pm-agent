@@ -2762,14 +2762,25 @@ async fn execute_execution_adapter(
                         stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                     }
                     Err(error) => {
-                        metrics.observe_riskoff_transition();
-                        let degrade_outcome = runtime.degrade_and_cancel_all(
-                            observed_at_ms,
-                            format!(
-                                "live merge failed; risk-off until recycle path is fixed: {error}"
-                            ),
-                        );
-                        stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
+                        if error.is_retryable() {
+                            warn!(
+                                mode = "live",
+                                market_id = %intent.market_id,
+                                yes_instrument_id = %intent.yes_instrument_id,
+                                no_instrument_id = %intent.no_instrument_id,
+                                error = %error,
+                                "transient merge failure; will retry on next reconcile sweep"
+                            );
+                        } else {
+                            metrics.observe_riskoff_transition();
+                            let degrade_outcome = runtime.degrade_and_cancel_all(
+                                observed_at_ms,
+                                format!(
+                                    "live merge failed; risk-off until recycle path is fixed: {error}"
+                                ),
+                            );
+                            stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
+                        }
                     }
                 }
             }

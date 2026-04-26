@@ -121,6 +121,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             collateral_token_address: config.collateral_token_address.clone(),
             collateral_decimals: config.collateral_decimals,
             proxy_wallet_address: config.proxy_wallet_address.clone(),
+            polygon_rpc_url: config.polygon_rpc_url.clone(),
             market_id_by_asset: config.market_id_by_asset.clone(),
             protocol: ClobProtocolVersion::parse(&config.clob_version)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?,
@@ -146,6 +147,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
                 collateral_token_address: config.collateral_token_address.clone(),
                 collateral_decimals: config.collateral_decimals,
                 proxy_wallet_address: config.proxy_wallet_address.clone(),
+                polygon_rpc_url: config.polygon_rpc_url.clone(),
                 market_id_by_asset: config.market_id_by_asset.clone(),
                 protocol: ClobProtocolVersion::parse(&config.clob_version)
                     .map_err(|error| anyhow::anyhow!(error.to_string()))?,

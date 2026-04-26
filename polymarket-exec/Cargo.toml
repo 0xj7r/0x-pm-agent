@@ -5,7 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-alloy = { version = "1.6.3", default-features = false, features = ["signer-local"] }
+alloy = { version = "1.6.3", default-features = false, features = [
+    "signer-local",
+    "providers",
+    "provider-http",
+    "network",
+    "consensus",
+    "rpc-types-eth",
+] }
 async-trait = "0.1"
 axum = "0.7"
 base64 = "0.22"
