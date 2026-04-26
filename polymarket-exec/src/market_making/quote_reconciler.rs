@@ -322,9 +322,19 @@ impl QuoteReconciler {
         for desired_quote in desired.quotes {
             let desired_intent = desired_quote.intent;
             let key = QuoteMatchKey::from_intent(&desired_intent);
+            // Hedge-rescue IOC orders are CLOSE operations that need to fill
+            // promptly to manufacture paired inventory for merge. The submit
+            // rate cap exists to prevent maker-quote churn; rescue is not
+            // churn — it's the response to a rare stranded-leg event. Bypass
+            // the rate cap so the rescue actually reaches the venue. Same
+            // rationale as the risk-engine cap bypass.
+            let is_rescue = desired_intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
             let mut matches = by_key.remove(&key).unwrap_or_default();
             if matches.is_empty() {
-                if self.can_submit(now_ms, planned_submits + 1) {
+                if is_rescue || self.can_submit(now_ms, planned_submits + 1) {
                     plan.actions.push(QuoteAction::Submit(desired_intent));
                     planned_submits += 1;
                     planned_churn += 1;
