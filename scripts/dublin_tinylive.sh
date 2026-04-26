@@ -33,7 +33,7 @@ export POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com
 
 # Strategy + tuning
 export WHALE_PAIR_STRATEGY=btc_5m_mm
-export WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS=2000
+export WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS=8000
 export WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS=25
 export WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS=1
 export WHALE_PAIR_BTC_5M_MM_BASE_CLIP_USD=1.10
@@ -41,6 +41,13 @@ export WHALE_PAIR_BTC_5M_MM_MIN_CLIP_USD=0.25
 export WHALE_PAIR_BTC_5M_MM_MAX_CLIP_USD=8.0
 export WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS=25
 export WHALE_PAIR_BTC_5M_MM_LIQUIDITY_CLIP_FRACTION=0.02
+
+# Anti-churn: longer cooldown + more aggressive hedge rescue.
+# Without these the bot reposts every ~1s and chases the trending leg
+# (e.g. 4 UP fills as BTC ticked up while DOWN bid kept getting cancelled).
+export WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS=5000
+export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_CLIP_USD=5.00
+export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS=10
 
 # TIGHT risk caps
 export WHALE_PAIR_EXEC_STARTING_CASH_USD=50
