@@ -8,15 +8,32 @@
 set -uo pipefail
 cd ~/go/polymarket-agent
 
-# Safe .env loader
-while IFS='=' read -r raw_key raw_value || [[ -n "$raw_key" ]]; do
-  key="${raw_key%%[[:space:]]*}"
-  [[ -z "$key" || "$key" =~ ^# ]] && continue
-  [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && continue
-  value="${raw_value%\"}"; value="${value#\"}"
-  value="${value%\'}"; value="${value#\'}"
-  export "$key=$value"
-done < .env
+# Safe env loader — source secrets from whichever file exists.
+# Local dev: ./.env. Dublin EC2: ~/.config/polymarket-exec/common.env (where
+# systemd loads from via EnvironmentFile=).
+ENV_FILES=(".env" "$HOME/.config/polymarket-exec/common.env")
+load_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  while IFS='=' read -r raw_key raw_value || [[ -n "$raw_key" ]]; do
+    local key="${raw_key%%[[:space:]]*}"
+    [[ -z "$key" || "$key" =~ ^# ]] && continue
+    [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && continue
+    local value="${raw_value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    export "$key=$value"
+  done < "$file"
+  echo ">>> loaded env from: $file"
+  return 0
+}
+loaded=false
+for f in "${ENV_FILES[@]}"; do
+  load_env_file "$f" && loaded=true && break
+done
+if ! $loaded; then
+  echo "FATAL: no env file found in: ${ENV_FILES[*]}" >&2
+  exit 1
+fi
 
 # EOA mode (proxy not funded; whale uses proxy but we need to wrap pUSD for V2 first)
 export POLYMARKET_SIGNATURE_TYPE=eoa
