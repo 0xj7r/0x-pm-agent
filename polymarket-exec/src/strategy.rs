@@ -1736,21 +1736,26 @@ impl Btc5mMmStrategy {
     /// the missing side at near-resolution prices to manufacture the pair,
     /// then merge for $1 collateral release. The quote_level_tag prefix
     /// "mm-hedge-rescue" tells runner.rs to flip post_only off and TIF to IOC.
+    ///
+    /// Economic gate: only the rescue's NEW money matters; the stranded
+    /// leg's cost is sunk. If best_ask < $1, then `pay best_ask, get $1
+    /// back via merge` is guaranteed +EV on the operation itself —
+    /// independent of whatever we already paid for the stranded leg.
+    /// Skips per-leg cap (rescue CLOSES exposure, doesn't add) but still
+    /// respects gross cap.
     fn build_rescue_intent_for_quantity(
         &self,
         market_id: &MarketId,
         instrument_id: &InstrumentId,
         quote: &QuoteSnapshot,
         quantity: f64,
-        leg_cost: f64,
         gross_cost: f64,
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
         let best_ask = Self::best_ask(quote)?;
-        // A merged pair releases exactly $1 collateral. If we pay > $0.99
-        // on the rescue leg, we can't recover even an empty-spread original
-        // maker fill via merge. Cap aggression at $0.99.
+        // best_ask must be < $1 for the rescue to net positive on its own
+        // (pay best_ask per share, merge releases $1). 1c headroom for fees.
         if best_ask >= 0.99 {
             return None;
         }
@@ -1760,10 +1765,22 @@ impl Btc5mMmStrategy {
             return None;
         }
         let notional = quantity * best_ask;
-        if notional < self.config.min_order_notional_usd
-            || notional > self.config.max_leg_cost_usd - leg_cost + 1e-9
-            || notional > self.config.max_gross_cost_usd - gross_cost + 1e-9
-        {
+        if notional < self.config.min_order_notional_usd {
+            return None;
+        }
+        // Skip max_leg_cost cap — rescue closes existing exposure, doesn't
+        // add new directional risk. But respect gross_cost cap (total
+        // wallet outlay ceiling) since the rescue does require fresh cash
+        // out before the merge releases it back.
+        if notional > self.config.max_gross_cost_usd - gross_cost + 1e-9 {
+            tracing::debug!(
+                target: "strategy.rescue",
+                market = %market_id,
+                notional,
+                gross_cost,
+                gross_cap = self.config.max_gross_cost_usd,
+                "rescue skipped: would exceed gross cost cap"
+            );
             return None;
         }
         Some(Self::build_order(
@@ -2009,19 +2026,22 @@ impl Strategy for Btc5mMmStrategy {
                     .and_then(|state| state.last_rescue_attempt_ms)
                     .map(|last| context.now_ms.saturating_sub(last) >= self.config.cooldown_ms)
                     .unwrap_or(true);
-                let (lift_id, lift_quote, lift_qty, lift_leg_cost, side_label) =
+                // The "stranded" leg is the one we already hold; we lift the
+                // OPPOSITE leg's ask to manufacture the pair. Stranded
+                // leg's cost is sunk — the only economic question is whether
+                // best_ask < $1 (rescue netting against $1 merge release).
+                let (lift_id, lift_quote, stranded_qty, stranded_avg, side_label) =
                     if left_has_inventory {
-                        (&right_id, &right_quote, left_qty, right_cost, "lift_right_ask")
+                        (&right_id, &right_quote, left_qty, left_avg, "lift_right_ask")
                     } else {
-                        (&left_id, &left_quote, right_qty, left_cost, "lift_left_ask")
+                        (&left_id, &left_quote, right_qty, right_avg, "lift_left_ask")
                     };
                 let intent = if throttle_ok {
                     self.build_rescue_intent_for_quantity(
                         &snapshot.market_id,
                         lift_id,
                         lift_quote,
-                        lift_qty,
-                        lift_leg_cost,
+                        stranded_qty,
                         gross_cost,
                         "btc-5m-mm hedge rescue",
                         context.now_ms,
@@ -2033,8 +2053,10 @@ impl Strategy for Btc5mMmStrategy {
                     target: "strategy.rescue",
                     market = %snapshot.market_id,
                     side = side_label,
-                    stranded_qty = lift_qty,
+                    stranded_qty,
+                    stranded_avg,
                     lift_best_ask = ?Self::best_ask(lift_quote),
+                    rescue_profit_per_share = 1.0 - Self::best_ask(lift_quote).unwrap_or(1.0),
                     throttle_ok = throttle_ok,
                     intent_built = intent.is_some(),
                     "hedge rescue branch entered"
