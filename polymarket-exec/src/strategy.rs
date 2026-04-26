@@ -690,6 +690,10 @@ pub struct StrategyContext {
     pub open_orders_for_market: usize,
     pub market_context: Option<MarketContextRecord>,
     pub unlawful_signal: Option<UnlawfulSignalSnapshot>,
+    /// BTC spot regime snapshot. Populated for every strategy.on_market_snapshot
+    /// call so strategies can gate paired entries on regime (don't quote in
+    /// flat-vol or strong-trending tape).
+    pub btc_regime: crate::signals::BtcRegimeSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1948,6 +1952,50 @@ impl Strategy for Btc5mMmStrategy {
 
         match (left_has_inventory, right_has_inventory) {
             (false, false) => {
+                // Regime gate: skip paired entries when BTC tape doesn't
+                // support edge capture. Always allow rescue (other match
+                // arms) since rescue closes existing exposure regardless
+                // of regime — but don't OPEN new directional risk in
+                // hostile regimes. Whales like unlawful_shear stand down
+                // in flat/trending regimes; we should too.
+                //
+                // Bad regimes:
+                //   - flat: realized_vol_5m_bps < 5 → no taker flow,
+                //     paired bids sit unfilled, capital tied up
+                //   - trending hard: |return_60s_bps| > 30 → book moves
+                //     between bid placement and fill, one-leg fills create
+                //     stranded directional exposure
+                //
+                // Both thresholds tuned conservatively. The cost of
+                // skipping a quote is missed opportunity; the cost of
+                // bad-regime quoting is realized loss.
+                let regime = &context.btc_regime;
+                let trade_count_5m_ok = regime.trade_count_5m >= 30;
+                let vol_5m = regime.realized_vol_5m_bps.unwrap_or(0.0);
+                let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
+                let regime_too_flat = trade_count_5m_ok && vol_5m < 5.0;
+                let regime_too_trending = return_60s > 30.0;
+                if regime_too_flat || regime_too_trending {
+                    tracing::info!(
+                        target: "strategy.regime_gate",
+                        market = %snapshot.market_id,
+                        trade_count_5m = regime.trade_count_5m,
+                        realized_vol_5m_bps = vol_5m,
+                        return_60s_bps = regime.return_60s_bps,
+                        too_flat = regime_too_flat,
+                        too_trending = regime_too_trending,
+                        "regime gate: paired entry skipped"
+                    );
+                    return self.no_quote_decision(
+                        &snapshot.market_id,
+                        context.now_ms,
+                        format!(
+                            "regime gate: vol_5m={vol_5m:.2}bps return_60s={return_60s:.2}bps trades_5m={}",
+                            regime.trade_count_5m
+                        ),
+                    );
+                }
+
                 let left_bid_price = self.candidate_bid_price(
                     &left_quote,
                     left_fair,
@@ -4418,6 +4466,7 @@ mod tests {
             open_orders_for_market,
             market_context: None,
             unlawful_signal,
+            btc_regime: crate::signals::BtcRegimeSnapshot::default(),
         }
     }
 

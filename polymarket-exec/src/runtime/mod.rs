@@ -2028,6 +2028,7 @@ impl<S: Strategy> Runtime<S> {
                 .unwrap_or(0),
             market_context,
             unlawful_signal,
+            btc_regime: self.btc_signals.snapshot(now_ms),
         }
     }
 
@@ -3498,12 +3499,30 @@ mod tests {
             runtime.accept_intent(btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.44), 1);
         assert_eq!(first.commands.len(), 1);
 
-        let duplicate = runtime.accept_intent(
-            btc_mm_intent("market-mm", "down", "mm-hedge-rescue", 0.48),
+        // A SECOND mm-paired-bid on the same instrument is a duplicate and
+        // should be rejected — fresh entry accumulation is the failure mode.
+        let duplicate_paired = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.45),
             2,
         );
-        assert!(duplicate.commands.is_empty());
+        assert!(duplicate_paired.commands.is_empty());
         assert_eq!(runtime.open_orders().count(), 1);
+
+        // BUT an mm-hedge-rescue on the same instrument is NOT a duplicate —
+        // it's a CLOSE operation (taker IOC) that intentionally coexists with
+        // the maker paired-bid until the merge fires. The rescue path is the
+        // entire point of the architecture; suppressing it leaves us
+        // stranded long. This must produce a Submit command.
+        let rescue = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-hedge-rescue", 0.48),
+            3,
+        );
+        assert_eq!(
+            rescue.commands.len(),
+            1,
+            "hedge-rescue intent must coexist with active paired-bid"
+        );
+        assert_eq!(runtime.open_orders().count(), 2);
     }
 
     #[test]
