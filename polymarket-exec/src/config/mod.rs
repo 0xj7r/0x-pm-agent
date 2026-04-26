@@ -182,7 +182,7 @@ impl AppConfig {
         );
         let collateral_token_address = env_or(
             "POLYMARKET_COLLATERAL_TOKEN_ADDRESS",
-            crate::wire::relayer::DEFAULT_USDCE_ADDRESS,
+            crate::wire::relayer::DEFAULT_PUSD_ADDRESS,
         );
         let collateral_decimals = parse_usize("POLYMARKET_COLLATERAL_DECIMALS", 6)? as u8;
         let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
