@@ -34,7 +34,7 @@ use crate::strategy::{
     MarketActivitySignal as StrategyMarketActivitySignal,
     PairedBookSignal as StrategyPairedBookSignal, SessionBucket as StrategySessionBucket, Strategy,
     StrategyContext, StrategyDecision, UnlawfulExecutionMode as StrategyExecutionMode,
-    UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot,
+    UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot, VenueMarketRules,
 };
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillLiquidity, FillReport, InstrumentId, MarketId,
@@ -319,6 +319,7 @@ pub struct Runtime<S: Strategy> {
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     pending_merge_by_market: HashMap<MarketId, MergeIntent>,
     condition_id_by_market: HashMap<MarketId, String>,
+    venue_market_rules: HashMap<MarketId, VenueMarketRules>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
@@ -373,6 +374,7 @@ impl<S: Strategy> Runtime<S> {
             first_merge_by_market: HashMap::new(),
             pending_merge_by_market: HashMap::new(),
             condition_id_by_market: HashMap::new(),
+            venue_market_rules: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             markets_with_unresolved_drift: HashSet::new(),
@@ -395,6 +397,19 @@ impl<S: Strategy> Runtime<S> {
         config: crate::quote_reconciler::ReconcilerConfig,
     ) {
         self.quote_reconciler = QuoteReconciler::new(config);
+    }
+
+    /// Cache venue-authoritative market rules. Called by the runner after a
+    /// successful `fetch_market_metadata` round-trip. Subsequent calls to
+    /// `strategy_context()` will pass these rules to the strategy so it can
+    /// honour the venue's per-market minimum order size and tick size
+    /// without duplicating those facts as operator-tunable env vars.
+    pub fn set_venue_market_rules(&mut self, market_id: MarketId, rules: VenueMarketRules) {
+        self.venue_market_rules.insert(market_id, rules);
+    }
+
+    pub fn venue_market_rules(&self, market_id: &MarketId) -> Option<VenueMarketRules> {
+        self.venue_market_rules.get(market_id).copied()
     }
 
     pub fn run_id(&self) -> &str {
@@ -2018,6 +2033,7 @@ impl<S: Strategy> Runtime<S> {
             }
             _ => None,
         };
+        let venue_rules = market_id.and_then(|id| self.venue_market_rules.get(id).copied());
         StrategyContext {
             now_ms,
             runtime_status: self.status,
@@ -2029,6 +2045,7 @@ impl<S: Strategy> Runtime<S> {
             market_context,
             unlawful_signal,
             btc_regime: self.btc_signals.snapshot(now_ms),
+            venue_rules,
         }
     }
 

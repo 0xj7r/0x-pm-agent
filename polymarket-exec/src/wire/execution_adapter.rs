@@ -414,6 +414,17 @@ pub trait ExecutionAdapter: Send + Sync {
         &self,
         after_ms: EpochMillis,
     ) -> Result<Vec<VenueFill>, ExecutionError>;
+    /// Fetch venue-authoritative market rules (minimum_order_size, tick).
+    /// Default impl errors so the runtime can fall back to its config
+    /// defaults. Live adapter overrides to call the venue API.
+    async fn fetch_market_metadata(
+        &self,
+        condition_id: &str,
+    ) -> Result<MarketMetadata, ExecutionError> {
+        Err(ExecutionError::BadRequest(format!(
+            "fetch_market_metadata not implemented on this adapter (condition_id={condition_id})"
+        )))
+    }
 }
 
 #[derive(Default)]
@@ -1724,6 +1735,14 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         // Delegates to the inherent method (which uses the cached V2
         // SDK auth client to call /orders-scoring batch endpoint).
         Self::check_orders_scoring(self, venue_order_ids).await
+    }
+
+    async fn fetch_market_metadata(
+        &self,
+        condition_id: &str,
+    ) -> Result<MarketMetadata, ExecutionError> {
+        // Delegates to the inherent method (HTTP GET /markets/{condition_id}).
+        Self::fetch_market_metadata(self, condition_id).await
     }
 }
 

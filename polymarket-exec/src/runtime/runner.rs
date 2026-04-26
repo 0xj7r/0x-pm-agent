@@ -24,7 +24,7 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use crate::strategy::{Strategy, StrategyMode};
+use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
@@ -2270,7 +2270,9 @@ async fn execute_execution_adapter(
             market_assets,
             report,
             observed_at_ms,
-        );
+                            execution_adapter.as_ref(),
+        )
+                            .await;
         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
         let needs_reconcile_quarantine_age_ms = execution_policy
             .live_reconcile_missing_grace_ms
@@ -2434,7 +2436,9 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             observed_at_ms,
-                        );
+                            execution_adapter.as_ref(),
+                        )
+                            .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
@@ -2611,7 +2615,9 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             observed_at_ms,
-                        );
+                            execution_adapter.as_ref(),
+                        )
+                            .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
@@ -2663,7 +2669,9 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             ack.accepted_at_ms,
-                        );
+                            execution_adapter.as_ref(),
+                        )
+                        .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Err(error) => {
@@ -2762,7 +2770,9 @@ async fn execute_execution_adapter(
                             market_assets,
                             report,
                             ack.accepted_at_ms,
-                        );
+                            execution_adapter.as_ref(),
+                        )
+                        .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
@@ -3075,7 +3085,7 @@ async fn sync_execution_state(
     report
 }
 
-fn apply_sync_report(
+async fn apply_sync_report(
     runtime: &mut Runtime<StrategyMode>,
     metrics: &AppMetrics,
     live_safety: &mut LiveSafetyState,
@@ -3083,6 +3093,7 @@ fn apply_sync_report(
     market_assets: &[String],
     report: ExecutionSyncReport,
     now_ms: u64,
+    execution_adapter: &dyn ExecutionAdapter,
 ) -> RuntimeOutcome {
     let mut outcome = RuntimeOutcome::default();
     if execution_policy.paper_mode {
@@ -3169,6 +3180,52 @@ fn apply_sync_report(
                             stranded_legs = stranded.stranded_positions.len(),
                             "venue reconciliation found stranded inventory"
                         );
+                    }
+                    // Lazily fetch venue rules (minimum_order_size, tick) for
+                    // any market we just learned we have a position in. One
+                    // HTTP call per market per session — strategy then reads
+                    // venue truth instead of duplicating it as an env knob.
+                    for snapshot in &snapshots {
+                        if runtime.venue_market_rules(&snapshot.market_id).is_some() {
+                            continue;
+                        }
+                        let Some(condition_id) = snapshot
+                            .condition_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            continue;
+                        };
+                        match execution_adapter.fetch_market_metadata(condition_id).await {
+                            Ok(md) => {
+                                let rules = VenueMarketRules {
+                                    minimum_order_size: md.minimum_order_size,
+                                    minimum_tick_size: md.minimum_tick_size,
+                                    neg_risk: md.neg_risk,
+                                };
+                                info!(
+                                    target: "live_reconcile.venue_metadata",
+                                    market_id = %snapshot.market_id,
+                                    condition_id = %md.condition_id,
+                                    minimum_order_size = md.minimum_order_size,
+                                    minimum_tick_size = md.minimum_tick_size,
+                                    neg_risk = md.neg_risk,
+                                    "cached venue rules for market"
+                                );
+                                runtime.set_venue_market_rules(
+                                    snapshot.market_id.clone(),
+                                    rules,
+                                );
+                            }
+                            Err(error) => warn!(
+                                target: "live_reconcile.venue_metadata",
+                                market_id = %snapshot.market_id,
+                                condition_id = %condition_id,
+                                error = %error,
+                                "failed to fetch venue metadata; strategy will use config defaults"
+                            ),
+                        }
                     }
                     for market_id in merge_markets {
                         outcome.extend(runtime.plan_merge_command_for_market(
