@@ -473,6 +473,12 @@ impl ExecutionAdapter for PaperExecutionAdapter {
     }
 }
 
+/// Type alias for the V2 SDK's authenticated CLOB client. Wrapping the
+/// long generic path keeps field declarations + helper signatures readable.
+type V2SdkAuthClient = polymarket_client_sdk_v2::clob::Client<
+    polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>,
+>;
+
 pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
@@ -487,6 +493,13 @@ pub struct PolymarketExecutionAdapter {
     /// a fresh LocalSigner for the V2 SDK's typestate-based auth flow.
     /// Stored privately; never logged or serialized.
     _stored_private_key: Option<String>,
+    /// Cached authenticated V2 SDK client. Lazy-initialised on the first
+    /// V2 submit so we pay the ~150ms auth roundtrip once per adapter
+    /// lifetime, then reuse cheap `Clone` instances for every subsequent
+    /// order. Also keeps the SDK's automatic heartbeat task alive for
+    /// the duration of the trading session — process crash → server-side
+    /// auto-cancel within the venue's heartbeat timeout.
+    v2_sdk_client: Arc<tokio::sync::OnceCell<V2SdkAuthClient>>,
 }
 
 impl PolymarketExecutionAdapter {
@@ -614,6 +627,7 @@ impl PolymarketExecutionAdapter {
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
             _stored_private_key: Some(credentials.private_key.clone()),
+            v2_sdk_client: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -686,7 +700,61 @@ impl PolymarketExecutionAdapter {
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
             _stored_private_key: Some(credentials.private_key.clone()),
+            v2_sdk_client: Arc::new(tokio::sync::OnceCell::new()),
         })
+    }
+
+    /// Lazy-initialises and caches the authenticated V2 SDK client.
+    /// First call performs the auth roundtrip (~150ms) and, with the
+    /// `heartbeats` feature on, spawns a background task that keeps
+    /// our session alive on the venue. Subsequent calls return a cheap
+    /// `Clone` of the cached `Arc`-backed client.
+    async fn ensure_v2_sdk_client(
+        &self,
+        sdk_signer: &alloy::signers::local::LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+        signature_type_v2: polymarket_client_sdk_v2::clob::types::SignatureType,
+    ) -> Result<V2SdkAuthClient, ExecutionError> {
+        use polymarket_client_sdk_v2::auth::{Credentials as SdkV2Credentials, Uuid as SdkV2Uuid};
+        use polymarket_client_sdk_v2::clob::{Client as SdkV2Client, Config as SdkV2Config};
+
+        let cell = self.v2_sdk_client.clone();
+        let api_url = self._config.api_url.clone();
+        let creds_opt = self._config.credentials.clone();
+        let funder = self.trade_address;
+        let signer = sdk_signer.clone();
+
+        let client_ref = cell
+            .get_or_try_init(|| async move {
+                let mut auth_builder = SdkV2Client::new(&api_url, SdkV2Config::default())
+                    .map_err(|error| {
+                        ExecutionError::TransientNetwork(format!(
+                            "V2 SDK Client::new failed: {error}"
+                        ))
+                    })?
+                    .authentication_builder(&signer)
+                    .signature_type(signature_type_v2);
+                if let Some(credentials) = creds_opt.as_ref() {
+                    let api_key =
+                        SdkV2Uuid::parse_str(credentials.api_key.trim()).map_err(|error| {
+                            ExecutionError::AuthFailure(format!(
+                                "invalid POLYMARKET_API_KEY: {error}"
+                            ))
+                        })?;
+                    auth_builder = auth_builder.credentials(SdkV2Credentials::new(
+                        api_key,
+                        credentials.api_secret.clone(),
+                        credentials.api_passphrase.clone(),
+                    ));
+                }
+                if let Some(funder) = funder {
+                    auth_builder = auth_builder.funder(funder);
+                }
+                auth_builder.authenticate().await.map_err(|error| {
+                    ExecutionError::AuthFailure(format!("V2 SDK authenticate failed: {error}"))
+                })
+            })
+            .await?;
+        Ok(client_ref.clone())
     }
 
     /// Posts a V2 order via the official polymarket_client_sdk_v2.
@@ -699,11 +767,9 @@ impl PolymarketExecutionAdapter {
     ) -> Result<SubmitOrderAck, ExecutionError> {
         use alloy::signers::local::LocalSigner as SdkLocalSigner;
         use alloy::signers::Signer as _;
-        use polymarket_client_sdk_v2::auth::{Credentials as SdkV2Credentials, Uuid as SdkV2Uuid};
         use polymarket_client_sdk_v2::clob::types::{
             OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType,
         };
-        use polymarket_client_sdk_v2::clob::{Client as SdkV2Client, Config as SdkV2Config};
         use polymarket_client_sdk_v2::types::{Decimal as SdkV2Decimal, U256 as SdkV2U256};
         use polymarket_client_sdk_v2::POLYGON as SDK_V2_POLYGON;
 
@@ -747,32 +813,12 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(SDK_V2_POLYGON));
 
-        // Build authenticated SDK client. If the operator supplied static L2
-        // credentials, pass them through so V2 keeps using the existing API key.
-        // In L1-only mode, let the V2 SDK create/derive its own credentials
-        // rather than reusing credentials produced by the V1 client path.
-        let mut auth_builder = SdkV2Client::new(&self._config.api_url, SdkV2Config::default())
-            .map_err(|error| {
-                ExecutionError::TransientNetwork(format!("V2 SDK Client::new failed: {error}"))
-            })?
-            .authentication_builder(&sdk_signer)
-            .signature_type(signature_type_v2);
-        if let Some(credentials) = self._config.credentials.as_ref() {
-            let api_key = SdkV2Uuid::parse_str(credentials.api_key.trim()).map_err(|error| {
-                ExecutionError::AuthFailure(format!("invalid POLYMARKET_API_KEY: {error}"))
-            })?;
-            auth_builder = auth_builder.credentials(SdkV2Credentials::new(
-                api_key,
-                credentials.api_secret.clone(),
-                credentials.api_passphrase.clone(),
-            ));
-        }
-        if let Some(funder) = self.trade_address {
-            auth_builder = auth_builder.funder(funder);
-        }
-        let client = auth_builder.authenticate().await.map_err(|error| {
-            ExecutionError::AuthFailure(format!("V2 SDK authenticate failed: {error}"))
-        })?;
+        // Use cached authenticated V2 SDK client. First call pays the
+        // ~150ms auth roundtrip + starts the SDK's automatic heartbeat
+        // task; subsequent calls clone cheaply (Client uses Arc inside).
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
 
         // Build, sign, and post the order via the SDK.
         let price = SdkV2Decimal::from_str(&format!("{}", req.limit_price)).map_err(|error| {
