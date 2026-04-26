@@ -42,8 +42,7 @@ use crate::wire::clob_v2::{
 };
 use crate::wire::relayer::{
     CtfMergeRequest, CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
-    DEFAULT_RELAYER_URL,
-    DEFAULT_USDCE_ADDRESS,
+    DEFAULT_PUSD_ADDRESS, DEFAULT_RELAYER_URL,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -302,7 +301,7 @@ impl Default for PolymarketConfig {
             relayer_api_key: None,
             relayer_api_key_address: None,
             ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
-            collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
+            collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
             market_id_by_asset: HashMap::new(),
@@ -521,7 +520,7 @@ impl PolymarketExecutionAdapter {
             relayer_api_key: None,
             relayer_api_key_address: None,
             ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
-            collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
+            collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
             market_id_by_asset: HashMap::new(),
@@ -909,7 +908,8 @@ impl PolymarketExecutionAdapter {
             crate::types::TradeSide::Sell => SdkV2Side::Sell,
         };
         let order_type = match req.time_in_force {
-            TimeInForce::Ioc | TimeInForce::Fok => SdkV2OrderType::FOK,
+            TimeInForce::Ioc => SdkV2OrderType::FAK,
+            TimeInForce::Fok => SdkV2OrderType::FOK,
             TimeInForce::Gtc => SdkV2OrderType::GTC,
             TimeInForce::Gtd => SdkV2OrderType::GTD,
         };

@@ -2,7 +2,7 @@
 """Set Polymarket V2 trading approvals for an EOA wallet.
 
 Sets the two approvals needed to trade non-neg-risk markets on V2:
-  1. USDC.e.approve(CTF_EXCHANGE_V2, MAX_UINT256)
+  1. pUSD.approve(CTF_EXCHANGE_V2, MAX_UINT256)
   2. CTF.setApprovalForAll(CTF_EXCHANGE_V2, true)
 
 If you also want to trade neg-risk markets (different exchange contract),
@@ -27,7 +27,7 @@ POLYGON_RPC = os.getenv(
     "POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"
 )
 
-USDCE = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+PUSD = Web3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
 CTF = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 
 # V2 exchange addresses (per official polymarket_client_sdk_v2 lib.rs)
@@ -133,7 +133,7 @@ def main():
     print(f"wallet: {account.address}")
     print(f"MATIC: {w3.eth.get_balance(account.address)/1e18:.6f}")
 
-    usdce = w3.eth.contract(address=USDCE, abi=ERC20_ABI)
+    collateral = w3.eth.contract(address=PUSD, abi=ERC20_ABI)
     ctf = w3.eth.contract(address=CTF, abi=ERC1155_ABI)
 
     targets = [(CTF_EXCHANGE_V2, "CTF Exchange V2 (standard markets)")]
@@ -147,14 +147,14 @@ def main():
     print("\n=== current allowances ===")
     plan = []
     for spender, label in targets:
-        cur_usdc = usdce.functions.allowance(account.address, spender).call()
+        cur_collateral = collateral.functions.allowance(account.address, spender).call()
         cur_ctf = ctf.functions.isApprovedForAll(account.address, spender).call()
-        usdc_ok = cur_usdc >= MAX_UINT256 // 2
+        collateral_ok = cur_collateral >= MAX_UINT256 // 2
         print(f"  {label}")
-        print(f"    USDC.e allowance: {'MAX' if usdc_ok else f'{cur_usdc/1e6:.2f}'} {'✓' if usdc_ok else '→ approve needed'}")
+        print(f"    pUSD allowance: {'MAX' if collateral_ok else f'{cur_collateral/1e6:.2f}'} {'✓' if collateral_ok else '→ approve needed'}")
         print(f"    CTF approved: {cur_ctf} {'✓' if cur_ctf else '→ setApprovalForAll needed'}")
-        if not usdc_ok:
-            plan.append(("usdc", spender, label))
+        if not collateral_ok:
+            plan.append(("collateral", spender, label))
         if not cur_ctf:
             plan.append(("ctf", spender, label))
 
@@ -175,8 +175,8 @@ def main():
     submitted = 0
     for kind, spender, label in plan:
         print(f"\n>>> {kind.upper()} approval for {label}")
-        if kind == "usdc":
-            tx = usdce.functions.approve(spender, MAX_UINT256).build_transaction({
+        if kind == "collateral":
+            tx = collateral.functions.approve(spender, MAX_UINT256).build_transaction({
                 "from": account.address, "nonce": nonce, "gas": 100_000,
                 "gasPrice": gas_price, "chainId": 137,
             })

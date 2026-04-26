@@ -61,11 +61,12 @@ fn live_signature_type_from_env(auth: Option<&UserWsAuth>) -> Result<PolymarketS
     let raw = auth
         .and_then(|auth| auth.signature_type.clone())
         .or_else(|| std::env::var("POLYMARKET_SIGNATURE_TYPE").ok());
-    raw.as_deref()
-        .map(PolymarketSignatureType::parse)
-        .transpose()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-        .map(|value| value.unwrap_or_default())
+    let raw = raw.ok_or_else(|| {
+        anyhow::anyhow!(
+            "POLYMARKET_SIGNATURE_TYPE must be set explicitly (eoa, proxy, or gnosis_safe)"
+        )
+    })?;
+    PolymarketSignatureType::parse(raw.as_str()).map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
 fn live_funder_from_env(auth: Option<&UserWsAuth>) -> Option<String> {
