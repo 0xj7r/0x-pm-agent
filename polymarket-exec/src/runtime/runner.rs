@@ -35,7 +35,7 @@ use crate::wire::api::{
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
-    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
+    SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
@@ -126,7 +126,6 @@ pub async fn run() -> Result<()> {
         "live_smoke" => return run_live_smoke(config).await,
         "live_cancel" => return run_live_cancel(config).await,
         "live_reconcile" => return run_live_reconcile(config).await,
-        "live_redeem" => return run_live_redeem(config).await,
         "shadow_live" => return run_shadow_live(config).await,
         "replay" => return run_replay_cli(config).await,
         _ => {}
@@ -503,16 +502,6 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     if price <= 0.0 || notional <= 0.0 {
         anyhow::bail!("live smoke price and notional must be positive");
     }
-    let time_in_force = match std::env::var("WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE")
-        .unwrap_or_else(|_| "GTD".to_string())
-        .trim()
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "GTC" => TimeInForce::Gtc,
-        "GTD" => TimeInForce::Gtd,
-        other => anyhow::bail!("unsupported WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE={other}"),
-    };
     let now_ms = now_unix_ms();
     let ttl_ms = config.live_order_ttl.as_millis().max(5_000) as u64;
     let client_order_id = ClientOrderId::from(format!("live-smoke:{now_ms}:{asset_id}"));
@@ -524,12 +513,8 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
         limit_price: price,
         quantity: notional / price,
         post_only: true,
-        time_in_force,
-        expires_at_ms: if matches!(time_in_force, TimeInForce::Gtd) {
-            Some(now_ms.saturating_add(ttl_ms))
-        } else {
-            None
-        },
+        time_in_force: TimeInForce::Gtd,
+        expires_at_ms: Some(now_ms.saturating_add(ttl_ms)),
         strategy_tag: "live-smoke".to_string(),
         quote_level_tag: Some("far-touch-smoke".to_string()),
         submitted_at_ms: now_ms,
@@ -643,149 +628,6 @@ async fn run_live_cancel(config: AppConfig) -> Result<()> {
         remaining_venue_order_ids = ?visible_after,
         "manual live cancel reconciliation complete"
     );
-    Ok(())
-}
-
-/// Live redeem mode: scans the wallet's positions via the Polymarket
-/// Data API, filters to positions whose underlying market has resolved
-/// (`redeemable: true`), and submits one CTF redeem per unique
-/// `condition_id` through the relayer. Recovers stranded collateral
-/// from expired positions that would otherwise tie up capital.
-///
-/// Honors `WHALE_PAIR_LIVE_REDEEM_DRY_RUN=true` to log the planned
-/// redemptions without submitting (useful before risking gas).
-async fn run_live_redeem(config: AppConfig) -> Result<()> {
-    crate::logging::init(&config)?;
-    if config.paper_mode {
-        anyhow::bail!("live redeem mode requires WHALE_PAIR_PAPER_MODE=false");
-    }
-    if config
-        .live_kill_switch_path
-        .as_ref()
-        .is_some_and(|path| path.exists())
-    {
-        anyhow::bail!("live redeem blocked by active kill switch");
-    }
-    let dry_run = std::env::var("WHALE_PAIR_LIVE_REDEEM_DRY_RUN")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
-
-    let adapter = connect_live_adapter(&config).await?;
-    let balances = adapter.sync_balances().await?;
-    info!(
-        position_count = balances.positions.len(),
-        cash_usd = balances.cash_usd,
-        positions_authoritative = balances.positions_authoritative,
-        "live redeem: fetched venue positions"
-    );
-
-    // Group redeemable positions by condition_id. Both legs of a
-    // resolved binary market share one condition_id; we want one
-    // redeem call per condition that claims both legs (winning side
-    // pays out, losing side returns 0 atomically).
-    let mut redeemable_by_condition: std::collections::BTreeMap<String, Vec<&VenuePosition>> =
-        std::collections::BTreeMap::new();
-    let mut total_value_usd = 0.0;
-    for position in &balances.positions {
-        if !position.redeemable {
-            continue;
-        }
-        let Some(condition_id) = position.condition_id.as_ref() else {
-            warn!(
-                instrument_id = %position.instrument_id,
-                "redeemable position missing condition_id; skipping"
-            );
-            continue;
-        };
-        total_value_usd += position.current_value_usd;
-        redeemable_by_condition
-            .entry(condition_id.clone())
-            .or_default()
-            .push(position);
-    }
-
-    info!(
-        condition_count = redeemable_by_condition.len(),
-        total_value_usd,
-        dry_run,
-        "live redeem: identified redeemable positions"
-    );
-    if redeemable_by_condition.is_empty() {
-        info!("live redeem: no redeemable positions found; nothing to do");
-        return Ok(());
-    }
-
-    let mut submitted = 0_usize;
-    let mut failed = 0_usize;
-    for (condition_id, positions) in &redeemable_by_condition {
-        let market_id = positions
-            .first()
-            .map(|p| p.market_id.clone())
-            .unwrap_or_else(|| MarketId::from(condition_id.as_str()));
-        let value_usd: f64 = positions.iter().map(|p| p.current_value_usd).sum();
-        let leg_summary: Vec<String> = positions
-            .iter()
-            .map(|p| {
-                format!(
-                    "{}={:.2}sh@${:.2}",
-                    p.instrument_id, p.quantity, p.current_value_usd
-                )
-            })
-            .collect();
-        info!(
-            condition_id = %condition_id,
-            market_id = %market_id,
-            legs = ?leg_summary,
-            value_usd,
-            dry_run,
-            "live redeem: planning redemption"
-        );
-        if dry_run {
-            continue;
-        }
-        let now_ms = now_unix_ms();
-        let request = RedeemPositionsRequest {
-            command_id: ClientOrderId::from(format!("manual-redeem:{condition_id}:{now_ms}")),
-            market_id,
-            condition_id: condition_id.clone(),
-            // [1, 2] redeems both binary outcomes atomically; loss leg
-            // returns 0 collateral but the call succeeds.
-            index_sets: vec![1, 2],
-            submitted_at_ms: now_ms,
-        };
-        match adapter.redeem_positions(request).await {
-            Ok(ack) => {
-                submitted += 1;
-                info!(
-                    condition_id = %condition_id,
-                    venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
-                    "live redeem: submitted"
-                );
-            }
-            Err(error) => {
-                failed += 1;
-                warn!(
-                    condition_id = %condition_id,
-                    error = %error,
-                    "live redeem: submission failed"
-                );
-            }
-        }
-    }
-
-    info!(
-        planned = redeemable_by_condition.len(),
-        submitted,
-        failed,
-        dry_run,
-        "live redeem: complete"
-    );
-    if failed > 0 && !dry_run {
-        anyhow::bail!(
-            "live redeem: {failed} of {} submissions failed (see logs)",
-            redeemable_by_condition.len()
-        );
-    }
     Ok(())
 }
 
@@ -1187,31 +1029,6 @@ async fn run_runtime_loop(
 
     let mut summaries = interval(config.summary_log_interval);
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-    // Auto-redeem worker — periodic sweep that scans venue positions
-    // for resolved markets and submits CTF redeems via the relayer.
-    // Default interval 60s; disabled in paper mode (no real positions
-    // to redeem). Operator can disable via WHALE_PAIR_LIVE_AUTO_REDEEM=false
-    // (default true so live deployments don't accumulate stranded
-    // collateral). 60s is well above the 5-min market cycle so we
-    // never spam the relayer.
-    let auto_redeem_enabled = !config.paper_mode
-        && std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM")
-            .ok()
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
-            .unwrap_or(true);
-    let auto_redeem_period = std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(60);
-    let mut auto_redeem_ticks = interval(std::time::Duration::from_secs(auto_redeem_period));
-    auto_redeem_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // In-process dedup so we don't re-submit the same condition_id
-    // before the relayer has settled the previous redeem. Cleared on
-    // restart; the venue's own positions sync re-discovers anything
-    // still pending.
-    let mut auto_redeem_seen_conditions: HashSet<String> = HashSet::new();
-
     let mut spot_events_open = true;
     let mut user_events_open = true;
     let mut seen_venue_fill_keys = HashSet::<String>::new();
@@ -1453,41 +1270,6 @@ async fn run_runtime_loop(
                 persist_audit_outcome(audit, "reconcile", runtime, &reconcile_outcome)?;
                 metrics.touch_reconcile();
                 metrics.refresh_stream_ages();
-                // Sweep open orders for maker-rebate eligibility. No-op
-                // for paper adapter (default trait impl returns empty
-                // map). Live adapter calls /orders-scoring batch via
-                // the cached V2 SDK client. Cheap (one HTTP per sweep).
-                if !config.paper_mode {
-                    match execution_adapter.sync_open_orders().await {
-                        Ok(venue_orders) if !venue_orders.is_empty() => {
-                            let ids: Vec<String> = venue_orders
-                                .iter()
-                                .map(|o| o.venue_order_id.to_string())
-                                .collect();
-                            let id_refs: Vec<&str> =
-                                ids.iter().map(|s| s.as_str()).collect();
-                            match execution_adapter
-                                .check_orders_scoring(&id_refs)
-                                .await
-                            {
-                                Ok(map) => {
-                                    let scoring = map.values().filter(|s| **s).count();
-                                    let non_scoring = map.len() - scoring;
-                                    metrics.record_order_scoring_counts(scoring, non_scoring);
-                                }
-                                Err(error) => {
-                                    warn!(error = %error, "order-scoring sweep failed (non-fatal)");
-                                }
-                            }
-                        }
-                        Ok(_) => {
-                            metrics.record_order_scoring_counts(0, 0);
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "sync_open_orders for scoring sweep failed (non-fatal)");
-                        }
-                    }
-                }
                 persist_runtime_checkpoint(
                     journal,
                     runtime,
@@ -1502,82 +1284,6 @@ async fn run_runtime_loop(
                     now_unix_ms(),
                     "periodic",
                 )?;
-            }
-            _ = auto_redeem_ticks.tick(), if auto_redeem_enabled => {
-                // Scan venue for redeemable positions and submit one
-                // CTF redeem per unique condition_id (binary market both
-                // legs). Idempotent within process lifetime via the
-                // seen_conditions set; restarts re-discover from venue.
-                match execution_adapter.sync_balances().await {
-                    Ok(balances) => {
-                        let mut by_condition: std::collections::BTreeMap<String, Vec<&VenuePosition>> =
-                            std::collections::BTreeMap::new();
-                        for position in &balances.positions {
-                            if !position.redeemable {
-                                continue;
-                            }
-                            let Some(condition_id) = position.condition_id.as_ref() else {
-                                continue;
-                            };
-                            if auto_redeem_seen_conditions.contains(condition_id) {
-                                continue;
-                            }
-                            by_condition
-                                .entry(condition_id.clone())
-                                .or_default()
-                                .push(position);
-                        }
-                        if !by_condition.is_empty() {
-                            info!(
-                                target: "auto_redeem",
-                                condition_count = by_condition.len(),
-                                "auto-redeem: planning sweep of resolved positions"
-                            );
-                        }
-                        for (condition_id, positions) in &by_condition {
-                            let market_id = positions
-                                .first()
-                                .map(|p| p.market_id.clone())
-                                .unwrap_or_else(|| MarketId::from(condition_id.as_str()));
-                            let now_ms = now_unix_ms();
-                            let request = crate::wire::execution_adapter::RedeemPositionsRequest {
-                                command_id: ClientOrderId::from(format!(
-                                    "auto-redeem:{condition_id}:{now_ms}"
-                                )),
-                                market_id,
-                                condition_id: condition_id.clone(),
-                                index_sets: vec![1, 2],
-                                submitted_at_ms: now_ms,
-                            };
-                            match execution_adapter.redeem_positions(request).await {
-                                Ok(ack) => {
-                                    auto_redeem_seen_conditions.insert(condition_id.clone());
-                                    info!(
-                                        target: "auto_redeem",
-                                        condition_id = %condition_id,
-                                        venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
-                                        "auto-redeem: submitted"
-                                    );
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        target: "auto_redeem",
-                                        condition_id = %condition_id,
-                                        error = %error,
-                                        "auto-redeem: submission failed (will retry next tick unless venue confirmed)"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            target: "auto_redeem",
-                            error = %error,
-                            "auto-redeem: sync_balances failed (non-fatal)"
-                        );
-                    }
-                }
             }
             _ = summaries.tick() => {
                 let snapshots = books.snapshots(&config.market_assets).await;
@@ -3423,8 +3129,76 @@ fn paper_fill_from_book_snapshot(
             .filter(|level| level.price > 0.0 && level.price >= intent.limit_price)
             .collect()
     };
+
+    let order_age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms);
+    let is_resting = order_age_ms > execution_policy.paper_submit_latency_ms;
+    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
+        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
+    } else {
+        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
+    };
+
     if candidate_levels.is_empty() {
-        return None;
+        // No crossable book levels. The only fill path is maker-via-trade-through:
+        // we're resting at limit X, taker just swept our queue level at price ≤ X
+        // (for buys), and the book may have repriced past us. Without this branch,
+        // legitimate maker fills are silently dropped.
+        if !is_resting || !maker_trade_through {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = "no_crossable_levels",
+                side = ?intent.side,
+                limit = intent.limit_price,
+                best_bid = book.best_bid,
+                best_ask = book.best_ask,
+                last_trade = book.last_trade_price,
+                is_resting,
+                maker_trade_through,
+            );
+            return None;
+        }
+        let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
+        if order_age_ms < queue_wait_ms {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = "queue_wait_no_book",
+                order_age_ms,
+                queue_wait_ms,
+            );
+            return None;
+        }
+        let claim_ratio = (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0);
+        let qty_filled = (remaining_qty * claim_ratio).max(0.0);
+        if qty_filled <= 0.0 {
+            return None;
+        }
+        let price = intent.limit_price;
+        let notional = qty_filled * price;
+        if notional < execution_policy.paper_min_fill_notional_usd
+            && (remaining_qty * price) >= execution_policy.paper_min_fill_notional_usd
+        {
+            return None;
+        }
+        let fee_basis = price * (1.0 - price);
+        let fee = -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis);
+        order_ctx.last_fill_ms = observed_at_ms;
+        order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
+        order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
+        return Some(FillReport {
+            order_id: None,
+            client_order_id: Some(intent.client_order_id.clone()),
+            market_id: intent.market_id.clone(),
+            instrument_id: intent.instrument_id.clone(),
+            side: intent.side,
+            price,
+            quantity: qty_filled,
+            fee_usd: fee,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms,
+        });
     }
 
     let total_available: f64 = candidate_levels.iter().map(|level| level.size).sum();
@@ -3438,26 +3212,21 @@ fn paper_fill_from_book_snapshot(
     } else {
         book.best_bid > 0.0 && intent.limit_price <= book.best_bid
     };
-    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
-        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
-    } else {
-        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
-    };
-    // Distinguish a fresh submit (could be TAKER if crossing) from a
-    // resting order that the book later moved into (always MAKER, fills
-    // at our limit). A real venue does not turn our resting limit into
-    // a taker just because the opposite side moved through us; we get
-    // price-improved as the maker. Fresh = within submit-latency window.
-    let order_age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms);
-    // "Fresh" = just arrived at venue; "resting" = strictly older than the
-    // submit-latency window. A fresh order that crosses on arrival is a
-    // taker; a resting order the book later moves into is a maker
-    // (price-improvement to whoever takes our resting bid).
-    let is_resting = order_age_ms > execution_policy.paper_submit_latency_ms;
     let crosses_as_taker = crossing && !is_resting;
     if !crossing {
         let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
         if order_age_ms < queue_wait_ms || !maker_trade_through {
+            debug!(
+                target: "paper_fill_gate",
+                client_order_id = %intent.client_order_id,
+                gate = if order_age_ms < queue_wait_ms { "queue_wait" } else { "no_trade_through" },
+                side = ?intent.side,
+                limit = intent.limit_price,
+                last_trade = book.last_trade_price,
+                order_age_ms,
+                queue_wait_ms,
+                maker_trade_through,
+            );
             return None;
         }
     }
@@ -4075,9 +3844,6 @@ mod tests {
                     instrument_id: InstrumentId::from("down"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
-                    redeemable: false,
-                    mergeable: false,
-                    current_value_usd: 0.0,
                 }],
                 positions_authoritative: true,
                 observed_at_ms: now_ms,
@@ -4150,9 +3916,6 @@ mod tests {
                         instrument_id: InstrumentId::from("up"),
                         quantity: 6.5,
                         average_cost_usd: 0.20,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: 1.30,
                     },
                     VenuePosition {
                         market_id: MarketId::from("market-mm"),
@@ -4163,9 +3926,6 @@ mod tests {
                         instrument_id: InstrumentId::from("down"),
                         quantity: 6.5,
                         average_cost_usd: 0.79,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: 5.13,
                     },
                 ],
                 positions_authoritative: true,
@@ -4239,9 +3999,6 @@ mod tests {
                     instrument_id: InstrumentId::from("old-token"),
                     quantity: 6.5,
                     average_cost_usd: 0.80,
-                    redeemable: false,
-                    mergeable: false,
-                    current_value_usd: 0.0,
                 }],
                 positions_authoritative: true,
                 observed_at_ms: now_ms,
@@ -4697,6 +4454,119 @@ mod tests {
             "expected fill at our limit price 0.45, got {}",
             fill.price
         );
+    }
+
+    #[test]
+    fn resting_maker_fills_via_trade_through_when_book_has_no_crossable_levels() {
+        // Real venue: resting buy at 0.50; a taker sells through us at
+        // 0.50 (last_trade=0.50), and the bid level repriced past us so
+        // the snapshot now shows asks only above 0.50. Without the
+        // maker-via-trade-through branch, this fill is silently dropped.
+        let now_ms = now_unix_ms();
+        let arrival_ms = now_ms - 5_000; // resting (past submit-latency)
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.45, 200.0, 0.55, 200.0, 0.50, now_ms);
+        book.bids = vec![Level { price: 0.45, size: 200.0 }];
+        // No asks at or below our 0.50 limit; candidate_levels is empty.
+        book.asks = vec![Level { price: 0.55, size: 200.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-trade-through-maker"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "test trade-through maker".to_string(),
+            quote_level_tag: None,
+            created_at_ms: arrival_ms,
+            pair_id: None,
+        };
+        let mut policy = paper_test_policy();
+        policy.paper_post_only_reject_probability = 0.0;
+        policy.paper_min_fill_notional_usd = 0.0;
+        let mut ctx = PaperOrderContext {
+            arrival_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: arrival_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        )
+        .expect("expected maker fill via trade-through when book has no crossable levels");
+        assert!(
+            matches!(fill.liquidity, FillLiquidity::Maker),
+            "expected Maker liquidity for trade-through fill, got {:?}",
+            fill.liquidity
+        );
+        assert!(
+            (fill.price - 0.50).abs() < 1e-9,
+            "expected fill at our limit price 0.50, got {}",
+            fill.price
+        );
+        let expected_qty =
+            intent.quantity * (1.0 - policy.paper_queue_depth_fraction).max(0.0);
+        assert!(
+            (fill.quantity - expected_qty).abs() < 1e-9,
+            "expected qty {} (queue_depth_fraction-driven), got {}",
+            expected_qty,
+            fill.quantity
+        );
+    }
+
+    #[test]
+    fn no_fill_when_no_crossable_levels_and_no_trade_through() {
+        // Sanity: if the book has no crossable levels AND last_trade is
+        // away from our limit, we must NOT synthesize a maker fill.
+        let now_ms = now_unix_ms();
+        let arrival_ms = now_ms - 5_000;
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.45, 200.0, 0.55, 200.0, 0.55, now_ms);
+        book.bids = vec![Level { price: 0.45, size: 200.0 }];
+        book.asks = vec![Level { price: 0.55, size: 200.0 }];
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-no-trade-through"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "test no trade-through".to_string(),
+            quote_level_tag: None,
+            created_at_ms: arrival_ms,
+            pair_id: None,
+        };
+        let policy = paper_test_policy();
+        let mut ctx = PaperOrderContext {
+            arrival_ms,
+            queue_bias: 0.5,
+            last_attempt_ms: arrival_ms,
+            last_fill_ms: 0,
+            last_fill_book_update_ms: 0,
+            fill_count: 0,
+            cancel_requested_at_ms: None,
+        };
+        let fill = paper_fill_from_book_snapshot(
+            &book,
+            &intent,
+            now_ms,
+            0.0,
+            &mut ctx,
+            intent.quantity,
+            &policy,
+        );
+        assert!(fill.is_none(), "should not fill without trade-through evidence");
     }
 
     #[test]
