@@ -1187,6 +1187,31 @@ async fn run_runtime_loop(
 
     let mut summaries = interval(config.summary_log_interval);
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    // Auto-redeem worker — periodic sweep that scans venue positions
+    // for resolved markets and submits CTF redeems via the relayer.
+    // Default interval 60s; disabled in paper mode (no real positions
+    // to redeem). Operator can disable via WHALE_PAIR_LIVE_AUTO_REDEEM=false
+    // (default true so live deployments don't accumulate stranded
+    // collateral). 60s is well above the 5-min market cycle so we
+    // never spam the relayer.
+    let auto_redeem_enabled = !config.paper_mode
+        && std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM")
+            .ok()
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true);
+    let auto_redeem_period = std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    let mut auto_redeem_ticks = interval(std::time::Duration::from_secs(auto_redeem_period));
+    auto_redeem_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // In-process dedup so we don't re-submit the same condition_id
+    // before the relayer has settled the previous redeem. Cleared on
+    // restart; the venue's own positions sync re-discovers anything
+    // still pending.
+    let mut auto_redeem_seen_conditions: HashSet<String> = HashSet::new();
+
     let mut spot_events_open = true;
     let mut user_events_open = true;
     let mut seen_venue_fill_keys = HashSet::<String>::new();
@@ -1477,6 +1502,82 @@ async fn run_runtime_loop(
                     now_unix_ms(),
                     "periodic",
                 )?;
+            }
+            _ = auto_redeem_ticks.tick(), if auto_redeem_enabled => {
+                // Scan venue for redeemable positions and submit one
+                // CTF redeem per unique condition_id (binary market both
+                // legs). Idempotent within process lifetime via the
+                // seen_conditions set; restarts re-discover from venue.
+                match execution_adapter.sync_balances().await {
+                    Ok(balances) => {
+                        let mut by_condition: std::collections::BTreeMap<String, Vec<&VenuePosition>> =
+                            std::collections::BTreeMap::new();
+                        for position in &balances.positions {
+                            if !position.redeemable {
+                                continue;
+                            }
+                            let Some(condition_id) = position.condition_id.as_ref() else {
+                                continue;
+                            };
+                            if auto_redeem_seen_conditions.contains(condition_id) {
+                                continue;
+                            }
+                            by_condition
+                                .entry(condition_id.clone())
+                                .or_default()
+                                .push(position);
+                        }
+                        if !by_condition.is_empty() {
+                            info!(
+                                target: "auto_redeem",
+                                condition_count = by_condition.len(),
+                                "auto-redeem: planning sweep of resolved positions"
+                            );
+                        }
+                        for (condition_id, positions) in &by_condition {
+                            let market_id = positions
+                                .first()
+                                .map(|p| p.market_id.clone())
+                                .unwrap_or_else(|| MarketId::from(condition_id.as_str()));
+                            let now_ms = now_unix_ms();
+                            let request = crate::wire::execution_adapter::RedeemPositionsRequest {
+                                command_id: ClientOrderId::from(format!(
+                                    "auto-redeem:{condition_id}:{now_ms}"
+                                )),
+                                market_id,
+                                condition_id: condition_id.clone(),
+                                index_sets: vec![1, 2],
+                                submitted_at_ms: now_ms,
+                            };
+                            match execution_adapter.redeem_positions(request).await {
+                                Ok(ack) => {
+                                    auto_redeem_seen_conditions.insert(condition_id.clone());
+                                    info!(
+                                        target: "auto_redeem",
+                                        condition_id = %condition_id,
+                                        venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
+                                        "auto-redeem: submitted"
+                                    );
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        target: "auto_redeem",
+                                        condition_id = %condition_id,
+                                        error = %error,
+                                        "auto-redeem: submission failed (will retry next tick unless venue confirmed)"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "auto_redeem",
+                            error = %error,
+                            "auto-redeem: sync_balances failed (non-fatal)"
+                        );
+                    }
+                }
             }
             _ = summaries.tick() => {
                 let snapshots = books.snapshots(&config.market_assets).await;
