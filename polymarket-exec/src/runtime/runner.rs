@@ -2911,9 +2911,24 @@ fn submit_request_from_intent(
     observed_at_ms: u64,
     execution_policy: &ExecutionPolicy,
 ) -> SubmitOrderRequest {
+    // Hedge-rescue intents are taker IOC orders that lift the opposite leg
+    // to manufacture paired inventory (whales' atomic completion pattern).
+    // They MUST cross the book — post-only would defeat the whole purpose.
+    let is_hedge_rescue = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
     let live_expires_at_ms = (!execution_policy.paper_mode
-        && execution_policy.live_order_ttl_ms > 0)
+        && execution_policy.live_order_ttl_ms > 0
+        && !is_hedge_rescue)
         .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms));
+    let (time_in_force, post_only) = if is_hedge_rescue {
+        (TimeInForce::Ioc, false)
+    } else if live_expires_at_ms.is_some() {
+        (TimeInForce::Gtd, !execution_policy.paper_mode && execution_policy.live_post_only)
+    } else {
+        (TimeInForce::Gtc, !execution_policy.paper_mode && execution_policy.live_post_only)
+    };
     SubmitOrderRequest {
         client_order_id: intent.client_order_id.clone(),
         market_id: intent.market_id.clone(),
@@ -2921,12 +2936,8 @@ fn submit_request_from_intent(
         side: intent.side,
         limit_price: intent.limit_price,
         quantity: intent.quantity,
-        post_only: !execution_policy.paper_mode && execution_policy.live_post_only,
-        time_in_force: if live_expires_at_ms.is_some() {
-            TimeInForce::Gtd
-        } else {
-            TimeInForce::Gtc
-        },
+        post_only,
+        time_in_force,
         expires_at_ms: live_expires_at_ms,
         strategy_tag: "runtime".to_string(),
         quote_level_tag: intent.quote_level_tag.clone(),

@@ -1726,6 +1726,57 @@ impl Btc5mMmStrategy {
         }
     }
 
+    /// Build a TAKER (IOC) rescue order that lifts the current ask of the
+    /// stranded-leg's opposite outcome. Mirrors unlawful's atomic-completion
+    /// pattern: when one leg fills and the other doesn't, sweep the ask on
+    /// the missing side at near-resolution prices to manufacture the pair,
+    /// then merge for $1 collateral release. The quote_level_tag prefix
+    /// "mm-hedge-rescue" tells runner.rs to flip post_only off and TIF to IOC.
+    fn build_rescue_intent_for_quantity(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        quote: &QuoteSnapshot,
+        quantity: f64,
+        leg_cost: f64,
+        gross_cost: f64,
+        reason_prefix: &str,
+        now_ms: EpochMillis,
+    ) -> Option<OrderIntent> {
+        let best_ask = Self::best_ask(quote)?;
+        // A merged pair releases exactly $1 collateral. If we pay > $0.99
+        // on the rescue leg, we can't recover even an empty-spread original
+        // maker fill via merge. Cap aggression at $0.99.
+        if best_ask >= 0.99 {
+            return None;
+        }
+        if quantity < self.config.min_order_quantity
+            || quantity + 1e-9 < self.config.venue_min_order_quantity
+        {
+            return None;
+        }
+        let notional = quantity * best_ask;
+        if notional < self.config.min_order_notional_usd
+            || notional > self.config.max_leg_cost_usd - leg_cost + 1e-9
+            || notional > self.config.max_gross_cost_usd - gross_cost + 1e-9
+        {
+            return None;
+        }
+        Some(Self::build_order(
+            market_id.clone(),
+            instrument_id.clone(),
+            TradeSide::Buy,
+            best_ask,
+            quantity,
+            false,
+            "mm-hedge-rescue".to_string(),
+            format!(
+                "{reason_prefix} ioc-lift ask={best_ask:.4} qty={quantity:.2} notional={notional:.2}"
+            ),
+            now_ms,
+        ))
+    }
+
     fn build_bid_intent_for_quantity(
         &self,
         market_id: &MarketId,
@@ -1943,38 +1994,32 @@ impl Strategy for Btc5mMmStrategy {
                 }
             }
             (true, false) => {
-                let hedge_qty = left_qty
-                    .min(self.config.max_clip_usd / Self::best_bid(&right_quote).unwrap_or(1.0));
-                if let Some(hedge) = self.build_bid_intent_for_quantity(
+                // Stranded long on left → manufacture pair by IOC-lifting right's ask.
+                let hedge_qty = left_qty;
+                if let Some(hedge) = self.build_rescue_intent_for_quantity(
                     &snapshot.market_id,
                     &right_id,
                     &right_quote,
-                    right_fair,
+                    hedge_qty,
                     right_cost,
                     gross_cost,
-                    hedge_qty,
-                    self.config.hedge_rescue_edge_bps,
-                    "mm-hedge-rescue",
-                    "btc-5m-mm hedge rescue",
+                    "btc-5m-mm hedge rescue (lift right ask)",
                     context.now_ms,
                 ) {
                     intents.push(hedge);
                 }
             }
             (false, true) => {
-                let hedge_qty = right_qty
-                    .min(self.config.max_clip_usd / Self::best_bid(&left_quote).unwrap_or(1.0));
-                if let Some(hedge) = self.build_bid_intent_for_quantity(
+                // Stranded long on right → manufacture pair by IOC-lifting left's ask.
+                let hedge_qty = right_qty;
+                if let Some(hedge) = self.build_rescue_intent_for_quantity(
                     &snapshot.market_id,
                     &left_id,
                     &left_quote,
-                    left_fair,
+                    hedge_qty,
                     left_cost,
                     gross_cost,
-                    hedge_qty,
-                    self.config.hedge_rescue_edge_bps,
-                    "mm-hedge-rescue",
-                    "btc-5m-mm hedge rescue",
+                    "btc-5m-mm hedge rescue (lift left ask)",
                     context.now_ms,
                 ) {
                     intents.push(hedge);

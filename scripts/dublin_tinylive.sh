@@ -45,7 +45,7 @@ export WHALE_PAIR_BTC_5M_MM_LIQUIDITY_CLIP_FRACTION=0.02
 # Anti-churn: longer cooldown + more aggressive hedge rescue.
 # Without these the bot reposts every ~1s and chases the trending leg
 # (e.g. 4 UP fills as BTC ticked up while DOWN bid kept getting cancelled).
-export WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS=5000
+export WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS=2000
 export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_CLIP_USD=5.00
 export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS=10
 
