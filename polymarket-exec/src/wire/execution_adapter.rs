@@ -730,7 +730,14 @@ impl PolymarketExecutionAdapter {
         let cell = self.v2_sdk_client.clone();
         let api_url = self._config.api_url.clone();
         let creds_opt = self._config.credentials.clone();
-        let funder = self.trade_address;
+        // V2 SDK rejects 'funder' on EOA orders (it's only meaningful for
+        // proxy/Safe wallets). Only pass it when we're in proxy/Safe mode
+        // AND the funder is actually different from the signer's own address.
+        let signer_addr = sdk_signer.address();
+        let funder = match self.signature_type {
+            PolymarketSignatureType::Eoa => None,
+            _ => self.trade_address.filter(|addr| *addr != signer_addr),
+        };
         let signer = sdk_signer.clone();
 
         let client_ref = cell
