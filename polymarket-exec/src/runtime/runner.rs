@@ -2477,6 +2477,17 @@ async fn execute_execution_adapter(
                         if active_order {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
+                            warn!(
+                                target: "polymarket_exec::runtime::runner",
+                                mode = "live",
+                                client_order_id = %intent.client_order_id,
+                                instrument_id = %intent.instrument_id,
+                                price = intent.limit_price,
+                                qty = intent.quantity,
+                                error = %error,
+                                error_kind = std::any::type_name_of_val(&error),
+                                "submit Err returned by adapter (full venue text)"
+                            );
                         } else {
                             debug!(
                                 mode = "live",
