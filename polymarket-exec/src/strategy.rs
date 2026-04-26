@@ -1730,19 +1730,44 @@ impl Btc5mMmStrategy {
         }
     }
 
-    /// Build a TAKER (IOC) rescue order that lifts the current ask of the
-    /// stranded-leg's opposite outcome. Mirrors unlawful's atomic-completion
-    /// pattern: when one leg fills and the other doesn't, sweep the ask on
-    /// the missing side at near-resolution prices to manufacture the pair,
-    /// then merge for $1 collateral release. The quote_level_tag prefix
-    /// "mm-hedge-rescue" tells runner.rs to flip post_only off and TIF to IOC.
+    /// Walk the ask depth book to find the limit price that, when used on
+    /// an IOC, will sweep enough liquidity to fill `target_qty`. Returns
+    /// `(limit_price, fillable_qty)` where fillable_qty <= target_qty
+    /// (less if total available depth is shallower than what we want).
     ///
-    /// Economic gate: only the rescue's NEW money matters; the stranded
-    /// leg's cost is sunk. If best_ask < $1, then `pay best_ask, get $1
-    /// back via merge` is guaranteed +EV on the operation itself —
-    /// independent of whatever we already paid for the stranded leg.
-    /// Skips per-leg cap (rescue CLOSES exposure, doesn't add) but still
-    /// respects gross cap.
+    /// IOC behavior: a buy IOC at price P takes ALL ask liquidity at
+    /// price <= P, up to the order's quantity. So setting the limit to
+    /// the worst price needed to cover target_qty guarantees a sweep
+    /// through every cheaper level too — one order, multi-level fill.
+    fn depth_walk_to_quantity(quote: &QuoteSnapshot, target_qty: f64) -> Option<(f64, f64)> {
+        let mut accum = 0.0;
+        let mut last_price = 0.0;
+        for level in &quote.ask_levels {
+            if !level.price.is_finite() || level.price <= 0.0 || level.quantity <= 0.0 {
+                continue;
+            }
+            accum += level.quantity;
+            last_price = level.price;
+            if accum >= target_qty {
+                return Some((last_price, target_qty));
+            }
+        }
+        if accum > 1e-9 {
+            Some((last_price, accum))
+        } else {
+            None
+        }
+    }
+
+    /// Build a TAKER (IOC) rescue order that sweeps the depth book of the
+    /// stranded-leg's opposite outcome. Mirrors unlawful's atomic-completion
+    /// pattern: when one leg fills and the other doesn't, sweep multiple
+    /// price levels of the missing side in ONE IOC at the deepest price
+    /// needed to cover stranded_qty (or all available depth if shallower).
+    ///
+    /// Economic gate: only NEW money matters — stranded leg's cost is
+    /// sunk. Sweep limit must be < $1 so each pair-via-merge nets ≥ $0.
+    /// Skips per-leg cap (rescue CLOSES exposure) but respects gross cap.
     fn build_rescue_intent_for_quantity(
         &self,
         market_id: &MarketId,
@@ -1753,46 +1778,53 @@ impl Btc5mMmStrategy {
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
-        let best_ask = Self::best_ask(quote)?;
-        // best_ask must be < $1 for the rescue to net positive on its own
-        // (pay best_ask per share, merge releases $1). 1c headroom for fees.
-        if best_ask >= 0.99 {
+        // Depth walk: find the price needed to sweep `quantity` shares,
+        // OR cap to whatever depth exists if it's shallower than that.
+        let (sweep_price, sweep_qty) =
+            Self::depth_walk_to_quantity(quote, quantity).or_else(|| {
+                // Fallback: top of book only (shouldn't happen if depth_walk
+                // saw any level, but defensive).
+                Self::best_ask(quote).map(|p| (p, quantity))
+            })?;
+        // Sweep price must be < $1 so each pair-via-merge nets ≥ $0.
+        if sweep_price >= 0.99 {
             return None;
         }
-        if quantity < self.config.min_order_quantity
-            || quantity + 1e-9 < self.config.venue_min_order_quantity
+        if sweep_qty < self.config.min_order_quantity
+            || sweep_qty + 1e-9 < self.config.venue_min_order_quantity
         {
             return None;
         }
-        let notional = quantity * best_ask;
+        let notional = sweep_qty * sweep_price;
         if notional < self.config.min_order_notional_usd {
             return None;
         }
-        // Skip max_leg_cost cap — rescue closes existing exposure, doesn't
-        // add new directional risk. But respect gross_cost cap (total
-        // wallet outlay ceiling) since the rescue does require fresh cash
-        // out before the merge releases it back.
-        if notional > self.config.max_gross_cost_usd - gross_cost + 1e-9 {
-            tracing::debug!(
-                target: "strategy.rescue",
-                market = %market_id,
-                notional,
-                gross_cost,
-                gross_cap = self.config.max_gross_cost_usd,
-                "rescue skipped: would exceed gross cost cap"
-            );
-            return None;
-        }
+        // Skip BOTH max_leg_cost AND max_gross_cost caps. Both are
+        // entry-time caps designed to prevent paired-entry accumulation
+        // runaway. Rescue is the OPPOSITE of accumulation — it closes
+        // existing directional exposure by manufacturing a paired set
+        // for immediate merge. Blocking it here just leaves us naked
+        // long on one side. The merge will return the cash within ~30s
+        // of the rescue submit (paired_qty × $1 collateral release).
+        // Wallet-cash exhaustion is still gated upstream by the
+        // execution adapter's balance check; we don't need a duplicate
+        // here. Suppress unused parameter warning.
+        let _ = gross_cost;
+        let depth_levels_swept = quote
+            .ask_levels
+            .iter()
+            .take_while(|l| l.price <= sweep_price + 1e-9 && l.price > 0.0)
+            .count();
         Some(Self::build_order(
             market_id.clone(),
             instrument_id.clone(),
             TradeSide::Buy,
-            best_ask,
-            quantity,
+            sweep_price,
+            sweep_qty,
             false,
             "mm-hedge-rescue".to_string(),
             format!(
-                "{reason_prefix} ioc-lift ask={best_ask:.4} qty={quantity:.2} notional={notional:.2}"
+                "{reason_prefix} depth-sweep limit={sweep_price:.4} qty={sweep_qty:.2} notional={notional:.2} levels={depth_levels_swept}"
             ),
             now_ms,
         ))
