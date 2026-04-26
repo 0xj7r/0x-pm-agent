@@ -697,12 +697,15 @@ impl PolymarketExecutionAdapter {
         &self,
         req: SubmitOrderRequest,
     ) -> Result<SubmitOrderAck, ExecutionError> {
-        use polymarket_client_sdk_v2::clob::types::{OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType};
+        use alloy::signers::local::LocalSigner as SdkLocalSigner;
+        use alloy::signers::Signer as _;
+        use polymarket_client_sdk_v2::auth::{Credentials as SdkV2Credentials, Uuid as SdkV2Uuid};
+        use polymarket_client_sdk_v2::clob::types::{
+            OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType,
+        };
         use polymarket_client_sdk_v2::clob::{Client as SdkV2Client, Config as SdkV2Config};
         use polymarket_client_sdk_v2::types::{Decimal as SdkV2Decimal, U256 as SdkV2U256};
         use polymarket_client_sdk_v2::POLYGON as SDK_V2_POLYGON;
-        use alloy::signers::local::LocalSigner as SdkLocalSigner;
-        use alloy::signers::Signer as _;
 
         // Map our types to SDK V2 types.
         let token_id = SdkV2U256::from_str(req.instrument_id.as_str()).map_err(|error| {
@@ -715,15 +718,10 @@ impl PolymarketExecutionAdapter {
             crate::types::TradeSide::Buy => SdkV2Side::Buy,
             crate::types::TradeSide::Sell => SdkV2Side::Sell,
         };
-        // V2 venue requires future expiration even for resting orders;
-        // SDK rejects non-zero expiration on GTC. Easiest path: always
-        // use GTD with a 1h expiration unless the request is GTC and
-        // no expires_at_ms is set (rare; default to 1h GTD anyway for
-        // the V2 path so the venue accepts it).
         let order_type = match req.time_in_force {
             TimeInForce::Ioc | TimeInForce::Fok => SdkV2OrderType::FOK,
-            // Both Gtc and Gtd map to GTD here for V2 compatibility.
-            TimeInForce::Gtc | TimeInForce::Gtd => SdkV2OrderType::GTD,
+            TimeInForce::Gtc => SdkV2OrderType::GTC,
+            TimeInForce::Gtd => SdkV2OrderType::GTD,
         };
         let signature_type_v2 = match self.signature_type {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
@@ -749,18 +747,26 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(SDK_V2_POLYGON));
 
-        // Build authenticated SDK client (one network roundtrip). The
-        // SDK calls /auth/api-key which 400s if a key already exists
-        // (warning visible in logs); SDK then falls back to
-        // /auth/derive-api-key which usually succeeds. TODO: pass our
-        // pre-existing creds via .credentials() to skip the warning —
-        // requires accessing V1 SDK's SecretString fields cleanly.
+        // Build authenticated SDK client. If the operator supplied static L2
+        // credentials, pass them through so V2 keeps using the existing API key.
+        // In L1-only mode, let the V2 SDK create/derive its own credentials
+        // rather than reusing credentials produced by the V1 client path.
         let mut auth_builder = SdkV2Client::new(&self._config.api_url, SdkV2Config::default())
             .map_err(|error| {
                 ExecutionError::TransientNetwork(format!("V2 SDK Client::new failed: {error}"))
             })?
             .authentication_builder(&sdk_signer)
             .signature_type(signature_type_v2);
+        if let Some(credentials) = self._config.credentials.as_ref() {
+            let api_key = SdkV2Uuid::parse_str(credentials.api_key.trim()).map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid POLYMARKET_API_KEY: {error}"))
+            })?;
+            auth_builder = auth_builder.credentials(SdkV2Credentials::new(
+                api_key,
+                credentials.api_secret.clone(),
+                credentials.api_passphrase.clone(),
+            ));
+        }
         if let Some(funder) = self.trade_address {
             auth_builder = auth_builder.funder(funder);
         }
@@ -776,16 +782,18 @@ impl PolymarketExecutionAdapter {
             ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}"))
         })?;
 
-        // V2 requires expiration > now + 60s safety threshold even for
-        // GTC orders. If the request specifies an explicit expires_at_ms
-        // (GTD path), use it; otherwise default to 1h ahead so GTC and
-        // smoke orders satisfy the validator.
+        // V2 keeps expiration outside the signed order. GTC uses epoch
+        // expiration (0), matching the public migration docs; GTD uses
+        // the requested future expiry or defaults to 1h ahead.
         let expiration_dt = {
-            use chrono::{DateTime, TimeZone, Utc};
-            let secs_ms = req
-                .expires_at_ms
-                .filter(|ms| *ms > now_unix_ms() + 60_000)
-                .unwrap_or_else(|| now_unix_ms() + 3_600_000);
+            use chrono::{TimeZone, Utc};
+            let secs_ms = if matches!(req.time_in_force, TimeInForce::Gtc) {
+                0
+            } else {
+                req.expires_at_ms
+                    .filter(|ms| *ms > now_unix_ms() + 60_000)
+                    .unwrap_or_else(|| now_unix_ms() + 3_600_000)
+            };
             Utc.timestamp_millis_opt(secs_ms as i64)
                 .single()
                 .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
@@ -795,7 +803,7 @@ impl PolymarketExecutionAdapter {
         // but ZERO causes some venue-side mismatches in V2).
         let builder_code_b256 = parse_bytes32(&self._config.v2_builder_code, "builder")?;
 
-        let mut order_builder = client
+        let order_builder = client
             .limit_order()
             .token_id(token_id)
             .side(side)

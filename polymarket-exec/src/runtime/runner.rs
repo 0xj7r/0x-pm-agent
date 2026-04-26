@@ -503,6 +503,16 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     if price <= 0.0 || notional <= 0.0 {
         anyhow::bail!("live smoke price and notional must be positive");
     }
+    let time_in_force = match std::env::var("WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE")
+        .unwrap_or_else(|_| "GTD".to_string())
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "GTC" => TimeInForce::Gtc,
+        "GTD" => TimeInForce::Gtd,
+        other => anyhow::bail!("unsupported WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE={other}"),
+    };
     let now_ms = now_unix_ms();
     let ttl_ms = config.live_order_ttl.as_millis().max(5_000) as u64;
     let client_order_id = ClientOrderId::from(format!("live-smoke:{now_ms}:{asset_id}"));
@@ -514,8 +524,12 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
         limit_price: price,
         quantity: notional / price,
         post_only: true,
-        time_in_force: TimeInForce::Gtd,
-        expires_at_ms: Some(now_ms.saturating_add(ttl_ms)),
+        time_in_force,
+        expires_at_ms: if matches!(time_in_force, TimeInForce::Gtd) {
+            Some(now_ms.saturating_add(ttl_ms))
+        } else {
+            None
+        },
         strategy_tag: "live-smoke".to_string(),
         quote_level_tag: Some("far-touch-smoke".to_string()),
         submitted_at_ms: now_ms,
