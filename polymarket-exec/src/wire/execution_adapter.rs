@@ -483,6 +483,10 @@ pub struct PolymarketExecutionAdapter {
     raw_http: reqwest::Client,
     trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
+    /// Raw private key hex retained so submit_v2_via_sdk can reconstruct
+    /// a fresh LocalSigner for the V2 SDK's typestate-based auth flow.
+    /// Stored privately; never logged or serialized.
+    _stored_private_key: Option<String>,
 }
 
 impl PolymarketExecutionAdapter {
@@ -609,6 +613,7 @@ impl PolymarketExecutionAdapter {
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
+            _stored_private_key: Some(credentials.private_key.clone()),
         })
     }
 
@@ -680,10 +685,151 @@ impl PolymarketExecutionAdapter {
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
+            _stored_private_key: Some(credentials.private_key.clone()),
+        })
+    }
+
+    /// Posts a V2 order via the official polymarket_client_sdk_v2.
+    /// Delegates all EIP-712 signing + JSON serialization to the SDK so
+    /// our orders match exactly what the venue expects. Slower than
+    /// our custom path (one auth roundtrip per call) but correct.
+    async fn submit_v2_via_sdk(
+        &self,
+        req: SubmitOrderRequest,
+    ) -> Result<SubmitOrderAck, ExecutionError> {
+        use polymarket_client_sdk_v2::clob::types::{OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType};
+        use polymarket_client_sdk_v2::clob::{Client as SdkV2Client, Config as SdkV2Config};
+        use polymarket_client_sdk_v2::types::{Decimal as SdkV2Decimal, U256 as SdkV2U256};
+        use polymarket_client_sdk_v2::POLYGON as SDK_V2_POLYGON;
+        use alloy::signers::local::LocalSigner as SdkLocalSigner;
+        use alloy::signers::Signer as _;
+
+        // Map our types to SDK V2 types.
+        let token_id = SdkV2U256::from_str(req.instrument_id.as_str()).map_err(|error| {
+            ExecutionError::BadRequest(format!(
+                "invalid Polymarket token id `{}`: {error}",
+                req.instrument_id
+            ))
+        })?;
+        let side = match req.side {
+            crate::types::TradeSide::Buy => SdkV2Side::Buy,
+            crate::types::TradeSide::Sell => SdkV2Side::Sell,
+        };
+        // V2 venue requires future expiration even for resting orders;
+        // SDK rejects non-zero expiration on GTC. Easiest path: always
+        // use GTD with a 1h expiration unless the request is GTC and
+        // no expires_at_ms is set (rare; default to 1h GTD anyway for
+        // the V2 path so the venue accepts it).
+        let order_type = match req.time_in_force {
+            TimeInForce::Ioc | TimeInForce::Fok => SdkV2OrderType::FOK,
+            // Both Gtc and Gtd map to GTD here for V2 compatibility.
+            TimeInForce::Gtc | TimeInForce::Gtd => SdkV2OrderType::GTD,
+        };
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+
+        // Re-derive a LocalSigner from the stored private key. Alloy's
+        // LocalSigner == PrivateKeySigner; this is just a fresh instance
+        // with the chain_id set for the SDK.
+        let pk_hex = self
+            ._stored_private_key
+            .as_deref()
+            .ok_or_else(|| {
+                ExecutionError::AuthFailure(
+                    "submit_v2_via_sdk requires _stored_private_key (set during connect_with_*)"
+                        .to_string(),
+                )
+            })?;
+        let sdk_signer = SdkLocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?
+            .with_chain_id(Some(SDK_V2_POLYGON));
+
+        // Build authenticated SDK client (one network roundtrip). The
+        // SDK calls /auth/api-key which 400s if a key already exists
+        // (warning visible in logs); SDK then falls back to
+        // /auth/derive-api-key which usually succeeds. TODO: pass our
+        // pre-existing creds via .credentials() to skip the warning —
+        // requires accessing V1 SDK's SecretString fields cleanly.
+        let mut auth_builder = SdkV2Client::new(&self._config.api_url, SdkV2Config::default())
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("V2 SDK Client::new failed: {error}"))
+            })?
+            .authentication_builder(&sdk_signer)
+            .signature_type(signature_type_v2);
+        if let Some(funder) = self.trade_address {
+            auth_builder = auth_builder.funder(funder);
+        }
+        let client = auth_builder.authenticate().await.map_err(|error| {
+            ExecutionError::AuthFailure(format!("V2 SDK authenticate failed: {error}"))
+        })?;
+
+        // Build, sign, and post the order via the SDK.
+        let price = SdkV2Decimal::from_str(&format!("{}", req.limit_price)).map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid V2 SDK price: {error}"))
+        })?;
+        let size = SdkV2Decimal::from_str(&format!("{}", req.quantity)).map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}"))
+        })?;
+
+        // V2 requires expiration > now + 60s safety threshold even for
+        // GTC orders. If the request specifies an explicit expires_at_ms
+        // (GTD path), use it; otherwise default to 1h ahead so GTC and
+        // smoke orders satisfy the validator.
+        let expiration_dt = {
+            use chrono::{DateTime, TimeZone, Utc};
+            let secs_ms = req
+                .expires_at_ms
+                .filter(|ms| *ms > now_unix_ms() + 60_000)
+                .unwrap_or_else(|| now_unix_ms() + 3_600_000);
+            Utc.timestamp_millis_opt(secs_ms as i64)
+                .single()
+                .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+        };
+
+        // Set builder_code from our config (defaults to ZERO if not set,
+        // but ZERO causes some venue-side mismatches in V2).
+        let builder_code_b256 = parse_bytes32(&self._config.v2_builder_code, "builder")?;
+
+        let mut order_builder = client
+            .limit_order()
+            .token_id(token_id)
+            .side(side)
+            .price(price)
+            .size(size)
+            .order_type(order_type)
+            .expiration(expiration_dt)
+            .post_only(req.post_only)
+            .builder_code(builder_code_b256);
+
+        let resp = order_builder
+            .build_sign_and_post(&sdk_signer)
+            .await
+            .map_err(|error| {
+                ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
+            })?;
+
+        let now_ms = now_unix_ms();
+        Ok(SubmitOrderAck {
+            client_order_id: req.client_order_id,
+            venue_order_id: Some(OrderId::from(resp.order_id.to_string())),
+            accepted: true,
+            accepted_at_ms: now_ms,
+            venue_message: Some(format!("v2-sdk status={:?}", resp.status)),
         })
     }
 
     async fn submit_v2(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
+        // Prefer the V2 SDK path when stored private key is available
+        // (set by connect_with_config / connect_with_l1_config). Falls
+        // back to the custom path otherwise (e.g. tests without a key).
+        if self._stored_private_key.is_some() {
+            return self.submit_v2_via_sdk(req).await;
+        }
         let order_type = Self::v2_order_type(&req)?;
         let builder_code = parse_bytes32(&self._config.v2_builder_code, "builder")?;
         let metadata = parse_bytes32(&self._config.v2_metadata, "metadata")?;
