@@ -26,7 +26,10 @@ export POLYMARKET_FUNDER_ADDRESS='' POLYMARKET_FUNDER=''
 # V1 endpoint — works today with USDC.e until Apr 28 cutover
 export POLYMARKET_CLOB_API_URL=https://clob.polymarket.com
 export POLYMARKET_CLOB_VERSION=v1
-export POLYMARKET_COLLATERAL_TOKEN=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+export POLYMARKET_COLLATERAL_TOKEN_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+
+# Required for EOA-mode CTF merge/redeem (signs + submits direct to Polygon).
+export POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com}
 
 # Strategy + tuning
 export WHALE_PAIR_STRATEGY=btc_5m_mm
@@ -48,6 +51,13 @@ export WHALE_PAIR_EXEC_MIN_FREE_CASH_USD=5
 export WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL=2
 export WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET=2
 export WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS=3
+# Default WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS=1 freezes the bot on a single
+# startup race. 10 absorbs the unavoidable rejections during book chase.
+export WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS=10
+# Faster reconcile so first-merge-per-market warmup drops from 15s to 3s.
+# Each tick is one cheap data-api positions call. After warmup, merges are
+# fill-driven (~3-6s end-to-end including chain).
+export WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS=3000
 
 # Kill switch path
 export WHALE_PAIR_LIVE_KILL_SWITCH_PATH=$HOME/.config/polymarket-exec/live.kill
