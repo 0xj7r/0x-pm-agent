@@ -79,3 +79,27 @@ in-flight engine state every restart, can't share state with the
 engine's data structures, hide bugs from the type checker / tests, and
 require operators to understand TWO systems instead of one. The Rust
 engine is the source of truth.
+
+## Distinguishing entry vs close intents
+
+Trading intents fall into TWO categories with opposite risk profiles:
+
+- **Entry** (paired bids, fresh quotes): ADD exposure. Subject to all
+  entry-time caps (max_open_orders, max_position_qty, max_order_notional,
+  max_gross_cost, submit rate cap). These exist to prevent accumulation
+  runaway and quote-spam.
+- **Close** (hedge rescue, reduce-only sells): REMOVE exposure. They
+  manufacture or unwind paired inventory so it can be merged for $1
+  collateral release. Entry-time caps must NOT apply — blocking a close
+  leaves the bot stuck with naked directional exposure that the cap was
+  trying to prevent in the first place.
+
+If you find yourself building the third "bypass entry-time cap for
+close intents" code path in a separate file, that's a smell. Consider
+adding a typed `IntentKind::{Entry, Close}` enum on `OrderIntent` so
+ALL downstream gates can branch cleanly on it, instead of every cap
+layer doing its own `quote_level_tag.starts_with("mm-hedge-rescue")`
+string check. Today's cap-bypass landed in strategy.rs, core/risk.rs,
+and market_making/quote_reconciler.rs — three separate places, all
+checking the same string. Promote to a type when the third or fourth
+layer needs the same logic.
