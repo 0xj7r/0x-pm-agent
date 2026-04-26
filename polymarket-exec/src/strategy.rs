@@ -2110,16 +2110,92 @@ impl Strategy for Btc5mMmStrategy {
 
     fn on_fill(
         &mut self,
-        _context: &StrategyContext,
+        context: &StrategyContext,
         fill: &crate::types::FillReport,
     ) -> StrategyDecision {
-        StrategyDecision {
-            intents: Vec::new(),
-            notes: vec![format!(
-                "btc-5m-mm fill {} {:?} qty={:.4}@{:.4}",
-                fill.instrument_id, fill.side, fill.quantity, fill.price
-            )],
+        let mut notes = vec![format!(
+            "btc-5m-mm fill {} {:?} qty={:.4}@{:.4}",
+            fill.instrument_id, fill.side, fill.quantity, fill.price
+        )];
+        let mut intents = Vec::new();
+
+        // Atomic on-fill rescue: when this fill creates a stranded leg
+        // (we now hold side X, side Y is empty), immediately fire the IOC
+        // rescue intent for side Y instead of waiting for the next book
+        // snapshot tick (which can be 1-3s later). Mirrors unlawful's
+        // sub-second pair completion latency.
+        let market_state = match self.market_states.get(&fill.market_id) {
+            Some(state) => state,
+            None => return StrategyDecision { notes, intents },
+        };
+
+        // Need both outcome quotes cached to know what to lift.
+        if market_state.quotes.len() < 2 {
+            return StrategyDecision { notes, intents };
         }
+
+        let mut sides: Vec<(InstrumentId, QuoteSnapshot)> = market_state
+            .quotes
+            .iter()
+            .map(|(id, q)| (id.clone(), q.clone()))
+            .collect();
+        sides.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        let (left_id, left_quote) = sides[0].clone();
+        let (right_id, right_quote) = sides[1].clone();
+
+        let (left_qty, _, _) = Self::position_for(&context.inventory, &fill.market_id, &left_id);
+        let (right_qty, _, _) = Self::position_for(&context.inventory, &fill.market_id, &right_id);
+        let left_has = left_qty > 1e-9;
+        let right_has = right_qty > 1e-9;
+        if left_has == right_has {
+            // Either both legs filled (no rescue needed) or both empty (impossible
+            // since the fill we just got created at least one). No-op.
+            return StrategyDecision { notes, intents };
+        }
+
+        // Throttle: skip if a rescue was emitted within cooldown_ms.
+        let throttle_ok = market_state
+            .last_rescue_attempt_ms
+            .map(|last| context.now_ms.saturating_sub(last) >= self.config.cooldown_ms)
+            .unwrap_or(true);
+        if !throttle_ok {
+            notes.push("on-fill rescue throttled".to_string());
+            return StrategyDecision { notes, intents };
+        }
+
+        let (lift_id, lift_quote, stranded_qty) = if left_has {
+            (right_id, right_quote, left_qty)
+        } else {
+            (left_id, left_quote, right_qty)
+        };
+        let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
+        let intent = self.build_rescue_intent_for_quantity(
+            &fill.market_id,
+            &lift_id,
+            &lift_quote,
+            stranded_qty,
+            gross_cost,
+            "btc-5m-mm on-fill rescue",
+            context.now_ms,
+        );
+        tracing::info!(
+            target: "strategy.on_fill_rescue",
+            market = %fill.market_id,
+            fill_instrument = %fill.instrument_id,
+            stranded_qty,
+            lift_best_ask = ?Self::best_ask(&lift_quote),
+            intent_built = intent.is_some(),
+            "on-fill rescue evaluated"
+        );
+        if let Some(hedge) = intent {
+            intents.push(hedge);
+            if let Some(state) = self.market_states.get_mut(&fill.market_id) {
+                state.last_rescue_attempt_ms = Some(context.now_ms);
+            }
+            notes.push("on-fill IOC rescue emitted".to_string());
+        }
+
+        StrategyDecision { notes, intents }
     }
 }
 
