@@ -1428,6 +1428,41 @@ async fn run_runtime_loop(
                 persist_audit_outcome(audit, "reconcile", runtime, &reconcile_outcome)?;
                 metrics.touch_reconcile();
                 metrics.refresh_stream_ages();
+                // Sweep open orders for maker-rebate eligibility. No-op
+                // for paper adapter (default trait impl returns empty
+                // map). Live adapter calls /orders-scoring batch via
+                // the cached V2 SDK client. Cheap (one HTTP per sweep).
+                if !config.paper_mode {
+                    match execution_adapter.sync_open_orders().await {
+                        Ok(venue_orders) if !venue_orders.is_empty() => {
+                            let ids: Vec<String> = venue_orders
+                                .iter()
+                                .map(|o| o.venue_order_id.to_string())
+                                .collect();
+                            let id_refs: Vec<&str> =
+                                ids.iter().map(|s| s.as_str()).collect();
+                            match execution_adapter
+                                .check_orders_scoring(&id_refs)
+                                .await
+                            {
+                                Ok(map) => {
+                                    let scoring = map.values().filter(|s| **s).count();
+                                    let non_scoring = map.len() - scoring;
+                                    metrics.record_order_scoring_counts(scoring, non_scoring);
+                                }
+                                Err(error) => {
+                                    warn!(error = %error, "order-scoring sweep failed (non-fatal)");
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            metrics.record_order_scoring_counts(0, 0);
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "sync_open_orders for scoring sweep failed (non-fatal)");
+                        }
+                    }
+                }
                 persist_runtime_checkpoint(
                     journal,
                     runtime,

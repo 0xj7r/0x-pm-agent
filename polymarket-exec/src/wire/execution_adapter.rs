@@ -397,6 +397,16 @@ pub trait ExecutionAdapter: Send + Sync {
             req.command_id
         )))
     }
+    /// Returns map of `venue_order_id` -> `is_scoring_for_rewards`.
+    /// Default impl returns an empty map (paper / non-live adapters do
+    /// not have rebate eligibility). Live adapters override to call the
+    /// venue's /order-scoring endpoint.
+    async fn check_orders_scoring(
+        &self,
+        _venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        Ok(std::collections::HashMap::new())
+    }
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError>;
     async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError>;
     async fn sync_recent_fills(
@@ -755,6 +765,99 @@ impl PolymarketExecutionAdapter {
             })
             .await?;
         Ok(client_ref.clone())
+    }
+
+    /// Checks whether a single live order is currently scoring for
+    /// maker rewards. Returns the venue's boolean. Logs a structured
+    /// event so operators can see (a) which orders qualify and (b)
+    /// whether the strategy is actually capturing the rebate side of
+    /// the edge whales rely on. Cheap GET (~30ms after warm-up since
+    /// the cached client is reused).
+    pub async fn check_order_scoring(
+        &self,
+        venue_order_id: &str,
+    ) -> Result<bool, ExecutionError> {
+        use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+        let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "check_order_scoring requires _stored_private_key".to_string(),
+            )
+        })?;
+        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?;
+        use alloy::signers::Signer as _;
+        let sdk_signer = sdk_signer.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
+        let resp = client
+            .is_order_scoring(venue_order_id)
+            .await
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("is_order_scoring: {error}"))
+            })?;
+        tracing::info!(
+            target: "order_scoring",
+            venue_order_id = %venue_order_id,
+            scoring = resp.scoring,
+            "rebate eligibility checked"
+        );
+        Ok(resp.scoring)
+    }
+
+    /// Batch version of [`Self::check_order_scoring`]. Returns a map of
+    /// `order_id` -> `is_scoring`. One HTTP request regardless of
+    /// `venue_order_ids.len()` — preferred when checking many orders
+    /// (e.g. periodic sweep over open orders).
+    pub async fn check_orders_scoring(
+        &self,
+        venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        if venue_order_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+        let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "check_orders_scoring requires _stored_private_key".to_string(),
+            )
+        })?;
+        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?;
+        use alloy::signers::Signer as _;
+        let sdk_signer = sdk_signer.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
+        let map = client
+            .are_orders_scoring(venue_order_ids)
+            .await
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("are_orders_scoring: {error}"))
+            })?;
+        let scoring_count = map.values().filter(|s| **s).count();
+        tracing::info!(
+            target: "order_scoring",
+            checked = venue_order_ids.len(),
+            scoring = scoring_count,
+            non_scoring = venue_order_ids.len() - scoring_count,
+            "batch rebate eligibility checked"
+        );
+        Ok(map)
     }
 
     /// Posts a V2 order via the official polymarket_client_sdk_v2.
@@ -1586,6 +1689,15 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         after_ms: EpochMillis,
     ) -> Result<Vec<VenueFill>, ExecutionError> {
         self.sync_recent_fills_from_client(after_ms).await
+    }
+
+    async fn check_orders_scoring(
+        &self,
+        venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        // Delegates to the inherent method (which uses the cached V2
+        // SDK auth client to call /orders-scoring batch endpoint).
+        Self::check_orders_scoring(self, venue_order_ids).await
     }
 }
 
