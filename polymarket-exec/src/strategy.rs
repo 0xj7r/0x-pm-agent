@@ -704,6 +704,20 @@ pub struct StrategyContext {
     /// call so strategies can gate paired entries on regime (don't quote in
     /// flat-vol or strong-trending tape).
     pub btc_regime: crate::signals::BtcRegimeSnapshot,
+    /// Venue-authoritative per-market rules (minimum_order_size, tick size).
+    /// `None` means the runner hasn't fetched metadata yet for this market;
+    /// strategy should fall back to its own defaults in that case. Once
+    /// populated by `Runtime::set_venue_market_rules`, the strategy uses
+    /// these values directly so we never have to keep an env knob in sync
+    /// with what Polymarket actually requires.
+    pub venue_rules: Option<VenueMarketRules>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct VenueMarketRules {
+    pub minimum_order_size: f64,
+    pub minimum_tick_size: f64,
+    pub neg_risk: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1789,6 +1803,7 @@ impl Btc5mMmStrategy {
         quote: &QuoteSnapshot,
         quantity: f64,
         gross_cost: f64,
+        venue_rules: Option<&VenueMarketRules>,
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
@@ -1800,6 +1815,12 @@ impl Btc5mMmStrategy {
                 // saw any level, but defensive).
                 Self::best_ask(quote).map(|p| (p, quantity))
             })?;
+        // Tick size: prefer venue-authoritative; fall back to config default
+        // when runner hasn't fetched MarketMetadata yet.
+        let tick_size = venue_rules
+            .map(|r| r.minimum_tick_size)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .unwrap_or(self.config.maker_price_tick);
         // Race buffer: pad the limit upward by a few ticks so the FAK still
         // crosses if the book ticks up between snapshot time and venue
         // receipt. Without this we routinely get back from Polymarket:
@@ -1810,8 +1831,7 @@ impl Btc5mMmStrategy {
         // pair-via-merge releases $1, so paying e.g. $0.05 extra per share
         // costs us 5¢ vs the typical $0.50+ rescue gain. Cap at $0.99
         // to preserve at least 1¢ per-share net before fees.
-        let race_buffer =
-            self.config.maker_price_tick * self.config.hedge_rescue_race_buffer_ticks;
+        let race_buffer = tick_size * self.config.hedge_rescue_race_buffer_ticks;
         let sweep_price = (depth_walk_price + race_buffer).min(0.99);
         // Final solvency gate after the buffer: a rescue at >= $1 nets ≤ $0
         // even before fees — never worth doing.
@@ -1829,7 +1849,15 @@ impl Btc5mMmStrategy {
         // as the other 4 cap-bypass layers (max_open_orders, max_leg_cost,
         // max_gross_cost, max_submit_per_window): entry-time caps must not
         // trap close intents in the exposure they were meant to prevent.
-        let sweep_qty = depth_walk_qty.max(self.config.venue_min_order_quantity);
+        //
+        // Prefer venue-authoritative minimum_order_size; only fall back to
+        // the config default while waiting for the runner to fetch
+        // MarketMetadata for this market.
+        let venue_min = venue_rules
+            .map(|r| r.minimum_order_size)
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .unwrap_or(self.config.venue_min_order_quantity);
+        let sweep_qty = depth_walk_qty.max(venue_min);
         if sweep_qty < self.config.min_order_quantity {
             return None;
         }
@@ -2157,6 +2185,7 @@ impl Strategy for Btc5mMmStrategy {
                         lift_quote,
                         stranded_qty,
                         gross_cost,
+                        context.venue_rules.as_ref(),
                         "btc-5m-mm hedge rescue",
                         context.now_ms,
                     )
@@ -2289,6 +2318,7 @@ impl Strategy for Btc5mMmStrategy {
             &lift_quote,
             stranded_qty,
             gross_cost,
+            context.venue_rules.as_ref(),
             "btc-5m-mm on-fill rescue",
             context.now_ms,
         );
@@ -4501,6 +4531,7 @@ mod tests {
             market_context: None,
             unlawful_signal,
             btc_regime: crate::signals::BtcRegimeSnapshot::default(),
+            venue_rules: None,
         }
     }
 
