@@ -241,6 +241,11 @@ pub struct Btc5mMmConfig {
     pub max_clip_usd: f64,
     pub liquidity_clip_fraction: f64,
     pub hedge_rescue_clip_usd: f64,
+    /// Number of ticks to pad the rescue FAK limit above depth-walk price.
+    /// Defeats the snapshot-to-venue latency race that otherwise kills FAK
+    /// rescues with "no orders found to match" 400s. Cheap insurance:
+    /// extra cost per share = ticks * tick_size, vs $0.50+ rescue gain.
+    pub hedge_rescue_race_buffer_ticks: f64,
     pub max_gross_cost_usd: f64,
     pub max_leg_cost_usd: f64,
     pub min_edge_bps: f64,
@@ -270,6 +275,10 @@ impl Btc5mMmConfig {
                 0.02,
             ),
             hedge_rescue_clip_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_CLIP_USD", 2.50),
+            hedge_rescue_race_buffer_ticks: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_RACE_BUFFER_TICKS",
+                3.0,
+            ),
             max_gross_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_GROSS_COST_USD", 20.0),
             max_leg_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_USD", 10.0),
             min_edge_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS", 75.0),
@@ -305,6 +314,7 @@ impl Btc5mMmConfig {
             max_clip_usd: config.max_clip_usd.max(config.min_clip_usd.max(0.01)),
             liquidity_clip_fraction: config.liquidity_clip_fraction.clamp(0.0, 1.0),
             hedge_rescue_clip_usd: config.hedge_rescue_clip_usd.max(0.01),
+            hedge_rescue_race_buffer_ticks: config.hedge_rescue_race_buffer_ticks.clamp(0.0, 20.0),
             max_gross_cost_usd: config.max_gross_cost_usd.max(0.01),
             max_leg_cost_usd: config.max_leg_cost_usd.max(0.01),
             min_edge_bps: config.min_edge_bps.max(0.0),
@@ -1784,13 +1794,27 @@ impl Btc5mMmStrategy {
     ) -> Option<OrderIntent> {
         // Depth walk: find the price needed to sweep `quantity` shares,
         // OR cap to whatever depth exists if it's shallower than that.
-        let (sweep_price, depth_walk_qty) =
+        let (depth_walk_price, depth_walk_qty) =
             Self::depth_walk_to_quantity(quote, quantity).or_else(|| {
                 // Fallback: top of book only (shouldn't happen if depth_walk
                 // saw any level, but defensive).
                 Self::best_ask(quote).map(|p| (p, quantity))
             })?;
-        // Sweep price must be < $1 so each pair-via-merge nets ≥ $0.
+        // Race buffer: pad the limit upward by a few ticks so the FAK still
+        // crosses if the book ticks up between snapshot time and venue
+        // receipt. Without this we routinely get back from Polymarket:
+        //   "no orders found to match with FAK order. FAK orders are
+        //    partially filled or killed if no match is found."
+        // because the depth-walk price is stale by ~50-200ms (network +
+        // batching latency). Net economics still strongly positive: each
+        // pair-via-merge releases $1, so paying e.g. $0.05 extra per share
+        // costs us 5¢ vs the typical $0.50+ rescue gain. Cap at $0.99
+        // to preserve at least 1¢ per-share net before fees.
+        let race_buffer =
+            self.config.maker_price_tick * self.config.hedge_rescue_race_buffer_ticks;
+        let sweep_price = (depth_walk_price + race_buffer).min(0.99);
+        // Final solvency gate after the buffer: a rescue at >= $1 nets ≤ $0
+        // even before fees — never worth doing.
         if sweep_price >= 0.99 {
             return None;
         }
@@ -4487,6 +4511,7 @@ mod tests {
             max_clip_usd: 5.0,
             liquidity_clip_fraction: 0.02,
             hedge_rescue_clip_usd: 2.50,
+            hedge_rescue_race_buffer_ticks: 0.0,
             max_gross_cost_usd: 20.0,
             max_leg_cost_usd: 10.0,
             min_edge_bps: 75.0,
