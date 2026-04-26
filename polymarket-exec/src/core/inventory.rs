@@ -271,6 +271,13 @@ impl InventoryState {
     ) -> Result<InventoryReconciliationReport, InventoryError> {
         let mut deltas = Vec::new();
 
+        tracing::debug!(
+            target: "inventory.reconcile",
+            venue_position_count = venue_positions.len(),
+            local_position_count = self.positions.len(),
+            "reconcile_venue_positions begin"
+        );
+
         for venue_position in venue_positions {
             if !venue_position.quantity.is_finite()
                 || !venue_position.average_cost_usd.is_finite()
@@ -297,6 +304,34 @@ impl InventoryState {
                     existing.avg_price = venue_position.average_cost_usd;
                     existing.mark_price = venue_position.mark_price;
                     existing.updated_at_ms = observed_at_ms;
+                } else if venue_quantity > 1e-9 {
+                    // Bug fix: previously this branch was a no-op. If local
+                    // position doesn't exist AND venue says we have nothing
+                    // (delta=0 because both 0), that's fine. But if local
+                    // doesn't exist AND venue says we have N>0 (which would
+                    // produce delta=N, not 0), we'd hit the insert branch
+                    // below. So reaching here means delta < 1e-9 and local
+                    // is None and venue_quantity > 0 — which means venue is
+                    // reporting a position that's vanishingly small relative
+                    // to itself somehow. INSERT IT anyway so the merge
+                    // planner can see it.
+                    tracing::warn!(
+                        target: "inventory.reconcile",
+                        instrument_id = %venue_position.instrument_id,
+                        venue_quantity,
+                        "venue position with delta~0 but no local — forcing insert"
+                    );
+                    self.positions.insert(
+                        venue_position.instrument_id.clone(),
+                        PositionState {
+                            market_id: venue_position.market_id.clone(),
+                            instrument_id: venue_position.instrument_id.clone(),
+                            quantity: venue_quantity,
+                            avg_price: venue_position.average_cost_usd,
+                            mark_price: venue_position.mark_price,
+                            updated_at_ms: observed_at_ms,
+                        },
+                    );
                 }
                 continue;
             }
