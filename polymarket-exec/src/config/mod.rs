@@ -51,6 +51,7 @@ pub struct AppConfig {
     pub collateral_token_address: String,
     pub collateral_decimals: u8,
     pub proxy_wallet_address: Option<String>,
+    pub polygon_rpc_url: Option<String>,
     pub market_ws_url: String,
     pub user_ws_url: String,
     pub spot_ws_url: String,
@@ -188,6 +189,10 @@ impl AppConfig {
         let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
             .ok()
             .filter(|value| !value.trim().is_empty());
+        let polygon_rpc_url = env::var("POLYGON_RPC_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|value| !value.is_empty());
         // Polymarket CLOB V2 cutover: 2026-04-28. Default to V2; operators can
         // override with POLYMARKET_CLOB_VERSION=v1 if they need legacy behavior
         // for a specific reason (e.g. comparing pre-cutover behavior). The V2
@@ -402,6 +407,7 @@ impl AppConfig {
             collateral_token_address,
             collateral_decimals,
             proxy_wallet_address,
+            polygon_rpc_url,
             market_ws_url,
             user_ws_url,
             spot_ws_url,

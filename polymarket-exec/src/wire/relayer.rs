@@ -11,6 +11,7 @@ use alloy::sol_types::SolCall;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
+use crate::wire::eoa_polygon::EoaPolygonSubmitter;
 use crate::wire::execution_adapter::ExecutionError;
 
 pub const DEFAULT_RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
@@ -64,12 +65,14 @@ pub struct CtfRelayerConfig {
     pub collateral_decimals: u8,
     pub signature_type_code: u8,
     pub proxy_wallet_address: Option<String>,
+    pub polygon_rpc_url: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct CtfRelayerClient {
     config: CtfRelayerConfig,
     http: reqwest::Client,
+    eoa_submitter: Option<EoaPolygonSubmitter>,
 }
 
 #[derive(Clone, Debug)]
@@ -143,9 +146,19 @@ struct TransactionRequest {
 
 impl CtfRelayerClient {
     pub fn new(config: CtfRelayerConfig) -> Self {
+        let eoa_submitter = if config.signature_type_code == 0 {
+            config
+                .polygon_rpc_url
+                .as_ref()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| EoaPolygonSubmitter::new(url.clone()))
+        } else {
+            None
+        };
         Self {
             config,
             http: reqwest::Client::new(),
+            eoa_submitter,
         }
     }
 
@@ -153,55 +166,118 @@ impl CtfRelayerClient {
         &self,
         request: CtfMergeRequest,
     ) -> Result<RelayerSubmitAck, ExecutionError> {
-        if self.config.signature_type_code != 1 {
-            return Err(ExecutionError::BadRequest(format!(
-                "CTF relayer merge currently supports POLYMARKET_SIGNATURE_TYPE=1 proxy wallets only, got {}",
-                self.config.signature_type_code
-            )));
+        match self.config.signature_type_code {
+            1 => {
+                let from = request.signer.address();
+                let relay_payload = self.relay_payload(from, "PROXY").await?;
+                let body = self
+                    .build_proxy_merge_transaction_request(
+                        &request.signer,
+                        relay_payload,
+                        &request.condition_id,
+                        request.quantity,
+                        request.metadata,
+                    )
+                    .await?;
+                self.submit(body).await
+            }
+            0 => self.submit_eoa_merge(&request).await,
+            other => Err(ExecutionError::BadRequest(format!(
+                "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+            ))),
         }
-
-        let from = request.signer.address();
-        let relay_payload = self.relay_payload(from, "PROXY").await?;
-        let body = self
-            .build_proxy_merge_transaction_request(
-                &request.signer,
-                relay_payload,
-                &request.condition_id,
-                request.quantity,
-                request.metadata,
-            )
-            .await?;
-        self.submit(body).await
     }
 
     pub async fn redeem_positions(
         &self,
         request: CtfRedeemRequest,
     ) -> Result<RelayerSubmitAck, ExecutionError> {
-        if self.config.signature_type_code != 1 {
-            return Err(ExecutionError::BadRequest(format!(
-                "CTF relayer redeem currently supports POLYMARKET_SIGNATURE_TYPE=1 proxy wallets only, got {}",
-                self.config.signature_type_code
-            )));
-        }
         if request.index_sets.is_empty() {
             return Err(ExecutionError::BadRequest(
                 "redeem index_sets must be non-empty".to_string(),
             ));
         }
+        match self.config.signature_type_code {
+            1 => {
+                let from = request.signer.address();
+                let relay_payload = self.relay_payload(from, "PROXY").await?;
+                let body = self
+                    .build_proxy_redeem_transaction_request(
+                        &request.signer,
+                        relay_payload,
+                        &request.condition_id,
+                        &request.index_sets,
+                        request.metadata,
+                    )
+                    .await?;
+                self.submit(body).await
+            }
+            0 => self.submit_eoa_redeem(&request).await,
+            other => Err(ExecutionError::BadRequest(format!(
+                "CTF relayer redeem supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+            ))),
+        }
+    }
 
-        let from = request.signer.address();
-        let relay_payload = self.relay_payload(from, "PROXY").await?;
-        let body = self
-            .build_proxy_redeem_transaction_request(
-                &request.signer,
-                relay_payload,
-                &request.condition_id,
-                &request.index_sets,
-                request.metadata,
+    async fn submit_eoa_merge(
+        &self,
+        request: &CtfMergeRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let submitter = self.eoa_submitter.as_ref().ok_or_else(|| {
+            ExecutionError::BadRequest(
+                "EOA mode CTF merge requires POLYGON_RPC_URL to be configured".to_string(),
             )
+        })?;
+        let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
+        let condition_id = parse_b256(&request.condition_id, "condition id")?;
+        let amount = scaled_token_amount(request.quantity, self.config.collateral_decimals)?;
+        let calldata = mergePositionsCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            partition: vec![U256::from(1_u8), U256::from(2_u8)],
+            amount,
+        }
+        .abi_encode();
+        let tx_hash = submitter
+            .submit_call(&request.signer, ctf, Bytes::from(calldata))
             .await?;
-        self.submit(body).await
+        Ok(RelayerSubmitAck {
+            transaction_id: None,
+            state: Some("MINED".to_string()),
+            transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
+        })
+    }
+
+    async fn submit_eoa_redeem(
+        &self,
+        request: &CtfRedeemRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let submitter = self.eoa_submitter.as_ref().ok_or_else(|| {
+            ExecutionError::BadRequest(
+                "EOA mode CTF redeem requires POLYGON_RPC_URL to be configured".to_string(),
+            )
+        })?;
+        let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
+        let condition_id = parse_b256(&request.condition_id, "condition id")?;
+        let index_sets_u256: Vec<U256> = request.index_sets.iter().copied().map(U256::from).collect();
+        let calldata = redeemPositionsCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            indexSets: index_sets_u256,
+        }
+        .abi_encode();
+        let tx_hash = submitter
+            .submit_call(&request.signer, ctf, Bytes::from(calldata))
+            .await?;
+        Ok(RelayerSubmitAck {
+            transaction_id: None,
+            state: Some("MINED".to_string()),
+            transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
+        })
     }
 
     async fn build_proxy_merge_transaction_request(
@@ -536,6 +612,7 @@ mod tests {
             collateral_decimals: 6,
             signature_type_code: 1,
             proxy_wallet_address: None,
+            polygon_rpc_url: None,
         }
     }
 
