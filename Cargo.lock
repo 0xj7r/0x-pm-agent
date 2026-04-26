@@ -2953,10 +2953,12 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "chrono",
  "dotenvy",
  "futures-util",
  "hmac",
  "polymarket-client-sdk",
+ "polymarket_client_sdk_v2",
  "prometheus",
  "reqwest 0.12.28",
  "rusqlite",
@@ -2968,6 +2970,44 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "polymarket_client_sdk_v2"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "594de0bf0e129e266946f02acbf579253951afbbee92fc1564da3c9179303aea"
+dependencies = [
+ "alloy",
+ "async-stream",
+ "async-trait",
+ "base64",
+ "bon",
+ "chrono",
+ "dashmap",
+ "futures",
+ "hmac",
+ "phf",
+ "rand 0.10.1",
+ "reqwest 0.13.2",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "secrecy",
+ "serde",
+ "serde_html_form",
+ "serde_ignored",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_repr",
+ "serde_with",
+ "sha1",
+ "sha2",
+ "strum_macros 0.28.0",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3903,6 +3943,16 @@ dependencies = [
  "indexmap 2.14.0",
  "itoa",
  "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
  "serde_core",
 ]
 

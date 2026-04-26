@@ -73,6 +73,14 @@ pub struct AppMetrics {
     unrealized_pnl_usd: Gauge,
     fees_usd_total: Gauge,
     rebates_usd_total: Gauge,
+    /// Count of our currently-open orders that the venue says are
+    /// scoring for maker rewards. Set by periodic /order-scoring sweep.
+    /// Diagnostic only — strategy doesn't gate on this yet.
+    orders_scoring_total: IntGauge,
+    /// Count of our currently-open orders that the venue says are NOT
+    /// scoring (outside spread, too small, too fresh, etc.). High value
+    /// here means we're posting but capturing zero of the rebate edge.
+    orders_non_scoring_total: IntGauge,
     net_edge_usd_total: Gauge,
     market_last_message_unix_ms: AtomicU64,
     user_last_message_unix_ms: AtomicU64,
@@ -115,6 +123,8 @@ pub struct ControlPlaneMetricsSnapshot {
     pub unrealized_pnl_usd: f64,
     pub fees_usd_total: f64,
     pub rebates_usd_total: f64,
+    pub orders_scoring_total: i64,
+    pub orders_non_scoring_total: i64,
     pub net_edge_usd_total: f64,
 }
 
@@ -278,6 +288,14 @@ impl AppMetrics {
             Gauge::with_opts(Opts::new("unrealized_pnl_usd", "Unrealized PnL in USD"))?;
         let fees_usd_total = Gauge::with_opts(Opts::new("fees_usd_total", "Fees in USD"))?;
         let rebates_usd_total = Gauge::with_opts(Opts::new("rebates_usd_total", "Rebates in USD"))?;
+        let orders_scoring_total = IntGauge::with_opts(Opts::new(
+            "orders_scoring_total",
+            "Open orders currently scoring for maker rewards",
+        ))?;
+        let orders_non_scoring_total = IntGauge::with_opts(Opts::new(
+            "orders_non_scoring_total",
+            "Open orders NOT scoring for maker rewards (out of spread, too small, too fresh)",
+        ))?;
         let net_edge_usd_total =
             Gauge::with_opts(Opts::new("net_edge_usd_total", "Net edge in USD"))?;
 
@@ -324,6 +342,8 @@ impl AppMetrics {
         registry.register(Box::new(unrealized_pnl_usd.clone()))?;
         registry.register(Box::new(fees_usd_total.clone()))?;
         registry.register(Box::new(rebates_usd_total.clone()))?;
+        registry.register(Box::new(orders_scoring_total.clone()))?;
+        registry.register(Box::new(orders_non_scoring_total.clone()))?;
         registry.register(Box::new(net_edge_usd_total.clone()))?;
 
         Ok(Self {
@@ -371,6 +391,8 @@ impl AppMetrics {
             unrealized_pnl_usd,
             fees_usd_total,
             rebates_usd_total,
+            orders_scoring_total,
+            orders_non_scoring_total,
             net_edge_usd_total,
             market_last_message_unix_ms: AtomicU64::new(0),
             user_last_message_unix_ms: AtomicU64::new(0),
@@ -610,8 +632,18 @@ impl AppMetrics {
             unrealized_pnl_usd: self.unrealized_pnl_usd.get(),
             fees_usd_total: self.fees_usd_total.get(),
             rebates_usd_total: self.rebates_usd_total.get(),
+            orders_scoring_total: self.orders_scoring_total.get(),
+            orders_non_scoring_total: self.orders_non_scoring_total.get(),
             net_edge_usd_total: self.net_edge_usd_total.get(),
         }
+    }
+
+    /// Update the rebate-eligibility gauges from a /order-scoring or
+    /// /orders-scoring sweep. Pass the count of currently-open orders
+    /// the venue says ARE scoring vs AREN'T.
+    pub fn record_order_scoring_counts(&self, scoring: usize, non_scoring: usize) {
+        self.orders_scoring_total.set(scoring as i64);
+        self.orders_non_scoring_total.set(non_scoring as i64);
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {

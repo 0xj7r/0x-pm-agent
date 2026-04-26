@@ -76,6 +76,14 @@ _Last updated: 2026-04-25_
   - The relayer key owner can be the core/builder account, but the transaction signer still needs to be the bot private key and the proxy wallet must be the inventory-holding Polymarket wallet.
   - Confirm `POLYMARKET_FUNDER_ADDRESS` or `POLYMARKET_PROXY_WALLET_ADDRESS` is the wallet that owns the outcome tokens before enabling live merge.
 
+## Followups deferred to a later session
+
+- [ ] **AWS migration for always-on operation.** Local-Mac shadow_live works for hours-long sessions but isn't sustainable for 24/7 calibration or live capital scaling. AWS-EC2 deployment scaffold exists at `polymarket-exec/ops/deploy/deploy_live_aws_ec2.sh`; S3 backup wired via `polymarket-exec/scripts/backup_to_s3.sh`. When ready: provision cloud-init/Terraform module, ship metrics to CloudWatch, move secrets to Secrets Manager, add healthcheck-driven kill-switch via SSM. Trigger to flip: scaling capital past tinylive OR wanting continuous shadow_live calibration. ~1-2 days of ops work.
+- [ ] **Single-line per-order lifecycle log.** Today the maker-fill submission lifecycle is split across `strategy.sizing` + `polymarket_exec::runtime` + `polymarket_exec::wire::execution_adapter` log targets. Operators have to grep `client_order_id` across them to reconstruct intent → submit → ack → fill/reject. A single `info!()` per terminal lifecycle event with the full trail (intent params + venue ack + fill outcome) would make ops debugging much faster. ~10-20 lines of code in `runtime/mod.rs`.
+- [ ] **Auto-wire strategy sizing to venue metadata cache (Q6 full closure).** `fetch_market_metadata` exists and logs venue truth on startup; strategy still uses the hardcoded `entry_min_size_multiplier`. Wiring the strategy to read from a cached `MarketMetadata` (TTL ~5min) closes the audit gap fully.
+- [ ] **Persist `markets_with_unresolved_drift` across restart.** Currently in-memory only; warn-logged on `recover_from_store`. Persist to order_store schema so drift block survives crashes.
+- [ ] **Calibrate paper-env defaults against real Polymarket fill data.** Latency 150ms / queue depth 0.75 / post-only reject 0.85 / cancel race 500ms are all from MM literature, not measured. Run multi-hour shadow_live + use `compare_replay.py` + `suggest_paper_calibration.py` to find values that match observed fill rates within tolerance.
+
 ## Notes
 
 - The Python runtime (`execution/core/engine.py`) remains a useful reference implementation for decision/test behavior, but the primary live path appears to be the Rust crate.
