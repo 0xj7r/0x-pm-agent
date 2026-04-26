@@ -71,6 +71,15 @@ pub struct V2PostOrder {
     pub metadata: String,
     pub builder: String,
     pub signature: String,
+    // NOTE: feeRateBps, nonce, taker are deliberately OMITTED.
+    // Per official polymarket_client_sdk_v2 v0.5.1, the V2 JSON body
+    // does NOT include these fields. Polymarket's /order endpoint
+    // routes V1 vs V2 by JSON shape: present = V1 (needs them in
+    // EIP-712 hash), absent = V2. Earlier "error parsing fee rate
+    // bps () to int64" came from Polymarket interpreting our partial
+    // payload as V1. The fix is to NOT send the V1-specific fields
+    // so the venue uses its V2 validation path that matches our
+    // EIP-712 signed struct.
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -255,8 +264,12 @@ mod tests {
         assert_eq!(json["order"]["makerAmount"], "5000000");
         assert_eq!(json["order"]["takerAmount"], "12500000");
         assert_eq!(json["order"]["signatureType"], 2);
-        assert!(json["order"].get("nonce").is_none());
+        // V2 JSON body must NOT include feeRateBps/nonce/taker — those
+        // are V1 fields. Polymarket routes V1/V2 by presence; sending
+        // them triggers V1 validation (which would mismatch our V2
+        // EIP-712 signed payload).
         assert!(json["order"].get("feeRateBps").is_none());
+        assert!(json["order"].get("nonce").is_none());
         assert!(json["order"].get("taker").is_none());
         assert_eq!(json["postOnly"], true);
         assert_eq!(json["deferExec"], false);

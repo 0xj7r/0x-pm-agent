@@ -35,6 +35,14 @@ sol! {
     );
 
     #[derive(Debug, PartialEq)]
+    function redeemPositions(
+        address collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] indexSets
+    );
+
+    #[derive(Debug, PartialEq)]
     struct ProxyTransactionCall {
         address to;
         uint8 typeCode;
@@ -69,6 +77,17 @@ pub struct CtfMergeRequest {
     pub signer: PrivateKeySigner,
     pub condition_id: String,
     pub quantity: f64,
+    pub metadata: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CtfRedeemRequest {
+    pub signer: PrivateKeySigner,
+    pub condition_id: String,
+    /// Outcome index sets to redeem. For binary markets pass `vec![1, 2]`
+    /// to claim both legs (winning leg pays, losing leg returns nothing
+    /// but the call still succeeds atomically).
+    pub index_sets: Vec<u64>,
     pub metadata: String,
 }
 
@@ -155,6 +174,36 @@ impl CtfRelayerClient {
         self.submit(body).await
     }
 
+    pub async fn redeem_positions(
+        &self,
+        request: CtfRedeemRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        if self.config.signature_type_code != 1 {
+            return Err(ExecutionError::BadRequest(format!(
+                "CTF relayer redeem currently supports POLYMARKET_SIGNATURE_TYPE=1 proxy wallets only, got {}",
+                self.config.signature_type_code
+            )));
+        }
+        if request.index_sets.is_empty() {
+            return Err(ExecutionError::BadRequest(
+                "redeem index_sets must be non-empty".to_string(),
+            ));
+        }
+
+        let from = request.signer.address();
+        let relay_payload = self.relay_payload(from, "PROXY").await?;
+        let body = self
+            .build_proxy_redeem_transaction_request(
+                &request.signer,
+                relay_payload,
+                &request.condition_id,
+                &request.index_sets,
+                request.metadata,
+            )
+            .await?;
+        self.submit(body).await
+    }
+
     async fn build_proxy_merge_transaction_request(
         &self,
         signer: &PrivateKeySigner,
@@ -201,6 +250,73 @@ impl CtfRelayerClient {
             .await
             .map_err(|error| {
                 ExecutionError::AuthFailure(format!("failed to sign CTF proxy merge: {error}"))
+            })?
+            .to_string();
+
+        Ok(TransactionRequest {
+            tx_type: "PROXY".to_string(),
+            from: from.to_string(),
+            to: POLYMARKET_PROXY_FACTORY.to_string(),
+            proxy_wallet: self.proxy_wallet(from)?.to_string(),
+            data: proxy_data_hex,
+            nonce,
+            signature,
+            signature_params: ProxySignatureParams {
+                gas_price: "0".to_string(),
+                gas_limit: DEFAULT_PROXY_GAS_LIMIT.to_string(),
+                relayer_fee: "0".to_string(),
+                relay_hub: POLYMARKET_RELAY_HUB.to_string(),
+                relay: relay.to_string(),
+            },
+            metadata,
+        })
+    }
+
+    async fn build_proxy_redeem_transaction_request(
+        &self,
+        signer: &PrivateKeySigner,
+        relay_payload: RelayPayload,
+        condition_id_raw: &str,
+        index_sets: &[u64],
+        metadata: String,
+    ) -> Result<TransactionRequest, ExecutionError> {
+        let from = signer.address();
+        let relay = parse_address(&relay_payload.address, "relayer relay address")?;
+        let nonce = relay_payload.nonce;
+        let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
+        let condition_id = parse_b256(condition_id_raw, "condition id")?;
+        let index_sets_u256: Vec<U256> = index_sets.iter().copied().map(U256::from).collect();
+        let redeem_data = redeemPositionsCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            indexSets: index_sets_u256,
+        }
+        .abi_encode();
+        let proxy_data = proxyCall {
+            transactions: vec![ProxyTransactionCall {
+                to: ctf,
+                typeCode: 1,
+                data: Bytes::from(redeem_data),
+                value: U256::ZERO,
+            }],
+        }
+        .abi_encode();
+        let proxy_data_hex = proxy_data.encode_hex_with_prefix();
+        let tx_hash = proxy_relay_hash(
+            from,
+            POLYMARKET_PROXY_FACTORY,
+            &proxy_data,
+            &nonce,
+            POLYMARKET_RELAY_HUB,
+            relay,
+        )?;
+        let signature = signer
+            .sign_message(tx_hash.as_slice())
+            .await
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("failed to sign CTF proxy redeem: {error}"))
             })?
             .to_string();
 
@@ -460,6 +576,64 @@ mod tests {
             client.proxy_wallet(owner).unwrap().to_string(),
             "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_redeem_builds_expected_relayer_transaction_request() {
+        let mut config = test_config();
+        config.proxy_wallet_address =
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string());
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+
+        let body = client
+            .build_proxy_redeem_transaction_request(
+                &signer,
+                RelayPayload {
+                    address: "0x1234567890123456789012345678901234567890".to_string(),
+                    nonce: "11".to_string(),
+                },
+                "0x2222222222222222222222222222222222222222222222222222222222222222",
+                &[1u64, 2u64],
+                "{\"redeem\":true}".to_string(),
+            )
+            .await
+            .expect("redeem transaction request");
+
+        assert_eq!(body.tx_type, "PROXY");
+        assert_eq!(
+            body.proxy_wallet,
+            "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
+        );
+        assert_eq!(body.nonce, "11");
+        assert_eq!(body.signature_params.gas_limit, "10000000");
+        assert_eq!(body.metadata, "{\"redeem\":true}");
+        assert!(body.data.starts_with("0x"));
+        assert!(body.signature.starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn redeem_rejects_empty_index_sets() {
+        let client = CtfRelayerClient::new(test_config());
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+        let request = CtfRedeemRequest {
+            signer,
+            condition_id: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+            index_sets: vec![],
+            metadata: "{}".to_string(),
+        };
+        let error = client
+            .redeem_positions(request)
+            .await
+            .expect_err("expected empty index_sets rejection");
+        assert!(error.to_string().contains("index_sets"));
     }
 
     #[tokio::test]

@@ -41,7 +41,8 @@ use crate::wire::clob_v2::{
     CLOB_V2_NEG_RISK_EXCHANGE,
 };
 use crate::wire::relayer::{
-    CtfMergeRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
+    CtfMergeRequest, CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
+    DEFAULT_RELAYER_URL,
     DEFAULT_USDCE_ADDRESS,
 };
 
@@ -127,6 +128,26 @@ pub struct MergePositionsAck {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RedeemPositionsRequest {
+    pub command_id: ClientOrderId,
+    pub market_id: MarketId,
+    pub condition_id: String,
+    /// CTF index sets to redeem. For binary markets pass `vec![1, 2]`
+    /// to claim both legs (winning leg pays, losing leg returns nothing
+    /// but the call still succeeds atomically).
+    pub index_sets: Vec<u64>,
+    pub submitted_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RedeemPositionsAck {
+    pub command_id: ClientOrderId,
+    pub accepted: bool,
+    pub accepted_at_ms: EpochMillis,
+    pub venue_message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VenueOpenOrder {
     pub venue_order_id: OrderId,
     pub client_order_id: Option<ClientOrderId>,
@@ -154,6 +175,19 @@ pub struct VenuePosition {
     pub instrument_id: InstrumentId,
     pub quantity: f64,
     pub average_cost_usd: f64,
+    /// True when the underlying market has resolved and the position
+    /// can be redeemed for collateral (winning side pays $1/share,
+    /// losing side returns 0). Set from the Polymarket Data API
+    /// `redeemable` flag; defaults to false in synthetic constructions.
+    pub redeemable: bool,
+    /// True when the holder also has the opposite-outcome position in
+    /// matching size, allowing a CTF merge to recover collateral
+    /// without waiting for resolution.
+    pub mergeable: bool,
+    /// Current market value of the position (for ranking which to
+    /// redeem first). $0 doesn't mean unredeemable — losing-side legs
+    /// of resolved markets still need to be redeemed to clear inventory.
+    pub current_value_usd: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -354,6 +388,25 @@ pub trait ExecutionAdapter: Send + Sync {
             req.command_id
         )))
     }
+    async fn redeem_positions(
+        &self,
+        req: RedeemPositionsRequest,
+    ) -> Result<RedeemPositionsAck, ExecutionError> {
+        Err(ExecutionError::BadRequest(format!(
+            "redeem positions not implemented for execution adapter command_id={}",
+            req.command_id
+        )))
+    }
+    /// Returns map of `venue_order_id` -> `is_scoring_for_rewards`.
+    /// Default impl returns an empty map (paper / non-live adapters do
+    /// not have rebate eligibility). Live adapters override to call the
+    /// venue's /order-scoring endpoint.
+    async fn check_orders_scoring(
+        &self,
+        _venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        Ok(std::collections::HashMap::new())
+    }
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError>;
     async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError>;
     async fn sync_recent_fills(
@@ -430,6 +483,12 @@ impl ExecutionAdapter for PaperExecutionAdapter {
     }
 }
 
+/// Type alias for the V2 SDK's authenticated CLOB client. Wrapping the
+/// long generic path keeps field declarations + helper signatures readable.
+type V2SdkAuthClient = polymarket_client_sdk_v2::clob::Client<
+    polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>,
+>;
+
 pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
@@ -440,6 +499,17 @@ pub struct PolymarketExecutionAdapter {
     raw_http: reqwest::Client,
     trade_address: Option<SdkAddress>,
     state: Arc<RwLock<AdapterState>>,
+    /// Raw private key hex retained so submit_v2_via_sdk can reconstruct
+    /// a fresh LocalSigner for the V2 SDK's typestate-based auth flow.
+    /// Stored privately; never logged or serialized.
+    _stored_private_key: Option<String>,
+    /// Cached authenticated V2 SDK client. Lazy-initialised on the first
+    /// V2 submit so we pay the ~150ms auth roundtrip once per adapter
+    /// lifetime, then reuse cheap `Clone` instances for every subsequent
+    /// order. Also keeps the SDK's automatic heartbeat task alive for
+    /// the duration of the trading session — process crash → server-side
+    /// auto-cancel within the venue's heartbeat timeout.
+    v2_sdk_client: Arc<tokio::sync::OnceCell<V2SdkAuthClient>>,
 }
 
 impl PolymarketExecutionAdapter {
@@ -566,6 +636,8 @@ impl PolymarketExecutionAdapter {
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
+            _stored_private_key: Some(credentials.private_key.clone()),
+            v2_sdk_client: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -637,10 +709,284 @@ impl PolymarketExecutionAdapter {
             raw_http: reqwest::Client::new(),
             trade_address,
             state: Arc::new(RwLock::new(AdapterState::default())),
+            _stored_private_key: Some(credentials.private_key.clone()),
+            v2_sdk_client: Arc::new(tokio::sync::OnceCell::new()),
+        })
+    }
+
+    /// Lazy-initialises and caches the authenticated V2 SDK client.
+    /// First call performs the auth roundtrip (~150ms) and, with the
+    /// `heartbeats` feature on, spawns a background task that keeps
+    /// our session alive on the venue. Subsequent calls return a cheap
+    /// `Clone` of the cached `Arc`-backed client.
+    async fn ensure_v2_sdk_client(
+        &self,
+        sdk_signer: &alloy::signers::local::LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+        signature_type_v2: polymarket_client_sdk_v2::clob::types::SignatureType,
+    ) -> Result<V2SdkAuthClient, ExecutionError> {
+        use polymarket_client_sdk_v2::auth::{Credentials as SdkV2Credentials, Uuid as SdkV2Uuid};
+        use polymarket_client_sdk_v2::clob::{Client as SdkV2Client, Config as SdkV2Config};
+
+        let cell = self.v2_sdk_client.clone();
+        let api_url = self._config.api_url.clone();
+        let creds_opt = self._config.credentials.clone();
+        let funder = self.trade_address;
+        let signer = sdk_signer.clone();
+
+        let client_ref = cell
+            .get_or_try_init(|| async move {
+                let mut auth_builder = SdkV2Client::new(&api_url, SdkV2Config::default())
+                    .map_err(|error| {
+                        ExecutionError::TransientNetwork(format!(
+                            "V2 SDK Client::new failed: {error}"
+                        ))
+                    })?
+                    .authentication_builder(&signer)
+                    .signature_type(signature_type_v2);
+                if let Some(credentials) = creds_opt.as_ref() {
+                    let api_key =
+                        SdkV2Uuid::parse_str(credentials.api_key.trim()).map_err(|error| {
+                            ExecutionError::AuthFailure(format!(
+                                "invalid POLYMARKET_API_KEY: {error}"
+                            ))
+                        })?;
+                    auth_builder = auth_builder.credentials(SdkV2Credentials::new(
+                        api_key,
+                        credentials.api_secret.clone(),
+                        credentials.api_passphrase.clone(),
+                    ));
+                }
+                if let Some(funder) = funder {
+                    auth_builder = auth_builder.funder(funder);
+                }
+                auth_builder.authenticate().await.map_err(|error| {
+                    ExecutionError::AuthFailure(format!("V2 SDK authenticate failed: {error}"))
+                })
+            })
+            .await?;
+        Ok(client_ref.clone())
+    }
+
+    /// Checks whether a single live order is currently scoring for
+    /// maker rewards. Returns the venue's boolean. Logs a structured
+    /// event so operators can see (a) which orders qualify and (b)
+    /// whether the strategy is actually capturing the rebate side of
+    /// the edge whales rely on. Cheap GET (~30ms after warm-up since
+    /// the cached client is reused).
+    pub async fn check_order_scoring(
+        &self,
+        venue_order_id: &str,
+    ) -> Result<bool, ExecutionError> {
+        use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+        let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "check_order_scoring requires _stored_private_key".to_string(),
+            )
+        })?;
+        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?;
+        use alloy::signers::Signer as _;
+        let sdk_signer = sdk_signer.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
+        let resp = client
+            .is_order_scoring(venue_order_id)
+            .await
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("is_order_scoring: {error}"))
+            })?;
+        tracing::info!(
+            target: "order_scoring",
+            venue_order_id = %venue_order_id,
+            scoring = resp.scoring,
+            "rebate eligibility checked"
+        );
+        Ok(resp.scoring)
+    }
+
+    /// Batch version of [`Self::check_order_scoring`]. Returns a map of
+    /// `order_id` -> `is_scoring`. One HTTP request regardless of
+    /// `venue_order_ids.len()` — preferred when checking many orders
+    /// (e.g. periodic sweep over open orders).
+    pub async fn check_orders_scoring(
+        &self,
+        venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        if venue_order_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+        let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "check_orders_scoring requires _stored_private_key".to_string(),
+            )
+        })?;
+        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?;
+        use alloy::signers::Signer as _;
+        let sdk_signer = sdk_signer.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
+        let map = client
+            .are_orders_scoring(venue_order_ids)
+            .await
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("are_orders_scoring: {error}"))
+            })?;
+        let scoring_count = map.values().filter(|s| **s).count();
+        tracing::info!(
+            target: "order_scoring",
+            checked = venue_order_ids.len(),
+            scoring = scoring_count,
+            non_scoring = venue_order_ids.len() - scoring_count,
+            "batch rebate eligibility checked"
+        );
+        Ok(map)
+    }
+
+    /// Posts a V2 order via the official polymarket_client_sdk_v2.
+    /// Delegates all EIP-712 signing + JSON serialization to the SDK so
+    /// our orders match exactly what the venue expects. Slower than
+    /// our custom path (one auth roundtrip per call) but correct.
+    async fn submit_v2_via_sdk(
+        &self,
+        req: SubmitOrderRequest,
+    ) -> Result<SubmitOrderAck, ExecutionError> {
+        use alloy::signers::local::LocalSigner as SdkLocalSigner;
+        use alloy::signers::Signer as _;
+        use polymarket_client_sdk_v2::clob::types::{
+            OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType,
+        };
+        use polymarket_client_sdk_v2::types::{Decimal as SdkV2Decimal, U256 as SdkV2U256};
+        use polymarket_client_sdk_v2::POLYGON as SDK_V2_POLYGON;
+
+        // Map our types to SDK V2 types.
+        let token_id = SdkV2U256::from_str(req.instrument_id.as_str()).map_err(|error| {
+            ExecutionError::BadRequest(format!(
+                "invalid Polymarket token id `{}`: {error}",
+                req.instrument_id
+            ))
+        })?;
+        let side = match req.side {
+            crate::types::TradeSide::Buy => SdkV2Side::Buy,
+            crate::types::TradeSide::Sell => SdkV2Side::Sell,
+        };
+        let order_type = match req.time_in_force {
+            TimeInForce::Ioc | TimeInForce::Fok => SdkV2OrderType::FOK,
+            TimeInForce::Gtc => SdkV2OrderType::GTC,
+            TimeInForce::Gtd => SdkV2OrderType::GTD,
+        };
+        let signature_type_v2 = match self.signature_type {
+            PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
+            PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
+            PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+        };
+
+        // Re-derive a LocalSigner from the stored private key. Alloy's
+        // LocalSigner == PrivateKeySigner; this is just a fresh instance
+        // with the chain_id set for the SDK.
+        let pk_hex = self
+            ._stored_private_key
+            .as_deref()
+            .ok_or_else(|| {
+                ExecutionError::AuthFailure(
+                    "submit_v2_via_sdk requires _stored_private_key (set during connect_with_*)"
+                        .to_string(),
+                )
+            })?;
+        let sdk_signer = SdkLocalSigner::from_str(pk_hex.trim())
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
+            })?
+            .with_chain_id(Some(SDK_V2_POLYGON));
+
+        // Use cached authenticated V2 SDK client. First call pays the
+        // ~150ms auth roundtrip + starts the SDK's automatic heartbeat
+        // task; subsequent calls clone cheaply (Client uses Arc inside).
+        let client = self
+            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .await?;
+
+        // Build, sign, and post the order via the SDK.
+        let price = SdkV2Decimal::from_str(&format!("{}", req.limit_price)).map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid V2 SDK price: {error}"))
+        })?;
+        let size = SdkV2Decimal::from_str(&format!("{}", req.quantity)).map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}"))
+        })?;
+
+        // V2 keeps expiration outside the signed order. GTC uses epoch
+        // expiration (0), matching the public migration docs; GTD uses
+        // the requested future expiry or defaults to 1h ahead.
+        let expiration_dt = {
+            use chrono::{TimeZone, Utc};
+            let secs_ms = if matches!(req.time_in_force, TimeInForce::Gtc) {
+                0
+            } else {
+                req.expires_at_ms
+                    .filter(|ms| *ms > now_unix_ms() + 60_000)
+                    .unwrap_or_else(|| now_unix_ms() + 3_600_000)
+            };
+            Utc.timestamp_millis_opt(secs_ms as i64)
+                .single()
+                .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+        };
+
+        // Set builder_code from our config (defaults to ZERO if not set,
+        // but ZERO causes some venue-side mismatches in V2).
+        let builder_code_b256 = parse_bytes32(&self._config.v2_builder_code, "builder")?;
+
+        let order_builder = client
+            .limit_order()
+            .token_id(token_id)
+            .side(side)
+            .price(price)
+            .size(size)
+            .order_type(order_type)
+            .expiration(expiration_dt)
+            .post_only(req.post_only)
+            .builder_code(builder_code_b256);
+
+        let resp = order_builder
+            .build_sign_and_post(&sdk_signer)
+            .await
+            .map_err(|error| {
+                ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
+            })?;
+
+        let now_ms = now_unix_ms();
+        Ok(SubmitOrderAck {
+            client_order_id: req.client_order_id,
+            venue_order_id: Some(OrderId::from(resp.order_id.to_string())),
+            accepted: true,
+            accepted_at_ms: now_ms,
+            venue_message: Some(format!("v2-sdk status={:?}", resp.status)),
         })
     }
 
     async fn submit_v2(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
+        // Prefer the V2 SDK path when stored private key is available
+        // (set by connect_with_config / connect_with_l1_config). Falls
+        // back to the custom path otherwise (e.g. tests without a key).
+        if self._stored_private_key.is_some() {
+            return self.submit_v2_via_sdk(req).await;
+        }
         let order_type = Self::v2_order_type(&req)?;
         let builder_code = parse_bytes32(&self._config.v2_builder_code, "builder")?;
         let metadata = parse_bytes32(&self._config.v2_metadata, "metadata")?;
@@ -901,6 +1247,13 @@ impl PolymarketExecutionAdapter {
             instrument_id: InstrumentId::from(asset),
             quantity: position.size.to_string().parse::<f64>().unwrap_or(0.0),
             average_cost_usd: position.avg_price.to_string().parse::<f64>().unwrap_or(0.0),
+            redeemable: position.redeemable,
+            mergeable: position.mergeable,
+            current_value_usd: position
+                .current_value
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0),
         }
     }
 
@@ -1289,6 +1642,40 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         })
     }
 
+    async fn redeem_positions(
+        &self,
+        req: RedeemPositionsRequest,
+    ) -> Result<RedeemPositionsAck, ExecutionError> {
+        let metadata = serde_json::json!({
+            "source": "polymarket-exec",
+            "command_id": req.command_id.as_str(),
+            "market_id": req.market_id.as_str(),
+            "condition_id": req.condition_id,
+            "index_sets": req.index_sets,
+        })
+        .to_string();
+        let ack = self
+            .relayer_client
+            .redeem_positions(CtfRedeemRequest {
+                signer: self.signer.clone(),
+                condition_id: req.condition_id.clone(),
+                index_sets: req.index_sets.clone(),
+                metadata,
+            })
+            .await?;
+        Ok(RedeemPositionsAck {
+            command_id: req.command_id,
+            accepted: true,
+            accepted_at_ms: now_unix_ms(),
+            venue_message: Some(format!(
+                "relayer redeem submitted transaction_id={} state={} hash={}",
+                ack.transaction_id.as_deref().unwrap_or("unknown"),
+                ack.state.as_deref().unwrap_or("unknown"),
+                ack.transaction_hash.as_deref().unwrap_or("unknown")
+            )),
+        })
+    }
+
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         self.sync_open_orders_from_client().await
     }
@@ -1302,6 +1689,15 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         after_ms: EpochMillis,
     ) -> Result<Vec<VenueFill>, ExecutionError> {
         self.sync_recent_fills_from_client(after_ms).await
+    }
+
+    async fn check_orders_scoring(
+        &self,
+        venue_order_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, bool>, ExecutionError> {
+        // Delegates to the inherent method (which uses the cached V2
+        // SDK auth client to call /orders-scoring batch endpoint).
+        Self::check_orders_scoring(self, venue_order_ids).await
     }
 }
 
