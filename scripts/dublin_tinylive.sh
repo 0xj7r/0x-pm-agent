@@ -91,7 +91,7 @@ mkdir -p ~/.config/polymarket-exec
 export WHALE_PAIR_PAPER_MODE=false
 unset WHALE_PAIR_EXEC_MODE
 
-# Refresh active markets
+# Refresh active markets (initial pull before launch).
 python3 scripts/export_btc_5m_runtime.py \
   --context-out /tmp/tinylive_ctx.json \
   --env-out /tmp/tinylive_runtime.env > /dev/null
@@ -111,4 +111,70 @@ echo ">>> wallet: 0x97fBC6Bc... | endpoint: V1 | collateral: USDC.e"
 echo ">>> strategy: btc_5m_mm | edge=25bps | quote_age=2s | safety=1tick"
 echo ">>> caps: cash=\$50 max_gross=\$25 max_orders=2"
 echo ">>> kill: touch ~/.config/polymarket-exec/live.kill"
-exec target/release/polymarket-exec
+
+# Context refresh supervisor: 5-min markets cycle every 5 min, but we have
+# no WS for "new market opened". Poll gamma every 45s; if context hash
+# changed (new bars opened, old ones resolved out), restart bot onto fresh
+# market universe so we don't sit dead with all-resolved books.
+REFRESH_INTERVAL_SEC=${WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC:-45}
+CHILD_PID=""
+prev_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json | awk '{print $1}')
+
+launch_child() {
+  exec target/release/polymarket-exec &
+  CHILD_PID=$!
+  echo ">>> [supervisor] launched child pid=$CHILD_PID at $(date -u +%H:%M:%S)"
+}
+
+stop_child() {
+  local reason="$1"
+  if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    echo ">>> [supervisor] stopping child pid=$CHILD_PID reason=$reason"
+    kill -INT "$CHILD_PID" 2>/dev/null || true
+    sleep 5
+    kill -KILL "$CHILD_PID" 2>/dev/null || true
+    wait "$CHILD_PID" 2>/dev/null || true
+  fi
+  CHILD_PID=""
+}
+
+cleanup() {
+  stop_child "supervisor exit"
+  exit 0
+}
+trap cleanup INT TERM EXIT
+
+launch_child
+
+while true; do
+  sleep "$REFRESH_INTERVAL_SEC"
+
+  # Crash detection: relaunch on unexpected exit.
+  if ! kill -0 "$CHILD_PID" 2>/dev/null; then
+    wait "$CHILD_PID" 2>/dev/null || true
+    echo ">>> [supervisor] child exited unexpectedly; relaunching"
+    launch_child
+    continue
+  fi
+
+  # Refresh context, compare hash, restart if changed.
+  python3 scripts/export_btc_5m_runtime.py \
+    --context-out /tmp/tinylive_ctx.json.new \
+    --env-out /tmp/tinylive_runtime.env.new > /dev/null 2>&1 || {
+    echo ">>> [supervisor] context refresh failed; keeping current"
+    continue
+  }
+  new_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json.new | awk '{print $1}')
+  if [[ "$new_ctx_hash" != "$prev_ctx_hash" ]]; then
+    echo ">>> [supervisor] market context changed; restarting bot"
+    mv /tmp/tinylive_ctx.json.new /tmp/tinylive_ctx.json
+    mv /tmp/tinylive_runtime.env.new /tmp/tinylive_runtime.env
+    source /tmp/tinylive_runtime.env
+    export WHALE_PAIR_ASSET_IDS WHALE_PAIR_INSTRUMENT_MARKETS WHALE_PAIR_USER_MARKETS
+    prev_ctx_hash="$new_ctx_hash"
+    stop_child "context-refresh"
+    launch_child
+  else
+    rm -f /tmp/tinylive_ctx.json.new /tmp/tinylive_runtime.env.new
+  fi
+done
