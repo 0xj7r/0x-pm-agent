@@ -1784,7 +1784,7 @@ impl Btc5mMmStrategy {
     ) -> Option<OrderIntent> {
         // Depth walk: find the price needed to sweep `quantity` shares,
         // OR cap to whatever depth exists if it's shallower than that.
-        let (sweep_price, sweep_qty) =
+        let (sweep_price, depth_walk_qty) =
             Self::depth_walk_to_quantity(quote, quantity).or_else(|| {
                 // Fallback: top of book only (shouldn't happen if depth_walk
                 // saw any level, but defensive).
@@ -1794,9 +1794,19 @@ impl Btc5mMmStrategy {
         if sweep_price >= 0.99 {
             return None;
         }
-        if sweep_qty < self.config.min_order_quantity
-            || sweep_qty + 1e-9 < self.config.venue_min_order_quantity
-        {
+        // Upsize to satisfy the venue's per-order minimum. Rescue qty is
+        // dictated by stranded inventory, not by us — when partial fills
+        // leave us with e.g. 4.99 shares and venue requires ≥5, blocking
+        // the rescue here just leaves us naked long forever. Buy the venue
+        // minimum instead; the merge engine pairs MIN(left, right) (see
+        // `core/inventory.rs` stranded-pairing) so the (venue_min - stranded)
+        // residual becomes a tiny new stranded position — bounded by
+        // venue_min and itself a future rescue candidate. Same principle
+        // as the other 4 cap-bypass layers (max_open_orders, max_leg_cost,
+        // max_gross_cost, max_submit_per_window): entry-time caps must not
+        // trap close intents in the exposure they were meant to prevent.
+        let sweep_qty = depth_walk_qty.max(self.config.venue_min_order_quantity);
+        if sweep_qty < self.config.min_order_quantity {
             return None;
         }
         let notional = sweep_qty * sweep_price;
