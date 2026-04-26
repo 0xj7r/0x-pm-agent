@@ -1,3 +1,41 @@
+# Engineering principles
+
+## No bandaids — fix the core engine
+
+When a behavior is missing or broken, the fix goes IN THE RUST ENGINE
+(`polymarket-exec/src/`), NOT in a bash supervisor, env wrapper, polling
+script, cron, or any other shell-level workaround.
+
+If the answer to "why doesn't X work" is "the engine doesn't have a code
+path for X yet" — then add the code path to the engine. Do not paper
+over it with shell.
+
+**Examples of what NOT to do:**
+- "Engine reads markets from env vars at startup only" → DO NOT wrap in a
+  bash loop that restarts the bot when markets change. ADD periodic
+  context refresh inside `runtime/runner.rs` that subscribes WS to new
+  markets dynamically.
+- "Engine doesn't know when to stand down in flat tape" → DO NOT add an
+  env override or wrapper-side gate. ADD a regime gate in `strategy.rs`.
+- "Engine doesn't track in-flight rescues so we over-rescue" → DO NOT
+  add a sleep or per-tick throttle in shell. ADD per-market rescue
+  tracking in `market_states`.
+
+**Deploy scripts (`scripts/*.sh`) should ONLY:**
+- Load env vars / secrets
+- Launch the binary
+
+They should NOT contain business logic, retry loops, polling, market
+context refresh, or anything that needs to know about strategy/runtime
+state. Process supervision via systemd is fine; bash supervision around
+the bot's domain logic is not.
+
+**Why this matters:** ad-hoc shell wrappers ship faster but they kill
+in-flight engine state every restart, can't share state with the
+engine's data structures, hide bugs from the type checker / tests, and
+require operators to understand TWO systems instead of one. The Rust
+engine is the source of truth.
+
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

@@ -589,6 +589,10 @@ struct Btc5mMmMarketState {
     quotes: HashMap<InstrumentId, QuoteSnapshot>,
     last_action_ms: Option<EpochMillis>,
     last_no_quote_note_ms: Option<EpochMillis>,
+    /// Last time we emitted an IOC hedge-rescue intent on this market.
+    /// Used to throttle rescue emission so we don't drown the engine's
+    /// rate limiter with 85 intents/min on every book tick.
+    last_rescue_attempt_ms: Option<EpochMillis>,
 }
 
 #[derive(Debug, Default)]
@@ -1993,56 +1997,53 @@ impl Strategy for Btc5mMmStrategy {
                     }
                 }
             }
-            (true, false) => {
-                // Stranded long on left → manufacture pair by IOC-lifting right's ask.
-                let hedge_qty = left_qty;
-                let intent = self.build_rescue_intent_for_quantity(
-                    &snapshot.market_id,
-                    &right_id,
-                    &right_quote,
-                    hedge_qty,
-                    right_cost,
-                    gross_cost,
-                    "btc-5m-mm hedge rescue (lift right ask)",
-                    context.now_ms,
-                );
+            (true, false) | (false, true) => {
+                // Stranded inventory on one side → manufacture pair by IOC-lifting
+                // the OPPOSITE leg's ask. Throttle so we don't emit on every
+                // book tick — the IOC submit needs ~3-6s round-trip; emitting
+                // 80+ duplicates per minute drowns the engine's rate limiter
+                // (which then drops them all silently).
+                let throttle_ok = self
+                    .market_states
+                    .get(&snapshot.market_id)
+                    .and_then(|state| state.last_rescue_attempt_ms)
+                    .map(|last| context.now_ms.saturating_sub(last) >= self.config.cooldown_ms)
+                    .unwrap_or(true);
+                let (lift_id, lift_quote, lift_qty, lift_leg_cost, side_label) =
+                    if left_has_inventory {
+                        (&right_id, &right_quote, left_qty, right_cost, "lift_right_ask")
+                    } else {
+                        (&left_id, &left_quote, right_qty, left_cost, "lift_left_ask")
+                    };
+                let intent = if throttle_ok {
+                    self.build_rescue_intent_for_quantity(
+                        &snapshot.market_id,
+                        lift_id,
+                        lift_quote,
+                        lift_qty,
+                        lift_leg_cost,
+                        gross_cost,
+                        "btc-5m-mm hedge rescue",
+                        context.now_ms,
+                    )
+                } else {
+                    None
+                };
                 tracing::info!(
                     target: "strategy.rescue",
                     market = %snapshot.market_id,
-                    side = "lift_right_ask",
-                    stranded_qty = hedge_qty,
-                    right_best_ask = ?Self::best_ask(&right_quote),
+                    side = side_label,
+                    stranded_qty = lift_qty,
+                    lift_best_ask = ?Self::best_ask(lift_quote),
+                    throttle_ok = throttle_ok,
                     intent_built = intent.is_some(),
-                    "hedge rescue branch entered (true, false)"
+                    "hedge rescue branch entered"
                 );
                 if let Some(hedge) = intent {
                     intents.push(hedge);
-                }
-            }
-            (false, true) => {
-                // Stranded long on right → manufacture pair by IOC-lifting left's ask.
-                let hedge_qty = right_qty;
-                let intent = self.build_rescue_intent_for_quantity(
-                    &snapshot.market_id,
-                    &left_id,
-                    &left_quote,
-                    hedge_qty,
-                    left_cost,
-                    gross_cost,
-                    "btc-5m-mm hedge rescue (lift left ask)",
-                    context.now_ms,
-                );
-                tracing::info!(
-                    target: "strategy.rescue",
-                    market = %snapshot.market_id,
-                    side = "lift_left_ask",
-                    stranded_qty = hedge_qty,
-                    left_best_ask = ?Self::best_ask(&left_quote),
-                    intent_built = intent.is_some(),
-                    "hedge rescue branch entered (false, true)"
-                );
-                if let Some(hedge) = intent {
-                    intents.push(hedge);
+                    if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
+                        state.last_rescue_attempt_ms = Some(context.now_ms);
+                    }
                 }
             }
             (true, true) => {}
