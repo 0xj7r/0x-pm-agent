@@ -115,8 +115,22 @@ impl RiskEngine {
             );
         }
 
+        // Hedge-rescue intents are CLOSE operations — they manufacture the
+        // missing leg of an existing stranded position so the pair can be
+        // merged for $1 collateral release. They reduce exposure, not add
+        // to it. Entry-time caps (max_open_orders, max_position_quantity,
+        // max_order_notional) protect against accumulation runaway and
+        // shouldn't apply. The merge will return the rescue's cash within
+        // ~30s, and wallet exhaustion is gated upstream by the adapter
+        // balance check. Still enforce InvalidOrder above and the
+        // sufficient-balance check (rescue can't spend cash we don't have).
+        let is_rescue = order
+            .quote_level_tag
+            .as_deref()
+            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+
         let notional = order.notional_usd();
-        if notional > self.limits.max_order_notional_usd {
+        if !is_rescue && notional > self.limits.max_order_notional_usd {
             return self.reject(
                 RiskRejectReason::OrderNotionalTooLarge,
                 context.now_ms.max(order.created_at_ms),
@@ -129,7 +143,7 @@ impl RiskEngine {
             );
         }
 
-        if context.open_orders_total >= self.limits.max_open_orders_total {
+        if !is_rescue && context.open_orders_total >= self.limits.max_open_orders_total {
             return self.reject(
                 RiskRejectReason::TooManyOpenOrders,
                 context.now_ms.max(order.created_at_ms),
@@ -142,7 +156,7 @@ impl RiskEngine {
             );
         }
 
-        if context.open_orders_for_market >= self.limits.max_open_orders_per_market {
+        if !is_rescue && context.open_orders_for_market >= self.limits.max_open_orders_per_market {
             return self.reject(
                 RiskRejectReason::TooManyOpenOrdersForMarket,
                 context.now_ms.max(order.created_at_ms),
