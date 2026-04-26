@@ -766,9 +766,23 @@ impl PolymarketExecutionAdapter {
                 if let Some(funder) = funder {
                     auth_builder = auth_builder.funder(funder);
                 }
-                auth_builder.authenticate().await.map_err(|error| {
+                let client = auth_builder.authenticate().await.map_err(|error| {
                     ExecutionError::AuthFailure(format!("V2 SDK authenticate failed: {error}"))
-                })
+                })?;
+                // Refresh venue's cached on-chain balance/allowance view.
+                // Without this the venue may reject /order with
+                // "not enough balance / allowance" even when our approvals
+                // are correctly set on chain (their balance check is
+                // cached and lazily-refreshed otherwise).
+                use polymarket_client_sdk_v2::clob::types::AssetType;
+                use polymarket_client_sdk_v2::clob::types::request::UpdateBalanceAllowanceRequest;
+                let req = UpdateBalanceAllowanceRequest::builder()
+                    .asset_type(AssetType::Collateral)
+                    .build();
+                if let Err(e) = client.update_balance_allowance(req).await {
+                    tracing::warn!(error = %e, "update_balance_allowance failed (non-fatal)");
+                }
+                Ok(client)
             })
             .await?;
         Ok(client_ref.clone())
