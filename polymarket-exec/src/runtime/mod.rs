@@ -3271,7 +3271,7 @@ mod tests {
                 quote_level_tag: Some("fallback-cleanup".to_string()),
                 created_at_ms: 12,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Close,
             },
             12,
         );
