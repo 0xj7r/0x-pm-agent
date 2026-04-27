@@ -50,7 +50,7 @@ id_type!(InstrumentId);
 id_type!(ClientOrderId);
 id_type!(OrderId);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeStatus {
     #[default]
     Starting,
