@@ -4051,7 +4051,7 @@ fn enforce_capital_guard(
     }
 
     metrics.observe_riskoff_transition();
-    runtime.degrade_and_cancel_all(
+    runtime.degrade_and_cancel_entry_orders(
         now_ms,
         format!(
             "{mode} capital guard: portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
