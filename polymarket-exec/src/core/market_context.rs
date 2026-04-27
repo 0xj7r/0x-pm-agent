@@ -74,6 +74,25 @@ impl MarketContextStore {
         Self::default()
     }
 
+    pub fn from_records(
+        records: Vec<MarketContextRecord>,
+        source: Option<String>,
+        source_generated_at_ms: Option<u64>,
+    ) -> Self {
+        let by_market_id = records
+            .into_iter()
+            .filter(|record| !record.market_id.trim().is_empty())
+            .map(|record| (MarketId::from(record.market_id.clone()), record))
+            .collect();
+
+        Self {
+            by_market_id,
+            version: DEFAULT_MARKET_CONTEXT_VERSION.to_string(),
+            source,
+            source_generated_at_ms,
+        }
+    }
+
     pub fn load_json(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read market context file {}", path.display()))?;
@@ -127,6 +146,41 @@ impl MarketContextStore {
             .values()
             .filter(|record| record.is_active_btc_5m_window(now_ms))
             .collect()
+    }
+
+    pub fn records(&self) -> Vec<MarketContextRecord> {
+        self.sorted_records()
+    }
+
+    pub fn asset_ids(&self) -> Vec<String> {
+        let mut asset_ids = self
+            .sorted_records()
+            .into_iter()
+            .flat_map(|record| record.instrument_ids)
+            .filter(|asset_id| !asset_id.trim().is_empty())
+            .collect::<Vec<_>>();
+        asset_ids.dedup();
+        asset_ids
+    }
+
+    pub fn market_ids(&self) -> Vec<String> {
+        self.sorted_records()
+            .into_iter()
+            .map(|record| record.market_id)
+            .filter(|market_id| !market_id.trim().is_empty())
+            .collect()
+    }
+
+    pub fn asset_market_map(&self) -> HashMap<String, String> {
+        let mut mapping = HashMap::new();
+        for record in self.sorted_records() {
+            for asset_id in record.instrument_ids {
+                if !asset_id.trim().is_empty() {
+                    mapping.insert(asset_id, record.market_id.clone());
+                }
+            }
+        }
+        mapping
     }
 
     pub fn len(&self) -> usize {

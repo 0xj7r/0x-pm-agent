@@ -6,6 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +21,7 @@ pub struct MarketWsClient {
     ping_interval: Duration,
     books: Arc<BookStore>,
     metrics: Arc<AppMetrics>,
+    assets_rx: Option<watch::Receiver<Vec<String>>>,
 }
 
 impl MarketWsClient {
@@ -36,14 +38,36 @@ impl MarketWsClient {
             ping_interval,
             books,
             metrics,
+            assets_rx: None,
         }
+    }
+
+    pub fn with_asset_updates(mut self, assets_rx: watch::Receiver<Vec<String>>) -> Self {
+        self.assets_rx = Some(assets_rx);
+        self
     }
 
     pub async fn run(self, shutdown: CancellationToken) {
         let mut backoff = Duration::from_secs(1);
+        let mut assets = self.assets.clone();
         while !shutdown.is_cancelled() {
-            match self.run_once(shutdown.clone()).await {
+            if let Some(rx) = &self.assets_rx {
+                assets = rx.borrow().clone();
+            }
+            match self
+                .run_once(shutdown.clone(), assets.clone(), self.assets_rx.clone())
+                .await
+            {
                 Ok(()) => break,
+                Err(error) if error.to_string().contains("asset subscription changed") => {
+                    self.metrics.set_stream_connected(StreamKind::Market, false);
+                    info!(
+                        asset_count = assets.len(),
+                        "market websocket asset universe changed; reconnecting"
+                    );
+                    backoff = Duration::from_secs(1);
+                    continue;
+                }
                 Err(error) if shutdown.is_cancelled() => {
                     debug!(error = ?error, "market websocket shutdown");
                     break;
@@ -64,19 +88,21 @@ impl MarketWsClient {
         self.metrics.set_stream_connected(StreamKind::Market, false);
     }
 
-    async fn run_once(&self, shutdown: CancellationToken) -> Result<()> {
+    async fn run_once(
+        &self,
+        shutdown: CancellationToken,
+        assets: Vec<String>,
+        mut assets_rx: Option<watch::Receiver<Vec<String>>>,
+    ) -> Result<()> {
         let (stream, _) = connect_async(self.url.as_str())
             .await
             .with_context(|| format!("failed to connect market websocket {}", self.url))?;
-        info!(
-            asset_count = self.assets.len(),
-            "market websocket connected"
-        );
+        info!(asset_count = assets.len(), "market websocket connected");
         self.metrics.set_stream_connected(StreamKind::Market, true);
 
         let (mut write, mut read) = stream.split();
         let subscribe = json!({
-            "assets_ids": self.assets,
+            "assets_ids": assets,
             "type": "market",
             "initial_dump": true,
             "level": 2,
@@ -95,6 +121,15 @@ impl MarketWsClient {
                 _ = shutdown.cancelled() => {
                     let _ = write.send(Message::Close(None)).await;
                     return Ok(());
+                }
+                changed = async {
+                    match assets_rx.as_mut() {
+                        Some(rx) => rx.changed().await.map(|_| ()),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    changed.context("market websocket asset update channel closed")?;
+                    anyhow::bail!("asset subscription changed");
                 }
                 _ = pings.tick() => {
                     write
