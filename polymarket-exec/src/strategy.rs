@@ -1,6 +1,6 @@
 //! Strategy implementations and decision logic for unlawful_shear and baseline modes.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -639,6 +639,40 @@ struct Btc5mMmMarketState {
     /// post-fill entry cooldown that prevents re-stranding immediately
     /// after a merge in a trending market.
     last_fill_ms: Option<EpochMillis>,
+}
+
+impl Btc5mMmMarketState {
+    fn last_seen_ms(&self) -> EpochMillis {
+        let quote_seen = self
+            .quotes
+            .values()
+            .map(|quote| quote.observed_at_ms)
+            .max()
+            .unwrap_or_default();
+        let mid_seen = self
+            .market_mid_history
+            .back()
+            .map(|(ts, _)| *ts)
+            .unwrap_or_default();
+        let fill_seen = self
+            .recent_fills
+            .back()
+            .map(|(ts, _, _)| *ts)
+            .unwrap_or_default();
+        [
+            quote_seen,
+            mid_seen,
+            fill_seen,
+            self.asymmetric_entry_block_until_ms.unwrap_or_default(),
+            self.last_action_ms.unwrap_or_default(),
+            self.last_no_quote_note_ms.unwrap_or_default(),
+            self.last_rescue_attempt_ms.unwrap_or_default(),
+            self.last_fill_ms.unwrap_or_default(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1528,6 +1562,8 @@ impl Btc5mMmStrategy {
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
     const LATE_BAR_HOLD_CONFIDENCE_FAIR: f64 = 0.70;
+    const MARKET_STATE_TTL_MS: u64 = 6 * 60 * 60 * 1_000;
+    const MAX_MARKET_STATES: usize = 512;
 
     pub fn new(config: Btc5mMmConfig) -> Self {
         Self {
@@ -1542,6 +1578,41 @@ impl Btc5mMmStrategy {
         let cutoff = now_ms.saturating_sub(Self::FILL_WINDOW_MS);
         while self.recent_fill_times.front().is_some_and(|t| *t < cutoff) {
             self.recent_fill_times.pop_front();
+        }
+    }
+
+    fn prune_market_states(&mut self, context: &StrategyContext, active_market_id: &MarketId) {
+        let inventory_markets = context
+            .inventory
+            .positions
+            .iter()
+            .filter(|position| position.quantity.abs() > 1e-9)
+            .map(|position| position.market_id.clone())
+            .collect::<HashSet<_>>();
+        let cutoff = context.now_ms.saturating_sub(Self::MARKET_STATE_TTL_MS);
+        self.market_states.retain(|market_id, state| {
+            market_id == active_market_id
+                || inventory_markets.contains(market_id)
+                || state.last_seen_ms() >= cutoff
+        });
+
+        if self.market_states.len() <= Self::MAX_MARKET_STATES {
+            return;
+        }
+
+        let mut removable = self
+            .market_states
+            .iter()
+            .filter(|(market_id, _)| {
+                *market_id != active_market_id && !inventory_markets.contains(*market_id)
+            })
+            .map(|(market_id, state)| (market_id.clone(), state.last_seen_ms()))
+            .collect::<Vec<_>>();
+        removable.sort_by_key(|(_, last_seen)| *last_seen);
+
+        let overflow = self.market_states.len() - Self::MAX_MARKET_STATES;
+        for (market_id, _) in removable.into_iter().take(overflow) {
+            self.market_states.remove(&market_id);
         }
     }
 
@@ -2757,9 +2828,7 @@ impl Strategy for Btc5mMmStrategy {
         context: &StrategyContext,
         snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
-        if context.runtime_status != RuntimeStatus::Running {
-            return StrategyDecision::none();
-        }
+        self.prune_market_states(context, &snapshot.market_id);
         let (left_id, left_quote, right_id, right_quote) = {
             let state = self
                 .market_states
@@ -2843,6 +2912,16 @@ impl Strategy for Btc5mMmStrategy {
 
         match (left_has_inventory, right_has_inventory) {
             (false, false) => {
+                if context.runtime_status != RuntimeStatus::Running {
+                    return self.no_quote_decision(
+                        &snapshot.market_id,
+                        context.now_ms,
+                        format!(
+                            "fresh entry suppressed: runtime status is {:?}",
+                            context.runtime_status
+                        ),
+                    );
+                }
                 if let Btc5mMmMarketMode::Cooling { reason, until_ms } = &market_mode {
                     tracing::info!(
                         target: "strategy.market_state",
@@ -3197,6 +3276,7 @@ impl Strategy for Btc5mMmStrategy {
             fill.instrument_id, fill.side, fill.quantity, fill.price
         )];
         let mut intents = Vec::new();
+        self.prune_market_states(context, &fill.market_id);
 
         // Track this fill for fill-rate-aware sizing (#43). Buy-side fills
         // only — sells (e.g. inventory unwinds) don't count toward the
@@ -5453,8 +5533,8 @@ fn normalize_unlawful_invariants(mut config: UnlawfulShearConfig) -> UnlawfulShe
 #[cfg(test)]
 mod tests {
     use super::{
-        Btc5mMmConfig, Btc5mMmMarketMode, Btc5mMmStrategy, GoatPairConfig, GoatPairStrategy,
-        NoopStrategy, QuoteSnapshot, Strategy, StrategyContext, StrategyDecision,
+        Btc5mMmConfig, Btc5mMmMarketMode, Btc5mMmMarketState, Btc5mMmStrategy, GoatPairConfig,
+        GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext, StrategyDecision,
     };
     use super::{
         BtcRegimeSnapshot, MarketActivitySignal, PairedBookSignal, SessionBucket,
@@ -6120,6 +6200,55 @@ mod tests {
             Some(Btc5mMmMarketMode::Cooling { reason, .. })
                 if reason.contains("market mid moved")
         ));
+    }
+
+    #[test]
+    fn btc_5m_mm_prunes_stale_market_states_without_dropping_inventory_market() {
+        let mut config = btc_5m_mm_test_config();
+        config.cooldown_ms = 0;
+        let mut strategy = Btc5mMmStrategy::new(config);
+        for index in 0..600 {
+            let mut state = Btc5mMmMarketState::default();
+            state.last_action_ms = Some(1);
+            strategy
+                .market_states
+                .insert(MarketId::from(format!("stale-{index}")), state);
+        }
+        let mut inventory_state = Btc5mMmMarketState::default();
+        inventory_state.last_action_ms = Some(1);
+        strategy
+            .market_states
+            .insert(MarketId::from("market-inventory"), inventory_state);
+
+        let now_ms = Btc5mMmStrategy::MARKET_STATE_TTL_MS + 10_000;
+        let ctx = context_at(
+            vec![PositionState {
+                market_id: MarketId::from("market-inventory"),
+                instrument_id: InstrumentId::from("inventory-up"),
+                quantity: 5.0,
+                avg_price: 0.50,
+                mark_price: Some(0.50),
+                updated_at_ms: now_ms,
+            }],
+            now_ms,
+        );
+
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-active", 0.48, 0.52, now_ms));
+        strategy.on_market_snapshot(
+            &ctx,
+            &snapshot("down", "market-active", 0.48, 0.52, now_ms),
+        );
+
+        assert!(strategy
+            .market_states
+            .contains_key(&MarketId::from("market-active")));
+        assert!(strategy
+            .market_states
+            .contains_key(&MarketId::from("market-inventory")));
+        assert!(strategy.market_states.len() <= Btc5mMmStrategy::MAX_MARKET_STATES);
+        assert!(!strategy
+            .market_states
+            .contains_key(&MarketId::from("stale-0")));
     }
 
     #[test]

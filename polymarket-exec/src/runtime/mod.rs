@@ -1621,6 +1621,25 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    pub fn request_cancel_entry_orders(
+        &mut self,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let reason = reason.into();
+        let ids = self
+            .open_orders
+            .values()
+            .filter(|managed| managed.intent.kind != crate::types::IntentKind::Close)
+            .map(|managed| managed.intent.client_order_id.clone())
+            .collect::<Vec<_>>();
+        let mut outcome = RuntimeOutcome::default();
+        for client_order_id in ids {
+            outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));
+        }
+        outcome
+    }
+
     pub fn request_cancel_orders_not_in_instruments(
         &mut self,
         active_instruments: &HashSet<InstrumentId>,
@@ -1670,6 +1689,29 @@ impl<S: Strategy> Runtime<S> {
             );
         }
         outcome.extend(self.request_cancel_all(now_ms, reason));
+        outcome
+    }
+
+    pub fn degrade_and_cancel_entry_orders(
+        &mut self,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let reason = reason.into();
+        let mut outcome = RuntimeOutcome::default();
+        if self.status != RuntimeStatus::Degraded {
+            self.status = RuntimeStatus::Degraded;
+            outcome.push_event(self.event_log.push(EventRecord::new(
+                EventCategory::Runtime,
+                now_ms,
+                format!("runtime degraded: {reason}"),
+            )));
+            outcome.push_event(
+                self.event_log
+                    .push(EventRecord::runtime_status(now_ms, self.status)),
+            );
+        }
+        outcome.extend(self.request_cancel_entry_orders(now_ms, reason));
         outcome
     }
 
@@ -1852,6 +1894,21 @@ impl<S: Strategy> Runtime<S> {
         // prices, different intent kind (taker vs maker), different goal.
         // Suppressing them here leaves us stranded long. Bypass for rescue.
         let is_rescue_intent = intent.kind == crate::types::IntentKind::Close;
+        if self.status != RuntimeStatus::Running && !is_rescue_intent {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "fresh entry suppressed: runtime is not running",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         if !is_rescue_intent && self.has_active_btc_mm_buy_for_instrument(&intent) {
             outcome.push_event(
                 self.event_log.push(
@@ -2958,6 +3015,7 @@ mod tests {
         MarketSnapshot, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, TradeSide,
     };
 
+    use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct SingleShotStrategy {
@@ -3462,6 +3520,82 @@ mod tests {
             pair_id: None,
             kind,
         }
+    }
+
+    #[test]
+    fn degraded_runtime_suppresses_entries_but_accepts_close_intents() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Degraded,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let entry =
+            runtime.accept_intent(btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44), 1);
+        assert!(entry.commands.is_empty());
+
+        let close = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.55),
+            2,
+        );
+        assert_eq!(close.commands.len(), 1);
+        assert_eq!(runtime.open_orders().count(), 1);
+        assert!(runtime
+            .open_orders()
+            .all(|managed| managed.intent.kind == crate::types::IntentKind::Close));
+    }
+
+    #[test]
+    fn capital_guard_degrade_cancels_entries_without_canceling_close_orders() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let entry_order = btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44);
+        let entry_id = entry_order.client_order_id.clone();
+        let close_order = btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.55);
+        let close_id = close_order.client_order_id.clone();
+
+        assert_eq!(runtime.accept_intent(entry_order, 1).commands.len(), 1);
+        assert_eq!(runtime.accept_intent(close_order, 2).commands.len(), 1);
+
+        let outcome = runtime.degrade_and_cancel_entry_orders(3, "capital guard test");
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert!(outcome.commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &entry_id
+        )));
+        assert!(!outcome.commands.iter().any(|command| matches!(
+            command,
+            RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &close_id
+        )));
+
+        let statuses = runtime
+            .open_orders()
+            .map(|managed| (managed.intent.client_order_id.clone(), managed.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            statuses.get(&entry_id),
+            Some(&ManagedOrderStatus::CancelRequested)
+        );
+        assert_eq!(
+            statuses.get(&close_id),
+            Some(&ManagedOrderStatus::PendingSubmit)
+        );
     }
 
     #[test]
