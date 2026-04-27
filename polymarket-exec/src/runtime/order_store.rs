@@ -940,7 +940,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "strat",
         );
@@ -997,7 +997,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "strat",
         ))?;
@@ -1038,7 +1038,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "strat",
         ))?;
@@ -1082,7 +1082,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "strat",
         ))?;
@@ -1123,7 +1123,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "strat",
         ))?;
@@ -1161,7 +1161,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let record = crate::runtime::order_store::OrderRecord::from_intent("run", &intent, "strat");
         store.insert(record.clone())?;

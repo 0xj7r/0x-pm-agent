@@ -94,6 +94,10 @@ export WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS=10
 # Each tick is one cheap data-api positions call. After warmup, merges are
 # fill-driven (~3-6s end-to-end including chain).
 export WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS=3000
+export WHALE_PAIR_MARKET_DISCOVERY_ENABLED=true
+export WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS=30000
+export WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_PREV=0
+export WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_NEXT=0
 
 # Kill switch path
 export WHALE_PAIR_LIVE_KILL_SWITCH_PATH=$HOME/.config/polymarket-exec/live.kill
@@ -130,85 +134,6 @@ echo ">>> wallet: 0x97fBC6Bc... | endpoint: V1 | collateral: USDC.e"
 echo ">>> strategy: btc_5m_mm | edge=25bps | quote_age=2s | safety=1tick"
 echo ">>> caps: cash=\$50 max_gross=\$25 max_orders=2"
 echo ">>> kill: touch ~/.config/polymarket-exec/live.kill"
+echo ">>> market discovery: engine-owned refresh every ${WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS}ms"
 
-# Context refresh supervisor: 5-min markets cycle every 5 min, but we have
-# no WS for "new market opened". Poll gamma periodically; restart the bot
-# ONLY when our current market universe is exhausted (all resolved or about
-# to resolve). Restarting on every context change kills in-flight IOC
-# rescues mid-completion — observed 8 restarts in 7 min eating 377 rescue
-# intents that never landed. Better to miss the freshest market for one
-# cycle than to lose all in-flight pair completion.
-REFRESH_INTERVAL_SEC=${WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC:-300}
-MIN_RESTART_INTERVAL_SEC=${WHALE_PAIR_MIN_RESTART_INTERVAL_SEC:-240}
-CHILD_PID=""
-last_restart_epoch=$(date +%s)
-prev_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json | awk '{print $1}')
-
-launch_child() {
-  exec target/release/polymarket-exec &
-  CHILD_PID=$!
-  echo ">>> [supervisor] launched child pid=$CHILD_PID at $(date -u +%H:%M:%S)"
-}
-
-stop_child() {
-  local reason="$1"
-  if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
-    echo ">>> [supervisor] stopping child pid=$CHILD_PID reason=$reason"
-    kill -INT "$CHILD_PID" 2>/dev/null || true
-    sleep 5
-    kill -KILL "$CHILD_PID" 2>/dev/null || true
-    wait "$CHILD_PID" 2>/dev/null || true
-  fi
-  CHILD_PID=""
-}
-
-cleanup() {
-  stop_child "supervisor exit"
-  exit 0
-}
-trap cleanup INT TERM EXIT
-
-launch_child
-
-while true; do
-  sleep "$REFRESH_INTERVAL_SEC"
-
-  # Crash detection: relaunch on unexpected exit.
-  if ! kill -0 "$CHILD_PID" 2>/dev/null; then
-    wait "$CHILD_PID" 2>/dev/null || true
-    echo ">>> [supervisor] child exited unexpectedly; relaunching"
-    launch_child
-    continue
-  fi
-
-  # Refresh context, compare hash, restart only if (1) hash changed AND
-  # (2) at least MIN_RESTART_INTERVAL_SEC has passed since last restart.
-  # The interval gate prevents thrash that kills in-flight IOC rescues.
-  python3 scripts/export_btc_5m_runtime.py \
-    --context-out /tmp/tinylive_ctx.json.new \
-    --env-out /tmp/tinylive_runtime.env.new > /dev/null 2>&1 || {
-    echo ">>> [supervisor] context refresh failed; keeping current"
-    continue
-  }
-  new_ctx_hash=$(sha256sum /tmp/tinylive_ctx.json.new | awk '{print $1}')
-  if [[ "$new_ctx_hash" != "$prev_ctx_hash" ]]; then
-    now=$(date +%s)
-    age=$((now - last_restart_epoch))
-    if [[ "$age" -lt "$MIN_RESTART_INTERVAL_SEC" ]]; then
-      echo ">>> [supervisor] context changed but only ${age}s since last restart (min=${MIN_RESTART_INTERVAL_SEC}s); deferring"
-      rm -f /tmp/tinylive_ctx.json.new /tmp/tinylive_runtime.env.new
-      continue
-    fi
-    echo ">>> [supervisor] market context changed (${age}s since last restart); restarting bot"
-    mv /tmp/tinylive_ctx.json.new /tmp/tinylive_ctx.json
-    mv /tmp/tinylive_runtime.env.new /tmp/tinylive_runtime.env
-    source /tmp/tinylive_runtime.env
-    export WHALE_PAIR_ASSET_IDS WHALE_PAIR_INSTRUMENT_MARKETS WHALE_PAIR_USER_MARKETS
-    prev_ctx_hash="$new_ctx_hash"
-    last_restart_epoch="$now"
-    stop_child "context-refresh"
-    launch_child
-  else
-    rm -f /tmp/tinylive_ctx.json.new /tmp/tinylive_runtime.env.new
-  fi
-done
+exec target/release/polymarket-exec

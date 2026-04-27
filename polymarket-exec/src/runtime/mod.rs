@@ -24,10 +24,10 @@ pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
 use crate::signals::{
-    BtcRegimeSnapshot as GateBtcRegimeSnapshot, MarketActivitySignal as GateMarketActivitySignal,
-    PairedBookSignal as GatePairedBookSignal, SessionBucket as GateSessionBucket,
-    UnlawfulExecutionMode as GateExecutionMode, UnlawfulGateConfig, UnlawfulGateInputs,
-    UnlawfulSignalSnapshot as GateSignalSnapshot, evaluate_unlawful_mode,
+    evaluate_unlawful_mode, BtcRegimeSnapshot as GateBtcRegimeSnapshot,
+    MarketActivitySignal as GateMarketActivitySignal, PairedBookSignal as GatePairedBookSignal,
+    SessionBucket as GateSessionBucket, UnlawfulExecutionMode as GateExecutionMode,
+    UnlawfulGateConfig, UnlawfulGateInputs, UnlawfulSignalSnapshot as GateSignalSnapshot,
 };
 use crate::strategy::{
     BtcRegimeSnapshot as StrategyBtcRegimeSnapshot,
@@ -439,6 +439,32 @@ impl<S: Strategy> Runtime<S> {
 
     pub fn market_context_version(&self) -> &str {
         self.market_contexts.version.as_str()
+    }
+
+    pub fn replace_market_contexts(
+        &mut self,
+        market_contexts: MarketContextStore,
+        observed_at_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let market_count = market_contexts.len();
+        let source = market_contexts
+            .source
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        self.market_contexts = market_contexts;
+        let mut outcome = RuntimeOutcome::default();
+        outcome.push_event(self.event_log.push(EventRecord::new(
+            EventCategory::Strategy,
+            observed_at_ms,
+            format!(
+                "market context replaced: rows={} source={} reason={}",
+                market_count,
+                source,
+                reason.into()
+            ),
+        )));
+        outcome
     }
 
     pub fn recover_from_store(
@@ -1588,6 +1614,26 @@ impl<S: Strategy> Runtime<S> {
     ) -> RuntimeOutcome {
         let reason = reason.into();
         let ids = self.open_orders.keys().cloned().collect::<Vec<_>>();
+        let mut outcome = RuntimeOutcome::default();
+        for client_order_id in ids {
+            outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));
+        }
+        outcome
+    }
+
+    pub fn request_cancel_orders_not_in_instruments(
+        &mut self,
+        active_instruments: &HashSet<InstrumentId>,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let reason = reason.into();
+        let ids = self
+            .open_orders
+            .values()
+            .filter(|managed| !active_instruments.contains(&managed.intent.instrument_id))
+            .map(|managed| managed.intent.client_order_id.clone())
+            .collect::<Vec<_>>();
         let mut outcome = RuntimeOutcome::default();
         for client_order_id in ids {
             outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));

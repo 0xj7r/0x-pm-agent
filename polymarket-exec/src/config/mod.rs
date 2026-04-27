@@ -58,6 +58,12 @@ pub struct AppConfig {
     pub spot_symbol: String,
     pub market_assets: Vec<String>,
     pub user_markets: Vec<String>,
+    pub market_discovery_enabled: bool,
+    pub market_discovery_interval: Duration,
+    pub market_discovery_include_prev: usize,
+    pub market_discovery_include_next: usize,
+    pub market_discovery_gamma_url: String,
+    pub market_discovery_slug_prefix: String,
     pub runtime_loop_interval: Duration,
     pub summary_log_interval: Duration,
     pub order_reconcile_interval: Duration,
@@ -227,8 +233,25 @@ impl AppConfig {
             "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
         );
         let spot_symbol = env_or("WHALE_PAIR_EXEC_SPOT_SYMBOL", "BTCUSDT");
-        let market_assets = split_csv_required("WHALE_PAIR_ASSET_IDS")?;
+        let market_discovery_enabled = parse_bool("WHALE_PAIR_MARKET_DISCOVERY_ENABLED", false)?;
+        let market_assets = if market_discovery_enabled {
+            split_csv_optional("WHALE_PAIR_ASSET_IDS")
+        } else {
+            split_csv_required("WHALE_PAIR_ASSET_IDS")?
+        };
         let user_markets = split_csv_optional("WHALE_PAIR_USER_MARKETS");
+        let market_discovery_interval =
+            parse_duration_ms("WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS", 30_000)?;
+        let market_discovery_include_prev =
+            parse_usize("WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_PREV", 0)?;
+        let market_discovery_include_next =
+            parse_usize("WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_NEXT", 0)?;
+        let market_discovery_gamma_url = env_or(
+            "WHALE_PAIR_MARKET_DISCOVERY_GAMMA_URL",
+            "https://gamma-api.polymarket.com/markets",
+        );
+        let market_discovery_slug_prefix =
+            env_or("WHALE_PAIR_MARKET_DISCOVERY_SLUG_PREFIX", "btc-updown-5m-");
         let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
         let summary_log_interval =
             parse_duration_ms("WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
@@ -446,6 +469,12 @@ impl AppConfig {
             spot_symbol,
             market_assets,
             user_markets,
+            market_discovery_enabled,
+            market_discovery_interval,
+            market_discovery_include_prev,
+            market_discovery_include_next,
+            market_discovery_gamma_url,
+            market_discovery_slug_prefix,
             runtime_loop_interval,
             summary_log_interval,
             order_reconcile_interval,

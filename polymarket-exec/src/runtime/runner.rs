@@ -5,9 +5,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{RwLock, mpsc};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -31,8 +33,8 @@ use crate::types::{
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
 use crate::wire::api::{
-    DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot,
-    DashboardUiState, serve_http,
+    serve_http, DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition,
+    DashboardSnapshot, DashboardUiState,
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -43,6 +45,47 @@ use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
+const BTC_5M_WINDOW_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone)]
+struct RuntimeMarketUniverse {
+    market_assets: Vec<String>,
+    user_markets: Vec<String>,
+    market_id_by_asset: HashMap<String, String>,
+}
+
+impl RuntimeMarketUniverse {
+    fn from_config_and_context(config: &AppConfig, contexts: &MarketContextStore) -> Self {
+        let context_assets = contexts.asset_ids();
+        let context_markets = contexts.market_ids();
+        let context_map = contexts.asset_market_map();
+        Self {
+            market_assets: if context_assets.is_empty() {
+                config.market_assets.clone()
+            } else {
+                context_assets
+            },
+            user_markets: if context_markets.is_empty() {
+                config.user_markets.clone()
+            } else {
+                context_markets
+            },
+            market_id_by_asset: if context_map.is_empty() {
+                config.market_id_by_asset.clone()
+            } else {
+                context_map
+            },
+        }
+    }
+
+    fn market_id_for_asset(&self, config: &AppConfig, asset_id: &str) -> String {
+        self.market_id_by_asset
+            .get(asset_id)
+            .cloned()
+            .or_else(|| config.market_id_by_asset.get(asset_id).cloned())
+            .unwrap_or_else(|| asset_id.to_string())
+    }
+}
 
 #[derive(Debug, Default)]
 struct LiveSafetyState {
@@ -794,11 +837,41 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
 
     let metrics = Arc::new(AppMetrics::new()?);
-    let books = Arc::new(BookStore::new(&config.market_assets));
-    let market_contexts = match &config.market_context_path {
+    let mut market_contexts = match &config.market_context_path {
         Some(path) => MarketContextStore::load_json(path)?,
         None => MarketContextStore::empty(),
     };
+    if config.market_discovery_enabled {
+        match fetch_btc_5m_market_contexts(&config, now_unix_ms()).await {
+            Ok(discovered) if discovered.len() > 0 => {
+                info!(
+                    target: "market_discovery",
+                    market_count = discovered.len(),
+                    "loaded initial market universe from engine discovery"
+                );
+                market_contexts = discovered;
+            }
+            Ok(_) => warn!(
+                target: "market_discovery",
+                "initial market discovery returned no markets; falling back to configured context"
+            ),
+            Err(error) => warn!(
+                target: "market_discovery",
+                error = %error,
+                "initial market discovery failed; falling back to configured context"
+            ),
+        }
+    }
+    let initial_universe =
+        RuntimeMarketUniverse::from_config_and_context(&config, &market_contexts);
+    if initial_universe.market_assets.is_empty() {
+        anyhow::bail!("no market assets configured or discovered");
+    }
+    let books = Arc::new(BookStore::new(&initial_universe.market_assets));
+    let market_universe = Arc::new(RwLock::new(initial_universe.clone()));
+    let (market_assets_tx, market_assets_rx) =
+        watch::channel(initial_universe.market_assets.clone());
+    let (user_markets_tx, user_markets_rx) = watch::channel(initial_universe.user_markets.clone());
     let strategy = StrategyMode::from_name(&config.strategy_name, config.strategy_profile.as_ref());
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
@@ -914,7 +987,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         metrics.as_ref(),
         &config,
         dashboard_state.clone(),
-        &config.market_assets,
+        &initial_universe.market_assets,
         &strategy_name,
         config.dashboard_event_limit,
     )
@@ -928,8 +1001,8 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
             .as_ref()
             .map(|_| "loaded")
             .unwrap_or("none"),
-        assets = ?config.market_assets,
-        user_markets = ?config.user_markets,
+        assets = ?initial_universe.market_assets,
+        user_markets = ?initial_universe.user_markets,
         metrics_bind = %config.metrics_bind,
         loop_interval_ms = config.runtime_loop_interval.as_millis(),
         book_stale_after_ms = config.book_stale_after.as_millis(),
@@ -951,6 +1024,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         metrics.clone(),
         books.clone(),
         &config,
+        market_assets_rx,
         shutdown.child_token(),
     );
     let (spot_trade_tx, spot_trade_rx) = mpsc::unbounded_channel();
@@ -966,6 +1040,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &config,
         effective_user_auth,
         Some(user_order_tx),
+        user_markets_rx,
         shutdown.child_token(),
     );
     let mut paper_order_ctx = HashMap::<ClientOrderId, PaperOrderContext>::new();
@@ -989,6 +1064,9 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut execution_venue_map,
         &mut live_safety,
         execution_adapter,
+        market_universe,
+        market_assets_tx,
+        user_markets_tx,
         spot_trade_rx,
         user_order_rx,
         dashboard_state.clone(),
@@ -1096,6 +1174,7 @@ fn spawn_market_ws(
     metrics: Arc<AppMetrics>,
     books: Arc<BookStore>,
     config: &AppConfig,
+    assets_rx: watch::Receiver<Vec<String>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     let client = MarketWsClient::new(
@@ -1104,7 +1183,8 @@ fn spawn_market_ws(
         config.ping_interval,
         books,
         metrics,
-    );
+    )
+    .with_asset_updates(assets_rx);
     tokio::spawn(async move {
         client.run(shutdown).await;
     })
@@ -1133,6 +1213,7 @@ fn spawn_user_ws(
     config: &AppConfig,
     user_auth: Option<UserWsAuth>,
     event_tx: Option<mpsc::UnboundedSender<UserOrderEvent>>,
+    markets_rx: watch::Receiver<Vec<String>>,
     shutdown: CancellationToken,
 ) -> Option<JoinHandle<()>> {
     let auth = match user_auth {
@@ -1149,7 +1230,8 @@ fn spawn_user_ws(
         config.ping_interval,
         metrics,
         event_tx,
-    );
+    )
+    .with_market_updates(markets_rx);
     Some(tokio::spawn(async move {
         client.run(shutdown).await;
     }))
@@ -1171,6 +1253,9 @@ async fn run_runtime_loop(
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
     execution_adapter: Arc<dyn ExecutionAdapter>,
+    market_universe: Arc<RwLock<RuntimeMarketUniverse>>,
+    market_assets_tx: watch::Sender<Vec<String>>,
+    user_markets_tx: watch::Sender<Vec<String>>,
     mut spot_events: mpsc::UnboundedReceiver<SpotTradeEvent>,
     mut user_events: mpsc::UnboundedReceiver<UserOrderEvent>,
     dashboard: Arc<RwLock<DashboardSnapshot>>,
@@ -1189,6 +1274,9 @@ async fn run_runtime_loop(
 
     let mut summaries = interval(config.summary_log_interval);
     summaries.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let mut market_discovery_ticks = interval(config.market_discovery_interval);
+    market_discovery_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Auto-redeem worker — periodic sweep that scans venue positions
     // for resolved markets and submits CTF redeems via the relayer.
@@ -1256,13 +1344,14 @@ async fn run_runtime_loop(
                             user_outcome.clone(),
                         )?;
                         persist_audit_outcome(audit, "user-ws", runtime, &user_outcome)?;
+                        let assets = market_universe.read().await.market_assets.clone();
                         refresh_dashboard_state(
                             runtime,
                             &books,
                             metrics.as_ref(),
                             &config,
                             dashboard.clone(),
-                            &config.market_assets,
+                            &assets,
                             strategy_name,
                             dashboard_event_limit,
                         )
@@ -1274,9 +1363,68 @@ async fn run_runtime_loop(
                     }
                 }
             }
+            _ = market_discovery_ticks.tick(), if config.market_discovery_enabled => {
+                match refresh_runtime_market_universe(
+                    config,
+                    runtime,
+                    &market_universe,
+                    &market_assets_tx,
+                    &user_markets_tx,
+                    now_unix_ms(),
+                )
+                .await {
+                    Ok(Some(outcome)) => {
+                        let assets = market_universe.read().await.market_assets.clone();
+                        let combined = execute_execution_adapter(
+                            runtime,
+                            books,
+                            &assets,
+                            paper_fee_coeff,
+                            metrics.as_ref(),
+                            outcome,
+                            paper_order_ctx,
+                            execution_venue_map,
+                            live_safety,
+                            execution_adapter.clone(),
+                            execution_policy,
+                            &mut seen_venue_fill_keys,
+                            paper_report.as_mut(),
+                        )
+                        .await?;
+                        persist_runtime_outcome(
+                            journal,
+                            runtime.event_log(),
+                            "market-discovery",
+                            combined.clone(),
+                        )?;
+                        persist_audit_outcome(audit, "market-discovery", runtime, &combined)?;
+                        refresh_dashboard_state(
+                            runtime,
+                            &books,
+                            metrics.as_ref(),
+                            &config,
+                            dashboard.clone(),
+                            &assets,
+                            strategy_name,
+                            dashboard_event_limit,
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            target: "market_discovery",
+                            error = %error,
+                            "market discovery refresh failed; keeping current universe"
+                        );
+                    }
+                }
+            }
             _ = ticks.tick() => {
                 let _timer = metrics.runtime_loop_timer();
                 metrics.refresh_stream_ages();
+                let current_universe = market_universe.read().await.clone();
+                let current_assets = current_universe.market_assets.clone();
                 if execution_policy.paper_mode && !paper_market_closed {
                     if let Some(close_at_ms) = execution_policy.paper_market_close_at_ms {
                         let now = now_unix_ms();
@@ -1296,7 +1444,7 @@ async fn run_runtime_loop(
                             let combined = execute_execution_adapter(
                                 runtime,
                                 books,
-                                &config.market_assets,
+                                &current_assets,
                                 paper_fee_coeff,
                                 metrics.as_ref(),
                                 close_outcome,
@@ -1322,7 +1470,7 @@ async fn run_runtime_loop(
                                 metrics.as_ref(),
                                 &config,
                                 dashboard.clone(),
-                                &config.market_assets,
+                                &current_assets,
                                 strategy_name,
                                 dashboard_event_limit,
                             )
@@ -1342,7 +1490,7 @@ async fn run_runtime_loop(
                     let combined = execute_execution_adapter(
                         runtime,
                         books,
-                        &config.market_assets,
+                        &current_assets,
                         paper_fee_coeff,
                         metrics.as_ref(),
                         capital_outcome,
@@ -1376,7 +1524,7 @@ async fn run_runtime_loop(
                         let combined = execute_execution_adapter(
                             runtime,
                             books,
-                            &config.market_assets,
+                            &current_assets,
                             paper_fee_coeff,
                             metrics.as_ref(),
                             health_outcome,
@@ -1398,7 +1546,7 @@ async fn run_runtime_loop(
                         persist_audit_outcome(audit, "live-health", runtime, &combined)?;
                     }
                 }
-                for asset_id in &config.market_assets {
+                for asset_id in &current_assets {
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
                             if let Some(snap) = book_snapshot.as_mut() {
@@ -1426,14 +1574,16 @@ async fn run_runtime_loop(
                                 },
                             );
                             let outcome = runtime.on_book_state(
-                                MarketId::from(config.market_id_for_asset(asset_id)),
+                                MarketId::from(
+                                    current_universe.market_id_for_asset(config, asset_id),
+                                ),
                                 InstrumentId::from(asset_id.as_str()),
                                 &book,
                             )?;
                             let combined = execute_execution_adapter(
                                 runtime,
                                 books,
-                                &config.market_assets,
+                                &current_assets,
                                 paper_fee_coeff,
                                 metrics.as_ref(),
                                 outcome,
@@ -1459,7 +1609,7 @@ async fn run_runtime_loop(
                                 metrics.as_ref(),
                                 &config,
                                 dashboard.clone(),
-                                &config.market_assets,
+                                &current_assets,
                                 strategy_name,
                                 dashboard_event_limit,
                             )
@@ -1615,7 +1765,8 @@ async fn run_runtime_loop(
                 }
             }
             _ = summaries.tick() => {
-                let snapshots = books.snapshots(&config.market_assets).await;
+                let assets = market_universe.read().await.market_assets.clone();
+                let snapshots = books.snapshots(&assets).await;
                 if snapshots.is_empty() {
                     warn!("runtime summary: no book snapshots available yet");
                     continue;
@@ -1646,6 +1797,261 @@ async fn run_runtime_loop(
             }
         }
     }
+}
+
+async fn refresh_runtime_market_universe(
+    config: &AppConfig,
+    runtime: &mut Runtime<StrategyMode>,
+    market_universe: &Arc<RwLock<RuntimeMarketUniverse>>,
+    market_assets_tx: &watch::Sender<Vec<String>>,
+    user_markets_tx: &watch::Sender<Vec<String>>,
+    now_ms: u64,
+) -> Result<Option<RuntimeOutcome>> {
+    let contexts = fetch_btc_5m_market_contexts(config, now_ms).await?;
+    if contexts.len() == 0 {
+        anyhow::bail!("market discovery returned no BTC 5m markets");
+    }
+    let next = RuntimeMarketUniverse::from_config_and_context(config, &contexts);
+    if next.market_assets.is_empty() {
+        anyhow::bail!("market discovery returned no token ids");
+    }
+
+    let mut guard = market_universe.write().await;
+    let changed = guard.market_assets != next.market_assets
+        || guard.user_markets != next.user_markets
+        || guard.market_id_by_asset != next.market_id_by_asset;
+    if !changed {
+        return Ok(None);
+    }
+
+    let active_instruments = next
+        .market_assets
+        .iter()
+        .map(|asset| InstrumentId::from(asset.as_str()))
+        .collect::<HashSet<_>>();
+    let mut outcome = runtime.replace_market_contexts(contexts, now_ms, "gamma market discovery");
+    outcome.extend(runtime.request_cancel_orders_not_in_instruments(
+        &active_instruments,
+        now_ms,
+        "market universe rolled; cancel stale-market quote",
+    ));
+
+    *guard = next.clone();
+    let _ = market_assets_tx.send(next.market_assets.clone());
+    let _ = user_markets_tx.send(next.user_markets.clone());
+    info!(
+        target: "market_discovery",
+        asset_count = next.market_assets.len(),
+        market_count = next.user_markets.len(),
+        markets = ?next.user_markets,
+        "runtime market universe refreshed"
+    );
+    Ok(Some(outcome))
+}
+
+async fn fetch_btc_5m_market_contexts(
+    config: &AppConfig,
+    now_ms: u64,
+) -> Result<MarketContextStore> {
+    let records = fetch_btc_5m_gamma_records(config, now_ms).await?;
+    let selected = select_runtime_market_records(
+        records,
+        now_ms,
+        config.market_discovery_include_prev,
+        config.market_discovery_include_next,
+    );
+    Ok(MarketContextStore::from_records(
+        selected,
+        Some("gamma-api:engine-discovery".to_string()),
+        Some(now_ms),
+    ))
+}
+
+async fn fetch_btc_5m_gamma_records(
+    config: &AppConfig,
+    now_ms: u64,
+) -> Result<Vec<crate::market_context::MarketContextRecord>> {
+    let client = reqwest::Client::new();
+    let current_start_ms = now_ms - (now_ms % BTC_5M_WINDOW_MS);
+    let start_offset = -(config.market_discovery_include_prev as i64);
+    let end_offset = config.market_discovery_include_next as i64;
+    let mut records = Vec::new();
+    for offset in start_offset..=end_offset {
+        let start_ms = if offset < 0 {
+            current_start_ms.saturating_sub((-offset as u64) * BTC_5M_WINDOW_MS)
+        } else {
+            current_start_ms.saturating_add((offset as u64) * BTC_5M_WINDOW_MS)
+        };
+        let slug = format!(
+            "{}{}",
+            config.market_discovery_slug_prefix,
+            start_ms / 1_000
+        );
+        let payload = client
+            .get(&config.market_discovery_gamma_url)
+            .query(&[("slug", slug.as_str())])
+            .header("User-Agent", "polymarket-agent/1.0")
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let Some(items) = payload.as_array() else {
+            continue;
+        };
+        for item in items {
+            if let Some(record) =
+                parse_gamma_market_record(item, &config.market_discovery_slug_prefix)
+            {
+                records.push(record);
+            }
+        }
+    }
+    records.sort_by_key(|record| {
+        (
+            record.event_start_time_ms.unwrap_or_default(),
+            record.event_end_time_ms.unwrap_or_default(),
+            record.market_id.clone(),
+        )
+    });
+    records.dedup_by(|left, right| left.market_id == right.market_id);
+    Ok(records)
+}
+
+fn select_runtime_market_records(
+    records: Vec<crate::market_context::MarketContextRecord>,
+    now_ms: u64,
+    include_prev: usize,
+    include_next: usize,
+) -> Vec<crate::market_context::MarketContextRecord> {
+    let mut previous = records
+        .iter()
+        .filter(|record| record.event_end_time_ms.is_some_and(|end| end < now_ms))
+        .cloned()
+        .collect::<Vec<_>>();
+    let active = records
+        .iter()
+        .filter(|record| record.is_active_btc_5m_window(now_ms))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut upcoming = records
+        .into_iter()
+        .filter(|record| {
+            record
+                .event_start_time_ms
+                .is_some_and(|start| start > now_ms)
+        })
+        .collect::<Vec<_>>();
+    previous.sort_by_key(|record| std::cmp::Reverse(record.event_end_time_ms.unwrap_or_default()));
+    upcoming.sort_by_key(|record| record.event_start_time_ms.unwrap_or_default());
+
+    let mut selected = previous.into_iter().take(include_prev).collect::<Vec<_>>();
+    selected.reverse();
+    selected.extend(active);
+    selected.extend(upcoming.into_iter().take(include_next));
+    selected
+}
+
+fn parse_gamma_market_record(
+    value: &Value,
+    slug_prefix: &str,
+) -> Option<crate::market_context::MarketContextRecord> {
+    let slug = value.get("slug")?.as_str()?.trim();
+    if !slug.starts_with(slug_prefix) {
+        return None;
+    }
+    let market_id = value
+        .get("id")
+        .or_else(|| value.get("market_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let instrument_ids = parse_gamma_token_ids(
+        value
+            .get("clobTokenIds")
+            .or_else(|| value.get("clobTokenIdsJson"))
+            .or_else(|| value.get("token_ids_json"))
+            .or_else(|| value.get("tokenIds")),
+    );
+    if instrument_ids.len() < 2 {
+        return None;
+    }
+    let start_ms = parse_gamma_time_ms(
+        value
+            .get("event_start_time")
+            .or_else(|| value.get("eventStartTime"))
+            .or_else(|| value.get("startTime"))
+            .or_else(|| value.get("startDate"))
+            .or_else(|| value.get("start_date")),
+    )
+    .or_else(|| parse_start_ms_from_btc_slug(slug));
+    let end_ms = parse_gamma_time_ms(
+        value
+            .get("endDate")
+            .or_else(|| value.get("end_date"))
+            .or_else(|| value.get("endTime"))
+            .or_else(|| value.get("end_time")),
+    )
+    .or_else(|| start_ms.map(|start| start.saturating_add(BTC_5M_WINDOW_MS)));
+    let start_ms = start_ms.or_else(|| end_ms.map(|end| end.saturating_sub(BTC_5M_WINDOW_MS)));
+
+    Some(crate::market_context::MarketContextRecord {
+        market_id: market_id.to_string(),
+        instrument_ids: instrument_ids.into_iter().take(2).collect(),
+        price_to_beat: pick_gamma_f64(value, &["priceToBeat", "price_to_beat"]),
+        final_price: pick_gamma_f64(value, &["finalPrice", "final_price"]),
+        event_start_time_ms: start_ms,
+        event_end_time_ms: end_ms,
+    })
+}
+
+fn parse_gamma_token_ids(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .filter(|item| !item.trim().is_empty())
+            .collect(),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Vec::new();
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return parse_gamma_token_ids(Some(&parsed));
+            }
+            trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_gamma_time_ms(value: Option<&Value>) -> Option<u64> {
+    let raw = value?.as_str()?;
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|ts| ts.with_timezone(&Utc).timestamp_millis().max(0) as u64)
+}
+
+fn parse_start_ms_from_btc_slug(slug: &str) -> Option<u64> {
+    slug.rsplit('-')
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .map(|seconds| seconds.saturating_mul(1_000))
+}
+
+fn pick_gamma_f64(value: &Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| match value.get(*key)? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse::<f64>().ok(),
+        _ => None,
+    })
 }
 
 async fn refresh_dashboard_state(
@@ -4387,12 +4793,10 @@ mod tests {
         .await
         .expect("execute");
 
-        assert!(
-            outcome
-                .commands
-                .iter()
-                .any(|command| matches!(command, RuntimeCommand::Merge(_)))
-        );
+        assert!(outcome
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
         assert_eq!(runtime.status(), RuntimeStatus::Degraded);
         assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
         assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
@@ -5011,7 +5415,7 @@ mod tests {
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.0; // bypass reject for the test
         policy.paper_min_fill_notional_usd = 0.0; // allow tiny initial fill ratio
-        // arrival_ms == now_ms; well within submit-latency window (default 150ms).
+                                                  // arrival_ms == now_ms; well within submit-latency window (default 150ms).
         let mut ctx = PaperOrderContext {
             arrival_ms: now_ms,
             queue_bias: 0.5,
