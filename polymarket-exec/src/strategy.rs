@@ -1476,26 +1476,14 @@ impl Btc5mMmStrategy {
         }
     }
 
-    /// Returns clip-scaling multiplier in [1.0, 2.0] based on recent fill
-    /// activity. Cold start / dry tape → 1.0x baseline (regime gate already
-    /// handles "don't trade dead tape" — no need to scale down further here).
-    /// Hot tape → scale up to compound. Asymmetric on purpose: scaling DOWN
-    /// would compete with the regime gate's job and shrink clips below the
-    /// venue minimum (5 shares = $1-3 notional) where they can't even fit.
-    fn fill_rate_clip_scale(&self, now_ms: EpochMillis) -> f64 {
-        // Snapshot current count without mutating (caller prunes first).
-        let cutoff = now_ms.saturating_sub(Self::FILL_WINDOW_MS);
-        let recent = self
-            .recent_fill_times
-            .iter()
-            .filter(|t| **t >= cutoff)
-            .count();
-        // 0 fills/5min → 1.0x. 10 fills/5min → 2.0x. Linear in between,
-        // capped at 2.0. Tuned for whale-comparable throughput (unlawful
-        // gets ~1-3 fills/min in active periods; we get ~1-5/min when
-        // regime gate lets us trade).
-        let scale = 1.0 + (recent as f64) * 0.1;
-        scale.clamp(1.0, 2.0)
+    /// Returns clip-scaling multiplier — currently HARDCODED to 1.0x
+    /// after 2026-04-27 bleed analysis. The original 1.0x → 2.0x scaling
+    /// compounded both good AND bad fill streaks (asymmetric one-sided
+    /// fills are common in trending tape; scaling up made bleeds bigger).
+    /// Keeping the field for future re-enable when we have separate
+    /// "good fill" detection (paired both legs) vs "bad fill" (one-sided).
+    fn fill_rate_clip_scale(&self, _now_ms: EpochMillis) -> f64 {
+        1.0
     }
 
     pub fn with_defaults() -> Self {
@@ -1566,23 +1554,12 @@ impl Btc5mMmStrategy {
             .map(|r| r.minimum_tick_size)
             .filter(|t| t.is_finite() && *t > 0.0)
             .unwrap_or(self.config.maker_price_tick);
-        // Per-leg adaptive safety_ticks: on the CHEAP leg (mid < 0.30),
-        // sellers are rare and we need queue position 0 (at best_bid) to
-        // catch them. Use safety=1. On the EXPENSIVE leg (mid >= 0.30),
-        // sellers are common (people dumping the favored side) so we can
-        // afford to sit safety=N below the bid for race protection.
-        //
-        // Whale unlawful balances his book by capturing both ends of the
-        // distribution ($0.01 and $0.94 fills both happen). We were missing
-        // the cheap-leg fills because safety=2 placed us 1 tick below
-        // best_bid → behind the queue. This recaptures the cheap leg.
-        let leg_mid = (best_bid + best_ask) * 0.5;
-        let safety = if leg_mid < 0.30 {
-            1.0
-        } else {
-            self.config.maker_safety_ticks
-        };
-        let maker_cap = best_ask - tick * safety;
+        // Reverted adaptive safety after 2026-04-27 bleed analysis.
+        // Adaptive safety=1 on cheap leg got queue position 0 but combined
+        // with extreme-book entries kept filling us on whichever leg was
+        // rallying. Uniform safety_ticks is more defensive: trades a bit
+        // of fill rate for not paying premium prices on rallying leg.
+        let maker_cap = best_ask - tick * self.config.maker_safety_ticks;
         let price = Self::floor_to_tick(best_bid.min(max_bid).min(maker_cap), tick);
         (price >= 0.01 && price < best_ask).then_some(price)
     }
@@ -2183,8 +2160,14 @@ impl Strategy for Btc5mMmStrategy {
                 let trade_count_5m_ok = regime.trade_count_5m >= 30;
                 let vol_5m = regime.realized_vol_5m_bps.unwrap_or(0.0);
                 let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
-                let regime_too_flat = trade_count_5m_ok && vol_5m < 0.1;
-                let regime_too_trending = return_60s > 30.0;
+                // Conservative defaults after 2026-04-27 bleed analysis:
+                // 0.1 was too lax (let entries through in mildly trending
+                // tape that bled). 1.0 only allows clearly active tape.
+                // 30bps return gate also tightened to 15bps — prior
+                // threshold let through markets that were mid-trend and
+                // adversely selected us.
+                let regime_too_flat = trade_count_5m_ok && vol_5m < 1.0;
+                let regime_too_trending = return_60s > 15.0;
                 // Post-fill cooldown: after a recent fill on THIS market,
                 // hold off on re-entering for cooldown_ms × 30. Real failure
                 // mode 2026-04-27 on btc-updown-5m-1777283700: bought 15 Up
@@ -2228,8 +2211,12 @@ impl Strategy for Btc5mMmStrategy {
                 // Skip when either fair_value > 0.85 or < 0.15 — quoting
                 // in those books carries unfavorable mean-reversion EV
                 // for paired-entry MM.
+                // Tightened from 0.85 to 0.65 after 2026-04-27 bleed:
+                // we filled Up at 0.67 in a market that reverted to 0.50,
+                // -$3 unrealized + $27 capital locked. The threshold needs
+                // to be inside the "danger zone" of mean-reversion fills.
                 let max_fair = left_fair.max(right_fair);
-                let too_extreme = max_fair > 0.85;
+                let too_extreme = max_fair > 0.65;
                 if regime_too_flat || regime_too_trending || too_extreme {
                     tracing::info!(
                         target: "strategy.regime_gate",
@@ -5176,15 +5163,20 @@ mod tests {
         config.entry_min_size_multiplier = 1.30;
         let mut strategy = Btc5mMmStrategy::new(config);
         let ctx = context(Vec::new());
-        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.74, 0.76, 10));
+        // Neutral book (0.49/0.51) so price-extremity gate (>0.65) passes.
+        // Original test used 0.74/0.16 which is now (correctly) blocked.
+        // With neutral book min_ref=0.49, required=max(0.01, 5.0, 1.0/0.49)=5.0,
+        // so expected quantity is the venue floor (5.0), not the prior
+        // 6.25 (which came from min_notional_usd / 0.16 cheap leg).
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.49, 0.51, 10));
         let decision =
-            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.16, 0.18, 10));
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.49, 0.51, 10));
 
         assert_eq!(decision.intents.len(), 2);
         assert!(decision
             .intents
             .iter()
-            .all(|intent| (intent.quantity - 6.25).abs() < 1e-9));
+            .all(|intent| (intent.quantity - 5.0).abs() < 1e-9));
     }
 
     #[test]
@@ -5196,12 +5188,15 @@ mod tests {
         config.entry_min_size_multiplier = 1.30;
         let mut strategy = Btc5mMmStrategy::new(config);
         let ctx = context(Vec::new());
-        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.74, 0.76, 10));
+        // Use a near-neutral book (0.49/0.51) instead of extreme (0.74/0.16)
+        // so the new price-extremity gate (max_fair > 0.65) doesn't skip
+        // entry. Test is about clip sizing, not extremity gating.
+        strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.49, 0.51, 10));
         let decision =
-            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.16, 0.18, 10));
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.49, 0.51, 10));
 
         assert_eq!(decision.intents.len(), 2);
-        let expected_qty = 5.20 / 0.74;
+        let expected_qty = 5.20 / 0.49;
         assert!(decision
             .intents
             .iter()
