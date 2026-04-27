@@ -2779,6 +2779,8 @@ async fn execute_execution_adapter(
                         let reason = ack.venue_message.unwrap_or_else(|| {
                             "execution venue rejected merge positions".to_string()
                         });
+                        // Clear dedup so future merges aren't permanently blocked.
+                        runtime.clear_pending_merge(&intent.market_id, ack.accepted_at_ms);
                         metrics.observe_riskoff_transition();
                         let degrade_outcome = runtime.degrade_and_cancel_all(
                             ack.accepted_at_ms,
@@ -2787,6 +2789,11 @@ async fn execute_execution_adapter(
                         stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                     }
                     Err(error) => {
+                        // CRITICAL: clear dedup on BOTH retryable and non-retryable
+                        // failures. Without this, the next reconcile sweep sees the
+                        // stale pending_merge entry and skips the merge — making
+                        // "will retry on next sweep" a lie that strands the market.
+                        runtime.clear_pending_merge(&intent.market_id, observed_at_ms);
                         if error.is_retryable() {
                             warn!(
                                 mode = "live",

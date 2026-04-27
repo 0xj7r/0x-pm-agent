@@ -412,6 +412,25 @@ impl<S: Strategy> Runtime<S> {
         self.venue_market_rules.get(market_id).copied()
     }
 
+    /// Clear the pending-merge dedup entry for a market. Called by the
+    /// runner when a merge submission FAILS (retryable or otherwise) so
+    /// the next reconcile sweep can re-attempt. Without this, a single
+    /// transient merge failure (RPC down, gas issue) permanently blocks
+    /// merging on that market — pending_merge_by_market only got cleared
+    /// on successful fill arrival.
+    pub fn clear_pending_merge(&mut self, market_id: &MarketId, now_ms: EpochMillis) {
+        if self.pending_merge_by_market.remove(market_id).is_some() {
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Execution,
+                    now_ms,
+                    "pending merge cleared (likely after submit failure); next reconcile sweep can retry",
+                )
+                .with_market(market_id.clone()),
+            );
+        }
+    }
+
     pub fn run_id(&self) -> &str {
         self.run_id.as_str()
     }
