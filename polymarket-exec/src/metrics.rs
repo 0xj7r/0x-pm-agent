@@ -82,6 +82,8 @@ pub struct AppMetrics {
     /// here means we're posting but capturing zero of the rebate edge.
     orders_non_scoring_total: IntGauge,
     net_edge_usd_total: Gauge,
+    strategy_events_total: IntCounterVec,
+    strategy_intents_total: IntCounterVec,
     market_last_message_unix_ms: AtomicU64,
     user_last_message_unix_ms: AtomicU64,
     last_reconcile_unix_ms: AtomicU64,
@@ -298,6 +300,20 @@ impl AppMetrics {
         ))?;
         let net_edge_usd_total =
             Gauge::with_opts(Opts::new("net_edge_usd_total", "Net edge in USD"))?;
+        let strategy_events_total = IntCounterVec::new(
+            Opts::new(
+                "strategy_events_total",
+                "Classified strategy/risk events for live attribution",
+            ),
+            &["event"],
+        )?;
+        let strategy_intents_total = IntCounterVec::new(
+            Opts::new(
+                "strategy_intents_total",
+                "Classified strategy intents emitted before execution filtering",
+            ),
+            &["intent"],
+        )?;
 
         registry.register(Box::new(market_ws_connected.clone()))?;
         registry.register(Box::new(user_ws_connected.clone()))?;
@@ -345,6 +361,8 @@ impl AppMetrics {
         registry.register(Box::new(orders_scoring_total.clone()))?;
         registry.register(Box::new(orders_non_scoring_total.clone()))?;
         registry.register(Box::new(net_edge_usd_total.clone()))?;
+        registry.register(Box::new(strategy_events_total.clone()))?;
+        registry.register(Box::new(strategy_intents_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -394,6 +412,8 @@ impl AppMetrics {
             orders_scoring_total,
             orders_non_scoring_total,
             net_edge_usd_total,
+            strategy_events_total,
+            strategy_intents_total,
             market_last_message_unix_ms: AtomicU64::new(0),
             user_last_message_unix_ms: AtomicU64::new(0),
             last_reconcile_unix_ms: AtomicU64::new(0),
@@ -503,6 +523,16 @@ impl AppMetrics {
 
     pub fn observe_riskoff_transition(&self) {
         self.runtime_riskoff_transitions_total.inc();
+    }
+
+    pub fn observe_strategy_event(&self, event: &str) {
+        self.strategy_events_total.with_label_values(&[event]).inc();
+    }
+
+    pub fn observe_strategy_intent(&self, intent: &str) {
+        self.strategy_intents_total
+            .with_label_values(&[intent])
+            .inc();
     }
 
     pub fn record_fill(&self, fill: &FillReport, merge_latency_ms: Option<u64>) {
