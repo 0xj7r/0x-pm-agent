@@ -488,10 +488,54 @@ impl<S: Strategy> Runtime<S> {
              will repopulate it. Until then, fresh entry in drifted markets \
              is gated only by live-mode startup checks, not by drift block."
         );
-        let Some(order_store) = self.order_store.as_mut() else {
+        if self.order_store.is_none() {
             return outcome;
-        };
-        let records = match order_store.list_open() {
+        }
+        let strategy_tag = self.strategy.name().to_string();
+        let strategy_state = self
+            .order_store
+            .as_ref()
+            .expect("checked order_store")
+            .latest_strategy_state(&strategy_tag);
+        match strategy_state {
+            Ok(Some(state)) => match self.strategy.restore_checkpoint_state(&state) {
+                Ok(()) => {
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        format!("restored strategy state strategy={strategy_tag}"),
+                    )));
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        strategy = %strategy_tag,
+                        run_id = %self.run_id,
+                        "failed to restore durable strategy state"
+                    );
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        format!("failed to restore strategy state strategy={strategy_tag}: {error}"),
+                    )));
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    strategy = %strategy_tag,
+                    run_id = %self.run_id,
+                    "failed to load durable strategy state during recovery"
+                );
+            }
+        }
+        let records = match self
+            .order_store
+            .as_mut()
+            .expect("checked order_store")
+            .list_open()
+        {
             Ok(records) => records,
             Err(error) => {
                 warn!(
@@ -531,6 +575,27 @@ impl<S: Strategy> Runtime<S> {
         }
         outcome.extend(self.reconcile_open_orders(now_ms, stale_after_ms));
         outcome
+    }
+
+    pub fn persist_strategy_state(&mut self, observed_at_ms: EpochMillis) {
+        let Some(state) = self.strategy.checkpoint_state() else {
+            return;
+        };
+        let strategy_tag = self.strategy.name().to_string();
+        let run_id = self.run_id.clone();
+        let Some(order_store) = self.order_store.as_mut() else {
+            return;
+        };
+        if let Err(error) =
+            order_store.put_strategy_state(&run_id, &strategy_tag, observed_at_ms, &state)
+        {
+            warn!(
+                error = ?error,
+                strategy = %strategy_tag,
+                run_id = %run_id,
+                "failed to persist strategy state"
+            );
+        }
     }
 
     pub fn reconcile_open_orders(
@@ -3021,6 +3086,10 @@ mod tests {
     };
 
     use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct SingleShotStrategy {
@@ -3055,6 +3124,33 @@ mod tests {
                 pair_id: None,
                 kind: crate::types::IntentKind::Entry,
             })
+        }
+    }
+
+    struct StatefulTestStrategy {
+        restored: Arc<AtomicBool>,
+        state: serde_json::Value,
+    }
+
+    impl Strategy for StatefulTestStrategy {
+        fn name(&self) -> &str {
+            "stateful-test"
+        }
+
+        fn checkpoint_state(&self) -> Option<serde_json::Value> {
+            Some(self.state.clone())
+        }
+
+        fn restore_checkpoint_state(
+            &mut self,
+            state: &serde_json::Value,
+        ) -> std::result::Result<(), String> {
+            if state.get("marker").and_then(|value| value.as_str()) == Some("persisted") {
+                self.restored.store(true, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err("missing persisted marker".to_string())
+            }
         }
     }
 
@@ -4092,6 +4188,66 @@ mod tests {
                 .any(|message| message.contains("fail-closed stale submit state PendingSubmit")),
             "missing fail-closed pending-submit event in {recent_messages:?}"
         );
+    }
+
+    #[test]
+    fn recover_from_store_restores_strategy_checkpoint_state() {
+        let path = std::env::temp_dir().join(format!(
+            "polymarket-exec-recover-strategy-state-{}.sqlite",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let restored = Arc::new(AtomicBool::new(false));
+
+        {
+            let store = SqliteOrderStore::open(path.clone()).expect("open store");
+            let mut runtime = Runtime::new_with_order_store(
+                RuntimeConfig {
+                    starting_cash_usd: 100.0,
+                    event_log_capacity: 128,
+                    initial_status: RuntimeStatus::Running,
+                    ..RuntimeConfig::default()
+                },
+                RiskLimits::default(),
+                StatefulTestStrategy {
+                    restored: restored.clone(),
+                    state: serde_json::json!({"marker": "persisted"}),
+                },
+                MarketContextStore::empty(),
+                Some(Box::new(store)),
+                "run-state-save".to_string(),
+            );
+            runtime.persist_strategy_state(10);
+        }
+
+        let store = SqliteOrderStore::open(path).expect("reopen store");
+        let mut recovered = Runtime::new_with_order_store(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StatefulTestStrategy {
+                restored: restored.clone(),
+                state: serde_json::json!({}),
+            },
+            MarketContextStore::empty(),
+            Some(Box::new(store)),
+            "run-state-restore".to_string(),
+        );
+
+        let outcome = recovered.recover_from_store(20, 5_000);
+        assert!(restored.load(Ordering::SeqCst));
+        assert!(!outcome.event_seqs.is_empty());
+        assert!(recovered
+            .event_log()
+            .recent(8)
+            .iter()
+            .any(|event| event.message.contains("restored strategy state")));
     }
 
     #[test]
