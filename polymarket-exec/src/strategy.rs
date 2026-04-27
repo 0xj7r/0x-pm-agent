@@ -622,6 +622,10 @@ struct Btc5mMmMarketState {
     /// Used to throttle rescue emission so we don't drown the engine's
     /// rate limiter with 85 intents/min on every book tick.
     last_rescue_attempt_ms: Option<EpochMillis>,
+    /// Last time on_fill recorded a fill on this market. Drives the
+    /// post-fill entry cooldown that prevents re-stranding immediately
+    /// after a merge in a trending market.
+    last_fill_ms: Option<EpochMillis>,
 }
 
 #[derive(Debug, Default)]
@@ -2181,6 +2185,33 @@ impl Strategy for Btc5mMmStrategy {
                 let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
                 let regime_too_flat = trade_count_5m_ok && vol_5m < 0.1;
                 let regime_too_trending = return_60s > 30.0;
+                // Post-fill cooldown: after a recent fill on THIS market,
+                // hold off on re-entering for cooldown_ms × 30. Real failure
+                // mode 2026-04-27 on btc-updown-5m-1777283700: bought 15 Up
+                // at \$0.48, asymmetric-rescued via 16.9 Down at \$0.15, merged
+                // 15 paired (\$15 release). Then strategy IMMEDIATELY re-entered
+                // and bought 7 more Up at \$0.36-\$0.42 in the same trending
+                // tape — re-stranded, ~\$16 loss. The first fill being one-sided
+                // is the signal that THIS market is currently flow-asymmetric;
+                // wait for it to balance or rotate to next bar.
+                let post_fill_cooldown_ms = self.config.cooldown_ms.saturating_mul(30);
+                let post_fill_block = self
+                    .market_states
+                    .get(&snapshot.market_id)
+                    .and_then(|state| state.last_fill_ms)
+                    .map(|last| context.now_ms.saturating_sub(last) < post_fill_cooldown_ms)
+                    .unwrap_or(false);
+                if post_fill_block {
+                    return self.no_quote_decision(
+                        &snapshot.market_id,
+                        context.now_ms,
+                        format!(
+                            "post-fill cooldown active (last fill < {}ms ago); skip re-entry",
+                            post_fill_cooldown_ms
+                        ),
+                    );
+                }
+
                 // Price-extremity gate (#PriceExtremity): if the book is
                 // heavily one-sided (e.g. Down at $0.93, Up at $0.07), any
                 // paired bid we post will FILL on the expensive leg first
@@ -2522,6 +2553,15 @@ impl Strategy for Btc5mMmStrategy {
             self.recent_fill_times.push_back(context.now_ms);
             self.prune_fill_window(context.now_ms);
         }
+
+        // Record per-market last-fill timestamp for the post-fill entry
+        // cooldown (avoids re-stranding on the same trending market right
+        // after a successful merge).
+        let market_state_ref = self
+            .market_states
+            .entry(fill.market_id.clone())
+            .or_default();
+        market_state_ref.last_fill_ms = Some(context.now_ms);
 
         // Atomic on-fill rescue: when this fill creates a stranded leg
         // (we now hold side X, side Y is empty), immediately fire the IOC
