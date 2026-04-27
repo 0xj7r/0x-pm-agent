@@ -317,7 +317,7 @@ impl Btc5mMmConfig {
             ),
             min_order_quantity: parse_f64("WHALE_PAIR_BTC_5M_MM_TARGET_MIN_ORDER_QUANTITY", 0.01),
             maker_price_tick: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_PRICE_TICK", 0.01),
-            maker_safety_ticks: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS", 3.0),
+            maker_safety_ticks: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS", 2.0),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
             allow_single_leg_entry: parse_bool(
@@ -2151,15 +2151,15 @@ impl Strategy for Btc5mMmStrategy {
                 // stddev of per-tick log returns in bps. With dense BTC spot
                 // sampling (~10/sec) per-tick returns are tiny (sub-bp), so
                 // a "normal" tape lives in the 0.1-2 bps range. Initial
-                // 5.0 threshold gated 92% of attempts. Lowered to 0.3 — still
-                // skips dead tape but lets normal activity through. The cost
-                // of skipping a good quote is opportunity loss; cost of
-                // bad-regime quoting is realized loss.
+                // 5.0 → 0.3 → 0.1: at 0.3 we still gated ~52% of ticks
+                // (3746 skips/h). Cost of skipping a quote is opportunity
+                // loss; cost of attempting in flat tape is just an
+                // unfilled order (no $ loss, just sits and gets cancelled).
                 let regime = &context.btc_regime;
                 let trade_count_5m_ok = regime.trade_count_5m >= 30;
                 let vol_5m = regime.realized_vol_5m_bps.unwrap_or(0.0);
                 let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
-                let regime_too_flat = trade_count_5m_ok && vol_5m < 0.3;
+                let regime_too_flat = trade_count_5m_ok && vol_5m < 0.1;
                 let regime_too_trending = return_60s > 30.0;
                 if regime_too_flat || regime_too_trending {
                     tracing::info!(
