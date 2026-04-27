@@ -328,10 +328,7 @@ impl QuoteReconciler {
             // churn — it's the response to a rare stranded-leg event. Bypass
             // the rate cap so the rescue actually reaches the venue. Same
             // rationale as the risk-engine cap bypass.
-            let is_rescue = desired_intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+            let is_rescue = desired_intent.kind == crate::types::IntentKind::Close;
             let mut matches = by_key.remove(&key).unwrap_or_default();
             if matches.is_empty() {
                 if is_rescue || self.can_submit(now_ms, planned_submits + 1) {
@@ -505,6 +502,7 @@ mod tests {
             quote_level_tag: Some("lvl-1".to_string()),
             created_at_ms: 1,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         }
     }
 
