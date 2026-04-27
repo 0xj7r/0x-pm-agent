@@ -1090,12 +1090,17 @@ impl<S: Strategy> Runtime<S> {
     }
 
     pub fn start(&mut self, now_ms: EpochMillis) -> RuntimeOutcome {
-        if self.status == RuntimeStatus::Degraded {
+        if matches!(self.status, RuntimeStatus::Degraded | RuntimeStatus::RiskOff) {
             let mut outcome = RuntimeOutcome::default();
+            let message = match self.status {
+                RuntimeStatus::Degraded => "runtime start skipped because runtime is degraded",
+                RuntimeStatus::RiskOff => "runtime start skipped because runtime is risk-off",
+                _ => unreachable!("start guard only handles degraded/risk-off statuses"),
+            };
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Runtime,
                 now_ms,
-                "runtime start skipped because runtime is degraded",
+                message,
             )));
             outcome.push_event(
                 self.event_log
@@ -1692,19 +1697,19 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
-    pub fn degrade_and_cancel_entry_orders(
+    pub fn riskoff_and_cancel_entry_orders(
         &mut self,
         now_ms: EpochMillis,
         reason: impl Into<String>,
     ) -> RuntimeOutcome {
         let reason = reason.into();
         let mut outcome = RuntimeOutcome::default();
-        if self.status != RuntimeStatus::Degraded {
-            self.status = RuntimeStatus::Degraded;
+        if self.status != RuntimeStatus::RiskOff {
+            self.status = RuntimeStatus::RiskOff;
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Runtime,
                 now_ms,
-                format!("runtime degraded: {reason}"),
+                format!("runtime risk-off: {reason}"),
             )));
             outcome.push_event(
                 self.event_log
@@ -3552,7 +3557,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_guard_degrade_cancels_entries_without_canceling_close_orders() {
+    fn capital_guard_riskoff_cancels_entries_without_canceling_close_orders() {
         let mut runtime = Runtime::new(
             RuntimeConfig {
                 starting_cash_usd: 100.0,
@@ -3573,8 +3578,8 @@ mod tests {
         assert_eq!(runtime.accept_intent(entry_order, 1).commands.len(), 1);
         assert_eq!(runtime.accept_intent(close_order, 2).commands.len(), 1);
 
-        let outcome = runtime.degrade_and_cancel_entry_orders(3, "capital guard test");
-        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        let outcome = runtime.riskoff_and_cancel_entry_orders(3, "capital guard test");
+        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
         assert!(outcome.commands.iter().any(|command| matches!(
             command,
             RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &entry_id

@@ -55,6 +55,7 @@ pub enum RuntimeStatus {
     #[default]
     Starting,
     Running,
+    RiskOff,
     Degraded,
     Stopped,
 }
