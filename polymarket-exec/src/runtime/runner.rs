@@ -2692,6 +2692,9 @@ fn classify_runtime_event(message: &str) -> Option<&'static str> {
     if message.contains("runtime degraded") {
         return Some("runtime_degraded");
     }
+    if message.contains("runtime risk-off") {
+        return Some("runtime_riskoff");
+    }
     None
 }
 
@@ -3938,53 +3941,54 @@ fn enforce_live_health(
         .as_ref()
         .and_then(|profile| profile.health.user_ws_stale_ms)
         .unwrap_or(30_000);
-    let mut failures = Vec::new();
+    let mut health_failures = Vec::new();
+    let mut risk_failures = Vec::new();
     if !snapshot.market_ws_connected {
-        failures.push("market websocket disconnected".to_string());
+        health_failures.push("market websocket disconnected".to_string());
     }
     if snapshot.market_last_message_age_ms >= 0.0
         && snapshot.market_last_message_age_ms > market_stale_ms as f64
     {
-        failures.push(format!(
+        health_failures.push(format!(
             "market websocket stale age_ms={:.0} max_ms={market_stale_ms}",
             snapshot.market_last_message_age_ms
         ));
     }
     if !snapshot.user_ws_connected && snapshot.user_last_message_age_ms >= 0.0 {
-        failures.push("user websocket disconnected".to_string());
+        health_failures.push("user websocket disconnected".to_string());
     }
     if snapshot.user_last_message_age_ms >= 0.0
         && snapshot.user_last_message_age_ms > user_stale_ms as f64
     {
-        failures.push(format!(
+        health_failures.push(format!(
             "user websocket stale age_ms={:.0} max_ms={user_stale_ms}",
             snapshot.user_last_message_age_ms
         ));
     }
     if !snapshot.execution_adapter_connected {
-        failures.push("execution adapter disconnected".to_string());
+        health_failures.push("execution adapter disconnected".to_string());
     }
     let free_cash_floor_usd = config
         .risk_limits
         .free_cash_floor_usd(config.starting_cash_usd);
     match live_safety.last_venue_cash_usd {
         Some(cash_usd) if cash_usd < free_cash_floor_usd => {
-            failures.push(format!(
+            risk_failures.push(format!(
                 "venue cash below floor cash={cash_usd:.4} floor={:.4}",
                 free_cash_floor_usd
             ));
         }
         Some(_) => {}
-        None => failures.push("venue balance has not synced".to_string()),
+        None => health_failures.push("venue balance has not synced".to_string()),
     }
     let needs_reconcile = needs_reconcile_order_count(runtime);
     if needs_reconcile > 0 {
-        failures.push(format!(
+        health_failures.push(format!(
             "orders need reconciliation count={needs_reconcile}"
         ));
     }
     if runtime.inventory().gross_exposure_usd() > config.risk_limits.max_gross_notional_usd {
-        failures.push(format!(
+        risk_failures.push(format!(
             "gross exposure exceeded cap exposure={:.4} cap={:.4}",
             runtime.inventory().gross_exposure_usd(),
             config.risk_limits.max_gross_notional_usd
@@ -3996,14 +4000,14 @@ fn enforce_live_health(
         let local_equity_usd =
             runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
         if local_equity_usd < equity_floor_usd {
-            failures.push(format!(
+            risk_failures.push(format!(
                 "local portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
             ));
         }
         if let Some(venue_cash_usd) = live_safety.last_venue_cash_usd {
             let venue_marked_equity_usd = venue_cash_usd + runtime.inventory().gross_exposure_usd();
             if venue_marked_equity_usd < equity_floor_usd {
-                failures.push(format!(
+                risk_failures.push(format!(
                     "venue marked equity below floor equity={venue_marked_equity_usd:.4} floor={equity_floor_usd:.4}"
                 ));
             }
@@ -4011,17 +4015,25 @@ fn enforce_live_health(
     }
     if let Some(path) = config.live_kill_switch_path.as_ref() {
         if path.exists() {
-            failures.push(format!(
+            health_failures.push(format!(
                 "operator kill switch active path={}",
                 path.display()
             ));
         }
     }
 
-    if failures.is_empty() {
+    if health_failures.is_empty() && risk_failures.is_empty() {
         RuntimeOutcome::default()
+    } else if health_failures.is_empty() {
+        metrics.observe_riskoff_transition();
+        runtime.riskoff_and_cancel_entry_orders(
+            now_ms,
+            format!("live risk limit failure: {}", risk_failures.join("; ")),
+        )
     } else {
         metrics.observe_riskoff_transition();
+        let mut failures = health_failures;
+        failures.extend(risk_failures);
         runtime.degrade_and_cancel_all(
             now_ms,
             format!("live health failure: {}", failures.join("; ")),
@@ -4051,7 +4063,7 @@ fn enforce_capital_guard(
     }
 
     metrics.observe_riskoff_transition();
-    runtime.degrade_and_cancel_entry_orders(
+    runtime.riskoff_and_cancel_entry_orders(
         now_ms,
         format!(
             "{mode} capital guard: portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
@@ -5192,7 +5204,7 @@ mod tests {
     }
 
     #[test]
-    fn capital_guard_degrades_runtime_when_marked_equity_breaks_floor() {
+    fn capital_guard_sets_riskoff_when_marked_equity_breaks_floor() {
         let mut runtime = Runtime::new(
             RuntimeConfig {
                 starting_cash_usd: 100.0,
@@ -5247,7 +5259,7 @@ mod tests {
             "paper",
         );
 
-        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
         assert!(!outcome.event_seqs.is_empty());
         assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
     }
