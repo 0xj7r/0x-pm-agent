@@ -2352,7 +2352,80 @@ impl Strategy for Btc5mMmStrategy {
                     }
                 }
             }
-            (true, true) => {}
+            (true, true) => {
+                // ASYMMETRIC RESCUE: both legs have inventory, but if one is
+                // much bigger than the other (e.g. 47 Up + 5 Down because Up
+                // fills kept hitting in a trending market), the merge engine
+                // can only pair MIN(left, right). The EXCESS is stranded and
+                // bleeds at resolution if the favored side loses.
+                //
+                // Real failure mode observed 2026-04-27 on btc-updown-5m-1777282500:
+                // -$20.55 in 30min from 47 stranded Up shares against 5 Down.
+                // Strategy was no-op'ing on (true, true) instead of rescuing.
+                //
+                // Fix: detect imbalance, rescue the excess by lifting the
+                // opposite (under-stocked) leg's ask. Same throttle + race
+                // buffer + venue-min upsize as the (true, false)/(false, true)
+                // rescue path.
+                let imbalance = (left_qty - right_qty).abs();
+                let venue_min = context
+                    .venue_rules
+                    .as_ref()
+                    .map(|r| r.minimum_order_size)
+                    .filter(|m| m.is_finite() && *m > 0.0)
+                    .unwrap_or(self.config.venue_min_order_quantity);
+                if imbalance >= venue_min {
+                    let throttle_ok = self
+                        .market_states
+                        .get(&snapshot.market_id)
+                        .and_then(|state| state.last_rescue_attempt_ms)
+                        .map(|last| {
+                            context.now_ms.saturating_sub(last) >= self.config.cooldown_ms
+                        })
+                        .unwrap_or(true);
+                    let (lift_id, lift_quote, stranded_excess, stranded_avg, side_label) =
+                        if left_qty > right_qty {
+                            // Excess is on left → manufacture more right
+                            (&right_id, &right_quote, left_qty - right_qty, left_avg, "lift_right_ask_asym")
+                        } else {
+                            (&left_id, &left_quote, right_qty - left_qty, right_avg, "lift_left_ask_asym")
+                        };
+                    let intent = if throttle_ok {
+                        self.build_rescue_intent_for_quantity(
+                            &snapshot.market_id,
+                            lift_id,
+                            lift_quote,
+                            stranded_excess,
+                            gross_cost,
+                            context.venue_rules.as_ref(),
+                            "btc-5m-mm asymmetric rescue",
+                            context.now_ms,
+                        )
+                    } else {
+                        None
+                    };
+                    tracing::info!(
+                        target: "strategy.rescue",
+                        market = %snapshot.market_id,
+                        side = side_label,
+                        left_qty,
+                        right_qty,
+                        imbalance,
+                        stranded_avg,
+                        lift_best_ask = ?Self::best_ask(lift_quote),
+                        rescue_profit_per_share = 1.0 - Self::best_ask(lift_quote).unwrap_or(1.0),
+                        throttle_ok,
+                        intent_built = intent.is_some(),
+                        "asymmetric rescue branch entered"
+                    );
+                    if let Some(hedge) = intent {
+                        intents.push(hedge);
+                        if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
+                            state.last_rescue_attempt_ms = Some(context.now_ms);
+                        }
+                    }
+                }
+            }
         }
 
         if intents.is_empty() {
