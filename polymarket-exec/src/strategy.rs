@@ -246,6 +246,15 @@ pub struct Btc5mMmConfig {
     /// rescues with "no orders found to match" 400s. Cheap insurance:
     /// extra cost per share = ticks * tick_size, vs $0.50+ rescue gain.
     pub hedge_rescue_race_buffer_ticks: f64,
+    /// Probability tilt applied to the UP leg's mid per bps of BTC return
+    /// over the last 60s. Lets us bid slightly higher on the leg that's
+    /// becoming favored as spot moves, instead of quoting symmetrically
+    /// around the (laggy) book mid. 0.0 disables. Default kept very mild
+    /// so book signal still dominates.
+    pub momentum_tilt_per_bps: f64,
+    /// Hard cap on the momentum tilt magnitude (in probability units).
+    /// Bounds damage from bad regime data or one-off shocks.
+    pub momentum_max_tilt: f64,
     pub max_gross_cost_usd: f64,
     pub max_leg_cost_usd: f64,
     pub min_edge_bps: f64,
@@ -278,6 +287,14 @@ impl Btc5mMmConfig {
             hedge_rescue_race_buffer_ticks: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_RACE_BUFFER_TICKS",
                 3.0,
+            ),
+            momentum_tilt_per_bps: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MOMENTUM_TILT_PER_BPS",
+                0.0001,
+            ),
+            momentum_max_tilt: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MOMENTUM_MAX_TILT",
+                0.02,
             ),
             max_gross_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_GROSS_COST_USD", 20.0),
             max_leg_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_USD", 10.0),
@@ -315,6 +332,8 @@ impl Btc5mMmConfig {
             liquidity_clip_fraction: config.liquidity_clip_fraction.clamp(0.0, 1.0),
             hedge_rescue_clip_usd: config.hedge_rescue_clip_usd.max(0.01),
             hedge_rescue_race_buffer_ticks: config.hedge_rescue_race_buffer_ticks.clamp(0.0, 20.0),
+            momentum_tilt_per_bps: config.momentum_tilt_per_bps.clamp(0.0, 0.01),
+            momentum_max_tilt: config.momentum_max_tilt.clamp(0.0, 0.10),
             max_gross_cost_usd: config.max_gross_cost_usd.max(0.01),
             max_leg_cost_usd: config.max_leg_cost_usd.max(0.01),
             min_edge_bps: config.min_edge_bps.max(0.0),
@@ -1686,12 +1705,57 @@ impl Btc5mMmStrategy {
         )
     }
 
-    fn fair_values(&self, left: &QuoteSnapshot, right: &QuoteSnapshot) -> Option<(f64, f64)> {
+    fn fair_values(
+        &self,
+        left_id: &InstrumentId,
+        left: &QuoteSnapshot,
+        right_id: &InstrumentId,
+        right: &QuoteSnapshot,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+        market_context: Option<&MarketContextRecord>,
+    ) -> Option<(f64, f64)> {
         let left_mid = (Self::best_bid(left)? + Self::best_ask(left)?) * 0.5;
         let right_mid = (Self::best_bid(right)? + Self::best_ask(right)?) * 0.5;
-        let sum = left_mid + right_mid;
+
+        // Spot momentum tilt: when BTC is moving, the leg whose outcome
+        // benefits should fair higher than the book mid suggests, since
+        // the book lags spot by 50-500ms. Without this we quote symmetrically
+        // around stale mid and get adversely selected on every directional
+        // tick. Strength is intentionally small (so book signal still
+        // dominates) and capped to bound damage from bad data.
+        //
+        // Identify UP leg via gamma's instrument_ids ordering: index 0 is
+        // the YES/UP outcome by Polymarket convention. If we can't identify,
+        // skip the tilt entirely (fall back to pure book mid).
+        let tilt_left = if let (Some(ctx), Some(return_bps)) = (
+            market_context,
+            btc_regime.return_60s_bps,
+        ) {
+            if return_bps.is_finite()
+                && ctx.instrument_ids.len() >= 2
+                && self.config.momentum_tilt_per_bps > 0.0
+            {
+                let up_id = ctx.instrument_ids[0].as_str();
+                let raw = (return_bps * self.config.momentum_tilt_per_bps)
+                    .clamp(-self.config.momentum_max_tilt, self.config.momentum_max_tilt);
+                if up_id == left_id.as_str() {
+                    raw
+                } else if up_id == right_id.as_str() {
+                    -raw
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let left_biased = (left_mid + tilt_left).clamp(0.001, 0.999);
+        let right_biased = (right_mid - tilt_left).clamp(0.001, 0.999);
+        let sum = left_biased + right_biased;
         if sum.is_finite() && sum > 0.0 {
-            Some((left_mid / sum, right_mid / sum))
+            Some((left_biased / sum, right_biased / sum))
         } else {
             None
         }
@@ -2002,7 +2066,14 @@ impl Strategy for Btc5mMmStrategy {
                 ),
             );
         }
-        let Some((left_fair, right_fair)) = self.fair_values(&left_quote, &right_quote) else {
+        let Some((left_fair, right_fair)) = self.fair_values(
+            &left_id,
+            &left_quote,
+            &right_id,
+            &right_quote,
+            &context.btc_regime,
+            context.market_context.as_ref(),
+        ) else {
             return self.no_quote_decision(
                 &snapshot.market_id,
                 context.now_ms,
@@ -4561,6 +4632,8 @@ mod tests {
             liquidity_clip_fraction: 0.02,
             hedge_rescue_clip_usd: 2.50,
             hedge_rescue_race_buffer_ticks: 0.0,
+            momentum_tilt_per_bps: 0.0,
+            momentum_max_tilt: 0.0,
             max_gross_cost_usd: 20.0,
             max_leg_cost_usd: 10.0,
             min_edge_bps: 75.0,
