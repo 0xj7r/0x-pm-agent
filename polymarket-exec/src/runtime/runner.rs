@@ -964,6 +964,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     }
     persist_runtime_outcome(
         &mut journal,
+        metrics.as_ref(),
         runtime.event_log(),
         "startup",
         startup_outcome.clone(),
@@ -1339,6 +1340,7 @@ async fn run_runtime_loop(
                         )?;
                         persist_runtime_outcome(
                             journal,
+                            metrics.as_ref(),
                             runtime.event_log(),
                             "user-ws",
                             user_outcome.clone(),
@@ -1393,6 +1395,7 @@ async fn run_runtime_loop(
                         .await?;
                         persist_runtime_outcome(
                             journal,
+                            metrics.as_ref(),
                             runtime.event_log(),
                             "market-discovery",
                             combined.clone(),
@@ -1459,6 +1462,7 @@ async fn run_runtime_loop(
                             .await?;
                             persist_runtime_outcome(
                                 journal,
+                                metrics.as_ref(),
                                 runtime.event_log(),
                                 "paper-market-close",
                                 combined.clone(),
@@ -1505,6 +1509,7 @@ async fn run_runtime_loop(
                     .await?;
                     persist_runtime_outcome(
                         journal,
+                        metrics.as_ref(),
                         runtime.event_log(),
                         "capital-guard",
                         combined.clone(),
@@ -1539,6 +1544,7 @@ async fn run_runtime_loop(
                         .await?;
                         persist_runtime_outcome(
                             journal,
+                            metrics.as_ref(),
                             runtime.event_log(),
                             "live-health",
                             combined.clone(),
@@ -1598,6 +1604,7 @@ async fn run_runtime_loop(
                             .await?;
                             persist_runtime_outcome(
                                 journal,
+                                metrics.as_ref(),
                                 runtime.event_log(),
                                 "book",
                                 combined.clone(),
@@ -1631,6 +1638,7 @@ async fn run_runtime_loop(
                 }
                 persist_runtime_outcome(
                     journal,
+                    metrics.as_ref(),
                     runtime.event_log(),
                     "reconcile",
                     reconcile_outcome.clone(),
@@ -2591,6 +2599,7 @@ async fn join_task(name: &str, handle: JoinHandle<()>) {
 
 fn persist_runtime_outcome(
     journal: &mut Option<JournalWriter>,
+    metrics: &AppMetrics,
     event_log: &EventLog,
     source: &str,
     outcome: RuntimeOutcome,
@@ -2604,15 +2613,16 @@ fn persist_runtime_outcome(
         );
     }
 
+    let records = if let Some(first_seq) = outcome.event_seqs.first().copied() {
+        event_log.snapshot_since(first_seq.saturating_sub(1))
+    } else {
+        Vec::new()
+    };
+    record_strategy_attribution(metrics, &records, &outcome.commands);
+
     if let Some(writer) = journal.as_mut() {
-        let after_seq = outcome
-            .event_seqs
-            .first()
-            .copied()
-            .unwrap_or_default()
-            .saturating_sub(1);
-        for record in event_log.snapshot_since(after_seq) {
-            writer.append_event(&record)?;
+        for record in &records {
+            writer.append_event(record)?;
         }
         for command in &outcome.commands {
             writer.append_command(command)?;
@@ -2621,6 +2631,82 @@ fn persist_runtime_outcome(
     }
 
     Ok(())
+}
+
+fn record_strategy_attribution(
+    metrics: &AppMetrics,
+    records: &[crate::event_log::EventRecord],
+    commands: &[RuntimeCommand],
+) {
+    for record in records {
+        if let Some(event) = classify_runtime_event(record.message.as_str()) {
+            metrics.observe_strategy_event(event);
+        }
+    }
+    for command in commands {
+        if let Some(intent) = classify_runtime_command(command) {
+            metrics.observe_strategy_intent(intent);
+        }
+    }
+}
+
+fn classify_runtime_event(message: &str) -> Option<&'static str> {
+    if message.contains("entry-fill asymmetry cooldown")
+        || message.contains("asymmetric entry-fill cooldown")
+    {
+        return Some("asym_fill_cooldown");
+    }
+    if message.contains("market mid moved") {
+        return Some("market_mid_trend_gate");
+    }
+    if message.contains("btc regime flat") {
+        return Some("btc_flat_gate");
+    }
+    if message.contains("btc regime trending") {
+        return Some("btc_trend_gate");
+    }
+    if message.contains("premium fair cap") {
+        return Some("premium_fair_gate");
+    }
+    if message.contains("hold stranded positive-asymmetry") {
+        return Some("hold_positive_asym");
+    }
+    if message.contains("rescue stranded leg") {
+        return Some("rescue_ev_selected");
+    }
+    if message.contains("on-fill IOC rescue emitted") {
+        return Some("on_fill_rescue");
+    }
+    if message.contains("on-fill rescue throttled") {
+        return Some("rescue_throttled");
+    }
+    if message.contains("paired entry ladder rejected") {
+        return Some("entry_ladder_rejected");
+    }
+    if message.contains("inventory management rejected") {
+        return Some("inventory_management_rejected");
+    }
+    if message.contains("market context replaced") {
+        return Some("market_rollover");
+    }
+    if message.contains("runtime degraded") {
+        return Some("runtime_degraded");
+    }
+    None
+}
+
+fn classify_runtime_command(command: &RuntimeCommand) -> Option<&'static str> {
+    let RuntimeCommand::Submit(intent) = command else {
+        return None;
+    };
+    match intent.quote_level_tag.as_deref().unwrap_or_default() {
+        tag if tag.starts_with("mm-paired-bid") => Some("paired_ladder"),
+        tag if tag.starts_with("mm-convex-accum") => Some("convex_accum"),
+        tag if tag.starts_with("mm-hedge-rescue") => Some("hedge_rescue"),
+        tag if tag.starts_with("mm-reduce") => Some("reduce_cleanup"),
+        "" => Some("untagged_submit"),
+        _ => Some("other_submit"),
+    }
 }
 
 fn persist_audit_outcome(
