@@ -1823,7 +1823,18 @@ impl<S: Strategy> Runtime<S> {
             );
             return outcome;
         }
+        // Drift block — incident #1 guard. Suppresses FRESH ENTRIES on
+        // markets where local was flat but venue had positions (typically
+        // post-restart before reconcile populated). MUST bypass for rescue
+        // intents: they're close-side operations that manufacture the
+        // missing leg to enable a merge — exactly the OPPOSITE of "fresh
+        // entry". Without this bypass, stranded inventory in drifted
+        // markets sits naked forever (998 rescue intents silently dropped
+        // / 0 hedge-rescue ever appeared at venue in v27 logs over 1h).
+        // Same pattern as the other 4 cap-bypass layers per CLAUDE.md
+        // "Distinguishing entry vs close intents".
         if !intent.reduce_only
+            && !is_rescue_intent
             && self
                 .markets_with_unresolved_drift
                 .contains(&intent.market_id)
