@@ -2103,20 +2103,25 @@ impl Strategy for Btc5mMmStrategy {
                 // in flat/trending regimes; we should too.
                 //
                 // Bad regimes:
-                //   - flat: realized_vol_5m_bps < 5 → no taker flow,
-                //     paired bids sit unfilled, capital tied up
-                //   - trending hard: |return_60s_bps| > 30 → book moves
+                //   - flat: realized_vol_5m_bps < min → no directional flow
+                //     to capture; paired bids sit unfilled, capital tied up
+                //   - trending hard: |return_60s_bps| > max → book moves
                 //     between bid placement and fill, one-leg fills create
                 //     stranded directional exposure
                 //
-                // Both thresholds tuned conservatively. The cost of
-                // skipping a quote is missed opportunity; the cost of
+                // Threshold tuning note (2026-04-27): realized_vol is the
+                // stddev of per-tick log returns in bps. With dense BTC spot
+                // sampling (~10/sec) per-tick returns are tiny (sub-bp), so
+                // a "normal" tape lives in the 0.1-2 bps range. Initial
+                // 5.0 threshold gated 92% of attempts. Lowered to 0.3 — still
+                // skips dead tape but lets normal activity through. The cost
+                // of skipping a good quote is opportunity loss; cost of
                 // bad-regime quoting is realized loss.
                 let regime = &context.btc_regime;
                 let trade_count_5m_ok = regime.trade_count_5m >= 30;
                 let vol_5m = regime.realized_vol_5m_bps.unwrap_or(0.0);
                 let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
-                let regime_too_flat = trade_count_5m_ok && vol_5m < 5.0;
+                let regime_too_flat = trade_count_5m_ok && vol_5m < 0.3;
                 let regime_too_trending = return_60s > 30.0;
                 if regime_too_flat || regime_too_trending {
                     tracing::info!(
