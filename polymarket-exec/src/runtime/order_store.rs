@@ -7,7 +7,8 @@ use rusqlite::{params, types::Type, Connection, OptionalExtension, Row};
 
 use crate::runtime::types::ManagedOrderStatus;
 use crate::types::{
-    ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, TradeSide,
+    ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, RuntimeStatus,
+    TradeSide,
 };
 
 const DUST_REMAINING_QTY: f64 = 0.01;
@@ -180,6 +181,13 @@ pub trait OrderStore {
         &self,
         strategy_tag: &str,
     ) -> std::result::Result<Option<serde_json::Value>, OrderStoreError>;
+    fn put_runtime_status(
+        &mut self,
+        run_id: &str,
+        observed_at_ms: EpochMillis,
+        status: RuntimeStatus,
+    ) -> std::result::Result<(), OrderStoreError>;
+    fn latest_runtime_status(&self) -> std::result::Result<Option<RuntimeStatus>, OrderStoreError>;
 }
 
 #[derive(Debug)]
@@ -333,6 +341,20 @@ impl SqliteOrderStore {
             )
             .map_err(|error| {
                 OrderStoreError::Sqlite(format!("failed to create strategy_state table: {error}"))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS runtime_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    run_id TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    runtime_status TEXT NOT NULL
+                )",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to create runtime_state table: {error}"))
             })?;
 
         for (column, declaration) in [
@@ -980,13 +1002,63 @@ impl OrderStore for SqliteOrderStore {
         })
         .transpose()
     }
+
+    fn put_runtime_status(
+        &mut self,
+        run_id: &str,
+        observed_at_ms: EpochMillis,
+        status: RuntimeStatus,
+    ) -> std::result::Result<(), OrderStoreError> {
+        let status_json = serde_json::to_string(&status).map_err(|error| {
+            OrderStoreError::Serialization(format!("failed to encode runtime status: {error}"))
+        })?;
+        self.connection
+            .execute(
+                "INSERT INTO runtime_state (
+                    id,
+                    run_id,
+                    observed_at_ms,
+                    runtime_status
+                ) VALUES (1, ?1, ?2, ?3)
+                ON CONFLICT(id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    observed_at_ms = excluded.observed_at_ms,
+                    runtime_status = excluded.runtime_status",
+                params![run_id, observed_at_ms as i64, status_json],
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to upsert runtime status: {error}"))
+            })?;
+        Ok(())
+    }
+
+    fn latest_runtime_status(&self) -> std::result::Result<Option<RuntimeStatus>, OrderStoreError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT runtime_status FROM runtime_state WHERE id = 1",
+                (),
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to load runtime status: {error}"))
+            })?;
+        raw.map(|status_json| {
+            serde_json::from_str(&status_json).map_err(|error| {
+                OrderStoreError::Serialization(format!("failed to decode runtime status: {error}"))
+            })
+        })
+        .transpose()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{OrderStore, OrderStoreError, SignalSnapshotRecord, SqliteOrderStore};
     use crate::types::{
-        ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, TradeSide,
+        ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, RuntimeStatus,
+        TradeSide,
     };
 
     use std::env;
@@ -1340,6 +1412,25 @@ mod tests {
         store.put_strategy_state("run-2", "btc_5m_mm", 20, &second)?;
         assert_eq!(store.latest_strategy_state("btc_5m_mm")?, Some(second));
         assert!(store.latest_strategy_state("other")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_status_is_upserted_and_loaded() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("polymarket-exec-runtime-state-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(path)?;
+
+        assert_eq!(store.latest_runtime_status()?, None);
+
+        store.put_runtime_status("run-1", 10, RuntimeStatus::RiskOff)?;
+        assert_eq!(store.latest_runtime_status()?, Some(RuntimeStatus::RiskOff));
+
+        store.put_runtime_status("run-2", 20, RuntimeStatus::Running)?;
+        assert_eq!(store.latest_runtime_status()?, Some(RuntimeStatus::Running));
         Ok(())
     }
 }

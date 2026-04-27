@@ -2731,6 +2731,7 @@ fn persist_runtime_checkpoint(
     name: &str,
 ) -> Result<()> {
     runtime.persist_strategy_state(observed_at_ms);
+    runtime.persist_runtime_status(observed_at_ms);
     if let Some(writer) = journal.as_mut() {
         let open_orders = runtime.open_order_snapshots();
         let open_orders_count = open_orders.len();

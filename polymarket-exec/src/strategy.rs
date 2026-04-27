@@ -665,7 +665,6 @@ impl Btc5mMmMarketState {
             fill_seen,
             self.asymmetric_entry_block_until_ms.unwrap_or_default(),
             self.last_action_ms.unwrap_or_default(),
-            self.last_no_quote_note_ms.unwrap_or_default(),
             self.last_rescue_attempt_ms.unwrap_or_default(),
             self.last_fill_ms.unwrap_or_default(),
         ]
@@ -1618,6 +1617,8 @@ impl Btc5mMmStrategy {
     const LATE_BAR_HOLD_CONFIDENCE_FAIR: f64 = 0.70;
     const MARKET_STATE_TTL_MS: u64 = 6 * 60 * 60 * 1_000;
     const MAX_MARKET_STATES: usize = 512;
+    const PERSISTED_STATE_VERSION: u32 = 1;
+    const MAX_RECENT_FILL_TIMES: usize = 20_000;
 
     pub fn new(config: Btc5mMmConfig) -> Self {
         Self {
@@ -1631,6 +1632,9 @@ impl Btc5mMmStrategy {
     fn prune_fill_window(&mut self, now_ms: EpochMillis) {
         let cutoff = now_ms.saturating_sub(Self::FILL_WINDOW_MS);
         while self.recent_fill_times.front().is_some_and(|t| *t < cutoff) {
+            self.recent_fill_times.pop_front();
+        }
+        while self.recent_fill_times.len() > Self::MAX_RECENT_FILL_TIMES {
             self.recent_fill_times.pop_front();
         }
     }
@@ -1672,7 +1676,7 @@ impl Btc5mMmStrategy {
 
     fn persisted_state(&self) -> Btc5mMmPersistedState {
         Btc5mMmPersistedState {
-            version: 1,
+            version: Self::PERSISTED_STATE_VERSION,
             market_states: self
                 .market_states
                 .iter()
@@ -1731,7 +1735,7 @@ impl Btc5mMmStrategy {
         self.recent_fill_times = persisted
             .recent_fill_times
             .into_iter()
-            .take(Self::MAX_MARKET_STATES)
+            .take(Self::MAX_RECENT_FILL_TIMES)
             .collect();
     }
 
@@ -3530,6 +3534,13 @@ impl Strategy for Btc5mMmStrategy {
     ) -> std::result::Result<(), String> {
         let persisted = serde_json::from_value::<Btc5mMmPersistedState>(state.clone())
             .map_err(|error| format!("failed to decode btc_5m_mm state: {error}"))?;
+        if persisted.version != Self::PERSISTED_STATE_VERSION {
+            return Err(format!(
+                "unsupported btc_5m_mm state version: got {}, expected {}",
+                persisted.version,
+                Self::PERSISTED_STATE_VERSION
+            ));
+        }
         self.restore_persisted_state(persisted);
         Ok(())
     }
@@ -6352,8 +6363,13 @@ mod tests {
         strategy
             .market_states
             .insert(MarketId::from("market-inventory"), inventory_state);
-
         let now_ms = Btc5mMmStrategy::MARKET_STATE_TTL_MS + 10_000;
+        let mut noquote_only_state = Btc5mMmMarketState::default();
+        noquote_only_state.last_no_quote_note_ms = Some(now_ms);
+        strategy
+            .market_states
+            .insert(MarketId::from("noquote-only"), noquote_only_state);
+
         let ctx = context_at(
             vec![PositionState {
                 market_id: MarketId::from("market-inventory"),
@@ -6382,6 +6398,9 @@ mod tests {
         assert!(!strategy
             .market_states
             .contains_key(&MarketId::from("stale-0")));
+        assert!(!strategy
+            .market_states
+            .contains_key(&MarketId::from("noquote-only")));
     }
 
     #[test]
@@ -6430,6 +6449,39 @@ mod tests {
             Btc5mMmMarketMode::Cooling { ref reason, until_ms: Some(90_000) }
                 if reason.contains("asymmetric")
         ));
+    }
+
+    #[test]
+    fn btc_5m_mm_rejects_unknown_checkpoint_version() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let checkpoint = serde_json::json!({
+            "version": Btc5mMmStrategy::PERSISTED_STATE_VERSION + 1,
+            "market_states": [],
+            "recent_fill_times": [],
+        });
+
+        let error = strategy
+            .restore_checkpoint_state(&checkpoint)
+            .expect_err("unknown version must fail closed");
+
+        assert!(error.contains("unsupported btc_5m_mm state version"));
+    }
+
+    #[test]
+    fn btc_5m_mm_restore_recent_fill_times_uses_fill_queue_cap() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let fill_count = Btc5mMmStrategy::MAX_MARKET_STATES + 88;
+        let checkpoint = serde_json::json!({
+            "version": Btc5mMmStrategy::PERSISTED_STATE_VERSION,
+            "market_states": [],
+            "recent_fill_times": (0..fill_count).collect::<Vec<_>>(),
+        });
+
+        strategy
+            .restore_checkpoint_state(&checkpoint)
+            .expect("restore state");
+
+        assert_eq!(strategy.recent_fill_times.len(), fill_count);
     }
 
     #[test]

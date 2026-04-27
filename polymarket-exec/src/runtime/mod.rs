@@ -491,6 +491,33 @@ impl<S: Strategy> Runtime<S> {
         if self.order_store.is_none() {
             return outcome;
         }
+        let runtime_status = self
+            .order_store
+            .as_ref()
+            .expect("checked order_store")
+            .latest_runtime_status();
+        match runtime_status {
+            Ok(Some(RuntimeStatus::RiskOff)) => {
+                self.status = RuntimeStatus::RiskOff;
+                outcome.push_event(self.event_log.push(EventRecord::new(
+                    EventCategory::Runtime,
+                    now_ms,
+                    "restored runtime status from durable store status=RiskOff",
+                )));
+                outcome.push_event(
+                    self.event_log
+                        .push(EventRecord::runtime_status(now_ms, self.status)),
+                );
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    run_id = %self.run_id,
+                    "failed to load durable runtime status during recovery"
+                );
+            }
+        }
         let strategy_tag = self.strategy.name().to_string();
         let strategy_state = self
             .order_store
@@ -516,7 +543,9 @@ impl<S: Strategy> Runtime<S> {
                     outcome.push_event(self.event_log.push(EventRecord::new(
                         EventCategory::Runtime,
                         now_ms,
-                        format!("failed to restore strategy state strategy={strategy_tag}: {error}"),
+                        format!(
+                            "failed to restore strategy state strategy={strategy_tag}: {error}"
+                        ),
                     )));
                 }
             },
@@ -594,6 +623,22 @@ impl<S: Strategy> Runtime<S> {
                 strategy = %strategy_tag,
                 run_id = %run_id,
                 "failed to persist strategy state"
+            );
+        }
+    }
+
+    pub fn persist_runtime_status(&mut self, observed_at_ms: EpochMillis) {
+        let run_id = self.run_id.clone();
+        let status = self.status;
+        let Some(order_store) = self.order_store.as_mut() else {
+            return;
+        };
+        if let Err(error) = order_store.put_runtime_status(&run_id, observed_at_ms, status) {
+            warn!(
+                error = ?error,
+                status = ?status,
+                run_id = %run_id,
+                "failed to persist runtime status"
             );
         }
     }
@@ -1155,7 +1200,10 @@ impl<S: Strategy> Runtime<S> {
     }
 
     pub fn start(&mut self, now_ms: EpochMillis) -> RuntimeOutcome {
-        if matches!(self.status, RuntimeStatus::Degraded | RuntimeStatus::RiskOff) {
+        if matches!(
+            self.status,
+            RuntimeStatus::Degraded | RuntimeStatus::RiskOff
+        ) {
             let mut outcome = RuntimeOutcome::default();
             let message = match self.status {
                 RuntimeStatus::Degraded => "runtime start skipped because runtime is degraded",
@@ -1769,6 +1817,9 @@ impl<S: Strategy> Runtime<S> {
     ) -> RuntimeOutcome {
         let reason = reason.into();
         let mut outcome = RuntimeOutcome::default();
+        // RiskOff is sticky and operator-recovered. The capital guard does
+        // not auto-promote back to Running on a healthy later tick, because
+        // doing so can oscillate the engine after a real equity breach.
         if self.status != RuntimeStatus::RiskOff {
             self.status = RuntimeStatus::RiskOff;
             outcome.push_event(self.event_log.push(EventRecord::new(
@@ -4248,6 +4299,61 @@ mod tests {
             .recent(8)
             .iter()
             .any(|event| event.message.contains("restored strategy state")));
+    }
+
+    #[test]
+    fn recover_from_store_restores_sticky_riskoff_status() {
+        let path = std::env::temp_dir().join(format!(
+            "polymarket-exec-recover-runtime-state-{}.sqlite",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        {
+            let store = SqliteOrderStore::open(path.clone()).expect("open store");
+            let mut runtime = Runtime::new_with_order_store(
+                RuntimeConfig {
+                    starting_cash_usd: 100.0,
+                    event_log_capacity: 128,
+                    initial_status: RuntimeStatus::Running,
+                    ..RuntimeConfig::default()
+                },
+                RiskLimits::default(),
+                SingleShotStrategy { fired: false },
+                MarketContextStore::empty(),
+                Some(Box::new(store)),
+                "run-riskoff-save".to_string(),
+            );
+            runtime.riskoff_and_cancel_entry_orders(10, "test equity floor");
+            runtime.persist_runtime_status(10);
+        }
+
+        let store = SqliteOrderStore::open(path).expect("reopen store");
+        let mut recovered = Runtime::new_with_order_store(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SingleShotStrategy { fired: false },
+            MarketContextStore::empty(),
+            Some(Box::new(store)),
+            "run-riskoff-restore".to_string(),
+        );
+
+        recovered.recover_from_store(20, 5_000);
+        assert_eq!(recovered.status(), RuntimeStatus::RiskOff);
+
+        let start_outcome = recovered.start(30);
+        assert_eq!(recovered.status(), RuntimeStatus::RiskOff);
+        assert!(start_outcome.commands.is_empty());
+        assert!(recovered.event_log().recent(8).iter().any(|event| event
+            .message
+            .contains("restored runtime status from durable store status=RiskOff")));
     }
 
     #[test]
