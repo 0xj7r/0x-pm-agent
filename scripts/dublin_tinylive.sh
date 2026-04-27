@@ -94,14 +94,14 @@ export WHALE_PAIR_PAPER_MODE=false
 unset WHALE_PAIR_EXEC_MODE
 
 # Refresh active markets (initial pull before launch).
-# Single-market focus: only the currently-live 5min bar (no prev/next).
-# Whales like unlawful concentrate capital on 1-2 markets, deploy bigger
-# clips, and earn meaningful per-pair edge. Spreading across 3 markets at
-# $94 capital = $25 per market = below the threshold for meaningful
-# rescue depth-sweep.
+# 3-market focus: prev (resolving) + current (live) + next (opening).
+# Mirrors unlawful_shear's actual subscription pattern (verified via
+# data-api: 500 trades / 10min spread across 3 consecutive bars).
+# At $98 capital with $5 venue minimum per leg = $30/market headroom
+# before any leg blocks on insufficient capital.
 python3 scripts/export_btc_5m_runtime.py \
-  --include-prev 0 \
-  --include-next 0 \
+  --include-prev 1 \
+  --include-next 1 \
   --context-out /tmp/tinylive_ctx.json \
   --env-out /tmp/tinylive_runtime.env > /dev/null
 source /tmp/tinylive_runtime.env
