@@ -1562,7 +1562,23 @@ impl Btc5mMmStrategy {
             .map(|r| r.minimum_tick_size)
             .filter(|t| t.is_finite() && *t > 0.0)
             .unwrap_or(self.config.maker_price_tick);
-        let maker_cap = best_ask - tick * self.config.maker_safety_ticks;
+        // Per-leg adaptive safety_ticks: on the CHEAP leg (mid < 0.30),
+        // sellers are rare and we need queue position 0 (at best_bid) to
+        // catch them. Use safety=1. On the EXPENSIVE leg (mid >= 0.30),
+        // sellers are common (people dumping the favored side) so we can
+        // afford to sit safety=N below the bid for race protection.
+        //
+        // Whale unlawful balances his book by capturing both ends of the
+        // distribution ($0.01 and $0.94 fills both happen). We were missing
+        // the cheap-leg fills because safety=2 placed us 1 tick below
+        // best_bid → behind the queue. This recaptures the cheap leg.
+        let leg_mid = (best_bid + best_ask) * 0.5;
+        let safety = if leg_mid < 0.30 {
+            1.0
+        } else {
+            self.config.maker_safety_ticks
+        };
+        let maker_cap = best_ask - tick * safety;
         let price = Self::floor_to_tick(best_bid.min(max_bid).min(maker_cap), tick);
         (price >= 0.01 && price < best_ask).then_some(price)
     }
