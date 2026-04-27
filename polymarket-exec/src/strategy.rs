@@ -2165,22 +2165,43 @@ impl Strategy for Btc5mMmStrategy {
                 let return_60s = regime.return_60s_bps.unwrap_or(0.0).abs();
                 let regime_too_flat = trade_count_5m_ok && vol_5m < 0.1;
                 let regime_too_trending = return_60s > 30.0;
-                if regime_too_flat || regime_too_trending {
+                // Price-extremity gate (#PriceExtremity): if the book is
+                // heavily one-sided (e.g. Down at $0.93, Up at $0.07), any
+                // paired bid we post will FILL on the expensive leg first
+                // (sellers happy to dump for $0.93) and likely NEVER fill
+                // on the cheap leg (no one wants to sell at $0.07). When
+                // the book reverts to neutral, we're stuck holding overpriced
+                // inventory.
+                //
+                // Real failure mode observed 2026-04-27: market shifted
+                // momentarily to Down=$0.93, we filled 12.77 Down at avg
+                // $0.93, market reverted to $0.525. -$5.23 expected loss
+                // from this one fill. Strategy should have stood down.
+                //
+                // Skip when either fair_value > 0.85 or < 0.15 — quoting
+                // in those books carries unfavorable mean-reversion EV
+                // for paired-entry MM.
+                let max_fair = left_fair.max(right_fair);
+                let too_extreme = max_fair > 0.85;
+                if regime_too_flat || regime_too_trending || too_extreme {
                     tracing::info!(
                         target: "strategy.regime_gate",
                         market = %snapshot.market_id,
                         trade_count_5m = regime.trade_count_5m,
                         realized_vol_5m_bps = vol_5m,
                         return_60s_bps = regime.return_60s_bps,
+                        left_fair,
+                        right_fair,
                         too_flat = regime_too_flat,
                         too_trending = regime_too_trending,
+                        too_extreme,
                         "regime gate: paired entry skipped"
                     );
                     return self.no_quote_decision(
                         &snapshot.market_id,
                         context.now_ms,
                         format!(
-                            "regime gate: vol_5m={vol_5m:.2}bps return_60s={return_60s:.2}bps trades_5m={}",
+                            "regime gate: vol_5m={vol_5m:.2}bps return_60s={return_60s:.2}bps trades_5m={} max_fair={max_fair:.3}",
                             regime.trade_count_5m
                         ),
                     );
