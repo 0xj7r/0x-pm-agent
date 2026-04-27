@@ -970,7 +970,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         startup_outcome.clone(),
     )?;
     persist_audit_outcome(&mut audit, "startup", &runtime, &startup_outcome)?;
-    persist_runtime_checkpoint(&mut journal, &runtime, now_unix_ms(), "startup")?;
+    persist_runtime_checkpoint(&mut journal, &mut runtime, now_unix_ms(), "startup")?;
     let mut effective_user_auth = config.user_auth.clone();
     let execution_adapter: Arc<dyn ExecutionAdapter> = match config.paper_mode {
         true => Arc::new(PaperExecutionAdapter::new()),
@@ -2726,10 +2726,11 @@ fn persist_audit_outcome(
 
 fn persist_runtime_checkpoint(
     journal: &mut Option<JournalWriter>,
-    runtime: &Runtime<StrategyMode>,
+    runtime: &mut Runtime<StrategyMode>,
     observed_at_ms: u64,
     name: &str,
 ) -> Result<()> {
+    runtime.persist_strategy_state(observed_at_ms);
     if let Some(writer) = journal.as_mut() {
         let open_orders = runtime.open_order_snapshots();
         let open_orders_count = open_orders.len();

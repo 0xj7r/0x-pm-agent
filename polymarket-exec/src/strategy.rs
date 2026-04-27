@@ -675,7 +675,7 @@ impl Btc5mMmMarketState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Btc5mMmMarketMode {
     Ready,
     Cooling {
@@ -683,6 +683,28 @@ enum Btc5mMmMarketMode {
         until_ms: Option<EpochMillis>,
     },
     ManagingInventory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Btc5mMmPersistedState {
+    version: u32,
+    market_states: Vec<Btc5mMmPersistedMarketState>,
+    recent_fill_times: Vec<EpochMillis>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Btc5mMmPersistedMarketState {
+    market_id: String,
+    mode: Btc5mMmMarketMode,
+    market_mid_history: Vec<(EpochMillis, f64)>,
+    recent_fills: Vec<(EpochMillis, String, f64)>,
+    asymmetric_entry_block_until_ms: Option<EpochMillis>,
+    last_action_ms: Option<EpochMillis>,
+    last_no_quote_note_ms: Option<EpochMillis>,
+    last_rescue_attempt_ms: Option<EpochMillis>,
+    last_fill_ms: Option<EpochMillis>,
 }
 
 #[derive(Debug, Clone)]
@@ -1432,6 +1454,17 @@ pub trait Strategy {
     ) -> StrategyDecision {
         StrategyDecision::none()
     }
+
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn restore_checkpoint_state(
+        &mut self,
+        _state: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1518,6 +1551,27 @@ impl Strategy for StrategyMode {
             Self::Goat(strategy) => strategy.on_fill(context, fill),
             Self::UnlawfulShear(strategy) => strategy.on_fill(context, fill),
             Self::Noop(strategy) => strategy.on_fill(context, fill),
+        }
+    }
+
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Btc5mMm(strategy) => strategy.checkpoint_state(),
+            Self::Goat(strategy) => strategy.checkpoint_state(),
+            Self::UnlawfulShear(strategy) => strategy.checkpoint_state(),
+            Self::Noop(strategy) => strategy.checkpoint_state(),
+        }
+    }
+
+    fn restore_checkpoint_state(
+        &mut self,
+        state: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        match self {
+            Self::Btc5mMm(strategy) => strategy.restore_checkpoint_state(state),
+            Self::Goat(strategy) => strategy.restore_checkpoint_state(state),
+            Self::UnlawfulShear(strategy) => strategy.restore_checkpoint_state(state),
+            Self::Noop(strategy) => strategy.restore_checkpoint_state(state),
         }
     }
 }
@@ -1614,6 +1668,71 @@ impl Btc5mMmStrategy {
         for (market_id, _) in removable.into_iter().take(overflow) {
             self.market_states.remove(&market_id);
         }
+    }
+
+    fn persisted_state(&self) -> Btc5mMmPersistedState {
+        Btc5mMmPersistedState {
+            version: 1,
+            market_states: self
+                .market_states
+                .iter()
+                .map(|(market_id, state)| Btc5mMmPersistedMarketState {
+                    market_id: market_id.as_str().to_string(),
+                    mode: state.mode.clone(),
+                    market_mid_history: state.market_mid_history.iter().copied().collect(),
+                    recent_fills: state
+                        .recent_fills
+                        .iter()
+                        .map(|(ts, instrument_id, qty)| {
+                            (*ts, instrument_id.as_str().to_string(), *qty)
+                        })
+                        .collect(),
+                    asymmetric_entry_block_until_ms: state.asymmetric_entry_block_until_ms,
+                    last_action_ms: state.last_action_ms,
+                    last_no_quote_note_ms: state.last_no_quote_note_ms,
+                    last_rescue_attempt_ms: state.last_rescue_attempt_ms,
+                    last_fill_ms: state.last_fill_ms,
+                })
+                .collect(),
+            recent_fill_times: self.recent_fill_times.iter().copied().collect(),
+        }
+    }
+
+    fn restore_persisted_state(&mut self, persisted: Btc5mMmPersistedState) {
+        self.market_states.clear();
+        for record in persisted
+            .market_states
+            .into_iter()
+            .filter(|record| !record.market_id.trim().is_empty())
+            .take(Self::MAX_MARKET_STATES)
+        {
+            let market_id = MarketId::from(record.market_id);
+            self.market_states.insert(
+                market_id,
+                Btc5mMmMarketState {
+                    mode: record.mode,
+                    // Quotes are intentionally not persisted: after restart
+                    // the engine must rebuild them from fresh venue books.
+                    quotes: HashMap::new(),
+                    market_mid_history: record.market_mid_history.into_iter().collect(),
+                    recent_fills: record
+                        .recent_fills
+                        .into_iter()
+                        .map(|(ts, instrument_id, qty)| (ts, InstrumentId::from(instrument_id), qty))
+                        .collect(),
+                    asymmetric_entry_block_until_ms: record.asymmetric_entry_block_until_ms,
+                    last_action_ms: record.last_action_ms,
+                    last_no_quote_note_ms: record.last_no_quote_note_ms,
+                    last_rescue_attempt_ms: record.last_rescue_attempt_ms,
+                    last_fill_ms: record.last_fill_ms,
+                },
+            );
+        }
+        self.recent_fill_times = persisted
+            .recent_fill_times
+            .into_iter()
+            .take(Self::MAX_MARKET_STATES)
+            .collect();
     }
 
     /// Returns clip-scaling multiplier — currently HARDCODED to 1.0x
@@ -3399,6 +3518,20 @@ impl Strategy for Btc5mMmStrategy {
         }
 
         StrategyDecision { notes, intents }
+    }
+
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.persisted_state()).ok()
+    }
+
+    fn restore_checkpoint_state(
+        &mut self,
+        state: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        let persisted = serde_json::from_value::<Btc5mMmPersistedState>(state.clone())
+            .map_err(|error| format!("failed to decode btc_5m_mm state: {error}"))?;
+        self.restore_persisted_state(persisted);
+        Ok(())
     }
 }
 
@@ -6249,6 +6382,54 @@ mod tests {
         assert!(!strategy
             .market_states
             .contains_key(&MarketId::from("stale-0")));
+    }
+
+    #[test]
+    fn btc_5m_mm_checkpoint_restores_flow_state_without_stale_quotes() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let mut state = Btc5mMmMarketState::default();
+        state.mode = Btc5mMmMarketMode::Cooling {
+            reason: "asymmetric entry-fill cooldown".to_string(),
+            until_ms: Some(90_000),
+        };
+        state
+            .quotes
+            .insert(InstrumentId::from("up"), snapshot("up", "market-mm", 0.48, 0.52, 10).quote);
+        state.market_mid_history.push_back((10, 0.50));
+        state
+            .recent_fills
+            .push_back((20, InstrumentId::from("up"), 10.0));
+        state.asymmetric_entry_block_until_ms = Some(90_000);
+        state.last_action_ms = Some(30);
+        state.last_no_quote_note_ms = Some(40);
+        state.last_rescue_attempt_ms = Some(50);
+        state.last_fill_ms = Some(60);
+        strategy
+            .market_states
+            .insert(MarketId::from("market-mm"), state);
+        strategy.recent_fill_times.push_back(20);
+
+        let checkpoint = strategy.checkpoint_state().expect("state");
+        let mut restored = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        restored
+            .restore_checkpoint_state(&checkpoint)
+            .expect("restore state");
+
+        let restored_state = restored
+            .market_states
+            .get(&MarketId::from("market-mm"))
+            .expect("market state restored");
+        assert!(restored_state.quotes.is_empty());
+        assert_eq!(restored_state.market_mid_history.len(), 1);
+        assert_eq!(restored_state.recent_fills.len(), 1);
+        assert_eq!(restored_state.asymmetric_entry_block_until_ms, Some(90_000));
+        assert_eq!(restored_state.last_rescue_attempt_ms, Some(50));
+        assert_eq!(restored.recent_fill_times.len(), 1);
+        assert!(matches!(
+            restored_state.mode,
+            Btc5mMmMarketMode::Cooling { ref reason, until_ms: Some(90_000) }
+                if reason.contains("asymmetric")
+        ));
     }
 
     #[test]

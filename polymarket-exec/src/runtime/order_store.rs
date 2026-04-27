@@ -169,6 +169,17 @@ pub trait OrderStore {
         &mut self,
         record: SignalSnapshotRecord,
     ) -> std::result::Result<(), OrderStoreError>;
+    fn put_strategy_state(
+        &mut self,
+        run_id: &str,
+        strategy_tag: &str,
+        observed_at_ms: EpochMillis,
+        payload: &serde_json::Value,
+    ) -> std::result::Result<(), OrderStoreError>;
+    fn latest_strategy_state(
+        &self,
+        strategy_tag: &str,
+    ) -> std::result::Result<Option<serde_json::Value>, OrderStoreError>;
 }
 
 #[derive(Debug)]
@@ -308,6 +319,20 @@ impl SqliteOrderStore {
                 OrderStoreError::Sqlite(format!(
                     "failed to create signal_snapshots market-time index: {error}"
                 ))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS strategy_state (
+                    strategy_tag TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                )",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to create strategy_state table: {error}"))
             })?;
 
         for (column, declaration) in [
@@ -902,6 +927,59 @@ impl OrderStore for SqliteOrderStore {
             })?;
         Ok(())
     }
+
+    fn put_strategy_state(
+        &mut self,
+        run_id: &str,
+        strategy_tag: &str,
+        observed_at_ms: EpochMillis,
+        payload: &serde_json::Value,
+    ) -> std::result::Result<(), OrderStoreError> {
+        let payload_json = serde_json::to_string(payload).map_err(|error| {
+            OrderStoreError::Serialization(format!("failed to encode strategy state: {error}"))
+        })?;
+        self.connection
+            .execute(
+                "INSERT INTO strategy_state (
+                    strategy_tag,
+                    run_id,
+                    observed_at_ms,
+                    payload_json
+                ) VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(strategy_tag) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    observed_at_ms = excluded.observed_at_ms,
+                    payload_json = excluded.payload_json",
+                params![strategy_tag, run_id, observed_at_ms as i64, payload_json],
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to upsert strategy state: {error}"))
+            })?;
+        Ok(())
+    }
+
+    fn latest_strategy_state(
+        &self,
+        strategy_tag: &str,
+    ) -> std::result::Result<Option<serde_json::Value>, OrderStoreError> {
+        let raw = self
+            .connection
+            .query_row(
+                "SELECT payload_json FROM strategy_state WHERE strategy_tag = ?1",
+                params![strategy_tag],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to load strategy state: {error}"))
+            })?;
+        raw.map(|payload_json| {
+            serde_json::from_str(&payload_json).map_err(|error| {
+                OrderStoreError::Serialization(format!("failed to decode strategy state: {error}"))
+            })
+        })
+        .transpose()
+    }
 }
 
 #[cfg(test)]
@@ -1234,6 +1312,34 @@ mod tests {
                     row.get(0)
                 })?;
         assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn strategy_state_is_upserted_and_loaded() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("polymarket-exec-strategy-state-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(path)?;
+
+        assert!(store.latest_strategy_state("btc_5m_mm")?.is_none());
+
+        let first = serde_json::json!({
+            "version": 1,
+            "market_states": [{"market_id": "market-a"}],
+        });
+        store.put_strategy_state("run-1", "btc_5m_mm", 10, &first)?;
+        assert_eq!(store.latest_strategy_state("btc_5m_mm")?, Some(first));
+
+        let second = serde_json::json!({
+            "version": 1,
+            "market_states": [{"market_id": "market-b"}],
+        });
+        store.put_strategy_state("run-2", "btc_5m_mm", 20, &second)?;
+        assert_eq!(store.latest_strategy_state("btc_5m_mm")?, Some(second));
+        assert!(store.latest_strategy_state("other")?.is_none());
         Ok(())
     }
 }
