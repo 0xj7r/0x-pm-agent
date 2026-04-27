@@ -94,14 +94,14 @@ export WHALE_PAIR_PAPER_MODE=false
 unset WHALE_PAIR_EXEC_MODE
 
 # Refresh active markets (initial pull before launch).
-# 3-market focus: prev (resolving) + current (live) + next (opening).
-# Mirrors unlawful_shear's actual subscription pattern (verified via
-# data-api: 500 trades / 10min spread across 3 consecutive bars).
-# At $98 capital with $5 venue minimum per leg = $30/market headroom
-# before any leg blocks on insufficient capital.
+# REVERTED to single-market focus 2026-04-27 after bleed analysis:
+# 3 markets concurrent meant 3x exposure to the trending-tape adverse
+# selection that kept costing us. Single market = focus on cleanest
+# bar (the live one) + lower compound risk surface. Re-enable
+# include-prev/next 1 only after we have per-market trend gating.
 python3 scripts/export_btc_5m_runtime.py \
-  --include-prev 1 \
-  --include-next 1 \
+  --include-prev 0 \
+  --include-next 0 \
   --context-out /tmp/tinylive_ctx.json \
   --env-out /tmp/tinylive_runtime.env > /dev/null
 source /tmp/tinylive_runtime.env
