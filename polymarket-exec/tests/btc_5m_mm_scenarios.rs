@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use polymarket_exec::journal::JournalWriter;
 use polymarket_exec::market_context::MarketContextStore;
@@ -268,6 +268,7 @@ impl FixtureStrategy {
                         quote_level_tag: None,
                         created_at_ms: *at_ms,
                         pair_id: None,
+                        kind: polymarket_exec::types::IntentKind::Entry,
                     })
                     .collect::<Vec<_>>();
                 decisions_by_key.insert((*at_ms, instrument_id.clone()), intents);
@@ -758,8 +759,12 @@ fn run_fixture(name: &str) {
                 let coid = ClientOrderId::from(client_order_id.clone());
                 let outcome = runtime.on_order_cancelled(
                     &coid,
-                    if reason.is_empty() { "scenario cancel" } else { reason.as_str() }
-                        .to_string(),
+                    if reason.is_empty() {
+                        "scenario cancel"
+                    } else {
+                        reason.as_str()
+                    }
+                    .to_string(),
                     *at_ms,
                 );
                 drain_event_log(&runtime, &mut journal, &mut seen_categories, &mut last_seq);
@@ -876,10 +881,12 @@ fn run_fixture(name: &str) {
                 assert_checkpoint(&runtime, &fixture, expected, *at_ms);
                 let checkpoint_line =
                     checkpoint_artifact(&runtime, &format!("{}-{}", fixture.name, at_ms), *at_ms);
-                assert!(checkpoint_line
-                    .as_object()
-                    .unwrap()
-                    .contains_key("inventory_json"));
+                assert!(
+                    checkpoint_line
+                        .as_object()
+                        .unwrap()
+                        .contains_key("inventory_json")
+                );
                 let journal_checkpoint_name = format!("checkpoint-{}-{}", fixture.name, at_ms);
                 let checkpoint_path = journal_path_for_checkpoint(&fixture.name, *at_ms);
                 let mut checkpoint_journal = JournalWriter::open(checkpoint_path)

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -19,6 +19,7 @@ use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::quote_reconciler::ReconcilerConfig;
+use crate::risk::RiskLimits;
 use crate::runtime::audit::AuditWriter;
 use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
@@ -30,8 +31,8 @@ use crate::types::{
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
 use crate::wire::api::{
-    serve_http, DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition,
-    DashboardSnapshot, DashboardUiState,
+    DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition, DashboardSnapshot,
+    DashboardUiState, serve_http,
 };
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -158,9 +159,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
         .filter(|v| !v.trim().is_empty())
         .map(std::path::PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH"
-            )
+            anyhow::anyhow!("WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH")
         })?;
     let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
         let mut p = input_path.clone();
@@ -316,7 +315,10 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
                         runtime.on_order_opened(&intent.client_order_id, record.t);
                     }
                 }
-                RuntimeCommand::Cancel { client_order_id, reason } => {
+                RuntimeCommand::Cancel {
+                    client_order_id,
+                    reason,
+                } => {
                     cancels += 1;
                     paper_order_ctx.remove(&client_order_id);
                     runtime.on_order_cancelled(&client_order_id, reason, record.t);
@@ -433,8 +435,7 @@ async fn run_live_reconcile(config: AppConfig) -> Result<()> {
         "live reconcile balances synced"
     );
 
-    let mut seen_conditions: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen_conditions: std::collections::HashSet<String> = std::collections::HashSet::new();
     for position in &balances.positions {
         let Some(condition_id) = position
             .condition_id
@@ -667,7 +668,12 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
         anyhow::bail!("live redeem blocked by active kill switch");
     }
     let dry_run = std::env::var("WHALE_PAIR_LIVE_REDEEM_DRY_RUN")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes"
+            )
+        })
         .unwrap_or(false);
 
     let adapter = connect_live_adapter(&config).await?;
@@ -706,9 +712,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
 
     info!(
         condition_count = redeemable_by_condition.len(),
-        total_value_usd,
-        dry_run,
-        "live redeem: identified redeemable positions"
+        total_value_usd, dry_run, "live redeem: identified redeemable positions"
     );
     if redeemable_by_condition.is_empty() {
         info!("live redeem: no redeemable positions found; nothing to do");
@@ -775,10 +779,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
 
     info!(
         planned = redeemable_by_condition.len(),
-        submitted,
-        failed,
-        dry_run,
-        "live redeem: complete"
+        submitted, failed, dry_run, "live redeem: complete"
     );
     if failed > 0 && !dry_run {
         anyhow::bail!(
@@ -838,6 +839,12 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     );
     runtime.set_quote_reconciler_config(ReconcilerConfig {
         min_order_age_ms: config.quote_min_order_age.as_millis() as u64,
+        max_churn_per_window: config.quote_max_churn_per_window,
+        churn_window_ms: config.quote_churn_window.as_millis() as u64,
+        hard_pull_ms: config.quote_hard_pull.as_millis() as u64,
+        max_submit_per_window: config.quote_max_submit_per_window,
+        max_replace_per_window: config.quote_max_replace_per_window,
+        max_cancel_per_window: config.quote_max_cancel_per_window,
         ..ReconcilerConfig::default()
     });
     let mut journal = config
@@ -850,19 +857,18 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
         .transpose()?;
-    let mut paper_report: Option<crate::paper::report::PaperReportWriter> =
-        if config.paper_mode {
-            config.paper_report_path.clone().map(|path| {
-                crate::paper::report::PaperReportWriter::new(
-                    runtime.run_id().to_string(),
-                    "paper",
-                    path,
-                    now_unix_ms(),
-                )
-            })
-        } else {
-            None
-        };
+    let mut paper_report: Option<crate::paper::report::PaperReportWriter> = if config.paper_mode {
+        config.paper_report_path.clone().map(|path| {
+            crate::paper::report::PaperReportWriter::new(
+                runtime.run_id().to_string(),
+                "paper",
+                path,
+                now_unix_ms(),
+            )
+        })
+    } else {
+        None
+    };
     let mut book_snapshot: Option<crate::paper::snapshot::BookSnapshotWriter> = config
         .book_snapshot_log_path
         .as_deref()
@@ -1011,11 +1017,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 if notional <= 0.0 {
                     continue;
                 }
-                report.record_whale_fill_observed(
-                    ev.observed_at_ms,
-                    ev.side.as_deref(),
-                    notional,
-                );
+                report.record_whale_fill_observed(ev.observed_at_ms, ev.side.as_deref(), notional);
                 ingested += 1;
             }
             info!(
@@ -1327,6 +1329,39 @@ async fn run_runtime_loop(
                             .await?;
                         }
                     }
+                }
+                let capital_outcome = enforce_capital_guard(
+                    runtime,
+                    metrics.as_ref(),
+                    &config.risk_limits,
+                    config.starting_cash_usd,
+                    now_unix_ms(),
+                    if config.paper_mode { "paper" } else { "live" },
+                );
+                if !capital_outcome.event_seqs.is_empty() || !capital_outcome.commands.is_empty() {
+                    let combined = execute_execution_adapter(
+                        runtime,
+                        books,
+                        &config.market_assets,
+                        paper_fee_coeff,
+                        metrics.as_ref(),
+                        capital_outcome,
+                        paper_order_ctx,
+                        execution_venue_map,
+                        live_safety,
+                        execution_adapter.clone(),
+                        execution_policy,
+                        &mut seen_venue_fill_keys,
+                        paper_report.as_mut(),
+                    )
+                    .await?;
+                    persist_runtime_outcome(
+                        journal,
+                        runtime.event_log(),
+                        "capital-guard",
+                        combined.clone(),
+                    )?;
+                    persist_audit_outcome(audit, "capital-guard", runtime, &combined)?;
                 }
                 if !config.paper_mode {
                     let health_outcome = enforce_live_health(
@@ -2270,9 +2305,9 @@ async fn execute_execution_adapter(
             market_assets,
             report,
             observed_at_ms,
-                            execution_adapter.as_ref(),
+            execution_adapter.as_ref(),
         )
-                            .await;
+        .await;
         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
         let needs_reconcile_quarantine_age_ms = execution_policy
             .live_reconcile_missing_grace_ms
@@ -2438,7 +2473,7 @@ async fn execute_execution_adapter(
                             observed_at_ms,
                             execution_adapter.as_ref(),
                         )
-                            .await;
+                        .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
@@ -2617,7 +2652,7 @@ async fn execute_execution_adapter(
                             observed_at_ms,
                             execution_adapter.as_ref(),
                         )
-                            .await;
+                        .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                     }
                     Ok(ack) => {
@@ -2943,9 +2978,15 @@ fn submit_request_from_intent(
     let (time_in_force, post_only) = if is_hedge_rescue {
         (TimeInForce::Ioc, false)
     } else if live_expires_at_ms.is_some() {
-        (TimeInForce::Gtd, !execution_policy.paper_mode && execution_policy.live_post_only)
+        (
+            TimeInForce::Gtd,
+            !execution_policy.paper_mode && execution_policy.live_post_only,
+        )
     } else {
-        (TimeInForce::Gtc, !execution_policy.paper_mode && execution_policy.live_post_only)
+        (
+            TimeInForce::Gtc,
+            !execution_policy.paper_mode && execution_policy.live_post_only,
+        )
     };
     SubmitOrderRequest {
         client_order_id: intent.client_order_id.clone(),
@@ -3217,10 +3258,7 @@ async fn apply_sync_report(
                                     neg_risk = md.neg_risk,
                                     "cached venue rules for market"
                                 );
-                                runtime.set_venue_market_rules(
-                                    snapshot.market_id.clone(),
-                                    rules,
-                                );
+                                runtime.set_venue_market_rules(snapshot.market_id.clone(), rules);
                             }
                             Err(error) => warn!(
                                 target: "live_reconcile.venue_metadata",
@@ -3434,11 +3472,14 @@ fn enforce_live_health(
     if !snapshot.execution_adapter_connected {
         failures.push("execution adapter disconnected".to_string());
     }
+    let free_cash_floor_usd = config
+        .risk_limits
+        .free_cash_floor_usd(config.starting_cash_usd);
     match live_safety.last_venue_cash_usd {
-        Some(cash_usd) if cash_usd < config.risk_limits.min_free_cash_usd => {
+        Some(cash_usd) if cash_usd < free_cash_floor_usd => {
             failures.push(format!(
                 "venue cash below floor cash={cash_usd:.4} floor={:.4}",
-                config.risk_limits.min_free_cash_usd
+                free_cash_floor_usd
             ));
         }
         Some(_) => {}
@@ -3456,6 +3497,25 @@ fn enforce_live_health(
             runtime.inventory().gross_exposure_usd(),
             config.risk_limits.max_gross_notional_usd
         ));
+    }
+    if let Some(equity_floor_usd) =
+        portfolio_equity_floor_usd(&config.risk_limits, config.starting_cash_usd)
+    {
+        let local_equity_usd =
+            runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
+        if local_equity_usd < equity_floor_usd {
+            failures.push(format!(
+                "local portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
+            ));
+        }
+        if let Some(venue_cash_usd) = live_safety.last_venue_cash_usd {
+            let venue_marked_equity_usd = venue_cash_usd + runtime.inventory().gross_exposure_usd();
+            if venue_marked_equity_usd < equity_floor_usd {
+                failures.push(format!(
+                    "venue marked equity below floor equity={venue_marked_equity_usd:.4} floor={equity_floor_usd:.4}"
+                ));
+            }
+        }
     }
     if let Some(path) = config.live_kill_switch_path.as_ref() {
         if path.exists() {
@@ -3475,6 +3535,40 @@ fn enforce_live_health(
             format!("live health failure: {}", failures.join("; ")),
         )
     }
+}
+
+fn enforce_capital_guard(
+    runtime: &mut Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    risk_limits: &RiskLimits,
+    starting_cash_usd: f64,
+    now_ms: u64,
+    mode: &str,
+) -> RuntimeOutcome {
+    if runtime.status() != RuntimeStatus::Running {
+        return RuntimeOutcome::default();
+    }
+    let Some(equity_floor_usd) = portfolio_equity_floor_usd(risk_limits, starting_cash_usd) else {
+        return RuntimeOutcome::default();
+    };
+
+    let local_equity_usd =
+        runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
+    if local_equity_usd >= equity_floor_usd {
+        return RuntimeOutcome::default();
+    }
+
+    metrics.observe_riskoff_transition();
+    runtime.degrade_and_cancel_all(
+        now_ms,
+        format!(
+            "{mode} capital guard: portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
+        ),
+    )
+}
+
+fn portfolio_equity_floor_usd(risk_limits: &RiskLimits, starting_cash_usd: f64) -> Option<f64> {
+    risk_limits.portfolio_equity_floor_usd(starting_cash_usd)
 }
 
 fn paper_fill_from_book_snapshot(
@@ -3779,10 +3873,7 @@ fn paper_post_only_should_reject(
     if !crossing {
         return false;
     }
-    let roll = deterministic_unit_hash(
-        intent.client_order_id.as_str(),
-        book.last_update_unix_ms,
-    );
+    let roll = deterministic_unit_hash(intent.client_order_id.as_str(), book.last_update_unix_ms);
     roll < execution_policy.paper_post_only_reject_probability
 }
 
@@ -3964,12 +4055,9 @@ mod tests {
 
         assert!(outcome.commands.is_empty());
         assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
-        assert!(runtime
-            .open_order_snapshots()
-            .into_iter()
-            .all(
-                |managed| managed.intent.client_order_id != ClientOrderId::from("client-reconcile")
-            ));
+        assert!(runtime.open_order_snapshots().into_iter().all(|managed| {
+            managed.intent.client_order_id != ClientOrderId::from("client-reconcile")
+        }));
     }
 
     #[tokio::test]
@@ -3998,7 +4086,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_unix_ms(),
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let mut initial_outcome = RuntimeOutcome::default();
         initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
@@ -4299,10 +4387,12 @@ mod tests {
         .await
         .expect("execute");
 
-        assert!(outcome
-            .commands
-            .iter()
-            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
+        assert!(
+            outcome
+                .commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::Merge(_)))
+        );
         assert_eq!(runtime.status(), RuntimeStatus::Degraded);
         assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
         assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
@@ -4563,7 +4653,7 @@ mod tests {
             quote_level_tag: Some("lvl-1:test".to_string()),
             created_at_ms: 10,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let policy = live_test_policy();
         let request = submit_request_from_intent(&intent, 1_000, &policy);
@@ -4589,6 +4679,90 @@ mod tests {
     }
 
     #[test]
+    fn portfolio_equity_floor_uses_stricter_absolute_or_session_loss_floor() {
+        let risk_limits = RiskLimits {
+            min_portfolio_equity_usd: 60.0,
+            max_session_loss_usd: 25.0,
+            ..RiskLimits::default()
+        };
+
+        assert_eq!(portfolio_equity_floor_usd(&risk_limits, 100.0), Some(75.0));
+
+        let risk_limits = RiskLimits {
+            min_portfolio_equity_usd: 90.0,
+            max_session_loss_usd: 25.0,
+            ..RiskLimits::default()
+        };
+
+        assert_eq!(portfolio_equity_floor_usd(&risk_limits, 100.0), Some(90.0));
+        assert_eq!(
+            portfolio_equity_floor_usd(&RiskLimits::default(), 100.0),
+            None
+        );
+    }
+
+    #[test]
+    fn capital_guard_degrades_runtime_when_marked_equity_breaks_floor() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                price: 0.60,
+                quantity: 100.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 1,
+            })
+            .expect("fill");
+        runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: MarketId::from("market-1"),
+                    condition_id: None,
+                    instrument_id: InstrumentId::from("token-1"),
+                    quantity: 100.0,
+                    average_cost_usd: 0.60,
+                    mark_price: Some(0.30),
+                    observed_at_ms: 2,
+                }],
+                2,
+            )
+            .expect("reconcile");
+
+        let metrics = AppMetrics::new().expect("metrics");
+        let outcome = enforce_capital_guard(
+            &mut runtime,
+            &metrics,
+            &RiskLimits {
+                max_session_loss_usd: 20.0,
+                ..RiskLimits::default()
+            },
+            100.0,
+            3,
+            "paper",
+        );
+
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert!(!outcome.event_seqs.is_empty());
+        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
+    }
+
+    #[test]
     fn conservative_paper_fill_does_not_refill_same_book_update() {
         let now_ms = now_unix_ms();
         let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
@@ -4604,7 +4778,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         let mut ctx = PaperOrderContext {
@@ -4656,7 +4830,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let policy = live_test_policy();
         assert!(!paper_post_only_should_reject(&intent, &book, &policy));
@@ -4677,7 +4851,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         assert!(!paper_post_only_should_reject(&intent, &book, &policy));
@@ -4700,7 +4874,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         // probability 1.0 always rejects when crossing
         assert!(paper_post_only_should_reject(&intent, &book, &policy));
@@ -4725,7 +4899,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.5;
@@ -4747,17 +4921,16 @@ mod tests {
         let now_ms = now_unix_ms();
         // Arrival in the past so order is "resting" (past submit-latency).
         let arrival_ms = now_ms - 5_000;
-        let mut book = BookState::from_top_of_book(
-            "token-1",
-            0.42,
-            150.0,
-            0.43,
-            150.0,
-            0.43,
-            now_ms,
-        );
-        book.bids = vec![Level { price: 0.42, size: 150.0 }];
-        book.asks = vec![Level { price: 0.43, size: 150.0 }];
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.42, 150.0, 0.43, 150.0, 0.43, now_ms);
+        book.bids = vec![Level {
+            price: 0.42,
+            size: 150.0,
+        }];
+        book.asks = vec![Level {
+            price: 0.43,
+            size: 150.0,
+        }];
         let intent = OrderIntent {
             client_order_id: ClientOrderId::from("client-resting-maker"),
             market_id: MarketId::from("market-1"),
@@ -4770,7 +4943,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: arrival_ms,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.0; // skip reject path
@@ -4811,17 +4984,16 @@ mod tests {
         // already at 0.43 IS a taker scenario (we crossed at submit time).
         // Fill at best_opposite 0.43 with Taker liquidity.
         let now_ms = now_unix_ms();
-        let mut book = BookState::from_top_of_book(
-            "token-1",
-            0.42,
-            150.0,
-            0.43,
-            150.0,
-            0.43,
-            now_ms,
-        );
-        book.bids = vec![Level { price: 0.42, size: 150.0 }];
-        book.asks = vec![Level { price: 0.43, size: 150.0 }];
+        let mut book =
+            BookState::from_top_of_book("token-1", 0.42, 150.0, 0.43, 150.0, 0.43, now_ms);
+        book.bids = vec![Level {
+            price: 0.42,
+            size: 150.0,
+        }];
+        book.asks = vec![Level {
+            price: 0.43,
+            size: 150.0,
+        }];
         let intent = OrderIntent {
             client_order_id: ClientOrderId::from("client-fresh-taker"),
             market_id: MarketId::from("market-1"),
@@ -4834,7 +5006,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.0; // bypass reject for the test
@@ -4891,7 +5063,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         assert!(
@@ -5019,7 +5191,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: last_update_ms,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "noop",
         );

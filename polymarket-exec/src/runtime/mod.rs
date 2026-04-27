@@ -24,10 +24,10 @@ pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
 use crate::signals::{
-    evaluate_unlawful_mode, BtcRegimeSnapshot as GateBtcRegimeSnapshot,
-    MarketActivitySignal as GateMarketActivitySignal, PairedBookSignal as GatePairedBookSignal,
-    SessionBucket as GateSessionBucket, UnlawfulExecutionMode as GateExecutionMode,
-    UnlawfulGateConfig, UnlawfulGateInputs, UnlawfulSignalSnapshot as GateSignalSnapshot,
+    BtcRegimeSnapshot as GateBtcRegimeSnapshot, MarketActivitySignal as GateMarketActivitySignal,
+    PairedBookSignal as GatePairedBookSignal, SessionBucket as GateSessionBucket,
+    UnlawfulExecutionMode as GateExecutionMode, UnlawfulGateConfig, UnlawfulGateInputs,
+    UnlawfulSignalSnapshot as GateSignalSnapshot, evaluate_unlawful_mode,
 };
 use crate::strategy::{
     BtcRegimeSnapshot as StrategyBtcRegimeSnapshot,
@@ -302,6 +302,7 @@ pub struct Runtime<S: Strategy> {
     strategy: S,
     unlawful_gate_config: Option<UnlawfulGateConfig>,
     inventory: InventoryState,
+    starting_cash_usd: f64,
     risk: RiskEngine,
     event_log: EventLog,
     run_id: String,
@@ -357,6 +358,7 @@ impl<S: Strategy> Runtime<S> {
             strategy,
             unlawful_gate_config,
             inventory: InventoryState::new(config.starting_cash_usd),
+            starting_cash_usd: config.starting_cash_usd,
             risk: RiskEngine::new(risk_limits),
             event_log: EventLog::new(config.event_log_capacity),
             run_id,
@@ -560,9 +562,7 @@ impl<S: Strategy> Runtime<S> {
                     );
                 }
             } else if delta.quantity_delta.abs() < DRIFT_QTY_EPSILON
-                && self
-                    .markets_with_unresolved_drift
-                    .remove(&delta.market_id)
+                && self.markets_with_unresolved_drift.remove(&delta.market_id)
             {
                 self.event_log.push(
                     EventRecord::new(
@@ -678,14 +678,13 @@ impl<S: Strategy> Runtime<S> {
             .filter(|s| s.paired_quantity > 1e-9)
             .map(|s| s.market_id.clone())
             .collect();
-        let mut all_market_ids: std::collections::HashSet<MarketId> =
-            self.inventory.positions().map(|p| p.market_id.clone()).collect();
+        let mut all_market_ids: std::collections::HashSet<MarketId> = self
+            .inventory
+            .positions()
+            .map(|p| p.market_id.clone())
+            .collect();
         for mid in paired_market_ids {
-            outcome.extend(self.plan_merge_command_for_market(
-                &mid,
-                now_ms,
-                "paper market close",
-            ));
+            outcome.extend(self.plan_merge_command_for_market(&mid, now_ms, "paper market close"));
             all_market_ids.remove(&mid);
         }
 
@@ -750,17 +749,15 @@ impl<S: Strategy> Runtime<S> {
             }
         }
 
-        outcome.push_event(
-            self.event_log.push(EventRecord::new(
-                EventCategory::Runtime,
-                now_ms,
-                format!(
-                    "paper market close at_ms={now_ms} resolution_price={:?} \
+        outcome.push_event(self.event_log.push(EventRecord::new(
+            EventCategory::Runtime,
+            now_ms,
+            format!(
+                "paper market close at_ms={now_ms} resolution_price={:?} \
                      (Phase 1 paper env)",
-                    resolution_price
-                ),
-            )),
-        );
+                resolution_price
+            ),
+        )));
 
         outcome
     }
@@ -1915,6 +1912,7 @@ impl<S: Strategy> Runtime<S> {
         let risk_context = RiskContext {
             open_orders_total: self.open_orders.len(),
             open_orders_for_market: self.open_orders_for_market(&intent.market_id),
+            starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
         let decision = self.risk.evaluate(&self.inventory, &intent, &risk_context);
@@ -2946,7 +2944,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: snapshot.quote.observed_at_ms,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             })
         }
     }
@@ -3492,7 +3490,9 @@ mod tests {
             .commands
             .iter()
             .filter_map(|cmd| match cmd {
-                RuntimeCommand::Cancel { client_order_id, .. } => Some(client_order_id),
+                RuntimeCommand::Cancel {
+                    client_order_id, ..
+                } => Some(client_order_id),
                 _ => None,
             })
             .collect();
@@ -3545,7 +3545,9 @@ mod tests {
             .commands
             .iter()
             .filter_map(|cmd| match cmd {
-                RuntimeCommand::Cancel { client_order_id, .. } => Some(client_order_id),
+                RuntimeCommand::Cancel {
+                    client_order_id, ..
+                } => Some(client_order_id),
                 _ => None,
             })
             .collect();
@@ -3578,10 +3580,8 @@ mod tests {
 
         // A SECOND mm-paired-bid on the same instrument is a duplicate and
         // should be rejected — fresh entry accumulation is the failure mode.
-        let duplicate_paired = runtime.accept_intent(
-            btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.45),
-            2,
-        );
+        let duplicate_paired =
+            runtime.accept_intent(btc_mm_intent("market-mm", "down", "mm-paired-bid", 0.45), 2);
         assert!(duplicate_paired.commands.is_empty());
         assert_eq!(runtime.open_orders().count(), 1);
 
@@ -3866,7 +3866,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now_ms,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             },
             "single-shot",
         );

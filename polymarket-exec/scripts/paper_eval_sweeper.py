@@ -682,6 +682,7 @@ def capture_command(args: argparse.Namespace) -> int:
     print("set -a")
     print("source polymarket-exec/env/btc_5m_mm_shadowlive.env")
     print("export WHALE_PAIR_EXEC_STARTING_CASH_USD=1000")
+    print("export WHALE_PAIR_EXEC_MAX_SESSION_LOSS_BPS=500")
     print(f"export WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH={snapshot}")
     print(f"export WHALE_PAIR_PAPER_REPORT_PATH={report}")
     print("set +a")
