@@ -1,6 +1,6 @@
 //! Strategy implementations and decision logic for unlawful_shear and baseline modes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -1444,16 +1444,54 @@ impl Strategy for StrategyMode {
 pub struct Btc5mMmStrategy {
     config: Btc5mMmConfig,
     market_states: HashMap<MarketId, Btc5mMmMarketState>,
+    /// Timestamps of recent fills (any leg, any market). Pruned to the
+    /// last 5 minutes. Drives fill-rate-aware sizing: when fills are coming
+    /// in, scale clip up; when none, scale down. Mirrors how whales
+    /// compound via frequency on rewarding tape.
+    recent_fill_times: VecDeque<EpochMillis>,
 }
 
 impl Btc5mMmStrategy {
     const NO_QUOTE_NOTE_INTERVAL_MS: u64 = 15_000;
+    /// 5-minute rolling window for fill-rate-aware sizing.
+    const FILL_WINDOW_MS: EpochMillis = 5 * 60 * 1_000;
 
     pub fn new(config: Btc5mMmConfig) -> Self {
         Self {
             config,
             market_states: HashMap::new(),
+            recent_fill_times: VecDeque::new(),
         }
+    }
+
+    /// Trim recent_fill_times to the last FILL_WINDOW_MS.
+    fn prune_fill_window(&mut self, now_ms: EpochMillis) {
+        let cutoff = now_ms.saturating_sub(Self::FILL_WINDOW_MS);
+        while self.recent_fill_times.front().is_some_and(|t| *t < cutoff) {
+            self.recent_fill_times.pop_front();
+        }
+    }
+
+    /// Returns clip-scaling multiplier in [1.0, 2.0] based on recent fill
+    /// activity. Cold start / dry tape → 1.0x baseline (regime gate already
+    /// handles "don't trade dead tape" — no need to scale down further here).
+    /// Hot tape → scale up to compound. Asymmetric on purpose: scaling DOWN
+    /// would compete with the regime gate's job and shrink clips below the
+    /// venue minimum (5 shares = $1-3 notional) where they can't even fit.
+    fn fill_rate_clip_scale(&self, now_ms: EpochMillis) -> f64 {
+        // Snapshot current count without mutating (caller prunes first).
+        let cutoff = now_ms.saturating_sub(Self::FILL_WINDOW_MS);
+        let recent = self
+            .recent_fill_times
+            .iter()
+            .filter(|t| **t >= cutoff)
+            .count();
+        // 0 fills/5min → 1.0x. 10 fills/5min → 2.0x. Linear in between,
+        // capped at 2.0. Tuned for whale-comparable throughput (unlawful
+        // gets ~1-3 fills/min in active periods; we get ~1-5/min when
+        // regime gate lets us trade).
+        let scale = 1.0 + (recent as f64) * 0.1;
+        scale.clamp(1.0, 2.0)
     }
 
     pub fn with_defaults() -> Self {
@@ -2160,13 +2198,20 @@ impl Strategy for Btc5mMmStrategy {
                     self.config.min_edge_bps,
                     context.venue_rules.as_ref(),
                 );
+                // Fill-rate-aware sizing (#43): scale base clip by recent
+                // fill activity. Hot tape → bigger clips to compound; dead
+                // tape → smaller clips to preserve capital. Range [0.7x, 2.0x].
+                self.prune_fill_window(context.now_ms);
+                let fill_scale = self.fill_rate_clip_scale(context.now_ms);
+                let scaled_clip = (self.config.base_clip_usd * fill_scale)
+                    .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
                 let Some(entry_quantity) = self.paired_entry_quantity(
                     &snapshot.market_id,
                     &left_quote,
                     &right_quote,
                     left_bid_price.unwrap_or(0.0),
                     right_bid_price.unwrap_or(0.0),
-                    self.config.base_clip_usd,
+                    scaled_clip,
                 ) else {
                     return self.no_quote_decision(
                         &snapshot.market_id,
@@ -2355,6 +2400,14 @@ impl Strategy for Btc5mMmStrategy {
             fill.instrument_id, fill.side, fill.quantity, fill.price
         )];
         let mut intents = Vec::new();
+
+        // Track this fill for fill-rate-aware sizing (#43). Buy-side fills
+        // only — sells (e.g. inventory unwinds) don't count toward the
+        // "are makers being rewarded?" signal we're trying to capture.
+        if matches!(fill.side, TradeSide::Buy) {
+            self.recent_fill_times.push_back(context.now_ms);
+            self.prune_fill_window(context.now_ms);
+        }
 
         // Atomic on-fill rescue: when this fill creates a stranded leg
         // (we now hold side X, side Y is empty), immediately fire the IOC
