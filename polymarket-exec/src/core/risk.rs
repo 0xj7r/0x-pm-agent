@@ -124,10 +124,7 @@ impl RiskEngine {
         // ~30s, and wallet exhaustion is gated upstream by the adapter
         // balance check. Still enforce InvalidOrder above and the
         // sufficient-balance check (rescue can't spend cash we don't have).
-        let is_rescue = order
-            .quote_level_tag
-            .as_deref()
-            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+        let is_rescue = order.kind == crate::types::IntentKind::Close;
 
         let notional = order.notional_usd();
         if !is_rescue && notional > self.limits.max_order_notional_usd {
@@ -310,6 +307,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
 
         let decision = risk.evaluate(

@@ -14,8 +14,8 @@ use crate::market_context::MarketContextRecord;
 use crate::quote_engine::QuoteEngineConfig;
 use crate::signals::UnlawfulGateConfig;
 use crate::types::{
-    BookLevel, ClientOrderId, EpochMillis, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
-    QuoteSnapshot, RuntimeStatus, TradeSide,
+    BookLevel, ClientOrderId, EpochMillis, InstrumentId, IntentKind, MarketId, MarketSnapshot,
+    OrderIntent, QuoteSnapshot, RuntimeStatus, TradeSide,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1841,6 +1841,7 @@ impl Btc5mMmStrategy {
         reduce_only: bool,
         quote_level_tag: String,
         reason: String,
+        kind: IntentKind,
         now_ms: EpochMillis,
     ) -> OrderIntent {
         let client_order_tag = format!("{quote_level_tag}:attempt-{}", now_ms);
@@ -1865,6 +1866,7 @@ impl Btc5mMmStrategy {
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
             pair_id: None,
+            kind,
         }
     }
 
@@ -2002,6 +2004,7 @@ impl Btc5mMmStrategy {
             format!(
                 "{reason_prefix} depth-sweep limit={sweep_price:.4} qty={sweep_qty:.2} notional={notional:.2} levels={depth_levels_swept}"
             ),
+            IntentKind::Close,
             now_ms,
         ))
     }
@@ -2047,6 +2050,7 @@ impl Btc5mMmStrategy {
             format!(
                 "{reason_prefix} fair={fair:.4} bid={bid_price:.4} max_bid={max_bid:.4} leg_cost={leg_cost:.2}"
             ),
+            IntentKind::Entry,
             now_ms,
         ))
     }
@@ -2732,6 +2736,7 @@ impl GoatPairStrategy {
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
             pair_id: None,
+            kind: IntentKind::Entry,
         }
     }
 
@@ -3105,6 +3110,11 @@ impl UnlawfulShearStrategy {
             quote_level_tag: Some(quote_level_tag),
             created_at_ms: now_ms,
             pair_id: None,
+            // unlawful-shear strategy has no rescue intents (whales of this
+            // type unwind via merge of paired buys, not sells). Defensively
+            // tag the rare reduce_only path as Close so caps still bypass
+            // correctly if it ever fires; otherwise Entry.
+            kind: if reduce_only { IntentKind::Close } else { IntentKind::Entry },
         }
     }
 

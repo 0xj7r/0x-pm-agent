@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type EpochMillis = u64;
 
@@ -170,6 +170,30 @@ impl MarketSnapshot {
     }
 }
 
+/// Whether an order intent ADDS exposure (Entry) or REMOVES it (Close).
+///
+/// Per CLAUDE.md "Distinguishing entry vs close intents": entry-time caps
+/// (max_open_orders, max_leg_cost, max_gross_cost, max_submit_per_window,
+/// drift block) prevent accumulation runaway. Close intents must NOT be
+/// trapped in those caps — blocking a close leaves us stuck with the
+/// exact directional exposure the cap was meant to prevent.
+///
+/// This was previously expressed as 5 separate `quote_level_tag.starts_with("mm-hedge-rescue")`
+/// string checks across runtime/mod.rs, core/risk.rs, market_making/quote_reconciler.rs,
+/// strategy.rs, and accept_intent's drift block. Promoted to a typed
+/// enum so any future gate someone adds doesn't silently re-trap rescues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IntentKind {
+    /// Adds exposure: paired-bid maker entries, single-leg accumulations.
+    /// Subject to all entry-time caps.
+    #[default]
+    Entry,
+    /// Removes exposure: hedge rescue (FAK lift opposite leg for merge),
+    /// reduce-only sells. Bypasses entry-time caps because the goal is
+    /// to UNWIND the exposure, not add to it.
+    Close,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct OrderIntent {
     pub client_order_id: ClientOrderId,
@@ -187,6 +211,10 @@ pub struct OrderIntent {
     /// the mate to prevent naked exposure (handoff incident #4 guard).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_id: Option<String>,
+    /// Entry vs close classification. Drives gate behavior — close intents
+    /// bypass entry-time caps. Defaults to Entry for backwards compat.
+    #[serde(default)]
+    pub kind: IntentKind,
 }
 
 impl OrderIntent {

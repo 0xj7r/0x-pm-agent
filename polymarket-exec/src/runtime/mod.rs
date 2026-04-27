@@ -1789,10 +1789,7 @@ impl<S: Strategy> Runtime<S> {
         // existing maker paired-bid on that same instrument — different
         // prices, different intent kind (taker vs maker), different goal.
         // Suppressing them here leaves us stranded long. Bypass for rescue.
-        let is_rescue_intent = intent
-            .quote_level_tag
-            .as_deref()
-            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+        let is_rescue_intent = intent.kind == crate::types::IntentKind::Close;
         if !is_rescue_intent && self.has_active_btc_mm_buy_for_instrument(&intent) {
             outcome.push_event(
                 self.event_log.push(
@@ -2797,6 +2794,19 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn managed_from_checkpoint_order(record: RuntimeCheckpointOrder) -> ManagedOrder {
+        // Old persisted records pre-date IntentKind. Infer from
+        // quote_level_tag for backwards compat: rescue tag → Close,
+        // anything else → Entry.
+        let kind = if record
+            .quote_level_tag
+            .as_deref()
+            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"))
+            || record.reduce_only
+        {
+            crate::types::IntentKind::Close
+        } else {
+            crate::types::IntentKind::Entry
+        };
         ManagedOrder {
             intent: OrderIntent {
                 client_order_id: record.client_order_id,
@@ -2812,6 +2822,7 @@ impl<S: Strategy> Runtime<S> {
                 quote_level_tag: record.quote_level_tag,
                 created_at_ms: record.submitted_at_ms,
                 pair_id: None,
+                kind,
             },
             status: Self::checkpoint_status_from_string(&record.status),
             cumulative_filled_qty: record.filled_qty,
@@ -2825,6 +2836,16 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn managed_from_record(record: OrderRecord) -> ManagedOrder {
+        let kind = if record
+            .quote_level_tag
+            .as_deref()
+            .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"))
+            || record.reduce_only
+        {
+            crate::types::IntentKind::Close
+        } else {
+            crate::types::IntentKind::Entry
+        };
         ManagedOrder {
             intent: OrderIntent {
                 client_order_id: record.client_order_id,
@@ -2838,6 +2859,7 @@ impl<S: Strategy> Runtime<S> {
                 quote_level_tag: record.quote_level_tag,
                 created_at_ms: record.submitted_at_ms,
                 pair_id: None,
+                kind,
             },
             status: record.status,
             cumulative_filled_qty: record.filled_qty,
@@ -2905,6 +2927,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: snapshot.quote.observed_at_ms,
                 pair_id: None,
+            kind: crate::types::IntentKind::Entry,
             })
         }
     }
@@ -3229,6 +3252,7 @@ mod tests {
                 quote_level_tag: Some("fallback-cleanup".to_string()),
                 created_at_ms: 12,
                 pair_id: None,
+            kind: crate::types::IntentKind::Entry,
             },
             12,
         );
@@ -3354,6 +3378,11 @@ mod tests {
     }
 
     fn btc_mm_intent(market_id: &str, instrument_id: &str, level: &str, price: f64) -> OrderIntent {
+        let kind = if level.starts_with("mm-hedge-rescue") {
+            crate::types::IntentKind::Close
+        } else {
+            crate::types::IntentKind::Entry
+        };
         OrderIntent {
             client_order_id: ClientOrderId::from(format!(
                 "btc-5m-mm:{market_id}:{instrument_id}:b:n:{level}:{price:.8}:6.50000000"
@@ -3368,6 +3397,7 @@ mod tests {
             quote_level_tag: Some(level.to_string()),
             created_at_ms: 1,
             pair_id: None,
+            kind,
         }
     }
 
@@ -3817,6 +3847,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: now_ms,
                 pair_id: None,
+            kind: crate::types::IntentKind::Entry,
             },
             "single-shot",
         );

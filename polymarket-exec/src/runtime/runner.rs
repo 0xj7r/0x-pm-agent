@@ -2928,10 +2928,7 @@ fn submit_request_from_intent(
     // Hedge-rescue intents are taker IOC orders that lift the opposite leg
     // to manufacture paired inventory (whales' atomic completion pattern).
     // They MUST cross the book — post-only would defeat the whole purpose.
-    let is_hedge_rescue = intent
-        .quote_level_tag
-        .as_deref()
-        .is_some_and(|tag| tag.starts_with("mm-hedge-rescue"));
+    let is_hedge_rescue = intent.kind == crate::types::IntentKind::Close;
     let live_expires_at_ms = (!execution_policy.paper_mode
         && execution_policy.live_order_ttl_ms > 0
         && !is_hedge_rescue)
@@ -3994,6 +3991,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_unix_ms(),
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let mut initial_outcome = RuntimeOutcome::default();
         initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
@@ -4558,6 +4556,7 @@ mod tests {
             quote_level_tag: Some("lvl-1:test".to_string()),
             created_at_ms: 10,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let policy = live_test_policy();
         let request = submit_request_from_intent(&intent, 1_000, &policy);
@@ -4598,6 +4597,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         let mut ctx = PaperOrderContext {
@@ -4649,6 +4649,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let policy = live_test_policy();
         assert!(!paper_post_only_should_reject(&intent, &book, &policy));
@@ -4669,6 +4670,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         assert!(!paper_post_only_should_reject(&intent, &book, &policy));
@@ -4691,6 +4693,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         // probability 1.0 always rejects when crossing
         assert!(paper_post_only_should_reject(&intent, &book, &policy));
@@ -4715,6 +4718,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1_000,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.5;
@@ -4759,6 +4763,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: arrival_ms,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.0; // skip reject path
@@ -4822,6 +4827,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let mut policy = paper_test_policy();
         policy.paper_post_only_reject_probability = 0.0; // bypass reject for the test
@@ -4878,6 +4884,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: now_ms,
             pair_id: None,
+        kind: crate::types::IntentKind::Entry,
         };
         let policy = paper_test_policy();
         assert!(
@@ -5005,6 +5012,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: last_update_ms,
                 pair_id: None,
+            kind: crate::types::IntentKind::Entry,
             },
             "noop",
         );
