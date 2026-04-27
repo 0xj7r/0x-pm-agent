@@ -52,7 +52,9 @@ export POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com
 export WHALE_PAIR_STRATEGY=btc_5m_mm
 export WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS=2000
 export WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS=25
-export WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS=1
+# Defaults to 3 in strategy now; override only if a market needs tighter
+# (lower) or wider (higher) buffer than 3 ticks against book-move races.
+# 31 paired-bid "crosses book" rejections in 6h on safety=1 motivated bumping.
 export WHALE_PAIR_BTC_5M_MM_BASE_CLIP_USD=1.10
 export WHALE_PAIR_BTC_5M_MM_MIN_CLIP_USD=0.25
 export WHALE_PAIR_BTC_5M_MM_MAX_CLIP_USD=8.0

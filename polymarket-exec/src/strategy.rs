@@ -300,7 +300,7 @@ impl Btc5mMmConfig {
             ),
             min_order_quantity: parse_f64("WHALE_PAIR_BTC_5M_MM_TARGET_MIN_ORDER_QUANTITY", 0.01),
             maker_price_tick: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_PRICE_TICK", 0.01),
-            maker_safety_ticks: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS", 2.0),
+            maker_safety_ticks: parse_f64("WHALE_PAIR_BTC_5M_MM_MAKER_SAFETY_TICKS", 3.0),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
             allow_single_leg_entry: parse_bool(
@@ -1493,14 +1493,20 @@ impl Btc5mMmStrategy {
         deterministic_quote_unit((value / tick).floor() * tick)
     }
 
-    fn maker_bid_price(&self, quote: &QuoteSnapshot, max_bid: f64) -> Option<f64> {
+    fn maker_bid_price(
+        &self,
+        quote: &QuoteSnapshot,
+        max_bid: f64,
+        venue_rules: Option<&VenueMarketRules>,
+    ) -> Option<f64> {
         let best_bid = Self::best_bid(quote)?;
         let best_ask = Self::best_ask(quote)?;
-        let maker_cap = best_ask - self.config.maker_price_tick * self.config.maker_safety_ticks;
-        let price = Self::floor_to_tick(
-            best_bid.min(max_bid).min(maker_cap),
-            self.config.maker_price_tick,
-        );
+        let tick = venue_rules
+            .map(|r| r.minimum_tick_size)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .unwrap_or(self.config.maker_price_tick);
+        let maker_cap = best_ask - tick * self.config.maker_safety_ticks;
+        let price = Self::floor_to_tick(best_bid.min(max_bid).min(maker_cap), tick);
         (price >= 0.01 && price < best_ask).then_some(price)
     }
 
@@ -1664,6 +1670,7 @@ impl Btc5mMmStrategy {
         leg_cost: f64,
         gross_cost: f64,
         edge_bps: f64,
+        venue_rules: Option<&VenueMarketRules>,
     ) -> String {
         let best_bid = Self::best_bid(quote).unwrap_or(0.0);
         let max_bid = deterministic_quote_unit(
@@ -1671,7 +1678,7 @@ impl Btc5mMmStrategy {
                 .clamp(0.0, 0.99),
         );
         let maker_bid = self
-            .maker_bid_price(quote, max_bid)
+            .maker_bid_price(quote, max_bid, venue_rules)
             .map(|price| format!("{price:.4}"))
             .unwrap_or_else(|| "none".to_string());
         format!(
@@ -1713,13 +1720,14 @@ impl Btc5mMmStrategy {
         leg_cost: f64,
         gross_cost: f64,
         edge_bps: f64,
+        venue_rules: Option<&VenueMarketRules>,
     ) -> Option<f64> {
         let best_bid = Self::best_bid(quote)?;
         let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
         if best_bid <= 0.0 || best_bid > max_bid {
             return None;
         }
-        self.maker_bid_price(quote, max_bid)
+        self.maker_bid_price(quote, max_bid, venue_rules)
     }
 
     fn build_order(
@@ -1906,11 +1914,13 @@ impl Btc5mMmStrategy {
         gross_cost: f64,
         quantity: f64,
         edge_bps: f64,
+        venue_rules: Option<&VenueMarketRules>,
         quote_level_tag: &str,
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
-        let bid_price = self.candidate_bid_price(quote, fair, leg_cost, gross_cost, edge_bps)?;
+        let bid_price =
+            self.candidate_bid_price(quote, fair, leg_cost, gross_cost, edge_bps, venue_rules)?;
         let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
         if quantity < self.config.min_order_quantity
             || quantity + 1e-9 < self.config.venue_min_order_quantity
@@ -2064,6 +2074,7 @@ impl Strategy for Btc5mMmStrategy {
                     left_cost,
                     gross_cost,
                     self.config.min_edge_bps,
+                    context.venue_rules.as_ref(),
                 );
                 let right_bid_price = self.candidate_bid_price(
                     &right_quote,
@@ -2071,6 +2082,7 @@ impl Strategy for Btc5mMmStrategy {
                     right_cost,
                     gross_cost,
                     self.config.min_edge_bps,
+                    context.venue_rules.as_ref(),
                 );
                 let Some(entry_quantity) = self.paired_entry_quantity(
                     &snapshot.market_id,
@@ -2097,6 +2109,7 @@ impl Strategy for Btc5mMmStrategy {
                     gross_cost,
                     entry_quantity,
                     self.config.min_edge_bps,
+                    context.venue_rules.as_ref(),
                     "mm-paired-bid",
                     "btc-5m-mm paired bid",
                     context.now_ms,
@@ -2110,6 +2123,7 @@ impl Strategy for Btc5mMmStrategy {
                     gross_cost,
                     entry_quantity,
                     self.config.min_edge_bps,
+                    context.venue_rules.as_ref(),
                     "mm-paired-bid",
                     "btc-5m-mm paired bid",
                     context.now_ms,
@@ -2140,7 +2154,8 @@ impl Strategy for Btc5mMmStrategy {
                                     left_fair,
                                     left_cost,
                                     gross_cost,
-                                    self.config.min_edge_bps
+                                    self.config.min_edge_bps,
+                                    context.venue_rules.as_ref(),
                                 ),
                                 right_id,
                                 self.bid_health(
@@ -2148,7 +2163,8 @@ impl Strategy for Btc5mMmStrategy {
                                     right_fair,
                                     right_cost,
                                     gross_cost,
-                                    self.config.min_edge_bps
+                                    self.config.min_edge_bps,
+                                    context.venue_rules.as_ref(),
                                 ),
                                 self.config.allow_single_leg_entry
                             ),
@@ -2226,7 +2242,8 @@ impl Strategy for Btc5mMmStrategy {
                         left_fair,
                         left_cost,
                         gross_cost,
-                        self.config.hedge_rescue_edge_bps
+                        self.config.hedge_rescue_edge_bps,
+                        context.venue_rules.as_ref(),
                     ),
                     right_id,
                     self.bid_health(
@@ -2234,7 +2251,8 @@ impl Strategy for Btc5mMmStrategy {
                         right_fair,
                         right_cost,
                         gross_cost,
-                        self.config.hedge_rescue_edge_bps
+                        self.config.hedge_rescue_edge_bps,
+                        context.venue_rules.as_ref(),
                     ),
                 ),
             );
