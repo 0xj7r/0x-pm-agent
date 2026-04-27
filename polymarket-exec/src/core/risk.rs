@@ -11,6 +11,11 @@ pub struct RiskLimits {
     pub max_net_notional_per_market_usd: f64,
     pub max_position_quantity_per_instrument: f64,
     pub min_free_cash_usd: f64,
+    pub min_free_cash_bps: f64,
+    pub min_portfolio_equity_usd: f64,
+    pub min_portfolio_equity_bps: f64,
+    pub max_session_loss_usd: f64,
+    pub max_session_loss_bps: f64,
     pub max_open_orders_total: usize,
     pub max_open_orders_per_market: usize,
 }
@@ -23,16 +28,50 @@ impl Default for RiskLimits {
             max_net_notional_per_market_usd: 500.0,
             max_position_quantity_per_instrument: 10_000.0,
             min_free_cash_usd: 0.0,
+            min_free_cash_bps: 0.0,
+            min_portfolio_equity_usd: 0.0,
+            min_portfolio_equity_bps: 0.0,
+            max_session_loss_usd: 0.0,
+            max_session_loss_bps: 0.0,
             max_open_orders_total: 32,
             max_open_orders_per_market: 8,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+impl RiskLimits {
+    pub fn free_cash_floor_usd(&self, starting_cash_usd: f64) -> f64 {
+        let bps_floor = if self.min_free_cash_bps > 0.0 && starting_cash_usd > 0.0 {
+            starting_cash_usd * (self.min_free_cash_bps / 10_000.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.min_free_cash_usd.max(bps_floor).max(0.0)
+    }
+
+    pub fn portfolio_equity_floor_usd(&self, starting_cash_usd: f64) -> Option<f64> {
+        let mut floor = self.min_portfolio_equity_usd.max(0.0);
+        if self.min_portfolio_equity_bps > 0.0 && starting_cash_usd > 0.0 {
+            floor = floor.max(
+                starting_cash_usd * (self.min_portfolio_equity_bps / 10_000.0).clamp(0.0, 1.0),
+            );
+        }
+        if self.max_session_loss_usd > 0.0 && starting_cash_usd > 0.0 {
+            floor = floor.max(starting_cash_usd - self.max_session_loss_usd);
+        }
+        if self.max_session_loss_bps > 0.0 && starting_cash_usd > 0.0 {
+            let loss_fraction = (self.max_session_loss_bps / 10_000.0).clamp(0.0, 1.0);
+            floor = floor.max(starting_cash_usd * (1.0 - loss_fraction));
+        }
+        (floor > 0.0).then_some(floor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RiskContext {
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
+    pub starting_cash_usd: f64,
     pub now_ms: EpochMillis,
 }
 
@@ -43,6 +82,7 @@ pub enum RiskRejectReason {
     GrossExposureTooLarge,
     MarketNetExposureTooLarge,
     FreeCashTooLow,
+    PortfolioEquityTooLow,
     PositionQuantityTooLarge,
     TooManyOpenOrders,
     TooManyOpenOrdersForMarket,
@@ -126,6 +166,26 @@ impl RiskEngine {
         // sufficient-balance check (rescue can't spend cash we don't have).
         let is_rescue = order.kind == crate::types::IntentKind::Close;
 
+        let portfolio_equity_usd = inventory.total_cash_usd() + inventory.gross_exposure_usd();
+        let equity_floor_usd = self
+            .limits
+            .portfolio_equity_floor_usd(context.starting_cash_usd);
+        if !is_rescue && equity_floor_usd.is_some_and(|floor| portfolio_equity_usd < floor) {
+            let floor = equity_floor_usd.unwrap_or_default();
+            return self.reject(
+                RiskRejectReason::PortfolioEquityTooLow,
+                context.now_ms.max(order.created_at_ms),
+                inventory.free_cash_usd(),
+                inventory.gross_exposure_usd(),
+                inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
+                format!(
+                    "portfolio equity below floor equity={portfolio_equity_usd:.4} floor={floor:.4}"
+                ),
+            );
+        }
+
         let notional = order.notional_usd();
         if !is_rescue && notional > self.limits.max_order_notional_usd {
             return self.reject(
@@ -198,7 +258,8 @@ impl RiskEngine {
             TradeSide::Buy => inventory.free_cash_usd() - notional,
             TradeSide::Sell => inventory.free_cash_usd(),
         };
-        if projected_free_cash_usd < self.limits.min_free_cash_usd {
+        let free_cash_floor_usd = self.limits.free_cash_floor_usd(context.starting_cash_usd);
+        if projected_free_cash_usd < free_cash_floor_usd {
             return self.reject(
                 RiskRejectReason::FreeCashTooLow,
                 context.now_ms.max(order.created_at_ms),
@@ -207,7 +268,9 @@ impl RiskEngine {
                 inventory
                     .net_exposure_for_market_usd(&order.market_id)
                     .abs(),
-                "projected free cash falls below min_free_cash_usd",
+                format!(
+                    "projected free cash falls below floor cash={projected_free_cash_usd:.4} floor={free_cash_floor_usd:.4}"
+                ),
             );
         }
 
@@ -307,7 +370,7 @@ mod tests {
             quote_level_tag: None,
             created_at_ms: 1,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         };
 
         let decision = risk.evaluate(
@@ -323,6 +386,90 @@ mod tests {
         assert_eq!(
             decision.reject_reason,
             Some(RiskRejectReason::FreeCashTooLow)
+        );
+    }
+
+    #[test]
+    fn free_cash_floor_uses_stricter_absolute_or_bps_floor() {
+        let limits = RiskLimits {
+            min_free_cash_usd: 5.0,
+            min_free_cash_bps: 1_500.0,
+            ..RiskLimits::default()
+        };
+
+        assert_eq!(limits.free_cash_floor_usd(30.0), 5.0);
+        assert_eq!(limits.free_cash_floor_usd(100.0), 15.0);
+        assert_eq!(limits.free_cash_floor_usd(1_000.0), 150.0);
+    }
+
+    #[test]
+    fn portfolio_equity_floor_supports_session_loss_bps() {
+        let limits = RiskLimits {
+            max_session_loss_bps: 2_500.0,
+            ..RiskLimits::default()
+        };
+
+        assert_eq!(limits.portfolio_equity_floor_usd(100.0), Some(75.0));
+        assert_eq!(limits.portfolio_equity_floor_usd(1_000.0), Some(750.0));
+    }
+
+    #[test]
+    fn rejects_entry_when_session_loss_floor_is_breached() {
+        let mut inventory = InventoryState::new(100.0);
+        inventory
+            .apply_fill(&crate::types::FillReport {
+                order_id: None,
+                client_order_id: Some(ClientOrderId::from("fill-1")),
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("token-1"),
+                side: TradeSide::Buy,
+                price: 0.60,
+                quantity: 100.0,
+                fee_usd: 0.0,
+                liquidity: crate::types::FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 1,
+            })
+            .expect("apply fill");
+        inventory.mark_price(
+            &MarketId::from("market-1"),
+            &InstrumentId::from("token-1"),
+            0.30,
+            2,
+        );
+        let risk = RiskEngine::new(RiskLimits {
+            max_session_loss_usd: 20.0,
+            ..RiskLimits::default()
+        });
+        let order = OrderIntent {
+            client_order_id: ClientOrderId::from("order-2"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.4,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test".into(),
+            quote_level_tag: None,
+            created_at_ms: 3,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+
+        let decision = risk.evaluate(
+            &inventory,
+            &order,
+            &RiskContext {
+                starting_cash_usd: 100.0,
+                now_ms: 4,
+                ..RiskContext::default()
+            },
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.reject_reason,
+            Some(RiskRejectReason::PortfolioEquityTooLow)
         );
     }
 }

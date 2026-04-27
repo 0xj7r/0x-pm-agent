@@ -90,6 +90,12 @@ pub struct AppConfig {
     pub live_order_max_age: Duration,
     pub live_reconcile_missing_grace: Duration,
     pub quote_min_order_age: Duration,
+    pub quote_churn_window: Duration,
+    pub quote_hard_pull: Duration,
+    pub quote_max_churn_per_window: usize,
+    pub quote_max_submit_per_window: usize,
+    pub quote_max_replace_per_window: usize,
+    pub quote_max_cancel_per_window: usize,
     pub live_max_submit_errors: usize,
     pub live_max_cancel_errors: usize,
     pub live_kill_on_reconcile_mismatch: bool,
@@ -250,13 +256,11 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .map(|value| {
-                value
-                    .parse::<u64>()
-                    .with_context(|| {
-                        format!(
-                            "failed to parse WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES as u64 from `{value}`"
-                        )
-                    })
+                value.parse::<u64>().with_context(|| {
+                    format!(
+                        "failed to parse WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES as u64 from `{value}`"
+                    )
+                })
             })
             .transpose()?;
         let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
@@ -290,6 +294,31 @@ impl AppConfig {
                 profile_inventory.and_then(|profile| profile.min_free_cash_usd),
                 0.0,
             )?,
+            min_free_cash_bps: parse_f64_or_profile(
+                "WHALE_PAIR_EXEC_MIN_FREE_CASH_BPS",
+                profile_inventory.and_then(|profile| profile.min_free_cash_bps),
+                0.0,
+            )?,
+            min_portfolio_equity_usd: parse_f64_or_profile(
+                "WHALE_PAIR_EXEC_MIN_PORTFOLIO_EQUITY_USD",
+                profile_inventory.and_then(|profile| profile.min_portfolio_equity_usd),
+                0.0,
+            )?,
+            min_portfolio_equity_bps: parse_f64_or_profile(
+                "WHALE_PAIR_EXEC_MIN_PORTFOLIO_EQUITY_BPS",
+                profile_inventory.and_then(|profile| profile.min_portfolio_equity_bps),
+                0.0,
+            )?,
+            max_session_loss_usd: parse_f64_or_profile(
+                "WHALE_PAIR_EXEC_MAX_SESSION_LOSS_USD",
+                profile_inventory.and_then(|profile| profile.max_session_loss_usd),
+                0.0,
+            )?,
+            max_session_loss_bps: parse_f64_or_profile(
+                "WHALE_PAIR_EXEC_MAX_SESSION_LOSS_BPS",
+                profile_inventory.and_then(|profile| profile.max_session_loss_bps),
+                0.0,
+            )?,
             max_open_orders_total: parse_usize_or_profile(
                 "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL",
                 profile_inventory.and_then(|profile| profile.max_open_orders_total),
@@ -318,6 +347,14 @@ impl AppConfig {
             "WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS",
             quote_min_order_age_default_ms,
         )?;
+        let quote_churn_window = parse_duration_ms("WHALE_PAIR_QUOTE_CHURN_WINDOW_MS", 20_000)?;
+        let quote_hard_pull = parse_duration_ms("WHALE_PAIR_QUOTE_HARD_PULL_MS", 5_000)?;
+        let quote_max_churn_per_window = parse_usize("WHALE_PAIR_QUOTE_MAX_CHURN_PER_WINDOW", 12)?;
+        let quote_max_submit_per_window = parse_usize("WHALE_PAIR_QUOTE_MAX_SUBMIT_PER_WINDOW", 6)?;
+        let quote_max_replace_per_window =
+            parse_usize("WHALE_PAIR_QUOTE_MAX_REPLACE_PER_WINDOW", 4)?;
+        let quote_max_cancel_per_window =
+            parse_usize("WHALE_PAIR_QUOTE_MAX_CANCEL_PER_WINDOW", 12)?;
         let live_max_submit_errors = parse_usize("WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS", 1)?;
         let live_max_cancel_errors = parse_usize("WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS", 1)?;
         let live_kill_on_reconcile_mismatch =
@@ -332,11 +369,9 @@ impl AppConfig {
             .ok()
             .filter(|v| !v.trim().is_empty())
             .map(|v| {
-                v.trim()
-                    .parse::<u64>()
-                    .map_err(|err| anyhow::anyhow!(
-                        "invalid WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS: {err}"
-                    ))
+                v.trim().parse::<u64>().map_err(|err| {
+                    anyhow::anyhow!("invalid WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS: {err}")
+                })
             })
             .transpose()?;
         let paper_market_resolution_price =
@@ -362,8 +397,7 @@ impl AppConfig {
                 .transpose()?;
         let paper_submit_latency_ms =
             parse_duration_ms("WHALE_PAIR_PAPER_SUBMIT_LATENCY_MS", 150)?.as_millis() as u64;
-        let paper_queue_depth_fraction =
-            parse_f64("WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
+        let paper_queue_depth_fraction = parse_f64("WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
         if !(0.0..=1.0).contains(&paper_queue_depth_fraction) {
             anyhow::bail!(
                 "WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION must be in [0.0, 1.0], got {paper_queue_depth_fraction}"
@@ -380,10 +414,8 @@ impl AppConfig {
             parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
         let paper_report_path = parse_path_optional("WHALE_PAIR_PAPER_REPORT_PATH");
         let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
-        let book_snapshot_max_levels =
-            parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
-        let paper_maker_rebate_coeff =
-            parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
+        let book_snapshot_max_levels = parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
+        let paper_maker_rebate_coeff = parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
         let paper_taker_fee_coeff_override = std::env::var("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -446,6 +478,12 @@ impl AppConfig {
             live_order_max_age,
             live_reconcile_missing_grace,
             quote_min_order_age,
+            quote_churn_window,
+            quote_hard_pull,
+            quote_max_churn_per_window,
+            quote_max_submit_per_window,
+            quote_max_replace_per_window,
+            quote_max_cancel_per_window,
             live_max_submit_errors,
             live_max_cancel_errors,
             live_kill_on_reconcile_mismatch,

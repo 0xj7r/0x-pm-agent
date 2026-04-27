@@ -502,7 +502,7 @@ mod tests {
             quote_level_tag: Some("lvl-1".to_string()),
             created_at_ms: 1,
             pair_id: None,
-        kind: crate::types::IntentKind::Entry,
+            kind: crate::types::IntentKind::Entry,
         }
     }
 
@@ -634,9 +634,10 @@ mod tests {
         };
         let plan = reconciler.plan(desired, &HashMap::new(), 2);
         assert!(plan.actions.is_empty());
-        assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("submit rate cap reached")));
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("submit rate cap reached"))
+        );
     }
 }
