@@ -26,8 +26,39 @@ pub struct BonereaperFill {
     pub rebate_usd: f64,
 }
 
+/// First-party fills observed on our own wallet. When Approach C is
+/// deployed (live bonereaper at micro-capital), our own fills give us
+/// symmetric microstructure with shadow predictions: place-time, queue
+/// depth at submit, fill time. Our-live-vs-shadow MAPE is therefore
+/// the microstructure-validating signal; bonereaper-vs-shadow stays as
+/// the coarser external cross-check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OurLiveFill {
+    pub market_family: String,
+    pub notional_usd: f64,
+    pub rebate_usd: f64,
+}
+
 pub fn summarise_window(
     shadow_fills: &[ShadowFill],
+    bonereaper_fills: &[BonereaperFill],
+    window_start_ms: EpochMillis,
+    window_end_ms: EpochMillis,
+    observed_at_ms: EpochMillis,
+) -> Vec<FidelityEvent> {
+    summarise_window_with_our_live(
+        shadow_fills,
+        &[],
+        bonereaper_fills,
+        window_start_ms,
+        window_end_ms,
+        observed_at_ms,
+    )
+}
+
+pub fn summarise_window_with_our_live(
+    shadow_fills: &[ShadowFill],
+    our_live_fills: &[OurLiveFill],
     bonereaper_fills: &[BonereaperFill],
     window_start_ms: EpochMillis,
     window_end_ms: EpochMillis,
@@ -38,6 +69,9 @@ pub fn summarise_window(
         shadow_count: u32,
         shadow_notional: f64,
         shadow_rebate: f64,
+        our_live_count: u32,
+        our_live_notional: f64,
+        our_live_rebate: f64,
         bonereaper_count: u32,
         bonereaper_notional: f64,
         bonereaper_rebate: f64,
@@ -49,6 +83,12 @@ pub fn summarise_window(
         agg.shadow_notional += f.notional_usd;
         agg.shadow_rebate += f.rebate_usd;
     }
+    for f in our_live_fills {
+        let agg = by_family.entry(f.market_family.clone()).or_default();
+        agg.our_live_count += 1;
+        agg.our_live_notional += f.notional_usd;
+        agg.our_live_rebate += f.rebate_usd;
+    }
     for f in bonereaper_fills {
         let agg = by_family.entry(f.market_family.clone()).or_default();
         agg.bonereaper_count += 1;
@@ -58,15 +98,23 @@ pub fn summarise_window(
     by_family
         .into_iter()
         .map(|(family, agg)| {
-            let mape = if agg.bonereaper_count == 0 {
+            // Truth precedence: our_live > bonereaper. our_live is the
+            // microstructure-symmetric source; bonereaper is coarser
+            // count-level only.
+            let truth_count = if agg.our_live_count > 0 {
+                agg.our_live_count
+            } else {
+                agg.bonereaper_count
+            };
+            let mape = if truth_count == 0 {
                 if agg.shadow_count == 0 {
                     0.0
                 } else {
                     f64::INFINITY
                 }
             } else {
-                ((agg.shadow_count as f64) - (agg.bonereaper_count as f64)).abs()
-                    / (agg.bonereaper_count as f64)
+                ((agg.shadow_count as f64) - (truth_count as f64)).abs()
+                    / (truth_count as f64)
             };
             FidelityEvent {
                 observed_at_ms,
@@ -76,6 +124,9 @@ pub fn summarise_window(
                 shadow_fill_count: agg.shadow_count,
                 shadow_fill_notional_usd: agg.shadow_notional,
                 shadow_rebate_usd: agg.shadow_rebate,
+                our_live_fill_count: agg.our_live_count,
+                our_live_fill_notional_usd: agg.our_live_notional,
+                our_live_rebate_usd: agg.our_live_rebate,
                 bonereaper_fill_count: agg.bonereaper_count,
                 bonereaper_fill_notional_usd: agg.bonereaper_notional,
                 bonereaper_rebate_usd: agg.bonereaper_rebate,
@@ -128,9 +179,17 @@ pub struct FidelityEvent {
     pub shadow_fill_count: u32,
     pub shadow_fill_notional_usd: f64,
     pub shadow_rebate_usd: f64,
+    /// First-party fills observed on our wallet (Approach C deployed).
+    /// Zero when we have not yet shipped live bonereaper.
+    pub our_live_fill_count: u32,
+    pub our_live_fill_notional_usd: f64,
+    pub our_live_rebate_usd: f64,
     pub bonereaper_fill_count: u32,
     pub bonereaper_fill_notional_usd: f64,
     pub bonereaper_rebate_usd: f64,
+    /// MAPE between `shadow_fill_count` and the primary truth source.
+    /// Truth precedence: our_live > bonereaper. When both are zero and
+    /// shadow is non-zero, mape = +inf (a Fail).
     pub mape_fill_count: f64,
     pub verdict: FidelityVerdict,
 }
@@ -244,5 +303,44 @@ mod tests {
     fn extract_market_family_strips_trailing_timestamp() {
         assert_eq!(extract_market_family("btc-updown-5m-1776961500"), "btc-updown-5m");
         assert_eq!(extract_market_family("eth-updown-15m-1776960900"), "eth-updown-15m");
+    }
+
+    #[test]
+    fn summarise_includes_our_live_fills_as_microstructure_truth_source() {
+        // When our own wallet has live fills (Approach C deployed), the
+        // shadow-vs-our-live MAPE is the microstructure-validating signal
+        // since both sides have full place-time + queue + fill timing.
+        // bonereaper-vs-shadow stays as the count-level cross-check.
+        let shadow = vec![ShadowFill {
+            market_family: "btc-updown-5m".to_string(),
+            notional_usd: 20.0,
+            rebate_usd: 0.04,
+        }];
+        let our_live = vec![OurLiveFill {
+            market_family: "btc-updown-5m".to_string(),
+            notional_usd: 18.0,
+            rebate_usd: 0.04,
+        }];
+        let bonereaper = vec![BonereaperFill {
+            market_family: "btc-updown-5m".to_string(),
+            notional_usd: 24.0,
+            rebate_usd: 0.05,
+        }];
+        let events = summarise_window_with_our_live(
+            &shadow,
+            &our_live,
+            &bonereaper,
+            0,
+            60_000,
+            60_500,
+        );
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.shadow_fill_count, 1);
+        assert_eq!(e.our_live_fill_count, 1);
+        assert_eq!(e.bonereaper_fill_count, 1);
+        // Verdict prefers our_live as primary truth when present.
+        // |1 - 1| / 1 = 0 -> Ok
+        assert_eq!(e.verdict, FidelityVerdict::Ok);
     }
 }
