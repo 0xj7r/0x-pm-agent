@@ -4186,7 +4186,10 @@ fn auto_recover_live_riskoff(
     started_at_ms: u64,
 ) -> RuntimeOutcome {
     if config.paper_mode
-        || runtime.status() != RuntimeStatus::RiskOff
+        || !matches!(
+            runtime.status(),
+            RuntimeStatus::RiskOff | RuntimeStatus::Degraded
+        )
         || config.live_risk_off_auto_recover.is_zero()
     {
         return RuntimeOutcome::default();
@@ -4201,7 +4204,7 @@ fn auto_recover_live_riskoff(
     let (health_failures, risk_failures) =
         live_health_failures(runtime, metrics, config, live_safety);
     if health_failures.is_empty() && risk_failures.is_empty() {
-        runtime.recover_from_riskoff(
+        runtime.recover_live_blocked_status(
             now_ms,
             format!("live health checks passed for {recover_after_ms}ms"),
         )
@@ -5851,6 +5854,45 @@ mod tests {
             .recent(4)
             .iter()
             .any(|event| event.message.contains("runtime risk-off auto-recovered")));
+    }
+
+    #[test]
+    fn live_degraded_auto_recover_promotes_running_after_healthy_window() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Degraded,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        let metrics = AppMetrics::new().expect("metrics");
+        metrics.set_stream_connected(StreamKind::Market, true);
+        metrics.set_stream_connected(StreamKind::User, true);
+        metrics.set_execution_adapter_connected(true);
+        let config = runner_test_config();
+        let live_safety = LiveSafetyState {
+            last_venue_cash_usd: Some(100.0),
+            ..LiveSafetyState::default()
+        };
+
+        let early =
+            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 5_000, 0);
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        assert!(early.event_seqs.is_empty());
+
+        let recovered =
+            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
+        assert_eq!(runtime.status(), RuntimeStatus::Running);
+        assert!(!recovered.event_seqs.is_empty());
+        assert!(runtime
+            .event_log()
+            .recent(4)
+            .iter()
+            .any(|event| event.message.contains("runtime degraded auto-recovered")));
     }
 
     #[test]
