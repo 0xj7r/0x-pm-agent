@@ -972,6 +972,44 @@ fn btc_5m_mm_allows_convex_cheap_leg_accumulation_when_pair_is_premium_blocked()
 }
 
 #[test]
+fn btc_5m_mm_convex_accumulation_skips_when_kelly_budget_is_below_venue_minimum() {
+    let mut config = btc_5m_mm_test_config();
+    config.min_edge_bps = 10.0;
+    config.max_gross_cost_usd = 10.0;
+    config.max_leg_cost_usd = 5.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let ctx = context_at_with_cash(Vec::new(), 10, 40.0);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.38, 0.40, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.58, 0.62, 10));
+
+    assert!(decision.intents.is_empty());
+}
+
+#[test]
+fn btc_5m_mm_convex_accumulation_sizes_from_fractional_kelly_budget() {
+    let mut config = btc_5m_mm_test_config();
+    config.min_edge_bps = 10.0;
+    config.max_gross_cost_usd = 10.0;
+    config.max_leg_cost_usd = 5.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let bankroll_usd = 500.0;
+    let ctx = context_at_with_cash(Vec::new(), 10, bankroll_usd);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.38, 0.40, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.58, 0.62, 10));
+
+    assert_eq!(decision.intents.len(), 1);
+    let intent = &decision.intents[0];
+    assert_eq!(intent.instrument_id, InstrumentId::from("up"));
+    assert!(intent.quantity > config.venue_min_order_quantity);
+    assert!(
+        intent.quantity * intent.limit_price
+            <= bankroll_usd * Btc5mMmStrategy::CONVEX_MAX_KELLY_BANKROLL_FRACTION + 1e-9
+    );
+}
+
+#[test]
 fn btc_5m_mm_hedge_rescues_one_sided_inventory() {
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
