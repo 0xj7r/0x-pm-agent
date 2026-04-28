@@ -60,6 +60,7 @@ pub struct AppConfig {
     pub user_markets: Vec<String>,
     pub market_discovery_enabled: bool,
     pub market_discovery_interval: Duration,
+    pub market_discovery_window: Duration,
     pub market_discovery_include_prev: usize,
     pub market_discovery_include_next: usize,
     pub market_discovery_gamma_url: String,
@@ -242,6 +243,8 @@ impl AppConfig {
         let user_markets = split_csv_optional("WHALE_PAIR_USER_MARKETS");
         let market_discovery_interval =
             parse_duration_ms("WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS", 30_000)?;
+        let market_discovery_window =
+            parse_duration_ms("WHALE_PAIR_MARKET_DISCOVERY_WINDOW_MS", 5 * 60 * 1_000)?;
         let market_discovery_include_prev =
             parse_usize("WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_PREV", 0)?;
         let market_discovery_include_next =
@@ -471,6 +474,7 @@ impl AppConfig {
             user_markets,
             market_discovery_enabled,
             market_discovery_interval,
+            market_discovery_window,
             market_discovery_include_prev,
             market_discovery_include_next,
             market_discovery_gamma_url,
