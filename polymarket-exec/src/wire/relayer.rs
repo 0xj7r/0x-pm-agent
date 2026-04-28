@@ -87,6 +87,9 @@ pub struct CtfMergeRequest {
 pub struct CtfRedeemRequest {
     pub signer: PrivateKeySigner,
     pub condition_id: String,
+    /// Optional collateral override for legacy redemptions. Defaults to the
+    /// relayer config collateral, which is the active trading collateral.
+    pub collateral_token_address: Option<String>,
     /// Outcome index sets to redeem. For binary markets pass `vec![1, 2]`
     /// to claim both legs (winning leg pays, losing leg returns nothing
     /// but the call still succeeds atomically).
@@ -206,6 +209,7 @@ impl CtfRelayerClient {
                         &request.signer,
                         relay_payload,
                         &request.condition_id,
+                        request.collateral_token_address.as_deref(),
                         &request.index_sets,
                         request.metadata,
                     )
@@ -229,17 +233,7 @@ impl CtfRelayerClient {
             )
         })?;
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
-        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
-        let condition_id = parse_b256(&request.condition_id, "condition id")?;
-        let amount = scaled_token_amount(request.quantity, self.config.collateral_decimals)?;
-        let calldata = mergePositionsCall {
-            collateralToken: collateral,
-            parentCollectionId: B256::ZERO,
-            conditionId: condition_id,
-            partition: vec![U256::from(1_u8), U256::from(2_u8)],
-            amount,
-        }
-        .abi_encode();
+        let calldata = self.merge_positions_calldata(&request.condition_id, request.quantity)?;
         let tx_hash = submitter
             .submit_call(&request.signer, ctf, Bytes::from(calldata))
             .await?;
@@ -260,17 +254,11 @@ impl CtfRelayerClient {
             )
         })?;
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
-        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
-        let condition_id = parse_b256(&request.condition_id, "condition id")?;
-        let index_sets_u256: Vec<U256> =
-            request.index_sets.iter().copied().map(U256::from).collect();
-        let calldata = redeemPositionsCall {
-            collateralToken: collateral,
-            parentCollectionId: B256::ZERO,
-            conditionId: condition_id,
-            indexSets: index_sets_u256,
-        }
-        .abi_encode();
+        let calldata = self.redeem_positions_calldata(
+            request.collateral_token_address.as_deref(),
+            &request.condition_id,
+            &request.index_sets,
+        )?;
         let tx_hash = submitter
             .submit_call(&request.signer, ctf, Bytes::from(calldata))
             .await?;
@@ -293,17 +281,7 @@ impl CtfRelayerClient {
         let relay = parse_address(&relay_payload.address, "relayer relay address")?;
         let nonce = relay_payload.nonce;
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
-        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
-        let condition_id = parse_b256(condition_id_raw, "condition id")?;
-        let amount = scaled_token_amount(quantity, self.config.collateral_decimals)?;
-        let merge_data = mergePositionsCall {
-            collateralToken: collateral,
-            parentCollectionId: B256::ZERO,
-            conditionId: condition_id,
-            partition: vec![U256::from(1_u8), U256::from(2_u8)],
-            amount,
-        }
-        .abi_encode();
+        let merge_data = self.merge_positions_calldata(condition_id_raw, quantity)?;
         let proxy_data = proxyCall {
             transactions: vec![ProxyTransactionCall {
                 to: ctf,
@@ -354,6 +332,7 @@ impl CtfRelayerClient {
         signer: &PrivateKeySigner,
         relay_payload: RelayPayload,
         condition_id_raw: &str,
+        collateral_token_address: Option<&str>,
         index_sets: &[u64],
         metadata: String,
     ) -> Result<TransactionRequest, ExecutionError> {
@@ -361,16 +340,8 @@ impl CtfRelayerClient {
         let relay = parse_address(&relay_payload.address, "relayer relay address")?;
         let nonce = relay_payload.nonce;
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
-        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
-        let condition_id = parse_b256(condition_id_raw, "condition id")?;
-        let index_sets_u256: Vec<U256> = index_sets.iter().copied().map(U256::from).collect();
-        let redeem_data = redeemPositionsCall {
-            collateralToken: collateral,
-            parentCollectionId: B256::ZERO,
-            conditionId: condition_id,
-            indexSets: index_sets_u256,
-        }
-        .abi_encode();
+        let redeem_data =
+            self.redeem_positions_calldata(collateral_token_address, condition_id_raw, index_sets)?;
         let proxy_data = proxyCall {
             transactions: vec![ProxyTransactionCall {
                 to: ctf,
@@ -414,6 +385,45 @@ impl CtfRelayerClient {
             },
             metadata,
         })
+    }
+
+    fn redeem_positions_calldata(
+        &self,
+        collateral_token_address: Option<&str>,
+        condition_id_raw: &str,
+        index_sets: &[u64],
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let collateral = parse_address(
+            collateral_token_address.unwrap_or(&self.config.collateral_token_address),
+            "collateral token",
+        )?;
+        let condition_id = parse_b256(condition_id_raw, "condition id")?;
+        let index_sets_u256: Vec<U256> = index_sets.iter().copied().map(U256::from).collect();
+        Ok(redeemPositionsCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            indexSets: index_sets_u256,
+        }
+        .abi_encode())
+    }
+
+    fn merge_positions_calldata(
+        &self,
+        condition_id_raw: &str,
+        quantity: f64,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
+        let condition_id = parse_b256(condition_id_raw, "condition id")?;
+        let amount = scaled_token_amount(quantity, self.config.collateral_decimals)?;
+        Ok(mergePositionsCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            partition: vec![U256::from(1_u8), U256::from(2_u8)],
+            amount,
+        }
+        .abi_encode())
     }
 
     async fn relay_payload(
@@ -675,6 +685,7 @@ mod tests {
                     nonce: "11".to_string(),
                 },
                 "0x2222222222222222222222222222222222222222222222222222222222222222",
+                None,
                 &[1u64, 2u64],
                 "{\"redeem\":true}".to_string(),
             )
@@ -704,6 +715,7 @@ mod tests {
             signer,
             condition_id: "0x2222222222222222222222222222222222222222222222222222222222222222"
                 .to_string(),
+            collateral_token_address: None,
             index_sets: vec![],
             metadata: "{}".to_string(),
         };
@@ -712,6 +724,55 @@ mod tests {
             .await
             .expect_err("expected empty index_sets rejection");
         assert!(error.to_string().contains("index_sets"));
+    }
+
+    #[test]
+    fn redeem_calldata_can_override_collateral_token_for_legacy_positions() {
+        let client = CtfRelayerClient::new(test_config());
+        let calldata = client
+            .redeem_positions_calldata(
+                Some(DEFAULT_PUSD_ADDRESS),
+                "0x2222222222222222222222222222222222222222222222222222222222222222",
+                &[1, 2],
+            )
+            .expect("redeem calldata");
+        let decoded =
+            redeemPositionsCall::abi_decode(&calldata).expect("generated calldata decodes");
+
+        assert_eq!(
+            decoded.collateralToken,
+            Address::from_str(DEFAULT_PUSD_ADDRESS).unwrap()
+        );
+        assert_eq!(
+            decoded.conditionId,
+            B256::from_str(
+                "0x2222222222222222222222222222222222222222222222222222222222222222"
+            )
+            .unwrap()
+        );
+        assert_eq!(decoded.indexSets, vec![U256::from(1_u8), U256::from(2_u8)]);
+    }
+
+    #[test]
+    fn merge_calldata_uses_configured_ctf_collateral_token() {
+        let mut config = test_config();
+        config.collateral_token_address = DEFAULT_USDCE_ADDRESS.to_string();
+        let client = CtfRelayerClient::new(config);
+        let calldata = client
+            .merge_positions_calldata(
+                "0xf3eb9227564ea848dc5d95a577c06e11b67d3223046ff2decf53c63144d14908",
+                10.5,
+            )
+            .expect("merge calldata");
+        let decoded =
+            mergePositionsCall::abi_decode(&calldata).expect("generated calldata decodes");
+
+        assert_eq!(
+            decoded.collateralToken,
+            Address::from_str(DEFAULT_USDCE_ADDRESS).unwrap()
+        );
+        assert_eq!(decoded.amount, U256::from(10_500_000_u64));
+        assert_eq!(decoded.partition, vec![U256::from(1_u8), U256::from(2_u8)]);
     }
 
     #[tokio::test]

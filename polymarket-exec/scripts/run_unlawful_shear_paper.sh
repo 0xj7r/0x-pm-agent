@@ -44,11 +44,13 @@ export_runtime_context() {
 }
 
 load_runtime_env() {
-  if [[ -f "$CRATE_DIR/.env" ]]; then
+  if [[ -z "$SLEEVE_ENV_PATH" && -f "$CRATE_DIR/.env" ]]; then
     set -a
     source "$CRATE_DIR/.env"
     set +a
   fi
+
+  unset POLYMARKET_FUNDER POLYMARKET_FUNDER_ADDRESS POLYMARKET_PROXY_WALLET_ADDRESS
 
   set -a
   source "$RUNTIME_ENV_PATH"

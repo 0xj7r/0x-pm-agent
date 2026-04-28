@@ -1,5 +1,8 @@
 //! Live Polymarket auth wiring from env/user auth into execution-adapter clients.
 
+use std::str::FromStr;
+
+use alloy::signers::local::PrivateKeySigner;
 use anyhow::Result;
 use tracing::info;
 
@@ -76,6 +79,56 @@ fn live_funder_from_env(auth: Option<&UserWsAuth>) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn normalize_address(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn signer_address_from_private_key(private_key: &str) -> Result<String> {
+    let signer = PrivateKeySigner::from_str(private_key.trim())
+        .map_err(|error| anyhow::anyhow!("invalid POLYMARKET_PRIVATE_KEY: {error}"))?;
+    Ok(signer.address().to_string())
+}
+
+fn resolve_funder_for_signature(
+    private_key: &str,
+    signature_type: PolymarketSignatureType,
+    funder_address: Option<String>,
+    proxy_wallet_address: Option<String>,
+) -> Result<Option<String>> {
+    let signer_address = signer_address_from_private_key(private_key)?;
+    match signature_type {
+        PolymarketSignatureType::Eoa => {
+            for (name, configured) in [
+                ("POLYMARKET_FUNDER/POLYMARKET_FUNDER_ADDRESS", funder_address.as_ref()),
+                ("POLYMARKET_PROXY_WALLET_ADDRESS", proxy_wallet_address.as_ref()),
+            ] {
+                let Some(configured) = configured else {
+                    continue;
+                };
+                if normalize_address(configured) != normalize_address(&signer_address) {
+                    anyhow::bail!(
+                        "invalid live auth config: POLYMARKET_SIGNATURE_TYPE=0 (EOA) requires \
+                         funder/holder to equal signer {signer_address}, but {name} is {configured}. \
+                         Use signature_type=proxy/gnosis_safe for proxy-held funds, or remove the \
+                         proxy/funder env vars for true EOA trading."
+                    );
+                }
+            }
+            Ok(None)
+        }
+        PolymarketSignatureType::Proxy | PolymarketSignatureType::GnosisSafe => {
+            let resolved = funder_address.or(proxy_wallet_address);
+            let Some(resolved) = resolved else {
+                anyhow::bail!(
+                    "invalid live auth config: proxy/safe signature types require \
+                     POLYMARKET_FUNDER_ADDRESS or POLYMARKET_PROXY_WALLET_ADDRESS"
+                );
+            };
+            Ok(Some(resolved))
+        }
+    }
+}
+
 pub(super) async fn connect_live_adapter(config: &AppConfig) -> Result<PolymarketExecutionAdapter> {
     connect_live_session(config)
         .await
@@ -93,7 +146,13 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             )
         })?;
     let signature_type = live_signature_type_from_env(auth)?;
-    let funder_address = live_funder_from_env(auth);
+    let configured_funder_address = live_funder_from_env(auth);
+    let funder_address = resolve_funder_for_signature(
+        &private_key,
+        signature_type,
+        configured_funder_address,
+        config.proxy_wallet_address.clone(),
+    )?;
 
     log_live_venue_config(
         config,
@@ -118,6 +177,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
             relayer_api_key: config.relayer_api_key.clone(),
             relayer_api_key_address: config.relayer_api_key_address.clone(),
             ctf_contract_address: config.ctf_contract_address.clone(),
+            ctf_collateral_token_address: config.ctf_collateral_token_address.clone(),
             collateral_token_address: config.collateral_token_address.clone(),
             collateral_decimals: config.collateral_decimals,
             proxy_wallet_address: config.proxy_wallet_address.clone(),
@@ -144,6 +204,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
                 relayer_api_key: config.relayer_api_key.clone(),
                 relayer_api_key_address: config.relayer_api_key_address.clone(),
                 ctf_contract_address: config.ctf_contract_address.clone(),
+                ctf_collateral_token_address: config.ctf_collateral_token_address.clone(),
                 collateral_token_address: config.collateral_token_address.clone(),
                 collateral_decimals: config.collateral_decimals,
                 proxy_wallet_address: config.proxy_wallet_address.clone(),
@@ -181,5 +242,82 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
                 funder_address,
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_funder_for_signature, PolymarketSignatureType};
+
+    const TEST_PRIVATE_KEY: &str =
+        "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a";
+    const TEST_SIGNER_ADDRESS: &str = "0x769C78CF371775A2603BBdD895beD3b34C8F32Df";
+
+    #[test]
+    fn eoa_signature_rejects_mismatched_funder() {
+        let error = resolve_funder_for_signature(
+            TEST_PRIVATE_KEY,
+            PolymarketSignatureType::Eoa,
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string()),
+            None,
+        )
+        .expect_err("mismatched EOA funder must fail live startup");
+
+        assert!(error.to_string().contains("requires funder/holder to equal signer"));
+    }
+
+    #[test]
+    fn eoa_signature_accepts_matching_funder_as_noop() {
+        assert_eq!(
+            resolve_funder_for_signature(
+                TEST_PRIVATE_KEY,
+                PolymarketSignatureType::Eoa,
+                Some(TEST_SIGNER_ADDRESS.to_string()),
+                None,
+            )
+            .expect("matching EOA holder config"),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_signature_keeps_configured_funder() {
+        assert_eq!(
+            resolve_funder_for_signature(
+                TEST_PRIVATE_KEY,
+                PolymarketSignatureType::Proxy,
+                Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string()),
+                None,
+            )
+            .expect("proxy funder"),
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string())
+        );
+    }
+
+    #[test]
+    fn proxy_signature_can_use_proxy_wallet_as_funder() {
+        assert_eq!(
+            resolve_funder_for_signature(
+                TEST_PRIVATE_KEY,
+                PolymarketSignatureType::Proxy,
+                None,
+                Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string()),
+            )
+            .expect("proxy wallet funder fallback"),
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string())
+        );
+    }
+
+    #[test]
+    fn proxy_signature_requires_holder_address() {
+        let error = resolve_funder_for_signature(
+            TEST_PRIVATE_KEY,
+            PolymarketSignatureType::Proxy,
+            None,
+            None,
+        )
+        .expect_err("proxy mode without funder must fail");
+
+        assert!(error.to_string().contains("proxy/safe signature types require"));
     }
 }

@@ -175,6 +175,13 @@ impl UserWsClient {
                     }
                 } => {
                     changed.context("user websocket market update channel closed")?;
+                    let next_markets = markets_rx
+                        .as_mut()
+                        .map(|rx| rx.borrow_and_update().clone())
+                        .unwrap_or_default();
+                    if same_market_subscription(&markets, &next_markets) {
+                        continue;
+                    }
                     anyhow::bail!("market subscription changed");
                 }
                 _ = pings.tick() => {
@@ -532,6 +539,22 @@ fn build_subscribe_payload(auth: &UserWsAuth, markets: &[String]) -> Value {
     }
 }
 
+fn same_market_subscription(left: &[String], right: &[String]) -> bool {
+    normalize_markets(left) == normalize_markets(right)
+}
+
+fn normalize_markets(markets: &[String]) -> Vec<String> {
+    let mut normalized = markets
+        .iter()
+        .map(|market| market.trim())
+        .filter(|market| !market.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
 fn value_as_f64_opt(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
@@ -601,5 +624,25 @@ mod tests {
             }
             other => panic!("expected maker fill, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn market_subscription_compare_ignores_duplicate_order_and_whitespace() {
+        let current = vec![
+            " market-b ".to_string(),
+            "market-a".to_string(),
+            "market-a".to_string(),
+        ];
+        let next = vec!["market-a".to_string(), "market-b".to_string()];
+
+        assert!(same_market_subscription(&current, &next));
+    }
+
+    #[test]
+    fn market_subscription_compare_detects_real_changes() {
+        let current = vec!["market-a".to_string()];
+        let next = vec!["market-b".to_string()];
+
+        assert!(!same_market_subscription(&current, &next));
     }
 }

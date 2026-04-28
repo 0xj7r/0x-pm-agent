@@ -77,8 +77,8 @@ ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_se
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
 
-log "setting host cargo path for rustup toolchain"
-ssh_base "mkdir -p ~/.config/polymarket-exec && grep -q '^WHALE_PAIR_CARGO_BIN=' ~/.config/polymarket-exec/common.env && sed -i 's|^WHALE_PAIR_CARGO_BIN=.*|WHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo|' ~/.config/polymarket-exec/common.env || printf '\nWHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo\n' >> ~/.config/polymarket-exec/common.env"
+log "setting host cargo path for tinylive rustup toolchain"
+ssh_base "mkdir -p ~/.config/polymarket-exec && grep -q '^WHALE_PAIR_CARGO_BIN=' ~/.config/polymarket-exec/btc_5m_mm_tinylive.env && sed -i 's|^WHALE_PAIR_CARGO_BIN=.*|WHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo|' ~/.config/polymarket-exec/btc_5m_mm_tinylive.env || printf '\nWHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo\n' >> ~/.config/polymarket-exec/btc_5m_mm_tinylive.env"
 
 log "enabling linger for ${REMOTE_USER}"
 ssh_base "sudo loginctl enable-linger '${REMOTE_USER}' || true"
@@ -93,8 +93,8 @@ Deploy complete.
 Remote root:
   $REMOTE_ROOT
 
-Live smoke env to edit on the AWS host:
-  ~/.config/polymarket-exec/live.env
+Tinylive env to edit on the AWS host:
+  ~/.config/polymarket-exec/btc_5m_mm_tinylive.env
 
 Operator kill switch:
   touch ~/.config/polymarket-exec/live.kill

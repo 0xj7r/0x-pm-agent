@@ -9,17 +9,17 @@ Type=simple
 WorkingDirectory=%h/go/polymarket-agent
 Environment=WHALE_PAIR_ROOT_DIR=%h/go/polymarket-agent
 Environment=WHALE_PAIR_CONTEXT_SOURCE=live
-Environment=WHALE_PAIR_INCLUDE_PREV=1
-Environment=WHALE_PAIR_INCLUDE_NEXT=1
+Environment=WHALE_PAIR_INCLUDE_PREV=0
+Environment=WHALE_PAIR_INCLUDE_NEXT=0
 Environment=WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=45
+Environment=WHALE_PAIR_EXEC_LOAD_DOTENV=false
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 Environment=WHALE_PAIR_PYTHON_BIN=python3
 Environment=WHALE_PAIR_CARGO_BIN=cargo
-EnvironmentFile=-%h/.config/polymarket-exec/common.env
-EnvironmentFile=-%h/.config/polymarket-exec/paper.d/%i.env
-ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/paper" "$HOME/.config/polymarket-exec/paper.d"'
-ExecStart=/usr/bin/env bash -lc '"${WHALE_PAIR_ROOT_DIR}/polymarket-exec/scripts/run_sleeve.sh" %i'
+EnvironmentFile=-%h/.config/polymarket-exec/%i.env
+ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/live" "${WHALE_PAIR_ROOT_DIR}/data/execution/audit"'
+ExecStart=/usr/bin/env bash -lc 'cd "${WHALE_PAIR_ROOT_DIR}/polymarket-exec" && exec "${WHALE_PAIR_CARGO_BIN}" run'
 Restart=always
 RestartSec=10
 TimeoutStopSec=20

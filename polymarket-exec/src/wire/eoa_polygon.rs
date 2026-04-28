@@ -9,22 +9,52 @@
 use std::time::Duration;
 
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, Bytes, B256, U256};
+use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::sol;
+use alloy::sol_types::SolCall;
 
 use crate::wire::execution_adapter::ExecutionError;
 
 const DEFAULT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_GAS_LIMIT: u64 = 250_000;
 pub const POLYGON_CHAIN_ID: u64 = 137;
+pub const COLLATERAL_ONRAMP: Address = address!("93070a847efEf7F70739046A929D47a521F5B8ee");
+pub const USDCE: Address = address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+pub const PUSD: Address = address!("C011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+
+sol! {
+    #[derive(Debug, PartialEq)]
+    function balanceOf(address account) view returns (uint256);
+
+    #[derive(Debug, PartialEq)]
+    function allowance(address owner, address spender) view returns (uint256);
+
+    #[derive(Debug, PartialEq)]
+    function approve(address spender, uint256 amount) returns (bool);
+
+    #[derive(Debug, PartialEq)]
+    function wrap(address _asset, address _to, uint256 _amount);
+}
 
 #[derive(Clone)]
 pub struct EoaPolygonSubmitter {
     rpc_url: String,
     gas_limit: u64,
     receipt_timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PusdWrapReport {
+    pub wallet: Address,
+    pub usdce_balance_before: U256,
+    pub pusd_balance_before: U256,
+    pub onramp_allowance_before: U256,
+    pub wrapped_amount: U256,
+    pub approve_tx_hash: Option<B256>,
+    pub wrap_tx_hash: Option<B256>,
 }
 
 impl EoaPolygonSubmitter {
@@ -38,6 +68,98 @@ impl EoaPolygonSubmitter {
 
     pub fn rpc_url(&self) -> &str {
         &self.rpc_url
+    }
+
+    pub async fn ensure_pusd_from_usdce(
+        &self,
+        signer: &PrivateKeySigner,
+        recipient: Address,
+        min_wrap_amount: U256,
+    ) -> Result<PusdWrapReport, ExecutionError> {
+        let wallet = signer.address();
+        let usdce_balance = self.erc20_balance(USDCE, wallet).await?;
+        let pusd_balance = self.erc20_balance(PUSD, recipient).await?;
+        let allowance = self
+            .erc20_allowance(USDCE, wallet, COLLATERAL_ONRAMP)
+            .await?;
+        if usdce_balance < min_wrap_amount || usdce_balance.is_zero() {
+            return Ok(PusdWrapReport {
+                wallet,
+                usdce_balance_before: usdce_balance,
+                pusd_balance_before: pusd_balance,
+                onramp_allowance_before: allowance,
+                wrapped_amount: U256::ZERO,
+                approve_tx_hash: None,
+                wrap_tx_hash: None,
+            });
+        }
+
+        let approve_tx_hash = if allowance < usdce_balance {
+            let calldata = approveCall {
+                spender: COLLATERAL_ONRAMP,
+                amount: usdce_balance,
+            }
+            .abi_encode();
+            Some(
+                self.submit_call(signer, USDCE, Bytes::from(calldata))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let calldata = wrapCall {
+            _asset: USDCE,
+            _to: recipient,
+            _amount: usdce_balance,
+        }
+        .abi_encode();
+        let wrap_tx_hash = self
+            .submit_call(signer, COLLATERAL_ONRAMP, Bytes::from(calldata))
+            .await?;
+        Ok(PusdWrapReport {
+            wallet,
+            usdce_balance_before: usdce_balance,
+            pusd_balance_before: pusd_balance,
+            onramp_allowance_before: allowance,
+            wrapped_amount: usdce_balance,
+            approve_tx_hash,
+            wrap_tx_hash: Some(wrap_tx_hash),
+        })
+    }
+
+    async fn erc20_balance(&self, token: Address, owner: Address) -> Result<U256, ExecutionError> {
+        let calldata = balanceOfCall { account: owner }.abi_encode();
+        let bytes = self.eth_call(token, Bytes::from(calldata)).await?;
+        balanceOfCall::abi_decode_returns(&bytes).map_err(|error| {
+            ExecutionError::VenueRejection(format!("failed to decode ERC20 balanceOf: {error}"))
+        })
+    }
+
+    async fn erc20_allowance(
+        &self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+    ) -> Result<U256, ExecutionError> {
+        let calldata = allowanceCall { owner, spender }.abi_encode();
+        let bytes = self.eth_call(token, Bytes::from(calldata)).await?;
+        allowanceCall::abi_decode_returns(&bytes).map_err(|error| {
+            ExecutionError::VenueRejection(format!("failed to decode ERC20 allowance: {error}"))
+        })
+    }
+
+    async fn eth_call(&self, to: Address, data: Bytes) -> Result<Bytes, ExecutionError> {
+        let url = self.rpc_url.parse::<reqwest::Url>().map_err(|error| {
+            ExecutionError::BadRequest(format!(
+                "invalid POLYGON_RPC_URL `{}`: {error}",
+                self.rpc_url
+            ))
+        })?;
+        let provider = ProviderBuilder::new().connect_http(url);
+        let request = TransactionRequest::default().to(to).input(data.into());
+        provider.call(request).await.map_err(|error| {
+            ExecutionError::TransientNetwork(format!("polygon eth_call failed: {error}"))
+        })
     }
 
     /// Build, sign, submit, and await receipt for a single contract call.
@@ -97,5 +219,75 @@ impl EoaPolygonSubmitter {
             )));
         }
         Ok(tx_hash)
+    }
+}
+
+pub fn scaled_usdc_units(amount_usd: f64) -> Result<U256, ExecutionError> {
+    if !amount_usd.is_finite() || amount_usd < 0.0 {
+        return Err(ExecutionError::BadRequest(format!(
+            "USDC amount must be finite and non-negative, got {amount_usd}"
+        )));
+    }
+    Ok(U256::from((amount_usd * 1_000_000.0).ceil() as u128))
+}
+
+pub fn usdc_units_to_f64(amount: U256) -> f64 {
+    amount.to::<u128>() as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::hex::ToHexExt as _;
+
+    #[test]
+    fn scales_min_wrap_amount_to_usdc_base_units() {
+        assert_eq!(scaled_usdc_units(0.01).unwrap(), U256::from(10_000_u64));
+        assert_eq!(
+            scaled_usdc_units(1.234567).unwrap(),
+            U256::from(1_234_567_u64)
+        );
+    }
+
+    #[test]
+    fn wraps_with_documented_onramp_and_usdce_addresses() {
+        let wallet = address!("1111111111111111111111111111111111111111");
+        let amount = U256::from(5_000_000_u64);
+        let approve = approveCall {
+            spender: COLLATERAL_ONRAMP,
+            amount,
+        }
+        .abi_encode()
+        .encode_hex_with_prefix();
+        let wrap = wrapCall {
+            _asset: USDCE,
+            _to: wallet,
+            _amount: amount,
+        }
+        .abi_encode()
+        .encode_hex_with_prefix();
+        let decoded_wrap = wrapCall::abi_decode(
+            &wrapCall {
+                _asset: USDCE,
+                _to: wallet,
+                _amount: amount,
+            }
+            .abi_encode(),
+        )
+        .expect("generated wrap calldata decodes");
+
+        assert!(approve.starts_with("0x095ea7b3"));
+        assert!(wrap.starts_with("0x"));
+        assert_eq!(decoded_wrap._asset, USDCE);
+        assert_eq!(decoded_wrap._to, wallet);
+        assert_eq!(decoded_wrap._amount, amount);
+        assert_eq!(
+            COLLATERAL_ONRAMP.to_string(),
+            "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+        );
+        assert_eq!(
+            USDCE.to_string(),
+            "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        );
     }
 }

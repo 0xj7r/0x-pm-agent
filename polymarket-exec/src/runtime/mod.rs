@@ -323,6 +323,7 @@ pub struct Runtime<S: Strategy> {
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     pending_merge_by_market: HashMap<MarketId, MergeIntent>,
+    blocked_merge_by_market: HashMap<MarketId, BlockedMerge>,
     condition_id_by_market: HashMap<MarketId, String>,
     venue_market_rules: HashMap<MarketId, VenueMarketRules>,
     unlawful_mode_by_market: HashMap<MarketId, StrategyExecutionMode>,
@@ -336,6 +337,32 @@ pub struct Runtime<S: Strategy> {
     /// engage protective block).
     initial_reconcile_complete: bool,
     order_store: Option<Box<dyn OrderStore>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MergeSignature {
+    condition_id: Option<String>,
+    yes_instrument_id: InstrumentId,
+    no_instrument_id: InstrumentId,
+    quantity_units: u64,
+}
+
+impl MergeSignature {
+    fn from_intent(intent: &MergeIntent) -> Self {
+        Self {
+            condition_id: intent.condition_id.clone(),
+            yes_instrument_id: intent.yes_instrument_id.clone(),
+            no_instrument_id: intent.no_instrument_id.clone(),
+            quantity_units: (intent.quantity * 1_000_000.0).round().max(0.0) as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BlockedMerge {
+    signature: MergeSignature,
+    reason: String,
+    blocked_at_ms: EpochMillis,
 }
 
 impl<S: Strategy> Runtime<S> {
@@ -385,6 +412,7 @@ impl<S: Strategy> Runtime<S> {
             first_fill_by_market: HashMap::new(),
             first_merge_by_market: HashMap::new(),
             pending_merge_by_market: HashMap::new(),
+            blocked_merge_by_market: HashMap::new(),
             condition_id_by_market: HashMap::new(),
             venue_market_rules: HashMap::new(),
             unlawful_mode_by_market: HashMap::new(),
@@ -442,6 +470,35 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(market_id.clone()),
             );
         }
+    }
+
+    pub fn block_pending_merge(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) {
+        let Some(intent) = self.pending_merge_by_market.remove(market_id) else {
+            return;
+        };
+        let signature = MergeSignature::from_intent(&intent);
+        self.blocked_merge_by_market.insert(
+            market_id.clone(),
+            BlockedMerge {
+                signature,
+                reason: reason.into(),
+                blocked_at_ms: now_ms,
+            },
+        );
+        self.event_log.push(
+            EventRecord::new(
+                EventCategory::Execution,
+                now_ms,
+                "merge recycle blocked after non-retryable failure; will not resubmit \
+                 identical CTF merge until inventory changes",
+            )
+            .with_market(market_id.clone()),
+        );
     }
 
     pub fn run_id(&self) -> &str {
@@ -946,6 +1003,26 @@ impl<S: Strategy> Runtime<S> {
         };
         if intent.condition_id.is_none() {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
+        }
+        let signature = MergeSignature::from_intent(&intent);
+        if let Some(blocked) = self.blocked_merge_by_market.get(market_id) {
+            if blocked.signature == signature {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge intent suppressed: matching CTF recycle is blocked \
+                                 since {} reason={}",
+                                blocked.blocked_at_ms, blocked.reason
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
         }
 
         self.pending_merge_by_market
@@ -1844,9 +1921,9 @@ impl<S: Strategy> Runtime<S> {
     ) -> RuntimeOutcome {
         let reason = reason.into();
         let mut outcome = RuntimeOutcome::default();
-        // RiskOff is sticky and operator-recovered. The capital guard does
-        // not auto-promote back to Running on a healthy later tick, because
-        // doing so can oscillate the engine after a real equity breach.
+        // RiskOff remains sticky inside the core runtime. Live auto-recovery
+        // is an explicit runner policy that calls recover_from_riskoff only
+        // after its health/risk checks pass for the configured window.
         if self.status != RuntimeStatus::RiskOff {
             self.status = RuntimeStatus::RiskOff;
             outcome.push_event(self.event_log.push(EventRecord::new(
@@ -1860,6 +1937,27 @@ impl<S: Strategy> Runtime<S> {
             );
         }
         outcome.extend(self.request_cancel_entry_orders(now_ms, reason));
+        outcome
+    }
+
+    pub fn recover_from_riskoff(
+        &mut self,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+        if self.status == RuntimeStatus::RiskOff {
+            self.status = RuntimeStatus::Running;
+            outcome.push_event(self.event_log.push(EventRecord::new(
+                EventCategory::Runtime,
+                now_ms,
+                format!("runtime risk-off auto-recovered: {}", reason.into()),
+            )));
+            outcome.push_event(
+                self.event_log
+                    .push(EventRecord::runtime_status(now_ms, self.status)),
+            );
+        }
         outcome
     }
 
@@ -2851,6 +2949,7 @@ impl<S: Strategy> Runtime<S> {
         self.first_fill_by_market.remove(market_id);
         self.first_merge_by_market.remove(market_id);
         self.pending_merge_by_market.remove(market_id);
+        self.blocked_merge_by_market.remove(market_id);
         self.unlawful_mode_by_market.remove(market_id);
     }
 

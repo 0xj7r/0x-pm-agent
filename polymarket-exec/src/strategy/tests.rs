@@ -1,6 +1,7 @@
 use super::{
-    Btc5mMmConfig, Btc5mMmMarketMode, Btc5mMmMarketState, Btc5mMmStrategy, GoatPairConfig,
-    GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext, StrategyDecision,
+    Btc5mMmConfig, Btc5mMmMarketMode, Btc5mMmMarketState, Btc5mMmRescueState, Btc5mMmStrategy,
+    GoatPairConfig, GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext,
+    StrategyDecision,
 };
 use super::{
     BtcRegimeSnapshot, MarketActivitySignal, PairedBookSignal, SessionBucket,
@@ -743,6 +744,14 @@ fn btc_5m_mm_checkpoint_restores_flow_state_without_stale_quotes() {
     state.last_action_ms = Some(30);
     state.last_no_quote_note_ms = Some(40);
     state.last_rescue_attempt_ms = Some(50);
+    state.rescue_state = Some(Btc5mMmRescueState {
+        stranded_instrument_id: "up".to_string(),
+        lift_instrument_id: "down".to_string(),
+        stranded_qty_bucket: 500,
+        attempts: 2,
+        first_attempt_ms: 45,
+        last_attempt_ms: 50,
+    });
     state.last_fill_ms = Some(60);
     strategy
         .market_states
@@ -764,6 +773,13 @@ fn btc_5m_mm_checkpoint_restores_flow_state_without_stale_quotes() {
     assert_eq!(restored_state.recent_fills.len(), 1);
     assert_eq!(restored_state.asymmetric_entry_block_until_ms, Some(90_000));
     assert_eq!(restored_state.last_rescue_attempt_ms, Some(50));
+    assert_eq!(
+        restored_state
+            .rescue_state
+            .as_ref()
+            .map(|state| state.attempts),
+        Some(2)
+    );
     assert_eq!(restored.recent_fill_times.len(), 1);
     assert!(matches!(
         restored_state.mode,
@@ -958,6 +974,78 @@ fn btc_5m_mm_hedge_rescues_one_sided_inventory() {
         decision.intents[0].quote_level_tag.as_deref(),
         Some("mm-hedge-rescue")
     );
+}
+
+#[test]
+fn btc_5m_mm_hedge_rescue_does_not_repeat_while_in_flight() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.cooldown_ms = 100;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 5.0,
+        avg_price: 0.33,
+        mark_price: Some(0.33),
+        updated_at_ms: 1,
+    }];
+
+    let ctx = context_at(positions.clone(), 1_000);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.32, 0.34, 10));
+    let first = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+    assert_eq!(first.intents.len(), 1);
+
+    let ctx = context_at(positions, 2_000);
+    let second = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 20));
+    assert!(second.intents.is_empty());
+    assert!(second
+        .notes
+        .iter()
+        .any(|note| note.contains("rescue already in flight")));
+}
+
+#[test]
+fn btc_5m_mm_hedge_rescue_stops_after_attempt_cap() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.cooldown_ms = 100;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 5.0,
+        avg_price: 0.33,
+        mark_price: Some(0.33),
+        updated_at_ms: 1,
+    }];
+
+    let ctx = context_at(positions.clone(), 1_000);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.32, 0.34, 1_000));
+    let first =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 1_000));
+    assert_eq!(first.intents.len(), 1);
+
+    for (i, now_ms) in [17_000, 33_000].into_iter().enumerate() {
+        let ctx = context_at(positions.clone(), now_ms);
+        let decision =
+            strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, now_ms));
+        assert_eq!(
+            decision.intents.len(),
+            1,
+            "attempt {} should emit rescue",
+            i + 2
+        );
+    }
+
+    let ctx = context_at(positions, 49_000);
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 49_000));
+    assert!(decision.intents.is_empty());
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("rescue attempt cap reached")));
 }
 
 #[test]

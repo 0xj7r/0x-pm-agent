@@ -36,6 +36,7 @@ use crate::wire::api::{
     serve_http, DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition,
     DashboardSnapshot, DashboardUiState,
 };
+use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
     RedeemPositionsRequest, SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
@@ -717,6 +718,11 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
             )
         })
         .unwrap_or(false);
+    let redeem_collateral_token_address =
+        std::env::var("POLYMARKET_REDEEM_COLLATERAL_TOKEN_ADDRESS")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
     let adapter = connect_live_adapter(&config).await?;
     let balances = adapter.sync_balances().await?;
@@ -783,6 +789,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
             market_id = %market_id,
             legs = ?leg_summary,
             value_usd,
+            collateral_token_address = redeem_collateral_token_address.as_deref().unwrap_or(&config.collateral_token_address),
             dry_run,
             "live redeem: planning redemption"
         );
@@ -794,6 +801,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
             command_id: ClientOrderId::from(format!("manual-redeem:{condition_id}:{now_ms}")),
             market_id,
             condition_id: condition_id.clone(),
+            collateral_token_address: redeem_collateral_token_address.clone(),
             // [1, 2] redeems both binary outcomes atomically; loss leg
             // returns 0 collateral but the call succeeds.
             index_sets: vec![1, 2],
@@ -983,6 +991,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         false => {
             let live_connection = connect_live_session(&config).await?;
             effective_user_auth = live_connection.user_auth;
+            maybe_auto_wrap_pusd(&config, &live_connection.adapter).await?;
             Arc::new(live_connection.adapter)
         }
     };
@@ -1154,6 +1163,53 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     join_task("metrics", metrics_handle).await;
 
     info!("whale pair execution scaffold stopped");
+    Ok(())
+}
+
+async fn maybe_auto_wrap_pusd(
+    config: &AppConfig,
+    adapter: &crate::wire::execution_adapter::PolymarketExecutionAdapter,
+) -> Result<()> {
+    if config.paper_mode || !config.live_pusd_auto_wrap {
+        return Ok(());
+    }
+    let Some(report) = adapter
+        .ensure_pusd_collateral_from_usdce(config.live_pusd_auto_wrap_min_usd)
+        .await?
+    else {
+        info!(
+            target: "live_collateral.startup",
+            "pUSD auto-wrap skipped because live signer is not EOA"
+        );
+        return Ok(());
+    };
+    let usdce_before = usdc_units_to_f64(report.usdce_balance_before);
+    let pusd_before = usdc_units_to_f64(report.pusd_balance_before);
+    let allowance_before = usdc_units_to_f64(report.onramp_allowance_before);
+    let wrapped = usdc_units_to_f64(report.wrapped_amount);
+    if report.wrapped_amount.is_zero() {
+        info!(
+            target: "live_collateral.startup",
+            wallet = %report.wallet,
+            usdce_before,
+            pusd_before,
+            allowance_before,
+            min_wrap_usd = config.live_pusd_auto_wrap_min_usd,
+            "pUSD auto-wrap checked; no USDC.e balance above threshold"
+        );
+    } else {
+        info!(
+            target: "live_collateral.startup",
+            wallet = %report.wallet,
+            usdce_before,
+            pusd_before,
+            allowance_before,
+            wrapped,
+            approve_tx_hash = ?report.approve_tx_hash,
+            wrap_tx_hash = ?report.wrap_tx_hash,
+            "pUSD auto-wrap completed before live quoting"
+        );
+    }
     Ok(())
 }
 
@@ -1562,6 +1618,48 @@ async fn run_runtime_loop(
                         )?;
                         persist_audit_outcome(audit, "live-health", runtime, &combined)?;
                     }
+                    let recover_outcome = auto_recover_live_riskoff(
+                        runtime,
+                        metrics.as_ref(),
+                        config,
+                        live_safety,
+                        now_unix_ms(),
+                        live_health_started_at_ms,
+                    );
+                    if !recover_outcome.event_seqs.is_empty()
+                        || !recover_outcome.commands.is_empty()
+                    {
+                        let combined = execute_execution_adapter(
+                            runtime,
+                            books,
+                            &current_assets,
+                            paper_fee_coeff,
+                            metrics.as_ref(),
+                            recover_outcome,
+                            paper_order_ctx,
+                            execution_venue_map,
+                            live_safety,
+                            execution_adapter.clone(),
+                            execution_policy,
+                            &mut seen_venue_fill_keys,
+                            paper_report.as_mut(),
+                        )
+                        .await?;
+                        persist_runtime_outcome(
+                            journal,
+                            metrics.as_ref(),
+                            runtime.event_log(),
+                            paper_report.as_mut(),
+                            "live-riskoff-auto-recover",
+                            combined.clone(),
+                        )?;
+                        persist_audit_outcome(
+                            audit,
+                            "live-riskoff-auto-recover",
+                            runtime,
+                            &combined,
+                        )?;
+                    }
                 }
                 for asset_id in &current_assets {
                     match books.snapshot(asset_id).await {
@@ -1757,6 +1855,7 @@ async fn run_runtime_loop(
                                 )),
                                 market_id,
                                 condition_id: condition_id.clone(),
+                                collateral_token_address: None,
                                 index_sets: vec![1, 2],
                                 submitted_at_ms: now_ms,
                             };
@@ -3371,8 +3470,7 @@ async fn execute_execution_adapter(
                         let reason = ack.venue_message.unwrap_or_else(|| {
                             "execution venue rejected merge positions".to_string()
                         });
-                        // Clear dedup so future merges aren't permanently blocked.
-                        runtime.clear_pending_merge(&intent.market_id, ack.accepted_at_ms);
+                        runtime.block_pending_merge(&intent.market_id, ack.accepted_at_ms, &reason);
                         metrics.observe_riskoff_transition();
                         let degrade_outcome = runtime.degrade_and_cancel_all(
                             ack.accepted_at_ms,
@@ -3381,12 +3479,8 @@ async fn execute_execution_adapter(
                         stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                     }
                     Err(error) => {
-                        // CRITICAL: clear dedup on BOTH retryable and non-retryable
-                        // failures. Without this, the next reconcile sweep sees the
-                        // stale pending_merge entry and skips the merge — making
-                        // "will retry on next sweep" a lie that strands the market.
-                        runtime.clear_pending_merge(&intent.market_id, observed_at_ms);
                         if error.is_retryable() {
+                            runtime.clear_pending_merge(&intent.market_id, observed_at_ms);
                             warn!(
                                 mode = "live",
                                 market_id = %intent.market_id,
@@ -3396,6 +3490,11 @@ async fn execute_execution_adapter(
                                 "transient merge failure; will retry on next reconcile sweep"
                             );
                         } else {
+                            runtime.block_pending_merge(
+                                &intent.market_id,
+                                observed_at_ms,
+                                error.to_string(),
+                            );
                             metrics.observe_riskoff_transition();
                             let degrade_outcome = runtime.degrade_and_cancel_all(
                                 observed_at_ms,
@@ -3999,6 +4098,67 @@ fn enforce_live_health(
     if now_ms.saturating_sub(started_at_ms) < LIVE_HEALTH_STARTUP_GRACE_MS {
         return RuntimeOutcome::default();
     }
+    let (health_failures, risk_failures) =
+        live_health_failures(runtime, metrics, config, live_safety);
+
+    if health_failures.is_empty() && risk_failures.is_empty() {
+        RuntimeOutcome::default()
+    } else if health_failures.is_empty() {
+        metrics.observe_riskoff_transition();
+        runtime.riskoff_and_cancel_entry_orders(
+            now_ms,
+            format!("live risk limit failure: {}", risk_failures.join("; ")),
+        )
+    } else {
+        metrics.observe_riskoff_transition();
+        let mut failures = health_failures;
+        failures.extend(risk_failures);
+        runtime.degrade_and_cancel_all(
+            now_ms,
+            format!("live health failure: {}", failures.join("; ")),
+        )
+    }
+}
+
+fn auto_recover_live_riskoff(
+    runtime: &mut Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    config: &AppConfig,
+    live_safety: &LiveSafetyState,
+    now_ms: u64,
+    started_at_ms: u64,
+) -> RuntimeOutcome {
+    if config.paper_mode
+        || runtime.status() != RuntimeStatus::RiskOff
+        || config.live_risk_off_auto_recover.is_zero()
+    {
+        return RuntimeOutcome::default();
+    }
+    let recover_after_ms = config
+        .live_risk_off_auto_recover
+        .as_millis()
+        .max(LIVE_HEALTH_STARTUP_GRACE_MS as u128) as u64;
+    if now_ms.saturating_sub(started_at_ms) < recover_after_ms {
+        return RuntimeOutcome::default();
+    }
+    let (health_failures, risk_failures) =
+        live_health_failures(runtime, metrics, config, live_safety);
+    if health_failures.is_empty() && risk_failures.is_empty() {
+        runtime.recover_from_riskoff(
+            now_ms,
+            format!("live health checks passed for {recover_after_ms}ms"),
+        )
+    } else {
+        RuntimeOutcome::default()
+    }
+}
+
+fn live_health_failures(
+    runtime: &Runtime<StrategyMode>,
+    metrics: &AppMetrics,
+    config: &AppConfig,
+    live_safety: &LiveSafetyState,
+) -> (Vec<String>, Vec<String>) {
     let snapshot = metrics.snapshot();
     let market_stale_ms = config
         .strategy_profile
@@ -4091,23 +4251,7 @@ fn enforce_live_health(
         }
     }
 
-    if health_failures.is_empty() && risk_failures.is_empty() {
-        RuntimeOutcome::default()
-    } else if health_failures.is_empty() {
-        metrics.observe_riskoff_transition();
-        runtime.riskoff_and_cancel_entry_orders(
-            now_ms,
-            format!("live risk limit failure: {}", risk_failures.join("; ")),
-        )
-    } else {
-        metrics.observe_riskoff_transition();
-        let mut failures = health_failures;
-        failures.extend(risk_failures);
-        runtime.degrade_and_cancel_all(
-            now_ms,
-            format!("live health failure: {}", failures.join("; ")),
-        )
-    }
+    (health_failures, risk_failures)
 }
 
 fn enforce_capital_guard(
@@ -4471,7 +4615,9 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::book::Level;
+    use crate::config::{LogFormat, MarketDiscoveryFamily};
     use crate::market_context::MarketContextStore;
+    use crate::metrics::StreamKind;
     use crate::risk::RiskLimits;
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::strategy::NoopStrategy;
@@ -4479,6 +4625,101 @@ mod tests {
         CancelOrderAck, ExecutionError, MergePositionsAck, MergePositionsRequest, SubmitOrderAck,
         VenueBalances, VenueFill, VenuePosition,
     };
+
+    fn runner_test_config() -> AppConfig {
+        AppConfig {
+            service_name: "test".to_string(),
+            strategy_name: "noop".to_string(),
+            paper_mode: false,
+            log_level: "info".to_string(),
+            log_format: LogFormat::Pretty,
+            metrics_bind: "127.0.0.1:0".parse().unwrap(),
+            clob_api_url: "https://clob.polymarket.com".to_string(),
+            data_api_url: "https://data-api.polymarket.com".to_string(),
+            relayer_url: "https://relayer-v2.polymarket.com".to_string(),
+            relayer_api_key: None,
+            relayer_api_key_address: None,
+            ctf_contract_address: "0x0000000000000000000000000000000000000000".to_string(),
+            ctf_collateral_token_address: "0x0000000000000000000000000000000000000000".to_string(),
+            collateral_token_address: "0x0000000000000000000000000000000000000000".to_string(),
+            collateral_decimals: 6,
+            proxy_wallet_address: None,
+            polygon_rpc_url: None,
+            market_ws_url: "wss://example.invalid/market".to_string(),
+            user_ws_url: "wss://example.invalid/user".to_string(),
+            spot_ws_url: "wss://example.invalid/spot".to_string(),
+            spot_symbol: "btcusdt".to_string(),
+            market_assets: Vec::new(),
+            user_markets: Vec::new(),
+            market_discovery_enabled: false,
+            market_discovery_interval: std::time::Duration::from_secs(60),
+            market_discovery_window: std::time::Duration::from_secs(300),
+            market_discovery_include_prev: 0,
+            market_discovery_include_next: 0,
+            market_discovery_gamma_url: "https://gamma-api.polymarket.com".to_string(),
+            market_discovery_slug_prefix: "btc-updown-5m".to_string(),
+            market_discovery_families: Vec::<MarketDiscoveryFamily>::new(),
+            runtime_loop_interval: std::time::Duration::from_millis(250),
+            summary_log_interval: std::time::Duration::from_secs(30),
+            order_reconcile_interval: std::time::Duration::from_secs(10),
+            order_reconcile_stale_window: std::time::Duration::from_secs(5),
+            runtime_checkpoint_interval: std::time::Duration::from_secs(30),
+            book_stale_after: std::time::Duration::from_secs(5),
+            order_store_path: None,
+            runtime_run_id: None,
+            ping_interval: std::time::Duration::from_secs(10),
+            market_context_path: None,
+            journal_path: None,
+            journal_rotate_bytes: None,
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            market_id_by_asset: HashMap::new(),
+            risk_limits: RiskLimits::default(),
+            strategy_profile_path: None,
+            strategy_profile: None,
+            user_auth: None,
+            dashboard_whale_events_path: None,
+            dashboard_refresh_ms: 1_000,
+            dashboard_event_limit: 100,
+            audit_path: None,
+            clob_version: "v2".to_string(),
+            clob_v2_builder_code: crate::wire::clob_v2::BYTES32_ZERO.to_string(),
+            clob_v2_metadata: crate::wire::clob_v2::BYTES32_ZERO.to_string(),
+            clob_v2_neg_risk: false,
+            live_post_only: true,
+            live_order_ttl: std::time::Duration::from_secs(60),
+            live_order_max_age: std::time::Duration::from_secs(60),
+            live_reconcile_missing_grace: std::time::Duration::from_secs(5),
+            quote_min_order_age: std::time::Duration::from_millis(250),
+            quote_churn_window: std::time::Duration::from_secs(10),
+            quote_hard_pull: std::time::Duration::from_secs(30),
+            quote_max_churn_per_window: 12,
+            quote_max_submit_per_window: 6,
+            quote_max_replace_per_window: 4,
+            quote_max_cancel_per_window: 12,
+            live_max_submit_errors: 1,
+            live_max_cancel_errors: 1,
+            live_kill_on_reconcile_mismatch: true,
+            live_kill_switch_path: None,
+            live_pusd_auto_wrap: false,
+            live_pusd_auto_wrap_min_usd: 0.01,
+            live_risk_off_auto_recover: std::time::Duration::from_secs(30),
+            paper_min_fill_notional_usd: 0.05,
+            paper_max_fills_per_order: 3,
+            paper_min_fill_interval: std::time::Duration::from_millis(750),
+            paper_market_close_at_ms: None,
+            paper_market_resolution_price: None,
+            paper_submit_latency_ms: 150,
+            paper_queue_depth_fraction: 0.75,
+            paper_post_only_reject_probability: 0.85,
+            paper_cancel_race_window_ms: 500,
+            paper_report_path: None,
+            book_snapshot_log_path: None,
+            book_snapshot_max_levels: 10,
+            paper_maker_rebate_coeff: 0.0,
+            paper_taker_fee_coeff_override: None,
+        }
+    }
 
     #[derive(Default)]
     struct RecordingAdapter {
@@ -4973,6 +5214,37 @@ mod tests {
             merges[0].condition_id.as_deref(),
             Some("0x1111111111111111111111111111111111111111111111111111111111111111")
         );
+        drop(merges);
+
+        let second_outcome = execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+            None,
+        )
+        .await
+        .expect("second execute");
+
+        assert!(!second_outcome
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
+        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+        let merges = adapter.merged.lock().expect("merged lock");
+        assert_eq!(
+            merges.len(),
+            1,
+            "non-retryable merge failure must not resubmit identical CTF recycle tx"
+        );
     }
 
     #[tokio::test]
@@ -5331,6 +5603,71 @@ mod tests {
         assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
         assert!(!outcome.event_seqs.is_empty());
         assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
+    }
+
+    #[test]
+    fn live_riskoff_auto_recover_promotes_running_after_healthy_window() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::RiskOff,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        let metrics = AppMetrics::new().expect("metrics");
+        metrics.set_stream_connected(StreamKind::Market, true);
+        metrics.set_stream_connected(StreamKind::User, true);
+        metrics.set_execution_adapter_connected(true);
+        let config = runner_test_config();
+        let live_safety = LiveSafetyState {
+            last_venue_cash_usd: Some(100.0),
+            ..LiveSafetyState::default()
+        };
+
+        let early =
+            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 5_000, 0);
+        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
+        assert!(early.event_seqs.is_empty());
+
+        let recovered =
+            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
+        assert_eq!(runtime.status(), RuntimeStatus::Running);
+        assert!(!recovered.event_seqs.is_empty());
+        assert!(runtime
+            .event_log()
+            .recent(4)
+            .iter()
+            .any(|event| event.message.contains("runtime risk-off auto-recovered")));
+    }
+
+    #[test]
+    fn live_riskoff_auto_recover_stays_riskoff_when_health_not_clean() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::RiskOff,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+        let metrics = AppMetrics::new().expect("metrics");
+        metrics.set_stream_connected(StreamKind::Market, true);
+        metrics.set_stream_connected(StreamKind::User, true);
+        metrics.set_execution_adapter_connected(true);
+        let config = runner_test_config();
+        let live_safety = LiveSafetyState::default();
+
+        let outcome =
+            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
+        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
+        assert!(outcome.event_seqs.is_empty());
     }
 
     #[test]
