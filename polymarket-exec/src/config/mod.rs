@@ -121,6 +121,17 @@ pub struct AppConfig {
     pub live_max_cancel_errors: usize,
     pub live_kill_on_reconcile_mismatch: bool,
     pub live_kill_switch_path: Option<PathBuf>,
+    /// After how long of healthy operation post-restart should the runtime
+    /// auto-recover from a persisted RiskOff state. Default 30s. Set to 0
+    /// to disable (operator must clear runtime_state manually).
+    ///
+    /// This exists because `Persist risk-off runtime state` (commit 2982576)
+    /// added durable persistence of RiskOff but no recovery path. A single
+    /// transient reconcile mismatch traps the bot indefinitely until human
+    /// intervention. The default 30s window gives the protective property
+    /// (don't trade if conditions are still bad) without trapping the bot
+    /// forever (transient triggers self-clear quickly).
+    pub live_risk_off_auto_recover: Duration,
     pub paper_min_fill_notional_usd: f64,
     pub paper_max_fills_per_order: usize,
     pub paper_min_fill_interval: Duration,
@@ -269,9 +280,8 @@ impl AppConfig {
         );
         let market_discovery_slug_prefix =
             env_or("WHALE_PAIR_MARKET_DISCOVERY_SLUG_PREFIX", "btc-updown-5m-");
-        let market_discovery_families = parse_market_discovery_families(
-            "WHALE_PAIR_MARKET_DISCOVERY_FAMILIES",
-        )?;
+        let market_discovery_families =
+            parse_market_discovery_families("WHALE_PAIR_MARKET_DISCOVERY_FAMILIES")?;
         let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
         let summary_log_interval =
             parse_duration_ms("WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
@@ -403,6 +413,8 @@ impl AppConfig {
         let live_kill_on_reconcile_mismatch =
             parse_bool("WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
         let live_kill_switch_path = parse_path_optional("WHALE_PAIR_LIVE_KILL_SWITCH_PATH");
+        let live_risk_off_auto_recover =
+            parse_duration_ms("WHALE_PAIR_LIVE_RISK_OFF_AUTO_RECOVER_MS", 30_000)?;
         let paper_min_fill_notional_usd =
             parse_f64("WHALE_PAIR_PAPER_MIN_FILL_NOTIONAL_USD", 0.05)?;
         let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
@@ -539,6 +551,7 @@ impl AppConfig {
             live_max_cancel_errors,
             live_kill_on_reconcile_mismatch,
             live_kill_switch_path,
+            live_risk_off_auto_recover,
             paper_min_fill_notional_usd,
             paper_max_fills_per_order,
             paper_min_fill_interval,
@@ -641,8 +654,7 @@ mod tests {
     #[test]
     fn returns_empty_when_unset() {
         std::env::remove_var("TEST_FAMILIES_UNSET_X");
-        let families =
-            parse_market_discovery_families("TEST_FAMILIES_UNSET_X").unwrap();
+        let families = parse_market_discovery_families("TEST_FAMILIES_UNSET_X").unwrap();
         assert!(families.is_empty());
     }
 
