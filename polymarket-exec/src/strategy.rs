@@ -1672,6 +1672,13 @@ impl Btc5mMmStrategy {
     /// 4 fires per bar gives 4 chances at the asymmetric payoff while
     /// bounding cumulative damage if signals all happen to be wrong.
     const CONVEX_MAX_BIDS_PER_BAR: u32 = 4;
+    /// Fractional Kelly keeps convex accumulation proportional to measured
+    /// edge instead of forcing the venue minimum on every eligible tick.
+    const CONVEX_FRACTIONAL_KELLY: f64 = 0.25;
+    /// Absolute bankroll slice for a single convex clip. This protects small
+    /// live bankrolls from turning a tiny theoretical edge into an oversized
+    /// minimum-order bet.
+    const CONVEX_MAX_KELLY_BANKROLL_FRACTION: f64 = 0.03;
     /// 180s rolling BTC return magnitude that flags a "persistent trend".
     /// Tuned to match the smallest spot move that consistently produces
     /// >5pp Polymarket book repricing in a single 5min bar. Below this,
@@ -2078,6 +2085,23 @@ impl Btc5mMmStrategy {
             .min_order_quantity
             .max(self.config.venue_min_order_quantity)
             .max(min_notional_quantity)
+    }
+
+    fn convex_kelly_budget_usd(&self, fair: f64, bid_price: f64, bankroll_usd: f64) -> f64 {
+        if !fair.is_finite()
+            || !bid_price.is_finite()
+            || !bankroll_usd.is_finite()
+            || fair <= bid_price
+            || bid_price <= 0.0
+            || bid_price >= 1.0
+            || bankroll_usd <= 0.0
+        {
+            return 0.0;
+        }
+        let full_kelly_fraction = ((fair - bid_price) / (1.0 - bid_price)).clamp(0.0, 1.0);
+        let fractional_kelly =
+            (full_kelly_fraction * Self::CONVEX_FRACTIONAL_KELLY).clamp(0.0, 1.0);
+        bankroll_usd * fractional_kelly.min(Self::CONVEX_MAX_KELLY_BANKROLL_FRACTION)
     }
 
     fn rescue_inflight_ttl_ms(&self) -> u64 {
@@ -2837,6 +2861,7 @@ impl Btc5mMmStrategy {
         gross_cost: f64,
         max_gross_cost_usd: f64,
         max_leg_cost_usd: f64,
+        convex_bankroll_usd: f64,
         venue_rules: Option<&VenueMarketRules>,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
@@ -2880,11 +2905,34 @@ impl Btc5mMmStrategy {
             let min_quantity = self.required_order_quantity(bid_price);
             let remaining_leg_usd = (max_leg_cost_usd - leg_cost).max(0.0);
             let remaining_gross_usd = (max_gross_cost_usd - gross_cost).max(0.0);
-            let max_quantity = (remaining_leg_usd / bid_price).min(remaining_gross_usd / bid_price);
+            let kelly_budget_usd =
+                self.convex_kelly_budget_usd(fair, bid_price, convex_bankroll_usd);
+            let max_notional_usd = remaining_leg_usd
+                .min(remaining_gross_usd)
+                .min(kelly_budget_usd)
+                .min(self.config.max_clip_usd)
+                .max(0.0);
+            let max_quantity = max_notional_usd / bid_price;
+            let min_notional_usd = min_quantity * bid_price;
             if !max_quantity.is_finite() || max_quantity + 1e-9 < min_quantity {
+                tracing::info!(
+                    target: "strategy.convex_kelly",
+                    market = %market_id,
+                    instrument = %instrument_id,
+                    fair,
+                    bid_price,
+                    convex_bankroll_usd,
+                    kelly_budget_usd,
+                    min_notional_usd,
+                    max_notional_usd,
+                    remaining_leg_usd,
+                    remaining_gross_usd,
+                    outcome = "below_venue_minimum",
+                    "convex accumulation skipped by Kelly budget"
+                );
                 continue;
             }
-            let quantity = min_quantity.min(max_quantity);
+            let quantity = max_quantity;
             let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, self.config.min_edge_bps);
             return self.build_bid_intent_at_price(
                 market_id,
@@ -3476,6 +3524,8 @@ impl Strategy for Btc5mMmStrategy {
                         gross_cost,
                         max_entry_gross_cost_usd * Self::CONVEX_BUDGET_FRACTION,
                         max_entry_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION,
+                        Self::inventory_equity_usd(&context.inventory)
+                            .min(context.inventory.free_cash_usd.max(0.0)),
                         context.venue_rules.as_ref(),
                         context.now_ms,
                     ) {
