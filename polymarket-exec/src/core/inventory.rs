@@ -49,6 +49,7 @@ pub enum InventoryAdjustmentReason {
     FillApplied,
     MergeApplied,
     MarkUpdated,
+    CashReconciled,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,18 +238,30 @@ impl InventoryState {
     }
 
     pub fn gross_exposure_usd(&self) -> f64 {
-        self.positions
+        let exposure = self
+            .positions
             .values()
             .map(PositionState::gross_notional_usd)
-            .sum()
+            .sum::<f64>();
+        if exposure.abs() < 1e-9 {
+            0.0
+        } else {
+            exposure
+        }
     }
 
     pub fn net_exposure_for_market_usd(&self, market_id: &MarketId) -> f64 {
-        self.positions
+        let exposure = self
+            .positions
             .values()
             .filter(|position| &position.market_id == market_id)
             .map(PositionState::net_notional_usd)
-            .sum()
+            .sum::<f64>();
+        if exposure.abs() < 1e-9 {
+            0.0
+        } else {
+            exposure
+        }
     }
 
     pub fn snapshot(&self) -> InventorySnapshot {
@@ -262,6 +275,35 @@ impl InventoryState {
             gross_exposure_usd: self.gross_exposure_usd(),
             positions,
         }
+    }
+
+    pub fn reconcile_venue_cash(
+        &mut self,
+        authoritative_total_cash_usd: f64,
+        observed_at_ms: EpochMillis,
+    ) -> Result<InventoryAdjustment, InventoryError> {
+        if !authoritative_total_cash_usd.is_finite() || authoritative_total_cash_usd < -1e-9 {
+            return Err(InventoryError::InvalidFill("invalid venue cash snapshot"));
+        }
+
+        let previous_total_cash_usd = self.total_cash_usd();
+        let authoritative_total_cash_usd = authoritative_total_cash_usd.max(0.0);
+        self.free_cash_usd = (authoritative_total_cash_usd - self.reserved_cash_usd).max(0.0);
+
+        Ok(InventoryAdjustment {
+            reason: InventoryAdjustmentReason::CashReconciled,
+            observed_at_ms,
+            market_id: None,
+            instrument_id: None,
+            client_order_id: None,
+            cash_delta_usd: authoritative_total_cash_usd - previous_total_cash_usd,
+            reserved_cash_delta_usd: 0.0,
+            position_delta: 0.0,
+            realized_pnl_delta_usd: 0.0,
+            free_cash_after_usd: self.free_cash_usd,
+            reserved_cash_after_usd: self.reserved_cash_usd,
+            gross_exposure_after_usd: self.gross_exposure_usd(),
+        })
     }
 
     pub fn reconcile_venue_positions(
@@ -885,6 +927,42 @@ mod tests {
             report.stranded_markets[0].stranded_positions[0].quantity,
             6.5
         );
+    }
+
+    #[test]
+    fn venue_cash_reconciliation_updates_free_cash_without_losing_reservations() {
+        let market_id = MarketId::from("market-a");
+        let instrument_id = InstrumentId::from("token-a");
+        let client_order_id = ClientOrderId::from("client-1");
+        let mut inventory = InventoryState::new(100.0);
+
+        inventory
+            .reserve_for_order(&OrderIntent {
+                client_order_id,
+                market_id,
+                instrument_id,
+                side: TradeSide::Buy,
+                limit_price: 0.40,
+                quantity: 25.0,
+                reduce_only: false,
+                reason: "test".into(),
+                quote_level_tag: None,
+                created_at_ms: 10,
+                pair_id: None,
+                kind: crate::types::IntentKind::Entry,
+            })
+            .expect("reserve");
+
+        let adjustment = inventory
+            .reconcile_venue_cash(65.0, 20)
+            .expect("venue cash reconciliation");
+
+        assert_eq!(inventory.reserved_cash_usd(), 10.0);
+        assert_eq!(inventory.free_cash_usd(), 55.0);
+        assert_eq!(inventory.total_cash_usd(), 65.0);
+        assert_eq!(adjustment.free_cash_after_usd, 55.0);
+        assert_eq!(adjustment.reserved_cash_after_usd, 10.0);
+        assert_eq!(adjustment.cash_delta_usd, -35.0);
     }
 
     #[test]

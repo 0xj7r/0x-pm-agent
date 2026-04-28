@@ -140,6 +140,8 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         max_gross_cost_bps: 0.0,
         max_leg_cost_usd: 10.0,
         max_leg_cost_bps: 0.0,
+        max_entry_free_cash_bps: 10_000.0,
+        max_rescue_free_cash_bps: 10_000.0,
         min_edge_bps: 75.0,
         hedge_rescue_edge_bps: 25.0,
         inventory_skew_bps: 150.0,
@@ -1029,6 +1031,43 @@ fn btc_5m_mm_hedge_rescue_does_not_repeat_while_in_flight() {
 }
 
 #[test]
+fn btc_5m_mm_hedge_rescue_does_not_repeat_when_stranded_quantity_moves() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.cooldown_ms = 100;
+    let mut strategy = Btc5mMmStrategy::new(config);
+
+    let initial_positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 5.0,
+        avg_price: 0.33,
+        mark_price: Some(0.33),
+        updated_at_ms: 1,
+    }];
+    let ctx = context_at(initial_positions, 1_000);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.32, 0.34, 10));
+    let first = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+    assert_eq!(first.intents.len(), 1);
+
+    let changed_positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 6.25,
+        avg_price: 0.33,
+        mark_price: Some(0.33),
+        updated_at_ms: 2,
+    }];
+    let ctx = context_at(changed_positions, 2_000);
+    let second = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 20));
+    assert!(second.intents.is_empty());
+    assert!(second
+        .notes
+        .iter()
+        .any(|note| note.contains("rescue already in flight")));
+}
+
+#[test]
 fn btc_5m_mm_hedge_rescue_stops_after_attempt_cap() {
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
@@ -1069,6 +1108,57 @@ fn btc_5m_mm_hedge_rescue_stops_after_attempt_cap() {
         .notes
         .iter()
         .any(|note| note.contains("rescue attempt cap reached")));
+}
+
+#[test]
+fn btc_5m_mm_hedge_rescue_uses_rescue_clip_budget() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.hedge_rescue_clip_usd = 2.50;
+    config.venue_min_order_quantity = 0.01;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 20.0,
+        avg_price: 0.33,
+        mark_price: Some(0.33),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.32, 0.34, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+
+    assert_eq!(decision.intents.len(), 1);
+    let hedge = &decision.intents[0];
+    assert!(hedge.quantity < 20.0);
+    assert!(hedge.quantity * hedge.limit_price <= config.hedge_rescue_clip_usd + 1e-9);
+}
+
+#[test]
+fn btc_5m_mm_entry_caps_scale_with_free_cash_budget() {
+    let mut config = btc_5m_mm_test_config();
+    config.min_edge_bps = 10.0;
+    config.max_gross_cost_usd = 20.0;
+    config.max_leg_cost_usd = 10.0;
+    config.max_entry_free_cash_bps = 2_000.0;
+    config.min_order_notional_usd = 0.50;
+    config.venue_min_order_quantity = 0.01;
+    config.min_order_quantity = 0.01;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let ctx = context_at_with_cash(Vec::new(), 10, 10.0);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.50, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+
+    assert_eq!(decision.intents.len(), 2);
+    let total_notional: f64 = decision
+        .intents
+        .iter()
+        .map(|intent| intent.quantity * intent.limit_price)
+        .sum();
+    assert!(total_notional <= 2.0 + 1e-9);
 }
 
 #[test]

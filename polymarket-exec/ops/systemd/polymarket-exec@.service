@@ -16,10 +16,10 @@ Environment=WHALE_PAIR_EXEC_LOAD_DOTENV=false
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 Environment=WHALE_PAIR_PYTHON_BIN=python3
-Environment=WHALE_PAIR_CARGO_BIN=cargo
+Environment=WHALE_PAIR_EXEC_BIN=%h/go/polymarket-agent/target/release/polymarket-exec
 EnvironmentFile=-%h/.config/polymarket-exec/%i.env
 ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/live" "${WHALE_PAIR_ROOT_DIR}/data/execution/audit"'
-ExecStart=/usr/bin/env bash -lc 'cd "${WHALE_PAIR_ROOT_DIR}/polymarket-exec" && exec "${WHALE_PAIR_CARGO_BIN}" run'
+ExecStart=/usr/bin/env bash -lc 'exec "${WHALE_PAIR_EXEC_BIN}"'
 Restart=always
 RestartSec=10
 TimeoutStopSec=20

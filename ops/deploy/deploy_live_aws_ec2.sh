@@ -74,11 +74,11 @@ ssh_base "
 log "installing user service templates"
 ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
 
+log "building single release binary"
+ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && \"\$CARGO_BIN\" build --release -p polymarket-exec && test -x target/release/polymarket-exec"
+
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
-
-log "setting host cargo path for tinylive rustup toolchain"
-ssh_base "mkdir -p ~/.config/polymarket-exec && grep -q '^WHALE_PAIR_CARGO_BIN=' ~/.config/polymarket-exec/btc_5m_mm_tinylive.env && sed -i 's|^WHALE_PAIR_CARGO_BIN=.*|WHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo|' ~/.config/polymarket-exec/btc_5m_mm_tinylive.env || printf '\nWHALE_PAIR_CARGO_BIN=/home/ubuntu/.cargo/bin/cargo\n' >> ~/.config/polymarket-exec/btc_5m_mm_tinylive.env"
 
 log "enabling linger for ${REMOTE_USER}"
 ssh_base "sudo loginctl enable-linger '${REMOTE_USER}' || true"

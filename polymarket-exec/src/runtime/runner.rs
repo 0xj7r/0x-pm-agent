@@ -3142,6 +3142,8 @@ async fn execute_execution_adapter(
                             &reason,
                             execution_policy.live_post_only,
                         );
+                        let immediate_live_stop =
+                            active_order && submit_rejection_requires_immediate_live_stop(&reason);
                         if active_order && counts_against_budget {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
@@ -3155,6 +3157,7 @@ async fn execute_execution_adapter(
                             qty = intent.quantity,
                             reason = %reason,
                             counts_against_budget,
+                            immediate_live_stop,
                             active_order,
                             "submit ack-rejected by venue (full venue text)"
                         );
@@ -3162,10 +3165,19 @@ async fn execute_execution_adapter(
                         if active_order {
                             let rejected_outcome = runtime.on_order_rejected(
                                 &intent.client_order_id,
-                                reason,
+                                reason.clone(),
                                 ack.accepted_at_ms,
                             );
                             combined.extend(rejected_outcome);
+                            if immediate_live_stop {
+                                metrics.observe_riskoff_transition();
+                                combined.extend(runtime.degrade_and_cancel_all(
+                                    ack.accepted_at_ms,
+                                    format!(
+                                        "deterministic live submit rejection; risk-off until wire encoding is fixed: {reason}"
+                                    ),
+                                ));
+                            }
                         } else {
                             execution_venue_map.remove(&intent.client_order_id);
                         }
@@ -3176,6 +3188,8 @@ async fn execute_execution_adapter(
                         if active_order {
                             live_safety.consecutive_submit_errors =
                                 live_safety.consecutive_submit_errors.saturating_add(1);
+                            let immediate_live_stop =
+                                submit_rejection_requires_immediate_live_stop(&error.to_string());
                             warn!(
                                 target: "polymarket_exec::runtime::runner",
                                 mode = "live",
@@ -3185,6 +3199,7 @@ async fn execute_execution_adapter(
                                 qty = intent.quantity,
                                 error = %error,
                                 error_kind = std::any::type_name_of_val(&error),
+                                immediate_live_stop,
                                 "submit Err returned by adapter (full venue text)"
                             );
                         } else {
@@ -3213,13 +3228,25 @@ async fn execute_execution_adapter(
                                 ));
                             }
                         } else if active_order {
+                            let reason = error.to_string();
+                            let immediate_live_stop =
+                                submit_rejection_requires_immediate_live_stop(&reason);
                             let rejected_outcome = runtime.on_order_rejected(
                                 &intent.client_order_id,
-                                error.to_string(),
+                                reason.clone(),
                                 observed_at_ms,
                             );
                             paper_order_ctx.remove(&intent.client_order_id);
                             combined.extend(rejected_outcome);
+                            if immediate_live_stop {
+                                metrics.observe_riskoff_transition();
+                                combined.extend(runtime.degrade_and_cancel_all(
+                                    observed_at_ms,
+                                    format!(
+                                        "deterministic live submit rejection; risk-off until wire encoding is fixed: {reason}"
+                                    ),
+                                ));
+                            }
                         } else {
                             paper_order_ctx.remove(&intent.client_order_id);
                             execution_venue_map.remove(&intent.client_order_id);
@@ -3465,6 +3492,7 @@ async fn execute_execution_adapter(
                         )
                         .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
+                        runtime.mark_pending_merge_accepted(&intent.market_id, ack.accepted_at_ms);
                     }
                     Ok(ack) => {
                         let reason = ack.venue_message.unwrap_or_else(|| {
@@ -3815,11 +3843,61 @@ async fn apply_sync_report(
     } else {
         live_safety.consecutive_reconcile_mismatches = 0;
     }
+
+    for fill in report.venue_fills {
+        let fill_report = FillReport {
+            order_id: Some(fill.venue_order_id),
+            client_order_id: fill.client_order_id,
+            market_id: fill.market_id,
+            instrument_id: fill.instrument_id,
+            side: fill.side,
+            price: fill.price,
+            quantity: fill.quantity,
+            fee_usd: fill.fee_usd,
+            liquidity: fill.liquidity,
+            close_method: None,
+            observed_at_ms: fill.observed_at_ms,
+        };
+        if fill_report.quantity <= 0.0 || fill_report.price <= 0.0 {
+            continue;
+        }
+        metrics.record_fill(&fill_report, None);
+        match runtime.on_fill(fill_report) {
+            Ok(fill_outcome) => outcome.extend(fill_outcome),
+            Err(error) => {
+                live_safety.consecutive_reconcile_mismatches = live_safety
+                    .consecutive_reconcile_mismatches
+                    .saturating_add(1);
+                metrics.observe_reconcile_failure();
+                warn!(error = ?error, "failed to apply venue fill during live reconciliation");
+            }
+        }
+    }
+
     if report.balance_synced {
         live_safety.last_venue_cash_usd = report.venue_cash_usd;
         live_safety.last_venue_position_count = report.venue_position_count;
         live_safety.last_venue_balance_observed_at_ms = report.venue_balance_observed_at_ms;
         if let Some(cash_usd) = report.venue_cash_usd {
+            let observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
+            match runtime.reconcile_venue_cash(cash_usd, observed_at_ms) {
+                Ok(adjustment) => {
+                    debug!(
+                        mode = "live",
+                        venue_cash_usd = cash_usd,
+                        free_cash_after_usd = adjustment.free_cash_after_usd,
+                        reserved_cash_after_usd = adjustment.reserved_cash_after_usd,
+                        "reconciled runtime cash from venue balance"
+                    );
+                }
+                Err(error) => {
+                    live_safety.consecutive_reconcile_mismatches = live_safety
+                        .consecutive_reconcile_mismatches
+                        .saturating_add(1);
+                    metrics.observe_reconcile_failure();
+                    warn!(error = ?error, "failed to reconcile venue cash snapshot");
+                }
+            }
             metrics.set_venue_balance_metrics(cash_usd, report.venue_position_count);
             info!(
                 mode = "live",
@@ -3953,36 +4031,6 @@ async fn apply_sync_report(
         }
     }
 
-    for fill in report.venue_fills {
-        let fill_report = FillReport {
-            order_id: Some(fill.venue_order_id),
-            client_order_id: fill.client_order_id,
-            market_id: fill.market_id,
-            instrument_id: fill.instrument_id,
-            side: fill.side,
-            price: fill.price,
-            quantity: fill.quantity,
-            fee_usd: fill.fee_usd,
-            liquidity: fill.liquidity,
-            close_method: None,
-            observed_at_ms: fill.observed_at_ms,
-        };
-        if fill_report.quantity <= 0.0 || fill_report.price <= 0.0 {
-            continue;
-        }
-        metrics.record_fill(&fill_report, None);
-        match runtime.on_fill(fill_report) {
-            Ok(fill_outcome) => outcome.extend(fill_outcome),
-            Err(error) => {
-                live_safety.consecutive_reconcile_mismatches = live_safety
-                    .consecutive_reconcile_mismatches
-                    .saturating_add(1);
-                metrics.observe_reconcile_failure();
-                warn!(error = ?error, "failed to apply venue fill during live reconciliation");
-            }
-        }
-    }
-
     for client_order_id in report.pending_missing_local_orders {
         debug!(
             mode = "live",
@@ -4018,6 +4066,15 @@ fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) ->
         || lower.contains("crosses book")
         || lower.contains("would cross")
         || lower.contains("would take liquidity"))
+}
+
+fn submit_rejection_requires_immediate_live_stop(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("invalid amounts")
+        || lower.contains("maker amount supports a max accuracy")
+        || lower.contains("taker amount a max")
+        || (lower.contains("unable to build order")
+            && (lower.contains("decimal") || lower.contains("precision")))
 }
 
 fn runtime_has_active_order(
@@ -5118,6 +5175,7 @@ mod tests {
             .expect("venue position should reconcile into runtime inventory");
         assert_eq!(position.quantity, 6.5);
         assert_eq!(position.avg_price, 0.80);
+        assert!((runtime.inventory().free_cash_usd() - 74.89).abs() < 1e-9);
         assert_eq!(runtime.stranded_inventory().len(), 1);
         assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
         assert_eq!(metrics.snapshot().venue_position_count, 1);
@@ -5245,6 +5303,157 @@ mod tests {
             1,
             "non-retryable merge failure must not resubmit identical CTF recycle tx"
         );
+    }
+
+    #[tokio::test]
+    async fn live_accepted_merge_suppresses_duplicate_but_allows_later_paired_inventory() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            StrategyMode::Noop(NoopStrategy),
+            MarketContextStore::empty(),
+        );
+
+        fn paired_balances(quantity: f64, now_ms: u64) -> VenueBalances {
+            VenueBalances {
+                cash_usd: 80.0,
+                positions: vec![
+                    VenuePosition {
+                        market_id: MarketId::from("market-mm"),
+                        condition_id: Some(
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        ),
+                        instrument_id: InstrumentId::from("up"),
+                        quantity,
+                        average_cost_usd: 0.20,
+                        redeemable: false,
+                        mergeable: true,
+                        current_value_usd: quantity * 0.20,
+                    },
+                    VenuePosition {
+                        market_id: MarketId::from("market-mm"),
+                        condition_id: Some(
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        ),
+                        instrument_id: InstrumentId::from("down"),
+                        quantity,
+                        average_cost_usd: 0.79,
+                        redeemable: false,
+                        mergeable: true,
+                        current_value_usd: quantity * 0.79,
+                    },
+                ],
+                positions_authoritative: true,
+                observed_at_ms: now_ms,
+            }
+        }
+
+        let metrics = AppMetrics::new().expect("metrics");
+        let assets = vec!["up".to_string(), "down".to_string()];
+        let books = Arc::new(BookStore::new(&assets));
+        let mut paper_order_ctx = HashMap::new();
+        let mut execution_venue_map = HashMap::new();
+        let mut live_safety = LiveSafetyState::default();
+        let execution_policy = live_test_policy();
+        let mut seen_venue_fill_keys = HashSet::new();
+
+        let now_ms = now_unix_ms();
+        let first_adapter = Arc::new(RecordingAdapter {
+            merge_accept: true,
+            balances: Some(paired_balances(10.0, now_ms)),
+            ..RecordingAdapter::default()
+        });
+
+        execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            first_adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+            None,
+        )
+        .await
+        .expect("first execute");
+
+        assert_eq!(runtime.status(), RuntimeStatus::Running);
+        assert_eq!(first_adapter.merged.lock().expect("merged lock").len(), 1);
+
+        let duplicate_snapshot_adapter = Arc::new(RecordingAdapter {
+            merge_accept: true,
+            balances: Some(paired_balances(10.0, now_ms + 1)),
+            ..RecordingAdapter::default()
+        });
+        execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            duplicate_snapshot_adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+            None,
+        )
+        .await
+        .expect("duplicate execute");
+
+        assert!(
+            duplicate_snapshot_adapter
+                .merged
+                .lock()
+                .expect("merged lock")
+                .is_empty(),
+            "identical post-ack venue snapshot must not resubmit the same CTF merge"
+        );
+
+        let later_inventory_adapter = Arc::new(RecordingAdapter {
+            merge_accept: true,
+            balances: Some(paired_balances(12.0, now_ms + 2)),
+            ..RecordingAdapter::default()
+        });
+        execute_execution_adapter(
+            &mut runtime,
+            &books,
+            &assets,
+            0.0,
+            &metrics,
+            RuntimeOutcome::default(),
+            &mut paper_order_ctx,
+            &mut execution_venue_map,
+            &mut live_safety,
+            later_inventory_adapter.clone(),
+            &execution_policy,
+            &mut seen_venue_fill_keys,
+            None,
+        )
+        .await
+        .expect("later execute");
+
+        let later_merges = later_inventory_adapter.merged.lock().expect("merged lock");
+        assert_eq!(
+            later_merges.len(),
+            1,
+            "later changed paired inventory should plan and submit a fresh merge"
+        );
+        assert_eq!(later_merges[0].quantity, 12.0);
     }
 
     #[tokio::test]
@@ -6046,6 +6255,19 @@ mod tests {
             paper_maker_rebate_coeff: 0.0,
             paper_taker_fee_coeff_override: None,
         }
+    }
+
+    #[test]
+    fn deterministic_v2_amount_rejections_require_immediate_live_stop() {
+        assert!(submit_rejection_requires_immediate_live_stop(
+            "V2 SDK build_sign_and_post: Api error: status 400 Bad Request: invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker amount a max of 4 decimals"
+        ));
+        assert!(submit_rejection_requires_immediate_live_stop(
+            "Validation: invalid: Unable to build Order: Size 9.090909 has 6 decimal places"
+        ));
+        assert!(!submit_rejection_requires_immediate_live_stop(
+            "invalid post-only order: order crosses book"
+        ));
     }
 
     fn paper_test_policy() -> ExecutionPolicy {

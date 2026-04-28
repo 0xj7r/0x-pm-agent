@@ -908,7 +908,8 @@ impl PolymarketExecutionAdapter {
         use alloy::signers::local::LocalSigner as SdkLocalSigner;
         use alloy::signers::Signer as _;
         use polymarket_client_sdk_v2::clob::types::{
-            OrderType as SdkV2OrderType, Side as SdkV2Side, SignatureType as SdkV2SigType,
+            Amount as SdkV2Amount, OrderType as SdkV2OrderType, Side as SdkV2Side,
+            SignatureType as SdkV2SigType,
         };
         use polymarket_client_sdk_v2::types::{Decimal as SdkV2Decimal, U256 as SdkV2U256};
         use polymarket_client_sdk_v2::POLYGON as SDK_V2_POLYGON;
@@ -959,11 +960,19 @@ impl PolymarketExecutionAdapter {
             .await?;
 
         // Build, sign, and post the order via the SDK.
-        let price = SdkV2Decimal::from_str(&format!("{}", req.limit_price)).map_err(|error| {
-            ExecutionError::BadRequest(format!("invalid V2 SDK price: {error}"))
-        })?;
-        let size = SdkV2Decimal::from_str(&format!("{}", req.quantity))
+        let price = SdkV2Decimal::from_str(&Self::v2_decimal_string(req.limit_price, 2, false)?)
+            .map_err(|error| {
+                ExecutionError::BadRequest(format!("invalid V2 SDK price: {error}"))
+            })?;
+        let size = SdkV2Decimal::from_str(&Self::v2_decimal_string(req.quantity, 2, false)?)
             .map_err(|error| ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}")))?;
+        let market_buy_amount = SdkV2Decimal::from_str(&Self::v2_market_buy_amount_usdc(
+            req.limit_price,
+            req.quantity,
+        )?)
+        .map_err(|error| {
+            ExecutionError::BadRequest(format!("invalid V2 SDK market buy amount: {error}"))
+        })?;
 
         // V2 keeps expiration outside the signed order. GTC uses epoch
         // expiration (0), matching the public migration docs; GTD uses
@@ -978,23 +987,46 @@ impl PolymarketExecutionAdapter {
         // but ZERO causes some venue-side mismatches in V2).
         let builder_code_b256 = parse_bytes32(&self._config.v2_builder_code, "builder")?;
 
-        let order_builder = client
-            .limit_order()
-            .token_id(token_id)
-            .side(side)
-            .price(price)
-            .size(size)
-            .order_type(order_type)
-            .expiration(expiration_dt)
-            .post_only(req.post_only)
-            .builder_code(builder_code_b256);
-
-        let resp = order_builder
-            .build_sign_and_post(&sdk_signer)
-            .await
-            .map_err(|error| {
-                ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
+        let resp = if req.side == TradeSide::Buy
+            && matches!(req.time_in_force, TimeInForce::Ioc | TimeInForce::Fok)
+            && !req.post_only
+        {
+            // V2 validates market-buy collateral on the maker side, not just
+            // share size. A BUY FAK encoded as a limit order with size=5.88
+            // and price=0.81 creates makerAmount=$4.7628 and is rejected:
+            // "maker amount supports a max accuracy of 2 decimals". Use the
+            // SDK market-order path with a cent-rounded USDC amount so close /
+            // hedge-rescue orders are venue-valid.
+            let amount = SdkV2Amount::usdc(market_buy_amount).map_err(|error| {
+                ExecutionError::BadRequest(format!("invalid V2 SDK USDC amount: {error}"))
             })?;
+            client
+                .market_order()
+                .token_id(token_id)
+                .side(side)
+                .price(price)
+                .amount(amount)
+                .order_type(order_type)
+                .builder_code(builder_code_b256)
+                .build_sign_and_post(&sdk_signer)
+                .await
+        } else {
+            client
+                .limit_order()
+                .token_id(token_id)
+                .side(side)
+                .price(price)
+                .size(size)
+                .order_type(order_type)
+                .expiration(expiration_dt)
+                .post_only(req.post_only)
+                .builder_code(builder_code_b256)
+                .build_sign_and_post(&sdk_signer)
+                .await
+        }
+        .map_err(|error| {
+            ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
+        })?;
 
         let now_ms = now_unix_ms();
         Ok(SubmitOrderAck {
@@ -1259,6 +1291,38 @@ impl PolymarketExecutionAdapter {
         Utc.timestamp_millis_opt(expiration_ms as i64)
             .single()
             .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
+    }
+
+    fn v2_decimal_string(
+        value: f64,
+        decimal_places: u32,
+        round_up: bool,
+    ) -> Result<String, ExecutionError> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(ExecutionError::BadRequest(format!(
+                "V2 decimal must be positive and finite, got {value}"
+            )));
+        }
+        let scale = 10_f64.powi(decimal_places as i32);
+        let scaled = if round_up {
+            (value * scale).ceil()
+        } else {
+            (value * scale).floor()
+        };
+        if !scaled.is_finite() || scaled <= 0.0 {
+            return Err(ExecutionError::BadRequest(format!(
+                "V2 decimal rounded to zero, got {value}"
+            )));
+        }
+        Ok(format!("{:.*}", decimal_places as usize, scaled / scale))
+    }
+
+    fn v2_market_buy_amount_usdc(
+        limit_price: f64,
+        quantity: f64,
+    ) -> Result<String, ExecutionError> {
+        let notional = limit_price * quantity;
+        Self::v2_decimal_string(notional, 2, true)
     }
 
     fn sdk_side(side: TradeSide) -> SdkSide {
@@ -2359,6 +2423,34 @@ mod tests {
             PolymarketExecutionAdapter::v2_sdk_expiration_dt(&req, now_ms).timestamp_millis(),
             future_expiration_ms as i64
         );
+    }
+
+    #[test]
+    fn v2_market_buy_amount_is_rounded_up_to_usdc_cents() {
+        assert_eq!(
+            PolymarketExecutionAdapter::v2_market_buy_amount_usdc(0.81, 5.88).unwrap(),
+            "4.77"
+        );
+        assert_eq!(
+            PolymarketExecutionAdapter::v2_market_buy_amount_usdc(0.27, 10.5263).unwrap(),
+            "2.85"
+        );
+        assert_eq!(
+            PolymarketExecutionAdapter::v2_market_buy_amount_usdc(0.77, 19.85811406628941).unwrap(),
+            "15.30"
+        );
+    }
+
+    #[test]
+    fn v2_decimal_string_rejects_non_positive_values() {
+        assert!(matches!(
+            PolymarketExecutionAdapter::v2_market_buy_amount_usdc(0.0, 5.0),
+            Err(ExecutionError::BadRequest(_))
+        ));
+        assert!(matches!(
+            PolymarketExecutionAdapter::v2_market_buy_amount_usdc(0.50, 0.0),
+            Err(ExecutionError::BadRequest(_))
+        ));
     }
 
     #[test]

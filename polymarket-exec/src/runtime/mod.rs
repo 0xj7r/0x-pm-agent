@@ -323,6 +323,7 @@ pub struct Runtime<S: Strategy> {
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
     first_merge_by_market: HashMap<MarketId, EpochMillis>,
     pending_merge_by_market: HashMap<MarketId, MergeIntent>,
+    accepted_merge_by_market: HashMap<MarketId, AcceptedMerge>,
     blocked_merge_by_market: HashMap<MarketId, BlockedMerge>,
     condition_id_by_market: HashMap<MarketId, String>,
     venue_market_rules: HashMap<MarketId, VenueMarketRules>,
@@ -363,6 +364,12 @@ struct BlockedMerge {
     signature: MergeSignature,
     reason: String,
     blocked_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug)]
+struct AcceptedMerge {
+    signature: MergeSignature,
+    accepted_at_ms: EpochMillis,
 }
 
 impl<S: Strategy> Runtime<S> {
@@ -412,6 +419,7 @@ impl<S: Strategy> Runtime<S> {
             first_fill_by_market: HashMap::new(),
             first_merge_by_market: HashMap::new(),
             pending_merge_by_market: HashMap::new(),
+            accepted_merge_by_market: HashMap::new(),
             blocked_merge_by_market: HashMap::new(),
             condition_id_by_market: HashMap::new(),
             venue_market_rules: HashMap::new(),
@@ -470,6 +478,29 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(market_id.clone()),
             );
         }
+    }
+
+    pub fn mark_pending_merge_accepted(&mut self, market_id: &MarketId, now_ms: EpochMillis) {
+        let Some(intent) = self.pending_merge_by_market.remove(market_id) else {
+            return;
+        };
+        let signature = MergeSignature::from_intent(&intent);
+        self.accepted_merge_by_market.insert(
+            market_id.clone(),
+            AcceptedMerge {
+                signature,
+                accepted_at_ms: now_ms,
+            },
+        );
+        self.event_log.push(
+            EventRecord::new(
+                EventCategory::Execution,
+                now_ms,
+                "pending merge accepted; suppressing only identical CTF recycle until venue \
+                 reconciliation changes paired inventory",
+            )
+            .with_market(market_id.clone()),
+        );
     }
 
     pub fn block_pending_merge(
@@ -723,6 +754,16 @@ impl<S: Strategy> Runtime<S> {
         &self.inventory
     }
 
+    pub fn reconcile_venue_cash(
+        &mut self,
+        authoritative_total_cash_usd: f64,
+        observed_at_ms: EpochMillis,
+    ) -> Result<crate::inventory::InventoryAdjustment, RuntimeError> {
+        Ok(self
+            .inventory
+            .reconcile_venue_cash(authoritative_total_cash_usd, observed_at_ms)?)
+    }
+
     pub fn reconcile_venue_positions(
         &mut self,
         venue_positions: &[VenuePositionSnapshot],
@@ -830,6 +871,13 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(stranded.market_id.clone()),
             );
         }
+        let active_markets = venue_positions
+            .iter()
+            .filter(|position| position.quantity.abs() > DRIFT_QTY_EPSILON)
+            .map(|position| position.market_id.clone())
+            .collect::<HashSet<_>>();
+        self.accepted_merge_by_market
+            .retain(|market_id, _| active_markets.contains(market_id));
         self.initial_reconcile_complete = true;
         Ok(report)
     }
@@ -1023,6 +1071,26 @@ impl<S: Strategy> Runtime<S> {
                 );
                 return outcome;
             }
+        }
+        if let Some(accepted) = self.accepted_merge_by_market.get(market_id) {
+            if accepted.signature == signature {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge intent suppressed: matching CTF recycle was already \
+                                 accepted at {}; awaiting venue reconciliation",
+                                accepted.accepted_at_ms
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+            self.accepted_merge_by_market.remove(market_id);
         }
 
         self.pending_merge_by_market
@@ -2949,6 +3017,7 @@ impl<S: Strategy> Runtime<S> {
         self.first_fill_by_market.remove(market_id);
         self.first_merge_by_market.remove(market_id);
         self.pending_merge_by_market.remove(market_id);
+        self.accepted_merge_by_market.remove(market_id);
         self.blocked_merge_by_market.remove(market_id);
         self.unlawful_mode_by_market.remove(market_id);
     }
