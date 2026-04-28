@@ -3,6 +3,7 @@
 //! `docs/architecture/2026-04-25-paper-env-design.md` for the design.
 
 pub mod queue_model;
+pub mod trade_tape;
 pub mod replay;
 pub mod report;
 pub mod snapshot;
