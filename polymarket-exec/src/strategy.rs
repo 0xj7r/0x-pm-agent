@@ -1638,6 +1638,9 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_WINDOW_MS: u64 = 120_000;
     const RESCUE_INFLIGHT_TTL_MS: u64 = 15_000;
     const MAX_RESCUE_ATTEMPTS_PER_SIGNATURE: u32 = 3;
+    /// Polymarket V2 rejects marketable BUY orders below $1 notional. Keep this
+    /// as a protocol invariant so stale live env cannot emit invalid rescues.
+    const MARKETABLE_BUY_MIN_NOTIONAL_USD: f64 = 1.0;
     const ASYMMETRIC_FILL_MODERATE_COOLDOWN_MS: u64 = 30_000;
     const ASYMMETRIC_FILL_SEVERE_COOLDOWN_MS: u64 = 90_000;
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
@@ -2988,20 +2991,37 @@ impl Btc5mMmStrategy {
         reason_prefix: &str,
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
-        // Depth walk: find the price needed to sweep `quantity` shares,
-        // OR cap to whatever depth exists if it's shallower than that.
-        let (depth_walk_price, depth_walk_qty) = Self::depth_walk_to_quantity(quote, quantity)
-            .or_else(|| {
-                // Fallback: top of book only (shouldn't happen if depth_walk
-                // saw any level, but defensive).
-                Self::best_ask(quote).map(|p| (p, quantity))
-            })?;
         // Tick size: prefer venue-authoritative; fall back to config default
         // when runner hasn't fetched MarketMetadata yet.
         let tick_size = venue_rules
             .map(|r| r.minimum_tick_size)
             .filter(|t| t.is_finite() && *t > 0.0)
             .unwrap_or(self.config.maker_price_tick);
+        // Prefer venue-authoritative minimum_order_size; only fall back to
+        // the config default while waiting for the runner to fetch
+        // MarketMetadata for this market.
+        let venue_min = venue_rules
+            .map(|r| r.minimum_order_size)
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .unwrap_or(self.config.venue_min_order_quantity);
+        let min_marketable_notional = self
+            .config
+            .min_order_notional_usd
+            .max(Self::MARKETABLE_BUY_MIN_NOTIONAL_USD);
+        let best_sweep_price = (Self::best_ask(quote)?
+            + tick_size * self.config.hedge_rescue_race_buffer_ticks)
+            .min(0.99);
+        if best_sweep_price >= 0.99 {
+            return None;
+        }
+        let min_target_qty = venue_min.max(min_marketable_notional / best_sweep_price);
+        // Depth walk: find the price needed to sweep enough liquidity to both
+        // cover the stranded quantity and satisfy protocol marketable-BUY
+        // floors. If visible depth cannot support that, do not emit an order
+        // the venue will deterministically reject.
+        let depth_target_qty = quantity.max(min_target_qty);
+        let (depth_walk_price, depth_walk_qty) =
+            Self::depth_walk_to_quantity(quote, depth_target_qty)?;
         // Race buffer: pad the limit upward by a few ticks so the FAK still
         // crosses if the book ticks up between snapshot time and venue
         // receipt. Without this we routinely get back from Polymarket:
@@ -3031,33 +3051,27 @@ impl Btc5mMmStrategy {
         // max_gross_cost, max_submit_per_window): entry-time caps must not
         // trap close intents in the exposure they were meant to prevent.
         //
-        // Prefer venue-authoritative minimum_order_size; only fall back to
-        // the config default while waiting for the runner to fetch
-        // MarketMetadata for this market.
-        let venue_min = venue_rules
-            .map(|r| r.minimum_order_size)
-            .filter(|m| m.is_finite() && *m > 0.0)
-            .unwrap_or(self.config.venue_min_order_quantity);
-        let venue_min_notional = venue_min * sweep_price;
-        if max_rescue_notional_usd + 1e-9 < venue_min_notional {
+        let min_sweep_qty = venue_min.max(min_marketable_notional / sweep_price);
+        let min_sweep_notional = min_sweep_qty * sweep_price;
+        if max_rescue_notional_usd + 1e-9 < min_sweep_notional {
             return None;
         }
         let max_sweep_notional = self
             .config
             .hedge_rescue_clip_usd
-            .max(venue_min_notional)
+            .max(min_sweep_notional)
             .min(max_rescue_notional_usd)
             .max(0.0);
         let max_sweep_qty = max_sweep_notional / sweep_price;
-        if max_sweep_qty + 1e-9 < venue_min {
+        if max_sweep_qty + 1e-9 < min_sweep_qty || depth_walk_qty + 1e-9 < min_sweep_qty {
             return None;
         }
-        let sweep_qty = depth_walk_qty.min(max_sweep_qty).max(venue_min);
+        let sweep_qty = depth_walk_qty.min(max_sweep_qty).max(min_sweep_qty);
         if sweep_qty < self.config.min_order_quantity {
             return None;
         }
         let notional = sweep_qty * sweep_price;
-        if notional < self.config.min_order_notional_usd {
+        if notional + 1e-9 < min_marketable_notional {
             return None;
         }
         // Skip BOTH max_leg_cost AND max_gross_cost caps. Both are
