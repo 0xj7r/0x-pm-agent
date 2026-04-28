@@ -14,6 +14,7 @@ pub struct RuntimeConfig {
     pub initial_status: RuntimeStatus,
     pub quote_engine_config: QuoteEngineConfig,
     pub quote_stale_ms: u64,
+    pub require_initial_reconcile_before_entry: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -24,6 +25,7 @@ impl Default for RuntimeConfig {
             initial_status: RuntimeStatus::Starting,
             quote_engine_config: QuoteEngineConfig::default(),
             quote_stale_ms: 10_000,
+            require_initial_reconcile_before_entry: false,
         }
     }
 }

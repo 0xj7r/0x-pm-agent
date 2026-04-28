@@ -331,6 +331,7 @@ pub struct Runtime<S: Strategy> {
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
     markets_with_unresolved_drift: HashSet<MarketId>,
+    require_initial_reconcile_before_entry: bool,
     /// True once `reconcile_venue_positions` has run for the first time.
     /// Used to distinguish "venue has positions we don't know about because
     /// we just started up and haven't synced yet" (install silently) from
@@ -426,6 +427,7 @@ impl<S: Strategy> Runtime<S> {
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             markets_with_unresolved_drift: HashSet::new(),
+            require_initial_reconcile_before_entry: config.require_initial_reconcile_before_entry,
             initial_reconcile_complete: false,
             order_store,
         }
@@ -582,21 +584,13 @@ impl<S: Strategy> Runtime<S> {
         stale_after_ms: u64,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
-        // Bug fix: drift block (markets_with_unresolved_drift) is in-memory
-        // only and is reinitialized empty on every restart. Until the next
-        // venue reconcile fires, the engine could accept fresh entries in
-        // markets where the venue has stranded inventory. Log a warning so
-        // operators know the drift state is uninitialized, and the
-        // existing live-mode startup gating remains the primary safeguard
-        // (live_smoke / live_reconcile / has_needs_reconcile_orders fail-
-        // closed paths in run_with_config).
-        warn!(
-            run_id = %self.run_id,
-            "recover_from_store: drift block state is in-memory and not \
-             persisted; first reconcile_venue_positions call after restart \
-             will repopulate it. Until then, fresh entry in drifted markets \
-             is gated only by live-mode startup checks, not by drift block."
-        );
+        if self.require_initial_reconcile_before_entry {
+            info!(
+                run_id = %self.run_id,
+                "recover_from_store: fresh entries require first venue position reconcile before \
+                 drift-sensitive live trading can start"
+            );
+        }
         if self.order_store.is_none() {
             return outcome;
         }
@@ -2262,6 +2256,24 @@ impl<S: Strategy> Runtime<S> {
                         EventCategory::Runtime,
                         now_ms,
                         "fresh entry suppressed: runtime is not running",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if self.require_initial_reconcile_before_entry
+            && !self.initial_reconcile_complete
+            && !is_rescue_intent
+        {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "fresh entry suppressed: initial venue position reconcile has not completed",
                     )
                     .with_market(intent.market_id.clone())
                     .with_instrument(intent.instrument_id.clone())
@@ -4055,6 +4067,44 @@ mod tests {
         assert!(runtime
             .open_orders()
             .all(|managed| managed.intent.kind == crate::types::IntentKind::Close));
+    }
+
+    #[test]
+    fn live_runtime_suppresses_entries_until_initial_position_reconcile() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                require_initial_reconcile_before_entry: true,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let early_entry =
+            runtime.accept_intent(btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44), 1);
+        assert!(early_entry.commands.is_empty());
+        assert_eq!(runtime.open_orders().count(), 0);
+        assert!(runtime.event_log().recent(4).iter().any(|event| event
+            .message
+            .contains("initial venue position reconcile has not completed")));
+
+        let rescue = runtime.accept_intent(
+            btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.55),
+            2,
+        );
+        assert_eq!(rescue.commands.len(), 1);
+
+        runtime
+            .reconcile_venue_positions(&[], 3)
+            .expect("initial empty venue reconcile");
+
+        let entry =
+            runtime.accept_intent(btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44), 4);
+        assert_eq!(entry.commands.len(), 1);
     }
 
     #[test]

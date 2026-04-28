@@ -241,6 +241,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
             initial_status: RuntimeStatus::Running,
             quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
             quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
+            require_initial_reconcile_before_entry: false,
         },
         config.risk_limits.clone(),
         strategy,
@@ -907,6 +908,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .as_ref()
                 .and_then(|profile| profile.quote.min_quote_age_ms)
                 .unwrap_or(10_000),
+            require_initial_reconcile_before_entry: !config.paper_mode,
         },
         config.risk_limits.clone(),
         strategy,
