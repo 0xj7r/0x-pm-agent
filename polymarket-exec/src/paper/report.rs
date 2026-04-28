@@ -2,6 +2,7 @@
 //! per-reject counts during a paper run, writes a JSON summary on flush.
 //! Phase 3 of the paper env design.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::types::{ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, TradeSide};
+use crate::event_log::EventRecord;
+use crate::types::{
+    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, RuntimeCommand, TradeSide,
+};
 
 /// Per-fill record captured by `PaperReportWriter`.
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +56,9 @@ pub struct PaperReportSummary {
     pub edge: EdgeStats,
     pub queue: QueueStats,
     pub vs_whale: VsWhaleStats,
+    pub strategy: StrategySessionStats,
+    pub markets: Vec<MarketSessionStats>,
+    pub acceptance: AcceptanceGateStats,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +117,63 @@ pub struct VsWhaleStats {
     pub directional_imbalance_count: i64,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct StrategySessionStats {
+    pub event_total: usize,
+    pub intent_total: usize,
+    pub events_by_type: BTreeMap<String, usize>,
+    pub intents_by_type: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MarketSessionStats {
+    pub market_id: MarketId,
+    pub submit_count: usize,
+    pub cancel_count: usize,
+    pub reject_count: usize,
+    pub fill_count: usize,
+    pub maker_fill_count: usize,
+    pub taker_fill_count: usize,
+    pub total_notional_usd: f64,
+    pub buy_qty: f64,
+    pub sell_qty: f64,
+    pub buy_notional_usd: f64,
+    pub sell_notional_usd: f64,
+    pub net_qty: f64,
+    pub fill_symmetry: Option<f64>,
+    pub max_stranded_qty_estimate: f64,
+    pub strategy_events_by_type: BTreeMap<String, usize>,
+    pub intents_by_type: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AcceptanceGateStats {
+    pub pass: bool,
+    pub no_fills_observed: bool,
+    pub excessive_cancel_churn: bool,
+    pub poor_fill_symmetry: bool,
+    pub stranded_exposure: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MarketAccumulator {
+    submit_count: usize,
+    cancel_count: usize,
+    reject_count: usize,
+    fill_count: usize,
+    maker_fill_count: usize,
+    taker_fill_count: usize,
+    total_notional_usd: f64,
+    buy_qty: f64,
+    sell_qty: f64,
+    buy_notional_usd: f64,
+    sell_notional_usd: f64,
+    instrument_qty: BTreeMap<InstrumentId, f64>,
+    strategy_events_by_type: BTreeMap<String, usize>,
+    intents_by_type: BTreeMap<String, usize>,
+}
+
 /// Accumulator + writer. Build it at run start; record events as they
 /// happen; call `flush()` on shutdown to persist a JSON summary.
 pub struct PaperReportWriter {
@@ -122,6 +186,9 @@ pub struct PaperReportWriter {
     rejects: Vec<PaperRejectRecord>,
     expected_edge_usd: f64,
     late_fill_after_cancel_count: usize,
+    strategy_events_by_type: BTreeMap<String, usize>,
+    strategy_intents_by_type: BTreeMap<String, usize>,
+    markets: BTreeMap<MarketId, MarketAccumulator>,
     whale_fill_count: usize,
     whale_buy_count: usize,
     whale_sell_count: usize,
@@ -145,10 +212,67 @@ impl PaperReportWriter {
             rejects: Vec::new(),
             expected_edge_usd: 0.0,
             late_fill_after_cancel_count: 0,
+            strategy_events_by_type: BTreeMap::new(),
+            strategy_intents_by_type: BTreeMap::new(),
+            markets: BTreeMap::new(),
             whale_fill_count: 0,
             whale_buy_count: 0,
             whale_sell_count: 0,
             whale_total_notional_usd: 0.0,
+        }
+    }
+
+    /// Record runtime events and commands so the paper report can explain
+    /// zero-fill sessions, not just summarize sessions that already filled.
+    pub fn record_runtime_outcome(
+        &mut self,
+        records: &[EventRecord],
+        commands: &[RuntimeCommand],
+        observed_at_ms: u64,
+    ) {
+        self.last_observed_at_ms = self.last_observed_at_ms.max(observed_at_ms);
+        for record in records {
+            if let Some(event) = classify_runtime_event(record.message.as_str()) {
+                increment(&mut self.strategy_events_by_type, event);
+                if let Some(market_id) = &record.market_id {
+                    increment(
+                        &mut self
+                            .markets
+                            .entry(market_id.clone())
+                            .or_default()
+                            .strategy_events_by_type,
+                        event,
+                    );
+                }
+            }
+            if record.message.contains("requested order cancellation") {
+                if let Some(market_id) = &record.market_id {
+                    self.markets.entry(market_id.clone()).or_default().cancel_count += 1;
+                }
+            }
+        }
+        for command in commands {
+            match command {
+                RuntimeCommand::Submit(intent) => {
+                    let intent_type = classify_submit_intent(
+                        intent.quote_level_tag.as_deref().unwrap_or_default(),
+                    );
+                    increment(&mut self.strategy_intents_by_type, intent_type);
+                    let market = self.markets.entry(intent.market_id.clone()).or_default();
+                    market.submit_count += 1;
+                    increment(&mut market.intents_by_type, intent_type);
+                }
+                RuntimeCommand::Cancel {
+                    client_order_id: _,
+                    reason: _,
+                } => {
+                    increment(&mut self.strategy_intents_by_type, "cancel");
+                    // Cancel commands do not currently carry market_id; keep
+                    // the session-level count exact and per-market count from
+                    // request-cancel EventRecords when available.
+                }
+                _ => {}
+            }
         }
     }
 
@@ -226,6 +350,33 @@ impl PaperReportWriter {
             slippage_bps,
             realized_edge_usd,
         });
+        let market = self.markets.entry(fill.market_id.clone()).or_default();
+        market.fill_count += 1;
+        match fill.liquidity {
+            FillLiquidity::Maker => market.maker_fill_count += 1,
+            FillLiquidity::Taker => market.taker_fill_count += 1,
+            FillLiquidity::Unknown => {}
+        }
+        let notional = fill.price * fill.quantity;
+        market.total_notional_usd += notional;
+        match fill.side {
+            TradeSide::Buy => {
+                market.buy_qty += fill.quantity;
+                market.buy_notional_usd += notional;
+                *market
+                    .instrument_qty
+                    .entry(fill.instrument_id.clone())
+                    .or_default() += fill.quantity;
+            }
+            TradeSide::Sell => {
+                market.sell_qty += fill.quantity;
+                market.sell_notional_usd += notional;
+                *market
+                    .instrument_qty
+                    .entry(fill.instrument_id.clone())
+                    .or_default() -= fill.quantity;
+            }
+        }
     }
 
     /// Record a venue-rejection event (post-only cross, etc.).
@@ -247,6 +398,7 @@ impl PaperReportWriter {
             limit_price,
             reason: reason.into(),
         });
+        self.markets.entry(market_id.clone()).or_default().reject_count += 1;
     }
 
     /// Increment the late-fill-after-cancel counter (called when a fill is
@@ -295,6 +447,8 @@ impl PaperReportWriter {
         } else {
             None
         };
+        let markets = self.market_summaries();
+        let acceptance = self.acceptance_summary(total_count, &markets);
         PaperReportSummary {
             session: SessionInfo {
                 run_id: self.run_id.clone(),
@@ -350,6 +504,102 @@ impl PaperReportWriter {
                     directional_imbalance_count,
                 }
             },
+            strategy: StrategySessionStats {
+                event_total: self.strategy_events_by_type.values().sum(),
+                intent_total: self.strategy_intents_by_type.values().sum(),
+                events_by_type: self.strategy_events_by_type.clone(),
+                intents_by_type: self.strategy_intents_by_type.clone(),
+            },
+            markets,
+            acceptance,
+        }
+    }
+
+    fn market_summaries(&self) -> Vec<MarketSessionStats> {
+        self.markets
+            .iter()
+            .map(|(market_id, acc)| {
+                let mut positive_legs: Vec<f64> = acc
+                    .instrument_qty
+                    .values()
+                    .copied()
+                    .filter(|qty| *qty > 0.0)
+                    .collect();
+                positive_legs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let max_qty = positive_legs.last().copied().unwrap_or(0.0);
+                let min_qty = positive_legs.first().copied().unwrap_or(0.0);
+                let fill_symmetry = if max_qty > 0.0 && positive_legs.len() >= 2 {
+                    Some(min_qty / max_qty)
+                } else {
+                    None
+                };
+                let max_stranded_qty_estimate = if positive_legs.len() >= 2 {
+                    max_qty - min_qty
+                } else {
+                    max_qty
+                };
+                MarketSessionStats {
+                    market_id: market_id.clone(),
+                    submit_count: acc.submit_count,
+                    cancel_count: acc.cancel_count,
+                    reject_count: acc.reject_count,
+                    fill_count: acc.fill_count,
+                    maker_fill_count: acc.maker_fill_count,
+                    taker_fill_count: acc.taker_fill_count,
+                    total_notional_usd: acc.total_notional_usd,
+                    buy_qty: acc.buy_qty,
+                    sell_qty: acc.sell_qty,
+                    buy_notional_usd: acc.buy_notional_usd,
+                    sell_notional_usd: acc.sell_notional_usd,
+                    net_qty: acc.buy_qty - acc.sell_qty,
+                    fill_symmetry,
+                    max_stranded_qty_estimate,
+                    strategy_events_by_type: acc.strategy_events_by_type.clone(),
+                    intents_by_type: acc.intents_by_type.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn acceptance_summary(
+        &self,
+        total_fill_count: usize,
+        markets: &[MarketSessionStats],
+    ) -> AcceptanceGateStats {
+        let duration_ms = self.last_observed_at_ms.saturating_sub(self.started_at_ms);
+        let submit_count: usize = markets.iter().map(|market| market.submit_count).sum();
+        let cancel_count: usize = markets.iter().map(|market| market.cancel_count).sum();
+        let no_fills_observed = duration_ms >= 60_000 && total_fill_count == 0;
+        let excessive_cancel_churn =
+            submit_count >= 5 && cancel_count as f64 / submit_count as f64 > 5.0;
+        let poor_fill_symmetry = markets.iter().any(|market| {
+            market
+                .fill_symmetry
+                .is_some_and(|sym| market.buy_qty + market.sell_qty >= 10.0 && sym < 0.35)
+        });
+        let stranded_exposure = markets
+            .iter()
+            .any(|market| market.max_stranded_qty_estimate >= 5.0);
+        let mut notes = Vec::new();
+        if no_fills_observed {
+            notes.push("no fills observed after at least 60s".to_string());
+        }
+        if excessive_cancel_churn {
+            notes.push("cancel/submit ratio exceeded 5.0 with at least 5 submits".to_string());
+        }
+        if poor_fill_symmetry {
+            notes.push("market fill symmetry below 0.35 after at least 10 filled shares".to_string());
+        }
+        if stranded_exposure {
+            notes.push("estimated stranded exposure reached at least 5 shares".to_string());
+        }
+        AcceptanceGateStats {
+            pass: notes.is_empty(),
+            no_fills_observed,
+            excessive_cancel_churn,
+            poor_fill_symmetry,
+            stranded_exposure,
+            notes,
         }
     }
 
@@ -392,10 +642,79 @@ impl PaperReportWriter {
     }
 }
 
+fn increment(map: &mut BTreeMap<String, usize>, key: &str) {
+    *map.entry(key.to_string()).or_default() += 1;
+}
+
+fn classify_runtime_event(message: &str) -> Option<&'static str> {
+    if message.contains("entry-fill asymmetry cooldown")
+        || message.contains("asymmetric entry-fill cooldown")
+    {
+        return Some("asym_fill_cooldown");
+    }
+    if message.contains("market mid moved") {
+        return Some("market_mid_trend_gate");
+    }
+    if message.contains("btc regime flat") {
+        return Some("btc_flat_gate");
+    }
+    if message.contains("btc regime trending") {
+        return Some("btc_trend_gate");
+    }
+    if message.contains("premium fair cap") {
+        return Some("premium_fair_gate");
+    }
+    if message.contains("hold stranded positive-asymmetry") {
+        return Some("hold_positive_asym");
+    }
+    if message.contains("rescue stranded leg") {
+        return Some("rescue_ev_selected");
+    }
+    if message.contains("on-fill IOC rescue emitted") {
+        return Some("on_fill_rescue");
+    }
+    if message.contains("on-fill rescue throttled") {
+        return Some("rescue_throttled");
+    }
+    if message.contains("paired entry ladder rejected") {
+        return Some("entry_ladder_rejected");
+    }
+    if message.contains("inventory management rejected") {
+        return Some("inventory_management_rejected");
+    }
+    if message.contains("market context replaced") {
+        return Some("market_rollover");
+    }
+    if message.contains("runtime degraded") {
+        return Some("runtime_degraded");
+    }
+    if message.contains("runtime risk-off") {
+        return Some("runtime_riskoff");
+    }
+    None
+}
+
+fn classify_submit_intent(tag: &str) -> &'static str {
+    if tag.starts_with("mm-paired-bid") {
+        "paired_ladder"
+    } else if tag.starts_with("mm-convex-accum") {
+        "convex_accum"
+    } else if tag.starts_with("mm-hedge-rescue") {
+        "hedge_rescue"
+    } else if tag.starts_with("mm-reduce") {
+        "reduce_cleanup"
+    } else if tag.is_empty() {
+        "untagged_submit"
+    } else {
+        "other_submit"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::CloseMethod;
+    use crate::event_log::{EventCategory, EventRecord};
+    use crate::types::{CloseMethod, IntentKind, OrderIntent};
 
     fn fill(side: TradeSide, price: f64, qty: f64, liq: FillLiquidity, ts: u64) -> FillReport {
         FillReport {
@@ -411,6 +730,23 @@ mod tests {
             close_method: Some(CloseMethod::Unknown),
             observed_at_ms: ts,
         }
+    }
+
+    fn submit_command(market_id: &str, tag: &str) -> RuntimeCommand {
+        RuntimeCommand::Submit(OrderIntent {
+            client_order_id: ClientOrderId::from(format!("coid-{market_id}-{tag}")),
+            market_id: MarketId::from(market_id),
+            instrument_id: InstrumentId::from(format!("asset-{market_id}")),
+            side: TradeSide::Buy,
+            limit_price: 0.49,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test".to_string(),
+            quote_level_tag: Some(tag.to_string()),
+            created_at_ms: 1,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        })
     }
 
     #[test]
@@ -439,6 +775,54 @@ mod tests {
         assert!((summary.edge.realized_edge_usd - 0.10).abs() < 1e-9);
         let cap = summary.edge.edge_capture_ratio.expect("ratio set");
         assert!((cap - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paper_report_records_strategy_attribution_and_acceptance_gates() {
+        let mut writer =
+            PaperReportWriter::new("run-test", "paper", PathBuf::from("/tmp/_unused"), 0);
+        let records = vec![
+            EventRecord::new(
+                EventCategory::Strategy,
+                1_000,
+                "fresh paired entry suppressed by market state: market mid moved 0.100",
+            )
+            .with_market("m-1"),
+            EventRecord::new(
+                EventCategory::Runtime,
+                2_000,
+                "requested order cancellation from Working",
+            )
+            .with_market("m-1"),
+        ];
+        let commands = vec![
+            submit_command("m-1", "mm-paired-bid:l1"),
+            RuntimeCommand::Cancel {
+                client_order_id: ClientOrderId::from("coid-m-1"),
+                reason: "no longer desired".to_string(),
+            },
+        ];
+
+        writer.record_runtime_outcome(&records, &commands, 61_000);
+
+        let summary = writer.summary();
+        assert_eq!(
+            summary.strategy.events_by_type.get("market_mid_trend_gate"),
+            Some(&1)
+        );
+        assert_eq!(summary.strategy.intents_by_type.get("paired_ladder"), Some(&1));
+        assert_eq!(summary.strategy.intents_by_type.get("cancel"), Some(&1));
+        assert_eq!(summary.markets.len(), 1);
+        assert_eq!(summary.markets[0].submit_count, 1);
+        assert_eq!(summary.markets[0].cancel_count, 1);
+        assert_eq!(
+            summary.markets[0]
+                .strategy_events_by_type
+                .get("market_mid_trend_gate"),
+            Some(&1)
+        );
+        assert!(summary.acceptance.no_fills_observed);
+        assert!(!summary.acceptance.pass);
     }
 
     #[test]
