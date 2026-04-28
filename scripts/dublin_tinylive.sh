@@ -45,9 +45,16 @@ export POLYMARKET_FUNDER_ADDRESS='' POLYMARKET_FUNDER=''
 # Engine binary already supports V2 (see live_auth.startup logs reporting
 # clob_v2_exchange + clob_v2_builder_code_present + clob_v2_metadata_present
 # detected at runtime).
+#
+# V2 also changed the collateral token: V1 used USDC.e directly, V2 uses
+# pUSD (Polymarket USD, 0xC011a7E1...E82DFB) — an ERC-20 wrapper around
+# USDC.e enforced on-chain by CollateralOnramp/Offramp. EOA wallets must
+# manually wrap USDC.e -> pUSD via scripts/eoa_wrap_pusd.py before trading
+# (Polymarket UI deposits auto-wrap, but we're an EOA bot).
+# See: https://docs.polymarket.com -> pUSD
 export POLYMARKET_CLOB_API_URL=https://clob.polymarket.com
 export POLYMARKET_CLOB_VERSION=v2
-export POLYMARKET_COLLATERAL_TOKEN_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+export POLYMARKET_COLLATERAL_TOKEN_ADDRESS=0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
 
 # Required for EOA-mode CTF merge/redeem (signs + submits direct to Polygon).
 export POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-bor-rpc.publicnode.com}
