@@ -1607,6 +1607,12 @@ impl Btc5mMmStrategy {
     const ENTRY_PREMIUM_BID_CAP: f64 = 0.55;
     const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
     const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.50;
+    /// Convex accumulation gets a smaller slice of the per-market budget than
+    /// paired entry. Paired bidding is the rebate workhorse and should consume
+    /// the configured caps; convex is the asymmetric-payoff side bet that
+    /// shouldn't blow our bankroll on cheap-leg fades. With a 0.5 fraction,
+    /// a $20 gross / $10 leg market budget gives convex $10 / $5 to work with.
+    const CONVEX_BUDGET_FRACTION: f64 = 0.5;
     const HOLD_EV_MARGIN: f64 = 0.005;
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
@@ -3152,8 +3158,8 @@ impl Strategy for Btc5mMmStrategy {
                         right_fair,
                         right_cost,
                         gross_cost,
-                        max_entry_gross_cost_usd,
-                        max_entry_leg_cost_usd,
+                        max_entry_gross_cost_usd * Self::CONVEX_BUDGET_FRACTION,
+                        max_entry_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION,
                         context.venue_rules.as_ref(),
                         context.now_ms,
                     ) {
@@ -3495,12 +3501,20 @@ impl Strategy for Btc5mMmStrategy {
 
         // Record per-market last-fill timestamp for the post-fill entry
         // cooldown (avoids re-stranding on the same trending market right
-        // after a successful merge).
-        let market_state_ref = self
-            .market_states
-            .entry(fill.market_id.clone())
-            .or_default();
-        market_state_ref.last_fill_ms = Some(context.now_ms);
+        // after a directional fill). Skip merge-derived fills: merges UNWIND
+        // exposure (paired Up+Down -> $1 collateral release) rather than
+        // ADD it, so they shouldn't trip an entry cooldown that exists to
+        // prevent compounding into the wrong side. Bonereaper / unlawful
+        // both cycle paired-bid -> merge -> paired-bid back-to-back; gating
+        // re-entry for 15s after a merge throws away ~5% of every 5min bar.
+        let is_merge_fill = matches!(fill.close_method, Some(crate::types::CloseMethod::Merge));
+        if !is_merge_fill {
+            let market_state_ref = self
+                .market_states
+                .entry(fill.market_id.clone())
+                .or_default();
+            market_state_ref.last_fill_ms = Some(context.now_ms);
+        }
 
         // Atomic on-fill rescue: when this fill creates a stranded leg
         // (we now hold side X, side Y is empty), immediately fire the IOC
