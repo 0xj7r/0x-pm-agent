@@ -262,7 +262,8 @@ impl CtfRelayerClient {
         let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
         let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
         let condition_id = parse_b256(&request.condition_id, "condition id")?;
-        let index_sets_u256: Vec<U256> = request.index_sets.iter().copied().map(U256::from).collect();
+        let index_sets_u256: Vec<U256> =
+            request.index_sets.iter().copied().map(U256::from).collect();
         let calldata = redeemPositionsCall {
             collateralToken: collateral,
             parentCollectionId: B256::ZERO,

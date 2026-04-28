@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use polymarket_exec::journal::JournalWriter;
 use polymarket_exec::market_context::MarketContextStore;
@@ -881,12 +881,10 @@ fn run_fixture(name: &str) {
                 assert_checkpoint(&runtime, &fixture, expected, *at_ms);
                 let checkpoint_line =
                     checkpoint_artifact(&runtime, &format!("{}-{}", fixture.name, at_ms), *at_ms);
-                assert!(
-                    checkpoint_line
-                        .as_object()
-                        .unwrap()
-                        .contains_key("inventory_json")
-                );
+                assert!(checkpoint_line
+                    .as_object()
+                    .unwrap()
+                    .contains_key("inventory_json"));
                 let journal_checkpoint_name = format!("checkpoint-{}-{}", fixture.name, at_ms);
                 let checkpoint_path = journal_path_for_checkpoint(&fixture.name, *at_ms);
                 let mut checkpoint_journal = JournalWriter::open(checkpoint_path)

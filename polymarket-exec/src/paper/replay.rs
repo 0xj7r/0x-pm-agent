@@ -79,7 +79,11 @@ pub fn read_snapshot_log(path: &Path) -> Result<Vec<ReplayBookRecord>> {
     let mut records = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| {
-            format!("failed to read snapshot log {} at line {}", path.display(), idx + 1)
+            format!(
+                "failed to read snapshot log {} at line {}",
+                path.display(),
+                idx + 1
+            )
         })?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -181,18 +185,21 @@ mod tests {
             book.best_ask_size = 100.0;
             book.last_trade_price = 0.41;
             book.last_update_unix_ms = t;
-            book.bids = vec![Level { price: 0.40, size: 100.0 }];
-            book.asks = vec![Level { price: 0.42, size: 100.0 }];
+            book.bids = vec![Level {
+                price: 0.40,
+                size: 100.0,
+            }];
+            book.asks = vec![Level {
+                price: 0.42,
+                size: 100.0,
+            }];
             writer.record(&book, 5).expect("record");
         }
     }
 
     #[test]
     fn read_snapshot_log_parses_jsonl_in_time_order() {
-        let path = std::env::temp_dir().join(format!(
-            "replay-read-{}.jsonl",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("replay-read-{}.jsonl", std::process::id()));
         write_test_snapshot_log(&path);
         let records = read_snapshot_log(&path).expect("read");
         assert_eq!(records.len(), 3);
@@ -202,14 +209,9 @@ mod tests {
 
     #[test]
     fn replay_into_report_writes_summary_for_recorded_session() {
-        let input = std::env::temp_dir().join(format!(
-            "replay-input-{}.jsonl",
-            std::process::id()
-        ));
-        let output = std::env::temp_dir().join(format!(
-            "replay-output-{}.json",
-            std::process::id()
-        ));
+        let input = std::env::temp_dir().join(format!("replay-input-{}.jsonl", std::process::id()));
+        let output =
+            std::env::temp_dir().join(format!("replay-output-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&output);
         write_test_snapshot_log(&input);
@@ -227,7 +229,12 @@ mod tests {
         let body = std::fs::read_to_string(&output).expect("read report");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(parsed["session"]["mode"].as_str(), Some("replay"));
-        assert!(parsed["queue"]["post_only_reject_count"].as_u64().unwrap_or(0) >= 1);
+        assert!(
+            parsed["queue"]["post_only_reject_count"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
 
         let _ = std::fs::remove_file(&input);
         let _ = std::fs::remove_file(&output);
