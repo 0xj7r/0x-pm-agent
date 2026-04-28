@@ -45,7 +45,6 @@ use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
-const BTC_5M_WINDOW_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 struct RuntimeMarketUniverse {
@@ -1893,15 +1892,16 @@ async fn fetch_btc_5m_gamma_records(
     now_ms: u64,
 ) -> Result<Vec<crate::market_context::MarketContextRecord>> {
     let client = reqwest::Client::new();
-    let current_start_ms = now_ms - (now_ms % BTC_5M_WINDOW_MS);
+    let window_ms = config.market_discovery_window.as_millis().max(1) as u64;
+    let current_start_ms = now_ms - (now_ms % window_ms);
     let start_offset = -(config.market_discovery_include_prev as i64);
     let end_offset = config.market_discovery_include_next as i64;
     let mut records = Vec::new();
     for offset in start_offset..=end_offset {
         let start_ms = if offset < 0 {
-            current_start_ms.saturating_sub((-offset as u64) * BTC_5M_WINDOW_MS)
+            current_start_ms.saturating_sub((-offset as u64) * window_ms)
         } else {
-            current_start_ms.saturating_add((offset as u64) * BTC_5M_WINDOW_MS)
+            current_start_ms.saturating_add((offset as u64) * window_ms)
         };
         let slug = format!(
             "{}{}",
@@ -1923,7 +1923,7 @@ async fn fetch_btc_5m_gamma_records(
         };
         for item in items {
             if let Some(record) =
-                parse_gamma_market_record(item, &config.market_discovery_slug_prefix)
+                parse_gamma_market_record(item, &config.market_discovery_slug_prefix, window_ms)
             {
                 records.push(record);
             }
@@ -1977,6 +1977,7 @@ fn select_runtime_market_records(
 fn parse_gamma_market_record(
     value: &Value,
     slug_prefix: &str,
+    window_ms: u64,
 ) -> Option<crate::market_context::MarketContextRecord> {
     let slug = value.get("slug")?.as_str()?.trim();
     if !slug.starts_with(slug_prefix) {
@@ -2014,8 +2015,8 @@ fn parse_gamma_market_record(
             .or_else(|| value.get("endTime"))
             .or_else(|| value.get("end_time")),
     )
-    .or_else(|| start_ms.map(|start| start.saturating_add(BTC_5M_WINDOW_MS)));
-    let start_ms = start_ms.or_else(|| end_ms.map(|end| end.saturating_sub(BTC_5M_WINDOW_MS)));
+    .or_else(|| start_ms.map(|start| start.saturating_add(window_ms)));
+    let start_ms = start_ms.or_else(|| end_ms.map(|end| end.saturating_sub(window_ms)));
 
     Some(crate::market_context::MarketContextRecord {
         market_id: market_id.to_string(),
