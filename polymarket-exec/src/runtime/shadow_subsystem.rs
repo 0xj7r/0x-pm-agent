@@ -162,6 +162,10 @@ impl ShadowSubsystem {
     pub fn shadow_book(&self) -> &ShadowBook {
         &self.book
     }
+
+    pub fn journal_mut(&mut self) -> Option<&mut JournalWriter> {
+        self.journal.as_mut()
+    }
 }
 
 static GLOBAL_SHADOW: OnceLock<Arc<Mutex<ShadowSubsystem>>> = OnceLock::new();

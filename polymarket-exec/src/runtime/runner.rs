@@ -441,7 +441,124 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
         );
     }
 
+    // Spawn periodic shadow tasks: queue_estimate snapshot + /activity
+    // polling for fidelity scoring. Both run independently of the main
+    // run loop and write to the same journal.
+    let families = derive_market_families(&config);
+    let activity_url = format!("{}/activity", config.data_api_url.trim_end_matches('/'));
+    tokio::spawn(shadow_periodic_tasks(families, activity_url));
+
     run_with_config(config).await
+}
+
+fn derive_market_families(config: &AppConfig) -> Vec<String> {
+    config
+        .market_discovery_families
+        .iter()
+        .map(|family| {
+            family
+                .prefix
+                .strip_suffix('-')
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| family.prefix.clone())
+        })
+        .collect()
+}
+
+async fn shadow_periodic_tasks(families: Vec<String>, activity_url: String) {
+    use crate::runtime::fidelity::{
+        parse_bonereaper_activity, summarise_window_with_our_live, BonereaperFill, OurLiveFill,
+        ShadowFill, FIDELITY_TRUTH_MAX_STALENESS_MS,
+    };
+    use crate::runtime::shadow_subsystem::shadow;
+    use std::time::Duration;
+    use tokio::time::{interval, MissedTickBehavior};
+
+    const BONEREAPER_WALLET: &str = "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30";
+    const POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok();
+    let Some(http) = http else {
+        warn!(target: "shadow_live.periodic", "failed to build http client; skipping fidelity polling");
+        return;
+    };
+
+    let mut tick = interval(POLL_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_seen_ms: u64 = 0;
+    let family_refs: Vec<&str> = families.iter().map(|s| s.as_str()).collect();
+
+    loop {
+        tick.tick().await;
+        let now_ms = now_unix_ms();
+
+        if let Some(handle) = shadow() {
+            if let Ok(mut sub) = handle.lock() {
+                sub.snapshot_queue_estimates(now_ms, &family_refs);
+            }
+        }
+
+        let from_seconds = if last_seen_ms > 0 {
+            last_seen_ms / 1_000
+        } else {
+            now_ms.saturating_sub(POLL_INTERVAL.as_millis() as u64) / 1_000
+        };
+        let to_seconds = now_ms / 1_000;
+        let url = format!(
+            "{}?wallet={}&from={}&to={}",
+            activity_url, BONEREAPER_WALLET, from_seconds, to_seconds
+        );
+        let response = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(error) => {
+                warn!(target: "shadow_live.periodic", error = %error, "/activity request failed");
+                continue;
+            }
+        };
+        let body = match response.json::<serde_json::Value>().await {
+            Ok(v) => v,
+            Err(error) => {
+                warn!(target: "shadow_live.periodic", error = %error, "/activity response parse failed");
+                continue;
+            }
+        };
+        let activity = parse_bonereaper_activity(&body);
+        let newest_truth_ms = activity.iter().map(|(_, ts)| *ts).max();
+        let _ = crate::runtime::fidelity::truth_freshness(
+            newest_truth_ms,
+            now_ms,
+            FIDELITY_TRUTH_MAX_STALENESS_MS,
+        );
+        if let Some(ts) = newest_truth_ms {
+            last_seen_ms = last_seen_ms.max(ts);
+        }
+        let bonereaper: Vec<BonereaperFill> = activity.into_iter().map(|(f, _)| f).collect();
+        let shadow_fills: Vec<ShadowFill> = Vec::new(); // sourced from journal in v2
+        let our_live: Vec<OurLiveFill> = Vec::new(); // populated when we go live
+        let window_start = now_ms.saturating_sub(POLL_INTERVAL.as_millis() as u64);
+        let events = summarise_window_with_our_live(
+            &shadow_fills,
+            &our_live,
+            &bonereaper,
+            window_start,
+            now_ms,
+            now_ms,
+        );
+
+        if let Some(handle) = shadow() {
+            if let Ok(mut sub) = handle.lock() {
+                if let Some(journal) = sub.journal_mut() {
+                    for event in &events {
+                        let _ = journal.append_fidelity_event(event);
+                    }
+                    let _ = journal.flush();
+                }
+            }
+        }
+    }
 }
 
 /// Depth at our price level on the resting side. For a resting BUY,
