@@ -106,6 +106,8 @@ impl BtcSignalStore {
         let trade_count_15m = self.trade_count(now_ms, BTC_SIGNAL_WINDOW_15M_MS);
         let return_30s_bps = self.return_bps(now_ms, 30_000);
         let return_60s_bps = self.return_bps(now_ms, 60_000);
+        let return_120s_bps = self.return_bps(now_ms, 120_000);
+        let return_180s_bps = self.return_bps(now_ms, 180_000);
 
         GateBtcRegimeSnapshot {
             last_price: self.last_price,
@@ -115,6 +117,8 @@ impl BtcSignalStore {
             trade_count_15m,
             return_30s_bps,
             return_60s_bps,
+            return_120s_bps,
+            return_180s_bps,
             observed_at_ms: self.observed_at_ms,
         }
     }

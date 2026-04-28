@@ -630,6 +630,8 @@ mod tests {
             trade_count_15m: trades,
             return_30s_bps: Some(1.0),
             return_60s_bps: Some(1.0),
+            return_120s_bps: Some(1.0),
+            return_180s_bps: Some(1.0),
             observed_at_ms: 10_000,
         }
     }

@@ -635,6 +635,15 @@ struct Btc5mMmMarketState {
     /// post-fill entry cooldown that prevents re-stranding immediately
     /// after a merge in a trending market.
     last_fill_ms: Option<EpochMillis>,
+    /// Per-bar convex accumulation count. Convex_accum is the
+    /// asymmetric-payoff side bet; without a per-bar count cap, a single
+    /// trending bar can fire convex 14+ times and accumulate $18 of
+    /// stranded inventory. Reset when convex_bar_end_ms changes.
+    convex_bids_this_bar: u32,
+    /// The bar's event_end_time_ms snapshotted on the last convex bid.
+    /// When this differs from the current bar's end_ms, we reset
+    /// convex_bids_this_bar to 0 (new bar, fresh count).
+    convex_bar_end_ms: Option<EpochMillis>,
 }
 
 impl Btc5mMmMarketState {
@@ -1613,6 +1622,29 @@ impl Btc5mMmStrategy {
     /// shouldn't blow our bankroll on cheap-leg fades. With a 0.5 fraction,
     /// a $20 gross / $10 leg market budget gives convex $10 / $5 to work with.
     const CONVEX_BUDGET_FRACTION: f64 = 0.5;
+    /// Convex_accum should not fire late in the bar. The cheap-leg bet only
+    /// pays off if the market reverses, which needs time. Sub-60s remaining
+    /// = high conviction the bar resolves as currently-leading side =
+    /// near-certain loss on the cheap leg. Skip.
+    const CONVEX_MIN_BAR_REMAINING_MS: u64 = 60_000;
+    /// Convex_accum should not fire too early in the bar either. First 60s
+    /// of a 5min bar is noise: both sides typically near $0.50 (no clear
+    /// cheap side), brief spikes can momentarily push prices to <$0.45 but
+    /// usually mean-revert before the bar resolves. Wait for the market to
+    /// settle into a directional view before betting on its reversal.
+    const CONVEX_MIN_BAR_ELAPSED_MS: u64 = 60_000;
+    /// Per-bar count cap on convex accumulation bids per market. Even with
+    /// dollar caps + time-in-bar gate + trend persistence gate, fire-and-
+    /// forget refresh on every book tick can produce 10+ bids per bar.
+    /// 4 fires per bar gives 4 chances at the asymmetric payoff while
+    /// bounding cumulative damage if signals all happen to be wrong.
+    const CONVEX_MAX_BIDS_PER_BAR: u32 = 4;
+    /// 180s rolling BTC return magnitude that flags a "persistent trend".
+    /// Tuned to match the smallest spot move that consistently produces
+    /// >5pp Polymarket book repricing in a single 5min bar. Below this,
+    /// noise and short-term mean reversion dominate; above, the trend is
+    /// real and bidding the cheap (against-trend) leg is adverse selection.
+    const CONVEX_TREND_PERSISTENCE_BPS: f64 = 50.0;
     const HOLD_EV_MARGIN: f64 = 0.005;
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
@@ -1733,6 +1765,12 @@ impl Btc5mMmStrategy {
                     last_cooling_note_key: None,
                     last_rescue_attempt_ms: record.last_rescue_attempt_ms,
                     last_fill_ms: record.last_fill_ms,
+                    // Per-bar convex tracking is in-memory only; new bar
+                    // post-restart resets count naturally (curr_bar_end !=
+                    // None at restart, persisted None means "no recent
+                    // convex this bar yet").
+                    convex_bids_this_bar: 0,
+                    convex_bar_end_ms: None,
                 },
             );
         }
@@ -2551,6 +2589,84 @@ impl Btc5mMmStrategy {
         }
     }
 
+    /// Returns Some(reason) if convex accumulation should be skipped this
+    /// tick. None means "go ahead and call build_convex_accumulation_intent".
+    /// Gates checked (cheapest first, abort early):
+    ///   1. time-in-bar (>= 60s remaining)
+    ///   2. bar-just-opened (>= 60s elapsed since bar start)
+    ///   3. trend-persistent (180s + 120s BTC return both against cheap leg
+    ///      with magnitude > CONVEX_TREND_PERSISTENCE_BPS)
+    ///   4. per-bar bid count (<= CONVEX_MAX_BIDS_PER_BAR for this bar)
+    fn convex_skip_reason(
+        &self,
+        market_id: &MarketId,
+        left_id: &InstrumentId,
+        left_fair: f64,
+        right_id: &InstrumentId,
+        right_fair: f64,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
+    ) -> Option<String> {
+        // Bar timing gates: need market_context with event_end_time_ms.
+        if let Some(ctx) = market_context {
+            if let Some(end_ms) = ctx.event_end_time_ms {
+                let remaining = end_ms.saturating_sub(now_ms);
+                if remaining < Self::CONVEX_MIN_BAR_REMAINING_MS {
+                    return Some(format!(
+                        "convex skip: time-in-bar {remaining}ms remaining < {}ms",
+                        Self::CONVEX_MIN_BAR_REMAINING_MS
+                    ));
+                }
+                // Estimate elapsed assuming a 5min bar window. (TODO: thread
+                // bar_window_ms from config.market_discovery_window once
+                // strategy can read it; for now hardcoded to match BTC 5m.)
+                let bar_duration_ms: u64 = 5 * 60 * 1_000;
+                let elapsed = bar_duration_ms.saturating_sub(remaining);
+                if elapsed < Self::CONVEX_MIN_BAR_ELAPSED_MS {
+                    return Some(format!(
+                        "convex skip: bar-just-opened {elapsed}ms elapsed < {}ms",
+                        Self::CONVEX_MIN_BAR_ELAPSED_MS
+                    ));
+                }
+            }
+        }
+        // Trend persistence gate: need both 180s and 120s return readings.
+        let cheap_id = if left_fair < right_fair { left_id } else { right_id };
+        if let (Some(r180), Some(r120)) = (btc_regime.return_180s_bps, btc_regime.return_120s_bps)
+        {
+            if let Some(cheap_is_up) = Self::leg_is_up(cheap_id, market_context) {
+                let trend_against_cheap = if cheap_is_up {
+                    r180 < -Self::CONVEX_TREND_PERSISTENCE_BPS && r120 < 0.0
+                } else {
+                    r180 > Self::CONVEX_TREND_PERSISTENCE_BPS && r120 > 0.0
+                };
+                if trend_against_cheap {
+                    return Some(format!(
+                        "convex skip: trend-persistent r180={:.1}bps r120={:.1}bps cheap_is_up={cheap_is_up}",
+                        r180, r120
+                    ));
+                }
+            }
+        }
+        // Per-bar bid count cap.
+        if let Some(state) = self.market_states.get(market_id) {
+            let curr_bar_end = market_context.and_then(|c| c.event_end_time_ms);
+            let same_bar = matches!(
+                (state.convex_bar_end_ms, curr_bar_end),
+                (Some(a), Some(b)) if a == b
+            );
+            if same_bar && state.convex_bids_this_bar >= Self::CONVEX_MAX_BIDS_PER_BAR {
+                return Some(format!(
+                    "convex skip: bid-count-cap {} >= {} this bar",
+                    state.convex_bids_this_bar,
+                    Self::CONVEX_MAX_BIDS_PER_BAR
+                ));
+            }
+        }
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_convex_accumulation_intent(
         &self,
@@ -3147,7 +3263,24 @@ impl Strategy for Btc5mMmStrategy {
                     ));
                 }
                 if intents.is_empty() {
-                    if let Some(intent) = self.build_convex_accumulation_intent(
+                    let convex_skip = self.convex_skip_reason(
+                        &snapshot.market_id,
+                        &left_id,
+                        left_fair,
+                        &right_id,
+                        right_fair,
+                        &context.btc_regime,
+                        context.market_context.as_ref(),
+                        context.now_ms,
+                    );
+                    if let Some(reason) = convex_skip {
+                        tracing::debug!(
+                            target: "strategy.convex_gate",
+                            market = %snapshot.market_id,
+                            reason,
+                            "convex accumulation suppressed"
+                        );
+                    } else if let Some(intent) = self.build_convex_accumulation_intent(
                         &snapshot.market_id,
                         &left_id,
                         &left_quote,
@@ -3163,6 +3296,23 @@ impl Strategy for Btc5mMmStrategy {
                         context.venue_rules.as_ref(),
                         context.now_ms,
                     ) {
+                        // Track per-bar count: reset if this is a new bar,
+                        // increment otherwise. Used by convex_skip_reason
+                        // gate #4 to cap convex bids per market per bar.
+                        let curr_bar_end = context
+                            .market_context
+                            .as_ref()
+                            .and_then(|c| c.event_end_time_ms);
+                        let state = self
+                            .market_states
+                            .entry(snapshot.market_id.clone())
+                            .or_default();
+                        if state.convex_bar_end_ms != curr_bar_end {
+                            state.convex_bids_this_bar = 0;
+                            state.convex_bar_end_ms = curr_bar_end;
+                        }
+                        state.convex_bids_this_bar =
+                            state.convex_bids_this_bar.saturating_add(1);
                         intents.push(intent);
                     }
                 }
