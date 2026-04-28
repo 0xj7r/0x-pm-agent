@@ -781,11 +781,15 @@ impl<S: Strategy> Runtime<S> {
                     &position.market_id,
                 );
                 VenuePositionSnapshot {
-                    market_id: canonical_market_id,
+                    market_id: canonical_market_id.clone(),
                     condition_id: position.condition_id.clone(),
                     instrument_id: position.instrument_id.clone(),
                     quantity: position.quantity,
-                    average_cost_usd: position.average_cost_usd,
+                    average_cost_usd: self.resolved_venue_cost_basis_usd(
+                        &canonical_market_id,
+                        &position.instrument_id,
+                        position.average_cost_usd,
+                    ),
                     mark_price: position.mark_price,
                     observed_at_ms: position.observed_at_ms,
                 }
@@ -902,6 +906,44 @@ impl<S: Strategy> Runtime<S> {
             .retain(|market_id, _| active_markets.contains(market_id));
         self.initial_reconcile_complete = true;
         Ok(report)
+    }
+
+    fn resolved_venue_cost_basis_usd(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        venue_average_cost_usd: f64,
+    ) -> f64 {
+        if venue_average_cost_usd.is_finite() && venue_average_cost_usd > 0.0 {
+            return venue_average_cost_usd;
+        }
+        let Some(order_store) = self.order_store.as_ref() else {
+            return venue_average_cost_usd;
+        };
+        match order_store.filled_buy_cost_basis(market_id, instrument_id) {
+            Ok(Some(cost_basis)) if cost_basis.is_finite() && cost_basis > 0.0 => {
+                info!(
+                    run_id = %self.run_id,
+                    market_id = %market_id,
+                    instrument_id = %instrument_id,
+                    venue_average_cost_usd,
+                    resolved_average_cost_usd = cost_basis,
+                    "resolved missing venue position cost basis from durable fills"
+                );
+                cost_basis
+            }
+            Ok(_) => venue_average_cost_usd,
+            Err(error) => {
+                warn!(
+                    run_id = %self.run_id,
+                    market_id = %market_id,
+                    instrument_id = %instrument_id,
+                    error = ?error,
+                    "failed to resolve venue position cost basis from durable fills"
+                );
+                venue_average_cost_usd
+            }
+        }
     }
 
     pub fn stranded_inventory(&self) -> Vec<StrandedMarketInventory> {
@@ -4643,6 +4685,70 @@ mod tests {
                 .any(|message| message.contains("fail-closed stale submit state PendingSubmit")),
             "missing fail-closed pending-submit event in {recent_messages:?}"
         );
+    }
+
+    #[test]
+    fn venue_position_reconciliation_recovers_missing_cost_basis_from_filled_buys() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("polymarket-exec-cost-basis-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(&path).unwrap();
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("coid-cost-basis"),
+            market_id: MarketId::from("market-mm"),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            limit_price: 0.05,
+            quantity: 8.26,
+            reduce_only: false,
+            reason: "convex fill".to_string(),
+            quote_level_tag: Some("mm-convex-accum:l1".to_string()),
+            created_at_ms: 10,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let mut record = OrderRecord::from_intent("run-1", &intent, "btc_5m_mm");
+        record.status = ManagedOrderStatus::Filled;
+        record.remaining_qty = 0.0;
+        record.filled_qty = 8.26;
+        store.insert(record).unwrap();
+
+        let mut runtime = Runtime::new_with_order_store(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+            Some(Box::new(store)),
+            "run-1".to_string(),
+        );
+        runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: MarketId::from("market-mm"),
+                    condition_id: None,
+                    instrument_id: InstrumentId::from("up"),
+                    quantity: 8.26,
+                    average_cost_usd: 0.0,
+                    mark_price: Some(0.05),
+                    observed_at_ms: 20,
+                }],
+                20,
+            )
+            .expect("reconcile");
+
+        let position = runtime
+            .inventory()
+            .position(&InstrumentId::from("up"))
+            .expect("position");
+        assert_eq!(position.quantity, 8.26);
+        assert!((position.avg_price - 0.05).abs() < 1e-9);
     }
 
     #[test]

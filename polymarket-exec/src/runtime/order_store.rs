@@ -166,6 +166,11 @@ pub trait OrderStore {
         &self,
         market_id: &MarketId,
     ) -> std::result::Result<Vec<OrderRecord>, OrderStoreError>;
+    fn filled_buy_cost_basis(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+    ) -> std::result::Result<Option<f64>, OrderStoreError>;
     fn insert_signal_snapshot(
         &mut self,
         record: SignalSnapshotRecord,
@@ -836,6 +841,43 @@ impl OrderStore for SqliteOrderStore {
             })?);
         }
         Ok(records)
+    }
+
+    fn filled_buy_cost_basis(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+    ) -> std::result::Result<Option<f64>, OrderStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT SUM(filled_qty * limit_price), SUM(filled_qty)
+                 FROM orders
+                 WHERE market_id = ?1
+                   AND instrument_id = ?2
+                   AND side = 'Buy'
+                   AND reduce_only = 0
+                   AND filled_qty > 0.0",
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to prepare cost-basis query: {error}"))
+            })?;
+
+        let (notional, quantity): (Option<f64>, Option<f64>) = statement
+            .query_row(params![market_id.as_str(), instrument_id.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to query filled buy cost basis: {error}"))
+            })?;
+
+        let (Some(notional), Some(quantity)) = (notional, quantity) else {
+            return Ok(None);
+        };
+        if !notional.is_finite() || !quantity.is_finite() || quantity <= 0.0 {
+            return Ok(None);
+        }
+        Ok(Some((notional / quantity).max(0.0)))
     }
 
     fn insert_signal_snapshot(
