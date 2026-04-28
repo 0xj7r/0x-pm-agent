@@ -213,7 +213,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: 2,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             }))
             .unwrap();
         journal.flush().unwrap();

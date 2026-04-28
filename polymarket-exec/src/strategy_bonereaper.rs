@@ -20,9 +20,7 @@ use std::env;
 use crate::core::types::{
     EpochMillis, IntentKind, MarketSnapshot, OrderIntent, RuntimeStatus, TradeSide,
 };
-use crate::strategy::{
-    deterministic_client_order_id, Strategy, StrategyContext, StrategyDecision,
-};
+use crate::strategy::{deterministic_client_order_id, Strategy, StrategyContext, StrategyDecision};
 
 const DEFAULT_CLIP_USD: f64 = 20.0;
 const DEFAULT_MIN_TICK: f64 = 0.01;
@@ -181,9 +179,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 mod tests {
     use super::*;
     use crate::core::inventory::InventorySnapshot;
-    use crate::core::types::{
-        BookLevel, InstrumentId, MarketId, QuoteSnapshot, RuntimeStatus,
-    };
+    use crate::core::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot, RuntimeStatus};
     use crate::strategy::VenueMarketRules;
 
     fn empty_inventory() -> InventorySnapshot {
@@ -243,10 +239,7 @@ mod tests {
         assert!((intent.limit_price - 0.49).abs() < 1e-9);
         assert_eq!(intent.kind, IntentKind::Entry);
         assert!(!intent.reduce_only);
-        assert_eq!(
-            intent.quote_level_tag.as_deref(),
-            Some("bonereaper-mid")
-        );
+        assert_eq!(intent.quote_level_tag.as_deref(), Some("bonereaper-mid"));
     }
 
     #[test]

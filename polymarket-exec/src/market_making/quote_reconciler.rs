@@ -634,10 +634,9 @@ mod tests {
         };
         let plan = reconciler.plan(desired, &HashMap::new(), 2);
         assert!(plan.actions.is_empty());
-        assert!(
-            plan.notes
-                .iter()
-                .any(|note| note.contains("submit rate cap reached"))
-        );
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("submit rate cap reached")));
     }
 }

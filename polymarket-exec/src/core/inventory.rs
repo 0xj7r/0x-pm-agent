@@ -802,7 +802,7 @@ mod tests {
                 quote_level_tag: None,
                 created_at_ms: 10,
                 pair_id: None,
-            kind: crate::types::IntentKind::Entry,
+                kind: crate::types::IntentKind::Entry,
             })
             .expect("buy reserve");
         assert_eq!(reserve.cash_delta_usd, -4.0);

@@ -46,10 +46,7 @@ impl BookSnapshotWriter {
             .append(true)
             .open(path)
             .with_context(|| format!("failed to open book snapshot log {}", path.display()))?;
-        let bytes_written = file
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+        let bytes_written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             path: path.to_path_buf(),
             file: BufWriter::new(file),
@@ -83,8 +80,8 @@ impl BookSnapshotWriter {
             asks,
             last_trade: book.last_trade_price,
         };
-        let line = serde_json::to_string(&record)
-            .context("failed to serialize BookSnapshotRecord")?;
+        let line =
+            serde_json::to_string(&record).context("failed to serialize BookSnapshotRecord")?;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.bytes_written = self.bytes_written.saturating_add(line.len() as u64 + 1);
@@ -126,13 +123,28 @@ mod tests {
         book.last_trade_price = 0.43;
         book.last_update_unix_ms = 1_700_000_000_000;
         book.bids = vec![
-            Level { price: 0.42, size: 100.0 },
-            Level { price: 0.41, size: 200.0 },
-            Level { price: 0.40, size: 300.0 },
+            Level {
+                price: 0.42,
+                size: 100.0,
+            },
+            Level {
+                price: 0.41,
+                size: 200.0,
+            },
+            Level {
+                price: 0.40,
+                size: 300.0,
+            },
         ];
         book.asks = vec![
-            Level { price: 0.44, size: 80.0 },
-            Level { price: 0.45, size: 150.0 },
+            Level {
+                price: 0.44,
+                size: 80.0,
+            },
+            Level {
+                price: 0.45,
+                size: 150.0,
+            },
         ];
         book
     }
@@ -168,10 +180,8 @@ mod tests {
 
     #[test]
     fn book_snapshot_writer_truncates_to_max_levels() {
-        let path = std::env::temp_dir().join(format!(
-            "book-snap-trunc-{}.jsonl",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("book-snap-trunc-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let book = book_with_levels();
         {
@@ -188,10 +198,8 @@ mod tests {
 
     #[test]
     fn book_snapshot_writer_skips_uninitialised_book() {
-        let path = std::env::temp_dir().join(format!(
-            "book-snap-skip-{}.jsonl",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("book-snap-skip-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let book = BookState::default();
         {

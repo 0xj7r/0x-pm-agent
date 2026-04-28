@@ -789,8 +789,8 @@ impl PolymarketExecutionAdapter {
                 // "not enough balance / allowance" even when our approvals
                 // are correctly set on chain (their balance check is
                 // cached and lazily-refreshed otherwise).
-                use polymarket_client_sdk_v2::clob::types::AssetType;
                 use polymarket_client_sdk_v2::clob::types::request::UpdateBalanceAllowanceRequest;
+                use polymarket_client_sdk_v2::clob::types::AssetType;
                 let req = UpdateBalanceAllowanceRequest::builder()
                     .asset_type(AssetType::Collateral)
                     .build();
@@ -809,10 +809,7 @@ impl PolymarketExecutionAdapter {
     /// whether the strategy is actually capturing the rebate side of
     /// the edge whales rely on. Cheap GET (~30ms after warm-up since
     /// the cached client is reused).
-    pub async fn check_order_scoring(
-        &self,
-        venue_order_id: &str,
-    ) -> Result<bool, ExecutionError> {
+    pub async fn check_order_scoring(&self, venue_order_id: &str) -> Result<bool, ExecutionError> {
         use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
         let signature_type_v2 = match self.signature_type {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
@@ -824,8 +821,8 @@ impl PolymarketExecutionAdapter {
                 "check_order_scoring requires _stored_private_key".to_string(),
             )
         })?;
-        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
-            .map_err(|error| {
+        let sdk_signer =
+            alloy::signers::local::LocalSigner::from_str(pk_hex.trim()).map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
             })?;
         use alloy::signers::Signer as _;
@@ -870,8 +867,8 @@ impl PolymarketExecutionAdapter {
                 "check_orders_scoring requires _stored_private_key".to_string(),
             )
         })?;
-        let sdk_signer = alloy::signers::local::LocalSigner::from_str(pk_hex.trim())
-            .map_err(|error| {
+        let sdk_signer =
+            alloy::signers::local::LocalSigner::from_str(pk_hex.trim()).map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
             })?;
         use alloy::signers::Signer as _;
@@ -938,15 +935,12 @@ impl PolymarketExecutionAdapter {
         // Re-derive a LocalSigner from the stored private key. Alloy's
         // LocalSigner == PrivateKeySigner; this is just a fresh instance
         // with the chain_id set for the SDK.
-        let pk_hex = self
-            ._stored_private_key
-            .as_deref()
-            .ok_or_else(|| {
-                ExecutionError::AuthFailure(
-                    "submit_v2_via_sdk requires _stored_private_key (set during connect_with_*)"
-                        .to_string(),
-                )
-            })?;
+        let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "submit_v2_via_sdk requires _stored_private_key (set during connect_with_*)"
+                    .to_string(),
+            )
+        })?;
         let sdk_signer = SdkLocalSigner::from_str(pk_hex.trim())
             .map_err(|error| {
                 ExecutionError::AuthFailure(format!("invalid private key for V2 SDK: {error}"))
@@ -964,21 +958,24 @@ impl PolymarketExecutionAdapter {
         let price = SdkV2Decimal::from_str(&format!("{}", req.limit_price)).map_err(|error| {
             ExecutionError::BadRequest(format!("invalid V2 SDK price: {error}"))
         })?;
-        let size = SdkV2Decimal::from_str(&format!("{}", req.quantity)).map_err(|error| {
-            ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}"))
-        })?;
+        let size = SdkV2Decimal::from_str(&format!("{}", req.quantity))
+            .map_err(|error| ExecutionError::BadRequest(format!("invalid V2 SDK size: {error}")))?;
 
         // V2 keeps expiration outside the signed order. GTC uses epoch
         // expiration (0), matching the public migration docs; GTD uses
         // the requested future expiry or defaults to 1h ahead.
+        // V2 SDK validates: "Only GTD orders may have a non-zero expiration".
+        // Both GTC and IOC must pass expiration=0 (epoch). Previously this
+        // only zeroed for GTC; IOC fell through to the 1h default and the
+        // V2 SDK rejected every hedge-rescue submit.
         let expiration_dt = {
             use chrono::{TimeZone, Utc};
-            let secs_ms = if matches!(req.time_in_force, TimeInForce::Gtc) {
-                0
-            } else {
-                req.expires_at_ms
+            let secs_ms = match req.time_in_force {
+                TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok => 0,
+                TimeInForce::Gtd => req
+                    .expires_at_ms
                     .filter(|ms| *ms > now_unix_ms() + 60_000)
-                    .unwrap_or_else(|| now_unix_ms() + 3_600_000)
+                    .unwrap_or_else(|| now_unix_ms() + 3_600_000),
             };
             Utc.timestamp_millis_opt(secs_ms as i64)
                 .single()
@@ -1795,7 +1792,10 @@ fn parse_market_metadata(body: &str) -> Result<MarketMetadata, ExecutionError> {
             _ => None,
         })
         .unwrap_or(0.0);
-    let neg_risk = raw.get("neg_risk").and_then(|v| v.as_bool()).unwrap_or(false);
+    let neg_risk = raw
+        .get("neg_risk")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let active = raw.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
     let closed = raw.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
     Ok(MarketMetadata {
