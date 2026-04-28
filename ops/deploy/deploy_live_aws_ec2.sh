@@ -75,7 +75,7 @@ log "installing user service templates"
 ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
 
 log "building single release binary"
-ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && \"\$CARGO_BIN\" build --release -p polymarket-exec && test -x target/release/polymarket-exec"
+ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && \"\$CARGO_BIN\" build --release -p polymarket-exec && mkdir -p \"\$HOME/.local/bin\" && install -m 0755 target/release/polymarket-exec \"\$HOME/.local/bin/polymarket-exec\" && test -x \"\$HOME/.local/bin/polymarket-exec\" && rm -rf target"
 
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
