@@ -65,7 +65,9 @@ S2 (hygiene only).
 
 ## Found this session, not yet in catalog
 
-- **Merge fills trip post-fill cooldown** — `strategy.rs:3503` updates `last_fill_ms` on Merge-method fills, triggering 15s entry cooldown after merges that should let next paired cycle start immediately. Same family as #56 (capital guard not bypassing IntentKind::Close). Fix proposed in this session: skip `last_fill_ms` update when `fill.close_method == Some(CloseMethod::Merge)`.
+- **Merge fills trip post-fill cooldown** — `strategy.rs:3503` updates `last_fill_ms` on Merge-method fills, triggering 15s entry cooldown after merges that should let next paired cycle start immediately. Same family as #56 (capital guard not bypassing IntentKind::Close). Fix proposed in this session: skip `last_fill_ms` update when `fill.close_method == Some(CloseMethod::Merge)`. **SHIPPED in commit 7a38b15.**
+
+- **Persisted RiskOff with no auto-recovery (S0)** — Commit `2982576 Persist risk-off runtime state` writes RiskOff to `runtime_state` table in `orders.sqlite`. On every restart, `restored runtime status from durable store status=RiskOff` reads it back and the bot starts in RiskOff. Suppresses ALL entries indefinitely until operator manually clears the table (`DELETE FROM runtime_state;`). Once we trigger RiskOff once (e.g., by a transient reconcile mismatch), the bot is dead until human intervenes. **Hit this twice today.** Fix shape: add either (a) auto-recovery — clear RiskOff after N healthy ticks post-restart, (b) `WHALE_PAIR_LIVE_RECOVER_FROM_RISK_OFF=true` env to override on startup, or (c) explicit operator runbook for clearing the state. Recommend (a) with N=10-30 ticks (10-30s) as the safe default — gives the protection without trapping the bot indefinitely.
 
 ## Anti-pattern shapes (so we can recognize the next one)
 
