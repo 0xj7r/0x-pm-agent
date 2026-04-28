@@ -145,6 +145,71 @@ pub fn extract_market_family(slug: &str) -> &str {
     }
 }
 
+/// Maximum staleness for bonereaper /activity truth data before we mark
+/// the fidelity verdict as untrusted. Five minutes is enough to absorb
+/// normal API latency / our 60s poll cadence; beyond that the truth
+/// source itself is suspect (Polymarket caching, network, etc.) and we
+/// should not block the live deploy gate on stale truth.
+pub const FIDELITY_TRUTH_MAX_STALENESS_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruthFreshness {
+    Fresh,
+    Stale,
+}
+
+pub fn parse_bonereaper_activity(json: &serde_json::Value) -> Vec<(BonereaperFill, EpochMillis)> {
+    let mut out = Vec::new();
+    let Some(rows) = json.as_array() else {
+        return out;
+    };
+    for row in rows {
+        // Only TRADE rows count as fills; REDEEM/MERGE are lifecycle ops.
+        let row_type = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !row_type.eq_ignore_ascii_case("TRADE") {
+            continue;
+        }
+        let Some(slug) = row.get("slug").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let market_family = extract_market_family(slug).to_string();
+        let price = row.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let size = row.get("size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let usdc_size = row
+            .get("usdcSize")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(price * size);
+        // Activity timestamps are epoch seconds; convert to ms.
+        let ts_ms = row
+            .get("timestamp")
+            .and_then(|v| v.as_u64())
+            .map(|s| s.saturating_mul(1_000))
+            .unwrap_or(0);
+        // Rebate is not directly populated on /activity rows. Set to 0
+        // here; the rebate-aware path uses /rebates/current separately.
+        out.push((
+            BonereaperFill {
+                market_family,
+                notional_usd: usdc_size,
+                rebate_usd: 0.0,
+            },
+            ts_ms,
+        ));
+    }
+    out
+}
+
+pub fn truth_freshness(
+    newest_truth_ms: Option<EpochMillis>,
+    now_ms: EpochMillis,
+    max_staleness_ms: u64,
+) -> TruthFreshness {
+    match newest_truth_ms {
+        Some(ts) if ts.saturating_add(max_staleness_ms) >= now_ms => TruthFreshness::Fresh,
+        _ => TruthFreshness::Stale,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FidelityVerdict {
@@ -303,6 +368,59 @@ mod tests {
     fn extract_market_family_strips_trailing_timestamp() {
         assert_eq!(extract_market_family("btc-updown-5m-1776961500"), "btc-updown-5m");
         assert_eq!(extract_market_family("eth-updown-15m-1776960900"), "eth-updown-15m");
+    }
+
+    #[test]
+    fn parse_activity_keeps_trade_rows_and_drops_lifecycle_ops() {
+        let json = serde_json::json!([
+            {"type": "TRADE", "slug": "btc-updown-5m-1776961500", "price": 0.49, "size": 40.0, "usdcSize": 19.6, "timestamp": 1_700_000_000u64},
+            {"type": "REDEEM", "slug": "btc-updown-5m-1776961500", "price": 1.0, "size": 100.0, "timestamp": 1_700_000_100u64},
+            {"type": "MERGE", "slug": "eth-updown-5m-1776961500", "size": 50.0, "timestamp": 1_700_000_200u64},
+            {"type": "TRADE", "slug": "eth-updown-15m-1776960900", "price": 0.51, "size": 20.0, "usdcSize": 10.2, "timestamp": 1_700_000_300u64}
+        ]);
+        let out = parse_bonereaper_activity(&json);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.market_family, "btc-updown-5m");
+        assert!((out[0].0.notional_usd - 19.6).abs() < 1e-9);
+        assert_eq!(out[0].1, 1_700_000_000_000);
+        assert_eq!(out[1].0.market_family, "eth-updown-15m");
+    }
+
+    #[test]
+    fn parse_activity_handles_empty_or_malformed_response() {
+        let empty = serde_json::json!([]);
+        assert!(parse_bonereaper_activity(&empty).is_empty());
+
+        let object = serde_json::json!({"error": "not an array"});
+        assert!(parse_bonereaper_activity(&object).is_empty());
+    }
+
+    #[test]
+    fn truth_freshness_within_window_is_fresh() {
+        let now = 1_700_000_300_000;
+        let newest = 1_700_000_000_000; // 300s = 5min ago, EXACTLY at the boundary
+        assert_eq!(
+            truth_freshness(Some(newest), now, 5 * 60 * 1_000),
+            TruthFreshness::Fresh
+        );
+    }
+
+    #[test]
+    fn truth_freshness_beyond_window_is_stale() {
+        let now = 1_700_000_301_000;
+        let newest = 1_700_000_000_000; // 301s ago, just past the boundary
+        assert_eq!(
+            truth_freshness(Some(newest), now, 5 * 60 * 1_000),
+            TruthFreshness::Stale
+        );
+    }
+
+    #[test]
+    fn truth_freshness_no_data_is_stale() {
+        assert_eq!(
+            truth_freshness(None, 1_700_000_000_000, 5 * 60 * 1_000),
+            TruthFreshness::Stale
+        );
     }
 
     #[test]
