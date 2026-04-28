@@ -416,7 +416,53 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
         paper_report_path = ?config.paper_report_path,
         "shadow-live mode engaged: live feeds, paper submits"
     );
+
+    // Initialise the process-global shadow subsystem. Hooks in
+    // run_with_config (paper-mode submit branch) and wire/market_ws.rs
+    // (last_trade_price + price_change handlers) consult this handle and
+    // forward events to ShadowBook + TradeSynthesiser. The subsystem
+    // journals shadow predictions to the same WHALE_PAIR_EXEC_JOURNAL_PATH
+    // the runtime uses; the fidelity scorer reads them downstream.
+    //
+    // Observation-only: shadow predictions do NOT affect runtime
+    // inventory. The existing paper_fill_from_book_snapshot path remains
+    // the source of inventory updates until multi-day fidelity validates
+    // that ShadowBook's predictions are trustworthy enough to drive it.
+    {
+        use crate::runtime::shadow_subsystem::{init_shadow, ShadowSubsystem};
+        let journal = config
+            .journal_path
+            .as_ref()
+            .and_then(|p| crate::journal::JournalWriter::open(p).ok());
+        init_shadow(ShadowSubsystem::new(journal));
+        info!(
+            target: "shadow_live.startup",
+            "shadow subsystem initialised: parallel observation mode"
+        );
+    }
+
     run_with_config(config).await
+}
+
+/// Depth at our price level on the resting side. For a resting BUY,
+/// returns the quantity at our exact bid price level from the book's
+/// bid side. For a resting SELL, the same on the ask side. 0 if the
+/// price level is not present in the book snapshot.
+fn depth_at_our_price(
+    book: &crate::core::book::BookState,
+    side: crate::core::types::TradeSide,
+    price: f64,
+) -> f64 {
+    let levels = match side {
+        crate::core::types::TradeSide::Buy => book.bid_levels(),
+        crate::core::types::TradeSide::Sell => book.ask_levels(),
+    };
+    for level in levels {
+        if (level.price - price).abs() < 1e-9 {
+            return level.size;
+        }
+    }
+    0.0
 }
 
 async fn run_live_reconcile(config: AppConfig) -> Result<()> {
@@ -3083,6 +3129,25 @@ async fn execute_execution_adapter(
                         combined.extend(
                             runtime.on_order_opened(&intent.client_order_id, observed_at_ms),
                         );
+                    }
+                    // Shadow-subsystem parallel observer: register the intent in
+                    // ShadowBook so trade-tape replay can predict fills against
+                    // it later. Pure observation - does not affect runtime
+                    // inventory above. Only active when run_shadow_live initted
+                    // the global shadow handle; otherwise no-op.
+                    if let Some(handle) =
+                        crate::runtime::shadow_subsystem::shadow()
+                    {
+                        if let Ok(mut shadow) = handle.lock() {
+                            let depth_at_post =
+                                depth_at_our_price(&book, intent.side, intent.limit_price);
+                            shadow.on_intent_submit(
+                                &intent,
+                                depth_at_post,
+                                observed_at_ms,
+                                None,
+                            );
+                        }
                     }
                     continue;
                 }

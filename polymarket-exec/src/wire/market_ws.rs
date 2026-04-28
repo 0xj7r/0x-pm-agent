@@ -244,6 +244,24 @@ impl MarketWsClient {
                     self.books
                         .record_trade_event(asset_id, observed_at_ms)
                         .await;
+                    // Shadow-subsystem hook: in shadow_live mode, feed
+                    // the depth-delta to TradeSynthesiser so size can be
+                    // recovered when last_trade_price arrives. We treat
+                    // touch-move as a depth signal at the new touch
+                    // price; size is approximate but the synthesiser's
+                    // 100ms correlation window matches that imprecision.
+                    if let Some(handle) =
+                        crate::runtime::shadow_subsystem::shadow()
+                    {
+                        if let Ok(mut shadow) = handle.lock() {
+                            if let Some(bid) = best_bid {
+                                shadow.on_book_depth_delta(asset_id, bid, 1.0, observed_at_ms);
+                            }
+                            if let Some(ask) = best_ask {
+                                shadow.on_book_depth_delta(asset_id, ask, 1.0, observed_at_ms);
+                            }
+                        }
+                    }
                 }
             }
             "best_bid_ask" => {
@@ -263,10 +281,34 @@ impl MarketWsClient {
                 if asset_id.is_empty() {
                     return Ok(());
                 }
-                if let Some(price) = event.get("price").and_then(value_as_f64_opt) {
-                    self.books.apply_last_trade(&asset_id, price).await;
+                let price_opt = event.get("price").and_then(value_as_f64_opt);
+                let observed_at_ms = event
+                    .get("timestamp")
+                    .or_else(|| event.get("t"))
+                    .or_else(|| event.get("ts"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(now_unix_ms);
+                let mut shadow_inputs: Option<(f64, Option<f64>, Option<f64>)> = None;
+                if let Some(price) = price_opt {
+                    let book_state = self.books.apply_last_trade(&asset_id, price).await;
+                    let best_bid = (book_state.best_bid > 0.0).then_some(book_state.best_bid);
+                    let best_ask = (book_state.best_ask > 0.0).then_some(book_state.best_ask);
+                    shadow_inputs = Some((price, best_bid, best_ask));
                 }
                 self.metrics.observe_market_message("last_trade_price");
+                if let (Some((price, best_bid, best_ask)), Some(handle)) =
+                    (shadow_inputs, crate::runtime::shadow_subsystem::shadow())
+                {
+                    if let Ok(mut shadow) = handle.lock() {
+                        shadow.on_last_trade_price(
+                            &asset_id,
+                            price,
+                            best_bid,
+                            best_ask,
+                            observed_at_ms,
+                        );
+                    }
+                }
             }
             other => {
                 self.metrics.observe_market_message(other);

@@ -6,6 +6,7 @@ mod live_auth;
 pub mod order_store;
 pub mod reconcile;
 pub mod runner;
+pub mod shadow_subsystem;
 pub mod types;
 
 use std::collections::{HashMap, HashSet, VecDeque};
