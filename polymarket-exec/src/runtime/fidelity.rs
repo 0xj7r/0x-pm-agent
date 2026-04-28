@@ -19,6 +19,20 @@ pub struct ShadowFill {
     pub rebate_usd: f64,
 }
 
+/// Wire-format shadow fill row. Journaled when ShadowBook produces a
+/// fill in shadow_live mode. The periodic fidelity scorer reads these
+/// rows back from the journal (filtered by window_ms) to populate
+/// `shadow_fills` for the per-family MAPE comparison.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ShadowFillRecord {
+    pub observed_at_ms: EpochMillis,
+    pub market_family: String,
+    pub price: f64,
+    pub size: f64,
+    pub notional_usd: f64,
+    pub rebate_usd: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BonereaperFill {
     pub market_family: String,
@@ -313,6 +327,62 @@ pub fn evaluate_live_deploy_gate(
     decision
 }
 
+/// Read journaled `shadow_fill` rows from a JSONL file and return those
+/// within `[window_start_ms, window_end_ms]`. Used by the periodic
+/// fidelity scorer to populate `shadow_fills` for per-family MAPE
+/// comparison against bonereaper truth.
+pub fn read_shadow_fills_in_window(
+    journal_path: &std::path::Path,
+    window_start_ms: EpochMillis,
+    window_end_ms: EpochMillis,
+) -> std::io::Result<Vec<ShadowFill>> {
+    use std::io::BufRead;
+    let mut out = Vec::new();
+    let file = std::fs::File::open(journal_path)?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("kind").and_then(|v| v.as_str()) != Some("shadow_fill") {
+            continue;
+        }
+        let Some(fill_obj) = value.get("fill") else {
+            continue;
+        };
+        let observed_at_ms = fill_obj
+            .get("observed_at_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if observed_at_ms < window_start_ms || observed_at_ms > window_end_ms {
+            continue;
+        }
+        let market_family = match fill_obj
+            .get("market_family")
+            .and_then(|v| v.as_str())
+        {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
+        let notional_usd = fill_obj
+            .get("notional_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let rebate_usd = fill_obj
+            .get("rebate_usd")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        out.push(ShadowFill {
+            market_family,
+            notional_usd,
+            rebate_usd,
+        });
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FidelityVerdict {
@@ -558,6 +628,52 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(d.status, GateStatus::Pass);
         assert_eq!(d.warn_count, 1);
+    }
+
+    #[test]
+    fn read_shadow_fills_filters_to_window_and_drops_other_kinds() {
+        let now = 1_700_000_000_000;
+        let in_window = serde_json::json!({
+            "kind": "shadow_fill",
+            "fill": {
+                "observed_at_ms": now - 30_000,
+                "market_family": "btc-updown-5m",
+                "price": 0.49,
+                "size": 40.0,
+                "notional_usd": 19.6,
+                "rebate_usd": 0.05,
+            }
+        });
+        let out_of_window = serde_json::json!({
+            "kind": "shadow_fill",
+            "fill": {
+                "observed_at_ms": now - 90_000,
+                "market_family": "btc-updown-5m",
+                "price": 0.50,
+                "size": 40.0,
+                "notional_usd": 20.0,
+                "rebate_usd": 0.05,
+            }
+        });
+        let other_kind = serde_json::json!({
+            "kind": "trade_tape_event",
+            "event": {
+                "asset_id": "asset-1",
+                "taker_side": "sell",
+                "price": 0.49,
+                "size": 25.0,
+                "event_at_ms": now - 30_000u64,
+                "trade_id": "abc",
+                "synthesised": true,
+            }
+        });
+        let path = write_fidelity_journal(&[in_window, out_of_window, other_kind]);
+        let fills =
+            read_shadow_fills_in_window(&path, now - 60_000, now).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].market_family, "btc-updown-5m");
+        assert!((fills[0].notional_usd - 19.6).abs() < 1e-9);
     }
 
     #[test]

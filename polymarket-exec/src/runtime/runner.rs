@@ -446,7 +446,12 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
     // run loop and write to the same journal.
     let families = derive_market_families(&config);
     let activity_url = format!("{}/activity", config.data_api_url.trim_end_matches('/'));
-    tokio::spawn(shadow_periodic_tasks(families, activity_url));
+    let shadow_journal_path = config.journal_path.clone();
+    tokio::spawn(shadow_periodic_tasks(
+        families,
+        activity_url,
+        shadow_journal_path,
+    ));
 
     run_with_config(config).await
 }
@@ -465,10 +470,14 @@ fn derive_market_families(config: &AppConfig) -> Vec<String> {
         .collect()
 }
 
-async fn shadow_periodic_tasks(families: Vec<String>, activity_url: String) {
+async fn shadow_periodic_tasks(
+    families: Vec<String>,
+    activity_url: String,
+    shadow_journal_path: Option<std::path::PathBuf>,
+) {
     use crate::runtime::fidelity::{
-        parse_bonereaper_activity, summarise_window_with_our_live, BonereaperFill, OurLiveFill,
-        ShadowFill, FIDELITY_TRUTH_MAX_STALENESS_MS,
+        parse_bonereaper_activity, read_shadow_fills_in_window, summarise_window_with_our_live,
+        BonereaperFill, OurLiveFill, ShadowFill, FIDELITY_TRUTH_MAX_STALENESS_MS,
     };
     use crate::runtime::shadow_subsystem::shadow;
     use std::time::Duration;
@@ -536,9 +545,21 @@ async fn shadow_periodic_tasks(families: Vec<String>, activity_url: String) {
             last_seen_ms = last_seen_ms.max(ts);
         }
         let bonereaper: Vec<BonereaperFill> = activity.into_iter().map(|(f, _)| f).collect();
-        let shadow_fills: Vec<ShadowFill> = Vec::new(); // sourced from journal in v2
-        let our_live: Vec<OurLiveFill> = Vec::new(); // populated when we go live
         let window_start = now_ms.saturating_sub(POLL_INTERVAL.as_millis() as u64);
+        let shadow_fills: Vec<ShadowFill> = match shadow_journal_path.as_ref() {
+            Some(path) => read_shadow_fills_in_window(path, window_start, now_ms)
+                .unwrap_or_else(|error| {
+                    warn!(
+                        target: "shadow_live.periodic",
+                        error = %error,
+                        path = %path.display(),
+                        "failed to read shadow_fill rows from journal; treating window as empty"
+                    );
+                    Vec::new()
+                }),
+            None => Vec::new(),
+        };
+        let our_live: Vec<OurLiveFill> = Vec::new(); // populated when we go live
         let events = summarise_window_with_our_live(
             &shadow_fills,
             &our_live,

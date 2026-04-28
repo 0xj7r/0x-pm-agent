@@ -87,12 +87,27 @@ impl ShadowSubsystem {
             let _ = journal.append_trade_tape_event(&trade);
         }
         let fills = self.book.on_trade_event(&trade);
-        if !fills.is_empty() {
-            if let Some(journal) = self.journal.as_mut() {
+        if let Some(journal) = self.journal.as_mut() {
+            for fill in &fills {
+                let market_family =
+                    extract_market_family(fill.market_id.as_str()).to_string();
+                let record = crate::runtime::fidelity::ShadowFillRecord {
+                    observed_at_ms: fill.observed_at_ms,
+                    market_family,
+                    price: fill.price,
+                    size: fill.quantity,
+                    notional_usd: fill.notional_usd(),
+                    // Maker rebate accounting is downstream; populate
+                    // when the rebate engine wires through. Today we
+                    // leave 0.0 explicit so consumers see the gap.
+                    rebate_usd: 0.0,
+                };
+                let _ = journal.append_shadow_fill(&record);
+            }
+            if !fills.is_empty() {
                 let _ = journal.flush();
             }
         }
-        let _ = fills;
     }
 
     /// Convenience entry point used by wire/market_ws.rs which has
@@ -127,16 +142,28 @@ impl ShadowSubsystem {
             let _ = journal.append_trade_tape_event(&trade);
         }
         let fills = self.book.on_trade_event(&trade);
-        if !fills.is_empty() {
-            if let Some(journal) = self.journal.as_mut() {
+        if let Some(journal) = self.journal.as_mut() {
+            for fill in &fills {
+                let market_family =
+                    extract_market_family(fill.market_id.as_str()).to_string();
+                let record = crate::runtime::fidelity::ShadowFillRecord {
+                    observed_at_ms: fill.observed_at_ms,
+                    market_family,
+                    price: fill.price,
+                    size: fill.quantity,
+                    notional_usd: fill.notional_usd(),
+                    rebate_usd: 0.0,
+                };
+                let _ = journal.append_shadow_fill(&record);
+            }
+            if !fills.is_empty() {
                 let _ = journal.flush();
             }
         }
-        // Fills are journaled via trade_tape_event + downstream fidelity
-        // scoring; we do not re-emit them as runtime_event here because
-        // they are not real venue fills and must not affect the runtime
-        // inventory pipeline.
-        let _ = fills;
+        // Fills are journaled via trade_tape_event + shadow_fill +
+        // downstream fidelity scoring; we do not re-emit them as
+        // runtime_event here because they are not real venue fills and
+        // must not affect the runtime inventory pipeline.
     }
 
     pub fn snapshot_queue_estimates(&mut self, now_ms: EpochMillis, families: &[&str]) {

@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::event_log::EventRecord;
 use crate::paper::queue_model::QueueModelEstimate;
 use crate::paper::trade_tape::TradeEvent;
-use crate::runtime::fidelity::FidelityEvent;
+use crate::runtime::fidelity::{FidelityEvent, ShadowFillRecord};
 use crate::runtime::RuntimeCheckpoint;
 use crate::types::RuntimeCommand;
 
@@ -43,6 +43,9 @@ enum JournalLine<'a> {
     },
     FidelityEvent {
         event: &'a FidelityEvent,
+    },
+    ShadowFill {
+        fill: &'a ShadowFillRecord,
     },
 }
 
@@ -127,6 +130,10 @@ impl JournalWriter {
 
     pub fn append_fidelity_event(&mut self, event: &FidelityEvent) -> Result<()> {
         self.append_line(&JournalLine::FidelityEvent { event })
+    }
+
+    pub fn append_shadow_fill(&mut self, fill: &ShadowFillRecord) -> Result<()> {
+        self.append_line(&JournalLine::ShadowFill { fill })
     }
 
     pub fn flush(&mut self) -> Result<()> {
