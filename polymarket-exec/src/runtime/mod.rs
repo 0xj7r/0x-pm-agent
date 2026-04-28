@@ -325,6 +325,12 @@ pub struct Runtime<S: Strategy> {
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
     markets_with_unresolved_drift: HashSet<MarketId>,
+    /// True once `reconcile_venue_positions` has run for the first time.
+    /// Used to distinguish "venue has positions we don't know about because
+    /// we just started up and haven't synced yet" (install silently) from
+    /// "venue has positions we don't know about mid-session" (drift incident,
+    /// engage protective block).
+    initial_reconcile_complete: bool,
     order_store: Option<Box<dyn OrderStore>>,
 }
 
@@ -380,6 +386,7 @@ impl<S: Strategy> Runtime<S> {
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             markets_with_unresolved_drift: HashSet::new(),
+            initial_reconcile_complete: false,
             order_store,
         }
     }
@@ -674,10 +681,11 @@ impl<S: Strategy> Runtime<S> {
             .inventory
             .reconcile_venue_positions(venue_positions, observed_at_ms)?;
         const DRIFT_QTY_EPSILON: f64 = 1e-6;
+        let is_startup_reconcile = !self.initial_reconcile_complete;
         for delta in &report.deltas {
             let local_was_flat = delta.local_quantity_before.abs() < DRIFT_QTY_EPSILON;
             let venue_has_position = delta.venue_quantity.abs() > DRIFT_QTY_EPSILON;
-            if local_was_flat && venue_has_position {
+            if local_was_flat && venue_has_position && !is_startup_reconcile {
                 if self
                     .markets_with_unresolved_drift
                     .insert(delta.market_id.clone())
@@ -697,6 +705,20 @@ impl<S: Strategy> Runtime<S> {
                         .with_instrument(delta.instrument_id.clone()),
                     );
                 }
+            } else if local_was_flat && venue_has_position && is_startup_reconcile {
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Inventory,
+                        observed_at_ms,
+                        format!(
+                            "startup reconcile installed venue position qty={:.8} (no drift block; \
+                             local was flat because runtime just started, not because of mid-session loss)",
+                            delta.venue_quantity
+                        ),
+                    )
+                    .with_market(delta.market_id.clone())
+                    .with_instrument(delta.instrument_id.clone()),
+                );
             } else if delta.quantity_delta.abs() < DRIFT_QTY_EPSILON
                 && self.markets_with_unresolved_drift.remove(&delta.market_id)
             {
@@ -747,6 +769,7 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(stranded.market_id.clone()),
             );
         }
+        self.initial_reconcile_complete = true;
         Ok(report)
     }
 
