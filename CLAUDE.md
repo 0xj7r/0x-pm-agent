@@ -44,6 +44,39 @@ This project is indexed by GitNexus as **polymarket-agent** (3668 symbols, 7760 
 
 # Engineering principles
 
+## Calibration sources — always reference whale data first
+
+Before tuning ANY strategy knob, check what we know about the operators
+who already make this work. Don't tune in a vacuum and don't trust
+intuition over observed whale behavior. Concrete sources:
+
+| Source | Use for |
+|---|---|
+| [whale-research-index.md](docs/research/whale-research-index.md) | Index of all wallet threads |
+| [unlawful-shear-reconstruction-thread.md](docs/research/unlawful-shear-reconstruction-thread.md) | unlawful's strategy reconstruction (the canonical reference) |
+| [unlawful-shear-signal-pack-spec.md](docs/research/unlawful-shear-signal-pack-spec.md) | Signal-level spec |
+| [unlawful-shear-microstructure-spec.md](docs/research/unlawful-shear-microstructure-spec.md) | Microstructure observations |
+| [unlawful-whale-vs-us-calibration.md](docs/research/unlawful-whale-vs-us-calibration.md) | Direct comparison vs our bot |
+| [bonereaper-research-thread.md](docs/research/bonereaper-research-thread.md) | bonereaper as second benchmark |
+| `data/research/wallet_research/unlawful-shear/wallet_research.db` | Raw SQLite for deeper queries |
+| `data/research/wallet_research/unlawful-shear/unlawful_signal_pack.json` | Machine-readable signal pack |
+| [BANDAIDS.md](BANDAIDS.md) | Catalog of known anti-patterns to avoid |
+
+**Key empirically-validated facts** (don't re-derive these wrong):
+- unlawful's strategy is **paired MM + convex/cheap-leg accumulation**, NOT
+  directional latency arb. Most fills look one-sided because aggressive
+  bilateral laddering produces single-side fills when book moves.
+- unlawful **narrowed from multi-asset/multi-timeframe to ONLY 5min BTC**.
+  Concentration > diversification at production scale. Don't propose
+  multi-asset/timeframe expansion for our bot before we match per-market
+  execution quality first.
+- unlawful is **bootstrapped from $2K** of external capital — the rest
+  ($228K balance) came from trading + rebates compounded.
+
+When proposing any strategy change, the first question to answer is
+"what does the whale data say about this knob/path?" not "what feels
+right." If the answer is "we haven't measured," go measure first.
+
 ## Strategy intent: paired MM + convex asymmetric payoff
 
 The `btc_5m_mm` strategy runs TWO complementary entry paths, not one.
