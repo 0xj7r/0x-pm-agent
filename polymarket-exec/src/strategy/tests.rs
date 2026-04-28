@@ -1170,6 +1170,37 @@ fn btc_5m_mm_hedge_rescue_can_upsize_to_venue_minimum_above_clip() {
 }
 
 #[test]
+fn btc_5m_mm_hedge_rescue_enforces_marketable_buy_min_notional() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.hedge_rescue_clip_usd = 2.50;
+    config.venue_min_order_quantity = 5.0;
+    config.min_order_quantity = 0.01;
+    // Live env once lowered this below Polymarket's marketable BUY minimum,
+    // causing venue rejects for 5 shares at 7c. Rescue must enforce the
+    // protocol floor itself instead of trusting the tunable strategy knob.
+    config.min_order_notional_usd = 0.01;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 5.3891,
+        avg_price: 0.19,
+        mark_price: Some(0.19),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.17, 0.18, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.06, 0.07, 10));
+
+    assert_eq!(decision.intents.len(), 1);
+    let hedge = &decision.intents[0];
+    assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
+    assert!(hedge.quantity * hedge.limit_price >= 1.0 - 1e-9);
+}
+
+#[test]
 fn btc_5m_mm_entry_caps_scale_with_free_cash_budget() {
     let mut config = btc_5m_mm_test_config();
     config.min_edge_bps = 10.0;
@@ -1342,7 +1373,8 @@ fn btc_5m_mm_one_sided_inventory_prioritizes_opposite_hedge_only() {
     assert_eq!(hedge.instrument_id, InstrumentId::from("down"));
     assert_eq!(hedge.side, TradeSide::Buy);
     assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
-    assert!(hedge.quantity <= 6.5 + 1e-9);
+    assert!(hedge.quantity >= 6.5);
+    assert!(hedge.quantity * hedge.limit_price >= 1.0 - 1e-9);
     assert!(
         hedge.quantity * hedge.limit_price <= config.max_clip_usd + 1e-9,
         "hedge rescue must stay within configured clip budget"
