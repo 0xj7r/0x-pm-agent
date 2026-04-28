@@ -24,6 +24,19 @@ pub enum LogFormat {
     Json,
 }
 
+/// One slug-prefix / window pair that the discovery loop should sweep.
+///
+/// The legacy single-family discovery uses `market_discovery_slug_prefix` plus
+/// `market_discovery_window`. Strategies like `bonereaper` need to span
+/// multiple families simultaneously (BTC 5m + ETH 5m + BTC 15m + ...), each
+/// with its own slug timestamp window. When `market_discovery_families` is
+/// non-empty the runner iterates these instead of the single-prefix path.
+#[derive(Debug, Clone)]
+pub struct MarketDiscoveryFamily {
+    pub prefix: String,
+    pub window: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct UserWsAuth {
     pub api_key: String,
@@ -65,6 +78,7 @@ pub struct AppConfig {
     pub market_discovery_include_next: usize,
     pub market_discovery_gamma_url: String,
     pub market_discovery_slug_prefix: String,
+    pub market_discovery_families: Vec<MarketDiscoveryFamily>,
     pub runtime_loop_interval: Duration,
     pub summary_log_interval: Duration,
     pub order_reconcile_interval: Duration,
@@ -255,6 +269,9 @@ impl AppConfig {
         );
         let market_discovery_slug_prefix =
             env_or("WHALE_PAIR_MARKET_DISCOVERY_SLUG_PREFIX", "btc-updown-5m-");
+        let market_discovery_families = parse_market_discovery_families(
+            "WHALE_PAIR_MARKET_DISCOVERY_FAMILIES",
+        )?;
         let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
         let summary_log_interval =
             parse_duration_ms("WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
@@ -479,6 +496,7 @@ impl AppConfig {
             market_discovery_include_next,
             market_discovery_gamma_url,
             market_discovery_slug_prefix,
+            market_discovery_families,
             runtime_loop_interval,
             summary_log_interval,
             order_reconcile_interval,
@@ -567,5 +585,80 @@ fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> 
         parse_usize(key, default)
     } else {
         Ok(profile.unwrap_or(default))
+    }
+}
+
+fn parse_market_discovery_families(key: &str) -> Result<Vec<MarketDiscoveryFamily>> {
+    let raw = match env::var(key) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut families = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (prefix, window_raw) = entry
+            .rsplit_once(':')
+            .with_context(|| format!("{key} entry `{entry}` missing `:window_ms` suffix"))?;
+        let prefix = prefix.trim();
+        if prefix.is_empty() {
+            anyhow::bail!("{key} entry `{entry}` has empty prefix");
+        }
+        let window_ms: u64 = window_raw.trim().parse().with_context(|| {
+            format!("{key} entry `{entry}` has non-integer window_ms `{window_raw}`")
+        })?;
+        if window_ms == 0 {
+            anyhow::bail!("{key} entry `{entry}` has zero window_ms");
+        }
+        families.push(MarketDiscoveryFamily {
+            prefix: prefix.to_string(),
+            window: Duration::from_millis(window_ms),
+        });
+    }
+    Ok(families)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_csv_families_with_per_entry_window() {
+        std::env::set_var(
+            "TEST_FAMILIES_OK",
+            "btc-updown-5m-:300000,eth-updown-5m-:300000,btc-updown-15m-:900000",
+        );
+        let families = parse_market_discovery_families("TEST_FAMILIES_OK").unwrap();
+        std::env::remove_var("TEST_FAMILIES_OK");
+        assert_eq!(families.len(), 3);
+        assert_eq!(families[0].prefix, "btc-updown-5m-");
+        assert_eq!(families[0].window, Duration::from_millis(300_000));
+        assert_eq!(families[2].window, Duration::from_millis(900_000));
+    }
+
+    #[test]
+    fn returns_empty_when_unset() {
+        std::env::remove_var("TEST_FAMILIES_UNSET_X");
+        let families =
+            parse_market_discovery_families("TEST_FAMILIES_UNSET_X").unwrap();
+        assert!(families.is_empty());
+    }
+
+    #[test]
+    fn rejects_entry_without_window_separator() {
+        std::env::set_var("TEST_FAMILIES_BAD", "btc-updown-5m-");
+        let err = parse_market_discovery_families("TEST_FAMILIES_BAD").unwrap_err();
+        std::env::remove_var("TEST_FAMILIES_BAD");
+        assert!(err.to_string().contains("missing `:window_ms`"));
+    }
+
+    #[test]
+    fn rejects_zero_window() {
+        std::env::set_var("TEST_FAMILIES_ZERO", "btc-updown-5m-:0");
+        let err = parse_market_discovery_families("TEST_FAMILIES_ZERO").unwrap_err();
+        std::env::remove_var("TEST_FAMILIES_ZERO");
+        assert!(err.to_string().contains("zero window_ms"));
     }
 }

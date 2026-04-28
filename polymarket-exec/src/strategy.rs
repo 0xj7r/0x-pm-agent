@@ -777,7 +777,7 @@ fn deterministic_quote_unit(value: f64) -> f64 {
     (value * 100_000_000.0).round() / 100_000_000.0
 }
 
-fn deterministic_client_order_id(
+pub(crate) fn deterministic_client_order_id(
     strategy_tag: &str,
     market_id: &MarketId,
     instrument_id: &InstrumentId,
@@ -1467,6 +1467,7 @@ pub enum StrategyMode {
     Goat(GoatPairStrategy),
     Btc5mMm(Btc5mMmStrategy),
     UnlawfulShear(UnlawfulShearStrategy),
+    Bonereaper(crate::strategy_bonereaper::BonereaperStrategy),
     Noop(NoopStrategy),
 }
 
@@ -1477,6 +1478,9 @@ impl StrategyMode {
             "goat_pair" => Self::Goat(GoatPairStrategy::with_profile(profile)),
             "noop" => Self::Noop(NoopStrategy),
             "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile)),
+            "bonereaper" => Self::Bonereaper(
+                crate::strategy_bonereaper::BonereaperStrategy::with_defaults(),
+            ),
             _ => Self::UnlawfulShear(UnlawfulShearStrategy::with_defaults()),
         }
     }
@@ -1486,6 +1490,7 @@ impl StrategyMode {
             Self::Btc5mMm(strategy) => strategy.taker_fee_coeff(),
             Self::Goat(strategy) => strategy.taker_fee_coeff(),
             Self::UnlawfulShear(strategy) => strategy.taker_fee_coeff(),
+            Self::Bonereaper(strategy) => strategy.taker_fee_coeff(),
             Self::Noop(_) => 0.0,
         }
     }
@@ -1495,6 +1500,7 @@ impl StrategyMode {
             Self::Btc5mMm(_) => None,
             Self::Goat(_) => None,
             Self::Noop(_) => None,
+            Self::Bonereaper(_) => None,
             Self::UnlawfulShear(strategy) => Some(strategy.unlawful_gate_config()),
         }
     }
@@ -1506,6 +1512,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.name(),
             Self::Goat(strategy) => strategy.name(),
             Self::UnlawfulShear(strategy) => strategy.name(),
+            Self::Bonereaper(strategy) => strategy.name(),
             Self::Noop(strategy) => strategy.name(),
         }
     }
@@ -1519,6 +1526,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_start(context),
             Self::Goat(strategy) => strategy.on_start(context),
             Self::UnlawfulShear(strategy) => strategy.on_start(context),
+            Self::Bonereaper(strategy) => strategy.on_start(context),
             Self::Noop(strategy) => strategy.on_start(context),
         }
     }
@@ -1532,6 +1540,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Goat(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::UnlawfulShear(strategy) => strategy.on_market_snapshot(context, snapshot),
+            Self::Bonereaper(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Noop(strategy) => strategy.on_market_snapshot(context, snapshot),
         }
     }
@@ -1545,6 +1554,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_fill(context, fill),
             Self::Goat(strategy) => strategy.on_fill(context, fill),
             Self::UnlawfulShear(strategy) => strategy.on_fill(context, fill),
+            Self::Bonereaper(strategy) => strategy.on_fill(context, fill),
             Self::Noop(strategy) => strategy.on_fill(context, fill),
         }
     }
@@ -1554,6 +1564,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.checkpoint_state(),
             Self::Goat(strategy) => strategy.checkpoint_state(),
             Self::UnlawfulShear(strategy) => strategy.checkpoint_state(),
+            Self::Bonereaper(strategy) => strategy.checkpoint_state(),
             Self::Noop(strategy) => strategy.checkpoint_state(),
         }
     }
@@ -1566,6 +1577,7 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.restore_checkpoint_state(state),
             Self::Goat(strategy) => strategy.restore_checkpoint_state(state),
             Self::UnlawfulShear(strategy) => strategy.restore_checkpoint_state(state),
+            Self::Bonereaper(strategy) => strategy.restore_checkpoint_state(state),
             Self::Noop(strategy) => strategy.restore_checkpoint_state(state),
         }
     }
