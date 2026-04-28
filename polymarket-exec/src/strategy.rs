@@ -2713,6 +2713,21 @@ impl Btc5mMmStrategy {
         market_context: Option<&MarketContextRecord>,
         now_ms: EpochMillis,
     ) -> Btc5mMmExposureDecision {
+        if !avg_cost.is_finite() || avg_cost <= 0.0 {
+            return Btc5mMmExposureDecision {
+                rescue_qty: 0.0,
+                hold_qty: stranded_qty.max(0.0),
+                reason: format!(
+                    "hold stranded unknown cost basis leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_qty={:.4}",
+                    held_id,
+                    stranded_qty.max(0.0)
+                ),
+                hold_ev_per_share: f64::NAN,
+                rescue_ev_per_share: None,
+                held_fair,
+                avg_cost,
+            };
+        }
         let hold_ev = held_fair - avg_cost;
         let rescue_ev = Self::best_ask(opposite_quote)
             .map(|ask| 1.0 - avg_cost - ask - self.taker_fee_per_share(ask));

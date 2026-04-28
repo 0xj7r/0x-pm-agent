@@ -1289,6 +1289,34 @@ fn btc_5m_mm_holds_cheap_stranded_inventory_when_hold_ev_beats_rescue() {
 }
 
 #[test]
+fn btc_5m_mm_holds_stranded_inventory_when_cost_basis_is_unknown() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 8.26,
+        avg_price: 0.0,
+        mark_price: Some(0.05),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.04, 0.05, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.94, 0.95, 10));
+
+    assert!(
+        decision.intents.is_empty(),
+        "unknown venue cost basis must not make a 95c hedge look safe"
+    );
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("unknown cost basis")));
+}
+
+#[test]
 fn btc_5m_mm_partially_rescues_oversized_convex_inventory() {
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
