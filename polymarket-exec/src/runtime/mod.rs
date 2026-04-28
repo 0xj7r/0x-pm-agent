@@ -2043,13 +2043,30 @@ impl<S: Strategy> Runtime<S> {
         now_ms: EpochMillis,
         reason: impl Into<String>,
     ) -> RuntimeOutcome {
+        self.recover_live_blocked_status(now_ms, reason)
+    }
+
+    pub fn recover_live_blocked_status(
+        &mut self,
+        now_ms: EpochMillis,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
-        if self.status == RuntimeStatus::RiskOff {
+        let previous_status = self.status;
+        if matches!(
+            previous_status,
+            RuntimeStatus::RiskOff | RuntimeStatus::Degraded
+        ) {
             self.status = RuntimeStatus::Running;
+            let label = match previous_status {
+                RuntimeStatus::RiskOff => "risk-off",
+                RuntimeStatus::Degraded => "degraded",
+                _ => "blocked",
+            };
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Runtime,
                 now_ms,
-                format!("runtime risk-off auto-recovered: {}", reason.into()),
+                format!("runtime {label} auto-recovered: {}", reason.into()),
             )));
             outcome.push_event(
                 self.event_log

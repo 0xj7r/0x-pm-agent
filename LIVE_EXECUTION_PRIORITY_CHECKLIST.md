@@ -83,84 +83,116 @@ Working checklist for the live `polymarket-exec` engine. Check items only when t
   - Desired test: With pUSD below a configured floor, USDC.e above reserve, gas below cap, and the top-up cooldown elapsed, the runtime wraps only the top-up amount through CollateralOnramp; otherwise it logs the skipped reason and submits no transaction.
   - Fix shape: Add an engine-side balance worker that logs pUSD, USDC.e, and MATIC separately, keeps explicit USDC.e/MATIC reserves, enforces gas-price and minimum-interval guards, and wraps asynchronously to `WHALE_PAIR_LIVE_PUSD_TARGET_USD` rather than blindly converting all USDC.e.
 
+## P1.5 - Deployment And Process Hardening
+
+- [ ] 16. Build a proper deployment pipeline
+  - Issue: Deploys can install code without restarting the service, and the operator has to manually infer whether the running process picked up the new binary.
+  - Desired test: One deploy command builds the release binary, installs it atomically, restarts the intended service, and verifies the service is active on the expected binary/version.
+  - Fix shape: Make the deploy pipeline produce a single immutable release artifact, record git SHA/build metadata, install via atomic symlink or versioned path, restart only the named tinylive service, and print the exact active PID/binary/git SHA after rollout.
+
+- [ ] 17. Add pre-deployment checks
+  - Issue: We deployed into a full remote disk and only found out when the live process failed to flush its journal.
+  - Desired test: Preflight fails before deployment if local git state is dirty unexpectedly, required tests fail, remote disk is below reserve, env validation fails, or the target service/env/binary path is ambiguous.
+  - Fix shape: Add a `preflight` step that checks `cargo test -p polymarket-exec --lib`, local/main SHA alignment, remote disk free space, remote journal writability, canonical env presence, required secrets, Polygon RPC, CLOB/Data API reachability, kill-switch state, and systemd unit target.
+
+- [ ] 18. Add post-deployment smoke checks and rollback path
+  - Issue: A successful build/install is not the same as a healthy live bot.
+  - Desired test: After deploy, smoke checks prove the service stays active for N seconds, writes a journal record, syncs venue cash, connects market/user/spot websockets, exposes metrics, and has no crash loop or deterministic venue rejects.
+  - Fix shape: Add deploy-time health gates plus rollback to the previous installed binary if startup fails or health checks do not pass.
+
+- [ ] 19. Harden shadow/paper environments
+  - Issue: Paper/shadow artifacts filled the production host disk and took live trading down.
+  - Desired test: Running paper/shadow cannot consume the live root disk past a configured reserve, cannot write under live execution paths, and cannot share the tinylive env by accident.
+  - Fix shape: Separate paper/shadow data roots from live data, enforce retention/rotation, cap artifact size, add disk-reserve checks, and keep paper services isolated from live service env/secrets.
+
+- [ ] 20. Add remote artifact retention and disk guardrails
+  - Issue: Remote build caches and execution artifacts can silently consume the small EC2 root volume.
+  - Desired test: A scheduled or deploy-time guard reports disk usage by category and refuses live start when journal/order-store writes would fail.
+  - Fix shape: Keep only bounded Cargo cache, bounded paper artifacts, bounded journals, and explicitly preserve live order-store/audit data.
+
+- [ ] 21. Add operator-facing live calibration report
+  - Issue: Polymarket UI activity does not tell us whether fills were maker-rebate eligible, taker rescues, convex accumulation, merges, or redeems.
+  - Desired test: Report answers, per market/session, maker vs taker fills, intent kind, quote kind, notional, estimated fees/rebates, merge/redeem recycling, and convex-vs-paired capital use.
+  - Fix shape: Persist fill liquidity plus strategy tag/intent kind/quote kind into the live report path and expose a command or metrics endpoint for daily calibration.
+
 ## P2 - Bandaid-Killing S1 Refactors
 
-- [ ] 16. Introduce `CoolingReason` enum
+- [ ] 22. Introduce `CoolingReason` enum
   - Why: Replaces string-prefix cooling reason checks such as the convex accumulation bandaid.
 
-- [ ] 17. Persist `StrategyTag` and `IntentKind`
+- [ ] 23. Persist `StrategyTag` and `IntentKind`
   - Why: Removes `client_order_id.starts_with("btc-5m-mm:")` checks across runtime/reporting paths.
 
-- [ ] 18. Introduce typed `EventKind` and `MmQuoteKind`
+- [ ] 24. Introduce typed `EventKind` and `MmQuoteKind`
   - Why: Collapses duplicated string classifiers.
 
-- [ ] 19. Add single `PairLeg::classify` source of truth
+- [ ] 25. Add single `PairLeg::classify` source of truth
   - Why: Collapses repeated yes/no leg detection logic.
 
-- [ ] 20. Introduce typed cancel reasons
+- [ ] 26. Introduce typed cancel reasons
   - Why: Replaces string comparisons such as `reason != "no longer desired"`.
 
-- [ ] 21. Feed live fills into `paper_report`
+- [ ] 27. Feed live fills into `paper_report`
   - Why: Enables fill-level shadow vs tinylive parity, not only decision-level parity.
 
 ## P3 - Phase 4 V2 Signal-Derived Calibration
 
-- [ ] 22. Replace `CONVEX_TREND_PERSISTENCE_BPS=50`
+- [ ] 28. Replace `CONVEX_TREND_PERSISTENCE_BPS=50`
   - Target: Derive from about `2.0 * realized_vol_5m_bps`.
 
-- [ ] 23. Replace `CONVEX_MIN_BAR_REMAINING_MS=60_000`
+- [ ] 29. Replace `CONVEX_MIN_BAR_REMAINING_MS=60_000`
   - Target: Derive from `bar_window_ms / 5`.
 
-- [ ] 24. Replace `CONVEX_MIN_BAR_ELAPSED_MS=60_000`
+- [ ] 30. Replace `CONVEX_MIN_BAR_ELAPSED_MS=60_000`
   - Target: Derive from `bar_window_ms / 5`.
 
-- [ ] 25. Replace `CONVEX_MAX_BIDS_PER_BAR=4`
+- [ ] 31. Replace `CONVEX_MAX_BIDS_PER_BAR=4`
   - Target: Derive from `min(N, max_leg_cost / typical_clip)`.
 
-- [ ] 26. Add order-flow imbalance signal
+- [ ] 32. Add order-flow imbalance signal
   - Target: Rolling 60s taker buy vs sell volume per leg.
 
-- [ ] 27. Add convex self-feedback signal
+- [ ] 33. Add convex self-feedback signal
   - Target: Rolling P&L adjusts the per-bar count cap.
 
 ## P4 - Bash Supervisor Cleanup
 
-- [ ] 28. Move market discovery/restart logic out of `scripts/run_unlawful_shear_paper.sh`
+- [ ] 34. Move market discovery/restart logic out of `scripts/run_unlawful_shear_paper.sh`
   - Why: The engine should refresh context and subscriptions without losing in-flight state.
 
-- [x] 29. Move venue, EOA, and strategy tuning out of `scripts/dublin_tinylive.sh`
+- [x] 35. Move venue, EOA, and strategy tuning out of `scripts/dublin_tinylive.sh`
   - Why: Launcher scripts should load env and launch the binary only.
   - Fix: Removed the `scripts/dublin_tinylive.sh` live launcher entirely. Tinylive runs only through the systemd unit and the host canonical env.
 
-- [x] 30. Create one canonical tinylive env
+- [x] 36. Create one canonical tinylive env
   - Why: Live drifted across `common.env`, `live.env`, `paper.d`, repo sleeve env, and launcher exports.
   - Fix: Systemd instance services now load `~/.config/polymarket-exec/%i.env`; `run_sleeve.sh` prefers that host-local canonical env over repo presets.
 
 ## P5 - Larger Refactors
 
-- [ ] 31. Split `strategy.rs`
+- [ ] 37. Split `strategy.rs`
   - Target modules: `strategy/btc_mm.rs`, `strategy/unlawful_shear.rs`, `strategy/goat_pair.rs`, `strategy/types.rs`, and `strategy/profile.rs`.
   - Status: Tests are already extracted; main split remains pending.
 
-- [ ] 32. Split `runtime/runner.rs`
+- [ ] 38. Split `runtime/runner.rs`
   - Why: File is too large for safe navigation and isolated testing.
 
-- [ ] 33. Split `runtime/mod.rs`
+- [ ] 39. Split `runtime/mod.rs`
   - Why: File is too large for safe navigation and isolated testing.
 
-- [ ] 34. Add `Gate` trait and `GateOutcome` enum
+- [ ] 40. Add `Gate` trait and `GateOutcome` enum
   - Why: Replaces ad-hoc gate composition and makes paired-vs-convex suppression explicit.
 
-- [ ] 35. Add `BarFraction` timing primitive
+- [ ] 41. Add `BarFraction` timing primitive
   - Why: Makes 5m to 15m strategy timing changes zero or near-zero code changes.
 
 ## P6 - Defer Until P0-P3 Are Stable
 
-- [ ] 36. Increase clip size from $1.10 to $4-$5
+- [ ] 42. Increase clip size from $1.10 to $4-$5
   - Gate: Only after 5m behavior is statistically stable.
 
-- [ ] 37. Increase ladder depth from 2 levels to 4-8 levels
+- [ ] 43. Increase ladder depth from 2 levels to 4-8 levels
   - Gate: Only after current live execution quality is stable.
 
-- [ ] 38. Expand to multi-asset or multi-timeframe
+- [ ] 44. Expand to multi-asset or multi-timeframe
   - Gate: Only after we match per-market unlawful execution quality on BTC 5m.
