@@ -929,18 +929,24 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
         .transpose()?;
-    let mut paper_report: Option<crate::paper::report::PaperReportWriter> = if config.paper_mode {
+    // Decision log: previously gated on `if config.paper_mode { ... }` which
+    // meant LIVE mode wrote no decision log, blocking shadow-live <-> tinylive
+    // comparison. The writer's mode-agnostic methods (record_book_observation,
+    // record_runtime_outcome, record_suppression_sample) work identically in
+    // either mode. Now path-driven instead of mode-driven, mirroring how
+    // book_snapshot writer works (line ~944). Live mode still won't get
+    // paper_fill records (those are gated on execution_policy.paper_mode at
+    // each call site), but suppression decisions and runtime events DO land,
+    // which is what we need for cross-mode A/B testing.
+    let mut paper_report: Option<crate::paper::report::PaperReportWriter> =
         config.paper_report_path.clone().map(|path| {
             crate::paper::report::PaperReportWriter::new(
                 runtime.run_id().to_string(),
-                "paper",
+                if config.paper_mode { "paper" } else { "live" },
                 path,
                 now_unix_ms(),
             )
-        })
-    } else {
-        None
-    };
+        });
     let mut book_snapshot: Option<crate::paper::snapshot::BookSnapshotWriter> = config
         .book_snapshot_log_path
         .as_deref()

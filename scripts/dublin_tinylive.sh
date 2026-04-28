@@ -74,6 +74,15 @@ export WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS=10
 export WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_LEVELS=2
 export WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_SPACING_TICKS=1
 
+# Stronger spot momentum tilt. Defaults (0.0001 / 0.02) calibrated for
+# sub-second noise-fade; not enough to stand down in persistent trends.
+# 5x stronger per-bps response and 3x larger ceiling lets fair_value
+# decouple from book mid by up to +/-6pp in a 100bps/60s spot move.
+# The proper fix (BtcTrendPersistence signal) lands in Phase 4; this
+# tightening reduces bleed in the meantime.
+export WHALE_PAIR_BTC_5M_MM_MOMENTUM_TILT_PER_BPS=0.0005
+export WHALE_PAIR_BTC_5M_MM_MOMENTUM_MAX_TILT=0.06
+
 # TIGHT risk caps
 export WHALE_PAIR_EXEC_STARTING_CASH_USD=50
 export WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD=25
@@ -94,6 +103,22 @@ export WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS=10
 # Each tick is one cheap data-api positions call. After warmup, merges are
 # fill-driven (~3-6s end-to-end including chain).
 export WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS=3000
+
+# Auto-redeem on cadence. Without this, the engine NEVER fires CTF redeems
+# automatically — operator must run scripts/live_redeem.sh by hand. That
+# leaves winning legs locked in CTF tokens until manual intervention,
+# bleeding free cash for hours. 300s = once per 5min, aligned with bar
+# cadence so winners from a just-resolved bar redeem before the next.
+export WHALE_PAIR_LIVE_AUTO_REDEEM=true
+export WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC=300
+
+# Auto-redeem on cadence. Without this, the engine NEVER fires CTF redeems
+# automatically — operator must run scripts/live_redeem.sh by hand. That
+# leaves winning legs locked in CTF tokens until manual intervention,
+# bleeding free cash for hours. 300s = once every 5min, aligned with bar
+# cadence so winners from the just-resolved bar redeem before the next.
+export WHALE_PAIR_LIVE_AUTO_REDEEM=true
+export WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC=300
 export WHALE_PAIR_MARKET_DISCOVERY_ENABLED=true
 export WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS=30000
 export WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_PREV=0
@@ -132,6 +157,11 @@ SESSION_TS=$(date +%Y%m%d-%H%M%S)
 export WHALE_PAIR_EXEC_JOURNAL_PATH=~/.local/share/polymarket-exec/tinylive/journal-${SESSION_TS}.jsonl
 export WHALE_PAIR_EXEC_AUDIT_PATH=~/.local/share/polymarket-exec/tinylive/audit-${SESSION_TS}.jsonl
 export WHALE_PAIR_ORDER_STORE_PATH=~/.local/share/polymarket-exec/tinylive/orders.sqlite
+# Decision log + suppression-follow-through report. Same schema as shadow-live
+# writes; enables cross-mode A/B testing of strategy changes (you ship to
+# shadow first, diff the decision logs against tinylive's, promote when
+# shapes match). Previously gated to paper-mode-only; now path-driven.
+export WHALE_PAIR_PAPER_REPORT_PATH=~/.local/share/polymarket-exec/tinylive/decision-${SESSION_TS}.json
 
 export RUST_LOG=info,paper_fill_gate=warn
 
