@@ -14,7 +14,7 @@ Environment=WHALE_PAIR_INCLUDE_PREV=1
 Environment=WHALE_PAIR_INCLUDE_NEXT=1
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
-Environment=WHALE_PAIR_EXEC_BIN=%h/go/polymarket-agent/target/release/polymarket-exec
+Environment=WHALE_PAIR_EXEC_BIN=%h/.local/bin/polymarket-exec
 Environment=WHALE_PAIR_LIVE_KILL_SWITCH_PATH=%h/.config/polymarket-exec/live.kill
 EnvironmentFile=-%h/.config/polymarket-exec/common.env
 EnvironmentFile=-%h/.config/polymarket-exec/live.env
