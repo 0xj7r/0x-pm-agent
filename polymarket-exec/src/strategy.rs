@@ -631,6 +631,8 @@ struct Btc5mMmMarketState {
     asymmetric_entry_block_until_ms: Option<EpochMillis>,
     last_action_ms: Option<EpochMillis>,
     last_no_quote_note_ms: Option<EpochMillis>,
+    last_cooling_note_ms: Option<EpochMillis>,
+    last_cooling_note_reason: Option<String>,
     /// Last time we emitted an IOC hedge-rescue intent on this market.
     /// Used to throttle rescue emission so we don't drown the engine's
     /// rate limiter with 85 intents/min on every book tick.
@@ -1727,6 +1729,8 @@ impl Btc5mMmStrategy {
                     asymmetric_entry_block_until_ms: record.asymmetric_entry_block_until_ms,
                     last_action_ms: record.last_action_ms,
                     last_no_quote_note_ms: record.last_no_quote_note_ms,
+                    last_cooling_note_ms: None,
+                    last_cooling_note_reason: None,
                     last_rescue_attempt_ms: record.last_rescue_attempt_ms,
                     last_fill_ms: record.last_fill_ms,
                 },
@@ -2016,6 +2020,27 @@ impl Btc5mMmStrategy {
             intents: Vec::new(),
             notes: vec![format!("btc-5m-mm no quote: {reason}")],
         }
+    }
+
+    fn should_log_cooling_note(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> bool {
+        let state = self.market_states.entry(market_id.clone()).or_default();
+        let reason_changed = state.last_cooling_note_reason.as_deref() != Some(reason);
+        let interval_elapsed = state.last_cooling_note_ms.is_none_or(|last_ms| {
+            now_ms.saturating_sub(last_ms) >= Self::NO_QUOTE_NOTE_INTERVAL_MS
+        });
+
+        if !reason_changed && !interval_elapsed {
+            return false;
+        }
+
+        state.last_cooling_note_ms = Some(now_ms);
+        state.last_cooling_note_reason = Some(reason.to_string());
+        true
     }
 
     fn quote_health(quote: &QuoteSnapshot) -> String {
@@ -2382,21 +2407,7 @@ impl Btc5mMmStrategy {
         let trade_count_5m_ok = btc_regime.trade_count_5m >= 30;
         let vol_5m = btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
         let return_60s = btc_regime.return_60s_bps.unwrap_or(0.0).abs();
-        if trade_count_5m_ok && vol_5m < 1.0 {
-            return Btc5mMmMarketMode::Cooling {
-                reason: format!(
-                    "btc regime flat: vol_5m={vol_5m:.2}bps trades_5m={}",
-                    btc_regime.trade_count_5m
-                ),
-                until_ms: None,
-            };
-        }
-        if return_60s > 15.0 {
-            return Btc5mMmMarketMode::Cooling {
-                reason: format!("btc regime trending: return_60s={return_60s:.2}bps"),
-                until_ms: None,
-            };
-        }
+
         if let Some(movement) = market_mid_move {
             if movement > Self::MARKET_MID_TREND_MAX_MOVE {
                 return Btc5mMmMarketMode::Cooling {
@@ -2409,6 +2420,21 @@ impl Btc5mMmStrategy {
         if max_fair > Self::ENTRY_EXTREME_FAIR_CAP {
             return Btc5mMmMarketMode::Cooling {
                 reason: format!("premium fair cap: max_fair={max_fair:.3}"),
+                until_ms: None,
+            };
+        }
+        if trade_count_5m_ok && vol_5m < 1.0 {
+            return Btc5mMmMarketMode::Cooling {
+                reason: format!(
+                    "btc regime flat: vol_5m={vol_5m:.2}bps trades_5m={}",
+                    btc_regime.trade_count_5m
+                ),
+                until_ms: None,
+            };
+        }
+        if return_60s > 15.0 {
+            return Btc5mMmMarketMode::Cooling {
+                reason: format!("btc regime trending: return_60s={return_60s:.2}bps"),
                 until_ms: None,
             };
         }
@@ -3046,17 +3072,19 @@ impl Strategy for Btc5mMmStrategy {
                     );
                 }
                 if let Btc5mMmMarketMode::Cooling { reason, until_ms } = &market_mode {
-                    tracing::info!(
-                        target: "strategy.market_state",
-                        market = %snapshot.market_id,
-                        state = "cooling",
-                        reason,
-                        until_ms,
-                        left_fair,
-                        right_fair,
-                        market_mid_move,
-                        "fresh paired entry suppressed by market state"
-                    );
+                    if self.should_log_cooling_note(&snapshot.market_id, context.now_ms, reason) {
+                        tracing::info!(
+                            target: "strategy.market_state",
+                            market = %snapshot.market_id,
+                            state = "cooling",
+                            reason,
+                            until_ms,
+                            left_fair,
+                            right_fair,
+                            market_mid_move,
+                            "fresh paired entry suppressed by market state"
+                        );
+                    }
                     return self.no_quote_decision(
                         &snapshot.market_id,
                         context.now_ms,
@@ -6401,6 +6429,22 @@ mod tests {
         assert!(!strategy
             .market_states
             .contains_key(&MarketId::from("noquote-only")));
+    }
+
+    #[test]
+    fn btc_5m_mm_cooling_note_is_throttled_until_reason_changes_or_interval_elapses() {
+        let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+        let market_id = MarketId::from("market-mm");
+
+        assert!(strategy.should_log_cooling_note(&market_id, 1_000, "btc regime flat"));
+        assert!(!strategy.should_log_cooling_note(&market_id, 2_000, "btc regime flat"));
+        assert!(strategy.should_log_cooling_note(&market_id, 2_000, "market mid moved"));
+        assert!(!strategy.should_log_cooling_note(&market_id, 3_000, "market mid moved"));
+        assert!(strategy.should_log_cooling_note(
+            &market_id,
+            2_000 + Btc5mMmStrategy::NO_QUOTE_NOTE_INTERVAL_MS,
+            "market mid moved"
+        ));
     }
 
     #[test]
