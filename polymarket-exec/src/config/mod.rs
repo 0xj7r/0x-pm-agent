@@ -61,6 +61,7 @@ pub struct AppConfig {
     pub relayer_api_key: Option<String>,
     pub relayer_api_key_address: Option<String>,
     pub ctf_contract_address: String,
+    pub ctf_collateral_token_address: String,
     pub collateral_token_address: String,
     pub collateral_decimals: u8,
     pub proxy_wallet_address: Option<String>,
@@ -121,6 +122,13 @@ pub struct AppConfig {
     pub live_max_cancel_errors: usize,
     pub live_kill_on_reconcile_mismatch: bool,
     pub live_kill_switch_path: Option<PathBuf>,
+    /// Live EOA startup collateral repair. When enabled, the engine checks the
+    /// signer's Polygon USDC.e balance before quoting and wraps any balance
+    /// above `live_pusd_auto_wrap_min_usd` into pUSD via Polymarket's
+    /// CollateralOnramp. This is intentionally opt-in because it sends
+    /// on-chain transactions and consumes MATIC gas.
+    pub live_pusd_auto_wrap: bool,
+    pub live_pusd_auto_wrap_min_usd: f64,
     /// After how long of healthy operation post-restart should the runtime
     /// auto-recover from a persisted RiskOff state. Default 30s. Set to 0
     /// to disable (operator must clear runtime_state manually).
@@ -188,7 +196,9 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        let _ = dotenvy::dotenv();
+        if should_load_dotenv() {
+            let _ = dotenvy::dotenv();
+        }
 
         let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "polymarket-exec");
         let strategy_name = env_or("WHALE_PAIR_STRATEGY", "unlawful_shear");
@@ -222,6 +232,10 @@ impl AppConfig {
         let collateral_token_address = env_or(
             "POLYMARKET_COLLATERAL_TOKEN_ADDRESS",
             crate::wire::relayer::DEFAULT_PUSD_ADDRESS,
+        );
+        let ctf_collateral_token_address = env_or(
+            "POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS",
+            &collateral_token_address,
         );
         let collateral_decimals = parse_usize("POLYMARKET_COLLATERAL_DECIMALS", 6)? as u8;
         let proxy_wallet_address = env::var("POLYMARKET_PROXY_WALLET_ADDRESS")
@@ -413,6 +427,9 @@ impl AppConfig {
         let live_kill_on_reconcile_mismatch =
             parse_bool("WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
         let live_kill_switch_path = parse_path_optional("WHALE_PAIR_LIVE_KILL_SWITCH_PATH");
+        let live_pusd_auto_wrap = parse_bool("WHALE_PAIR_LIVE_PUSD_AUTO_WRAP", false)?;
+        let live_pusd_auto_wrap_min_usd =
+            parse_f64("WHALE_PAIR_LIVE_PUSD_AUTO_WRAP_MIN_USD", 0.01)?;
         let live_risk_off_auto_recover =
             parse_duration_ms("WHALE_PAIR_LIVE_RISK_OFF_AUTO_RECOVER_MS", 30_000)?;
         let paper_min_fill_notional_usd =
@@ -491,6 +508,7 @@ impl AppConfig {
             relayer_api_key,
             relayer_api_key_address,
             ctf_contract_address,
+            ctf_collateral_token_address,
             collateral_token_address,
             collateral_decimals,
             proxy_wallet_address,
@@ -551,6 +569,8 @@ impl AppConfig {
             live_max_cancel_errors,
             live_kill_on_reconcile_mismatch,
             live_kill_switch_path,
+            live_pusd_auto_wrap,
+            live_pusd_auto_wrap_min_usd,
             live_risk_off_auto_recover,
             paper_min_fill_notional_usd,
             paper_max_fills_per_order,
@@ -574,6 +594,16 @@ impl AppConfig {
             .get(asset_id)
             .cloned()
             .unwrap_or_else(|| asset_id.to_string())
+    }
+}
+
+fn should_load_dotenv() -> bool {
+    match env::var("WHALE_PAIR_EXEC_LOAD_DOTENV") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
     }
 }
 
@@ -672,5 +702,16 @@ mod tests {
         let err = parse_market_discovery_families("TEST_FAMILIES_ZERO").unwrap_err();
         std::env::remove_var("TEST_FAMILIES_ZERO");
         assert!(err.to_string().contains("zero window_ms"));
+    }
+
+    #[test]
+    fn dotenv_loading_can_be_disabled_for_service_envs() {
+        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "false");
+        assert!(!should_load_dotenv());
+        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "0");
+        assert!(!should_load_dotenv());
+        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "true");
+        assert!(should_load_dotenv());
+        std::env::remove_var("WHALE_PAIR_EXEC_LOAD_DOTENV");
     }
 }

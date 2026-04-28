@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CRATE_DIR="$ROOT_DIR/polymarket-exec"
 BASE_LAUNCHER="$CRATE_DIR/scripts/run_unlawful_shear_paper.sh"
 SLEEVE_INPUT="${1:-${WHALE_PAIR_SLEEVE:-}}"
+HOST_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/polymarket-exec"
 
 log() {
   echo "[polymarket-exec-sleeve] $1"
@@ -22,6 +23,10 @@ resolve_sleeve_env() {
   fi
   if [[ -f "$raw" ]]; then
     printf '%s\n' "$raw"
+    return 0
+  fi
+  if [[ -f "$HOST_CONFIG_DIR/$raw.env" ]]; then
+    printf '%s\n' "$HOST_CONFIG_DIR/$raw.env"
     return 0
   fi
   if [[ -f "$CRATE_DIR/env/$raw.env" ]]; then

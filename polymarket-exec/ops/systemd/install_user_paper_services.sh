@@ -11,6 +11,8 @@ SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/polymarket-exec"
 PAPER_DIR="$CONFIG_DIR/paper.d"
 LIVE_ENV="$CONFIG_DIR/live.env"
+TINYLIVE_ENV="$CONFIG_DIR/btc_5m_mm_tinylive.env"
+TINYLIVE_ENV_SRC="$ROOT_DIR/polymarket-exec/env/btc_5m_mm_tinylive.env"
 
 log() {
   echo "[install-user-paper-services] $1"
@@ -63,6 +65,30 @@ else
   log "leaving existing live env in place -> $LIVE_ENV"
 fi
 
+if [[ ! -f "$TINYLIVE_ENV" ]]; then
+  {
+    cat <<'EOF'
+# Host-local canonical tinylive env.
+# This file is the single source loaded by polymarket-exec@btc_5m_mm_tinylive.
+# Add secrets below; keep strategy/auth-holder settings in this same file.
+#
+# Required:
+# POLYMARKET_PRIVATE_KEY=
+# POLYMARKET_API_KEY=
+# POLYMARKET_API_SECRET=
+# POLYMARKET_API_PASSPHRASE=
+# RELAYER_API_KEY=
+# RELAYER_API_KEY_ADDRESS=
+
+EOF
+    cat "$TINYLIVE_ENV_SRC"
+  } >"$TINYLIVE_ENV"
+  chmod 0600 "$TINYLIVE_ENV"
+  log "wrote tinylive env template -> $TINYLIVE_ENV"
+else
+  log "leaving existing tinylive env in place -> $TINYLIVE_ENV"
+fi
+
 for sleeve in unlawful_baseline unlawful_broad_hours unlawful_press; do
   sleeve_env="$PAPER_DIR/$sleeve.env"
   if [[ ! -f "$sleeve_env" ]]; then
@@ -80,8 +106,8 @@ done
 cat <<'EOF'
 
 Next steps:
-1. Review and edit ~/.config/polymarket-exec/common.env
-2. Optional per-sleeve overrides live in ~/.config/polymarket-exec/paper.d/
+1. Review and edit ~/.config/polymarket-exec/btc_5m_mm_tinylive.env for tinylive
+2. Optional paper sleeves can use repo presets under polymarket-exec/env/
 3. Reload user services:
    systemctl --user daemon-reload
 4. Enable lingering so paper keeps running after logout:

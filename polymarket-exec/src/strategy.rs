@@ -620,6 +620,10 @@ struct Btc5mMmMarketState {
     /// Used to throttle rescue emission so we don't drown the engine's
     /// rate limiter with 85 intents/min on every book tick.
     last_rescue_attempt_ms: Option<EpochMillis>,
+    /// Tracks the currently outstanding rescue signature so repeated
+    /// snapshots cannot emit unlimited IOC attempts for the same stranded
+    /// exposure while the venue/result path has not acknowledged it.
+    rescue_state: Option<Btc5mMmRescueState>,
     /// Last time on_fill recorded a fill on this market. Drives the
     /// post-fill entry cooldown that prevents re-stranding immediately
     /// after a merge in a trending market.
@@ -660,6 +664,10 @@ impl Btc5mMmMarketState {
             self.asymmetric_entry_block_until_ms.unwrap_or_default(),
             self.last_action_ms.unwrap_or_default(),
             self.last_rescue_attempt_ms.unwrap_or_default(),
+            self.rescue_state
+                .as_ref()
+                .map(|state| state.last_attempt_ms)
+                .unwrap_or_default(),
             self.last_fill_ms.unwrap_or_default(),
         ]
         .into_iter()
@@ -698,7 +706,18 @@ struct Btc5mMmPersistedMarketState {
     last_action_ms: Option<EpochMillis>,
     last_no_quote_note_ms: Option<EpochMillis>,
     last_rescue_attempt_ms: Option<EpochMillis>,
+    rescue_state: Option<Btc5mMmRescueState>,
     last_fill_ms: Option<EpochMillis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Btc5mMmRescueState {
+    stranded_instrument_id: String,
+    lift_instrument_id: String,
+    stranded_qty_bucket: u64,
+    attempts: u32,
+    first_attempt_ms: EpochMillis,
+    last_attempt_ms: EpochMillis,
 }
 
 #[derive(Debug, Clone)]
@@ -1604,6 +1623,8 @@ impl Btc5mMmStrategy {
     /// operator tuning knobs: balanced fills can keep quoting; lopsided fills
     /// put this market into Cooling before we re-enter the same flow.
     const ASYMMETRIC_FILL_WINDOW_MS: u64 = 120_000;
+    const RESCUE_INFLIGHT_TTL_MS: u64 = 15_000;
+    const MAX_RESCUE_ATTEMPTS_PER_SIGNATURE: u32 = 3;
     const ASYMMETRIC_FILL_MODERATE_COOLDOWN_MS: u64 = 30_000;
     const ASYMMETRIC_FILL_SEVERE_COOLDOWN_MS: u64 = 90_000;
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
@@ -1725,6 +1746,7 @@ impl Btc5mMmStrategy {
                     last_action_ms: state.last_action_ms,
                     last_no_quote_note_ms: state.last_no_quote_note_ms,
                     last_rescue_attempt_ms: state.last_rescue_attempt_ms,
+                    rescue_state: state.rescue_state.clone(),
                     last_fill_ms: state.last_fill_ms,
                 })
                 .collect(),
@@ -1762,6 +1784,7 @@ impl Btc5mMmStrategy {
                     last_cooling_note_ms: None,
                     last_cooling_note_key: None,
                     last_rescue_attempt_ms: record.last_rescue_attempt_ms,
+                    rescue_state: record.rescue_state,
                     last_fill_ms: record.last_fill_ms,
                     // Per-bar convex tracking is in-memory only; new bar
                     // post-restart resets count naturally (curr_bar_end !=
@@ -2023,6 +2046,90 @@ impl Btc5mMmStrategy {
             .min_order_quantity
             .max(self.config.venue_min_order_quantity)
             .max(min_notional_quantity)
+    }
+
+    fn rescue_inflight_ttl_ms(&self) -> u64 {
+        Self::RESCUE_INFLIGHT_TTL_MS.max(self.config.cooldown_ms.saturating_mul(10))
+    }
+
+    fn rescue_qty_bucket(quantity: f64) -> u64 {
+        (quantity.max(0.0) * 100.0).round() as u64
+    }
+
+    fn can_emit_rescue(
+        &mut self,
+        market_id: &MarketId,
+        stranded_instrument_id: &InstrumentId,
+        lift_instrument_id: &InstrumentId,
+        stranded_qty: f64,
+        now_ms: EpochMillis,
+        notes: &mut Vec<String>,
+    ) -> bool {
+        let qty_bucket = Self::rescue_qty_bucket(stranded_qty);
+        let ttl_ms = self.rescue_inflight_ttl_ms();
+        let state = self.market_states.entry(market_id.clone()).or_default();
+        if state.rescue_state.as_ref().is_some_and(|rescue| {
+            rescue.stranded_instrument_id != stranded_instrument_id.as_str()
+                || rescue.lift_instrument_id != lift_instrument_id.as_str()
+                || rescue.stranded_qty_bucket != qty_bucket
+        }) {
+            state.rescue_state = None;
+        }
+
+        let Some(rescue) = state.rescue_state.as_ref() else {
+            return true;
+        };
+        if rescue.attempts >= Self::MAX_RESCUE_ATTEMPTS_PER_SIGNATURE {
+            notes.push("rescue attempt cap reached".to_string());
+            return false;
+        }
+        if now_ms.saturating_sub(rescue.last_attempt_ms) < ttl_ms {
+            notes.push("rescue already in flight".to_string());
+            return false;
+        }
+        true
+    }
+
+    fn record_rescue_attempt(
+        &mut self,
+        market_id: &MarketId,
+        stranded_instrument_id: &InstrumentId,
+        lift_instrument_id: &InstrumentId,
+        stranded_qty: f64,
+        now_ms: EpochMillis,
+    ) {
+        let qty_bucket = Self::rescue_qty_bucket(stranded_qty);
+        let state = self.market_states.entry(market_id.clone()).or_default();
+        let next_attempts = state
+            .rescue_state
+            .as_ref()
+            .filter(|rescue| {
+                rescue.stranded_instrument_id == stranded_instrument_id.as_str()
+                    && rescue.lift_instrument_id == lift_instrument_id.as_str()
+                    && rescue.stranded_qty_bucket == qty_bucket
+            })
+            .map(|rescue| rescue.attempts.saturating_add(1))
+            .unwrap_or(1);
+        let first_attempt_ms = state
+            .rescue_state
+            .as_ref()
+            .map(|rescue| rescue.first_attempt_ms)
+            .unwrap_or(now_ms);
+        state.rescue_state = Some(Btc5mMmRescueState {
+            stranded_instrument_id: stranded_instrument_id.as_str().to_string(),
+            lift_instrument_id: lift_instrument_id.as_str().to_string(),
+            stranded_qty_bucket: qty_bucket,
+            attempts: next_attempts,
+            first_attempt_ms,
+            last_attempt_ms: now_ms,
+        });
+        state.last_rescue_attempt_ms = Some(now_ms);
+    }
+
+    fn clear_rescue_state(&mut self, market_id: &MarketId) {
+        if let Some(state) = self.market_states.get_mut(market_id) {
+            state.rescue_state = None;
+        }
     }
 
     fn quote_is_usable(&self, quote: &QuoteSnapshot) -> bool {
@@ -3202,6 +3309,7 @@ impl Strategy for Btc5mMmStrategy {
 
         match (left_has_inventory, right_has_inventory) {
             (false, false) => {
+                self.clear_rescue_state(&snapshot.market_id);
                 if context.runtime_status != RuntimeStatus::Running {
                     return self.no_quote_decision(
                         &snapshot.market_id,
@@ -3404,7 +3512,17 @@ impl Strategy for Btc5mMmStrategy {
                     context.market_context.as_ref(),
                     context.now_ms,
                 );
-                let intent = if throttle_ok && !exposure_decision.hold {
+                let rescue_ok = throttle_ok
+                    && !exposure_decision.hold
+                    && self.can_emit_rescue(
+                        &snapshot.market_id,
+                        held_id,
+                        lift_id,
+                        stranded_qty,
+                        context.now_ms,
+                        &mut hold_notes,
+                    );
+                let intent = if rescue_ok {
                     self.build_rescue_intent_for_quantity(
                         &snapshot.market_id,
                         lift_id,
@@ -3440,9 +3558,13 @@ impl Strategy for Btc5mMmStrategy {
                 }
                 if let Some(hedge) = intent {
                     intents.push(hedge);
-                    if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
-                        state.last_rescue_attempt_ms = Some(context.now_ms);
-                    }
+                    self.record_rescue_attempt(
+                        &snapshot.market_id,
+                        held_id,
+                        lift_id,
+                        stranded_qty,
+                        context.now_ms,
+                    );
                 }
             }
             (true, true) => {
@@ -3467,7 +3589,9 @@ impl Strategy for Btc5mMmStrategy {
                     .map(|r| r.minimum_order_size)
                     .filter(|m| m.is_finite() && *m > 0.0)
                     .unwrap_or(self.config.venue_min_order_quantity);
-                if imbalance >= venue_min {
+                if imbalance < venue_min {
+                    self.clear_rescue_state(&snapshot.market_id);
+                } else {
                     let throttle_ok = self
                         .market_states
                         .get(&snapshot.market_id)
@@ -3512,7 +3636,17 @@ impl Strategy for Btc5mMmStrategy {
                         context.market_context.as_ref(),
                         context.now_ms,
                     );
-                    let intent = if throttle_ok && !exposure_decision.hold {
+                    let rescue_ok = throttle_ok
+                        && !exposure_decision.hold
+                        && self.can_emit_rescue(
+                            &snapshot.market_id,
+                            held_id,
+                            lift_id,
+                            stranded_excess,
+                            context.now_ms,
+                            &mut hold_notes,
+                        );
+                    let intent = if rescue_ok {
                         self.build_rescue_intent_for_quantity(
                             &snapshot.market_id,
                             lift_id,
@@ -3550,9 +3684,13 @@ impl Strategy for Btc5mMmStrategy {
                     }
                     if let Some(hedge) = intent {
                         intents.push(hedge);
-                        if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
-                            state.last_rescue_attempt_ms = Some(context.now_ms);
-                        }
+                        self.record_rescue_attempt(
+                            &snapshot.market_id,
+                            held_id,
+                            lift_id,
+                            stranded_excess,
+                            context.now_ms,
+                        );
                     }
                 }
             }
@@ -3710,11 +3848,21 @@ impl Strategy for Btc5mMmStrategy {
             return StrategyDecision { notes, intents };
         }
 
-        let (lift_id, lift_quote, stranded_qty) = if left_has {
-            (right_id, right_quote, left_qty)
+        let (stranded_id, lift_id, lift_quote, stranded_qty) = if left_has {
+            (left_id, right_id, right_quote, left_qty)
         } else {
-            (left_id, left_quote, right_qty)
+            (right_id, left_id, left_quote, right_qty)
         };
+        if !self.can_emit_rescue(
+            &fill.market_id,
+            &stranded_id,
+            &lift_id,
+            stranded_qty,
+            context.now_ms,
+            &mut notes,
+        ) {
+            return StrategyDecision { notes, intents };
+        }
         let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
         let intent = self.build_rescue_intent_for_quantity(
             &fill.market_id,
@@ -3737,9 +3885,13 @@ impl Strategy for Btc5mMmStrategy {
         );
         if let Some(hedge) = intent {
             intents.push(hedge);
-            if let Some(state) = self.market_states.get_mut(&fill.market_id) {
-                state.last_rescue_attempt_ms = Some(context.now_ms);
-            }
+            self.record_rescue_attempt(
+                &fill.market_id,
+                &stranded_id,
+                &lift_id,
+                stranded_qty,
+                context.now_ms,
+            );
             notes.push("on-fill IOC rescue emitted".to_string());
         }
 

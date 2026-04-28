@@ -11,12 +11,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use polymarket_client_sdk::auth::{Credentials as SdkCredentials, ExposeSecret, Signer, Uuid};
-use polymarket_client_sdk::clob::types::request::{
-    BalanceAllowanceRequest, OrdersRequest, TradesRequest as ClobTradesRequest,
-};
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk::clob::types::{
     OrderStatusType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
-    TraderSide,
 };
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
 use polymarket_client_sdk::data::types::request::PositionsRequest as DataPositionsRequest;
@@ -40,9 +37,10 @@ use crate::wire::clob_v2::{
     parse_bytes32, V2OrderBuildParams, V2OrderDraft, BYTES32_ZERO, CLOB_V2_EXCHANGE,
     CLOB_V2_NEG_RISK_EXCHANGE,
 };
+use crate::wire::eoa_polygon::{scaled_usdc_units, EoaPolygonSubmitter, PusdWrapReport};
 use crate::wire::relayer::{
     CtfMergeRequest, CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
-    DEFAULT_PUSD_ADDRESS, DEFAULT_RELAYER_URL,
+    DEFAULT_PUSD_ADDRESS, DEFAULT_RELAYER_URL, DEFAULT_USDCE_ADDRESS,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,6 +129,9 @@ pub struct RedeemPositionsRequest {
     pub command_id: ClientOrderId,
     pub market_id: MarketId,
     pub condition_id: String,
+    /// Optional collateral override for legacy positions. Live trading can use
+    /// pUSD while pre-cutover positions may still redeem against USDC.e.
+    pub collateral_token_address: Option<String>,
     /// CTF index sets to redeem. For binary markets pass `vec![1, 2]`
     /// to claim both legs (winning leg pays, losing leg returns nothing
     /// but the call still succeeds atomically).
@@ -281,6 +282,7 @@ pub struct PolymarketConfig {
     pub relayer_api_key: Option<String>,
     pub relayer_api_key_address: Option<String>,
     pub ctf_contract_address: String,
+    pub ctf_collateral_token_address: String,
     pub collateral_token_address: String,
     pub collateral_decimals: u8,
     pub proxy_wallet_address: Option<String>,
@@ -302,6 +304,7 @@ impl Default for PolymarketConfig {
             relayer_api_key: None,
             relayer_api_key_address: None,
             ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
+            ctf_collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
             collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
@@ -533,6 +536,7 @@ impl PolymarketExecutionAdapter {
             relayer_api_key: None,
             relayer_api_key_address: None,
             ctf_contract_address: DEFAULT_CTF_ADDRESS.to_string(),
+            ctf_collateral_token_address: DEFAULT_USDCE_ADDRESS.to_string(),
             collateral_token_address: DEFAULT_PUSD_ADDRESS.to_string(),
             collateral_decimals: 6,
             proxy_wallet_address: None,
@@ -627,7 +631,7 @@ impl PolymarketExecutionAdapter {
             api_key: config.relayer_api_key.clone(),
             api_key_address: config.relayer_api_key_address.clone(),
             ctf_contract_address: config.ctf_contract_address.clone(),
-            collateral_token_address: config.collateral_token_address.clone(),
+            collateral_token_address: config.ctf_collateral_token_address.clone(),
             collateral_decimals: config.collateral_decimals,
             proxy_wallet_address: relayer_proxy_wallet_address(
                 &config,
@@ -704,7 +708,7 @@ impl PolymarketExecutionAdapter {
             api_key: config.relayer_api_key.clone(),
             api_key_address: config.relayer_api_key_address.clone(),
             ctf_contract_address: config.ctf_contract_address.clone(),
-            collateral_token_address: config.collateral_token_address.clone(),
+            collateral_token_address: config.ctf_collateral_token_address.clone(),
             collateral_decimals: config.collateral_decimals,
             proxy_wallet_address: relayer_proxy_wallet_address(
                 &config,
@@ -968,19 +972,7 @@ impl PolymarketExecutionAdapter {
         // Both GTC and IOC must pass expiration=0 (epoch). Previously this
         // only zeroed for GTC; IOC fell through to the 1h default and the
         // V2 SDK rejected every hedge-rescue submit.
-        let expiration_dt = {
-            use chrono::{TimeZone, Utc};
-            let secs_ms = match req.time_in_force {
-                TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok => 0,
-                TimeInForce::Gtd => req
-                    .expires_at_ms
-                    .filter(|ms| *ms > now_unix_ms() + 60_000)
-                    .unwrap_or_else(|| now_unix_ms() + 3_600_000),
-            };
-            Utc.timestamp_millis_opt(secs_ms as i64)
-                .single()
-                .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
-        };
+        let expiration_dt = Self::v2_sdk_expiration_dt(&req, now_unix_ms());
 
         // Set builder_code from our config (defaults to ZERO if not set,
         // but ZERO causes some venue-side mismatches in V2).
@@ -1175,6 +1167,32 @@ impl PolymarketExecutionAdapter {
         )
     }
 
+    pub async fn ensure_pusd_collateral_from_usdce(
+        &self,
+        min_wrap_usd: f64,
+    ) -> Result<Option<PusdWrapReport>, ExecutionError> {
+        if self.signature_type != PolymarketSignatureType::Eoa {
+            return Ok(None);
+        }
+        let rpc_url = self
+            ._config
+            .polygon_rpc_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ExecutionError::BadRequest(
+                    "pUSD auto-wrap requires POLYGON_RPC_URL in EOA mode".to_string(),
+                )
+            })?;
+        let recipient = self.trade_address.unwrap_or_else(|| self.signer.address());
+        let min_wrap_amount = scaled_usdc_units(min_wrap_usd)?;
+        let submitter = EoaPolygonSubmitter::new(rpc_url.to_string());
+        submitter
+            .ensure_pusd_from_usdce(&self.signer, recipient, min_wrap_amount)
+            .await
+            .map(Some)
+    }
+
     fn map_order_type(req: &SubmitOrderRequest) -> Result<SdkOrderType, ExecutionError> {
         match req.time_in_force {
             TimeInForce::Gtc => Ok(SdkOrderType::GTC),
@@ -1223,6 +1241,24 @@ impl PolymarketExecutionAdapter {
                 }
             }
         }
+    }
+
+    fn v2_sdk_expiration_dt(
+        req: &SubmitOrderRequest,
+        now_ms: EpochMillis,
+    ) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{TimeZone, Utc};
+
+        let expiration_ms = match req.time_in_force {
+            TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok => 0,
+            TimeInForce::Gtd => req
+                .expires_at_ms
+                .filter(|ms| *ms > now_ms + 60_000)
+                .unwrap_or_else(|| now_ms + 3_600_000),
+        };
+        Utc.timestamp_millis_opt(expiration_ms as i64)
+            .single()
+            .unwrap_or_else(|| Utc.timestamp_opt(0, 0).unwrap())
     }
 
     fn sdk_side(side: TradeSide) -> SdkSide {
@@ -1414,76 +1450,14 @@ impl PolymarketExecutionAdapter {
         };
         let mut fills = Vec::new();
 
-        let maker_request = ClobTradesRequest::builder()
-            .maker_address(trade_address)
-            .after((after_ms / 1_000) as i64)
-            .build();
-        let maker_page = self
-            .client
-            .trades(&maker_request, None)
-            .await
-            .map_err(map_sdk_error)?;
-        for trade in maker_page.data {
-            let observed_at_ms = trade.match_time.timestamp_millis().max(0) as u64;
-            let market_id = MarketId::from(format!("{:#x}", trade.market));
-            for maker in trade
-                .maker_orders
-                .into_iter()
-                .filter(|maker| maker.maker_address == trade_address)
-            {
-                fills.push(VenueFill {
-                    venue_order_id: OrderId::from(maker.order_id),
-                    client_order_id: None,
-                    market_id: market_id.clone(),
-                    instrument_id: InstrumentId::from(maker.asset_id.to_string()),
-                    side: match maker.side {
-                        SdkSide::Buy => TradeSide::Buy,
-                        _ => TradeSide::Sell,
-                    },
-                    price: maker.price.to_string().parse::<f64>().unwrap_or(0.0),
-                    quantity: maker
-                        .matched_amount
-                        .to_string()
-                        .parse::<f64>()
-                        .unwrap_or(0.0),
-                    fee_usd: 0.0,
-                    liquidity: FillLiquidity::Maker,
-                    observed_at_ms,
-                });
-            }
-        }
-
-        let taker_request = ClobTradesRequest::builder()
-            .taker_address(trade_address)
-            .after((after_ms / 1_000) as i64)
-            .build();
-        let taker_page = self
-            .client
-            .trades(&taker_request, None)
-            .await
-            .map_err(map_sdk_error)?;
-        for trade in taker_page.data {
-            let observed_at_ms = trade.match_time.timestamp_millis().max(0) as u64;
-            fills.push(VenueFill {
-                venue_order_id: OrderId::from(trade.taker_order_id),
-                client_order_id: None,
-                market_id: MarketId::from(format!("{:#x}", trade.market)),
-                instrument_id: InstrumentId::from(trade.asset_id.to_string()),
-                side: match trade.side {
-                    SdkSide::Buy => TradeSide::Buy,
-                    _ => TradeSide::Sell,
-                },
-                price: trade.price.to_string().parse::<f64>().unwrap_or(0.0),
-                quantity: trade.size.to_string().parse::<f64>().unwrap_or(0.0),
-                fee_usd: 0.0,
-                liquidity: match trade.trader_side {
-                    TraderSide::Maker => FillLiquidity::Maker,
-                    TraderSide::Taker => FillLiquidity::Taker,
-                    TraderSide::Unknown(_) | _ => FillLiquidity::Unknown,
-                },
-                observed_at_ms,
-            });
-        }
+        fills.extend(
+            self.sync_raw_recent_fills_page(RawTradeFilter::Maker, trade_address, after_ms)
+                .await?,
+        );
+        fills.extend(
+            self.sync_raw_recent_fills_page(RawTradeFilter::Taker, trade_address, after_ms)
+                .await?,
+        );
 
         let mut seen = HashSet::new();
         fills.retain(|fill| {
@@ -1498,6 +1472,203 @@ impl PolymarketExecutionAdapter {
             ))
         });
         Ok(fills)
+    }
+
+    async fn sync_raw_recent_fills_page(
+        &self,
+        filter: RawTradeFilter,
+        trade_address: SdkAddress,
+        after_ms: EpochMillis,
+    ) -> Result<Vec<VenueFill>, ExecutionError> {
+        let url = join_url(&self._config.api_url, "data/trades");
+        let params = vec![
+            (filter.query_key(), trade_address.to_string()),
+            ("after", (after_ms / 1_000).to_string()),
+        ];
+        let timestamp_s = (now_unix_ms() / 1_000) as i64;
+        let headers = self.v2_l2_headers(Method::GET, &url, "", timestamp_s)?;
+        let response = self
+            .raw_http
+            .get(&url)
+            .headers(headers)
+            .query(&params)
+            .send()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        if !status.is_success() {
+            return Err(ExecutionError::VenueRejection(format!(
+                "CLOB trades GET failed {status}: {response_text}"
+            )));
+        }
+        parse_raw_trades_page(&response_text, filter, trade_address)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RawTradeFilter {
+    Maker,
+    Taker,
+}
+
+impl RawTradeFilter {
+    fn query_key(self) -> &'static str {
+        match self {
+            Self::Maker => "maker",
+            Self::Taker => "taker",
+        }
+    }
+}
+
+fn parse_raw_trades_page(
+    body: &str,
+    filter: RawTradeFilter,
+    trade_address: SdkAddress,
+) -> Result<Vec<VenueFill>, ExecutionError> {
+    let raw: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        ExecutionError::VenueRejection(format!(
+            "failed to decode CLOB trades response `{body}`: {error}"
+        ))
+    })?;
+    let trades = raw
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| {
+            ExecutionError::VenueRejection("CLOB trades response missing data array".to_string())
+        })?;
+
+    let mut fills = Vec::new();
+    for trade in trades {
+        match filter {
+            RawTradeFilter::Maker => {
+                let Some(market_id) = json_string(trade.get("market")) else {
+                    continue;
+                };
+                let observed_at_ms = json_epoch_seconds_ms(trade.get("match_time"));
+                let maker_orders = trade
+                    .get("maker_orders")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten();
+                for maker in maker_orders {
+                    if !json_string(maker.get("maker_address")).is_some_and(|address| {
+                        address.eq_ignore_ascii_case(&trade_address.to_string())
+                    }) {
+                        continue;
+                    }
+                    let (Some(order_id), Some(asset_id), Some(side), Some(price), Some(quantity)) = (
+                        json_string(maker.get("order_id")),
+                        json_string(maker.get("asset_id")),
+                        json_trade_side(maker.get("side")),
+                        json_decimal_f64(maker.get("price")),
+                        json_decimal_f64(maker.get("matched_amount")),
+                    ) else {
+                        continue;
+                    };
+                    fills.push(VenueFill {
+                        venue_order_id: OrderId::from(order_id),
+                        client_order_id: None,
+                        market_id: MarketId::from(market_id.clone()),
+                        instrument_id: InstrumentId::from(asset_id),
+                        side,
+                        price,
+                        quantity,
+                        fee_usd: 0.0,
+                        liquidity: FillLiquidity::Maker,
+                        observed_at_ms,
+                    });
+                }
+            }
+            RawTradeFilter::Taker => {
+                let (
+                    Some(order_id),
+                    Some(market_id),
+                    Some(asset_id),
+                    Some(side),
+                    Some(price),
+                    Some(quantity),
+                ) = (
+                    json_string(trade.get("taker_order_id")),
+                    json_string(trade.get("market")),
+                    json_string(trade.get("asset_id")),
+                    json_trade_side(trade.get("side")),
+                    json_decimal_f64(trade.get("price")),
+                    json_decimal_f64(trade.get("size")),
+                )
+                else {
+                    continue;
+                };
+                fills.push(VenueFill {
+                    venue_order_id: OrderId::from(order_id),
+                    client_order_id: None,
+                    market_id: MarketId::from(market_id),
+                    instrument_id: InstrumentId::from(asset_id),
+                    side,
+                    price,
+                    quantity,
+                    fee_usd: 0.0,
+                    liquidity: json_fill_liquidity(trade.get("trader_side")),
+                    observed_at_ms: json_epoch_seconds_ms(trade.get("match_time")),
+                });
+            }
+        }
+    }
+    Ok(fills)
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn json_decimal_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    match value? {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<f64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn json_epoch_seconds_ms(value: Option<&serde_json::Value>) -> EpochMillis {
+    json_decimal_f64(value)
+        .map(|seconds| (seconds.max(0.0) * 1_000.0) as EpochMillis)
+        .unwrap_or_default()
+}
+
+fn json_trade_side(value: Option<&serde_json::Value>) -> Option<TradeSide> {
+    match json_string(value)?.to_ascii_uppercase().as_str() {
+        "BUY" => Some(TradeSide::Buy),
+        "SELL" => Some(TradeSide::Sell),
+        _ => None,
+    }
+}
+
+fn json_fill_liquidity(value: Option<&serde_json::Value>) -> FillLiquidity {
+    match json_string(value)
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "MAKER" => FillLiquidity::Maker,
+        "TAKER" => FillLiquidity::Taker,
+        _ => FillLiquidity::Unknown,
     }
 }
 
@@ -1685,6 +1856,7 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             "command_id": req.command_id.as_str(),
             "market_id": req.market_id.as_str(),
             "condition_id": req.condition_id,
+            "collateral_token_address": req.collateral_token_address,
             "index_sets": req.index_sets,
         })
         .to_string();
@@ -1693,6 +1865,7 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             .redeem_positions(CtfRedeemRequest {
                 signer: self.signer.clone(),
                 condition_id: req.condition_id.clone(),
+                collateral_token_address: req.collateral_token_address.clone(),
                 index_sets: req.index_sets.clone(),
                 metadata,
             })
@@ -2033,6 +2206,106 @@ mod tests {
     }
 
     #[test]
+    fn parse_raw_trades_tolerates_empty_fee_rate_bps() {
+        let trade_address =
+            SdkAddress::from_str("0x4444444444444444444444444444444444444444").unwrap();
+        let body = serde_json::json!({
+            "data": [{
+                "id": "trade-1",
+                "taker_order_id": "taker-order-1",
+                "market": "0x000000000000000000000000000000000000000000000000000000006d61726b",
+                "asset_id": "123",
+                "side": "BUY",
+                "size": "10",
+                "fee_rate_bps": "",
+                "price": "0.51",
+                "status": "MATCHED",
+                "match_time": "1710000000",
+                "maker_orders": [{
+                    "order_id": "maker-order-1",
+                    "maker_address": "0x4444444444444444444444444444444444444444",
+                    "matched_amount": "5",
+                    "price": "0.50",
+                    "fee_rate_bps": "",
+                    "asset_id": "123",
+                    "side": "BUY"
+                }],
+                "trader_side": "TAKER"
+            }],
+            "next_cursor": "LTE=",
+            "limit": 100,
+            "count": 1
+        })
+        .to_string();
+
+        let maker_fills =
+            parse_raw_trades_page(&body, RawTradeFilter::Maker, trade_address).unwrap();
+        assert_eq!(maker_fills.len(), 1);
+        assert_eq!(
+            maker_fills[0].venue_order_id,
+            OrderId::from("maker-order-1")
+        );
+        assert_eq!(maker_fills[0].side, TradeSide::Buy);
+        assert_eq!(maker_fills[0].price, 0.50);
+        assert_eq!(maker_fills[0].quantity, 5.0);
+        assert_eq!(maker_fills[0].liquidity, FillLiquidity::Maker);
+        assert_eq!(maker_fills[0].observed_at_ms, 1_710_000_000_000);
+
+        let taker_fills =
+            parse_raw_trades_page(&body, RawTradeFilter::Taker, trade_address).unwrap();
+        assert_eq!(taker_fills.len(), 1);
+        assert_eq!(
+            taker_fills[0].venue_order_id,
+            OrderId::from("taker-order-1")
+        );
+        assert_eq!(taker_fills[0].price, 0.51);
+        assert_eq!(taker_fills[0].quantity, 10.0);
+        assert_eq!(taker_fills[0].liquidity, FillLiquidity::Taker);
+    }
+
+    #[test]
+    fn parse_raw_trades_skips_fills_with_empty_essential_decimals() {
+        let trade_address =
+            SdkAddress::from_str("0x4444444444444444444444444444444444444444").unwrap();
+        let body = serde_json::json!({
+            "data": [{
+                "id": "trade-1",
+                "taker_order_id": "taker-order-1",
+                "market": "0x000000000000000000000000000000000000000000000000000000006d61726b",
+                "asset_id": "123",
+                "side": "BUY",
+                "size": "",
+                "price": "0.51",
+                "match_time": "1710000000",
+                "maker_orders": [{
+                    "order_id": "maker-order-1",
+                    "maker_address": "0x4444444444444444444444444444444444444444",
+                    "matched_amount": "5",
+                    "price": "",
+                    "asset_id": "123",
+                    "side": "BUY"
+                }],
+                "trader_side": "TAKER"
+            }],
+            "next_cursor": "LTE=",
+            "limit": 100,
+            "count": 1
+        })
+        .to_string();
+
+        assert!(
+            parse_raw_trades_page(&body, RawTradeFilter::Maker, trade_address)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            parse_raw_trades_page(&body, RawTradeFilter::Taker, trade_address)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn post_only_market_order_types_are_rejected_before_venue() {
         assert!(
             PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Gtc, true)).is_ok()
@@ -2055,6 +2328,36 @@ mod tests {
         ));
         assert!(
             PolymarketExecutionAdapter::map_order_type(&submit_req(TimeInForce::Gtd, true)).is_ok()
+        );
+    }
+
+    #[test]
+    fn v2_sdk_expiration_is_zero_for_non_gtd_orders() {
+        let now_ms = 1_800_000_000_000;
+        let future_expiration_ms = now_ms + 300_000;
+
+        for time_in_force in [TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Fok] {
+            let mut req = submit_req(time_in_force, false);
+            req.expires_at_ms = Some(future_expiration_ms);
+
+            assert_eq!(
+                PolymarketExecutionAdapter::v2_sdk_expiration_dt(&req, now_ms).timestamp_millis(),
+                0,
+                "{time_in_force:?} must not send a non-zero V2 SDK expiration"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_sdk_expiration_uses_valid_gtd_expiration() {
+        let now_ms = 1_800_000_000_000;
+        let future_expiration_ms = now_ms + 300_000;
+        let mut req = submit_req(TimeInForce::Gtd, true);
+        req.expires_at_ms = Some(future_expiration_ms);
+
+        assert_eq!(
+            PolymarketExecutionAdapter::v2_sdk_expiration_dt(&req, now_ms).timestamp_millis(),
+            future_expiration_ms as i64
         );
     }
 
