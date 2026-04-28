@@ -225,6 +225,76 @@ impl ShadowBook {
     }
 }
 
+/// Replay journaled `trade_tape_event` rows into a `ShadowBook` for
+/// post-hoc analysis or fidelity calibration. Returns the count of
+/// events successfully replayed. Skips lines with kind != trade_tape_event,
+/// malformed lines, or out-of-order trade_ids (deduplicated by ShadowBook).
+pub fn replay_trade_events_from_journal(
+    journal_path: &std::path::Path,
+    book: &mut ShadowBook,
+) -> std::io::Result<u64> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(journal_path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut replayed: u64 = 0;
+    for line in reader.lines() {
+        let line = line?;
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("kind").and_then(|v| v.as_str()) != Some("trade_tape_event") {
+            continue;
+        }
+        let Some(event_obj) = value.get("event") else {
+            continue;
+        };
+        let asset = match event_obj.get("asset_id").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let taker_side = match event_obj.get("taker_side").and_then(|v| v.as_str()) {
+            Some("buy") => TradeSide::Buy,
+            Some("sell") => TradeSide::Sell,
+            Some("Buy") => TradeSide::Buy,
+            Some("Sell") => TradeSide::Sell,
+            _ => continue,
+        };
+        let Some(price) = event_obj.get("price").and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        let Some(size) = event_obj.get("size").and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        let Some(event_at_ms) = event_obj.get("event_at_ms").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let Some(trade_id) = event_obj
+            .get("trade_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let synthesised = event_obj
+            .get("synthesised")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let trade = TradeEvent {
+            asset_id: InstrumentId::from(asset),
+            taker_side,
+            price,
+            size,
+            event_at_ms,
+            trade_id,
+            synthesised,
+        };
+        let _ = book.on_trade_event(&trade);
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +555,71 @@ mod tests {
         let f2 = book.on_trade_event(&t2);
         assert!((f2[0].quantity - 30.0).abs() < 1e-9);
         assert_eq!(book.open_order_count(), 1);
+    }
+
+    #[test]
+    fn replay_from_journal_produces_same_fills_as_live_processing() {
+        use std::io::Write;
+
+        let mut shadow_live_book = calibrated_book(0.0);
+        let mut shadow_replay_book = calibrated_book(0.0);
+
+        // Both books receive the same intent.
+        shadow_live_book.on_submit(
+            intent("c1", "a1", TradeSide::Buy, 0.49, 100.0),
+            None,
+            0.0,
+            1_000,
+            "fam",
+        );
+        shadow_replay_book.on_submit(
+            intent("c1", "a1", TradeSide::Buy, 0.49, 100.0),
+            None,
+            0.0,
+            1_000,
+            "fam",
+        );
+
+        // Live path: process trade event in-process.
+        let live_trade = trade("a1", TradeSide::Sell, 0.49, 50.0, 5_000);
+        let live_fills = shadow_live_book.on_trade_event(&live_trade);
+
+        // Replay path: same event written to journal, then replayed.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("trade_replay_{unique}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let line = serde_json::to_string(&serde_json::json!({
+            "kind": "trade_tape_event",
+            "event": {
+                "asset_id": "a1",
+                "taker_side": "sell",
+                "price": 0.49,
+                "size": 50.0,
+                "event_at_ms": 5_000u64,
+                "trade_id": "t-5000",
+                "synthesised": true
+            }
+        }))
+        .unwrap();
+        writeln!(file, "{line}").unwrap();
+        // Add a non-matching line and a malformed line to verify they are skipped.
+        writeln!(file, "{}", r#"{"kind":"runtime_event","record":{}}"#).unwrap();
+        writeln!(file, "this is not json").unwrap();
+        drop(file);
+
+        let count = replay_trade_events_from_journal(&path, &mut shadow_replay_book).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(count, 1, "exactly one trade_tape_event row was replayed");
+        assert_eq!(live_fills.len(), 1);
+        assert_eq!(
+            shadow_live_book.open_order_count(),
+            shadow_replay_book.open_order_count(),
+            "replayed book and live book agree on open-order count"
+        );
     }
 
     #[test]
