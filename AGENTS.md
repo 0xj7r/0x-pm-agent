@@ -1,5 +1,77 @@
 # Engineering principles
 
+## Strategy intent: paired MM + convex asymmetric payoff
+
+The `btc_5m_mm` strategy runs TWO complementary entry paths, not one.
+Future agents have repeatedly over-suppressed one to "fix" the other.
+Don't do that.
+
+**Path 1 — Paired bidding (the rebate workhorse).**
+Quote both legs (Up + Down) at fair − edge, capture maker rebates on
+fills, merge paired inventory back to $1 collateral. Works in flat /
+mid-priced markets where both legs are near 50/50. This is where most
+of our day-to-day revenue comes from.
+
+**Path 2 — Convex accumulation (the asymmetric payoff side bet).**
+When paired entry is suppressed because one leg is at premium prices
+(e.g., Up=$0.95, Down=$0.05), the strategy buys the cheap leg at
+≤ $0.45 in small size, betting on rare reversal. Pays off ~5-15% of
+the time but pays 5-20× when it does. This is NOT a separate strategy —
+it's the second arm of the same one. The asymmetric payoff is a core
+design intent.
+
+**What this strategy is NOT.**
+- NOT directional momentum chasing. We do not buy the winning side
+  at $0.95 expecting $1 payout. That's a different strategy
+  (latency-arb-against-spot) we don't currently run.
+- NOT pure paired-only. Suppressing convex_accum because "one side is
+  too expensive" kills the asymmetric payoff. Cooling state should
+  pause paired bidding while still attempting convex_accum where the
+  reason permits (premium fair cap, market mid moved, btc trending).
+
+**Hard suppression triggers** (skip ALL entry paths, including convex):
+asymmetric entry-fill cooldown, post-fill cooldown, btc regime
+inactive, runtime degraded.
+
+**Soft suppression triggers** (skip paired, allow convex):
+premium fair cap, market mid moved, btc regime trending.
+
+When introducing a new gate, ASK yourself: does this gate hurt paired
+behavior, convex behavior, or both? Encode the answer in the gate's
+return type (e.g., `GateOutcome::{Allow, SuppressPaired, SuppressAll}`)
+rather than a string-prefix classifier downstream.
+
+## Gate calibration: prefer signals over hardcoded constants
+
+When adding a threshold (timing, magnitude, count), the V1 implementation
+can use a constant for safety, but the V2 should be SIGNAL-DERIVED:
+- Trend persistence threshold → scaled by `btc_regime.realized_vol_5m_bps`
+- Bar-relative timing → fraction of `bar_window_ms` (works for 5m, 15m,
+  any future timeframe)
+- Bid count caps → `max_leg_cost / typical_clip` (capital-aware)
+- Hit-rate-driven self-feedback (rolling P&L tracking) where possible
+
+Constants get the bot bounded; signals get it optimal. Plan the V2 in
+the same PR's commit message even if you ship V1.
+
+## Env var alignment
+
+Launcher (`scripts/*.sh`) env exports MUST match what `config/mod.rs`
+parses, exactly. We've shipped 2 silent-failure bugs from this:
+
+- `WHALE_PAIR_JOURNAL_PATH` (launcher) vs `WHALE_PAIR_EXEC_JOURNAL_PATH`
+  (parser) → tinylive ran with no decision log on disk.
+- `WHALE_PAIR_LIVE_AUTO_REDEEM` parsed by binary but never set by any
+  launcher → auto-redeem silently disabled in production.
+
+**Before shipping any new env knob:** grep both directions
+(`grep -rn "MY_NEW_VAR" polymarket-exec/src/ scripts/`) and verify
+the names match. If you remove a knob from the binary, also remove
+from env files / launcher. If you remove from launcher, remove from
+binary.
+
+A coverage table belongs in BANDAIDS.md so we don't drift.
+
 ## No bandaids — fix the core engine
 
 When a behavior is missing or broken, the fix goes IN THE RUST ENGINE
