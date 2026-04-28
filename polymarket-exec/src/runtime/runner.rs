@@ -1898,24 +1898,70 @@ async fn fetch_btc_5m_gamma_records(
     now_ms: u64,
 ) -> Result<Vec<crate::market_context::MarketContextRecord>> {
     let client = reqwest::Client::new();
-    let window_ms = config.market_discovery_window.as_millis().max(1) as u64;
-    let current_start_ms = now_ms - (now_ms % window_ms);
-    let start_offset = -(config.market_discovery_include_prev as i64);
-    let end_offset = config.market_discovery_include_next as i64;
     let mut records = Vec::new();
+    if config.market_discovery_families.is_empty() {
+        let window_ms = config.market_discovery_window.as_millis().max(1) as u64;
+        sweep_family_into(
+            &client,
+            &config.market_discovery_gamma_url,
+            &config.market_discovery_slug_prefix,
+            window_ms,
+            config.market_discovery_include_prev,
+            config.market_discovery_include_next,
+            now_ms,
+            &mut records,
+        )
+        .await?;
+    } else {
+        for family in &config.market_discovery_families {
+            let window_ms = family.window.as_millis().max(1) as u64;
+            sweep_family_into(
+                &client,
+                &config.market_discovery_gamma_url,
+                &family.prefix,
+                window_ms,
+                config.market_discovery_include_prev,
+                config.market_discovery_include_next,
+                now_ms,
+                &mut records,
+            )
+            .await?;
+        }
+    }
+    records.sort_by_key(|record| {
+        (
+            record.event_start_time_ms.unwrap_or_default(),
+            record.event_end_time_ms.unwrap_or_default(),
+            record.market_id.clone(),
+        )
+    });
+    records.dedup_by(|left, right| left.market_id == right.market_id);
+    Ok(records)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep_family_into(
+    client: &reqwest::Client,
+    gamma_url: &str,
+    slug_prefix: &str,
+    window_ms: u64,
+    include_prev: usize,
+    include_next: usize,
+    now_ms: u64,
+    out: &mut Vec<crate::market_context::MarketContextRecord>,
+) -> Result<()> {
+    let current_start_ms = now_ms - (now_ms % window_ms);
+    let start_offset = -(include_prev as i64);
+    let end_offset = include_next as i64;
     for offset in start_offset..=end_offset {
         let start_ms = if offset < 0 {
             current_start_ms.saturating_sub((-offset as u64) * window_ms)
         } else {
             current_start_ms.saturating_add((offset as u64) * window_ms)
         };
-        let slug = format!(
-            "{}{}",
-            config.market_discovery_slug_prefix,
-            start_ms / 1_000
-        );
+        let slug = format!("{slug_prefix}{}", start_ms / 1_000);
         let payload = client
-            .get(&config.market_discovery_gamma_url)
+            .get(gamma_url)
             .query(&[("slug", slug.as_str())])
             .header("User-Agent", "polymarket-agent/1.0")
             .header("Accept", "application/json")
@@ -1928,22 +1974,12 @@ async fn fetch_btc_5m_gamma_records(
             continue;
         };
         for item in items {
-            if let Some(record) =
-                parse_gamma_market_record(item, &config.market_discovery_slug_prefix, window_ms)
-            {
-                records.push(record);
+            if let Some(record) = parse_gamma_market_record(item, slug_prefix, window_ms) {
+                out.push(record);
             }
         }
     }
-    records.sort_by_key(|record| {
-        (
-            record.event_start_time_ms.unwrap_or_default(),
-            record.event_end_time_ms.unwrap_or_default(),
-            record.market_id.clone(),
-        )
-    });
-    records.dedup_by(|left, right| left.market_id == right.market_id);
-    Ok(records)
+    Ok(())
 }
 
 fn select_runtime_market_records(
