@@ -274,7 +274,6 @@ pub struct Btc5mMmConfig {
     pub entry_ladder_spacing_ticks: f64,
     pub cooldown_ms: u64,
     pub taker_fee_coeff: f64,
-    pub allow_single_leg_entry: bool,
 }
 
 impl Btc5mMmConfig {
@@ -325,10 +324,6 @@ impl Btc5mMmConfig {
             ),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
-            allow_single_leg_entry: parse_bool(
-                "WHALE_PAIR_BTC_5M_MM_ALLOW_SINGLE_LEG_ENTRY",
-                false,
-            ),
         };
         Self {
             base_clip_usd: config.base_clip_usd.max(0.01),
@@ -358,7 +353,6 @@ impl Btc5mMmConfig {
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
-            allow_single_leg_entry: config.allow_single_leg_entry,
         }
     }
 }
@@ -2060,6 +2054,12 @@ impl Btc5mMmStrategy {
         }
     }
 
+    fn cooling_allows_convex_accumulation(reason: &str) -> bool {
+        reason.starts_with("market mid moved")
+            || reason.starts_with("premium fair cap")
+            || reason.starts_with("btc regime trending")
+    }
+
     fn quote_health(quote: &QuoteSnapshot) -> String {
         let bid = Self::best_bid(quote)
             .map(|price| format!("{price:.4}"))
@@ -2440,10 +2440,11 @@ impl Btc5mMmStrategy {
                 until_ms: None,
             };
         }
-        if trade_count_5m_ok && vol_5m < 1.0 {
+        let has_btc_signal = btc_regime.observed_at_ms > 0;
+        if has_btc_signal && !trade_count_5m_ok && vol_5m < 1.0 {
             return Btc5mMmMarketMode::Cooling {
                 reason: format!(
-                    "btc regime flat: vol_5m={vol_5m:.2}bps trades_5m={}",
+                    "btc regime inactive: vol_5m={vol_5m:.2}bps trades_5m={}",
                     btc_regime.trade_count_5m
                 ),
                 until_ms: None,
@@ -3088,6 +3089,7 @@ impl Strategy for Btc5mMmStrategy {
                         ),
                     );
                 }
+                let mut cooling_reason = None;
                 if let Btc5mMmMarketMode::Cooling { reason, until_ms } = &market_mode {
                     if self.should_log_cooling_note(&snapshot.market_id, context.now_ms, reason) {
                         tracing::info!(
@@ -3102,11 +3104,14 @@ impl Strategy for Btc5mMmStrategy {
                             "fresh paired entry suppressed by market state"
                         );
                     }
-                    return self.no_quote_decision(
-                        &snapshot.market_id,
-                        context.now_ms,
-                        format!("market state cooling: {reason} until={until_ms:?}"),
-                    );
+                    if !Self::cooling_allows_convex_accumulation(reason) {
+                        return self.no_quote_decision(
+                            &snapshot.market_id,
+                            context.now_ms,
+                            format!("market state cooling: {reason} until={until_ms:?}"),
+                        );
+                    }
+                    cooling_reason = Some((reason.as_str(), *until_ms));
                 }
 
                 // Fill-rate-aware sizing (#43): scale base clip by recent
@@ -3116,23 +3121,25 @@ impl Strategy for Btc5mMmStrategy {
                 let fill_scale = self.fill_rate_clip_scale(context.now_ms);
                 let scaled_clip = (self.config.base_clip_usd * fill_scale)
                     .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
-                intents.extend(self.build_paired_entry_ladder(
-                    &snapshot.market_id,
-                    &left_id,
-                    &left_quote,
-                    left_fair,
-                    left_cost,
-                    &right_id,
-                    &right_quote,
-                    right_fair,
-                    right_cost,
-                    gross_cost,
-                    max_entry_gross_cost_usd,
-                    max_entry_leg_cost_usd,
-                    scaled_clip,
-                    context.venue_rules.as_ref(),
-                    context.now_ms,
-                ));
+                if cooling_reason.is_none() {
+                    intents.extend(self.build_paired_entry_ladder(
+                        &snapshot.market_id,
+                        &left_id,
+                        &left_quote,
+                        left_fair,
+                        left_cost,
+                        &right_id,
+                        &right_quote,
+                        right_fair,
+                        right_cost,
+                        gross_cost,
+                        max_entry_gross_cost_usd,
+                        max_entry_leg_cost_usd,
+                        scaled_clip,
+                        context.venue_rules.as_ref(),
+                        context.now_ms,
+                    ));
+                }
                 if intents.is_empty() {
                     if let Some(intent) = self.build_convex_accumulation_intent(
                         &snapshot.market_id,
@@ -3154,11 +3161,16 @@ impl Strategy for Btc5mMmStrategy {
                     }
                 }
                 if intents.is_empty() {
+                    let cooling_suffix = cooling_reason
+                        .map(|(reason, until_ms)| {
+                            format!(" cooling_reason={reason} until={until_ms:?}")
+                        })
+                        .unwrap_or_default();
                     return self.no_quote_decision(
                         &snapshot.market_id,
                         context.now_ms,
                         format!(
-                            "paired entry ladder rejected left={} {} right={} {} gross_cost={gross_cost:.2}/{max_entry_gross_cost_usd:.2} leg_cap={max_entry_leg_cost_usd:.2} levels={} scaled_clip={scaled_clip:.2}",
+                            "entry rejected left={} {} right={} {} gross_cost={gross_cost:.2}/{max_entry_gross_cost_usd:.2} leg_cap={max_entry_leg_cost_usd:.2} levels={} scaled_clip={scaled_clip:.2}{}",
                             left_id,
                             self.bid_health(
                                 &left_quote,
@@ -3178,6 +3190,7 @@ impl Strategy for Btc5mMmStrategy {
                                 context.venue_rules.as_ref(),
                             ),
                             self.config.entry_ladder_levels,
+                            cooling_suffix,
                         ),
                     );
                 }
@@ -5622,16 +5635,6 @@ fn parse_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn parse_bool(key: &str, default: bool) -> bool {
-    env::var(key)
-        .ok()
-        .and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "y" | "on" => Some(true),
-            "0" | "false" | "no" | "n" | "off" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
-}
 
 fn parse_usize(key: &str, default: usize) -> usize {
     env::var(key)
@@ -5877,7 +5880,6 @@ mod tests {
             entry_ladder_spacing_ticks: 1.0,
             cooldown_ms: 0,
             taker_fee_coeff: 0.072,
-            allow_single_leg_entry: false,
         }
     }
 
