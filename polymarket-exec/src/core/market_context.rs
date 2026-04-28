@@ -183,6 +183,22 @@ impl MarketContextStore {
         mapping
     }
 
+    pub fn market_id_for_asset(&self, asset_id: &str) -> Option<MarketId> {
+        let asset_id = asset_id.trim();
+        if asset_id.is_empty() {
+            return None;
+        }
+        self.by_market_id
+            .iter()
+            .find(|(_, record)| {
+                record
+                    .instrument_ids
+                    .iter()
+                    .any(|instrument_id| instrument_id == asset_id)
+            })
+            .map(|(market_id, _)| market_id.clone())
+    }
+
     pub fn len(&self) -> usize {
         self.by_market_id.len()
     }
