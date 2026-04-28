@@ -1,6 +1,6 @@
 # TODO: Execution Roadmap (Rust `polymarket-exec` is now primary)
 
-_Last updated: 2026-04-25_
+_Last updated: 2026-04-28_
 
 ## What is already in place
 
@@ -71,6 +71,9 @@ _Last updated: 2026-04-25_
   - Add mock CLOB + relayer HTTP fixtures for order submit/cancel, open-order sync, Data API positions, relayer nonce, relayer submit, and transaction polling.
   - Replay one full paired market lifecycle: maker bid submit -> one leg fill -> hedge/pair fill -> merge request -> venue position disappears -> cash recovers.
   - Treat this as CI coverage; live tiny-capital smoke remains the final venue validation, not the only test layer.
+- [ ] Add maker-rebate attribution for live fills.
+  - Distinguish submitted-as-post-only from actually-rested-and-filled-as-maker.
+  - Persist per-order maker/taker outcome, rest time before fill, and rebated-fee eligibility so calibration can answer whether our buys are being left open for takers.
 - [ ] Validate relayer wallet mapping before next live run.
   - `RELAYER_API_KEY` is present locally but `RELAYER_API_KEY_ADDRESS` is currently missing.
   - The relayer key owner can be the core/builder account, but the transaction signer still needs to be the bot private key and the proxy wallet must be the inventory-holding Polymarket wallet.
