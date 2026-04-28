@@ -40,9 +40,13 @@ export POLYMARKET_SIGNATURE_TYPE=eoa
 unset POLYMARKET_FUNDER_ADDRESS POLYMARKET_FUNDER
 export POLYMARKET_FUNDER_ADDRESS='' POLYMARKET_FUNDER=''
 
-# V1 endpoint — works today with USDC.e until Apr 28 cutover
+# V2 endpoint. Polymarket cutover happened 2026-04-28; V1 now returns
+# {"error":"order_version_mismatch"} on submits. Flipped from v1 -> v2.
+# Engine binary already supports V2 (see live_auth.startup logs reporting
+# clob_v2_exchange + clob_v2_builder_code_present + clob_v2_metadata_present
+# detected at runtime).
 export POLYMARKET_CLOB_API_URL=https://clob.polymarket.com
-export POLYMARKET_CLOB_VERSION=v1
+export POLYMARKET_CLOB_VERSION=v2
 export POLYMARKET_COLLATERAL_TOKEN_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
 
 # Required for EOA-mode CTF merge/redeem (signs + submits direct to Polygon).
