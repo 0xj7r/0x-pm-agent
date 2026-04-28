@@ -9,6 +9,9 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::event_log::EventRecord;
+use crate::paper::queue_model::QueueModelEstimate;
+use crate::paper::trade_tape::TradeEvent;
+use crate::runtime::fidelity::FidelityEvent;
 use crate::runtime::RuntimeCheckpoint;
 use crate::types::RuntimeCommand;
 
@@ -31,6 +34,15 @@ enum JournalLine<'a> {
     },
     RuntimeReplayCheckpoint {
         checkpoint: &'a RuntimeCheckpoint,
+    },
+    TradeTapeEvent {
+        event: &'a TradeEvent,
+    },
+    QueueModelEstimate {
+        estimate: &'a QueueModelEstimate,
+    },
+    FidelityEvent {
+        event: &'a FidelityEvent,
     },
 }
 
@@ -103,6 +115,18 @@ impl JournalWriter {
 
     pub fn append_runtime_checkpoint(&mut self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
         self.append_line(&JournalLine::RuntimeReplayCheckpoint { checkpoint })
+    }
+
+    pub fn append_trade_tape_event(&mut self, event: &TradeEvent) -> Result<()> {
+        self.append_line(&JournalLine::TradeTapeEvent { event })
+    }
+
+    pub fn append_queue_model_estimate(&mut self, estimate: &QueueModelEstimate) -> Result<()> {
+        self.append_line(&JournalLine::QueueModelEstimate { estimate })
+    }
+
+    pub fn append_fidelity_event(&mut self, event: &FidelityEvent) -> Result<()> {
+        self.append_line(&JournalLine::FidelityEvent { event })
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -287,5 +311,107 @@ mod tests {
         assert!(active_contents.contains("\"second\""));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_trade_tape_event_jsonl() {
+        use crate::paper::trade_tape::TradeEvent;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("polymarket-exec-journal-trade-{unique}.jsonl"));
+
+        let event = TradeEvent {
+            asset_id: InstrumentId::from("asset-1"),
+            taker_side: TradeSide::Sell,
+            price: 0.49,
+            size: 25.0,
+            event_at_ms: 1_700_000_000_000,
+            trade_id: "trade-abc".to_string(),
+            synthesised: false,
+        };
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal.append_trade_tape_event(&event).unwrap();
+        journal.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let line = contents.lines().next().unwrap();
+        assert!(line.contains("\"kind\":\"trade_tape_event\""));
+        assert!(line.contains("\"trade_id\":\"trade-abc\""));
+        assert!(line.contains("\"size\":25.0"));
+        assert!(line.contains("\"synthesised\":false"));
+    }
+
+    #[test]
+    fn writes_queue_model_estimate_jsonl() {
+        use crate::paper::queue_model::QueueModelEstimate;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("polymarket-exec-journal-queue-{unique}.jsonl"));
+
+        let estimate = QueueModelEstimate {
+            observed_at_ms: 1_700_000_000_000,
+            market_family: "btc-updown-5m".to_string(),
+            queue_decay_rate_per_sec: 1.45,
+            n_observations: 87,
+        };
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal.append_queue_model_estimate(&estimate).unwrap();
+        journal.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let line = contents.lines().next().unwrap();
+        assert!(line.contains("\"kind\":\"queue_model_estimate\""));
+        assert!(line.contains("\"market_family\":\"btc-updown-5m\""));
+        assert!(line.contains("\"queue_decay_rate_per_sec\":1.45"));
+        assert!(line.contains("\"n_observations\":87"));
+    }
+
+    #[test]
+    fn writes_fidelity_event_jsonl() {
+        use crate::runtime::fidelity::{FidelityEvent, FidelityVerdict};
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("polymarket-exec-journal-fidelity-{unique}.jsonl"));
+
+        let event = FidelityEvent {
+            observed_at_ms: 1_700_000_000_000,
+            market_family: "eth-updown-5m".to_string(),
+            window_start_ms: 1_699_999_940_000,
+            window_end_ms: 1_700_000_000_000,
+            shadow_fill_count: 14,
+            shadow_fill_notional_usd: 280.0,
+            shadow_rebate_usd: 0.42,
+            bonereaper_fill_count: 18,
+            bonereaper_fill_notional_usd: 360.0,
+            bonereaper_rebate_usd: 0.54,
+            mape_fill_count: 0.22,
+            verdict: FidelityVerdict::Ok,
+        };
+        let mut journal = JournalWriter::open(&path).unwrap();
+        journal.append_fidelity_event(&event).unwrap();
+        journal.flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let line = contents.lines().next().unwrap();
+        assert!(line.contains("\"kind\":\"fidelity_event\""));
+        assert!(line.contains("\"verdict\":\"ok\""));
+        assert!(line.contains("\"market_family\":\"eth-updown-5m\""));
+        assert!(line.contains("\"shadow_fill_count\":14"));
+        assert!(line.contains("\"bonereaper_fill_count\":18"));
     }
 }

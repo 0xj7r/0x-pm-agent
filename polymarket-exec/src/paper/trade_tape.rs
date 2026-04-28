@@ -22,12 +22,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
+
 use crate::core::types::{
     ClientOrderId, EpochMillis, FillLiquidity, FillReport, InstrumentId, OrderIntent, TradeSide,
 };
 use crate::paper::queue_model::{depth_ahead_remaining, DepthInputs, QueueDecayEstimator};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TradeEvent {
     pub asset_id: InstrumentId,
     pub taker_side: TradeSide,

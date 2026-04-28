@@ -17,6 +17,10 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
+use crate::core::types::EpochMillis;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DepthInputs {
     pub depth_ahead_at_post: f64,
@@ -38,6 +42,16 @@ pub fn depth_ahead_remaining(inputs: DepthInputs, decay_rate_per_sec: f64) -> f6
 struct FamilyState {
     rate: f64,
     n_observations: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueModelEstimate {
+    pub observed_at_ms: EpochMillis,
+    pub market_family: String,
+    /// `f64::NAN` while the model is uncalibrated. Treated as a meaningful
+    /// "we don't know yet" signal by downstream consumers.
+    pub queue_decay_rate_per_sec: f64,
+    pub n_observations: u32,
 }
 
 #[derive(Debug)]
@@ -70,6 +84,16 @@ impl QueueDecayEstimator {
 
     pub fn n_observations(&self, family: &str) -> u32 {
         self.state.get(family).map(|s| s.n_observations).unwrap_or(0)
+    }
+
+    pub fn snapshot(&self, family: &str, observed_at_ms: EpochMillis) -> QueueModelEstimate {
+        let entry = self.state.get(family);
+        QueueModelEstimate {
+            observed_at_ms,
+            market_family: family.to_string(),
+            queue_decay_rate_per_sec: entry.map(|s| s.rate).unwrap_or(f64::NAN),
+            n_observations: entry.map(|s| s.n_observations).unwrap_or(0),
+        }
     }
 
     pub fn update_with_fill(

@@ -1,6 +1,7 @@
 //! Core runtime state machine: signal ingestion, strategy evaluation, and order lifecycle.
 
 mod audit;
+pub mod fidelity;
 mod live_auth;
 pub mod order_store;
 pub mod reconcile;
