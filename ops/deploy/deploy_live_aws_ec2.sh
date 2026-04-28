@@ -8,6 +8,7 @@ REMOTE_USER="${AWS_LIVE_USER:-ubuntu}"
 REMOTE_PORT="${AWS_LIVE_PORT:-22}"
 REMOTE_KEY="${AWS_LIVE_KEY_PATH:-$HOME/.ssh/polymarket_aws_live}"
 REMOTE_ROOT="${AWS_LIVE_REMOTE_ROOT:-/home/$REMOTE_USER/go/polymarket-agent}"
+REMOTE_CARGO_TARGET_DIR="${AWS_LIVE_CARGO_TARGET_DIR:-/home/$REMOTE_USER/.cache/polymarket-agent-cargo-target}"
 AWS_REGION="${AWS_REGION:-eu-west-1}"
 
 log() {
@@ -75,7 +76,7 @@ log "installing user service templates"
 ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
 
 log "building single release binary"
-ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && \"\$CARGO_BIN\" build --release -p polymarket-exec && mkdir -p \"\$HOME/.local/bin\" && install -m 0755 target/release/polymarket-exec \"\$HOME/.local/bin/polymarket-exec\" && test -x \"\$HOME/.local/bin/polymarket-exec\" && rm -rf target"
+ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && mkdir -p '$REMOTE_CARGO_TARGET_DIR' \"\$HOME/.local/bin\" && CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec && install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/polymarket-exec\" && test -x \"\$HOME/.local/bin/polymarket-exec\""
 
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
@@ -92,6 +93,9 @@ Deploy complete.
 
 Remote root:
   $REMOTE_ROOT
+
+Persistent remote Cargo target dir:
+  $REMOTE_CARGO_TARGET_DIR
 
 Tinylive env to edit on the AWS host:
   ~/.config/polymarket-exec/btc_5m_mm_tinylive.env
