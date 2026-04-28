@@ -78,84 +78,89 @@ Working checklist for the live `polymarket-exec` engine. Check items only when t
   - Desired test: Service exits cleanly on SIGINT/SIGTERM before `TimeoutStopSec`.
   - Fix shape: Wire shutdown signal handling through the runtime select loop and close websocket/tasks cleanly.
 
+- [ ] 15. Opportunistically maintain a pUSD trading float from USDC.e reserves
+  - Issue: V2 trading consumes pUSD, but deposits/redeems/operator tracking can leave idle USDC.e outside the CLOB trading balance.
+  - Desired test: With pUSD below a configured floor, USDC.e above reserve, gas below cap, and the top-up cooldown elapsed, the runtime wraps only the top-up amount through CollateralOnramp; otherwise it logs the skipped reason and submits no transaction.
+  - Fix shape: Add an engine-side balance worker that logs pUSD, USDC.e, and MATIC separately, keeps explicit USDC.e/MATIC reserves, enforces gas-price and minimum-interval guards, and wraps asynchronously to `WHALE_PAIR_LIVE_PUSD_TARGET_USD` rather than blindly converting all USDC.e.
+
 ## P2 - Bandaid-Killing S1 Refactors
 
-- [ ] 15. Introduce `CoolingReason` enum
+- [ ] 16. Introduce `CoolingReason` enum
   - Why: Replaces string-prefix cooling reason checks such as the convex accumulation bandaid.
 
-- [ ] 16. Persist `StrategyTag` and `IntentKind`
+- [ ] 17. Persist `StrategyTag` and `IntentKind`
   - Why: Removes `client_order_id.starts_with("btc-5m-mm:")` checks across runtime/reporting paths.
 
-- [ ] 17. Introduce typed `EventKind` and `MmQuoteKind`
+- [ ] 18. Introduce typed `EventKind` and `MmQuoteKind`
   - Why: Collapses duplicated string classifiers.
 
-- [ ] 18. Add single `PairLeg::classify` source of truth
+- [ ] 19. Add single `PairLeg::classify` source of truth
   - Why: Collapses repeated yes/no leg detection logic.
 
-- [ ] 19. Introduce typed cancel reasons
+- [ ] 20. Introduce typed cancel reasons
   - Why: Replaces string comparisons such as `reason != "no longer desired"`.
 
-- [ ] 20. Feed live fills into `paper_report`
+- [ ] 21. Feed live fills into `paper_report`
   - Why: Enables fill-level shadow vs tinylive parity, not only decision-level parity.
 
 ## P3 - Phase 4 V2 Signal-Derived Calibration
 
-- [ ] 21. Replace `CONVEX_TREND_PERSISTENCE_BPS=50`
+- [ ] 22. Replace `CONVEX_TREND_PERSISTENCE_BPS=50`
   - Target: Derive from about `2.0 * realized_vol_5m_bps`.
 
-- [ ] 22. Replace `CONVEX_MIN_BAR_REMAINING_MS=60_000`
+- [ ] 23. Replace `CONVEX_MIN_BAR_REMAINING_MS=60_000`
   - Target: Derive from `bar_window_ms / 5`.
 
-- [ ] 23. Replace `CONVEX_MIN_BAR_ELAPSED_MS=60_000`
+- [ ] 24. Replace `CONVEX_MIN_BAR_ELAPSED_MS=60_000`
   - Target: Derive from `bar_window_ms / 5`.
 
-- [ ] 24. Replace `CONVEX_MAX_BIDS_PER_BAR=4`
+- [ ] 25. Replace `CONVEX_MAX_BIDS_PER_BAR=4`
   - Target: Derive from `min(N, max_leg_cost / typical_clip)`.
 
-- [ ] 25. Add order-flow imbalance signal
+- [ ] 26. Add order-flow imbalance signal
   - Target: Rolling 60s taker buy vs sell volume per leg.
 
-- [ ] 26. Add convex self-feedback signal
+- [ ] 27. Add convex self-feedback signal
   - Target: Rolling P&L adjusts the per-bar count cap.
 
 ## P4 - Bash Supervisor Cleanup
 
-- [ ] 27. Move market discovery/restart logic out of `scripts/run_unlawful_shear_paper.sh`
+- [ ] 28. Move market discovery/restart logic out of `scripts/run_unlawful_shear_paper.sh`
   - Why: The engine should refresh context and subscriptions without losing in-flight state.
 
-- [x] 28. Move venue, EOA, and strategy tuning out of `scripts/dublin_tinylive.sh`
+- [x] 29. Move venue, EOA, and strategy tuning out of `scripts/dublin_tinylive.sh`
   - Why: Launcher scripts should load env and launch the binary only.
   - Fix: `scripts/dublin_tinylive.sh` now delegates to `run_sleeve.sh btc_5m_mm_tinylive`; tinylive settings live in the canonical env.
 
-- [x] 29. Create one canonical tinylive env
+- [x] 30. Create one canonical tinylive env
   - Why: Live drifted across `common.env`, `live.env`, `paper.d`, repo sleeve env, and launcher exports.
   - Fix: Systemd instance services now load `~/.config/polymarket-exec/%i.env`; `run_sleeve.sh` prefers that host-local canonical env over repo presets.
 
 ## P5 - Larger Refactors
 
-- [ ] 30. Split `strategy.rs`
+- [ ] 31. Split `strategy.rs`
   - Target modules: `strategy/btc_mm.rs`, `strategy/unlawful_shear.rs`, `strategy/goat_pair.rs`, `strategy/types.rs`, and `strategy/profile.rs`.
   - Status: Tests are already extracted; main split remains pending.
 
-- [ ] 31. Split `runtime/runner.rs`
+- [ ] 32. Split `runtime/runner.rs`
   - Why: File is too large for safe navigation and isolated testing.
 
-- [ ] 32. Split `runtime/mod.rs`
+- [ ] 33. Split `runtime/mod.rs`
   - Why: File is too large for safe navigation and isolated testing.
 
-- [ ] 33. Add `Gate` trait and `GateOutcome` enum
+- [ ] 34. Add `Gate` trait and `GateOutcome` enum
   - Why: Replaces ad-hoc gate composition and makes paired-vs-convex suppression explicit.
 
-- [ ] 34. Add `BarFraction` timing primitive
+- [ ] 35. Add `BarFraction` timing primitive
   - Why: Makes 5m to 15m strategy timing changes zero or near-zero code changes.
 
 ## P6 - Defer Until P0-P3 Are Stable
 
-- [ ] 35. Increase clip size from $1.10 to $4-$5
+- [ ] 36. Increase clip size from $1.10 to $4-$5
   - Gate: Only after 5m behavior is statistically stable.
 
-- [ ] 36. Increase ladder depth from 2 levels to 4-8 levels
+- [ ] 37. Increase ladder depth from 2 levels to 4-8 levels
   - Gate: Only after current live execution quality is stable.
 
-- [ ] 37. Expand to multi-asset or multi-timeframe
+- [ ] 38. Expand to multi-asset or multi-timeframe
   - Gate: Only after we match per-market unlawful execution quality on BTC 5m.

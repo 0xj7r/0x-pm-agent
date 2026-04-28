@@ -651,6 +651,29 @@ fn btc_5m_mm_blocks_entry_when_market_mid_moves_fast() {
 }
 
 #[test]
+fn btc_5m_mm_keeps_pairing_when_market_move_is_still_pairable() {
+    let mut config = btc_5m_mm_test_config();
+    config.cooldown_ms = 0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let initial_ctx = context_at(Vec::new(), 10);
+    strategy.on_market_snapshot(&initial_ctx, &snapshot("up", "market-mm", 0.49, 0.51, 10));
+    strategy.on_market_snapshot(&initial_ctx, &snapshot("down", "market-mm", 0.49, 0.51, 10));
+
+    let moved_ctx = context_at(Vec::new(), 20_000);
+    strategy.on_market_snapshot(&moved_ctx, &snapshot("up", "market-mm", 0.44, 0.46, 20_000));
+    let decision = strategy.on_market_snapshot(
+        &moved_ctx,
+        &snapshot("down", "market-mm", 0.54, 0.56, 20_000),
+    );
+
+    assert_eq!(decision.intents.len(), 2);
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() == Some("mm-paired-bid:l1")));
+}
+
+#[test]
 fn btc_5m_mm_prunes_stale_market_states_without_dropping_inventory_market() {
     let mut config = btc_5m_mm_test_config();
     config.cooldown_ms = 0;
@@ -1071,6 +1094,39 @@ fn btc_5m_mm_holds_cheap_stranded_inventory_when_hold_ev_beats_rescue() {
         .notes
         .iter()
         .any(|note| note.contains("hold stranded positive-asymmetry")));
+}
+
+#[test]
+fn btc_5m_mm_partially_rescues_oversized_convex_inventory() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.max_leg_cost_usd = 10.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 25.0,
+        avg_price: 0.42,
+        mark_price: Some(0.52),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.50, 0.54, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.46, 0.48, 10));
+
+    assert_eq!(decision.intents.len(), 1);
+    let hedge = &decision.intents[0];
+    assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
+    assert!(hedge.quantity > 0.0);
+    assert!(
+        hedge.quantity < 25.0,
+        "strategy should keep a convex tranche instead of rescuing everything"
+    );
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("partial rescue stranded leg")));
 }
 
 #[test]
