@@ -461,6 +461,16 @@ impl<S: Strategy> Runtime<S> {
         self.venue_market_rules.get(market_id).copied()
     }
 
+    fn canonical_market_id_for_instrument(
+        &self,
+        instrument_id: &InstrumentId,
+        fallback: &MarketId,
+    ) -> MarketId {
+        self.market_contexts
+            .market_id_for_asset(instrument_id.as_str())
+            .unwrap_or_else(|| fallback.clone())
+    }
+
     /// Clear the pending-merge dedup entry for a market. Called by the
     /// runner when a merge submission FAILS (retryable or otherwise) so
     /// the next reconcile sweep can re-attempt. Without this, a single
@@ -769,7 +779,25 @@ impl<S: Strategy> Runtime<S> {
         venue_positions: &[VenuePositionSnapshot],
         observed_at_ms: EpochMillis,
     ) -> Result<InventoryReconciliationReport, RuntimeError> {
-        for venue_position in venue_positions {
+        let venue_positions = venue_positions
+            .iter()
+            .map(|position| {
+                let canonical_market_id = self.canonical_market_id_for_instrument(
+                    &position.instrument_id,
+                    &position.market_id,
+                );
+                VenuePositionSnapshot {
+                    market_id: canonical_market_id,
+                    condition_id: position.condition_id.clone(),
+                    instrument_id: position.instrument_id.clone(),
+                    quantity: position.quantity,
+                    average_cost_usd: position.average_cost_usd,
+                    mark_price: position.mark_price,
+                    observed_at_ms: position.observed_at_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        for venue_position in &venue_positions {
             if let Some(condition_id) = venue_position
                 .condition_id
                 .as_deref()
@@ -781,7 +809,7 @@ impl<S: Strategy> Runtime<S> {
         }
         let report = self
             .inventory
-            .reconcile_venue_positions(venue_positions, observed_at_ms)?;
+            .reconcile_venue_positions(&venue_positions, observed_at_ms)?;
         const DRIFT_QTY_EPSILON: f64 = 1e-6;
         let is_startup_reconcile = !self.initial_reconcile_complete;
         for delta in &report.deltas {
@@ -1491,7 +1519,9 @@ impl<S: Strategy> Runtime<S> {
         self.btc_signals.record_trade(price, observed_at_ms);
     }
 
-    pub fn on_fill(&mut self, fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
+    pub fn on_fill(&mut self, mut fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
+        fill.market_id =
+            self.canonical_market_id_for_instrument(&fill.instrument_id, &fill.market_id);
         let now_ms = fill.observed_at_ms;
         let merge_flow = matches!(
             fill.close_method,
@@ -3564,6 +3594,118 @@ mod tests {
         assert_eq!(report.deltas.len(), 1);
         assert_eq!(runtime.stranded_inventory().len(), 1);
         assert_eq!(runtime.open_orders().count(), 0);
+    }
+
+    #[test]
+    fn venue_position_reconciliation_uses_active_market_id_for_token_inventory() {
+        let market_contexts = MarketContextStore::from_records(
+            vec![MarketContextRecord {
+                market_id: "2099163".to_string(),
+                instrument_ids: vec!["down-token".to_string(), "up-token".to_string()],
+                ..MarketContextRecord::default()
+            }],
+            Some("test".to_string()),
+            Some(10),
+        );
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            market_contexts,
+        );
+
+        runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    // Polymarket Data API can report condition id as the
+                    // market key; strategy book snapshots use the CLOB market
+                    // id. Runtime inventory must use the active CLOB market id
+                    // so strategy exposure gates count venue-held inventory.
+                    market_id: MarketId::from(
+                        "0xfb04b40894b43ad326be88f91e66cfb5d65dd31bed8dd85384404f8b2a23fe4f",
+                    ),
+                    condition_id: Some(
+                        "0xfb04b40894b43ad326be88f91e66cfb5d65dd31bed8dd85384404f8b2a23fe4f"
+                            .to_string(),
+                    ),
+                    instrument_id: InstrumentId::from("down-token"),
+                    quantity: 45.0,
+                    average_cost_usd: 0.3644,
+                    mark_price: Some(0.03),
+                    observed_at_ms: 10,
+                }],
+                11,
+            )
+            .expect("runtime venue reconciliation");
+
+        let position = runtime
+            .inventory()
+            .positions()
+            .find(|position| position.instrument_id == InstrumentId::from("down-token"))
+            .expect("venue position should be installed");
+        assert_eq!(position.market_id, MarketId::from("2099163"));
+        assert_eq!(
+            runtime.stranded_inventory()[0].market_id,
+            MarketId::from("2099163")
+        );
+    }
+
+    #[test]
+    fn venue_fill_uses_active_market_id_for_token_inventory() {
+        let market_contexts = MarketContextStore::from_records(
+            vec![MarketContextRecord {
+                market_id: "2099163".to_string(),
+                instrument_ids: vec!["down-token".to_string(), "up-token".to_string()],
+                ..MarketContextRecord::default()
+            }],
+            Some("test".to_string()),
+            Some(10),
+        );
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            market_contexts,
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: MarketId::from(
+                    "0xfb04b40894b43ad326be88f91e66cfb5d65dd31bed8dd85384404f8b2a23fe4f",
+                ),
+                instrument_id: InstrumentId::from("down-token"),
+                side: TradeSide::Buy,
+                price: 0.21,
+                quantity: 5.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("fill");
+
+        let position = runtime
+            .inventory()
+            .positions()
+            .find(|position| position.instrument_id == InstrumentId::from("down-token"))
+            .expect("venue fill should be installed");
+        assert_eq!(position.market_id, MarketId::from("2099163"));
+        assert_eq!(
+            runtime.stranded_inventory()[0].market_id,
+            MarketId::from("2099163")
+        );
     }
 
     #[test]
