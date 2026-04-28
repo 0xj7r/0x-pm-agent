@@ -1137,6 +1137,39 @@ fn btc_5m_mm_hedge_rescue_uses_rescue_clip_budget() {
 }
 
 #[test]
+fn btc_5m_mm_hedge_rescue_can_upsize_to_venue_minimum_above_clip() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.hedge_rescue_clip_usd = 2.50;
+    config.venue_min_order_quantity = 5.0;
+    config.min_order_quantity = 0.01;
+    config.min_order_notional_usd = 1.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 20.0,
+        avg_price: 0.40,
+        mark_price: Some(0.40),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.38, 0.40, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.62, 0.64, 10));
+
+    assert_eq!(
+        decision.intents.len(),
+        1,
+        "rescue should not be suppressed just because venue minimum notional exceeds the clip"
+    );
+    let hedge = &decision.intents[0];
+    assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
+    assert_eq!(hedge.quantity, 5.0);
+    assert!(hedge.quantity * hedge.limit_price > config.hedge_rescue_clip_usd);
+}
+
+#[test]
 fn btc_5m_mm_entry_caps_scale_with_free_cash_budget() {
     let mut config = btc_5m_mm_test_config();
     config.min_edge_bps = 10.0;

@@ -3038,9 +3038,14 @@ impl Btc5mMmStrategy {
             .map(|r| r.minimum_order_size)
             .filter(|m| m.is_finite() && *m > 0.0)
             .unwrap_or(self.config.venue_min_order_quantity);
+        let venue_min_notional = venue_min * sweep_price;
+        if max_rescue_notional_usd + 1e-9 < venue_min_notional {
+            return None;
+        }
         let max_sweep_notional = self
             .config
             .hedge_rescue_clip_usd
+            .max(venue_min_notional)
             .min(max_rescue_notional_usd)
             .max(0.0);
         let max_sweep_qty = max_sweep_notional / sweep_price;
