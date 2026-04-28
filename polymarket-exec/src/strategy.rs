@@ -722,7 +722,8 @@ struct Btc5mMmRescueState {
 
 #[derive(Debug, Clone)]
 struct Btc5mMmExposureDecision {
-    hold: bool,
+    rescue_qty: f64,
+    hold_qty: f64,
     reason: String,
     hold_ev_per_share: f64,
     rescue_ev_per_share: Option<f64>,
@@ -1631,7 +1632,7 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_SEVERE_SYMMETRY: f64 = 0.35;
     const ASYMMETRIC_FILL_MIN_TOTAL_QTY: f64 = 10.0;
     const ENTRY_PREMIUM_BID_CAP: f64 = 0.55;
-    const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
+    const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.38;
     const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.50;
     /// Convex accumulation gets a smaller slice of the per-market budget than
     /// paired entry. Paired bidding is the rebate workhorse and should consume
@@ -2574,15 +2575,16 @@ impl Btc5mMmStrategy {
         let vol_5m = btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
         let return_60s = btc_regime.return_60s_bps.unwrap_or(0.0).abs();
 
+        let max_fair = left_fair.max(right_fair);
         if let Some(movement) = market_mid_move {
-            if movement > Self::MARKET_MID_TREND_MAX_MOVE {
+            if movement > Self::MARKET_MID_TREND_MAX_MOVE && max_fair > Self::ENTRY_PREMIUM_BID_CAP
+            {
                 return Btc5mMmMarketMode::Cooling {
                     reason: format!("market mid moved {movement:.3}"),
                     until_ms: None,
                 };
             }
         }
-        let max_fair = left_fair.max(right_fair);
         if max_fair > Self::ENTRY_EXTREME_FAIR_CAP {
             return Btc5mMmMarketMode::Cooling {
                 reason: format!("premium fair cap: max_fair={max_fair:.3}"),
@@ -2655,6 +2657,7 @@ impl Btc5mMmStrategy {
         held_id: &InstrumentId,
         held_fair: f64,
         avg_cost: f64,
+        stranded_qty: f64,
         opposite_quote: &QuoteSnapshot,
         market_context: Option<&MarketContextRecord>,
         now_ms: EpochMillis,
@@ -2672,20 +2675,37 @@ impl Btc5mMmStrategy {
         let beats_rescue = rescue_ev
             .map(|ev| hold_ev > ev + Self::HOLD_EV_MARGIN)
             .unwrap_or(hold_ev >= Self::HOLD_MIN_EDGE);
-        let hold = beats_rescue && (cheap_positive || late_confident);
-        let reason = if hold {
+        let can_hold_convex = beats_rescue && (cheap_positive || late_confident);
+        let convex_hold_qty_cap = if can_hold_convex && avg_cost > 0.0 {
+            (self.config.max_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION / avg_cost).max(0.0)
+        } else {
+            0.0
+        };
+        let hold_qty = if can_hold_convex {
+            stranded_qty.min(convex_hold_qty_cap)
+        } else {
+            0.0
+        };
+        let rescue_qty = (stranded_qty - hold_qty).max(0.0);
+        let reason = if rescue_qty <= 1e-9 {
             format!(
-                "hold stranded positive-asymmetry leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_ev={hold_ev:.4} rescue_ev={rescue_ev:?}",
+                "hold stranded positive-asymmetry leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_ev={hold_ev:.4} rescue_ev={rescue_ev:?} hold_qty={hold_qty:.4}",
+                held_id
+            )
+        } else if hold_qty > 1e-9 {
+            format!(
+                "partial rescue stranded leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_ev={hold_ev:.4} rescue_ev={rescue_ev:?} rescue_qty={rescue_qty:.4} hold_qty={hold_qty:.4}",
                 held_id
             )
         } else {
             format!(
-                "rescue stranded leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_ev={hold_ev:.4} rescue_ev={rescue_ev:?}",
+                "rescue stranded leg={} fair={held_fair:.4} avg_cost={avg_cost:.4} hold_ev={hold_ev:.4} rescue_ev={rescue_ev:?} rescue_qty={rescue_qty:.4}",
                 held_id
             )
         };
         Btc5mMmExposureDecision {
-            hold,
+            rescue_qty,
+            hold_qty,
             reason,
             hold_ev_per_share: hold_ev,
             rescue_ev_per_share: rescue_ev,
@@ -3508,17 +3528,18 @@ impl Strategy for Btc5mMmStrategy {
                     held_id,
                     held_fair,
                     stranded_avg,
+                    stranded_qty,
                     lift_quote,
                     context.market_context.as_ref(),
                     context.now_ms,
                 );
                 let rescue_ok = throttle_ok
-                    && !exposure_decision.hold
+                    && exposure_decision.rescue_qty > 1e-9
                     && self.can_emit_rescue(
                         &snapshot.market_id,
                         held_id,
                         lift_id,
-                        stranded_qty,
+                        exposure_decision.rescue_qty,
                         context.now_ms,
                         &mut hold_notes,
                     );
@@ -3527,7 +3548,7 @@ impl Strategy for Btc5mMmStrategy {
                         &snapshot.market_id,
                         lift_id,
                         lift_quote,
-                        stranded_qty,
+                        exposure_decision.rescue_qty,
                         gross_cost,
                         context.venue_rules.as_ref(),
                         "btc-5m-mm hedge rescue",
@@ -3546,14 +3567,16 @@ impl Strategy for Btc5mMmStrategy {
                     avg_cost = exposure_decision.avg_cost,
                     hold_ev_per_share = exposure_decision.hold_ev_per_share,
                     rescue_ev_per_share = ?exposure_decision.rescue_ev_per_share,
-                    hold = exposure_decision.hold,
+                    rescue_qty = exposure_decision.rescue_qty,
+                    hold_qty = exposure_decision.hold_qty,
+                    hold = exposure_decision.rescue_qty <= 1e-9,
                     lift_best_ask = ?Self::best_ask(lift_quote),
                     rescue_profit_per_share = 1.0 - Self::best_ask(lift_quote).unwrap_or(1.0),
                     throttle_ok = throttle_ok,
                     intent_built = intent.is_some(),
                     "hedge rescue branch entered"
                 );
-                if exposure_decision.hold {
+                if exposure_decision.hold_qty > 1e-9 {
                     hold_notes.push(exposure_decision.reason);
                 }
                 if let Some(hedge) = intent {
@@ -3562,7 +3585,7 @@ impl Strategy for Btc5mMmStrategy {
                         &snapshot.market_id,
                         held_id,
                         lift_id,
-                        stranded_qty,
+                        exposure_decision.rescue_qty,
                         context.now_ms,
                     );
                 }
@@ -3632,17 +3655,18 @@ impl Strategy for Btc5mMmStrategy {
                         held_id,
                         held_fair,
                         stranded_avg,
+                        stranded_excess,
                         lift_quote,
                         context.market_context.as_ref(),
                         context.now_ms,
                     );
                     let rescue_ok = throttle_ok
-                        && !exposure_decision.hold
+                        && exposure_decision.rescue_qty > 1e-9
                         && self.can_emit_rescue(
                             &snapshot.market_id,
                             held_id,
                             lift_id,
-                            stranded_excess,
+                            exposure_decision.rescue_qty,
                             context.now_ms,
                             &mut hold_notes,
                         );
@@ -3651,7 +3675,7 @@ impl Strategy for Btc5mMmStrategy {
                             &snapshot.market_id,
                             lift_id,
                             lift_quote,
-                            stranded_excess,
+                            exposure_decision.rescue_qty,
                             gross_cost,
                             context.venue_rules.as_ref(),
                             "btc-5m-mm asymmetric rescue",
@@ -3672,14 +3696,16 @@ impl Strategy for Btc5mMmStrategy {
                         avg_cost = exposure_decision.avg_cost,
                         hold_ev_per_share = exposure_decision.hold_ev_per_share,
                         rescue_ev_per_share = ?exposure_decision.rescue_ev_per_share,
-                        hold = exposure_decision.hold,
+                        rescue_qty = exposure_decision.rescue_qty,
+                        hold_qty = exposure_decision.hold_qty,
+                        hold = exposure_decision.rescue_qty <= 1e-9,
                         lift_best_ask = ?Self::best_ask(lift_quote),
                         rescue_profit_per_share = 1.0 - Self::best_ask(lift_quote).unwrap_or(1.0),
                         throttle_ok,
                         intent_built = intent.is_some(),
                         "asymmetric rescue branch entered"
                     );
-                    if exposure_decision.hold {
+                    if exposure_decision.hold_qty > 1e-9 {
                         hold_notes.push(exposure_decision.reason);
                     }
                     if let Some(hedge) = intent {
@@ -3688,7 +3714,7 @@ impl Strategy for Btc5mMmStrategy {
                             &snapshot.market_id,
                             held_id,
                             lift_id,
-                            stranded_excess,
+                            exposure_decision.rescue_qty,
                             context.now_ms,
                         );
                     }
@@ -3732,13 +3758,12 @@ impl Strategy for Btc5mMmStrategy {
         if let Some(state) = self.market_states.get_mut(&snapshot.market_id) {
             state.last_action_ms = Some(context.now_ms);
         }
-        StrategyDecision {
-            notes: vec![format!(
-                "btc-5m-mm quotes left={} fair={left_fair:.4} right={} fair={right_fair:.4} gross_cost={gross_cost:.2}",
-                left_id, right_id
-            )],
-            intents,
-        }
+        let mut notes = hold_notes;
+        notes.push(format!(
+            "btc-5m-mm quotes left={} fair={left_fair:.4} right={} fair={right_fair:.4} gross_cost={gross_cost:.2}",
+            left_id, right_id
+        ));
+        StrategyDecision { notes, intents }
     }
 
     fn on_fill(
@@ -3828,8 +3853,10 @@ impl Strategy for Btc5mMmStrategy {
         let (left_id, left_quote) = sides[0].clone();
         let (right_id, right_quote) = sides[1].clone();
 
-        let (left_qty, _, _) = Self::position_for(&context.inventory, &fill.market_id, &left_id);
-        let (right_qty, _, _) = Self::position_for(&context.inventory, &fill.market_id, &right_id);
+        let (left_qty, left_avg, _) =
+            Self::position_for(&context.inventory, &fill.market_id, &left_id);
+        let (right_qty, right_avg, _) =
+            Self::position_for(&context.inventory, &fill.market_id, &right_id);
         let left_has = left_qty > 1e-9;
         let right_has = right_qty > 1e-9;
         if left_has == right_has {
@@ -3848,16 +3875,51 @@ impl Strategy for Btc5mMmStrategy {
             return StrategyDecision { notes, intents };
         }
 
-        let (stranded_id, lift_id, lift_quote, stranded_qty) = if left_has {
-            (left_id, right_id, right_quote, left_qty)
-        } else {
-            (right_id, left_id, left_quote, right_qty)
+        let Some((left_fair, right_fair)) = self.fair_values(
+            &left_id,
+            &left_quote,
+            &right_id,
+            &right_quote,
+            &context.btc_regime,
+            context.market_context.as_ref(),
+            context.now_ms,
+        ) else {
+            return StrategyDecision { notes, intents };
         };
+
+        let (stranded_id, held_fair, stranded_avg, lift_id, lift_quote, stranded_qty) = if left_has
+        {
+            (
+                left_id,
+                left_fair,
+                left_avg,
+                right_id,
+                right_quote,
+                left_qty,
+            )
+        } else {
+            (
+                right_id, right_fair, right_avg, left_id, left_quote, right_qty,
+            )
+        };
+        let exposure_decision = self.decide_stranded_exposure(
+            &stranded_id,
+            held_fair,
+            stranded_avg,
+            stranded_qty,
+            &lift_quote,
+            context.market_context.as_ref(),
+            context.now_ms,
+        );
+        if exposure_decision.rescue_qty <= 1e-9 {
+            notes.push(exposure_decision.reason);
+            return StrategyDecision { notes, intents };
+        }
         if !self.can_emit_rescue(
             &fill.market_id,
             &stranded_id,
             &lift_id,
-            stranded_qty,
+            exposure_decision.rescue_qty,
             context.now_ms,
             &mut notes,
         ) {
@@ -3868,7 +3930,7 @@ impl Strategy for Btc5mMmStrategy {
             &fill.market_id,
             &lift_id,
             &lift_quote,
-            stranded_qty,
+            exposure_decision.rescue_qty,
             gross_cost,
             context.venue_rules.as_ref(),
             "btc-5m-mm on-fill rescue",
@@ -3879,6 +3941,8 @@ impl Strategy for Btc5mMmStrategy {
             market = %fill.market_id,
             fill_instrument = %fill.instrument_id,
             stranded_qty,
+            rescue_qty = exposure_decision.rescue_qty,
+            hold_qty = exposure_decision.hold_qty,
             lift_best_ask = ?Self::best_ask(&lift_quote),
             intent_built = intent.is_some(),
             "on-fill rescue evaluated"
@@ -3889,7 +3953,7 @@ impl Strategy for Btc5mMmStrategy {
                 &fill.market_id,
                 &stranded_id,
                 &lift_id,
-                stranded_qty,
+                exposure_decision.rescue_qty,
                 context.now_ms,
             );
             notes.push("on-fill IOC rescue emitted".to_string());

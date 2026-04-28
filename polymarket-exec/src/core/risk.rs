@@ -228,7 +228,9 @@ impl RiskEngine {
 
         let current_position_qty = inventory.position_qty(&order.instrument_id);
         let projected_position_qty = current_position_qty + (order.quantity * order.side.sign());
-        if projected_position_qty.abs() > self.limits.max_position_quantity_per_instrument {
+        if !is_rescue
+            && projected_position_qty.abs() > self.limits.max_position_quantity_per_instrument
+        {
             return self.reject(
                 RiskRejectReason::PositionQuantityTooLarge,
                 context.now_ms.max(order.created_at_ms),
@@ -258,6 +260,31 @@ impl RiskEngine {
             TradeSide::Buy => inventory.free_cash_usd() - notional,
             TradeSide::Sell => inventory.free_cash_usd(),
         };
+        if is_rescue {
+            if projected_free_cash_usd < -1e-9 {
+                return self.reject(
+                    RiskRejectReason::FreeCashTooLow,
+                    context.now_ms.max(order.created_at_ms),
+                    projected_free_cash_usd,
+                    inventory.gross_exposure_usd(),
+                    inventory
+                        .net_exposure_for_market_usd(&order.market_id)
+                        .abs(),
+                    "rescue order exceeds available free cash",
+                );
+            }
+            return RiskDecision {
+                accepted: true,
+                reject_reason: None,
+                message: "risk check passed".into(),
+                evaluated_at_ms: context.now_ms.max(order.created_at_ms),
+                projected_free_cash_usd,
+                projected_gross_notional_usd: inventory.gross_exposure_usd(),
+                projected_market_net_notional_usd: inventory
+                    .net_exposure_for_market_usd(&order.market_id)
+                    .abs(),
+            };
+        }
         let free_cash_floor_usd = self.limits.free_cash_floor_usd(context.starting_cash_usd);
         if projected_free_cash_usd < free_cash_floor_usd {
             return self.reject(
@@ -349,7 +376,10 @@ impl RiskEngine {
 mod tests {
     use super::{RiskContext, RiskEngine, RiskLimits, RiskRejectReason};
     use crate::inventory::InventoryState;
-    use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, TradeSide};
+    use crate::types::{
+        ClientOrderId, FillLiquidity, FillReport, InstrumentId, IntentKind, MarketId, OrderIntent,
+        TradeSide,
+    };
 
     #[test]
     fn rejects_buy_that_exceeds_free_cash_floor() {
@@ -470,6 +500,96 @@ mod tests {
         assert_eq!(
             decision.reject_reason,
             Some(RiskRejectReason::PortfolioEquityTooLow)
+        );
+    }
+
+    #[test]
+    fn accepts_hedge_rescue_even_when_entry_exposure_caps_are_full() {
+        let mut inventory = InventoryState::new(50.0);
+        inventory
+            .apply_fill(&FillReport {
+                order_id: None,
+                client_order_id: Some(ClientOrderId::from("stranded-fill")),
+                market_id: MarketId::from("market-1"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.42,
+                quantity: 25.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 1,
+            })
+            .expect("seed stranded inventory");
+        let risk = RiskEngine::new(RiskLimits {
+            max_gross_notional_usd: 10.0,
+            max_net_notional_per_market_usd: 10.0,
+            max_position_quantity_per_instrument: 20.0,
+            min_free_cash_usd: 5.0,
+            min_free_cash_bps: 1_500.0,
+            ..RiskLimits::default()
+        });
+        let rescue = OrderIntent {
+            client_order_id: ClientOrderId::from("rescue-order"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            limit_price: 0.48,
+            quantity: 25.0,
+            reduce_only: false,
+            reason: "hedge rescue".into(),
+            quote_level_tag: Some("mm-hedge-rescue".into()),
+            created_at_ms: 2,
+            pair_id: None,
+            kind: IntentKind::Close,
+        };
+
+        let decision = risk.evaluate(
+            &inventory,
+            &rescue,
+            &RiskContext {
+                starting_cash_usd: 50.0,
+                now_ms: 3,
+                ..RiskContext::default()
+            },
+        );
+
+        assert!(decision.accepted, "{decision:?}");
+    }
+
+    #[test]
+    fn rejects_hedge_rescue_when_wallet_cash_cannot_cover_it() {
+        let inventory = InventoryState::new(5.0);
+        let risk = RiskEngine::new(RiskLimits::default());
+        let rescue = OrderIntent {
+            client_order_id: ClientOrderId::from("rescue-order"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            limit_price: 0.48,
+            quantity: 25.0,
+            reduce_only: false,
+            reason: "hedge rescue".into(),
+            quote_level_tag: Some("mm-hedge-rescue".into()),
+            created_at_ms: 2,
+            pair_id: None,
+            kind: IntentKind::Close,
+        };
+
+        let decision = risk.evaluate(
+            &inventory,
+            &rescue,
+            &RiskContext {
+                starting_cash_usd: 50.0,
+                now_ms: 3,
+                ..RiskContext::default()
+            },
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.reject_reason,
+            Some(RiskRejectReason::FreeCashTooLow)
         );
     }
 }
