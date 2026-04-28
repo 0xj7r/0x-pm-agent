@@ -8,49 +8,97 @@ and verify the gate behaves as expected across at least one quiet
 trading window (low fill volume), one busy window (high fill volume),
 and one connectivity blip (WS reconnect, stale `/activity` truth).
 
-Per memory `feedback_optimize_for_live_validation` and the spec
-"Out of scope: Multi-day shadow-on-AWS run before any live capital."
-This runbook executes that step.
+Per memory `feedback_optimize_for_live_validation` and the spec.
+
+## Deployment pattern
+
+Both the shadow process and the live bonereaper process are systemd
+instances of the canonical templated unit
+`polymarket-exec/ops/systemd/polymarket-exec@.service`. Each instance
+loads its own host-local env file from `~/.config/polymarket-exec/`.
+This is the same pattern that runs `polymarket-exec@btc_5m_mm_tinylive`
+on the Dublin box today.
+
+Two new instance names:
+- `polymarket-exec@bonereaper_shadowlive` — shadow process, paper submits
+- `polymarket-exec@bonereaper_live` — micro-capital live bonereaper
 
 ## Prerequisites
 
-- AWS Dublin bot (ec2-3-252-32-40.eu-west-1.compute.amazonaws.com) up and reachable.
-- `polymarket-shadow.service` installed per `deploy/systemd/README.md`.
-- `polymarket-bonereaper-live.service` installed but **NOT enabled**.
-- Local shell with the SSH key: `~/.ssh/whale_pair_dublin_ed25519.pem`.
+- AWS Dublin bot (`ec2-3-252-32-40.eu-west-1.compute.amazonaws.com`) up.
+- Repo present at `~/go/polymarket-agent` on the box.
+- Existing systemd templated unit installed (see
+  `polymarket-exec/ops/systemd/install_user_paper_services.sh`).
+- Local shell with `~/.ssh/whale_pair_dublin_ed25519.pem`.
 
-## Day 0: kick off
+## Day 0: install the bonereaper instance env files
 
 ```bash
-ssh -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com 'sudo systemctl start polymarket-shadow && sudo systemctl status polymarket-shadow --no-pager'
+ssh -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com '
+  cd ~/go/polymarket-agent &&
+  git fetch origin shadowlive-fidelity-bonereaper &&
+  git checkout shadowlive-fidelity-bonereaper &&
+  cargo build --release -p polymarket-exec
+'
+
+# Install host-local env files. The systemd template at
+# polymarket-exec@.service loads from ~/.config/polymarket-exec/<instance>.env.
+# Repo presets are the source of truth; copy them and add host-local
+# secrets at the top.
+ssh ... '
+  install -m 0600 polymarket-exec/env/bonereaper_shadowlive.env \
+    ~/.config/polymarket-exec/bonereaper_shadowlive.env
+  install -m 0600 polymarket-exec/env/bonereaper_live.env \
+    ~/.config/polymarket-exec/bonereaper_live.env
+'
+
+# Edit the live env on the box to add private key + API creds at the top
+# (the live instance needs auth; shadow does not).
+ssh ... 'vi ~/.config/polymarket-exec/bonereaper_live.env'
+```
+
+Then start shadow:
+
+```bash
+ssh ... '
+  systemctl --user daemon-reload
+  systemctl --user enable --now polymarket-exec@bonereaper_shadowlive
+  systemctl --user status polymarket-exec@bonereaper_shadowlive --no-pager
+'
 ```
 
 Confirm:
 - `Active: active (running)`
-- First few log lines from the engine: `clob_v2_exchange detected`, market discovery began, WS connected.
+- First few log lines from the engine: `clob_v2_exchange detected`,
+  market discovery began, WS connected.
 
 ## Day 0 + 6h: warmup gate
 
-The queue model needs ≥ 8 observed fills per market family before it leaves NaN. Bonereaper does ~990 fills over its comparator window across 5 families ≈ ~200 per family per day. Should warm up within hours.
+The queue model needs ≥ 8 observed fills per market family before it
+leaves NaN. Bonereaper does ~990 fills over its comparator window
+across 5 families ≈ ~200 per family per day. Should warm up within
+hours.
 
 ```bash
-ssh ... 'tail -200 /var/lib/polymarket/shadow_live_bonereaper/journal.jsonl | grep queue_model_estimate'
+ssh ... 'tail -200 ~/go/polymarket-agent/data/execution/paper/shadow_live_bonereaper/journal.jsonl | grep queue_model_estimate'
 ```
 
-Expected: per-family `queue_decay_rate_per_sec` rows that are no longer NaN, with `n_observations >= 8`.
+Expected: per-family `queue_decay_rate_per_sec` rows that are no
+longer NaN, with `n_observations >= 8`.
 
-If still NaN after 6h: investigate. Likely causes: market discovery failed, WS not connected, or strategy emitting zero intents (regime gate misfire).
+If still NaN after 6h: investigate. Likely causes: market discovery
+failed, WS not connected, or strategy emitting zero intents (regime
+gate misfire).
 
 ## Day 1: first 24h gate check
 
 ```bash
-ssh ... 'cat /var/lib/polymarket/shadow_live_bonereaper/journal.jsonl' \
-  | python3 polymarket-exec/scripts/bonereaper_exec_compare.py \
-        --mode fidelity-trend \
-        --journal-log /dev/stdin
-```
+scp -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com:~/go/polymarket-agent/data/execution/paper/shadow_live_bonereaper/journal.jsonl /tmp/shadow.jsonl
 
-(Or scp the journal locally and run against the file.)
+python3 polymarket-exec/scripts/bonereaper_exec_compare.py \
+    --mode fidelity-trend \
+    --journal-log /tmp/shadow.jsonl
+```
 
 Decision matrix:
 
@@ -63,7 +111,8 @@ Decision matrix:
 
 ## Days 2-3: catch failure modes
 
-Deliberately exercise the gate's failure paths before promoting to live:
+Deliberately exercise the gate's failure paths before promoting to
+live:
 
 ### a) Truth-source staleness
 
@@ -84,20 +133,19 @@ recovers once iptables rule is removed.
 Restart the shadow service (simulates WS reconnect):
 
 ```bash
-ssh ... 'sudo systemctl restart polymarket-shadow'
+ssh ... 'systemctl --user restart polymarket-exec@bonereaper_shadowlive'
 ```
 
 Expected: queue model state file is restored on warm start, no full
 warmup needed; first fidelity_event after restart should be `Ok` if
-data continuity holds. If queue model resumes NaN, the persistence
-path is broken (file a bug, do not promote).
+data continuity holds.
 
 ### c) Quiet market window
 
 Pick a low-volume hour (early UTC weekend morning is typical). Verify
 that `fidelity_event` rows still emit on the 60s clock with
-`shadow_fill_count=0` and `bonereaper_fill_count=0`, MAPE=0, verdict=Ok.
-Empty windows must not look like Fail.
+`shadow_fill_count=0` and `bonereaper_fill_count=0`, MAPE=0,
+verdict=Ok. Empty windows must not look like Fail.
 
 ## Promotion criteria
 
@@ -110,17 +158,40 @@ Live bonereaper is promoted only when ALL of:
 5. At least one of the failure-mode tests (a/b/c) was exercised and recovered cleanly.
 
 If any criterion is missing, extend the soak by 24h. Do not promote
-under "close enough" pressure - the gate's whole point is to be
-honest about what it has and has not validated.
+under "close enough" pressure.
+
+## Promote shadow to live
+
+After meeting the criteria:
+
+```bash
+ssh ... 'systemctl --user enable --now polymarket-exec@bonereaper_live'
+ssh ... 'journalctl --user -u polymarket-exec@bonereaper_live -f'
+```
+
+The first 60-90 seconds of live will report `RuntimeStatus::RiskOff`
+with reason `shadow_unobserved` (the gate is conservative). Once the
+gate confirms an in-window OK verdict, live transitions to `Running`
+and the strategy starts emitting intents.
+
+## Kill switch
+
+```bash
+# Halt live immediately, keep shadow running:
+ssh ... 'systemctl --user stop polymarket-exec@bonereaper_live'
+
+# Or use the file-based kill switch:
+ssh ... 'touch ~/.config/polymarket-exec/live.kill'
+```
+
+The file-based kill switch is safer because the engine checks it on
+every loop tick; systemd stop is a SIGTERM that may take seconds to
+propagate.
 
 ## Post-promotion daily check
 
-Once live is up:
-
 ```bash
-# Run from local each morning:
-scp -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com:/var/lib/polymarket/shadow_live_bonereaper/journal.jsonl /tmp/shadow.jsonl
-scp -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com:/var/lib/polymarket/live_bonereaper/journal.jsonl /tmp/live.jsonl
+scp -i ~/.ssh/whale_pair_dublin_ed25519.pem ubuntu@ec2-3-252-32-40.eu-west-1.compute.amazonaws.com:~/go/polymarket-agent/data/execution/paper/shadow_live_bonereaper/journal.jsonl /tmp/shadow.jsonl
 
 python3 polymarket-exec/scripts/bonereaper_exec_compare.py --mode fidelity-trend --journal-log /tmp/shadow.jsonl
 python3 polymarket-exec/scripts/bonereaper_exec_compare.py --mode queue-decay-trend --journal-log /tmp/shadow.jsonl
@@ -128,6 +199,6 @@ python3 polymarket-exec/scripts/bonereaper_exec_compare.py --mode queue-decay-tr
 
 Action thresholds:
 
-- Any `fail > 0` in last 24h → live process should already be `RiskOff` via the gate. Confirm `journalctl -u polymarket-bonereaper-live -n 100 | grep RiskOff`.
-- `avg_mape` rising trend over multiple days → the simulator is drifting from reality; investigate before scaling capital.
+- Any `fail > 0` in last 24h → live process should already be `RiskOff` via the gate. Confirm `journalctl --user -u polymarket-exec@bonereaper_live -n 100 | grep RiskOff`.
+- `avg_mape` rising trend over multiple days → simulator is drifting from reality; investigate before scaling capital.
 - Queue decay rate diverging from per-family stable value → market regime change; recalibrate or pause.
