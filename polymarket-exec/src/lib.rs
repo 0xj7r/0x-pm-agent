@@ -11,6 +11,7 @@ pub mod paper;
 pub mod runtime;
 pub mod signals;
 pub mod strategy;
+pub mod strategy_bonereaper;
 pub mod wire;
 
 pub use core::{book, inventory, market_context, risk, types};
