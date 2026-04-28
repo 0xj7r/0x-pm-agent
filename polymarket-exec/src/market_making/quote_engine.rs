@@ -54,7 +54,7 @@ impl DesiredQuote {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DesiredQuoteSet {
     pub quotes: Vec<DesiredQuote>,
     pub stale_quote_max_age_ms: Option<u64>,
@@ -71,16 +71,6 @@ pub enum StaleMode {
 pub enum ExpiryMode {
     Ignore,
     Remove,
-}
-
-impl Default for DesiredQuoteSet {
-    fn default() -> Self {
-        Self {
-            quotes: Vec::new(),
-            stale_quote_max_age_ms: None,
-            quote_expiry_ms: None,
-        }
-    }
 }
 
 impl DesiredQuoteSet {
