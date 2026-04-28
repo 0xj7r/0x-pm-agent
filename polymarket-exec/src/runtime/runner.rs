@@ -1585,11 +1585,16 @@ async fn run_runtime_loop(
                                     last_trade_event_age_ms: last_age_ms,
                                 },
                             );
+                            let market_id = MarketId::from(
+                                current_universe.market_id_for_asset(config, asset_id),
+                            );
+                            let instrument_id = InstrumentId::from(asset_id.as_str());
+                            if let Some(report) = paper_report.as_mut() {
+                                report.record_book_observation(&market_id, &instrument_id, &book);
+                            }
                             let outcome = runtime.on_book_state(
-                                MarketId::from(
-                                    current_universe.market_id_for_asset(config, asset_id),
-                                ),
-                                InstrumentId::from(asset_id.as_str()),
+                                market_id,
+                                instrument_id,
                                 &book,
                             )?;
                             let combined = execute_execution_adapter(
