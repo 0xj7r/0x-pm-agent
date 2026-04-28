@@ -1,0 +1,43 @@
+[Unit]
+Description=Polymarket shadowlive bonereaper (paper submits, live feeds)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-agent
+
+# Layered env load: common secrets first (RPC URLs, private keys), then
+# the bonereaper shadowlive preset which sets WHALE_PAIR_EXEC_MODE=shadow_live
+# + paper_mode=true + journal/book paths.
+EnvironmentFile=-/home/ubuntu/.config/polymarket-exec/common.env
+EnvironmentFile=/home/ubuntu/polymarket-agent/polymarket-exec/env/bonereaper_shadowlive.env
+
+# Override the journal paths to /var/lib so the live bonereaper unit's
+# fidelity gate has a stable absolute path to read.
+Environment=WHALE_PAIR_EXEC_JOURNAL_PATH=/var/lib/polymarket/shadow_live_bonereaper/journal.jsonl
+Environment=WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH=/var/lib/polymarket/shadow_live_bonereaper/book_snapshots.jsonl
+Environment=WHALE_PAIR_PAPER_REPORT_PATH=/var/lib/polymarket/shadow_live_bonereaper/paper_report.json
+
+ExecStartPre=/bin/mkdir -p /var/lib/polymarket/shadow_live_bonereaper
+ExecStart=/home/ubuntu/polymarket-agent/target/release/polymarket-exec
+
+# Restart on crash; back off if it fails repeatedly.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Resource caps. Shadow runs on the same box as the live process, so we
+# bound it to leave headroom.
+MemoryMax=1G
+CPUQuota=50%
+
+# Stdout/stderr to journald. Use `journalctl -u polymarket-shadow -f`
+# for live logs.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

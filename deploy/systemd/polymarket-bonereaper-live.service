@@ -1,0 +1,38 @@
+[Unit]
+Description=Polymarket bonereaper live at micro-capital (gated on shadow fidelity)
+After=network-online.target polymarket-shadow.service
+Wants=network-online.target
+# We do not Require= the shadow service. The fidelity gate inside the
+# binary explicitly handles "shadow not running" -> RiskOff. Hard-
+# linking the units would cause the live process to crash-loop if the
+# shadow process restarts, which is worse than a graceful RiskOff.
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-agent
+
+# Layered env load: common secrets first, then the live preset.
+EnvironmentFile=-/home/ubuntu/.config/polymarket-exec/common.env
+EnvironmentFile=/home/ubuntu/polymarket-agent/polymarket-exec/env/bonereaper_live.env
+
+ExecStartPre=/bin/mkdir -p /var/lib/polymarket/live_bonereaper
+ExecStart=/home/ubuntu/polymarket-agent/target/release/polymarket-exec
+
+# Restart on crash; tighter back-off than shadow because real capital
+# is at risk and a crash loop is its own incident.
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+# Resource caps. Bonereaper-live coexists with shadow + tinylive on
+# the same box.
+MemoryMax=1G
+CPUQuota=50%
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
