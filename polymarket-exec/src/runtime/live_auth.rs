@@ -25,7 +25,7 @@ fn log_live_venue_config(
     config: &AppConfig,
     signature_type: PolymarketSignatureType,
     funder_address: Option<&str>,
-    has_user_credentials: bool,
+    user_auth_source: &str,
 ) {
     let protocol = ClobProtocolVersion::parse(&config.clob_version)
         .map(|v| format!("{v:?}"))
@@ -43,7 +43,8 @@ fn log_live_venue_config(
         proxy_wallet_address = config.proxy_wallet_address.as_deref().unwrap_or("<none>"),
         relayer_url = %config.relayer_url,
         relayer_api_key_present = config.relayer_api_key.is_some(),
-        has_user_credentials,
+        user_auth_source,
+        has_user_credentials = user_auth_source != "none",
         "live venue config (verify CLOB V2 + auth before trading)"
     );
 }
@@ -99,8 +100,14 @@ fn resolve_funder_for_signature(
     match signature_type {
         PolymarketSignatureType::Eoa => {
             for (name, configured) in [
-                ("POLYMARKET_FUNDER/POLYMARKET_FUNDER_ADDRESS", funder_address.as_ref()),
-                ("POLYMARKET_PROXY_WALLET_ADDRESS", proxy_wallet_address.as_ref()),
+                (
+                    "POLYMARKET_FUNDER/POLYMARKET_FUNDER_ADDRESS",
+                    funder_address.as_ref(),
+                ),
+                (
+                    "POLYMARKET_PROXY_WALLET_ADDRESS",
+                    proxy_wallet_address.as_ref(),
+                ),
             ] {
                 let Some(configured) = configured else {
                     continue;
@@ -158,7 +165,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
         config,
         signature_type,
         funder_address.as_deref(),
-        auth.is_some(),
+        if auth.is_some() { "env" } else { "derived_l1" },
     );
 
     if let Some(auth) = auth {
@@ -263,7 +270,9 @@ mod tests {
         )
         .expect_err("mismatched EOA funder must fail live startup");
 
-        assert!(error.to_string().contains("requires funder/holder to equal signer"));
+        assert!(error
+            .to_string()
+            .contains("requires funder/holder to equal signer"));
     }
 
     #[test]
@@ -318,6 +327,8 @@ mod tests {
         )
         .expect_err("proxy mode without funder must fail");
 
-        assert!(error.to_string().contains("proxy/safe signature types require"));
+        assert!(error
+            .to_string()
+            .contains("proxy/safe signature types require"));
     }
 }

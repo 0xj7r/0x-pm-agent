@@ -130,7 +130,7 @@ Working checklist for the live `polymarket-exec` engine. Check items only when t
 
 - [x] 29. Move venue, EOA, and strategy tuning out of `scripts/dublin_tinylive.sh`
   - Why: Launcher scripts should load env and launch the binary only.
-  - Fix: `scripts/dublin_tinylive.sh` now delegates to `run_sleeve.sh btc_5m_mm_tinylive`; tinylive settings live in the canonical env.
+  - Fix: Removed the `scripts/dublin_tinylive.sh` live launcher entirely. Tinylive runs only through the systemd unit and the host canonical env.
 
 - [x] 30. Create one canonical tinylive env
   - Why: Live drifted across `common.env`, `live.env`, `paper.d`, repo sleeve env, and launcher exports.

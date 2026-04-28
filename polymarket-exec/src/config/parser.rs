@@ -87,10 +87,25 @@ pub fn split_csv_optional(key: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn load_user_auth() -> Option<UserWsAuth> {
-    let api_key = env::var("POLYMARKET_API_KEY").ok()?;
-    let api_secret = env::var("POLYMARKET_API_SECRET").ok()?;
-    let api_passphrase = env::var("POLYMARKET_API_PASSPHRASE").ok()?;
+fn lookup_first_env<F>(lookup: &F, keys: &[&str]) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    keys.iter()
+        .find_map(|key| lookup(key))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn load_user_auth_from_lookup<F>(lookup: F) -> Option<UserWsAuth>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let api_key = lookup_first_env(&lookup, &["POLYMARKET_API_KEY"])?;
+    let api_secret = lookup_first_env(&lookup, &["POLYMARKET_API_SECRET", "POLYMARKET_SECRET"])?;
+    let api_passphrase = lookup_first_env(
+        &lookup,
+        &["POLYMARKET_API_PASSPHRASE", "POLYMARKET_PASSPHRASE"],
+    )?;
     if api_key.trim().is_empty() || api_secret.trim().is_empty() || api_passphrase.trim().is_empty()
     {
         return None;
@@ -99,17 +114,17 @@ pub fn load_user_auth() -> Option<UserWsAuth> {
         api_key,
         api_secret,
         api_passphrase,
-        private_key: env::var("POLYMARKET_PRIVATE_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        signature_type: env::var("POLYMARKET_SIGNATURE_TYPE")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-        funder_address: env::var("POLYMARKET_FUNDER_ADDRESS")
-            .or_else(|_| env::var("POLYMARKET_FUNDER"))
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
+        private_key: lookup_first_env(&lookup, &["POLYMARKET_PRIVATE_KEY"]),
+        signature_type: lookup_first_env(&lookup, &["POLYMARKET_SIGNATURE_TYPE"]),
+        funder_address: lookup_first_env(
+            &lookup,
+            &["POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_FUNDER"],
+        ),
     })
+}
+
+pub fn load_user_auth() -> Option<UserWsAuth> {
+    load_user_auth_from_lookup(|key| env::var(key).ok())
 }
 
 pub fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
@@ -140,7 +155,11 @@ pub fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_asset_market_map, parse_bool, parse_log_format, LogFormat};
+    use std::collections::HashMap;
+
+    use super::{
+        load_user_auth_from_lookup, parse_asset_market_map, parse_bool, parse_log_format, LogFormat,
+    };
 
     #[test]
     fn parses_json_log_format() {
@@ -172,5 +191,55 @@ mod tests {
     #[test]
     fn rejects_bad_asset_market_mapping() {
         assert!(parse_asset_market_map("token-up").is_err());
+    }
+
+    #[test]
+    fn loads_user_auth_from_canonical_env_names() {
+        let values = HashMap::from([
+            ("POLYMARKET_API_KEY", "key"),
+            ("POLYMARKET_API_SECRET", "secret"),
+            ("POLYMARKET_API_PASSPHRASE", "passphrase"),
+        ]);
+
+        let auth = load_user_auth_from_lookup(|key| values.get(key).map(|value| value.to_string()))
+            .expect("canonical credentials");
+
+        assert_eq!(auth.api_key, "key");
+        assert_eq!(auth.api_secret, "secret");
+        assert_eq!(auth.api_passphrase, "passphrase");
+    }
+
+    #[test]
+    fn loads_user_auth_from_polymarket_sdk_aliases() {
+        let values = HashMap::from([
+            ("POLYMARKET_API_KEY", "key"),
+            ("POLYMARKET_SECRET", "secret"),
+            ("POLYMARKET_PASSPHRASE", "passphrase"),
+            ("POLYMARKET_FUNDER", "0xfunder"),
+        ]);
+
+        let auth = load_user_auth_from_lookup(|key| values.get(key).map(|value| value.to_string()))
+            .expect("alias credentials");
+
+        assert_eq!(auth.api_secret, "secret");
+        assert_eq!(auth.api_passphrase, "passphrase");
+        assert_eq!(auth.funder_address.as_deref(), Some("0xfunder"));
+    }
+
+    #[test]
+    fn canonical_user_auth_names_take_precedence_over_aliases() {
+        let values = HashMap::from([
+            ("POLYMARKET_API_KEY", "key"),
+            ("POLYMARKET_API_SECRET", "canonical-secret"),
+            ("POLYMARKET_SECRET", "alias-secret"),
+            ("POLYMARKET_API_PASSPHRASE", "canonical-passphrase"),
+            ("POLYMARKET_PASSPHRASE", "alias-passphrase"),
+        ]);
+
+        let auth = load_user_auth_from_lookup(|key| values.get(key).map(|value| value.to_string()))
+            .expect("credentials");
+
+        assert_eq!(auth.api_secret, "canonical-secret");
+        assert_eq!(auth.api_passphrase, "canonical-passphrase");
     }
 }

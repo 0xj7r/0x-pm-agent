@@ -745,10 +745,8 @@ mod tests {
         );
         assert_eq!(
             decoded.conditionId,
-            B256::from_str(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            )
-            .unwrap()
+            B256::from_str("0x2222222222222222222222222222222222222222222222222222222222222222")
+                .unwrap()
         );
         assert_eq!(decoded.indexSets, vec![U256::from(1_u8), U256::from(2_u8)]);
     }

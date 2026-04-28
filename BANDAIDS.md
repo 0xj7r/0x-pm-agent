@@ -9,11 +9,11 @@ S2 (hygiene only).
 
 | # | Finding | File:line | Category | Fix shape |
 |---|---|---|---|---|
-| C-3 | `WHALE_PAIR_LIVE_AUTO_REDEEM` never set in `dublin_tinylive.sh` → auto-redeem silently disabled in production | `scripts/dublin_tinylive.sh` (missing) | config | Add `export WHALE_PAIR_LIVE_AUTO_REDEEM=true` and `_PERIOD_SEC=300`. Stops manual redeem dance. |
+| C-3 | `WHALE_PAIR_LIVE_AUTO_REDEEM` never set in the old live launcher → auto-redeem silently disabled in production | removed `scripts/dublin_tinylive.sh` | config | **SHIPPED:** live now uses the canonical systemd env; no live launcher overrides remain. |
 | T-1 | `paper_report` writer construction gated on `if config.paper_mode` → live mode writes no decision log | `runtime/runner.rs:932-943` | telemetry | Construct iff `config.paper_report_path.is_some()`. Mirror `book_snapshot` pattern. |
 | T-3 | `record_book_observation` only fires in paper → no follow-through marks for live suppression samples | `runtime/runner.rs:1591-1593` | telemetry | Drop `if let Some(report)` wrap (transitively fixed by T-1). |
 | B-1 | `polymarket-exec/scripts/run_unlawful_shear_paper.sh:170-267` — full bash supervisor loop with context-hash restart kills in-flight engine state | `polymarket-exec/scripts/run_unlawful_shear_paper.sh` | bash | Extend engine-side `runtime/runner.rs:1872-1970` discovery to be strategy-agnostic. |
-| B-2 | Python Gamma pre-pull duplicated by both `dublin_tinylive.sh:116-123` AND the engine's discovery tick — two implementations of the same mapping that can drift | `scripts/dublin_tinylive.sh`, `scripts/live_smoke.sh` | bash | Drop Python pre-pull, engine self-seeds. |
+| B-2 | Python Gamma pre-pull duplicated by old live scripts AND the engine's discovery tick — two implementations of the same mapping that can drift | removed live shell wrappers | bash | **SHIPPED:** live service relies on engine discovery; old live wrappers removed. |
 | C-1 | `WHALE_PAIR_BTC_5M_MM_SELL_CLIP_USD=1.10` in env file but no consumer in code | `polymarket-exec/env/btc_5m_mm_tinylive.env:42` | config | Either wire to `Btc5mMmConfig` (if intended) or delete from env file. |
 | C-2 | `WHALE_PAIR_BTC_5M_MM_ALLOW_SINGLE_LEG_ENTRY=false` in env file but flag was dead (just removed in commit `cbdf743`) | `polymarket-exec/env/btc_5m_mm_tinylive.env:60` | config | Delete from env file (already removed from code today). |
 
@@ -37,13 +37,13 @@ S2 (hygiene only).
 - **TS-9**: `dashboard_refresh_ms: u64` parsed from env, stored on `AppConfig`, never read. (`config/mod.rs:88, 362-363, 502`)
 
 ### Bash supervisor (B)
-- **B-3**: `dublin_tinylive.sh:43-46` hardcodes `POLYMARKET_CLOB_API_URL`, `POLYMARKET_CLOB_VERSION=v1`, USDC.e collateral address (override AFTER sourcing `.env`, so env file can't win). Move venue config to `polymarket-exec/env/dublin_tinylive.env` as SSOT.
-- **B-4**: `dublin_tinylive.sh:39-41` does the `unset POLYMARKET_FUNDER_ADDRESS POLYMARKET_FUNDER` then `export ''=''` ritual. Bash workaround for inconsistent empty-string vs absent handling in `wire/execution_adapter.rs:617`. Validate at engine startup, drop the dance.
-- **B-5**: `live_redeem.sh:53-58` exports placeholder `WHALE_PAIR_ASSET_IDS=1` etc. to bypass `split_csv_required` validation in redeem mode. Branch on `WHALE_PAIR_EXEC_MODE=live_redeem` in `config/mod.rs::from_env`.
+- **B-3**: **SHIPPED** — removed `scripts/dublin_tinylive.sh`; live venue/collateral settings live in the canonical tinylive env.
+- **B-4**: **SHIPPED** — removed the live launcher funder unset/export dance; signer/funder validation is in Rust startup.
+- **B-5**: **SHIPPED by deletion** — removed `scripts/live_redeem.sh`; redeem is engine/systemd driven.
 
 ### Config (C)
-- **C-4**: `live_redeem.sh:13-14` docstring references `POLYMARKET_SECRET`, `POLYMARKET_PASSPHRASE`, `POLYMARKET_BOT_PRIVATE_KEY` — none are real (consumers expect `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`, `POLYMARKET_PRIVATE_KEY`). Operator following docs gets silent auth failure.
-- **C-5**: `RELAYER_API_KEY` validation missing in `live_redeem.sh` startup — silent failure if name mismatches.
+- **C-4**: **SHIPPED** — removed `scripts/live_redeem.sh`; parser now accepts both canonical and SDK alias names for user auth.
+- **C-5**: **SHIPPED by deletion** — removed `scripts/live_redeem.sh`; live redeem uses engine auth.
 - **C-6**: `WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH` defaults to `true`, never overridable by docs. Single transient mismatch will degrade bot. Document or expose.
 
 ## S2 findings (hygiene)
@@ -54,14 +54,14 @@ S2 (hygiene only).
 - **TS-12**: `DesiredQuote` carries both `is_cleanup: bool` and `suppress_if_stale: bool` plus `expires_at_ms`. File defines orphan `enum StaleMode {Ignore, Remove}` and `enum ExpiryMode {Ignore, Remove}` (lines 64-74) that were never wired. Promote.
 
 ### Bash
-- **B-6**: 50+ LOC of strategy tuning knobs in `dublin_tinylive.sh:51-100` (with rationale comments). Move to versioned env file.
+- **B-6**: **SHIPPED** — no live strategy tuning remains in `scripts/`; canonical tinylive env is the SSOT.
 - **B-7**: `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC` is bash-only — duplicate of engine-side `WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS`.
-- **B-8**: Hardcoded EOA wallet address in `dublin_tinylive.sh:3, 139` comment + banner. Have engine print derived wallet at startup.
-- **B-9**: `live_smoke.sh:48-66` re-exports 18 lines of tinylive risk caps. Should `source` the same env file.
+- **B-8**: **SHIPPED by deletion** — removed `scripts/dublin_tinylive.sh`.
+- **B-9**: **SHIPPED by deletion** — removed root `scripts/live_smoke.sh`; systemd live-smoke uses the release binary.
 
 ### Config
 - **C-7**: `WHALE_PAIR_TAKER_FEE_COEFF` read in three different strategy constructors with same default. Factor up.
-- **C-8**: 98 of 138 `WHALE_PAIR_*` env vars consumed by binary are NOT set by `dublin_tinylive.sh` → running on engine defaults. Most are correctly absent (paper-only or unlawful-only) but ~5-10 live-relevant ones (`LIVE_ORDER_TTL_MS`, `LIVE_ORDER_MAX_AGE_MS`, `LIVE_RECONCILE_AFTER_MS`) silently default. Audit which defaults are intentional for production.
+- **C-8**: old launcher/env coverage issue is obsolete after deleting `scripts/dublin_tinylive.sh`; remaining audit should compare `btc_5m_mm_tinylive.env` directly against `config/mod.rs`.
 
 ## Found this session, not yet in catalog
 
@@ -90,7 +90,7 @@ S2 (hygiene only).
 8. **TS-4 + TS-5 — typed `EventKind` + `MmQuoteKind`** — ~2 hours, eliminates classifier duplication.
 9. **TS-8 — single `PairLeg::classify` SSOT** — ~1 hour, eliminates 4 copies.
 10. **B-1 — engine-side discovery for unlawful_shear strategy** — biggest, ~1 day.
-11. **B-3, B-4, B-6 — move all config out of `dublin_tinylive.sh` into versioned env file** — ~2 hours.
+11. **B-3, B-4, B-6 — move all config out of `dublin_tinylive.sh` into versioned env file** — **SHIPPED; live wrapper removed.**
 12. **TS-9 — delete dead `dashboard_refresh_ms`** — ~10 min.
 
 ## Total

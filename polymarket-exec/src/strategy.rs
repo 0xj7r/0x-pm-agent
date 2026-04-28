@@ -248,6 +248,8 @@ pub struct Btc5mMmConfig {
     pub max_gross_cost_bps: f64,
     pub max_leg_cost_usd: f64,
     pub max_leg_cost_bps: f64,
+    pub max_entry_free_cash_bps: f64,
+    pub max_rescue_free_cash_bps: f64,
     pub min_edge_bps: f64,
     pub hedge_rescue_edge_bps: f64,
     pub inventory_skew_bps: f64,
@@ -286,6 +288,14 @@ impl Btc5mMmConfig {
             max_gross_cost_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_GROSS_COST_BPS", 0.0),
             max_leg_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_USD", 10.0),
             max_leg_cost_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_BPS", 0.0),
+            max_entry_free_cash_bps: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MAX_ENTRY_FREE_CASH_BPS",
+                6_000.0,
+            ),
+            max_rescue_free_cash_bps: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MAX_RESCUE_FREE_CASH_BPS",
+                5_000.0,
+            ),
             min_edge_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_MIN_EDGE_BPS", 75.0),
             hedge_rescue_edge_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_HEDGE_RESCUE_EDGE_BPS", 25.0),
             inventory_skew_bps: parse_f64("WHALE_PAIR_BTC_5M_MM_INVENTORY_SKEW_BPS", 150.0),
@@ -327,6 +337,8 @@ impl Btc5mMmConfig {
             max_gross_cost_bps: config.max_gross_cost_bps.clamp(0.0, 10_000.0),
             max_leg_cost_usd: config.max_leg_cost_usd.max(0.01),
             max_leg_cost_bps: config.max_leg_cost_bps.clamp(0.0, 10_000.0),
+            max_entry_free_cash_bps: config.max_entry_free_cash_bps.clamp(0.0, 10_000.0),
+            max_rescue_free_cash_bps: config.max_rescue_free_cash_bps.clamp(0.0, 10_000.0),
             min_edge_bps: config.min_edge_bps.max(0.0),
             hedge_rescue_edge_bps: config.hedge_rescue_edge_bps.max(0.0),
             inventory_skew_bps: config.inventory_skew_bps.max(0.0),
@@ -1866,18 +1878,34 @@ impl Btc5mMmStrategy {
 
     fn effective_entry_caps_usd(&self, inventory: &InventorySnapshot) -> (f64, f64) {
         let equity_usd = Self::inventory_equity_usd(inventory);
+        let free_cash_cap = if self.config.max_entry_free_cash_bps > 0.0 {
+            inventory.free_cash_usd * (self.config.max_entry_free_cash_bps / 10_000.0)
+        } else {
+            f64::INFINITY
+        };
         (
             Self::effective_cost_cap_usd(
                 self.config.max_gross_cost_usd,
                 self.config.max_gross_cost_bps,
                 equity_usd,
-            ),
+            )
+            .min(free_cash_cap)
+            .max(0.01),
             Self::effective_cost_cap_usd(
                 self.config.max_leg_cost_usd,
                 self.config.max_leg_cost_bps,
                 equity_usd,
-            ),
+            )
+            .min(free_cash_cap)
+            .max(0.01),
         )
+    }
+
+    fn rescue_free_cash_cap_usd(&self, inventory: &InventorySnapshot) -> f64 {
+        if self.config.max_rescue_free_cash_bps <= 0.0 {
+            return inventory.free_cash_usd.max(0.0);
+        }
+        (inventory.free_cash_usd * (self.config.max_rescue_free_cash_bps / 10_000.0)).max(0.0)
     }
 
     fn best_bid(quote: &QuoteSnapshot) -> Option<f64> {
@@ -2062,17 +2090,14 @@ impl Btc5mMmStrategy {
         market_id: &MarketId,
         stranded_instrument_id: &InstrumentId,
         lift_instrument_id: &InstrumentId,
-        stranded_qty: f64,
         now_ms: EpochMillis,
         notes: &mut Vec<String>,
     ) -> bool {
-        let qty_bucket = Self::rescue_qty_bucket(stranded_qty);
         let ttl_ms = self.rescue_inflight_ttl_ms();
         let state = self.market_states.entry(market_id.clone()).or_default();
         if state.rescue_state.as_ref().is_some_and(|rescue| {
             rescue.stranded_instrument_id != stranded_instrument_id.as_str()
                 || rescue.lift_instrument_id != lift_instrument_id.as_str()
-                || rescue.stranded_qty_bucket != qty_bucket
         }) {
             state.rescue_state = None;
         }
@@ -2107,7 +2132,6 @@ impl Btc5mMmStrategy {
             .filter(|rescue| {
                 rescue.stranded_instrument_id == stranded_instrument_id.as_str()
                     && rescue.lift_instrument_id == lift_instrument_id.as_str()
-                    && rescue.stranded_qty_bucket == qty_bucket
             })
             .map(|rescue| rescue.attempts.saturating_add(1))
             .unwrap_or(1);
@@ -2959,6 +2983,7 @@ impl Btc5mMmStrategy {
         quote: &QuoteSnapshot,
         quantity: f64,
         gross_cost: f64,
+        max_rescue_notional_usd: f64,
         venue_rules: Option<&VenueMarketRules>,
         reason_prefix: &str,
         now_ms: EpochMillis,
@@ -3013,7 +3038,16 @@ impl Btc5mMmStrategy {
             .map(|r| r.minimum_order_size)
             .filter(|m| m.is_finite() && *m > 0.0)
             .unwrap_or(self.config.venue_min_order_quantity);
-        let sweep_qty = depth_walk_qty.max(venue_min);
+        let max_sweep_notional = self
+            .config
+            .hedge_rescue_clip_usd
+            .min(max_rescue_notional_usd)
+            .max(0.0);
+        let max_sweep_qty = max_sweep_notional / sweep_price;
+        if max_sweep_qty + 1e-9 < venue_min {
+            return None;
+        }
+        let sweep_qty = depth_walk_qty.min(max_sweep_qty).max(venue_min);
         if sweep_qty < self.config.min_order_quantity {
             return None;
         }
@@ -3312,6 +3346,7 @@ impl Strategy for Btc5mMmStrategy {
         let right_cost = (right_qty * right_avg).max(0.0);
         let (max_entry_gross_cost_usd, max_entry_leg_cost_usd) =
             self.effective_entry_caps_usd(&context.inventory);
+        let max_rescue_notional_usd = self.rescue_free_cash_cap_usd(&context.inventory);
 
         let mut intents = Vec::new();
         let mut hold_notes = Vec::new();
@@ -3539,7 +3574,6 @@ impl Strategy for Btc5mMmStrategy {
                         &snapshot.market_id,
                         held_id,
                         lift_id,
-                        exposure_decision.rescue_qty,
                         context.now_ms,
                         &mut hold_notes,
                     );
@@ -3550,6 +3584,7 @@ impl Strategy for Btc5mMmStrategy {
                         lift_quote,
                         exposure_decision.rescue_qty,
                         gross_cost,
+                        max_rescue_notional_usd,
                         context.venue_rules.as_ref(),
                         "btc-5m-mm hedge rescue",
                         context.now_ms,
@@ -3666,7 +3701,6 @@ impl Strategy for Btc5mMmStrategy {
                             &snapshot.market_id,
                             held_id,
                             lift_id,
-                            exposure_decision.rescue_qty,
                             context.now_ms,
                             &mut hold_notes,
                         );
@@ -3677,6 +3711,7 @@ impl Strategy for Btc5mMmStrategy {
                             lift_quote,
                             exposure_decision.rescue_qty,
                             gross_cost,
+                            max_rescue_notional_usd,
                             context.venue_rules.as_ref(),
                             "btc-5m-mm asymmetric rescue",
                             context.now_ms,
@@ -3919,7 +3954,6 @@ impl Strategy for Btc5mMmStrategy {
             &fill.market_id,
             &stranded_id,
             &lift_id,
-            exposure_decision.rescue_qty,
             context.now_ms,
             &mut notes,
         ) {
@@ -3932,6 +3966,7 @@ impl Strategy for Btc5mMmStrategy {
             &lift_quote,
             exposure_decision.rescue_qty,
             gross_cost,
+            self.rescue_free_cash_cap_usd(&context.inventory),
             context.venue_rules.as_ref(),
             "btc-5m-mm on-fill rescue",
             context.now_ms,
