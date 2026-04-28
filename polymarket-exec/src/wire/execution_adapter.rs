@@ -401,6 +401,12 @@ pub trait ExecutionAdapter: Send + Sync {
             req.command_id
         )))
     }
+    async fn ensure_pusd_collateral_from_usdce(
+        &self,
+        _min_wrap_usd: f64,
+    ) -> Result<Option<PusdWrapReport>, ExecutionError> {
+        Ok(None)
+    }
     /// Returns map of `venue_order_id` -> `is_scoring_for_rewards`.
     /// Default impl returns an empty map (paper / non-live adapters do
     /// not have rebate eligibility). Live adapters override to call the
@@ -1945,6 +1951,13 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
                 ack.transaction_hash.as_deref().unwrap_or("unknown")
             )),
         })
+    }
+
+    async fn ensure_pusd_collateral_from_usdce(
+        &self,
+        min_wrap_usd: f64,
+    ) -> Result<Option<PusdWrapReport>, ExecutionError> {
+        Self::ensure_pusd_collateral_from_usdce(self, min_wrap_usd).await
     }
 
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {

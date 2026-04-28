@@ -64,9 +64,9 @@ _Last updated: 2026-04-28_
   - Tiny-live may temporarily use the funded MetaMask EOA path while we validate execution behavior.
   - Before increasing capital, set the correct `POLYMARKET_SIGNATURE_TYPE` and `POLYMARKET_FUNDER_ADDRESS` for the Polymarket Safe/proxy wallet, then rerun live smoke and balance/open-order reconciliation.
   - Do not treat EOA smoke success as proof that profile-wallet/Safe execution is configured correctly.
-- [ ] Add settlement/redeem operations for resolved market positions.
-  - Current live safety now tracks venue cash, but unresolved/redeemable positions can still tie up capital.
-  - Add an explicit post-settlement redeem worker or operator command before scaling capital.
+- [x] Add settlement/redeem operations for resolved market positions.
+  - Auto-redeem now sweeps resolved venue positions, and successful auto-redeem triggers engine-side USDC.e -> pUSD collateral repair when `WHALE_PAIR_LIVE_PUSD_AUTO_WRAP=true`.
+  - Remaining hardening belongs under bankroll/accounting: explicit pUSD/USDC.e balance telemetry, gas-aware wrap thresholds, and durable settlement lifecycle records.
 - [ ] Finish venue-contract E2E tests without live funds.
   - Add mock CLOB + relayer HTTP fixtures for order submit/cancel, open-order sync, Data API positions, relayer nonce, relayer submit, and transaction polling.
   - Replay one full paired market lifecycle: maker bid submit -> one leg fill -> hedge/pair fill -> merge request -> venue position disappears -> cash recovers.
@@ -74,6 +74,9 @@ _Last updated: 2026-04-28_
 - [ ] Add maker-rebate attribution for live fills.
   - Distinguish submitted-as-post-only from actually-rested-and-filled-as-maker.
   - Persist per-order maker/taker outcome, rest time before fill, and rebated-fee eligibility so calibration can answer whether our buys are being left open for takers.
+- [ ] Replace fallback venue cost-basis recovery with a first-class accounting ledger.
+  - Current live fallback recovers missing venue average cost from our durable filled buy orders, which is safer than treating unknown cost as zero.
+  - Proper fix: persist per-fill lots from user events/recent fills, reconcile against venue positions, and make rescue/hold decisions consume that ledger rather than API-derived average cost alone.
 - [ ] Validate relayer wallet mapping before next live run.
   - `RELAYER_API_KEY` is present locally but `RELAYER_API_KEY_ADDRESS` is currently missing.
   - The relayer key owner can be the core/builder account, but the transaction signer still needs to be the bot private key and the proxy wallet must be the inventory-holding Polymarket wallet.

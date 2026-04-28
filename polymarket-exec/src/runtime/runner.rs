@@ -993,7 +993,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         false => {
             let live_connection = connect_live_session(&config).await?;
             effective_user_auth = live_connection.user_auth;
-            maybe_auto_wrap_pusd(&config, &live_connection.adapter).await?;
+            maybe_auto_wrap_pusd(&config, &live_connection.adapter, "startup").await?;
             Arc::new(live_connection.adapter)
         }
     };
@@ -1170,7 +1170,8 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
 
 async fn maybe_auto_wrap_pusd(
     config: &AppConfig,
-    adapter: &crate::wire::execution_adapter::PolymarketExecutionAdapter,
+    adapter: &dyn ExecutionAdapter,
+    source: &'static str,
 ) -> Result<()> {
     if config.paper_mode || !config.live_pusd_auto_wrap {
         return Ok(());
@@ -1181,6 +1182,7 @@ async fn maybe_auto_wrap_pusd(
     else {
         info!(
             target: "live_collateral.startup",
+            source,
             "pUSD auto-wrap skipped because live signer is not EOA"
         );
         return Ok(());
@@ -1191,7 +1193,8 @@ async fn maybe_auto_wrap_pusd(
     let wrapped = usdc_units_to_f64(report.wrapped_amount);
     if report.wrapped_amount.is_zero() {
         info!(
-            target: "live_collateral.startup",
+            target: "live_collateral",
+            source,
             wallet = %report.wallet,
             usdce_before,
             pusd_before,
@@ -1201,7 +1204,8 @@ async fn maybe_auto_wrap_pusd(
         );
     } else {
         info!(
-            target: "live_collateral.startup",
+            target: "live_collateral",
+            source,
             wallet = %report.wallet,
             usdce_before,
             pusd_before,
@@ -1213,6 +1217,16 @@ async fn maybe_auto_wrap_pusd(
         );
     }
     Ok(())
+}
+
+async fn maybe_auto_wrap_pusd_after_redeem(config: &AppConfig, adapter: &dyn ExecutionAdapter) {
+    if let Err(error) = maybe_auto_wrap_pusd(config, adapter, "auto_redeem").await {
+        warn!(
+            target: "live_collateral",
+            error = %error,
+            "pUSD auto-wrap after redeem failed; continuing live loop"
+        );
+    }
 }
 
 fn spawn_metrics(
@@ -1870,6 +1884,11 @@ async fn run_runtime_loop(
                                         venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
                                         "auto-redeem: submitted"
                                     );
+                                    maybe_auto_wrap_pusd_after_redeem(
+                                        &config,
+                                        execution_adapter.as_ref(),
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
                                     warn!(
@@ -4794,6 +4813,7 @@ mod tests {
         open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
         fills: Vec<VenueFill>,
         balances: Option<VenueBalances>,
+        pusd_wrap_min_usd: Mutex<Vec<f64>>,
     }
 
     #[async_trait]
@@ -4862,6 +4882,17 @@ mod tests {
             })
         }
 
+        async fn ensure_pusd_collateral_from_usdce(
+            &self,
+            min_wrap_usd: f64,
+        ) -> Result<Option<crate::wire::eoa_polygon::PusdWrapReport>, ExecutionError> {
+            self.pusd_wrap_min_usd
+                .lock()
+                .expect("pusd wrap lock")
+                .push(min_wrap_usd);
+            Ok(None)
+        }
+
         async fn sync_open_orders(
             &self,
         ) -> Result<Vec<crate::wire::execution_adapter::VenueOpenOrder>, ExecutionError> {
@@ -4883,6 +4914,40 @@ mod tests {
         ) -> Result<Vec<VenueFill>, ExecutionError> {
             Ok(self.fills.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
+        let mut config = runner_test_config();
+        config.live_pusd_auto_wrap = true;
+        config.live_pusd_auto_wrap_min_usd = 2.50;
+        let adapter = RecordingAdapter::default();
+
+        maybe_auto_wrap_pusd_after_redeem(&config, &adapter).await;
+
+        assert_eq!(
+            adapter
+                .pusd_wrap_min_usd
+                .lock()
+                .expect("pusd wrap lock")
+                .as_slice(),
+            &[2.50]
+        );
+    }
+
+    #[tokio::test]
+    async fn pusd_auto_wrap_after_redeem_is_disabled_by_config() {
+        let mut config = runner_test_config();
+        config.live_pusd_auto_wrap = false;
+        let adapter = RecordingAdapter::default();
+
+        maybe_auto_wrap_pusd_after_redeem(&config, &adapter).await;
+
+        assert!(adapter
+            .pusd_wrap_min_usd
+            .lock()
+            .expect("pusd wrap lock")
+            .is_empty());
     }
 
     #[tokio::test]
