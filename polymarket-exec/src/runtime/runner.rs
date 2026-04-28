@@ -966,6 +966,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut journal,
         metrics.as_ref(),
         runtime.event_log(),
+        paper_report.as_mut(),
         "startup",
         startup_outcome.clone(),
     )?;
@@ -1342,6 +1343,7 @@ async fn run_runtime_loop(
                             journal,
                             metrics.as_ref(),
                             runtime.event_log(),
+                            paper_report.as_mut(),
                             "user-ws",
                             user_outcome.clone(),
                         )?;
@@ -1397,6 +1399,7 @@ async fn run_runtime_loop(
                             journal,
                             metrics.as_ref(),
                             runtime.event_log(),
+                            paper_report.as_mut(),
                             "market-discovery",
                             combined.clone(),
                         )?;
@@ -1464,6 +1467,7 @@ async fn run_runtime_loop(
                                 journal,
                                 metrics.as_ref(),
                                 runtime.event_log(),
+                                paper_report.as_mut(),
                                 "paper-market-close",
                                 combined.clone(),
                             )?;
@@ -1511,6 +1515,7 @@ async fn run_runtime_loop(
                         journal,
                         metrics.as_ref(),
                         runtime.event_log(),
+                        paper_report.as_mut(),
                         "capital-guard",
                         combined.clone(),
                     )?;
@@ -1546,6 +1551,7 @@ async fn run_runtime_loop(
                             journal,
                             metrics.as_ref(),
                             runtime.event_log(),
+                            paper_report.as_mut(),
                             "live-health",
                             combined.clone(),
                         )?;
@@ -1606,6 +1612,7 @@ async fn run_runtime_loop(
                                 journal,
                                 metrics.as_ref(),
                                 runtime.event_log(),
+                                paper_report.as_mut(),
                                 "book",
                                 combined.clone(),
                             )?;
@@ -1640,6 +1647,7 @@ async fn run_runtime_loop(
                     journal,
                     metrics.as_ref(),
                     runtime.event_log(),
+                    paper_report.as_mut(),
                     "reconcile",
                     reconcile_outcome.clone(),
                 )?;
@@ -2601,6 +2609,7 @@ fn persist_runtime_outcome(
     journal: &mut Option<JournalWriter>,
     metrics: &AppMetrics,
     event_log: &EventLog,
+    paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
     source: &str,
     outcome: RuntimeOutcome,
 ) -> Result<()> {
@@ -2619,6 +2628,9 @@ fn persist_runtime_outcome(
         Vec::new()
     };
     record_strategy_attribution(metrics, &records, &outcome.commands);
+    if let Some(report) = paper_report {
+        report.record_runtime_outcome(&records, &outcome.commands, now_unix_ms());
+    }
 
     if let Some(writer) = journal.as_mut() {
         for record in &records {
