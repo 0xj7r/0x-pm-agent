@@ -210,6 +210,109 @@ pub fn truth_freshness(
     }
 }
 
+/// Window for the live-deploy gate. 24h matches the spec: the live
+/// process refuses to start strategy entries unless an OK verdict is
+/// observable in the most recent 24 wall-clock hours of shadow output.
+pub const FIDELITY_GATE_DEFAULT_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateStatus {
+    Pass,
+    RiskOff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateReason {
+    Pass,
+    /// No fidelity_event rows in the journal within the window. Could
+    /// mean shadow is not running, the journal path is wrong, or shadow
+    /// is in cold-warmup. Treated as evidence-of-absence.
+    ShadowUnobserved,
+    /// At least one Fail verdict was observed in the window.
+    ShadowFail,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GateDecision {
+    pub status: GateStatus,
+    pub reason: GateReason,
+    pub newest_event_ms: Option<EpochMillis>,
+    pub ok_count: u32,
+    pub warn_count: u32,
+    pub fail_count: u32,
+}
+
+/// Read the shadow process's journal file and decide whether the live
+/// process is allowed to enter strategy mode. Pass requires at least one
+/// fidelity_event row in the window AND zero Fail verdicts in that
+/// window. Absence-of-evidence is treated as evidence-of-absence
+/// (RiskOff with reason=ShadowUnobserved).
+pub fn evaluate_live_deploy_gate(
+    shadow_journal_path: &std::path::Path,
+    now_ms: EpochMillis,
+    window_ms: u64,
+) -> GateDecision {
+    use std::io::BufRead;
+    let mut decision = GateDecision {
+        status: GateStatus::RiskOff,
+        reason: GateReason::ShadowUnobserved,
+        newest_event_ms: None,
+        ok_count: 0,
+        warn_count: 0,
+        fail_count: 0,
+    };
+    let cutoff = now_ms.saturating_sub(window_ms);
+    let Ok(file) = std::fs::File::open(shadow_journal_path) else {
+        return decision;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if value.get("kind").and_then(|v| v.as_str()) != Some("fidelity_event") {
+            continue;
+        }
+        let Some(event) = value.get("event") else {
+            continue;
+        };
+        let window_end_ms = event
+            .get("window_end_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if window_end_ms < cutoff {
+            continue;
+        }
+        decision.newest_event_ms = Some(
+            decision
+                .newest_event_ms
+                .map(|prev| prev.max(window_end_ms))
+                .unwrap_or(window_end_ms),
+        );
+        let verdict = event.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+        match verdict {
+            "ok" => decision.ok_count += 1,
+            "warn" => decision.warn_count += 1,
+            "fail" => decision.fail_count += 1,
+            _ => {}
+        }
+    }
+    if decision.fail_count > 0 {
+        decision.status = GateStatus::RiskOff;
+        decision.reason = GateReason::ShadowFail;
+    } else if decision.ok_count > 0 || decision.warn_count > 0 {
+        decision.status = GateStatus::Pass;
+        decision.reason = GateReason::Pass;
+    }
+    decision
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FidelityVerdict {
@@ -368,6 +471,93 @@ mod tests {
     fn extract_market_family_strips_trailing_timestamp() {
         assert_eq!(extract_market_family("btc-updown-5m-1776961500"), "btc-updown-5m");
         assert_eq!(extract_market_family("eth-updown-15m-1776960900"), "eth-updown-15m");
+    }
+
+    fn write_fidelity_journal(rows: &[serde_json::Value]) -> std::path::PathBuf {
+        use std::io::Write;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("fidelity-gate-{unique}.jsonl"));
+        let mut file = std::fs::File::create(&path).unwrap();
+        for row in rows {
+            writeln!(file, "{}", serde_json::to_string(row).unwrap()).unwrap();
+        }
+        path
+    }
+
+    fn fidelity_event_row(window_end_ms: u64, verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "fidelity_event",
+            "event": {
+                "window_end_ms": window_end_ms,
+                "verdict": verdict,
+                "market_family": "btc-updown-5m",
+            }
+        })
+    }
+
+    #[test]
+    fn gate_returns_riskoff_shadow_unobserved_when_journal_missing() {
+        let path = std::path::PathBuf::from("/nonexistent/journal.jsonl");
+        let d = evaluate_live_deploy_gate(&path, 1_000_000_000, 60_000);
+        assert_eq!(d.status, GateStatus::RiskOff);
+        assert_eq!(d.reason, GateReason::ShadowUnobserved);
+        assert_eq!(d.newest_event_ms, None);
+    }
+
+    #[test]
+    fn gate_returns_pass_when_recent_ok_event_exists() {
+        let now = 1_000_000_000;
+        let rows = vec![fidelity_event_row(now - 1_000, "ok")];
+        let path = write_fidelity_journal(&rows);
+        let d = evaluate_live_deploy_gate(&path, now, 60_000);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(d.status, GateStatus::Pass);
+        assert_eq!(d.reason, GateReason::Pass);
+        assert_eq!(d.ok_count, 1);
+    }
+
+    #[test]
+    fn gate_returns_riskoff_shadow_fail_on_any_recent_fail() {
+        let now = 1_000_000_000;
+        let rows = vec![
+            fidelity_event_row(now - 5_000, "ok"),
+            fidelity_event_row(now - 1_000, "fail"),
+        ];
+        let path = write_fidelity_journal(&rows);
+        let d = evaluate_live_deploy_gate(&path, now, 60_000);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(d.status, GateStatus::RiskOff);
+        assert_eq!(d.reason, GateReason::ShadowFail);
+        assert_eq!(d.ok_count, 1);
+        assert_eq!(d.fail_count, 1);
+    }
+
+    #[test]
+    fn gate_ignores_events_outside_window() {
+        let now = 1_000_000_000;
+        let rows = vec![
+            fidelity_event_row(now - 200_000, "ok"), // outside 60s window
+        ];
+        let path = write_fidelity_journal(&rows);
+        let d = evaluate_live_deploy_gate(&path, now, 60_000);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(d.status, GateStatus::RiskOff);
+        assert_eq!(d.reason, GateReason::ShadowUnobserved);
+        assert_eq!(d.ok_count, 0);
+    }
+
+    #[test]
+    fn gate_passes_on_warn_only_recent_events() {
+        let now = 1_000_000_000;
+        let rows = vec![fidelity_event_row(now - 1_000, "warn")];
+        let path = write_fidelity_journal(&rows);
+        let d = evaluate_live_deploy_gate(&path, now, 60_000);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(d.status, GateStatus::Pass);
+        assert_eq!(d.warn_count, 1);
     }
 
     #[test]
