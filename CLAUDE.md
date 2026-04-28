@@ -44,6 +44,63 @@ This project is indexed by GitNexus as **polymarket-agent** (3668 symbols, 7760 
 
 # Engineering principles
 
+## Strategy intent: paired MM + convex asymmetric payoff
+
+The `btc_5m_mm` strategy runs TWO complementary entry paths, not one.
+Future agents have repeatedly over-suppressed one to "fix" the other.
+Don't do that.
+
+**Path 1 — Paired bidding (the rebate workhorse).**
+Quote both legs at fair − edge, capture maker rebates on fills, merge
+paired inventory back to $1 collateral. Works in flat / mid-priced
+markets. Most day-to-day revenue.
+
+**Path 2 — Convex accumulation (the asymmetric payoff side bet).**
+When paired is suppressed because one leg is at premium prices, buy the
+cheap leg at ≤ $0.45 in small size, betting on rare reversal. Pays off
+~5-15% of the time but pays 5-20× when it does. NOT a separate strategy
+— second arm of the same one. Asymmetric payoff is core design intent.
+
+**What this strategy is NOT.**
+- NOT directional momentum chasing (buying winning side at $0.95).
+- NOT pure paired-only. Suppressing convex_accum because "one side is
+  too expensive" kills the asymmetric payoff.
+
+**Hard suppression triggers** (skip ALL entry paths, including convex):
+asymmetric entry-fill cooldown, post-fill cooldown, btc regime
+inactive, runtime degraded.
+
+**Soft suppression triggers** (skip paired, allow convex):
+premium fair cap, market mid moved, btc regime trending.
+
+When introducing a new gate, ASK: does this hurt paired, convex, or
+both? Encode the answer in the gate's return type, not a string-prefix
+classifier downstream.
+
+## Gate calibration: prefer signals over hardcoded constants
+
+V1 can use a constant for safety; V2 should be SIGNAL-DERIVED:
+- Trend persistence → scaled by `btc_regime.realized_vol_5m_bps`
+- Bar-relative timing → fraction of `bar_window_ms` (works 5m/15m/etc.)
+- Bid count caps → `max_leg_cost / typical_clip` (capital-aware)
+- Hit-rate self-feedback where possible
+
+Constants bound the bot; signals optimize it. Plan the V2 in the same
+PR's commit message even if you ship V1 first.
+
+## Env var alignment
+
+Launcher exports MUST exactly match `config/mod.rs` parser names. We've
+shipped 2 silent failures here:
+- `WHALE_PAIR_JOURNAL_PATH` (launcher) vs `WHALE_PAIR_EXEC_JOURNAL_PATH`
+  (parser) → tinylive ran with no decision log.
+- `WHALE_PAIR_LIVE_AUTO_REDEEM` parsed by binary, never set by launcher
+  → auto-redeem silently disabled in production.
+
+Before shipping a new env knob: grep both directions, verify names
+match. Remove from BOTH places when deleting. Catalog all knobs and
+their consumers in BANDAIDS.md to prevent drift.
+
 ## No bandaids — fix the core engine
 
 When a behavior is missing or broken, the fix goes IN THE RUST ENGINE
