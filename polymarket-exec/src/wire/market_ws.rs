@@ -50,12 +50,13 @@ impl MarketWsClient {
     pub async fn run(self, shutdown: CancellationToken) {
         let mut backoff = Duration::from_secs(1);
         let mut assets = self.assets.clone();
+        let mut assets_rx = self.assets_rx.clone();
         while !shutdown.is_cancelled() {
-            if let Some(rx) = &self.assets_rx {
-                assets = rx.borrow().clone();
+            if let Some(rx) = assets_rx.as_mut() {
+                assets = rx.borrow_and_update().clone();
             }
             match self
-                .run_once(shutdown.clone(), assets.clone(), self.assets_rx.clone())
+                .run_once(shutdown.clone(), assets.clone(), assets_rx.clone())
                 .await
             {
                 Ok(()) => break,
@@ -274,6 +275,21 @@ impl MarketWsClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_update_receiver_is_marked_seen_before_reconnect() {
+        let (_tx, mut rx) = watch::channel(vec!["old".to_string()]);
+        let _ = _tx.send(vec!["new".to_string()]);
+
+        let assets = rx.borrow_and_update().clone();
+        assert_eq!(assets, vec!["new".to_string()]);
+        assert!(!rx.has_changed().expect("sender open"));
     }
 }
 
