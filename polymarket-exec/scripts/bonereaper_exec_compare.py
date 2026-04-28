@@ -362,8 +362,131 @@ def render_summary(family_stats: dict[str, FamilyStats]) -> str:
     return "\n".join(lines)
 
 
+def load_fidelity_events(path: Path) -> list[dict]:
+    """Read fidelity_event rows from the engine journal."""
+    out = []
+    if not path.exists():
+        return out
+    with path.open() as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("kind") != "fidelity_event":
+                continue
+            event = row.get("event")
+            if isinstance(event, dict):
+                out.append(event)
+    return out
+
+
+def load_queue_model_estimates(path: Path) -> list[dict]:
+    """Read queue_model_estimate rows from the engine journal."""
+    out = []
+    if not path.exists():
+        return out
+    with path.open() as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("kind") != "queue_model_estimate":
+                continue
+            estimate = row.get("estimate")
+            if isinstance(estimate, dict):
+                out.append(estimate)
+    return out
+
+
+def render_fidelity_trend(events: list[dict]) -> str:
+    """Time-series rollup of fidelity verdicts and MAPE per market family."""
+    if not events:
+        return "no fidelity_event rows in the journal"
+    by_family: dict[str, list[dict]] = {}
+    for ev in events:
+        family = ev.get("market_family", "?")
+        by_family.setdefault(family, []).append(ev)
+    lines = []
+    for family in sorted(by_family.keys()):
+        family_events = sorted(by_family[family], key=lambda e: e.get("window_end_ms", 0))
+        n = len(family_events)
+        verdicts = [e.get("verdict", "?") for e in family_events]
+        ok = verdicts.count("ok")
+        warn = verdicts.count("warn")
+        fail = verdicts.count("fail")
+        mapes = [e.get("mape_fill_count", 0.0) for e in family_events if e.get("mape_fill_count") is not None]
+        avg_mape = sum(mapes) / len(mapes) if mapes else 0.0
+        max_mape = max(mapes) if mapes else 0.0
+        first_ms = family_events[0].get("window_end_ms", 0)
+        last_ms = family_events[-1].get("window_end_ms", 0)
+        lines.append(
+            f"{family:<22} n={n:>4} ok={ok:>4} warn={warn:>4} fail={fail:>4} "
+            f"avg_mape={avg_mape:.3f} max_mape={max_mape:.3f} "
+            f"window=[{first_ms} -> {last_ms}]"
+        )
+    return "\n".join(lines)
+
+
+def render_queue_decay_trend(estimates: list[dict]) -> str:
+    """Time-series rollup of queue_decay_rate_per_sec per market family."""
+    if not estimates:
+        return "no queue_model_estimate rows in the journal"
+    by_family: dict[str, list[dict]] = {}
+    for est in estimates:
+        family = est.get("market_family", "?")
+        by_family.setdefault(family, []).append(est)
+    lines = []
+    for family in sorted(by_family.keys()):
+        family_estimates = sorted(
+            by_family[family], key=lambda e: e.get("observed_at_ms", 0)
+        )
+        n = len(family_estimates)
+        rates = [
+            e.get("queue_decay_rate_per_sec", float("nan"))
+            for e in family_estimates
+        ]
+        # Skip NaN warmup rows for first/last/avg/min/max stats.
+        finite_rates = [r for r in rates if isinstance(r, (int, float)) and r == r]
+        if finite_rates:
+            avg_rate = sum(finite_rates) / len(finite_rates)
+            min_rate = min(finite_rates)
+            max_rate = max(finite_rates)
+            first_rate = finite_rates[0]
+            last_rate = finite_rates[-1]
+        else:
+            avg_rate = min_rate = max_rate = first_rate = last_rate = float("nan")
+        warmup = n - len(finite_rates)
+        max_obs = max(
+            (e.get("n_observations", 0) for e in family_estimates),
+            default=0,
+        )
+        lines.append(
+            f"{family:<22} n={n:>4} warmup={warmup:>4} "
+            f"first={first_rate:.3f} last={last_rate:.3f} "
+            f"min={min_rate:.3f} avg={avg_rate:.3f} max={max_rate:.3f} "
+            f"max_n_obs={max_obs}"
+        )
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=["compare", "fidelity-trend", "queue-decay-trend"],
+        default="compare",
+        help="compare (default) does the per-fill classification rollup; "
+        "fidelity-trend reads fidelity_event rows and prints per-family verdict + MAPE history; "
+        "queue-decay-trend reads queue_model_estimate rows and prints per-family decay-rate history",
+    )
     parser.add_argument(
         "--wallet",
         default="0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
@@ -377,8 +500,8 @@ def main() -> int:
     parser.add_argument(
         "--book-snapshot-log",
         type=Path,
-        required=True,
-        help="path to book_snapshots.jsonl produced by shadow-live",
+        default=None,
+        help="path to book_snapshots.jsonl produced by shadow-live (required for mode=compare)",
     )
     parser.add_argument(
         "--journal-log",
@@ -389,14 +512,14 @@ def main() -> int:
     parser.add_argument(
         "--from-ts",
         type=int,
-        required=True,
-        help="comparison window start (epoch seconds)",
+        default=None,
+        help="comparison window start (epoch seconds, required for mode=compare)",
     )
     parser.add_argument(
         "--to-ts",
         type=int,
-        required=True,
-        help="comparison window end (epoch seconds)",
+        default=None,
+        help="comparison window end (epoch seconds, required for mode=compare)",
     )
     parser.add_argument(
         "--detail-out",
@@ -406,6 +529,29 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.mode == "fidelity-trend":
+        if not args.journal_log.exists():
+            print(f"missing journal log: {args.journal_log}", file=sys.stderr)
+            return 2
+        events = load_fidelity_events(args.journal_log)
+        print(render_fidelity_trend(events))
+        return 0
+
+    if args.mode == "queue-decay-trend":
+        if not args.journal_log.exists():
+            print(f"missing journal log: {args.journal_log}", file=sys.stderr)
+            return 2
+        estimates = load_queue_model_estimates(args.journal_log)
+        print(render_queue_decay_trend(estimates))
+        return 0
+
+    # mode == "compare" requires the additional inputs.
+    if args.book_snapshot_log is None:
+        print("--book-snapshot-log is required for mode=compare", file=sys.stderr)
+        return 2
+    if args.from_ts is None or args.to_ts is None:
+        print("--from-ts and --to-ts are required for mode=compare", file=sys.stderr)
+        return 2
     if not args.book_snapshot_log.exists():
         print(f"missing book snapshot log: {args.book_snapshot_log}", file=sys.stderr)
         return 2
