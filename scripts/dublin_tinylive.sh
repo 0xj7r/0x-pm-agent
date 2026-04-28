@@ -122,9 +122,15 @@ source /tmp/tinylive_runtime.env
 export WHALE_PAIR_ASSET_IDS WHALE_PAIR_INSTRUMENT_MARKETS WHALE_PAIR_USER_MARKETS
 export WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH=/tmp/tinylive_ctx.json
 
-# Persistent journal/order store paths
+# Persistent journal/order store paths.
+# IMPORTANT: variable names must match config/mod.rs (parse_path_optional reads
+# WHALE_PAIR_EXEC_JOURNAL_PATH and WHALE_PAIR_EXEC_AUDIT_PATH). The earlier
+# WHALE_PAIR_JOURNAL_PATH name was silently ignored, leaving tinylive with no
+# decision log on disk.
 mkdir -p ~/.local/share/polymarket-exec/tinylive
-export WHALE_PAIR_JOURNAL_PATH=~/.local/share/polymarket-exec/tinylive/journal-$(date +%Y%m%d-%H%M%S).jsonl
+SESSION_TS=$(date +%Y%m%d-%H%M%S)
+export WHALE_PAIR_EXEC_JOURNAL_PATH=~/.local/share/polymarket-exec/tinylive/journal-${SESSION_TS}.jsonl
+export WHALE_PAIR_EXEC_AUDIT_PATH=~/.local/share/polymarket-exec/tinylive/audit-${SESSION_TS}.jsonl
 export WHALE_PAIR_ORDER_STORE_PATH=~/.local/share/polymarket-exec/tinylive/orders.sqlite
 
 export RUST_LOG=info,paper_fill_gate=warn
