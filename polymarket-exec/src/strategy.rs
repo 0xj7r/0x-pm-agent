@@ -632,7 +632,7 @@ struct Btc5mMmMarketState {
     last_action_ms: Option<EpochMillis>,
     last_no_quote_note_ms: Option<EpochMillis>,
     last_cooling_note_ms: Option<EpochMillis>,
-    last_cooling_note_reason: Option<String>,
+    last_cooling_note_key: Option<&'static str>,
     /// Last time we emitted an IOC hedge-rescue intent on this market.
     /// Used to throttle rescue emission so we don't drown the engine's
     /// rate limiter with 85 intents/min on every book tick.
@@ -1730,7 +1730,7 @@ impl Btc5mMmStrategy {
                     last_action_ms: record.last_action_ms,
                     last_no_quote_note_ms: record.last_no_quote_note_ms,
                     last_cooling_note_ms: None,
-                    last_cooling_note_reason: None,
+                    last_cooling_note_key: None,
                     last_rescue_attempt_ms: record.last_rescue_attempt_ms,
                     last_fill_ms: record.last_fill_ms,
                 },
@@ -2029,7 +2029,8 @@ impl Btc5mMmStrategy {
         reason: &str,
     ) -> bool {
         let state = self.market_states.entry(market_id.clone()).or_default();
-        let reason_changed = state.last_cooling_note_reason.as_deref() != Some(reason);
+        let reason_key = Self::cooling_reason_key(reason);
+        let reason_changed = state.last_cooling_note_key != Some(reason_key);
         let interval_elapsed = state.last_cooling_note_ms.is_none_or(|last_ms| {
             now_ms.saturating_sub(last_ms) >= Self::NO_QUOTE_NOTE_INTERVAL_MS
         });
@@ -2039,8 +2040,24 @@ impl Btc5mMmStrategy {
         }
 
         state.last_cooling_note_ms = Some(now_ms);
-        state.last_cooling_note_reason = Some(reason.to_string());
+        state.last_cooling_note_key = Some(reason_key);
         true
+    }
+
+    fn cooling_reason_key(reason: &str) -> &'static str {
+        if reason.starts_with("market mid moved") {
+            "market_mid_moved"
+        } else if reason.starts_with("premium fair cap") {
+            "premium_fair_cap"
+        } else if reason.starts_with("btc regime flat") {
+            "btc_regime_flat"
+        } else if reason.starts_with("btc regime trending") {
+            "btc_regime_trending"
+        } else if reason.starts_with("asymmetric entry-fill cooldown") {
+            "asymmetric_entry_fill_cooldown"
+        } else {
+            "other"
+        }
     }
 
     fn quote_health(quote: &QuoteSnapshot) -> String {
@@ -6436,14 +6453,22 @@ mod tests {
         let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
         let market_id = MarketId::from("market-mm");
 
-        assert!(strategy.should_log_cooling_note(&market_id, 1_000, "btc regime flat"));
-        assert!(!strategy.should_log_cooling_note(&market_id, 2_000, "btc regime flat"));
-        assert!(strategy.should_log_cooling_note(&market_id, 2_000, "market mid moved"));
-        assert!(!strategy.should_log_cooling_note(&market_id, 3_000, "market mid moved"));
+        assert!(strategy.should_log_cooling_note(
+            &market_id,
+            1_000,
+            "btc regime flat: vol_5m=0.05bps"
+        ));
+        assert!(!strategy.should_log_cooling_note(
+            &market_id,
+            2_000,
+            "btc regime flat: vol_5m=0.06bps"
+        ));
+        assert!(strategy.should_log_cooling_note(&market_id, 2_000, "market mid moved 0.060"));
+        assert!(!strategy.should_log_cooling_note(&market_id, 3_000, "market mid moved 0.100"));
         assert!(strategy.should_log_cooling_note(
             &market_id,
             2_000 + Btc5mMmStrategy::NO_QUOTE_NOTE_INTERVAL_MS,
-            "market mid moved"
+            "market mid moved 0.110"
         ));
     }
 
