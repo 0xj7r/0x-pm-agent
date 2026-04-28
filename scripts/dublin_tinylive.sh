@@ -92,8 +92,16 @@ export WHALE_PAIR_EXEC_STARTING_CASH_USD=50
 export WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD=25
 export WHALE_PAIR_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD=10
 export WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT=60
-export WHALE_PAIR_EXEC_MIN_FREE_CASH_USD=5
-export WHALE_PAIR_EXEC_MIN_FREE_CASH_BPS=1000
+# Disable venue-cash floor checks because POLYMARKET_API_KEY/SECRET/PASSPHRASE
+# auth is currently broken — the bot reads venue_cash=$0 and immediately
+# trips MIN_FREE_CASH_USD floor, going RiskOff every tick. Internal cash
+# accounting (which starts at STARTING_CASH=$50 and tracks deltas) is
+# untouched and remains the real safety. Restore floors > 0 once auth
+# credentials are fixed in .env on Dublin.
+# TODO(auth): once API_KEY/SECRET/PASSPHRASE restored, set:
+#   WHALE_PAIR_EXEC_MIN_FREE_CASH_USD=5  WHALE_PAIR_EXEC_MIN_FREE_CASH_BPS=1000
+export WHALE_PAIR_EXEC_MIN_FREE_CASH_USD=0
+export WHALE_PAIR_EXEC_MIN_FREE_CASH_BPS=0
 export WHALE_PAIR_EXEC_MAX_SESSION_LOSS_BPS=2000
 export WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL=8
 export WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET=8

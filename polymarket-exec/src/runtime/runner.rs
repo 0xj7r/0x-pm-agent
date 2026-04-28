@@ -3545,13 +3545,20 @@ fn submit_request_from_intent(
             !execution_policy.paper_mode && execution_policy.live_post_only,
         )
     };
+    // V2 SDK enforces strict decimal validation on order size: max 2 decimal
+    // places. Strategy computes qty=clip_usd/price which produces values like
+    // 9.0909090909 (15 decimals) that V1 silently accepted but V2 rejects with
+    // "Validation: invalid: Unable to build Order: Size N has 15 decimal
+    // places. Maximum lot size is 2". Round to 2 decimal places at the wire
+    // boundary so the strategy can stay precision-agnostic.
+    let venue_quantity = (intent.quantity * 100.0).floor() / 100.0;
     SubmitOrderRequest {
         client_order_id: intent.client_order_id.clone(),
         market_id: intent.market_id.clone(),
         instrument_id: intent.instrument_id.clone(),
         side: intent.side,
         limit_price: intent.limit_price,
-        quantity: intent.quantity,
+        quantity: venue_quantity,
         post_only,
         time_in_force,
         expires_at_ms: live_expires_at_ms,
