@@ -143,23 +143,12 @@ impl PairedBookSignal {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MarketActivitySignal {
     pub last_trade_event_count_10s: u32,
     pub last_trade_event_count_30s: u32,
     pub last_trade_event_count_60s: u32,
     pub last_trade_event_age_ms: Option<u64>,
-}
-
-impl Default for MarketActivitySignal {
-    fn default() -> Self {
-        Self {
-            last_trade_event_count_10s: 0,
-            last_trade_event_count_30s: 0,
-            last_trade_event_count_60s: 0,
-            last_trade_event_age_ms: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -679,8 +668,9 @@ impl Btc5mMmMarketState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum Btc5mMmMarketMode {
+    #[default]
     Ready,
     Cooling {
         reason: String,
@@ -719,12 +709,6 @@ struct Btc5mMmExposureDecision {
     rescue_ev_per_share: Option<f64>,
     held_fair: f64,
     avg_cost: f64,
-}
-
-impl Default for Btc5mMmMarketMode {
-    fn default() -> Self {
-        Self::Ready
-    }
 }
 
 #[derive(Debug, Default)]
@@ -3885,36 +3869,6 @@ impl GoatPairStrategy {
 
     fn completion_pnl_per_share(&self, opposite_avg: f64, price: f64) -> f64 {
         1.0 - opposite_avg - price - self.config.taker_fee_coeff * price * (1.0 - price)
-    }
-
-    fn quote_is_fresh(&self, observed_at_ms: EpochMillis, now_ms: EpochMillis) -> bool {
-        if let Some(max_age_ms) = self.quote_min_quote_age_ms {
-            if now_ms.saturating_sub(observed_at_ms) > max_age_ms {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn quote_refresh_allowed(
-        &self,
-        last_action_ms: Option<EpochMillis>,
-        now_ms: EpochMillis,
-    ) -> bool {
-        let Some(refresh_interval_ms) = self.quote_refresh_interval_ms else {
-            return true;
-        };
-        let Some(last_action_ms) = last_action_ms else {
-            return true;
-        };
-        now_ms.saturating_sub(last_action_ms) >= refresh_interval_ms
-    }
-
-    fn quote_expired(&self, last_action_ms: Option<EpochMillis>, now_ms: EpochMillis) -> bool {
-        self.quote_expiry_suppression_ms.is_some_and(|expiry_ms| {
-            last_action_ms
-                .is_some_and(|last_action_ms| now_ms.saturating_sub(last_action_ms) > expiry_ms)
-        })
     }
 
     fn inventory_skew_scale(&self, this_qty: f64, opp_qty: f64) -> f64 {
