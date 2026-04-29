@@ -994,7 +994,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         false => {
             let live_connection = connect_live_session(&config).await?;
             effective_user_auth = live_connection.user_auth;
-            maybe_auto_wrap_pusd(&config, &live_connection.adapter, "startup").await?;
+            maybe_auto_wrap_pusd_at_startup(&config, &live_connection.adapter).await;
             Arc::new(live_connection.adapter)
         }
     };
@@ -1226,6 +1226,16 @@ async fn maybe_auto_wrap_pusd_after_redeem(config: &AppConfig, adapter: &dyn Exe
             target: "live_collateral",
             error = %error,
             "pUSD auto-wrap after redeem failed; continuing live loop"
+        );
+    }
+}
+
+async fn maybe_auto_wrap_pusd_at_startup(config: &AppConfig, adapter: &dyn ExecutionAdapter) {
+    if let Err(error) = maybe_auto_wrap_pusd(config, adapter, "startup").await {
+        warn!(
+            target: "live_collateral.startup",
+            error = %error,
+            "pUSD auto-wrap at startup failed; continuing live loop"
         );
     }
 }
@@ -4815,6 +4825,7 @@ mod tests {
         fills: Vec<VenueFill>,
         balances: Option<VenueBalances>,
         pusd_wrap_min_usd: Mutex<Vec<f64>>,
+        pusd_wrap_fails: bool,
     }
 
     #[async_trait]
@@ -4891,6 +4902,11 @@ mod tests {
                 .lock()
                 .expect("pusd wrap lock")
                 .push(min_wrap_usd);
+            if self.pusd_wrap_fails {
+                return Err(ExecutionError::TransientNetwork(
+                    "test polygon rpc throttle".to_string(),
+                ));
+            }
             Ok(None)
         }
 
@@ -4949,6 +4965,28 @@ mod tests {
             .lock()
             .expect("pusd wrap lock")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn pusd_auto_wrap_startup_error_is_non_fatal() {
+        let mut config = runner_test_config();
+        config.live_pusd_auto_wrap = true;
+        config.live_pusd_auto_wrap_min_usd = 2.50;
+        let adapter = RecordingAdapter {
+            pusd_wrap_fails: true,
+            ..RecordingAdapter::default()
+        };
+
+        maybe_auto_wrap_pusd_at_startup(&config, &adapter).await;
+
+        assert_eq!(
+            adapter
+                .pusd_wrap_min_usd
+                .lock()
+                .expect("pusd wrap lock")
+                .as_slice(),
+            &[2.50]
+        );
     }
 
     #[tokio::test]
