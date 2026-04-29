@@ -172,10 +172,6 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         maker_safety_ticks: 2.0,
         entry_ladder_levels: 1,
         entry_ladder_spacing_ticks: 1.0,
-        bar_phase_default_window_ms: 300_000,
-        bar_phase_early_end_ratio: 0.20,
-        bar_phase_mid_end_ratio: 0.70,
-        bar_phase_late_end_ratio: 0.95,
         bar_phase_early_clip_scale: 1.0,
         bar_phase_mid_clip_scale: 0.6,
         bar_phase_late_clip_scale: 1.4,
@@ -183,7 +179,7 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         cooldown_ms: 0,
         taker_fee_coeff: 0.072,
         entry_premium_bid_cap: 0.97,
-        order_flow_imbalance_threshold: 0.60,
+        order_flow_imbalance_threshold_override: 0.60,
         asymmetric_fill_max_penalty: 0.05,
         merge_gas_cost_usd: 0.30,
     }
@@ -392,7 +388,7 @@ fn btc_5m_mm_quotes_maker_bids_on_both_outcomes() {
 #[test]
 fn btc_5m_mm_flow_imbalance_allows_just_below_threshold() {
     let mut config = btc_5m_mm_test_config();
-    config.order_flow_imbalance_threshold = 0.60;
+    config.order_flow_imbalance_threshold_override = 0.60;
     let mut strategy = Btc5mMmStrategy::new(config);
     let ctx = context(Vec::new());
     strategy.on_market_snapshot(
@@ -413,7 +409,7 @@ fn btc_5m_mm_flow_imbalance_allows_just_below_threshold() {
 #[test]
 fn btc_5m_mm_flow_imbalance_suppresses_just_above_threshold() {
     let mut config = btc_5m_mm_test_config();
-    config.order_flow_imbalance_threshold = 0.60;
+    config.order_flow_imbalance_threshold_override = 0.60;
     let mut strategy = Btc5mMmStrategy::new(config);
     let ctx = context(Vec::new());
     strategy.on_market_snapshot(

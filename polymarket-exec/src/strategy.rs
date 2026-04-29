@@ -271,10 +271,11 @@ pub struct Btc5mMmConfig {
     pub maker_safety_ticks: f64,
     pub entry_ladder_levels: usize,
     pub entry_ladder_spacing_ticks: f64,
-    pub bar_phase_default_window_ms: u64,
-    pub bar_phase_early_end_ratio: f64,
-    pub bar_phase_mid_end_ratio: f64,
-    pub bar_phase_late_end_ratio: f64,
+    /// V2 Signal 2 (bar-phase pacing): per-phase clip multipliers. Phase
+    /// boundaries are hardcoded definitions (not operator knobs) — see
+    /// `BAR_PHASE_*_END_RATIO` consts. These multipliers come from whale
+    /// notional-by-phase calibration; env-overridable for retuning if
+    /// whale's pattern shifts.
     pub bar_phase_early_clip_scale: f64,
     pub bar_phase_mid_clip_scale: f64,
     pub bar_phase_late_clip_scale: f64,
@@ -284,11 +285,17 @@ pub struct Btc5mMmConfig {
     /// Hard ceiling on per-leg paired bid price. Above this, the ladder
     /// loop breaks. Whale data shows favored-leg bids up to $0.97. Env-tunable.
     pub entry_premium_bid_cap: f64,
-    /// V2 Signal 1 (order-flow imbalance): suppress paired entry when
-    /// taker flow in the expensive leg is too one-sided over the last 60s.
-    pub order_flow_imbalance_threshold: f64,
+    /// V2 Signal 1 (order-flow imbalance) escape-hatch threshold. The
+    /// gate's primary threshold is computed at runtime from BTC realized
+    /// vol (vol-scaled — high-vol regimes get a looser threshold). This
+    /// env knob exists as an operator override; set to 0 to disable
+    /// signal-derivation and use this raw threshold instead.
+    pub order_flow_imbalance_threshold_override: f64,
     /// V2 Signal 4 (own-fill asymmetry): during asymmetric-entry cooldown,
     /// tighten entry max bid by penalty=(1-symmetry)*max_penalty.
+    /// Default 0.02 honors the spec's "tighten not block" intent — at
+    /// typical edge config a 0.05 cap drives max_bid below best_bid and
+    /// effectively re-arms the deleted asymmetric-entry cooldown.
     pub asymmetric_fill_max_penalty: f64,
     /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
     /// rescue EV. Env-tunable.
@@ -349,22 +356,6 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_SPACING_TICKS",
                 1.0,
             ),
-            bar_phase_default_window_ms: parse_u64(
-                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_DEFAULT_WINDOW_MS",
-                300_000,
-            ),
-            bar_phase_early_end_ratio: parse_f64(
-                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_EARLY_END_RATIO",
-                0.20,
-            ),
-            bar_phase_mid_end_ratio: parse_f64(
-                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_MID_END_RATIO",
-                0.70,
-            ),
-            bar_phase_late_end_ratio: parse_f64(
-                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_LATE_END_RATIO",
-                0.95,
-            ),
             bar_phase_early_clip_scale: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_EARLY_CLIP_SCALE",
                 1.0,
@@ -387,13 +378,18 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP",
                 0.97,
             ),
-            order_flow_imbalance_threshold: parse_f64(
+            // 0.0 = use signal-derived default (vol-scaled at runtime).
+            // Non-zero overrides with a fixed threshold (escape hatch).
+            order_flow_imbalance_threshold_override: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_ORDER_FLOW_IMBALANCE_THRESHOLD",
-                0.60,
+                0.0,
             ),
+            // Default 0.02 honors "tighten not block" — at 0.05 the penalty
+            // exceeds typical edge and re-arms the deleted asymmetric-entry
+            // cooldown. Operator can raise via env if needed.
             asymmetric_fill_max_penalty: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_ASYMMETRIC_FILL_MAX_PENALTY",
-                0.05,
+                0.02,
             ),
             merge_gas_cost_usd: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
@@ -428,10 +424,6 @@ impl Btc5mMmConfig {
             maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
             entry_ladder_levels: config.entry_ladder_levels.clamp(1, 32),
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
-            bar_phase_default_window_ms: config.bar_phase_default_window_ms.max(1_000),
-            bar_phase_early_end_ratio: config.bar_phase_early_end_ratio.clamp(0.0, 1.0),
-            bar_phase_mid_end_ratio: config.bar_phase_mid_end_ratio.clamp(0.0, 1.0),
-            bar_phase_late_end_ratio: config.bar_phase_late_end_ratio.clamp(0.0, 1.0),
             bar_phase_early_clip_scale: config.bar_phase_early_clip_scale.clamp(0.0, 3.0),
             bar_phase_mid_clip_scale: config.bar_phase_mid_clip_scale.clamp(0.0, 3.0),
             bar_phase_late_clip_scale: config.bar_phase_late_clip_scale.clamp(0.0, 3.0),
@@ -439,8 +431,8 @@ impl Btc5mMmConfig {
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
             entry_premium_bid_cap: config.entry_premium_bid_cap.clamp(0.50, 0.99),
-            order_flow_imbalance_threshold: config
-                .order_flow_imbalance_threshold
+            order_flow_imbalance_threshold_override: config
+                .order_flow_imbalance_threshold_override
                 .abs()
                 .clamp(0.0, 1.0),
             asymmetric_fill_max_penalty: config.asymmetric_fill_max_penalty.clamp(0.0, 0.10),
@@ -1740,6 +1732,33 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
     const ASYMMETRIC_FILL_SEVERE_SYMMETRY: f64 = 0.35;
     const ASYMMETRIC_FILL_MIN_TOTAL_QTY: f64 = 10.0;
+    /// Bar-phase definitions (V2 Signal 2). Hardcoded because these are
+    /// the *meaning* of "early/mid/late/final" within a bar — they were
+    /// chosen once based on whale notional-by-phase distribution. Operator
+    /// tunables are the per-phase clip multipliers in `Btc5mMmConfig`,
+    /// not these boundaries.
+    const BAR_PHASE_EARLY_END_RATIO: f64 = 0.20;
+    const BAR_PHASE_MID_END_RATIO: f64 = 0.70;
+    const BAR_PHASE_LATE_END_RATIO: f64 = 0.95;
+    /// Default bar window if `MarketContextRecord` lacks event timing.
+    /// 5min matches the btc-updown-5m family. For other families (e.g.
+    /// btc-updown-15m), supply correct timing via market_context.
+    const BAR_PHASE_DEFAULT_WINDOW_MS: u64 = 5 * 60 * 1_000;
+    /// Order-flow imbalance window (V2 Signal 1). 60s rolling — signal
+    /// definition, not an operator knob. Window enforcement lives in
+    /// `core::book::LegFlowState`; this const is the documented contract.
+    #[allow(dead_code)]
+    const FLOW_IMBALANCE_WINDOW_MS: u64 = 60_000;
+    /// Vol-scaled order-flow imbalance threshold defaults.
+    /// `threshold = base + slope * (1 - vol_normalized)`.
+    /// Calm regime (low vol) → tighter threshold (fires more readily on
+    /// any imbalance, since calm + one-sided flow = clean signal).
+    /// Hot regime (high vol) → looser threshold (noisy flow → less reliable).
+    const FLOW_IMBALANCE_THRESHOLD_BASE: f64 = 0.45;
+    const FLOW_IMBALANCE_THRESHOLD_SLOPE: f64 = 0.25;
+    /// Vol normalization point: realized 5m vol in bps that maps to
+    /// `vol_normalized = 1.0`. Above this → "high vol" → looser threshold.
+    const FLOW_IMBALANCE_VOL_REFERENCE_BPS: f64 = 80.0;
     const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
     const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.55;
     /// Convex accumulation gets a smaller slice of the per-market budget than
@@ -2138,20 +2157,39 @@ impl Btc5mMmStrategy {
                         .map(|end_ms| end_ms - start_ms)
                 })
             })
-            .unwrap_or(self.config.bar_phase_default_window_ms)
+            .unwrap_or(Self::BAR_PHASE_DEFAULT_WINDOW_MS)
             .max(1_000);
         let elapsed_ratio =
             (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
-        let scale = if elapsed_ratio < self.config.bar_phase_early_end_ratio {
+        let scale = if elapsed_ratio < Self::BAR_PHASE_EARLY_END_RATIO {
             self.config.bar_phase_early_clip_scale
-        } else if elapsed_ratio < self.config.bar_phase_mid_end_ratio {
+        } else if elapsed_ratio < Self::BAR_PHASE_MID_END_RATIO {
             self.config.bar_phase_mid_clip_scale
-        } else if elapsed_ratio < self.config.bar_phase_late_end_ratio {
+        } else if elapsed_ratio < Self::BAR_PHASE_LATE_END_RATIO {
             self.config.bar_phase_late_clip_scale
         } else {
             self.config.bar_phase_final_clip_scale
         };
         Some((scale, elapsed_ratio, remaining_ms, bar_window_ms))
+    }
+
+    /// Compute the order-flow imbalance threshold for this tick.
+    /// Vol-scaled by default; falls back to the operator override if set.
+    fn flow_imbalance_threshold(
+        &self,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+    ) -> f64 {
+        if self.config.order_flow_imbalance_threshold_override > 0.0 {
+            return self.config.order_flow_imbalance_threshold_override;
+        }
+        let vol_bps = btc_regime
+            .realized_vol_5m_bps
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS);
+        let vol_normalized =
+            (vol_bps / Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS).clamp(0.0, 1.0);
+        Self::FLOW_IMBALANCE_THRESHOLD_BASE
+            + Self::FLOW_IMBALANCE_THRESHOLD_SLOPE * (1.0 - vol_normalized)
     }
 
     fn dynamic_bid_clip_usd(
@@ -2190,8 +2228,8 @@ impl Btc5mMmStrategy {
             .unwrap_or((
                 self.config.bar_phase_early_clip_scale,
                 0.0,
-                self.config.bar_phase_default_window_ms,
-                self.config.bar_phase_default_window_ms,
+                Self::BAR_PHASE_DEFAULT_WINDOW_MS,
+                Self::BAR_PHASE_DEFAULT_WINDOW_MS,
             ));
         if phase_scale <= 0.0 {
             info!(
@@ -2200,7 +2238,7 @@ impl Btc5mMmStrategy {
                 elapsed_ratio,
                 remaining_ms,
                 bar_window_ms,
-                phase_late_end_ratio = self.config.bar_phase_late_end_ratio,
+                phase_late_end_ratio = Self::BAR_PHASE_LATE_END_RATIO,
                 phase_scale,
                 threshold = self.config.bar_phase_final_clip_scale,
                 "paired entry suppressed by bar-phase pacing signal"
@@ -2291,8 +2329,10 @@ impl Btc5mMmStrategy {
         right_id: &InstrumentId,
         right_quote: &QuoteSnapshot,
         right_fair: f64,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
     ) -> bool {
-        if self.config.order_flow_imbalance_threshold <= 0.0 {
+        let threshold = self.flow_imbalance_threshold(btc_regime);
+        if threshold <= 0.0 {
             return false;
         }
         let (expensive_leg, buy_qty_60s, sell_qty_60s) = if left_fair >= right_fair {
@@ -2313,7 +2353,7 @@ impl Btc5mMmStrategy {
             return false;
         }
         let imbalance = (buy_qty_60s - sell_qty_60s) / total_qty_60s;
-        if imbalance.abs() >= self.config.order_flow_imbalance_threshold {
+        if imbalance.abs() >= threshold {
             info!(
                 target: "strategy.flow_imbalance",
                 market = %market_id,
@@ -2321,7 +2361,8 @@ impl Btc5mMmStrategy {
                 expensive_leg_buy_qty_60s = buy_qty_60s,
                 expensive_leg_sell_qty_60s = sell_qty_60s,
                 expensive_leg_imbalance = imbalance,
-                threshold = self.config.order_flow_imbalance_threshold,
+                threshold,
+                vol_5m_bps = ?btc_regime.realized_vol_5m_bps,
                 left_fair,
                 right_fair,
                 "paired entry suppressed by order-flow imbalance signal"
@@ -3978,7 +4019,7 @@ impl Strategy for Btc5mMmStrategy {
                 let fill_scale = self.fill_rate_clip_scale(context.now_ms);
                 let scaled_clip = (self.config.base_clip_usd * fill_scale)
                     .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
-                let suppress_paired = self.suppress_paired_by_flow_imbalance(
+                let suppress_paired_flow = self.suppress_paired_by_flow_imbalance(
                     &snapshot.market_id,
                     &left_id,
                     &left_quote,
@@ -3986,7 +4027,18 @@ impl Strategy for Btc5mMmStrategy {
                     &right_id,
                     &right_quote,
                     right_fair,
+                    &context.btc_regime,
                 );
+                // Signal 2 (bar-phase pacing) early-suppression: when we
+                // are in the final-phase window, do not even attempt to
+                // build the ladder. Composition-order requirement: this
+                // must run BEFORE entry_premium_bid_cap inside the ladder
+                // construction, so we evaluate it here.
+                let suppress_paired_phase = self
+                    .bar_phase_clip_scale(context.market_context.as_ref(), context.now_ms)
+                    .map(|(scale, _, _, _)| scale <= 0.0)
+                    .unwrap_or(false);
+                let suppress_paired = suppress_paired_flow || suppress_paired_phase;
                 if cooling_reason.is_none() {
                     if !suppress_paired {
                         intents.extend(self.build_paired_entry_ladder(
