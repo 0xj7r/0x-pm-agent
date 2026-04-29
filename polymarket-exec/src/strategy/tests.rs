@@ -176,6 +176,7 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         taker_fee_coeff: 0.072,
         entry_premium_bid_cap: 0.97,
         order_flow_imbalance_threshold: 0.60,
+        asymmetric_fill_max_penalty: 0.05,
         merge_gas_cost_usd: 0.30,
     }
 }
@@ -716,6 +717,75 @@ fn btc_5m_mm_allows_reentry_after_balanced_entry_fills() {
         &snapshot("down", "market-mm", 0.48, 0.52, 30_000),
     );
 
+    assert_eq!(decision.intents.len(), 2);
+}
+
+#[test]
+fn btc_5m_mm_fill_asymmetry_penalty_suppresses_just_below_symmetry_threshold() {
+    let mut config = btc_5m_mm_test_config();
+    config.cooldown_ms = 0;
+    config.asymmetric_fill_max_penalty = 0.05;
+    let mut strategy = Btc5mMmStrategy::new(config);
+
+    let entry_ctx = context_at(Vec::new(), 10);
+    strategy.on_market_snapshot(&entry_ctx, &snapshot("up", "market-mm", 0.48, 0.50, 10));
+    let entry =
+        strategy.on_market_snapshot(&entry_ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+    let up_entry = entry
+        .intents
+        .iter()
+        .find(|intent| intent.instrument_id == InstrumentId::from("up"))
+        .expect("up entry");
+    let down_entry = entry
+        .intents
+        .iter()
+        .find(|intent| intent.instrument_id == InstrumentId::from("down"))
+        .expect("down entry");
+
+    let fill_ctx = context_at(Vec::new(), 20);
+    strategy.on_fill(&fill_ctx, &fill_from_intent(up_entry, 6.1, 20));
+    strategy.on_fill(&fill_ctx, &fill_from_intent(down_entry, 3.9, 21));
+
+    let reentry_ctx = context_at(Vec::new(), 22);
+    strategy.on_market_snapshot(&reentry_ctx, &snapshot("up", "market-mm", 0.48, 0.50, 22));
+    let decision =
+        strategy.on_market_snapshot(&reentry_ctx, &snapshot("down", "market-mm", 0.48, 0.50, 22));
+    assert!(
+        decision.intents.is_empty(),
+        "symmetry just below threshold should activate penalty via asymmetric cooldown and suppress paired ladder"
+    );
+}
+
+#[test]
+fn btc_5m_mm_fill_asymmetry_penalty_allows_just_above_symmetry_threshold() {
+    let mut config = btc_5m_mm_test_config();
+    config.cooldown_ms = 0;
+    config.asymmetric_fill_max_penalty = 0.05;
+    let mut strategy = Btc5mMmStrategy::new(config);
+
+    let entry_ctx = context_at(Vec::new(), 10);
+    strategy.on_market_snapshot(&entry_ctx, &snapshot("up", "market-mm", 0.48, 0.50, 10));
+    let entry =
+        strategy.on_market_snapshot(&entry_ctx, &snapshot("down", "market-mm", 0.48, 0.50, 10));
+    let up_entry = entry
+        .intents
+        .iter()
+        .find(|intent| intent.instrument_id == InstrumentId::from("up"))
+        .expect("up entry");
+    let down_entry = entry
+        .intents
+        .iter()
+        .find(|intent| intent.instrument_id == InstrumentId::from("down"))
+        .expect("down entry");
+
+    let fill_ctx = context_at(Vec::new(), 20);
+    strategy.on_fill(&fill_ctx, &fill_from_intent(up_entry, 6.2, 20));
+    strategy.on_fill(&fill_ctx, &fill_from_intent(down_entry, 4.1, 21));
+
+    let reentry_ctx = context_at(Vec::new(), 22);
+    strategy.on_market_snapshot(&reentry_ctx, &snapshot("up", "market-mm", 0.48, 0.50, 22));
+    let decision =
+        strategy.on_market_snapshot(&reentry_ctx, &snapshot("down", "market-mm", 0.48, 0.50, 22));
     assert_eq!(decision.intents.len(), 2);
 }
 

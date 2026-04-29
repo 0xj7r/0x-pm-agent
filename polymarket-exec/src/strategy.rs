@@ -279,6 +279,9 @@ pub struct Btc5mMmConfig {
     /// V2 Signal 1 (order-flow imbalance): suppress paired entry when
     /// taker flow in the expensive leg is too one-sided over the last 60s.
     pub order_flow_imbalance_threshold: f64,
+    /// V2 Signal 4 (own-fill asymmetry): during asymmetric-entry cooldown,
+    /// tighten entry max bid by penalty=(1-symmetry)*max_penalty.
+    pub asymmetric_fill_max_penalty: f64,
     /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
     /// rescue EV. Env-tunable.
     pub merge_gas_cost_usd: f64,
@@ -348,6 +351,10 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ORDER_FLOW_IMBALANCE_THRESHOLD",
                 0.60,
             ),
+            asymmetric_fill_max_penalty: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_ASYMMETRIC_FILL_MAX_PENALTY",
+                0.05,
+            ),
             merge_gas_cost_usd: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
                 0.30,
@@ -388,6 +395,7 @@ impl Btc5mMmConfig {
                 .order_flow_imbalance_threshold
                 .abs()
                 .clamp(0.0, 1.0),
+            asymmetric_fill_max_penalty: config.asymmetric_fill_max_penalty.clamp(0.0, 0.10),
             merge_gas_cost_usd: config.merge_gas_cost_usd.max(0.0),
         }
     }
@@ -2676,6 +2684,50 @@ impl Btc5mMmStrategy {
         }
     }
 
+    fn market_fill_symmetry(&self, market_id: &MarketId, now_ms: EpochMillis) -> Option<f64> {
+        let state = self.market_states.get(market_id)?;
+        let mut by_instrument: HashMap<InstrumentId, f64> = HashMap::new();
+        for (_ts, instrument_id, qty) in state.recent_fills.iter().filter(|(ts, _, _)| {
+            now_ms.saturating_sub(*ts) <= Self::ASYMMETRIC_FILL_WINDOW_MS
+        }) {
+            *by_instrument.entry(instrument_id.clone()).or_default() += qty.max(0.0);
+        }
+        let total_qty: f64 = by_instrument.values().sum();
+        if total_qty < Self::ASYMMETRIC_FILL_MIN_TOTAL_QTY {
+            return None;
+        }
+        if by_instrument.len() < 2 {
+            return Some(0.0);
+        }
+        let min_qty = by_instrument
+            .values()
+            .fold(f64::INFINITY, |acc, qty| acc.min(*qty));
+        let max_qty = by_instrument
+            .values()
+            .fold(0.0_f64, |acc, qty| acc.max(*qty));
+        if max_qty <= 0.0 {
+            return None;
+        }
+        Some((min_qty / max_qty).clamp(0.0, 1.0))
+    }
+
+    fn asymmetric_fill_penalty(&self, market_id: &MarketId, now_ms: EpochMillis) -> f64 {
+        if self.config.asymmetric_fill_max_penalty <= 0.0 {
+            return 0.0;
+        }
+        let Some(state) = self.market_states.get(market_id) else {
+            return 0.0;
+        };
+        if !state
+            .asymmetric_entry_block_until_ms
+            .is_some_and(|until_ms| until_ms > now_ms)
+        {
+            return 0.0;
+        }
+        let symmetry = self.market_fill_symmetry(market_id, now_ms).unwrap_or(0.0);
+        (1.0 - symmetry).clamp(0.0, 1.0) * self.config.asymmetric_fill_max_penalty
+    }
+
     fn is_own_entry_fill(fill: &crate::types::FillReport) -> bool {
         fill.side == TradeSide::Buy
             && fill.close_method.is_none()
@@ -2709,7 +2761,7 @@ impl Btc5mMmStrategy {
         //   - has_inventory (manage existing position)
         //   - per-leg ENTRY_PREMIUM_BID_CAP inside build_paired_entry_ladder
         //   - capital caps (max_leg_cost, max_gross_cost) in risk engine
-        let _ = (left_fair, right_fair, btc_regime, market_mid_move);
+        let _ = (now_ms, left_fair, right_fair, btc_regime, market_mid_move);
         let next_mode = if has_inventory {
             Btc5mMmMarketMode::ManagingInventory
         } else {
@@ -2739,6 +2791,8 @@ impl Btc5mMmStrategy {
 
     fn candidate_ladder_bid_price(
         &self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
         quote: &QuoteSnapshot,
         fair: f64,
         leg_cost: f64,
@@ -2748,7 +2802,20 @@ impl Btc5mMmStrategy {
         level_index: usize,
     ) -> Option<f64> {
         let best_bid = Self::best_bid(quote)?;
-        let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
+        let mut max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
+        let asymmetric_penalty = self.asymmetric_fill_penalty(market_id, now_ms);
+        if asymmetric_penalty > 0.0 {
+            max_bid = (max_bid - asymmetric_penalty).clamp(0.0, 0.99);
+            info!(
+                target: "strategy.fill_asymmetry",
+                market = %market_id,
+                symmetry = self.market_fill_symmetry(market_id, now_ms),
+                max_penalty = self.config.asymmetric_fill_max_penalty,
+                applied_penalty = asymmetric_penalty,
+                adjusted_max_bid = max_bid,
+                "entry ladder max bid tightened by own-fill asymmetry signal"
+            );
+        }
         if best_bid <= 0.0 || max_bid <= 0.0 || (level_index == 0 && best_bid > max_bid) {
             return None;
         }
@@ -3167,6 +3234,8 @@ impl Btc5mMmStrategy {
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
         let left_bid = self.candidate_ladder_bid_price(
+            market_id,
+            now_ms,
             left_quote,
             left_fair,
             left_cost,
@@ -3176,6 +3245,8 @@ impl Btc5mMmStrategy {
             0,
         );
         let right_bid = self.candidate_ladder_bid_price(
+            market_id,
+            now_ms,
             right_quote,
             right_fair,
             right_cost,
@@ -3527,6 +3598,8 @@ impl Btc5mMmStrategy {
             let effective_right_cost = right_cost + ladder_right_cost;
             let effective_gross_cost = gross_cost + ladder_gross_cost;
             let Some(left_bid_price) = self.candidate_ladder_bid_price(
+                market_id,
+                now_ms,
                 left_quote,
                 left_fair,
                 effective_left_cost,
@@ -3538,6 +3611,8 @@ impl Btc5mMmStrategy {
                 break;
             };
             let Some(right_bid_price) = self.candidate_ladder_bid_price(
+                market_id,
+                now_ms,
                 right_quote,
                 right_fair,
                 effective_right_cost,
