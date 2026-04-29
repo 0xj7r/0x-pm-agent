@@ -4097,10 +4097,16 @@ impl Strategy for Btc5mMmStrategy {
                         &context.inventory,
                     );
                     if let Some(reason) = late_skip {
-                        tracing::debug!(
+                        // Promoted to info 2026-04-29 so operator can see
+                        // why late-bar-core never fires. Critical for
+                        // tuning regime classifier thresholds in live data.
+                        tracing::info!(
                             target: "strategy.late_bar_core_gate",
                             market = %snapshot.market_id,
                             reason,
+                            regime = ?context.btc_regime.regime(),
+                            vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
+                            return_180s_bps = ?context.btc_regime.return_180s_bps,
                             "late-bar core accumulation suppressed"
                         );
                     } else {
