@@ -1598,6 +1598,8 @@ impl<S: Strategy> Runtime<S> {
         let best_ask = (book.best_ask > 0.0)
             .then(|| crate::types::BookLevel::new(book.best_ask, book.best_ask_size));
         let last_trade_price = (book.last_trade_price > 0.0).then_some(book.last_trade_price);
+        let (taker_buy_qty_60s, taker_sell_qty_60s) =
+            book.taker_flow_qty_60s(book.last_update_unix_ms);
 
         self.on_market_snapshot(MarketSnapshot {
             market_id,
@@ -1618,6 +1620,8 @@ impl<S: Strategy> Runtime<S> {
                 depth_observed_at_ms: (book.depth_update_unix_ms > 0)
                     .then_some(book.depth_update_unix_ms),
                 last_trade_price,
+                taker_buy_qty_60s,
+                taker_sell_qty_60s,
                 observed_at_ms: book.last_update_unix_ms,
             },
         })
@@ -3023,6 +3027,24 @@ impl<S: Strategy> Runtime<S> {
                 left_ask_levels,
             )
         };
+        let (cheap_taker_buy_qty_60s, cheap_taker_sell_qty_60s) = if left_is_cheap {
+            left_quote
+                .map(|quote| (quote.taker_buy_qty_60s, quote.taker_sell_qty_60s))
+                .unwrap_or((0.0, 0.0))
+        } else {
+            right_quote
+                .map(|quote| (quote.taker_buy_qty_60s, quote.taker_sell_qty_60s))
+                .unwrap_or((0.0, 0.0))
+        };
+        let (expensive_taker_buy_qty_60s, expensive_taker_sell_qty_60s) = if left_is_cheap {
+            right_quote
+                .map(|quote| (quote.taker_buy_qty_60s, quote.taker_sell_qty_60s))
+                .unwrap_or((0.0, 0.0))
+        } else {
+            left_quote
+                .map(|quote| (quote.taker_buy_qty_60s, quote.taker_sell_qty_60s))
+                .unwrap_or((0.0, 0.0))
+        };
 
         let observed_at_ms = cheap_obs
             .into_iter()
@@ -3092,6 +3114,10 @@ impl<S: Strategy> Runtime<S> {
                 expensive_bid_depth_top3_qty,
                 expensive_ask_depth_top3_qty,
             ),
+            cheap_taker_buy_qty_60s,
+            cheap_taker_sell_qty_60s,
+            expensive_taker_buy_qty_60s,
+            expensive_taker_sell_qty_60s,
         }
     }
 
@@ -3166,6 +3192,10 @@ impl<S: Strategy> Runtime<S> {
                 expensive_ask_notional_top3: signal.book.expensive_ask_notional_top3,
                 cheap_depth_imbalance_top3: signal.book.cheap_depth_imbalance_top3,
                 expensive_depth_imbalance_top3: signal.book.expensive_depth_imbalance_top3,
+                cheap_taker_buy_qty_60s: signal.book.cheap_taker_buy_qty_60s,
+                cheap_taker_sell_qty_60s: signal.book.cheap_taker_sell_qty_60s,
+                expensive_taker_buy_qty_60s: signal.book.expensive_taker_buy_qty_60s,
+                expensive_taker_sell_qty_60s: signal.book.expensive_taker_sell_qty_60s,
             },
             activity: StrategyMarketActivitySignal {
                 last_trade_event_count_10s: signal.activity.last_trade_event_count_10s,
@@ -3672,6 +3702,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2,
             },
         };
@@ -3737,6 +3769,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2,
             },
         };
@@ -5045,6 +5079,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.39, 100.0)],
                 depth_observed_at_ms: Some(10),
                 last_trade_price: Some(0.38),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2_000,
             },
         );
@@ -5057,6 +5093,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.60, 100.0)],
                 depth_observed_at_ms: Some(10),
                 last_trade_price: Some(0.59),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2_000,
             },
         );
@@ -5374,6 +5412,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2,
             },
         };
@@ -5430,6 +5470,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2,
             },
         };
@@ -5488,6 +5530,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(0.40, 100.0)],
                 depth_observed_at_ms: Some(2),
                 last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 2,
             },
         };
