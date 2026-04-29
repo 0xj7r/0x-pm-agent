@@ -182,6 +182,11 @@ Apr 28 raw activity for the canonical maker-active wallet `0xb27bc932...` showed
 - [ ] 33. Add convex self-feedback signal
   - Target: Rolling P&L adjusts the per-bar count cap.
 
+- [ ] 33a. Signal-driven entry ladder depth and spacing
+  - Issue: `entry_ladder_levels=3` and `entry_ladder_spacing_ticks=1` are constants. They do not adapt to volatility, book depth, or time-in-bar, which means a slow-oscillating market gets the same ladder shape as a fast-trending one.
+  - Target: Derive `(levels, spacing_ticks)` per tick from `realized_vol_5m_bps`, top-N book depth, and time-remaining-in-bar. Tight oscillation supports more levels at finer spacing (more fill chances inside the band); fast trending supports fewer levels at wider spacing (less stranded risk); thin book supports a shallow ladder (deeper levels would not fill anyway).
+  - Gate: Blocked on item 21 (calibration report) so the coefficients can be derived from observed live and whale behavior, not picked from intuition.
+
 ## P4 - Bash Supervisor Cleanup
 
 - [ ] 34. Move market discovery/restart logic out of `scripts/run_unlawful_shear_paper.sh`
