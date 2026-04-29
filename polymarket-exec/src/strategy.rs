@@ -350,7 +350,7 @@ impl Btc5mMmConfig {
             min_order_quantity: config.min_order_quantity.max(0.01),
             maker_price_tick: config.maker_price_tick.clamp(0.001, 0.05),
             maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
-            entry_ladder_levels: config.entry_ladder_levels.clamp(1, 5),
+            entry_ladder_levels: config.entry_ladder_levels.clamp(1, 10),
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
