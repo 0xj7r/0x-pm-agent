@@ -51,64 +51,7 @@ who already make this work. Don't tune in a vacuum and don't trust
 intuition over observed whale behavior. Concrete sources:
 
 | Source | Use for |
-|---|---|
-| [whale-research-index.md](docs/research/whale-research-index.md) | Index of all wallet threads |
-| [unlawful-shear-reconstruction-thread.md](docs/research/unlawful-shear-reconstruction-thread.md) | unlawful's strategy reconstruction (the canonical reference) |
-| [unlawful-shear-signal-pack-spec.md](docs/research/unlawful-shear-signal-pack-spec.md) | Signal-level spec |
-| [unlawful-shear-microstructure-spec.md](docs/research/unlawful-shear-microstructure-spec.md) | Microstructure observations |
-| [unlawful-whale-vs-us-calibration.md](docs/research/unlawful-whale-vs-us-calibration.md) | Direct comparison vs our bot |
-| [bonereaper-research-thread.md](docs/research/bonereaper-research-thread.md) | bonereaper as second benchmark |
-| `data/research/wallet_research/unlawful-shear/wallet_research.db` | Raw SQLite for deeper queries |
-| `data/research/wallet_research/unlawful-shear/unlawful_signal_pack.json` | Machine-readable signal pack |
 | [BANDAIDS.md](BANDAIDS.md) | Catalog of known anti-patterns to avoid |
-
-**Key empirically-validated facts** (don't re-derive these wrong):
-- unlawful's strategy is **paired MM + convex/cheap-leg accumulation**, NOT
-  directional latency arb. Most fills look one-sided because aggressive
-  bilateral laddering produces single-side fills when book moves.
-- unlawful **narrowed from multi-asset/multi-timeframe to ONLY 5min BTC**.
-  Concentration > diversification at production scale. Don't propose
-  multi-asset/timeframe expansion for our bot before we match per-market
-  execution quality first.
-- unlawful is **bootstrapped from $2K** of external capital — the rest
-  ($228K balance) came from trading + rebates compounded.
-
-When proposing any strategy change, the first question to answer is
-"what does the whale data say about this knob/path?" not "what feels
-right." If the answer is "we haven't measured," go measure first.
-
-## Strategy intent: paired MM + convex asymmetric payoff
-
-The `btc_5m_mm` strategy runs TWO complementary entry paths, not one.
-Future agents have repeatedly over-suppressed one to "fix" the other.
-Don't do that.
-
-**Path 1 — Paired bidding (the rebate workhorse).**
-Quote both legs at fair − edge, capture maker rebates on fills, merge
-paired inventory back to $1 collateral. Works in flat / mid-priced
-markets. Most day-to-day revenue.
-
-**Path 2 — Convex accumulation (the asymmetric payoff side bet).**
-When paired is suppressed because one leg is at premium prices, buy the
-cheap leg at ≤ $0.45 in small size, betting on rare reversal. Pays off
-~5-15% of the time but pays 5-20× when it does. NOT a separate strategy
-— second arm of the same one. Asymmetric payoff is core design intent.
-
-**What this strategy is NOT.**
-- NOT directional momentum chasing (buying winning side at $0.95).
-- NOT pure paired-only. Suppressing convex_accum because "one side is
-  too expensive" kills the asymmetric payoff.
-
-**Hard suppression triggers** (skip ALL entry paths, including convex):
-asymmetric entry-fill cooldown, post-fill cooldown, btc regime
-inactive, runtime degraded.
-
-**Soft suppression triggers** (skip paired, allow convex):
-premium fair cap, market mid moved, btc regime trending.
-
-When introducing a new gate, ASK: does this hurt paired, convex, or
-both? Encode the answer in the gate's return type, not a string-prefix
-classifier downstream.
 
 ## Gate calibration: prefer signals over hardcoded constants
 
@@ -121,18 +64,6 @@ V1 can use a constant for safety; V2 should be SIGNAL-DERIVED:
 Constants bound the bot; signals optimize it. Plan the V2 in the same
 PR's commit message even if you ship V1 first.
 
-## Env var alignment
-
-Launcher exports MUST exactly match `config/mod.rs` parser names. We've
-shipped 2 silent failures here:
-- `WHALE_PAIR_JOURNAL_PATH` (launcher) vs `WHALE_PAIR_EXEC_JOURNAL_PATH`
-  (parser) → tinylive ran with no decision log.
-- `WHALE_PAIR_LIVE_AUTO_REDEEM` parsed by binary, never set by launcher
-  → auto-redeem silently disabled in production.
-
-Before shipping a new env knob: grep both directions, verify names
-match. Remove from BOTH places when deleting. Catalog all knobs and
-their consumers in BANDAIDS.md to prevent drift.
 
 ## No bandaids — fix the core engine
 

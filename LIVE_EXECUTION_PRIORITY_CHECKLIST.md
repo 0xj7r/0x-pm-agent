@@ -2,6 +2,12 @@
 
 Working checklist for the live `polymarket-exec` engine. Check items only when the repo has the implementation and focused validation for that item. Operational rollout notes belong in the item notes until the deployed service is confirmed healthy.
 
+## Session Anchor (2026-04-29)
+
+Apr 28 raw activity for the canonical maker-active wallet `0xb27bc932...` showed multiple priors encoded in the codebase were stale. The earlier reconstruction doc (`docs/research/unlawful-shear-reconstruction-thread.md`) is no longer trusted as ground truth. Fresh analysis showed: zero sells (capital recycled via merge/redeem only), broad price distribution $0.05-$0.95 (not bimodal), bursty sub-second cadence (not steady), 13:1 redeem:merge ratio, ~310 trades/market/day across 227 markets. Items 49-56 below capture the structural follow-ups.
+
+**Single highest-leverage next item: item 21 (operator calibration report).** Without it, no further fix can be validated as helpful or harmful. Treat as the immediate unlock; everything else compounds from it.
+
 ## P0 - Live Trading Blockers
 
 - [x] 1. Fix IOC/FOK/GTC V2 order expiration
@@ -23,6 +29,26 @@ Working checklist for the live `polymarket-exec` engine. Check items only when t
   - Issue: User websocket reconnected several times per second even with unchanged `market_count=1`.
   - Fix: Market subscription comparison now normalizes order, whitespace, and duplicate market IDs.
   - Validation: Unit coverage for equivalent and changed subscriptions.
+
+- [x] 4a. Fix dust-pinned inventory + permanent blocked-merge deadlock
+  - Issue: Sub-venue-min residuals (qty < 5.0 but > 1e-9) pinned `market_has_inventory=true`, which blocked `maybe_clear_market_timing` from clearing `blocked_merge_by_market`. After a CTF merge revert the same-signature merge stayed blocked forever because inventory never cleared.
+  - Fix: `actionable_order_qty_for_market` returns venue minimum_order_size; `position_is_actionable_inventory` and `market_has_inventory` use it. Blocked merges retry after a 15-second backoff (`BLOCKED_MERGE_RETRY_AFTER_MS`) instead of waiting for inventory change. Commit `392ade3`.
+  - Validation: `sub_venue_min_single_leg_dust_is_not_actionable_inventory` and `blocked_merge_retries_after_backoff_instead_of_permanent_suppression` cover both legs of the deadlock.
+
+- [x] 4b. Exempt Close (rescue) intents from `enforce_unlawful_mode` cancel sweep
+  - Issue: The cleanup-mode cancel filter only excluded `reduce_only` orders, so hedge-rescue lift orders (kind=Close, reduce_only=false) were cancelled mid-flight whenever the unlawful gate transitioned to Cleanup or Flatten. This was the missed 5th cap-bypass site CLAUDE.md predicted alongside risk.rs, quote_reconciler, strategy.rs, and accept_intent.
+  - Fix: Add `kind != IntentKind::Close` to the cancel filter. Commit `bd28ff0`.
+  - Validation: `enforce_unlawful_mode_does_not_cancel_close_rescue_intents` asserts a working rescue Close intent survives a Manage→Cleanup transition.
+
+- [x] 4c. Derive avg_cost from total_bought when venue avg_price is zero
+  - Issue: `venue_position_from_data_position` only read `avg_price`, ignoring `initial_value` and `total_bought` even though all three are in the Polymarket Data API Position struct. When the venue returned `avg_price=0` for inherited or post-split positions, parser silently lost recoverable cost-basis info, leaving positions stuck in `decide_stranded_exposure`'s "unknown cost basis" branch.
+  - Fix: Fall back to `total_bought / size`, then `initial_value / size`, before defaulting to zero. Commit `bd7c16c`. Strictly additive — positions with positive `avg_price` keep that value.
+  - Validation: `data_api_position_derives_avg_price_from_total_bought_when_avg_is_zero` covers the recoverable case; existing `btc_5m_mm_holds_stranded_inventory_when_cost_basis_is_unknown` remains valid for the genuine all-zero case.
+
+- [x] 4d. Remove regime-trending and regime-inactive paired suppression
+  - Issue: `regime_entry_mode` skipped paired entries when `return_60s > 15.0bps` or BTC `trade_count_5m < 30` with `realized_vol_5m_bps < 1.0`. Apr 28 raw activity for `0xb27bc932` showed 69k trades through normal BTC volatility windows with no observable self-imposed paired suppression beyond venue health. The hardcoded thresholds fired on most active minutes (BTC routinely oscillates 20-50 bps/min) without empirical support.
+  - Fix: Remove both regime branches from `regime_entry_mode`; keep price-based guards (`market mid moved`, `premium fair cap`). Convex_accum still gates on its own trend persistence signal at strategy.rs:2828. Commit `cb76fdd`.
+  - Validation: `btc_5m_mm_emits_paired_bids_through_normal_btc_volatility` asserts paired bids fire at `return_60s=20bps`.
 
 ## P1 - Operational Safety Before Production Scale
 
@@ -110,10 +136,11 @@ Working checklist for the live `polymarket-exec` engine. Check items only when t
   - Desired test: A scheduled or deploy-time guard reports disk usage by category and refuses live start when journal/order-store writes would fail.
   - Fix shape: Keep only bounded Cargo cache, bounded paper artifacts, bounded journals, and explicitly preserve live order-store/audit data.
 
-- [ ] 21. Add operator-facing live calibration report
+- [ ] 21. Add operator-facing live calibration report **— IMMEDIATE NEXT UNLOCK; everything else compounds from this**
   - Issue: Polymarket UI activity does not tell us whether fills were maker-rebate eligible, taker rescues, convex accumulation, merges, or redeems.
   - Desired test: Report answers, per market/session, maker vs taker fills, intent kind, quote kind, notional, estimated fees/rebates, merge/redeem recycling, and convex-vs-paired capital use.
   - Fix shape: Persist fill liquidity plus strategy tag/intent kind/quote kind into the live report path and expose a command or metrics endpoint for daily calibration.
+  - Why blocking: Without this, no further fix can be validated as helpful or harmful, no constant can be derived from data, and no architectural refactor (Gate trait, etc.) has empirical guidance for what the unified gate should do. Items 49-56 below all depend on this being live.
 
 ## P2 - Bandaid-Killing S1 Refactors
 
