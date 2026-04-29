@@ -361,6 +361,39 @@ fn btc_5m_mm_quotes_maker_bids_on_both_outcomes() {
 }
 
 #[test]
+fn btc_5m_mm_emits_paired_bids_through_normal_btc_volatility() {
+    let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+    let now_ms = 10_000;
+    let mut ctx = context_at(Vec::new(), now_ms);
+    ctx.btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(50_000.0),
+        realized_vol_5m_bps: Some(20.0),
+        realized_vol_15m_bps: Some(20.0),
+        trade_count_5m: 200,
+        trade_count_15m: 600,
+        return_30s_bps: Some(15.0),
+        return_60s_bps: Some(20.0),
+        return_120s_bps: Some(18.0),
+        return_180s_bps: Some(16.0),
+        observed_at_ms: now_ms,
+    };
+
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, now_ms));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, now_ms));
+
+    assert!(
+        decision.intents.iter().any(|intent| intent
+            .quote_level_tag
+            .as_deref()
+            .map(|tag| tag.starts_with("mm-paired-bid"))
+            .unwrap_or(false)),
+        "paired bids must fire through normal BTC vol (return_60s=20bps); whale data shows \
+         continuous participation through this regime, no self-imposed paired suppression"
+    );
+}
+
+#[test]
 fn btc_5m_mm_emits_budget_aware_depth_ladder() {
     let mut config = btc_5m_mm_test_config();
     config.entry_ladder_levels = 3;
