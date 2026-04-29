@@ -2076,7 +2076,53 @@ impl Btc5mMmStrategy {
             .sum()
     }
 
-    fn dynamic_bid_clip_usd(&self, quote: &QuoteSnapshot, requested_clip_usd: f64) -> f64 {
+    fn bar_phase_clip_scale(
+        &self,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
+    ) -> Option<(f64, f64, u64, u64)> {
+        let early_end_ratio = 0.20;
+        let mid_end_ratio = 0.70;
+        let late_end_ratio = 0.95;
+        let early_clip_scale = 1.0;
+        let mid_clip_scale = 0.6;
+        let late_clip_scale = 1.4;
+        let final_clip_scale = 0.0;
+        let default_bar_window_ms = 300_000;
+        let remaining_ms = Self::time_remaining_ms(market_context, now_ms)?;
+        let bar_window_ms = market_context
+            .and_then(|ctx| {
+                ctx.event_start_time_ms.and_then(|start_ms| {
+                    ctx.event_end_time_ms
+                        .filter(|end_ms| *end_ms > start_ms)
+                        .map(|end_ms| end_ms - start_ms)
+                })
+            })
+            .unwrap_or(default_bar_window_ms)
+            .max(1_000);
+        let elapsed_ratio =
+            (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
+        let scale = if elapsed_ratio < early_end_ratio {
+            early_clip_scale
+        } else if elapsed_ratio < mid_end_ratio {
+            mid_clip_scale
+        } else if elapsed_ratio < late_end_ratio {
+            late_clip_scale
+        } else {
+            final_clip_scale
+        };
+        Some((scale, elapsed_ratio, remaining_ms, bar_window_ms))
+    }
+
+    fn dynamic_bid_clip_usd(
+        &self,
+        quote: &QuoteSnapshot,
+        requested_clip_usd: f64,
+        phase_scale: f64,
+    ) -> f64 {
+        if requested_clip_usd <= 0.0 || phase_scale <= 0.0 {
+            return 0.0;
+        }
         let visible_bid_notional = Self::top_notional(&quote.bid_levels, 3);
         let liquidity_cap =
             if visible_bid_notional > 0.0 && self.config.liquidity_clip_fraction > 0.0 {
@@ -2084,7 +2130,7 @@ impl Btc5mMmStrategy {
             } else {
                 self.config.max_clip_usd
             };
-        requested_clip_usd
+        (requested_clip_usd * phase_scale)
             .min(self.config.max_clip_usd)
             .min(liquidity_cap)
             .max(self.config.min_clip_usd)
@@ -2092,12 +2138,32 @@ impl Btc5mMmStrategy {
 
     fn paired_entry_clip_usd(
         &self,
+        market_id: &MarketId,
         left_quote: &QuoteSnapshot,
         right_quote: &QuoteSnapshot,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
     ) -> f64 {
-        self.dynamic_bid_clip_usd(left_quote, requested_clip_usd)
-            .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd))
+        let (phase_scale, elapsed_ratio, remaining_ms, bar_window_ms) = self
+            .bar_phase_clip_scale(market_context, now_ms)
+            .unwrap_or((1.0, 0.0, 300_000, 300_000));
+        if phase_scale <= 0.0 {
+            info!(
+                target: "strategy.bar_phase",
+                market = %market_id,
+                elapsed_ratio,
+                remaining_ms,
+                bar_window_ms,
+                phase_late_end_ratio = 0.95,
+                phase_scale,
+                threshold = 0.0,
+                "paired entry suppressed by bar-phase pacing signal"
+            );
+            return 0.0;
+        }
+        self.dynamic_bid_clip_usd(left_quote, requested_clip_usd, phase_scale)
+            .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd, phase_scale))
     }
 
     fn paired_entry_quantity(
@@ -2108,6 +2174,8 @@ impl Btc5mMmStrategy {
         left_bid_price: f64,
         right_bid_price: f64,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
     ) -> Option<f64> {
         let clip_reference_price = left_bid_price.max(right_bid_price);
         let min_notional_reference_price = left_bid_price.min(right_bid_price);
@@ -2118,7 +2186,17 @@ impl Btc5mMmStrategy {
         {
             return None;
         }
-        let clip_usd = self.paired_entry_clip_usd(left_quote, right_quote, requested_clip_usd);
+        let clip_usd = self.paired_entry_clip_usd(
+            market_id,
+            left_quote,
+            right_quote,
+            requested_clip_usd,
+            market_context,
+            now_ms,
+        );
+        if clip_usd <= 0.0 {
+            return None;
+        }
         let raw_quantity = clip_usd / clip_reference_price;
         let required_quantity = self.required_order_quantity(min_notional_reference_price);
         let max_quantity = self.config.max_clip_usd / clip_reference_price;
@@ -3584,6 +3662,7 @@ impl Btc5mMmStrategy {
         max_gross_cost_usd: f64,
         max_leg_cost_usd: f64,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
         venue_rules: Option<&VenueMarketRules>,
         now_ms: EpochMillis,
     ) -> Vec<OrderIntent> {
@@ -3633,6 +3712,8 @@ impl Btc5mMmStrategy {
                 left_bid_price,
                 right_bid_price,
                 requested_clip_usd,
+                market_context,
+                now_ms,
             ) else {
                 break;
             };
@@ -3874,12 +3955,13 @@ impl Strategy for Btc5mMmStrategy {
                             right_fair,
                             right_cost,
                             gross_cost,
-                            max_entry_gross_cost_usd,
-                            max_entry_leg_cost_usd,
-                            scaled_clip,
-                            context.venue_rules.as_ref(),
-                            context.now_ms,
-                        ));
+                        max_entry_gross_cost_usd,
+                        max_entry_leg_cost_usd,
+                        scaled_clip,
+                        context.market_context.as_ref(),
+                        context.venue_rules.as_ref(),
+                        context.now_ms,
+                    ));
                     }
                 }
                 if intents.is_empty() {
