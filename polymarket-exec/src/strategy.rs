@@ -1753,6 +1753,12 @@ impl Btc5mMmStrategy {
     /// bids were almost certainly still fillable.
     const MAX_SELL_UNWIND_BOOK_AGE_MS: u64 = 5_000;
     const MIN_SELL_UNWIND_BID_LEVELS: usize = 1;
+    /// Floor for the continuous flow-scaled clip multiplier. At extreme
+    /// imbalance (just below the binary suppression threshold) we still
+    /// bid 20% of base clip rather than zero, preserving rebate-eligible
+    /// presence in the book. Below this the binary backstop has already
+    /// suppressed entry.
+    const PAIRED_FLOW_SCALE_MIN: f64 = 0.2;
     const ASYMMETRIC_FILL_MODERATE_COOLDOWN_MS: u64 = 30_000;
     const ASYMMETRIC_FILL_SEVERE_COOLDOWN_MS: u64 = 90_000;
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
@@ -2399,6 +2405,47 @@ impl Btc5mMmStrategy {
             return true;
         }
         false
+    }
+
+    /// Continuous flow-scaled clip multiplier in [PAIRED_FLOW_SCALE_MIN, 1.0].
+    /// Replaces the binary suppression cliff with a smooth ramp: at zero
+    /// imbalance we bid full clip, scaling linearly down to PAIRED_FLOW_SCALE_MIN
+    /// as imbalance approaches the suppression threshold. Above the threshold
+    /// the binary suppression backstop kicks in and prevents entry entirely.
+    ///
+    /// Rationale: at 60/40 taker flow we still want to bid (mildly asymmetric,
+    /// rebate still EV+), just smaller than at 50/50. The pre-existing binary
+    /// gate at the threshold leaves us bidding full size at 59/41 then nothing
+    /// at 61/39 — a step function that doesn't match how adverse selection
+    /// actually scales with flow imbalance.
+    fn paired_clip_flow_scale(
+        &self,
+        left_quote: &QuoteSnapshot,
+        left_fair: f64,
+        right_quote: &QuoteSnapshot,
+        right_fair: f64,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+    ) -> f64 {
+        let threshold = self.flow_imbalance_threshold(btc_regime);
+        if threshold <= 0.0 {
+            return 1.0;
+        }
+        let (buy_qty_60s, sell_qty_60s) = if left_fair >= right_fair {
+            (left_quote.taker_buy_qty_60s, left_quote.taker_sell_qty_60s)
+        } else {
+            (right_quote.taker_buy_qty_60s, right_quote.taker_sell_qty_60s)
+        };
+        let total_qty_60s = buy_qty_60s + sell_qty_60s;
+        if total_qty_60s <= 1e-9 {
+            return 1.0;
+        }
+        let imbalance = ((buy_qty_60s - sell_qty_60s) / total_qty_60s).abs();
+        if imbalance >= threshold {
+            // Binary backstop will reject entry; scale doesn't matter here.
+            return Self::PAIRED_FLOW_SCALE_MIN;
+        }
+        let raw_scale = 1.0 - (imbalance / threshold);
+        raw_scale.clamp(Self::PAIRED_FLOW_SCALE_MIN, 1.0)
     }
 
     fn required_order_quantity(&self, reference_price: f64) -> f64 {
@@ -4329,8 +4376,31 @@ impl Strategy for Btc5mMmStrategy {
                 // tape → smaller clips to preserve capital. Range [0.7x, 2.0x].
                 self.prune_fill_window(context.now_ms);
                 let fill_scale = self.fill_rate_clip_scale(context.now_ms);
-                let scaled_clip = (self.config.base_clip_usd * fill_scale)
+                // Flow-scaled clip multiplier: continuous ramp from 1.0× at
+                // balanced flow to PAIRED_FLOW_SCALE_MIN at near-suppression
+                // imbalance. Replaces the binary suppression cliff with a
+                // smooth gradient that matches how adverse selection scales.
+                let flow_scale = self.paired_clip_flow_scale(
+                    &left_quote,
+                    left_fair,
+                    &right_quote,
+                    right_fair,
+                    &context.btc_regime,
+                );
+                let raw_scaled_clip = self.config.base_clip_usd * fill_scale * flow_scale;
+                let scaled_clip = raw_scaled_clip
                     .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
+                if (flow_scale - 1.0).abs() > 1e-6 {
+                    tracing::info!(
+                        target: "strategy.flow_scale",
+                        market = %snapshot.market_id,
+                        fill_scale,
+                        flow_scale,
+                        base_clip_usd = self.config.base_clip_usd,
+                        scaled_clip,
+                        "paired clip scaled by flow imbalance"
+                    );
+                }
                 let suppress_paired_flow = self.suppress_paired_by_flow_imbalance(
                     &snapshot.market_id,
                     &left_id,
