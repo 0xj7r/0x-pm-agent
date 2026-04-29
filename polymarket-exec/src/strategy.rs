@@ -265,6 +265,12 @@ pub struct Btc5mMmConfig {
     pub entry_ladder_spacing_ticks: f64,
     pub cooldown_ms: u64,
     pub taker_fee_coeff: f64,
+    /// Hard ceiling on per-leg paired bid price. Above this, the ladder
+    /// loop breaks. Whale data shows favored-leg bids up to $0.97. Env-tunable.
+    pub entry_premium_bid_cap: f64,
+    /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
+    /// rescue EV. Env-tunable.
+    pub merge_gas_cost_usd: f64,
 }
 
 impl Btc5mMmConfig {
@@ -323,6 +329,14 @@ impl Btc5mMmConfig {
             ),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
+            entry_premium_bid_cap: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP",
+                0.97,
+            ),
+            merge_gas_cost_usd: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
+                0.30,
+            ),
         };
         Self {
             base_clip_usd: config.base_clip_usd.max(0.01),
@@ -350,10 +364,12 @@ impl Btc5mMmConfig {
             min_order_quantity: config.min_order_quantity.max(0.01),
             maker_price_tick: config.maker_price_tick.clamp(0.001, 0.05),
             maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
-            entry_ladder_levels: config.entry_ladder_levels.clamp(1, 10),
+            entry_ladder_levels: config.entry_ladder_levels.clamp(1, 32),
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
+            entry_premium_bid_cap: config.entry_premium_bid_cap.clamp(0.50, 0.99),
+            merge_gas_cost_usd: config.merge_gas_cost_usd.max(0.0),
         }
     }
 }
@@ -1632,12 +1648,9 @@ impl Btc5mMmStrategy {
     /// Last-resort premium-price circuit breaker. This is not the edge model;
     /// it only prevents obviously bad single-level premium fills while
     /// market-local flow state decides most entries.
-    const ENTRY_EXTREME_FAIR_CAP: f64 = 0.65;
-    /// Market-local repricing gate. A 5c probability move in 30s is the
-    /// observed hostile-flow pattern where paired maker bids repeatedly fill
-    /// the premium leg while the other side stays untouched.
+    /// Market-local repricing gate window. The MAX_MOVE threshold itself is
+    /// env-tunable on `Btc5mMmConfig` (was a const; promoted 2026-04-29).
     const MARKET_MID_TREND_WINDOW_MS: u64 = 30_000;
-    const MARKET_MID_TREND_MAX_MOVE: f64 = 0.05;
     /// Recent own-entry fill symmetry policy. These are engine invariants, not
     /// operator tuning knobs: balanced fills can keep quoting; lopsided fills
     /// put this market into Cooling before we re-enter the same flow.
@@ -1652,13 +1665,8 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
     const ASYMMETRIC_FILL_SEVERE_SYMMETRY: f64 = 0.35;
     const ASYMMETRIC_FILL_MIN_TOTAL_QTY: f64 = 10.0;
-    const ENTRY_PREMIUM_BID_CAP: f64 = 0.55;
     const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
     const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.55;
-    /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
-    /// rescue_ev so the engine prefers hold-to-resolution when rescue would
-    /// lock in a sub-cent net win.
-    const MERGE_GAS_COST_USD: f64 = 0.30;
     /// Convex accumulation gets a smaller slice of the per-market budget than
     /// paired entry. Paired bidding is the rebate workhorse and should consume
     /// the configured caps; convex is the asymmetric-payoff side bet that
@@ -2512,7 +2520,7 @@ impl Btc5mMmStrategy {
         left_quote: &QuoteSnapshot,
         right_quote: &QuoteSnapshot,
     ) -> Option<f64> {
-        if Self::MARKET_MID_TREND_WINDOW_MS == 0 || Self::MARKET_MID_TREND_MAX_MOVE <= 0.0 {
+        if Self::MARKET_MID_TREND_WINDOW_MS == 0 {
             return None;
         }
         let left_mid = Self::normalized_left_mid(left_quote, right_quote)?;
@@ -2626,67 +2634,23 @@ impl Btc5mMmStrategy {
         btc_regime: &crate::signals::BtcRegimeSnapshot,
         market_mid_move: Option<f64>,
     ) -> Btc5mMmMarketMode {
+        // 2026-04-29 cleanup: removed post-fill cooldown, asymmetric-entry
+        // cooldown, mid-trend cooling, and premium-fair-cap gates. Whale data
+        // shows none of these patterns; whale fills repeatedly within seconds
+        // and bids on volatile bars at $0.85+. The remaining gates are:
+        //   - has_inventory (manage existing position)
+        //   - per-leg ENTRY_PREMIUM_BID_CAP inside build_paired_entry_ladder
+        //   - capital caps (max_leg_cost, max_gross_cost) in risk engine
+        let _ = (left_fair, right_fair, btc_regime, market_mid_move);
         let next_mode = if has_inventory {
             Btc5mMmMarketMode::ManagingInventory
-        } else if let Some(until_ms) = self
-            .market_states
-            .get(market_id)
-            .and_then(|state| state.asymmetric_entry_block_until_ms)
-            .filter(|until_ms| now_ms < *until_ms)
-        {
-            Btc5mMmMarketMode::Cooling {
-                reason: "asymmetric entry-fill cooldown".to_string(),
-                until_ms: Some(until_ms),
-            }
-        } else if let Some(last_fill_ms) = self
-            .market_states
-            .get(market_id)
-            .and_then(|state| state.last_fill_ms)
-        {
-            let post_fill_cooldown_ms = self.config.cooldown_ms.saturating_mul(30);
-            if now_ms.saturating_sub(last_fill_ms) < post_fill_cooldown_ms {
-                Btc5mMmMarketMode::Cooling {
-                    reason: format!(
-                        "post-fill cooldown active (last fill < {post_fill_cooldown_ms}ms ago)"
-                    ),
-                    until_ms: Some(last_fill_ms.saturating_add(post_fill_cooldown_ms)),
-                }
-            } else {
-                self.regime_entry_mode(left_fair, right_fair, btc_regime, market_mid_move)
-            }
         } else {
-            self.regime_entry_mode(left_fair, right_fair, btc_regime, market_mid_move)
+            Btc5mMmMarketMode::Ready
         };
         if let Some(state) = self.market_states.get_mut(market_id) {
             state.mode = next_mode.clone();
         }
         next_mode
-    }
-
-    fn regime_entry_mode(
-        &self,
-        left_fair: f64,
-        right_fair: f64,
-        _btc_regime: &crate::signals::BtcRegimeSnapshot,
-        market_mid_move: Option<f64>,
-    ) -> Btc5mMmMarketMode {
-        let max_fair = left_fair.max(right_fair);
-        if let Some(movement) = market_mid_move {
-            if movement > Self::MARKET_MID_TREND_MAX_MOVE && max_fair > Self::ENTRY_PREMIUM_BID_CAP
-            {
-                return Btc5mMmMarketMode::Cooling {
-                    reason: format!("market mid moved {movement:.3}"),
-                    until_ms: None,
-                };
-            }
-        }
-        if max_fair > Self::ENTRY_EXTREME_FAIR_CAP {
-            return Btc5mMmMarketMode::Cooling {
-                reason: format!("premium fair cap: max_fair={max_fair:.3}"),
-                until_ms: None,
-            };
-        }
-        Btc5mMmMarketMode::Ready
     }
 
     fn inventory_skew(&self, leg_cost: f64, gross_cost: f64) -> f64 {
@@ -2758,7 +2722,7 @@ impl Btc5mMmStrategy {
         }
         let hold_ev = held_fair - avg_cost;
         let merge_gas_per_share = if stranded_qty > 0.0 {
-            Self::MERGE_GAS_COST_USD / stranded_qty
+            self.config.merge_gas_cost_usd / stranded_qty
         } else {
             0.0
         };
@@ -2768,7 +2732,7 @@ impl Btc5mMmStrategy {
         let late_confident = remaining_ms.is_some_and(|remaining| remaining <= 60_000)
             && held_fair >= Self::LATE_BAR_HOLD_CONFIDENCE_FAIR
             && held_fair >= avg_cost + Self::HOLD_MIN_EDGE * 2.0
-            && avg_cost <= Self::ENTRY_PREMIUM_BID_CAP;
+            && avg_cost <= self.config.entry_premium_bid_cap;
         let cheap_positive =
             avg_cost <= Self::CONVEX_ACCUMULATION_MAX_AVG_COST && hold_ev >= Self::HOLD_MIN_EDGE;
         let beats_rescue = rescue_ev
@@ -3516,7 +3480,7 @@ impl Btc5mMmStrategy {
             ) else {
                 break;
             };
-            if left_bid_price.max(right_bid_price) > Self::ENTRY_PREMIUM_BID_CAP {
+            if left_bid_price.max(right_bid_price) > self.config.entry_premium_bid_cap {
                 break;
             }
             let Some(raw_quantity) = self.paired_entry_quantity(

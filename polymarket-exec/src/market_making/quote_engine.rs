@@ -15,7 +15,7 @@ pub struct QuoteEngineConfig {
 impl Default for QuoteEngineConfig {
     fn default() -> Self {
         Self {
-            max_levels_per_side: 3,
+            max_levels_per_side: 16,
             skew_bps: 7.5,
             stale_quote_max_age_ms: None,
             quote_expiry_ms: None,
@@ -103,7 +103,17 @@ impl DesiredQuoteSet {
     }
 
     pub fn from_intents(mut intents: Vec<OrderIntent>, config: &QuoteEngineConfig) -> Self {
-        let max_levels = config.max_levels_per_side.clamp(1, 3);
+        // Detect strategies that emit a pre-laddered intent set. Their level_tags
+        // (e.g. "mm-paired-bid:l1", "mm-paired-bid:l2") already encode the level,
+        // and their prices are tick-aligned by maker_bid_price_at_level. The
+        // legacy auto-skew in this function (skew_for_side) would push level >= 1
+        // prices off-tick, which Polymarket silently drops at submit. The legacy
+        // take(max_levels) cap also collapses N-level ladders into N=3.
+        //
+        // For pre-laddered intents we pass prices through verbatim and only cap
+        // at max_levels_per_side as a sanity bound. For legacy single-intent
+        // emissions (no per-level tag) we preserve the old fan-out behavior.
+        let max_levels = config.max_levels_per_side.clamp(1, 32);
 
         let mut buckets: BTreeMap<(MarketId, InstrumentId, TradeSide, bool), Vec<OrderIntent>> =
             BTreeMap::new();
@@ -134,13 +144,21 @@ impl DesiredQuoteSet {
                 }),
             }
 
+            let pre_laddered = bucket.len() > 1
+                || bucket
+                    .first()
+                    .and_then(|i| i.quote_level_tag.as_deref())
+                    .is_some_and(|t| t.contains(":l"));
+
             for (level, mut intent) in bucket.into_iter().take(max_levels).enumerate() {
-                intent.limit_price = Self::skew_for_side(
-                    Self::normalize_price(intent.limit_price, 8),
-                    side,
-                    config.skew_bps,
-                    level,
-                );
+                if !pre_laddered {
+                    intent.limit_price = Self::skew_for_side(
+                        Self::normalize_price(intent.limit_price, 8),
+                        side,
+                        config.skew_bps,
+                        level,
+                    );
+                }
                 if intent.limit_price <= 0.0 || intent.quantity <= 0.0 {
                     continue;
                 }

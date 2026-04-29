@@ -2267,17 +2267,35 @@ impl<S: Strategy> Runtime<S> {
             )));
         }
 
-        let desired = DesiredQuoteSet::from_intents(decision.intents, &self.quote_engine_config)
-            .with_stale_gate(
-                now_ms,
-                &self.last_quotes,
-                StaleMode::Remove,
-                |snapshot, now| {
-                    snapshot.is_none_or(|quote| {
-                        now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
-                    })
-                },
+        let intents_in = decision.intents.len();
+        let level_tags_in: Vec<String> = decision
+            .intents
+            .iter()
+            .map(|i| i.quote_level_tag.clone().unwrap_or_default())
+            .collect();
+        let desired_pre = DesiredQuoteSet::from_intents(decision.intents, &self.quote_engine_config);
+        let quotes_after_from_intents = desired_pre.quotes.len();
+        let desired = desired_pre.with_stale_gate(
+            now_ms,
+            &self.last_quotes,
+            StaleMode::Remove,
+            |snapshot, now| {
+                snapshot.is_none_or(|quote| {
+                    now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
+                })
+            },
+        );
+        let quotes_after_stale_gate = desired.quotes.len();
+        if intents_in > 0 {
+            tracing::info!(
+                target: "ladder.diag",
+                intents_in,
+                quotes_after_from_intents,
+                quotes_after_stale_gate,
+                level_tags_in = ?level_tags_in,
+                "ladder pipeline counts"
             );
+        }
         let plan = self
             .quote_reconciler
             .plan(desired, &self.open_orders, now_ms);
