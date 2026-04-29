@@ -87,6 +87,19 @@ ssh_base "sudo loginctl enable-linger '${REMOTE_USER}' || true"
 log "installed but did not start live smoke"
 ssh_base "systemctl --user status polymarket-exec-live-smoke.service --no-pager || true"
 
+# Safe-restart of running tinylive sleeve. Drains in-flight merges via the
+# kill switch + journal-quiet polling before issuing systemctl restart.
+# Set AWS_LIVE_SKIP_RESTART=1 to skip (e.g., for env-only or smoke deploys
+# that don't need the running process to swap binaries).
+if [[ "${AWS_LIVE_SKIP_RESTART:-0}" == "1" ]]; then
+  log "skipping safe-restart (AWS_LIVE_SKIP_RESTART=1)"
+elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
+  log "running poly-safe-restart for ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
+  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
+else
+  log "poly-safe-restart.sh not found on remote; skipping (manual restart required)"
+fi
+
 cat <<EOF
 
 Deploy complete.
