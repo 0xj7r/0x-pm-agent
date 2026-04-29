@@ -4049,110 +4049,132 @@ impl Strategy for Btc5mMmStrategy {
                     .bar_phase_clip_scale(context.market_context.as_ref(), context.now_ms)
                     .map(|(scale, _, _, _)| scale <= 0.0)
                     .unwrap_or(false);
-                let suppress_paired = suppress_paired_flow || suppress_paired_phase;
-                if cooling_reason.is_none() {
-                    if !suppress_paired {
-                        intents.extend(self.build_paired_entry_ladder(
-                            &snapshot.market_id,
-                            &left_id,
-                            &left_quote,
-                            left_fair,
-                            left_cost,
-                            &right_id,
-                            &right_quote,
-                            right_fair,
-                            right_cost,
-                            gross_cost,
+                // Parallel-path entry per asymmetric_core_hedge_spec: paired-bid,
+                // late-bar-core, and convex-accum are COMPLEMENTARY, not fallbacks.
+                // Each path's own gates decide whether to emit. Tick-committed
+                // budget is threaded across paths so a single tick can't double-spend
+                // the gross/leg caps.
+                let regime_suppresses_paired = context.btc_regime.favors_late_bar_core();
+                let suppress_paired =
+                    suppress_paired_flow || suppress_paired_phase || regime_suppresses_paired;
+                let mut tick_committed_left_usd = 0.0_f64;
+                let mut tick_committed_right_usd = 0.0_f64;
+                let mut tick_committed_gross_usd = 0.0_f64;
+                if cooling_reason.is_none() && !suppress_paired {
+                    let paired = self.build_paired_entry_ladder(
+                        &snapshot.market_id,
+                        &left_id,
+                        &left_quote,
+                        left_fair,
+                        left_cost,
+                        &right_id,
+                        &right_quote,
+                        right_fair,
+                        right_cost,
+                        gross_cost,
                         max_entry_gross_cost_usd,
                         max_entry_leg_cost_usd,
                         scaled_clip,
                         context.market_context.as_ref(),
                         context.venue_rules.as_ref(),
                         context.now_ms,
-                    ));
+                    );
+                    for intent in &paired {
+                        let n = intent.notional_usd();
+                        tick_committed_gross_usd += n;
+                        if intent.instrument_id == left_id {
+                            tick_committed_left_usd += n;
+                        } else if intent.instrument_id == right_id {
+                            tick_committed_right_usd += n;
+                        }
                     }
+                    intents.extend(paired);
                 }
-                if intents.is_empty() {
-                    // Late-bar expensive-leg accumulation: capture favored-leg
-                    // convergence near bar end before evaluating cheap-leg
-                    // convex accumulation. If both could fire on this tick,
-                    // late-bar-core takes precedence.
-                    let (
-                        expensive_leg_id,
-                        expensive_leg_quote,
-                        expensive_leg_fair,
-                        expensive_leg_cost,
-                    ) = if left_fair > right_fair {
-                        (&left_id, &left_quote, left_fair, left_cost)
-                    } else {
-                        (&right_id, &right_quote, right_fair, right_cost)
-                    };
-                    let late_skip = self.late_bar_core_skip_reason(
+
+                // Late-bar expensive-leg accumulation runs in parallel with paired-bid.
+                // It bids the favored leg ($0.85-$0.97) while paired bids both legs near mid.
+                let (
+                    expensive_leg_id,
+                    expensive_leg_quote,
+                    expensive_leg_fair,
+                    expensive_leg_cost,
+                    expensive_tick_committed_usd,
+                ) = if left_fair > right_fair {
+                    (&left_id, &left_quote, left_fair, left_cost, tick_committed_left_usd)
+                } else {
+                    (&right_id, &right_quote, right_fair, right_cost, tick_committed_right_usd)
+                };
+                let late_skip = self.late_bar_core_skip_reason(
+                    &snapshot.market_id,
+                    expensive_leg_id,
+                    expensive_leg_quote,
+                    &context.btc_regime,
+                    context.market_context.as_ref(),
+                    context.now_ms,
+                    &context.inventory,
+                );
+                if let Some(reason) = late_skip {
+                    tracing::info!(
+                        target: "strategy.late_bar_core_gate",
+                        market = %snapshot.market_id,
+                        reason,
+                        regime = ?context.btc_regime.regime(),
+                        vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
+                        return_180s_bps = ?context.btc_regime.return_180s_bps,
+                        "late-bar core accumulation suppressed"
+                    );
+                } else {
+                    let curr_bar_end = context
+                        .market_context
+                        .as_ref()
+                        .and_then(|record| record.event_end_time_ms);
+                    let remaining_bar_budget_usd = self
+                        .late_bar_core_remaining_budget_usd(&snapshot.market_id, curr_bar_end);
+                    let remaining_ms = Self::time_remaining_ms(
+                        context.market_context.as_ref(),
+                        context.now_ms,
+                    )
+                    .unwrap_or_default();
+                    if let Some(intent) = self.build_late_bar_core_intent(
                         &snapshot.market_id,
                         expensive_leg_id,
                         expensive_leg_quote,
-                        &context.btc_regime,
-                        context.market_context.as_ref(),
+                        expensive_leg_fair,
+                        expensive_leg_cost + expensive_tick_committed_usd,
+                        gross_cost + tick_committed_gross_usd,
+                        max_entry_gross_cost_usd,
+                        max_entry_leg_cost_usd,
+                        remaining_bar_budget_usd,
+                        remaining_ms,
+                        context.venue_rules.as_ref(),
                         context.now_ms,
-                        &context.inventory,
-                    );
-                    if let Some(reason) = late_skip {
-                        // Promoted to info 2026-04-29 so operator can see
-                        // why late-bar-core never fires. Critical for
-                        // tuning regime classifier thresholds in live data.
-                        tracing::info!(
-                            target: "strategy.late_bar_core_gate",
-                            market = %snapshot.market_id,
-                            reason,
-                            regime = ?context.btc_regime.regime(),
-                            vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
-                            return_180s_bps = ?context.btc_regime.return_180s_bps,
-                            "late-bar core accumulation suppressed"
-                        );
-                    } else {
-                        let curr_bar_end = context
-                            .market_context
-                            .as_ref()
-                            .and_then(|record| record.event_end_time_ms);
-                        let remaining_bar_budget_usd = self
-                            .late_bar_core_remaining_budget_usd(&snapshot.market_id, curr_bar_end);
-                        let remaining_ms = Self::time_remaining_ms(
-                            context.market_context.as_ref(),
-                            context.now_ms,
-                        )
-                        .unwrap_or_default();
-                        if let Some(intent) = self.build_late_bar_core_intent(
-                            &snapshot.market_id,
-                            expensive_leg_id,
-                            expensive_leg_quote,
-                            expensive_leg_fair,
-                            expensive_leg_cost,
-                            gross_cost,
-                            max_entry_gross_cost_usd,
-                            max_entry_leg_cost_usd,
-                            remaining_bar_budget_usd,
-                            remaining_ms,
-                            context.venue_rules.as_ref(),
-                            context.now_ms,
-                        ) {
-                            let state = self
-                                .market_states
-                                .entry(snapshot.market_id.clone())
-                                .or_default();
-                            if state.late_bar_core_bar_end_ms != curr_bar_end {
-                                state.late_bar_core_bids_this_bar = 0;
-                                state.late_bar_core_spend_this_bar_usd = 0.0;
-                                state.late_bar_core_bar_end_ms = curr_bar_end;
-                            }
-                            state.late_bar_core_bids_this_bar =
-                                state.late_bar_core_bids_this_bar.saturating_add(1);
-                            state.late_bar_core_spend_this_bar_usd +=
-                                intent.limit_price * intent.quantity;
-                            intents.push(intent);
+                    ) {
+                        let state = self
+                            .market_states
+                            .entry(snapshot.market_id.clone())
+                            .or_default();
+                        if state.late_bar_core_bar_end_ms != curr_bar_end {
+                            state.late_bar_core_bids_this_bar = 0;
+                            state.late_bar_core_spend_this_bar_usd = 0.0;
+                            state.late_bar_core_bar_end_ms = curr_bar_end;
                         }
+                        state.late_bar_core_bids_this_bar =
+                            state.late_bar_core_bids_this_bar.saturating_add(1);
+                        let n = intent.notional_usd();
+                        state.late_bar_core_spend_this_bar_usd += n;
+                        tick_committed_gross_usd += n;
+                        if intent.instrument_id == left_id {
+                            tick_committed_left_usd += n;
+                        } else if intent.instrument_id == right_id {
+                            tick_committed_right_usd += n;
+                        }
+                        intents.push(intent);
                     }
                 }
-                if intents.is_empty() {
+
+                // Convex cheap-leg accumulation runs in parallel with both paths above.
+                // Sees tick-adjusted budget so it can't double-spend the gross cap.
+                {
                     let convex_skip = self.convex_skip_reason(
                         &snapshot.market_id,
                         &left_id,
@@ -4175,12 +4197,12 @@ impl Strategy for Btc5mMmStrategy {
                         &left_id,
                         &left_quote,
                         left_fair,
-                        left_cost,
+                        left_cost + tick_committed_left_usd,
                         &right_id,
                         &right_quote,
                         right_fair,
-                        right_cost,
-                        gross_cost,
+                        right_cost + tick_committed_right_usd,
+                        gross_cost + tick_committed_gross_usd,
                         max_entry_gross_cost_usd * Self::CONVEX_BUDGET_FRACTION,
                         max_entry_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION,
                         Self::inventory_equity_usd(&context.inventory)
