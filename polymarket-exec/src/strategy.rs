@@ -300,6 +300,11 @@ pub struct Btc5mMmConfig {
     /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
     /// rescue EV. Env-tunable.
     pub merge_gas_cost_usd: f64,
+    /// Enable SELL fallback when BUY-rescue is structurally impossible
+    /// (stale or thin missing-leg ask book). Acts as the exit valve when
+    /// the merge cycle is broken — limits stranded-leg loss vs holding to
+    /// resolution at $0. EV-gated: only fires when sell_now_ev > hold_ev.
+    pub sell_unwind_enabled: bool,
 }
 
 impl Btc5mMmConfig {
@@ -395,6 +400,10 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
                 0.30,
             ),
+            sell_unwind_enabled: parse_bool(
+                "WHALE_PAIR_BTC_5M_MM_SELL_UNWIND_ENABLED",
+                true,
+            ),
         };
         Self {
             base_clip_usd: config.base_clip_usd.max(0.01),
@@ -437,6 +446,7 @@ impl Btc5mMmConfig {
                 .clamp(0.0, 1.0),
             asymmetric_fill_max_penalty: config.asymmetric_fill_max_penalty.clamp(0.0, 0.10),
             merge_gas_cost_usd: config.merge_gas_cost_usd.max(0.0),
+            sell_unwind_enabled: config.sell_unwind_enabled,
         }
     }
 }
@@ -3775,6 +3785,197 @@ impl Btc5mMmStrategy {
         ))
     }
 
+    /// SELL fallback for stranded paired inventory when BUY-rescue is
+    /// structurally impossible (missing-leg ask book stale or thin).
+    ///
+    /// Whales exit stranded paired positions via merge ($1 collateral
+    /// release). At our scale, merge often fails because of venue floor +
+    /// thin disfavored-leg books. Without a SELL valve, we end up holding
+    /// unintended directional exposure to resolution at $0 — strictly worse
+    /// than the whale's behavior because we lack their exit mechanism.
+    ///
+    /// EV-gated: only fires when `sell_now_ev > hold_ev + HOLD_EV_MARGIN`.
+    /// The same gate naturally separates paired-stranded (where holding
+    /// to $0 is a known loss) from convex-intentional (where our model
+    /// says fair > current bid and holding wins). On equal-EV cases the
+    /// margin keeps us from selling — variance is acceptable when EV is
+    /// equal.
+    #[allow(clippy::too_many_arguments)]
+    fn build_sell_unwind_intent_for_quantity(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        quote: &QuoteSnapshot,
+        avg_cost: f64,
+        quantity: f64,
+        hold_ev_per_share: f64,
+        venue_rules: Option<&VenueMarketRules>,
+        reason_prefix: &str,
+        now_ms: EpochMillis,
+    ) -> Option<OrderIntent> {
+        if !self.config.sell_unwind_enabled {
+            return None;
+        }
+        if !avg_cost.is_finite() || avg_cost <= 0.0 {
+            return None;
+        }
+        let tick_size = venue_rules
+            .map(|r| r.minimum_tick_size)
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .unwrap_or(self.config.maker_price_tick);
+        let venue_min = venue_rules
+            .map(|r| r.minimum_order_size)
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .unwrap_or(self.config.venue_min_order_quantity);
+        // Mirror BUY-rescue pre-checks: reject on stale snapshot or thin
+        // bid book. Bidding into a one-deep book reproduces the exact
+        // FAK no-match failure mode in the SELL direction.
+        let book_observed_at_ms = quote.depth_observed_at_ms.unwrap_or(quote.observed_at_ms);
+        let book_age_ms = now_ms.saturating_sub(book_observed_at_ms);
+        let bid_levels_with_qty = quote
+            .bid_levels
+            .iter()
+            .filter(|l| l.price.is_finite() && l.price > 0.0 && l.quantity > 1e-9)
+            .count();
+        let total_bid_qty: f64 = quote
+            .bid_levels
+            .iter()
+            .filter(|l| l.price.is_finite() && l.price > 0.0)
+            .map(|l| l.quantity)
+            .sum();
+        if book_age_ms > Self::MAX_RESCUE_BOOK_AGE_MS {
+            tracing::info!(
+                target: "strategy.sell_unwind_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                book_age_ms,
+                reason = "book_stale",
+                "sell-unwind skipped due to stale book"
+            );
+            return None;
+        }
+        if bid_levels_with_qty < Self::MIN_RESCUE_ASK_LEVELS {
+            tracing::info!(
+                target: "strategy.sell_unwind_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                bid_levels_with_qty,
+                total_bid_qty,
+                reason = "thin_bid_book",
+                "sell-unwind skipped due to thin bid book"
+            );
+            return None;
+        }
+
+        let best_bid = Self::best_bid(quote)?;
+        if best_bid <= 0.0 {
+            return None;
+        }
+        // Race buffer: hit slightly under best_bid to ensure FAK crosses
+        // even if the book ticks down between snapshot and venue receipt.
+        let race_buffer = tick_size * self.config.hedge_rescue_race_buffer_ticks;
+        let sweep_price = (best_bid - race_buffer).max(0.01);
+        if sweep_price <= 0.0 {
+            return None;
+        }
+
+        // Walk bid book downward to find depth that supports our quantity
+        // at or above sweep_price. Bid levels are typically sorted DESC
+        // (best bid first); we accumulate until we have enough or fall
+        // below our limit.
+        let mut accum = 0.0;
+        for level in &quote.bid_levels {
+            if !level.price.is_finite() || level.price <= 0.0 || level.quantity <= 0.0 {
+                continue;
+            }
+            if level.price + 1e-9 < sweep_price {
+                break;
+            }
+            accum += level.quantity;
+            if accum >= quantity {
+                break;
+            }
+        }
+        let sweep_qty = quantity.min(accum);
+        if sweep_qty + 1e-9 < venue_min {
+            tracing::info!(
+                target: "strategy.sell_unwind_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                sweep_price,
+                accum_qty = accum,
+                target_qty = quantity,
+                venue_min,
+                reason = "insufficient_bid_depth",
+                "sell-unwind skipped due to insufficient bid depth above sweep_price"
+            );
+            return None;
+        }
+
+        // EV gate. Selling locks in `sweep_price - avg_cost - taker_fee`.
+        // Holding to resolution has expected value `held_fair - avg_cost`
+        // (passed in as hold_ev_per_share). Only sell if locked-in beats
+        // expected hold by at least HOLD_EV_MARGIN — the margin keeps us
+        // from selling on equal-EV cases (variance reduction not worth
+        // execution friction).
+        let taker_fee_per_share = self.taker_fee_per_share(sweep_price);
+        let sell_now_ev = sweep_price - avg_cost - taker_fee_per_share;
+        if !sell_now_ev.is_finite() {
+            return None;
+        }
+        let hold_ev = if hold_ev_per_share.is_finite() {
+            hold_ev_per_share
+        } else {
+            // No fair value available — fall back to "sell only if locked-in is positive".
+            0.0
+        };
+        if sell_now_ev <= hold_ev + Self::HOLD_EV_MARGIN {
+            tracing::info!(
+                target: "strategy.sell_unwind_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                sell_now_ev,
+                hold_ev,
+                margin = Self::HOLD_EV_MARGIN,
+                reason = "ev_gate",
+                "sell-unwind skipped because hold-EV beats sell-EV"
+            );
+            return None;
+        }
+
+        let notional = sweep_qty * sweep_price;
+        tracing::info!(
+            target: "strategy.sell_unwind_attempt",
+            market = %market_id,
+            instrument = %instrument_id,
+            sweep_price,
+            sweep_qty,
+            notional,
+            avg_cost,
+            sell_now_ev,
+            hold_ev,
+            recovery_per_share = sell_now_ev - hold_ev,
+            bid_levels_with_qty,
+            book_age_ms,
+            "sell-unwind intent built"
+        );
+
+        Some(Self::build_order(
+            market_id.clone(),
+            instrument_id.clone(),
+            TradeSide::Sell,
+            sweep_price,
+            sweep_qty,
+            false,
+            "mm-sell-unwind".to_string(),
+            format!(
+                "{reason_prefix} sell-unwind limit={sweep_price:.4} qty={sweep_qty:.2} notional={notional:.2} avg_cost={avg_cost:.4} sell_ev={sell_now_ev:.4} hold_ev={hold_ev:.4}"
+            ),
+            IntentKind::Close,
+            now_ms,
+        ))
+    }
+
     fn build_bid_intent_at_price(
         &self,
         market_id: &MarketId,
@@ -4356,6 +4557,7 @@ impl Strategy for Btc5mMmStrategy {
                 // best_ask < $1 (rescue netting against $1 merge release).
                 let (
                     held_id,
+                    held_quote,
                     held_fair,
                     lift_id,
                     lift_quote,
@@ -4365,6 +4567,7 @@ impl Strategy for Btc5mMmStrategy {
                 ) = if left_has_inventory {
                     (
                         &left_id,
+                        &left_quote,
                         left_fair,
                         &right_id,
                         &right_quote,
@@ -4375,6 +4578,7 @@ impl Strategy for Btc5mMmStrategy {
                 } else {
                     (
                         &right_id,
+                        &right_quote,
                         right_fair,
                         &left_id,
                         &left_quote,
@@ -4413,6 +4617,19 @@ impl Strategy for Btc5mMmStrategy {
                         "btc-5m-mm hedge rescue",
                         context.now_ms,
                     )
+                    .or_else(|| {
+                        self.build_sell_unwind_intent_for_quantity(
+                            &snapshot.market_id,
+                            held_id,
+                            held_quote,
+                            exposure_decision.avg_cost,
+                            exposure_decision.rescue_qty,
+                            exposure_decision.hold_ev_per_share,
+                            context.venue_rules.as_ref(),
+                            "btc-5m-mm hedge rescue",
+                            context.now_ms,
+                        )
+                    })
                 } else {
                     None
                 };
@@ -4482,6 +4699,7 @@ impl Strategy for Btc5mMmStrategy {
                         .unwrap_or(true);
                     let (
                         held_id,
+                        held_quote,
                         held_fair,
                         lift_id,
                         lift_quote,
@@ -4492,6 +4710,7 @@ impl Strategy for Btc5mMmStrategy {
                         // Excess is on left → manufacture more right
                         (
                             &left_id,
+                            &left_quote,
                             left_fair,
                             &right_id,
                             &right_quote,
@@ -4502,6 +4721,7 @@ impl Strategy for Btc5mMmStrategy {
                     } else {
                         (
                             &right_id,
+                            &right_quote,
                             right_fair,
                             &left_id,
                             &left_quote,
@@ -4540,6 +4760,19 @@ impl Strategy for Btc5mMmStrategy {
                             "btc-5m-mm asymmetric rescue",
                             context.now_ms,
                         )
+                        .or_else(|| {
+                            self.build_sell_unwind_intent_for_quantity(
+                                &snapshot.market_id,
+                                held_id,
+                                held_quote,
+                                exposure_decision.avg_cost,
+                                exposure_decision.rescue_qty,
+                                exposure_decision.hold_ev_per_share,
+                                context.venue_rules.as_ref(),
+                                "btc-5m-mm asymmetric rescue",
+                                context.now_ms,
+                            )
+                        })
                     } else {
                         None
                     };
@@ -4748,6 +4981,11 @@ impl Strategy for Btc5mMmStrategy {
             return StrategyDecision { notes, intents };
         };
 
+        let held_quote = if left_has {
+            left_quote.clone()
+        } else {
+            right_quote.clone()
+        };
         let (stranded_id, held_fair, stranded_avg, lift_id, lift_quote, stranded_qty) = if left_has
         {
             (
@@ -4786,17 +5024,31 @@ impl Strategy for Btc5mMmStrategy {
             return StrategyDecision { notes, intents };
         }
         let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
-        let intent = self.build_rescue_intent_for_quantity(
-            &fill.market_id,
-            &lift_id,
-            &lift_quote,
-            exposure_decision.rescue_qty,
-            gross_cost,
-            self.rescue_free_cash_cap_usd(&context.inventory),
-            context.venue_rules.as_ref(),
-            "btc-5m-mm on-fill rescue",
-            context.now_ms,
-        );
+        let intent = self
+            .build_rescue_intent_for_quantity(
+                &fill.market_id,
+                &lift_id,
+                &lift_quote,
+                exposure_decision.rescue_qty,
+                gross_cost,
+                self.rescue_free_cash_cap_usd(&context.inventory),
+                context.venue_rules.as_ref(),
+                "btc-5m-mm on-fill rescue",
+                context.now_ms,
+            )
+            .or_else(|| {
+                self.build_sell_unwind_intent_for_quantity(
+                    &fill.market_id,
+                    &stranded_id,
+                    &held_quote,
+                    exposure_decision.avg_cost,
+                    exposure_decision.rescue_qty,
+                    exposure_decision.hold_ev_per_share,
+                    context.venue_rules.as_ref(),
+                    "btc-5m-mm on-fill rescue",
+                    context.now_ms,
+                )
+            });
         tracing::info!(
             target: "strategy.on_fill_rescue",
             market = %fill.market_id,
@@ -6858,6 +7110,18 @@ fn parse_usize(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_bool(key: &str, default: bool) -> bool {
+    env::var(key)
+        .ok()
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
