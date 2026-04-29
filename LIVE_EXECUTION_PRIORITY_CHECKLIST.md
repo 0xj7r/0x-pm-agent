@@ -182,6 +182,11 @@ Apr 28 raw activity for the canonical maker-active wallet `0xb27bc932...` showed
 - [ ] 33. Add convex self-feedback signal
   - Target: Rolling P&L adjusts the per-bar count cap.
 
+- [ ] 33b. Gas-aware batch redeem
+  - Issue: Resolved positions accrue and tie up capital (or stay locked in CTF) until manually redeemed. Each redeem costs gas; doing them ad-hoc burns gas at peak prices. Apr 28 wallet activity for `0xb27bc932` shows 18,280 REDEEMs concentrated in clusters, suggesting the operator either batches or runs an automated cleaner.
+  - Target: A periodic worker that, when Polygon gas price is below a configured floor (e.g., 30 gwei) and there are N+ redeemable positions queued, submits a batched redeem (one transaction per `conditionId`, but only when the gas/notional ratio is favorable). Should cooperate with merge so we never redeem a position that could still be merged for a better terminal payoff.
+  - Gate: Blocked on item 21 (calibration report) so we can confirm whether unlawful's redeem clusters are gas-driven or just resolution-driven.
+
 - [ ] 33a. Signal-driven entry ladder depth and spacing
   - Issue: `entry_ladder_levels=3` and `entry_ladder_spacing_ticks=1` are constants. They do not adapt to volatility, book depth, or time-in-bar, which means a slow-oscillating market gets the same ladder shape as a fast-trending one.
   - Target: Derive `(levels, spacing_ticks)` per tick from `realized_vol_5m_bps`, top-N book depth, and time-remaining-in-bar. Tight oscillation supports more levels at finer spacing (more fill chances inside the band); fast trending supports fewer levels at wider spacing (less stranded risk); thin book supports a shallow ladder (deeper levels would not fill anyway).
