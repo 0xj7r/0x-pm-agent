@@ -1647,8 +1647,12 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_SEVERE_SYMMETRY: f64 = 0.35;
     const ASYMMETRIC_FILL_MIN_TOTAL_QTY: f64 = 10.0;
     const ENTRY_PREMIUM_BID_CAP: f64 = 0.55;
-    const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.38;
-    const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.50;
+    const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
+    const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.55;
+    /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
+    /// rescue_ev so the engine prefers hold-to-resolution when rescue would
+    /// lock in a sub-cent net win.
+    const MERGE_GAS_COST_USD: f64 = 0.30;
     /// Convex accumulation gets a smaller slice of the per-market budget than
     /// paired entry. Paired bidding is the rebate workhorse and should consume
     /// the configured caps; convex is the asymmetric-payoff side bet that
@@ -1671,7 +1675,7 @@ impl Btc5mMmStrategy {
     /// forget refresh on every book tick can produce 10+ bids per bar.
     /// 4 fires per bar gives 4 chances at the asymmetric payoff while
     /// bounding cumulative damage if signals all happen to be wrong.
-    const CONVEX_MAX_BIDS_PER_BAR: u32 = 4;
+    const CONVEX_MAX_BIDS_PER_BAR: u32 = 8;
     /// Fractional Kelly keeps convex accumulation proportional to measured
     /// edge instead of forcing the venue minimum on every eligible tick.
     const CONVEX_FRACTIONAL_KELLY: f64 = 0.25;
@@ -1684,7 +1688,12 @@ impl Btc5mMmStrategy {
     /// >5pp Polymarket book repricing in a single 5min bar. Below this,
     /// noise and short-term mean reversion dominate; above, the trend is
     /// real and bidding the cheap (against-trend) leg is adverse selection.
-    const CONVEX_TREND_PERSISTENCE_BPS: f64 = 50.0;
+    /// Bumped 2026-04-29 from 50 → 150: convex_accum should only skip when BTC
+    /// is in genuinely extreme adverse trend (~1.5% over 3 min). At 50 bps the
+    /// gate fired so often that convex barely ran — defeats the asymmetric
+    /// upside leg of the strategy. Whale data shows continuous cheap-leg
+    /// accumulation across most bars, not gated on macro trend.
+    const CONVEX_TREND_PERSISTENCE_BPS: f64 = 150.0;
     const HOLD_EV_MARGIN: f64 = 0.005;
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
@@ -2706,8 +2715,14 @@ impl Btc5mMmStrategy {
             };
         }
         let hold_ev = held_fair - avg_cost;
-        let rescue_ev = Self::best_ask(opposite_quote)
-            .map(|ask| 1.0 - avg_cost - ask - self.taker_fee_per_share(ask));
+        let merge_gas_per_share = if stranded_qty > 0.0 {
+            Self::MERGE_GAS_COST_USD / stranded_qty
+        } else {
+            0.0
+        };
+        let rescue_ev = Self::best_ask(opposite_quote).map(|ask| {
+            1.0 - avg_cost - ask - self.taker_fee_per_share(ask) - merge_gas_per_share
+        });
         let remaining_ms = Self::time_remaining_ms(market_context, now_ms);
         let late_confident = remaining_ms.is_some_and(|remaining| remaining <= 60_000)
             && held_fair >= Self::LATE_BAR_HOLD_CONFIDENCE_FAIR
@@ -2718,13 +2733,31 @@ impl Btc5mMmStrategy {
         let beats_rescue = rescue_ev
             .map(|ev| hold_ev > ev + Self::HOLD_EV_MARGIN)
             .unwrap_or(hold_ev >= Self::HOLD_MIN_EDGE);
-        let can_hold_convex = beats_rescue && (cheap_positive || late_confident);
-        let convex_hold_qty_cap = if can_hold_convex && avg_cost > 0.0 {
-            (self.config.max_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION / avg_cost).max(0.0)
+        // Hold is preferred whenever it beats rescue OR rescue is unavailable.
+        // The cheap_positive / late_confident flags only set the QUANTITY cap,
+        // not whether to hold. Previously, those flags also gated the hold
+        // decision, which forced rescue into guaranteed-loss territory whenever
+        // the position was just above the cheap-leg band. Strategy preference
+        // now: never actively pay to lock in a worse outcome than holding
+        // would produce (gas + taker fee + slippage already baked into
+        // rescue_ev above).
+        let should_hold = beats_rescue;
+        let convex_hold_qty_cap = if avg_cost > 0.0 {
+            if cheap_positive || late_confident {
+                // Strong-thesis hold (cheap leg or late-bar confident): allow
+                // the larger convex-budget cap.
+                (self.config.max_leg_cost_usd * Self::CONVEX_BUDGET_FRACTION / avg_cost).max(0.0)
+            } else {
+                // Default hold (rescue would be EV-worse but no convex thesis):
+                // cap at standard leg budget so we don't accumulate unbounded
+                // expensive inventory just because rescue_ev happens to be
+                // marginally negative.
+                (self.config.max_leg_cost_usd / avg_cost).max(0.0)
+            }
         } else {
             0.0
         };
-        let hold_qty = if can_hold_convex {
+        let hold_qty = if should_hold {
             stranded_qty.min(convex_hold_qty_cap)
         } else {
             0.0
