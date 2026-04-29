@@ -3143,6 +3143,7 @@ impl<S: Strategy> Runtime<S> {
             .values()
             .filter(|managed| &managed.intent.market_id == market_id)
             .filter(|managed| !managed.intent.reduce_only)
+            .filter(|managed| managed.intent.kind != crate::types::IntentKind::Close)
             .filter(|managed| {
                 matches!(
                     managed.status,
@@ -3977,6 +3978,88 @@ mod tests {
         assert!(
             !runtime.market_has_inventory(&market_id),
             "sub-min single-leg residual should stay in accounting but not pin inventory mode"
+        );
+    }
+
+    #[test]
+    fn enforce_unlawful_mode_does_not_cancel_close_rescue_intents() {
+        let market_id = MarketId::from("market-mm");
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.20,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("seed stranded up leg");
+
+        let rescue_id = ClientOrderId::from("rescue-down-1");
+        runtime.accept_intent(
+            OrderIntent {
+                client_order_id: rescue_id.clone(),
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                limit_price: 0.30,
+                quantity: 6.5,
+                reduce_only: false,
+                reason: "hedge rescue lift opposite leg".to_string(),
+                quote_level_tag: Some("mm-hedge-rescue:l1".to_string()),
+                created_at_ms: 11,
+                pair_id: None,
+                kind: crate::types::IntentKind::Close,
+            },
+            11,
+        );
+
+        assert!(
+            runtime
+                .open_orders()
+                .any(|managed| managed.intent.client_order_id == rescue_id),
+            "rescue Close intent should be accepted into open orders"
+        );
+
+        let prior_mode = crate::strategy::UnlawfulExecutionMode::Manage;
+        runtime
+            .unlawful_mode_by_market
+            .insert(market_id.clone(), prior_mode);
+
+        let cleanup_signal = crate::strategy::UnlawfulSignalSnapshot {
+            mode: crate::strategy::UnlawfulExecutionMode::Cleanup,
+            ..Default::default()
+        };
+        runtime.enforce_unlawful_mode(&market_id, &cleanup_signal, 12);
+
+        let rescue_still_alive = runtime.open_orders().any(|managed| {
+            managed.intent.client_order_id == rescue_id
+                && !matches!(
+                    managed.status,
+                    ManagedOrderStatus::CancelRequested | ManagedOrderStatus::Cancelled
+                )
+        });
+        assert!(
+            rescue_still_alive,
+            "Close (rescue) intents must NOT be cancelled by enforce_unlawful_mode \
+             — they REMOVE exposure (per CLAUDE.md entry-vs-close distinction)"
         );
     }
 
