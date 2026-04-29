@@ -339,6 +339,11 @@ pub struct Runtime<S: Strategy> {
     last_persisted_unlawful_signal_by_market:
         HashMap<MarketId, (EpochMillis, StrategyExecutionMode)>,
     markets_with_unresolved_drift: HashSet<MarketId>,
+    /// Timestamp of first detection of local-flat/venue-nonflat drift per
+    /// market. Used to hold off engaging the drift block for transient
+    /// post-fill state lag (WS fill event lands ~50ms before local
+    /// position state catches up). Cleared when drift resolves.
+    markets_with_drift_first_seen_ms: HashMap<MarketId, EpochMillis>,
     require_initial_reconcile_before_entry: bool,
     /// True once `reconcile_venue_positions` has run for the first time.
     /// Used to distinguish "venue has positions we don't know about because
@@ -435,6 +440,7 @@ impl<S: Strategy> Runtime<S> {
             unlawful_mode_by_market: HashMap::new(),
             last_persisted_unlawful_signal_by_market: HashMap::new(),
             markets_with_unresolved_drift: HashSet::new(),
+            markets_with_drift_first_seen_ms: HashMap::new(),
             require_initial_reconcile_before_entry: config.require_initial_reconcile_before_entry,
             initial_reconcile_complete: false,
             order_store,
@@ -817,23 +823,36 @@ impl<S: Strategy> Runtime<S> {
             .inventory
             .reconcile_venue_positions(&venue_positions, observed_at_ms)?;
         const DRIFT_QTY_EPSILON: f64 = 1e-6;
+        // Hold-off before engaging the drift block. WS fill events arrive
+        // ~50ms ahead of the next reconcile pass, so a transient
+        // local-flat/venue-nonflat state is normal post-fill and should not
+        // trip the incident #1 guard. We only engage the block once the
+        // discrepancy persists past this window — long enough that it
+        // can no longer be explained by event-loop latency.
+        const DRIFT_HOLD_OFF_MS: u64 = 5_000;
         let is_startup_reconcile = !self.initial_reconcile_complete;
         for delta in &report.deltas {
             let local_was_flat = delta.local_quantity_before.abs() < DRIFT_QTY_EPSILON;
             let venue_has_position = delta.venue_quantity.abs() > DRIFT_QTY_EPSILON;
             if local_was_flat && venue_has_position && !is_startup_reconcile {
-                if self
-                    .markets_with_unresolved_drift
-                    .insert(delta.market_id.clone())
+                let first_seen_ms = *self
+                    .markets_with_drift_first_seen_ms
+                    .entry(delta.market_id.clone())
+                    .or_insert(observed_at_ms);
+                let drift_age_ms = observed_at_ms.saturating_sub(first_seen_ms);
+                if drift_age_ms >= DRIFT_HOLD_OFF_MS
+                    && self
+                        .markets_with_unresolved_drift
+                        .insert(delta.market_id.clone())
                 {
                     self.event_log.push(
                         EventRecord::new(
                             EventCategory::Inventory,
                             observed_at_ms,
                             format!(
-                                "drift block engaged: local was flat but venue qty={:.8}; \
-                                 fresh entry suppressed in this market until drift clears \
-                                 (incident #1 guard)",
+                                "drift block engaged: local was flat but venue qty={:.8} \
+                                 for {drift_age_ms}ms; fresh entry suppressed in this \
+                                 market until drift clears (incident #1 guard)",
                                 delta.venue_quantity
                             ),
                         )
@@ -855,18 +874,25 @@ impl<S: Strategy> Runtime<S> {
                     .with_market(delta.market_id.clone())
                     .with_instrument(delta.instrument_id.clone()),
                 );
-            } else if delta.quantity_delta.abs() < DRIFT_QTY_EPSILON
-                && self.markets_with_unresolved_drift.remove(&delta.market_id)
-            {
-                self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Inventory,
-                        observed_at_ms,
-                        "drift block cleared: local now matches venue",
-                    )
-                    .with_market(delta.market_id.clone())
-                    .with_instrument(delta.instrument_id.clone()),
-                );
+            } else if delta.quantity_delta.abs() < DRIFT_QTY_EPSILON {
+                // Drift resolved (or never engaged). Clear both the
+                // pending-detection tracker and the engaged-block set.
+                self.markets_with_drift_first_seen_ms
+                    .remove(&delta.market_id);
+                if self
+                    .markets_with_unresolved_drift
+                    .remove(&delta.market_id)
+                {
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Inventory,
+                            observed_at_ms,
+                            "drift block cleared: local now matches venue",
+                        )
+                        .with_market(delta.market_id.clone())
+                        .with_instrument(delta.instrument_id.clone()),
+                    );
+                }
             }
             self.event_log.push(
                 EventRecord::new(
