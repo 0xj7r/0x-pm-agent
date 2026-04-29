@@ -513,7 +513,127 @@ fn normalize_levels(levels: &[Level], highest_bid: bool) -> Vec<Level> {
 mod tests {
     use std::time::Duration;
 
-    use super::{BookStore, Level};
+    use super::{BookStore, LegFlowState, Level, TradeAggressor};
+
+    // ---- Lee-Ready classify_trade tests (V2 Signal 1 foundation) ----
+
+    fn flow_state_with(best_bid: f64, best_ask: f64) -> LegFlowState {
+        let mut s = LegFlowState::default();
+        s.update_best_quotes(best_bid, best_ask);
+        s
+    }
+
+    #[test]
+    fn classify_trade_at_ask_is_taker_buy() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.42), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_at_bid_is_taker_sell() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.40), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_above_ask_is_taker_buy() {
+        // Trade above the ask → buyer crossed past the visible quote
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.45), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_below_bid_is_taker_sell() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.38), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_inside_spread_closer_to_ask_is_buy() {
+        // Spread 0.40..0.50; trade at 0.47 → closer to 0.50 → buy
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.47), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_inside_spread_closer_to_bid_is_sell() {
+        // Spread 0.40..0.50; trade at 0.43 → closer to 0.40 → sell
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.43), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_exactly_midspread_breaks_to_sell() {
+        // Tie at midspread: tick rule's standard fallback is "sell" via
+        // !(dist_to_ask < dist_to_bid). Documented behavior, not a bug.
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.45), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_inverted_spread_returns_none() {
+        // best_ask < best_bid (book momentarily inverted during dislocation)
+        let s = flow_state_with(0.50, 0.40);
+        assert_eq!(s.classify_trade(0.45), None);
+    }
+
+    #[test]
+    fn classify_trade_missing_best_bid_returns_none() {
+        let mut s = LegFlowState::default();
+        s.last_best_ask = Some(0.42);
+        // last_best_bid is None
+        assert_eq!(s.classify_trade(0.41), None);
+    }
+
+    #[test]
+    fn classify_trade_missing_best_ask_returns_none() {
+        let mut s = LegFlowState::default();
+        s.last_best_bid = Some(0.40);
+        // last_best_ask is None
+        assert_eq!(s.classify_trade(0.41), None);
+    }
+
+    #[test]
+    fn classify_trade_non_finite_price_returns_none() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(f64::NAN), None);
+    }
+
+    // ---- prune correctness ----
+
+    #[test]
+    fn record_trade_drops_silently_when_book_unset() {
+        let mut s = LegFlowState::default();
+        // No best bid/ask → record_trade should be a no-op
+        s.record_trade(1_000, 0.40, 5.0);
+        assert!(s.taker_buys.is_empty());
+        assert!(s.taker_sells.is_empty());
+    }
+
+    #[test]
+    fn flow_qty_60s_excludes_old_entries() {
+        let mut s = flow_state_with(0.40, 0.42);
+        // Record a buy at t=0
+        s.record_trade(0, 0.42, 7.0);
+        // Record a buy at t=120s (well past 60s window)
+        s.record_trade(120_000, 0.42, 3.0);
+        // Now at 121s, only the t=120s entry should remain
+        let (buys, sells) = s.flow_qty_60s(121_000);
+        assert!((buys - 3.0).abs() < 1e-9, "expected only recent buy, got {buys}");
+        assert!(sells.abs() < 1e-9);
+    }
+
+    #[test]
+    fn prune_handles_non_monotonic_now_ms() {
+        // If a replay session feeds out-of-order timestamps, prune must
+        // not infinite-loop. saturating_sub of (now < entry_ts) returns 0,
+        // which is <= window, so we break the loop.
+        let mut s = flow_state_with(0.40, 0.42);
+        s.record_trade(10_000, 0.42, 1.0);
+        // now_ms < entry_ms — should not panic or hang
+        let (buys, _) = s.flow_qty_60s(5_000);
+        assert!((buys - 1.0).abs() < 1e-9);
+    }
 
     #[tokio::test]
     async fn snapshot_updates_top_levels() {
