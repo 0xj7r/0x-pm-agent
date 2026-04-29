@@ -2,30 +2,6 @@
 
 _Last updated: 2026-04-28_
 
-## What is already in place
-
-- Execution scaffold for paired strategies is implemented in Rust via `execution/rust/polymarket-exec`.
-- Runtime/event architecture exists:
-  - `execution/rust/polymarket-exec/src/runtime.rs`
-  - `execution/rust/polymarket-exec/src/inventory.rs`
-  - `execution/rust/polymarket-exec/src/risk.rs`
-  - `execution/rust/polymarket-exec/src/event_log.rs`
-  - `execution/rust/polymarket-exec/src/journal.rs`
-- Market + user websocket drivers are connected (`market_ws.rs`, `user_ws.rs`) and wired into a timed runtime loop in `runner.rs`.
-- Strategy modes are implemented:
-  - `goat_pair`
-  - `unlawful_shear`
-  - `noop`
-- `unlawful_shear` already includes:
-  - dual-side book geometry, cheap/core split logic
-  - paired-leg salvage behavior
-  - time-in-window progression and late/early phase behavior
-  - clip-based incremental re-entry/rebalance
-  - anchor-aware end-of-window close attempts when `event_end_time_ms` and `final_price` are available, with close attribution notes.
-- Market context file is supported in runtime (`market_context.rs`) and strategy notes include `price_to_beat` and timing context when available.
-- Paper dashboard endpoint + JSON state + whale overlay:
-  - `GET /dashboard`, `GET /api/state`, `GET /api/whale/events` in `execution/rust/polymarket-exec/src/metrics.rs`.
-  - `runner.rs` now refreshes runtime snapshots for dashboard consumers.
 
 ## Remaining work before we can call this “aligned/launch-ready” (incremental)
 
