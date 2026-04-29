@@ -423,6 +423,46 @@ fn btc_5m_mm_flow_imbalance_suppresses_just_above_threshold() {
 }
 
 #[test]
+fn btc_5m_mm_bar_phase_pacing_allows_just_below_final_phase_threshold() {
+    let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+    let market_context = MarketContextRecord {
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(300_000),
+        ..MarketContextRecord::default()
+    };
+    let ctx = context_at_with_market(
+        Vec::new(),
+        284_700,
+        market_context,
+        crate::signals::BtcRegimeSnapshot::default(),
+    );
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-phase", 0.48, 0.50, 284_700));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-phase", 0.48, 0.50, 284_700));
+    assert_eq!(decision.intents.len(), 2);
+}
+
+#[test]
+fn btc_5m_mm_bar_phase_pacing_suppresses_just_above_final_phase_threshold() {
+    let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+    let market_context = MarketContextRecord {
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(300_000),
+        ..MarketContextRecord::default()
+    };
+    let ctx = context_at_with_market(
+        Vec::new(),
+        285_300,
+        market_context,
+        crate::signals::BtcRegimeSnapshot::default(),
+    );
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-phase", 0.48, 0.50, 285_300));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-phase", 0.48, 0.50, 285_300));
+    assert!(decision.intents.is_empty());
+}
+
+#[test]
 fn btc_5m_mm_emits_paired_bids_through_normal_btc_volatility() {
     let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
     let now_ms = 10_000;
