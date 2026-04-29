@@ -271,6 +271,14 @@ pub struct Btc5mMmConfig {
     pub maker_safety_ticks: f64,
     pub entry_ladder_levels: usize,
     pub entry_ladder_spacing_ticks: f64,
+    pub bar_phase_default_window_ms: u64,
+    pub bar_phase_early_end_ratio: f64,
+    pub bar_phase_mid_end_ratio: f64,
+    pub bar_phase_late_end_ratio: f64,
+    pub bar_phase_early_clip_scale: f64,
+    pub bar_phase_mid_clip_scale: f64,
+    pub bar_phase_late_clip_scale: f64,
+    pub bar_phase_final_clip_scale: f64,
     pub cooldown_ms: u64,
     pub taker_fee_coeff: f64,
     /// Hard ceiling on per-leg paired bid price. Above this, the ladder
@@ -341,6 +349,38 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_SPACING_TICKS",
                 1.0,
             ),
+            bar_phase_default_window_ms: parse_u64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_DEFAULT_WINDOW_MS",
+                300_000,
+            ),
+            bar_phase_early_end_ratio: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_EARLY_END_RATIO",
+                0.20,
+            ),
+            bar_phase_mid_end_ratio: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_MID_END_RATIO",
+                0.70,
+            ),
+            bar_phase_late_end_ratio: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_LATE_END_RATIO",
+                0.95,
+            ),
+            bar_phase_early_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_EARLY_CLIP_SCALE",
+                1.0,
+            ),
+            bar_phase_mid_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_MID_CLIP_SCALE",
+                0.6,
+            ),
+            bar_phase_late_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_LATE_CLIP_SCALE",
+                1.4,
+            ),
+            bar_phase_final_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_FINAL_CLIP_SCALE",
+                0.0,
+            ),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
             entry_premium_bid_cap: parse_f64(
@@ -388,6 +428,14 @@ impl Btc5mMmConfig {
             maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
             entry_ladder_levels: config.entry_ladder_levels.clamp(1, 32),
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
+            bar_phase_default_window_ms: config.bar_phase_default_window_ms.max(1_000),
+            bar_phase_early_end_ratio: config.bar_phase_early_end_ratio.clamp(0.0, 1.0),
+            bar_phase_mid_end_ratio: config.bar_phase_mid_end_ratio.clamp(0.0, 1.0),
+            bar_phase_late_end_ratio: config.bar_phase_late_end_ratio.clamp(0.0, 1.0),
+            bar_phase_early_clip_scale: config.bar_phase_early_clip_scale.clamp(0.0, 3.0),
+            bar_phase_mid_clip_scale: config.bar_phase_mid_clip_scale.clamp(0.0, 3.0),
+            bar_phase_late_clip_scale: config.bar_phase_late_clip_scale.clamp(0.0, 3.0),
+            bar_phase_final_clip_scale: config.bar_phase_final_clip_scale.clamp(0.0, 3.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
             entry_premium_bid_cap: config.entry_premium_bid_cap.clamp(0.50, 0.99),
@@ -2081,14 +2129,6 @@ impl Btc5mMmStrategy {
         market_context: Option<&MarketContextRecord>,
         now_ms: EpochMillis,
     ) -> Option<(f64, f64, u64, u64)> {
-        let early_end_ratio = 0.20;
-        let mid_end_ratio = 0.70;
-        let late_end_ratio = 0.95;
-        let early_clip_scale = 1.0;
-        let mid_clip_scale = 0.6;
-        let late_clip_scale = 1.4;
-        let final_clip_scale = 0.0;
-        let default_bar_window_ms = 300_000;
         let remaining_ms = Self::time_remaining_ms(market_context, now_ms)?;
         let bar_window_ms = market_context
             .and_then(|ctx| {
@@ -2098,18 +2138,18 @@ impl Btc5mMmStrategy {
                         .map(|end_ms| end_ms - start_ms)
                 })
             })
-            .unwrap_or(default_bar_window_ms)
+            .unwrap_or(self.config.bar_phase_default_window_ms)
             .max(1_000);
         let elapsed_ratio =
             (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
-        let scale = if elapsed_ratio < early_end_ratio {
-            early_clip_scale
-        } else if elapsed_ratio < mid_end_ratio {
-            mid_clip_scale
-        } else if elapsed_ratio < late_end_ratio {
-            late_clip_scale
+        let scale = if elapsed_ratio < self.config.bar_phase_early_end_ratio {
+            self.config.bar_phase_early_clip_scale
+        } else if elapsed_ratio < self.config.bar_phase_mid_end_ratio {
+            self.config.bar_phase_mid_clip_scale
+        } else if elapsed_ratio < self.config.bar_phase_late_end_ratio {
+            self.config.bar_phase_late_clip_scale
         } else {
-            final_clip_scale
+            self.config.bar_phase_final_clip_scale
         };
         Some((scale, elapsed_ratio, remaining_ms, bar_window_ms))
     }
@@ -2147,7 +2187,12 @@ impl Btc5mMmStrategy {
     ) -> f64 {
         let (phase_scale, elapsed_ratio, remaining_ms, bar_window_ms) = self
             .bar_phase_clip_scale(market_context, now_ms)
-            .unwrap_or((1.0, 0.0, 300_000, 300_000));
+            .unwrap_or((
+                self.config.bar_phase_early_clip_scale,
+                0.0,
+                self.config.bar_phase_default_window_ms,
+                self.config.bar_phase_default_window_ms,
+            ));
         if phase_scale <= 0.0 {
             info!(
                 target: "strategy.bar_phase",
@@ -2155,9 +2200,9 @@ impl Btc5mMmStrategy {
                 elapsed_ratio,
                 remaining_ms,
                 bar_window_ms,
-                phase_late_end_ratio = 0.95,
+                phase_late_end_ratio = self.config.bar_phase_late_end_ratio,
                 phase_scale,
-                threshold = 0.0,
+                threshold = self.config.bar_phase_final_clip_scale,
                 "paired entry suppressed by bar-phase pacing signal"
             );
             return 0.0;
