@@ -1727,6 +1727,15 @@ impl Btc5mMmStrategy {
     /// Polymarket V2 rejects marketable BUY orders below $1 notional. Keep this
     /// as a protocol invariant so stale live env cannot emit invalid rescues.
     const MARKETABLE_BUY_MIN_NOTIONAL_USD: f64 = 1.0;
+    /// Maximum age of book snapshot before a rescue is refused. 38/38 FAK
+    /// rejections on 2026-04-29 traced to "no orders to match" — book asks
+    /// vanished between snapshot and venue arrival. Reject anything older
+    /// than this window; the asks are effectively gone.
+    const MAX_RESCUE_BOOK_AGE_MS: u64 = 1_500;
+    /// Minimum non-empty ask levels to attempt rescue. Single-level books
+    /// reliably get swept by other takers before our FAK lands. Two or
+    /// more levels is the empirical minimum for survival.
+    const MIN_RESCUE_ASK_LEVELS: usize = 2;
     const ASYMMETRIC_FILL_MODERATE_COOLDOWN_MS: u64 = 30_000;
     const ASYMMETRIC_FILL_SEVERE_COOLDOWN_MS: u64 = 90_000;
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
@@ -3609,6 +3618,55 @@ impl Btc5mMmStrategy {
         if best_sweep_price >= 0.99 {
             return None;
         }
+        // Rescue execution-hardening (2026-04-29): pre-submit checks to
+        // prevent the FAK no-match failure mode that produced 38/38
+        // rescue rejections in 6h. Book snapshot ages ≥1.5s or single-level
+        // ask books reliably correlate with "no orders to match" venue
+        // rejection — asks gone by the time our FAK lands.
+        let book_observed_at_ms = quote.depth_observed_at_ms.unwrap_or(quote.observed_at_ms);
+        let book_age_ms = now_ms.saturating_sub(book_observed_at_ms);
+        let ask_levels_with_qty = quote
+            .ask_levels
+            .iter()
+            .filter(|l| l.price.is_finite() && l.price > 0.0 && l.quantity > 1e-9)
+            .count();
+        let total_ask_qty: f64 = quote
+            .ask_levels
+            .iter()
+            .filter(|l| l.price.is_finite() && l.price > 0.0)
+            .map(|l| l.quantity)
+            .sum();
+        let ask_top_price = Self::best_ask(quote);
+        if book_age_ms > Self::MAX_RESCUE_BOOK_AGE_MS {
+            tracing::info!(
+                target: "strategy.rescue_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                book_age_ms,
+                max_age_ms = Self::MAX_RESCUE_BOOK_AGE_MS,
+                ask_levels_with_qty,
+                total_ask_qty,
+                ask_top_price = ?ask_top_price,
+                reason = "book_stale",
+                "rescue skipped due to stale book"
+            );
+            return None;
+        }
+        if ask_levels_with_qty < Self::MIN_RESCUE_ASK_LEVELS {
+            tracing::info!(
+                target: "strategy.rescue_skip",
+                market = %market_id,
+                instrument = %instrument_id,
+                book_age_ms,
+                ask_levels_with_qty,
+                min_required_levels = Self::MIN_RESCUE_ASK_LEVELS,
+                total_ask_qty,
+                ask_top_price = ?ask_top_price,
+                reason = "thin_ask_book",
+                "rescue skipped due to thin ask book"
+            );
+            return None;
+        }
         let min_target_qty = venue_min.max(min_marketable_notional / best_sweep_price);
         // Depth walk: find the price needed to sweep enough liquidity to both
         // cover the stranded quantity and satisfy protocol marketable-BUY
@@ -3685,6 +3743,22 @@ impl Btc5mMmStrategy {
             .iter()
             .take_while(|l| l.price <= sweep_price + 1e-9 && l.price > 0.0)
             .count();
+        // Per-attempt instrumentation. Pair with FAK ack/reject in runner.rs
+        // logs by client_order_id to compute snapshot-correlated success rate.
+        tracing::info!(
+            target: "strategy.rescue_attempt",
+            market = %market_id,
+            instrument = %instrument_id,
+            sweep_price,
+            sweep_qty,
+            notional,
+            depth_levels_swept,
+            book_age_ms,
+            ask_levels_with_qty,
+            total_ask_qty,
+            ask_top_price = ?ask_top_price,
+            "rescue intent built"
+        );
         Some(Self::build_order(
             market_id.clone(),
             instrument_id.clone(),
