@@ -30,6 +30,104 @@ Our edge comes from spread capture and rebates over many fills.
 
 ---
 
+## 1.5 The four entry/exit paths
+
+The strategy has four code paths that emit OrderIntents. Each fires under
+different conditions, has a different TIF, and has a different intent
+kind. When debugging, identify which path is (or is not) firing first —
+the answer to "why isn't the bot quoting" depends on which path you
+expect.
+
+### Path 1 — Paired bid (`mm-paired-bid`) — primary MM, ~95% of edge
+
+**Function:** `build_paired_entry_ladder` (`strategy.rs:3433`).
+**Tag:** `mm-paired-bid:lN` where N is the level index + 1.
+**TIF:** GTD with `live_order_ttl_ms` TTL (default 20s), post_only=true.
+**Intent kind:** Entry.
+**Fires when:** market not in `ManagingInventory` (no stranded
+inventory). Emits up to `entry_ladder_levels × 2` intents per
+on_market_snapshot tick (8 levels × YES leg + NO leg = 16 intents).
+**Edge source:** maker rebates + (1 - sum_of_paired_bid_prices) gap.
+
+This is the rebate workhorse. If this isn't firing, the bot is dormant.
+
+### Path 2 — Convex accumulation (`mm-convex-accum`) — cheap-leg side bet, ~3.5% of whale notional
+
+**Function:** `build_convex_accumulation_intent` (`strategy.rs:3083`).
+**Tag:** `mm-convex-accum:l1`.
+**TIF:** GTD, post_only=true.
+**Intent kind:** Entry.
+**Fires when:** the cheap leg (price < `CONVEX_ACCUMULATION_MAX_BID = 0.45`)
+shows trend persistence in the OPPOSITE direction (`CONVEX_TREND_PERSISTENCE_BPS = 50`)
+within bar phase 60-240s. Emits ONE intent per tick, capped at
+`CONVEX_MAX_BIDS_PER_BAR = 4` per market per bar.
+**Edge source:** asymmetric payoff — pays $1 if the cheap leg wins
+(low probability, high payoff). Bankroll-bounded by
+`CONVEX_FRACTIONAL_KELLY = 0.25`.
+
+Single-intent emission by design — this is a lottery ticket, not a
+ladder. Whale data shows this is 3.5% of notional, mostly opportunistic.
+
+### Path 3 — Late-bar core (`mm-late-bar-core`) — favored-leg late accumulation
+
+**Function:** `build_late_bar_core_intent` (`strategy.rs:3007`).
+**Tag:** `mm-late-bar-core:l1`.
+**TIF:** GTD with `LATE_BAR_CORE_TTL_MS = 60s`, post_only=true.
+**Intent kind:** Entry.
+**Fires when:** all of:
+- Time remaining in bar ∈ [30s, 120s]
+- Expensive leg book ask ∈ [`LATE_BAR_CORE_PRICE_FLOOR = 0.85`,
+  `LATE_BAR_CORE_PRICE_CEILING = 0.98`]
+- `realized_vol_5m_bps >= LATE_BAR_CORE_MIN_VOL_BPS = 50`
+- BTC momentum confirms direction
+- < `LATE_BAR_CORE_MAX_BIDS_PER_BAR = 15` already filled this bar
+- < `LATE_BAR_CORE_BUDGET_USD = $5` already spent
+
+Emits ONE intent per tick (single-shot, queued to repeat on subsequent
+ticks until the budget or count is hit).
+**Edge source:** high-probability, low-margin late-bar convergence —
+buy at $0.93, win $1.00 = $0.07/share with ~93% confidence.
+
+This is the "expensive leg accumulation" path you remember. Spec is at
+`docs/strategy/asymmetric_core_hedge_spec.md`.
+
+### Path 4 — Hedge rescue (`mm-hedge-rescue`) — close-side, IOC
+
+**Function:** rescue branch at `strategy.rs:3360+`.
+**Tag:** `mm-hedge-rescue`.
+**TIF:** **IOC**, post_only=**false**.
+**Intent kind:** **Close** — bypasses entry-time caps.
+**Fires when:** stranded inventory detected on a market and
+`decide_stranded_exposure` chooses RESCUE over HOLD. Lifts the
+opposite leg's ask + `hedge_rescue_race_buffer_ticks` to manufacture
+paired inventory for a merge.
+**Edge source:** locks in $1 - avg_cost - rescue_cost - taker_fee - merge_gas
+when better than holding to resolution.
+
+This is a TAKER action — pays venue fee, doesn't earn rebate. Used
+sparingly. Most stranded positions are HELD (positive-asymmetry hold
+beats rescue when fair has moved in our favor).
+
+### Decision tree per tick
+
+```
+on_market_snapshot:
+  ├─ has_inventory?
+  │    YES → ManagingInventory
+  │      └─ stranded leg detected?
+  │           ├─ rescue_ev > hold_ev → emit hedge_rescue (Path 4)
+  │           └─ otherwise → hold, no intent emitted
+  │    NO  → Ready
+  │      ├─ Path 1: build_paired_entry_ladder (always tries)
+  │      ├─ Path 2: build_convex_accumulation_intent (if cheap-leg gates pass)
+  │      └─ Path 3: build_late_bar_core_intent (if late-bar gates pass)
+```
+
+Path 1 and Paths 2/3 can fire on the SAME tick (they're not exclusive).
+Path 4 only fires when there's existing stranded inventory.
+
+---
+
 ## 2. Lifecycle of a single paired bid
 
 ```
