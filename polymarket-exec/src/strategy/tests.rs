@@ -26,9 +26,26 @@ fn snapshot(asset: &str, market: &str, bid: f64, ask: f64, ts: u64) -> MarketSna
             ask_levels: vec![BookLevel::new(ask, 1000.0)],
             depth_observed_at_ms: Some(ts),
             last_trade_price: Some(ask),
+            taker_buy_qty_60s: 0.0,
+            taker_sell_qty_60s: 0.0,
             observed_at_ms: ts,
         },
     }
+}
+
+fn snapshot_with_flow(
+    asset: &str,
+    market: &str,
+    bid: f64,
+    ask: f64,
+    ts: u64,
+    taker_buy_qty_60s: f64,
+    taker_sell_qty_60s: f64,
+) -> MarketSnapshot {
+    let mut snap = snapshot(asset, market, bid, ask, ts);
+    snap.quote.taker_buy_qty_60s = taker_buy_qty_60s;
+    snap.quote.taker_sell_qty_60s = taker_sell_qty_60s;
+    snap
 }
 
 fn context(positions: Vec<PositionState>) -> StrategyContext {
@@ -157,6 +174,9 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         entry_ladder_spacing_ticks: 1.0,
         cooldown_ms: 0,
         taker_fee_coeff: 0.072,
+        entry_premium_bid_cap: 0.97,
+        order_flow_imbalance_threshold: 0.60,
+        merge_gas_cost_usd: 0.30,
     }
 }
 
@@ -358,6 +378,47 @@ fn btc_5m_mm_quotes_maker_bids_on_both_outcomes() {
         .intents
         .iter()
         .all(|intent| intent.quantity >= strategy.config.venue_min_order_quantity));
+}
+
+#[test]
+fn btc_5m_mm_flow_imbalance_allows_just_below_threshold() {
+    let mut config = btc_5m_mm_test_config();
+    config.order_flow_imbalance_threshold = 0.60;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let ctx = context(Vec::new());
+    strategy.on_market_snapshot(
+        &ctx,
+        &snapshot_with_flow("up", "market-flow", 0.30, 0.32, 10, 0.0, 0.0),
+    );
+    let decision = strategy.on_market_snapshot(
+        &ctx,
+        &snapshot_with_flow("down", "market-flow", 0.68, 0.70, 10, 7.9, 2.1),
+    );
+    assert_eq!(decision.intents.len(), 2);
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() == Some("mm-paired-bid:l1")));
+}
+
+#[test]
+fn btc_5m_mm_flow_imbalance_suppresses_just_above_threshold() {
+    let mut config = btc_5m_mm_test_config();
+    config.order_flow_imbalance_threshold = 0.60;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let ctx = context(Vec::new());
+    strategy.on_market_snapshot(
+        &ctx,
+        &snapshot_with_flow("up", "market-flow", 0.30, 0.32, 10, 0.0, 0.0),
+    );
+    let decision = strategy.on_market_snapshot(
+        &ctx,
+        &snapshot_with_flow("down", "market-flow", 0.68, 0.70, 10, 8.1, 1.9),
+    );
+    assert!(
+        decision.intents.is_empty(),
+        "paired entry should be suppressed when |imbalance| is just above threshold"
+    );
 }
 
 #[test]

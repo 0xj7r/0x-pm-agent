@@ -371,6 +371,8 @@ mod tests {
                 ask_levels: Vec::new(),
                 depth_observed_at_ms: None,
                 last_trade_price: None,
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 1,
             },
         );

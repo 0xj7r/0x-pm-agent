@@ -94,6 +94,10 @@ pub struct PairedBookSignal {
     pub expensive_ask_notional_top3: Option<f64>,
     pub cheap_depth_imbalance_top3: Option<f64>,
     pub expensive_depth_imbalance_top3: Option<f64>,
+    pub cheap_taker_buy_qty_60s: f64,
+    pub cheap_taker_sell_qty_60s: f64,
+    pub expensive_taker_buy_qty_60s: f64,
+    pub expensive_taker_sell_qty_60s: f64,
 }
 
 impl PairedBookSignal {
@@ -139,6 +143,10 @@ impl PairedBookSignal {
             expensive_ask_notional_top3: None,
             cheap_depth_imbalance_top3: None,
             expensive_depth_imbalance_top3: None,
+            cheap_taker_buy_qty_60s: 0.0,
+            cheap_taker_sell_qty_60s: 0.0,
+            expensive_taker_buy_qty_60s: 0.0,
+            expensive_taker_sell_qty_60s: 0.0,
         }
     }
 }
@@ -268,6 +276,9 @@ pub struct Btc5mMmConfig {
     /// Hard ceiling on per-leg paired bid price. Above this, the ladder
     /// loop breaks. Whale data shows favored-leg bids up to $0.97. Env-tunable.
     pub entry_premium_bid_cap: f64,
+    /// V2 Signal 1 (order-flow imbalance): suppress paired entry when
+    /// taker flow in the expensive leg is too one-sided over the last 60s.
+    pub order_flow_imbalance_threshold: f64,
     /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
     /// rescue EV. Env-tunable.
     pub merge_gas_cost_usd: f64,
@@ -333,6 +344,10 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP",
                 0.97,
             ),
+            order_flow_imbalance_threshold: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_ORDER_FLOW_IMBALANCE_THRESHOLD",
+                0.60,
+            ),
             merge_gas_cost_usd: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
                 0.30,
@@ -369,6 +384,10 @@ impl Btc5mMmConfig {
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
             entry_premium_bid_cap: config.entry_premium_bid_cap.clamp(0.50, 0.99),
+            order_flow_imbalance_threshold: config
+                .order_flow_imbalance_threshold
+                .abs()
+                .clamp(0.0, 1.0),
             merge_gas_cost_usd: config.merge_gas_cost_usd.max(0.0),
         }
     }
@@ -2132,6 +2151,55 @@ impl Btc5mMmStrategy {
         Some(final_quantity)
     }
 
+    fn suppress_paired_by_flow_imbalance(
+        &self,
+        market_id: &MarketId,
+        left_id: &InstrumentId,
+        left_quote: &QuoteSnapshot,
+        left_fair: f64,
+        right_id: &InstrumentId,
+        right_quote: &QuoteSnapshot,
+        right_fair: f64,
+    ) -> bool {
+        if self.config.order_flow_imbalance_threshold <= 0.0 {
+            return false;
+        }
+        let (expensive_leg, buy_qty_60s, sell_qty_60s) = if left_fair >= right_fair {
+            (
+                left_id,
+                left_quote.taker_buy_qty_60s,
+                left_quote.taker_sell_qty_60s,
+            )
+        } else {
+            (
+                right_id,
+                right_quote.taker_buy_qty_60s,
+                right_quote.taker_sell_qty_60s,
+            )
+        };
+        let total_qty_60s = buy_qty_60s + sell_qty_60s;
+        if total_qty_60s <= 1e-9 {
+            return false;
+        }
+        let imbalance = (buy_qty_60s - sell_qty_60s) / total_qty_60s;
+        if imbalance.abs() >= self.config.order_flow_imbalance_threshold {
+            info!(
+                target: "strategy.flow_imbalance",
+                market = %market_id,
+                expensive_leg = %expensive_leg,
+                expensive_leg_buy_qty_60s = buy_qty_60s,
+                expensive_leg_sell_qty_60s = sell_qty_60s,
+                expensive_leg_imbalance = imbalance,
+                threshold = self.config.order_flow_imbalance_threshold,
+                left_fair,
+                right_fair,
+                "paired entry suppressed by order-flow imbalance signal"
+            );
+            return true;
+        }
+        false
+    }
+
     fn required_order_quantity(&self, reference_price: f64) -> f64 {
         let min_notional_quantity = if reference_price > 0.0 {
             self.config.min_order_notional_usd / reference_price
@@ -3709,24 +3777,35 @@ impl Strategy for Btc5mMmStrategy {
                 let fill_scale = self.fill_rate_clip_scale(context.now_ms);
                 let scaled_clip = (self.config.base_clip_usd * fill_scale)
                     .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
+                let suppress_paired = self.suppress_paired_by_flow_imbalance(
+                    &snapshot.market_id,
+                    &left_id,
+                    &left_quote,
+                    left_fair,
+                    &right_id,
+                    &right_quote,
+                    right_fair,
+                );
                 if cooling_reason.is_none() {
-                    intents.extend(self.build_paired_entry_ladder(
-                        &snapshot.market_id,
-                        &left_id,
-                        &left_quote,
-                        left_fair,
-                        left_cost,
-                        &right_id,
-                        &right_quote,
-                        right_fair,
-                        right_cost,
-                        gross_cost,
-                        max_entry_gross_cost_usd,
-                        max_entry_leg_cost_usd,
-                        scaled_clip,
-                        context.venue_rules.as_ref(),
-                        context.now_ms,
-                    ));
+                    if !suppress_paired {
+                        intents.extend(self.build_paired_entry_ladder(
+                            &snapshot.market_id,
+                            &left_id,
+                            &left_quote,
+                            left_fair,
+                            left_cost,
+                            &right_id,
+                            &right_quote,
+                            right_fair,
+                            right_cost,
+                            gross_cost,
+                            max_entry_gross_cost_usd,
+                            max_entry_leg_cost_usd,
+                            scaled_clip,
+                            context.venue_rules.as_ref(),
+                            context.now_ms,
+                        ));
+                    }
                 }
                 if intents.is_empty() {
                     // Late-bar expensive-leg accumulation: capture favored-leg
