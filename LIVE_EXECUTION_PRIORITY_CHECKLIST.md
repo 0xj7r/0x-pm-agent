@@ -233,3 +233,53 @@ Apr 28 raw activity for the canonical maker-active wallet `0xb27bc932...` showed
 
 - [ ] 44. Expand to multi-asset or multi-timeframe
   - Gate: Only after we match per-market unlawful execution quality on BTC 5m.
+
+## P7 — Items consolidated from TODO.md (2026-04-29)
+
+TODO.md was archived 2026-04-29 to deduplicate against this checklist. Items below were unique to TODO.md and remain open.
+
+- [ ] 45. Replace local execution bridge with real CLOB adapter in non-paper mode
+  - Issue: `runner.rs` deterministic local adapter is a fallback for paper-like simulation; non-paper still depends on it in some code paths.
+  - Fix shape: Wire the V2 CLOB adapter as the primary submitter for non-paper, keeping local adapter only as paper fallback.
+
+- [ ] 46. Resolve `runtime::accept_intent` downstream acknowledgement TODO
+  - Issue: Lifecycle handling between strategy intent and venue ack still has a TODO marker.
+  - Fix shape: Surface explicit ack/reject events from execution adapter and route into runtime so order state mirrors venue state without polling.
+
+- [ ] 47. Centralize per-strategy config contract
+  - Issue: `config.rs` reads strategy parameters from many env vars; risk of drift across presets.
+  - Fix shape: A single `StrategyProfile` struct with documented defaults and a from-env loader. Per-strategy presets compose against it.
+
+- [ ] 48. Validate relayer wallet mapping before next live run
+  - Issue: `RELAYER_API_KEY` present locally but `RELAYER_API_KEY_ADDRESS` may be missing.
+  - Fix shape: Startup check that confirms relayer key owner matches the configured signer/funder. Hard-fail if mismatch on live mode.
+
+- [ ] 49. End-to-end venue contract test (no live funds)
+  - Issue: Live tiny-capital smoke is currently the only venue validation layer.
+  - Fix shape: Mock CLOB + relayer HTTP fixtures; replay one full paired market lifecycle (bid → leg fill → hedge fill → merge → cash recovery). Run as CI coverage.
+
+- [ ] 50. First-class accounting ledger to replace fallback cost-basis recovery
+  - Issue: Current fallback recovers missing venue avg_cost from filled buys (commit `bd7c16c`); proper fix is a per-fill lot ledger.
+  - Fix shape: Persist per-fill lots from user events, reconcile against venue positions, make rescue/hold decisions consume the ledger.
+
+- [ ] 51. Single-line per-order lifecycle log
+  - Issue: Maker fill lifecycle is split across `strategy.sizing` + `runtime` + `wire::execution_adapter` log targets. Operators have to grep client_order_id across three.
+  - Fix shape: One `info!()` per terminal lifecycle event with full trail (intent params + venue ack + fill outcome). ~10-20 lines in `runtime/mod.rs`.
+
+- [ ] 52. Persist `markets_with_unresolved_drift` across restart
+  - Issue: Drift block info is in-memory only; warn-logged on `recover_from_store`.
+  - Fix shape: Add to order_store schema so drift block survives restarts.
+
+- [ ] 53. Auto-redeem with batched CTF redemption (gas-aware)
+  - Issue: Bot has `RuntimeCommand::Redeem(intent)` but warns "redeem command planned but relayer submission is not implemented" — winning legs from held-to-resolution positions don't auto-redeem. Whale Apr 28 data shows whale batches 9-10 redemptions per CTF tx and runs cleanup in UTC 15-23h window (gas-aware).
+  - Fix shape: Implement relayer redeem submission; queue resolved positions per market_id; flush queue when (a) ≥3 positions queued AND ≥$1 winning notional accumulated, OR (b) gas price below configured threshold (default 30 gwei), AND no currently-pending redeem tx for same wallet. Skip dust losers ($0 payout) unless `WHALE_PAIR_BATCH_REDEEM_DUST=true`.
+  - Why this is gated separately from item 33b: the batch-with-low-gas optimization is whale-pattern-validated; this item is about wiring the relayer call AND adding the batching logic.
+
+- [ ] 54. Asymmetric core+hedge strategy (vol-gated late-bar core accumulation)
+  - Issue: Whale Apr 28 + 35-day historical analysis (190K+ trades, r=0.688 vol↔late-exp correlation) shows late-bar expensive-leg accumulation is 13-25% of his notional, vol-driven. Our engine has no path for this — paired bidding handles 50/50 mid-prices, convex_accum (gated tightly) handles cheap-leg accumulation, but the LATE-BAR EXPENSIVE leg (where whale loads up at $0.85+ when one side is clearly winning) is missing.
+  - Fix shape: New `late_bar_core_accumulation` path that fires when `time_remaining < 120s AND time_remaining > 30s AND expensive_leg_ask in [0.85, 0.97] AND realized_vol_5m_bps >= threshold AND macro_signal_confirms_direction`. Place passive limit at maker price.
+  - See: `docs/strategy/asymmetric_core_hedge_spec.md` (TBD).
+
+## Archived
+
+- TODO.md → `docs/architecture/archived/TODO.md` (2026-04-29) — superseded by this checklist.
