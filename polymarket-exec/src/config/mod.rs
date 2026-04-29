@@ -410,10 +410,12 @@ impl AppConfig {
         let live_reconcile_missing_grace =
             parse_duration_ms("WHALE_PAIR_LIVE_RECONCILE_MISSING_GRACE_MS", 5_000)?;
         let quote_min_order_age_default_ms = if paper_mode { 750 } else { 5_000 };
-        let quote_min_order_age = parse_duration_ms(
+        let configured_quote_min_order_age = parse_duration_ms(
             "WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS",
             quote_min_order_age_default_ms,
         )?;
+        let quote_min_order_age =
+            effective_quote_min_order_age(paper_mode, configured_quote_min_order_age);
         let quote_churn_window = parse_duration_ms("WHALE_PAIR_QUOTE_CHURN_WINDOW_MS", 20_000)?;
         let quote_hard_pull = parse_duration_ms("WHALE_PAIR_QUOTE_HARD_PULL_MS", 5_000)?;
         let quote_max_churn_per_window = parse_usize("WHALE_PAIR_QUOTE_MAX_CHURN_PER_WINDOW", 12)?;
@@ -615,6 +617,14 @@ fn parse_duration_ms_or_profile(key: &str, profile: Option<u64>, default: u64) -
     }
 }
 
+fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Duration {
+    if paper_mode {
+        configured
+    } else {
+        configured.max(Duration::from_millis(5_000))
+    }
+}
+
 fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result<f64> {
     if env::var_os(key).is_some() {
         parse_f64(key, default)
@@ -713,5 +723,25 @@ mod tests {
         std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "true");
         assert!(should_load_dotenv());
         std::env::remove_var("WHALE_PAIR_EXEC_LOAD_DOTENV");
+    }
+
+    #[test]
+    fn live_quote_min_order_age_has_rebate_scoring_floor() {
+        assert_eq!(
+            effective_quote_min_order_age(false, Duration::from_millis(250)),
+            Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            effective_quote_min_order_age(false, Duration::from_millis(8_000)),
+            Duration::from_millis(8_000)
+        );
+    }
+
+    #[test]
+    fn paper_quote_min_order_age_keeps_fast_replay_setting() {
+        assert_eq!(
+            effective_quote_min_order_age(true, Duration::from_millis(250)),
+            Duration::from_millis(250)
+        );
     }
 }
