@@ -27,7 +27,7 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
+use crate::strategy::{Btc5mMmStrategy, Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
@@ -3687,12 +3687,23 @@ fn submit_request_from_intent(
     // to manufacture paired inventory (whales' atomic completion pattern).
     // They MUST cross the book — post-only would defeat the whole purpose.
     let is_hedge_rescue = intent.kind == crate::types::IntentKind::Close;
+    let is_late_bar_core = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("mm-late-bar-core"));
     let live_expires_at_ms = (!execution_policy.paper_mode
         && execution_policy.live_order_ttl_ms > 0
-        && !is_hedge_rescue)
-        .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms));
+        && !is_hedge_rescue
+        && !is_late_bar_core)
+        .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
+        .or_else(|| {
+            (!execution_policy.paper_mode && is_late_bar_core)
+                .then_some(observed_at_ms.saturating_add(Btc5mMmStrategy::LATE_BAR_CORE_TTL_MS))
+        });
     let (time_in_force, post_only) = if is_hedge_rescue {
         (TimeInForce::Ioc, false)
+    } else if is_late_bar_core {
+        (TimeInForce::Gtd, !execution_policy.paper_mode)
     } else if live_expires_at_ms.is_some() {
         (
             TimeInForce::Gtd,
@@ -5821,6 +5832,29 @@ mod tests {
         assert!(request.post_only);
         assert_eq!(request.time_in_force, TimeInForce::Gtd);
         assert_eq!(request.expires_at_ms, Some(21_000));
+    }
+
+    #[test]
+    fn late_bar_core_submit_uses_gtd_with_60s_ttl_and_post_only() {
+        let intent = OrderIntent {
+            client_order_id: ClientOrderId::from("client-late-core"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.93,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test late bar core".to_string(),
+            quote_level_tag: Some("mm-late-bar-core:l1".to_string()),
+            created_at_ms: 10,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let policy = live_test_policy();
+        let request = submit_request_from_intent(&intent, 1_000, &policy);
+        assert_eq!(request.time_in_force, TimeInForce::Gtd);
+        assert!(request.post_only);
+        assert_eq!(request.expires_at_ms, Some(61_000));
     }
 
     #[test]
