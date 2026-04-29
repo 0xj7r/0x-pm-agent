@@ -3217,11 +3217,18 @@ async fn execute_execution_adapter(
                     Err(error) => {
                         let active_order =
                             runtime_has_active_order(runtime, &intent.client_order_id);
+                        let error_text = error.to_string();
+                        let counts_against_budget = submit_rejection_counts_against_live_budget(
+                            &error_text,
+                            execution_policy.live_post_only,
+                        );
                         if active_order {
-                            live_safety.consecutive_submit_errors =
-                                live_safety.consecutive_submit_errors.saturating_add(1);
+                            if counts_against_budget {
+                                live_safety.consecutive_submit_errors =
+                                    live_safety.consecutive_submit_errors.saturating_add(1);
+                            }
                             let immediate_live_stop =
-                                submit_rejection_requires_immediate_live_stop(&error.to_string());
+                                submit_rejection_requires_immediate_live_stop(&error_text);
                             warn!(
                                 target: "polymarket_exec::runtime::runner",
                                 mode = "live",
@@ -3231,6 +3238,7 @@ async fn execute_execution_adapter(
                                 qty = intent.quantity,
                                 error = %error,
                                 error_kind = std::any::type_name_of_val(&error),
+                                counts_against_budget,
                                 immediate_live_stop,
                                 "submit Err returned by adapter (full venue text)"
                             );
