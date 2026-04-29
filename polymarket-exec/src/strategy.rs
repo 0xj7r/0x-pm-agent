@@ -2087,6 +2087,14 @@ impl Btc5mMmStrategy {
             .max(min_notional_quantity)
     }
 
+    fn actionable_inventory_min_quantity(&self, venue_rules: Option<&VenueMarketRules>) -> f64 {
+        venue_rules
+            .map(|rules| rules.minimum_order_size)
+            .filter(|quantity| quantity.is_finite() && *quantity > 1e-9)
+            .unwrap_or(self.config.venue_min_order_quantity)
+            .max(1e-9)
+    }
+
     fn convex_kelly_budget_usd(&self, fair: f64, bid_price: f64, bankroll_usd: f64) -> f64 {
         if !fair.is_finite()
             || !bid_price.is_finite()
@@ -2115,20 +2123,13 @@ impl Btc5mMmStrategy {
     fn can_emit_rescue(
         &mut self,
         market_id: &MarketId,
-        stranded_instrument_id: &InstrumentId,
-        lift_instrument_id: &InstrumentId,
+        _stranded_instrument_id: &InstrumentId,
+        _lift_instrument_id: &InstrumentId,
         now_ms: EpochMillis,
         notes: &mut Vec<String>,
     ) -> bool {
         let ttl_ms = self.rescue_inflight_ttl_ms();
         let state = self.market_states.entry(market_id.clone()).or_default();
-        if state.rescue_state.as_ref().is_some_and(|rescue| {
-            rescue.stranded_instrument_id != stranded_instrument_id.as_str()
-                || rescue.lift_instrument_id != lift_instrument_id.as_str()
-        }) {
-            state.rescue_state = None;
-        }
-
         let Some(rescue) = state.rescue_state.as_ref() else {
             return true;
         };
@@ -2156,10 +2157,6 @@ impl Btc5mMmStrategy {
         let next_attempts = state
             .rescue_state
             .as_ref()
-            .filter(|rescue| {
-                rescue.stranded_instrument_id == stranded_instrument_id.as_str()
-                    && rescue.lift_instrument_id == lift_instrument_id.as_str()
-            })
             .map(|rescue| rescue.attempts.saturating_add(1))
             .unwrap_or(1);
         let first_attempt_ms = state
@@ -3432,8 +3429,10 @@ impl Strategy for Btc5mMmStrategy {
 
         let mut intents = Vec::new();
         let mut hold_notes = Vec::new();
-        let left_has_inventory = left_qty > 1e-9;
-        let right_has_inventory = right_qty > 1e-9;
+        let actionable_inventory_min =
+            self.actionable_inventory_min_quantity(context.venue_rules.as_ref());
+        let left_has_inventory = left_qty + 1e-9 >= actionable_inventory_min;
+        let right_has_inventory = right_qty + 1e-9 >= actionable_inventory_min;
         let market_mode = self.transition_market_mode(
             &snapshot.market_id,
             context.now_ms,
@@ -3976,8 +3975,10 @@ impl Strategy for Btc5mMmStrategy {
             Self::position_for(&context.inventory, &fill.market_id, &left_id);
         let (right_qty, right_avg, _) =
             Self::position_for(&context.inventory, &fill.market_id, &right_id);
-        let left_has = left_qty > 1e-9;
-        let right_has = right_qty > 1e-9;
+        let actionable_inventory_min =
+            self.actionable_inventory_min_quantity(context.venue_rules.as_ref());
+        let left_has = left_qty + 1e-9 >= actionable_inventory_min;
+        let right_has = right_qty + 1e-9 >= actionable_inventory_min;
         if left_has == right_has {
             // Either both legs filled (no rescue needed) or both empty (impossible
             // since the fill we just got created at least one). No-op.

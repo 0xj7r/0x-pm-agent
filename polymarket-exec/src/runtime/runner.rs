@@ -816,6 +816,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
                     venue_message = ack.venue_message.as_deref().unwrap_or("(none)"),
                     "live redeem: submitted"
                 );
+                maybe_auto_wrap_pusd_after_redeem(&config, &adapter).await;
             }
             Err(error) => {
                 failed += 1;
