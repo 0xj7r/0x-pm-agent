@@ -2614,11 +2614,19 @@ impl<S: Strategy> Runtime<S> {
         if !Self::is_btc_mm_buy_intent(intent) {
             return false;
         }
+        // Match also by quote_level_tag so distinct ladder levels (l1, l2, ...)
+        // don't dedupe against each other. Pre-ladder, this filter compared by
+        // (market, instrument) only — fine for one-quote-per-instrument, but it
+        // collapses N-level ladders into level 0 because l2..lN all see l1
+        // active and get rejected as duplicates. Adding level_tag preserves the
+        // original "no two identical quotes" intent without blocking legitimate
+        // multi-level ladder emission.
         self.open_orders.values().any(|managed| {
             managed.intent.client_order_id != intent.client_order_id
                 && Self::is_btc_mm_buy_intent(&managed.intent)
                 && managed.intent.market_id == intent.market_id
                 && managed.intent.instrument_id == intent.instrument_id
+                && managed.intent.quote_level_tag == intent.quote_level_tag
                 && matches!(
                     managed.status,
                     ManagedOrderStatus::PendingSubmit
