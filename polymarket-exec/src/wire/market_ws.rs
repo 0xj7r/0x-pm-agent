@@ -264,7 +264,19 @@ impl MarketWsClient {
                     return Ok(());
                 }
                 if let Some(price) = event.get("price").and_then(value_as_f64_opt) {
-                    self.books.apply_last_trade(&asset_id, price).await;
+                    let quantity = event
+                        .get("size")
+                        .or_else(|| event.get("quantity"))
+                        .or_else(|| event.get("qty"))
+                        .and_then(value_as_f64_opt);
+                    let observed_at_ms = event
+                        .get("timestamp")
+                        .or_else(|| event.get("t"))
+                        .or_else(|| event.get("ts"))
+                        .and_then(Value::as_u64);
+                    self.books
+                        .apply_last_trade(&asset_id, price, quantity, observed_at_ms)
+                        .await;
                 }
                 self.metrics.observe_market_message("last_trade_price");
             }

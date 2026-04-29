@@ -94,6 +94,10 @@ pub struct PairedBookSignal {
     pub expensive_ask_notional_top3: Option<f64>,
     pub cheap_depth_imbalance_top3: Option<f64>,
     pub expensive_depth_imbalance_top3: Option<f64>,
+    pub cheap_taker_buy_qty_60s: f64,
+    pub cheap_taker_sell_qty_60s: f64,
+    pub expensive_taker_buy_qty_60s: f64,
+    pub expensive_taker_sell_qty_60s: f64,
 }
 
 impl PairedBookSignal {
@@ -139,6 +143,10 @@ impl PairedBookSignal {
             expensive_ask_notional_top3: None,
             cheap_depth_imbalance_top3: None,
             expensive_depth_imbalance_top3: None,
+            cheap_taker_buy_qty_60s: 0.0,
+            cheap_taker_sell_qty_60s: 0.0,
+            expensive_taker_buy_qty_60s: 0.0,
+            expensive_taker_sell_qty_60s: 0.0,
         }
     }
 }
@@ -263,11 +271,32 @@ pub struct Btc5mMmConfig {
     pub maker_safety_ticks: f64,
     pub entry_ladder_levels: usize,
     pub entry_ladder_spacing_ticks: f64,
+    /// V2 Signal 2 (bar-phase pacing): per-phase clip multipliers. Phase
+    /// boundaries are hardcoded definitions (not operator knobs) — see
+    /// `BAR_PHASE_*_END_RATIO` consts. These multipliers come from whale
+    /// notional-by-phase calibration; env-overridable for retuning if
+    /// whale's pattern shifts.
+    pub bar_phase_early_clip_scale: f64,
+    pub bar_phase_mid_clip_scale: f64,
+    pub bar_phase_late_clip_scale: f64,
+    pub bar_phase_final_clip_scale: f64,
     pub cooldown_ms: u64,
     pub taker_fee_coeff: f64,
     /// Hard ceiling on per-leg paired bid price. Above this, the ladder
     /// loop breaks. Whale data shows favored-leg bids up to $0.97. Env-tunable.
     pub entry_premium_bid_cap: f64,
+    /// V2 Signal 1 (order-flow imbalance) escape-hatch threshold. The
+    /// gate's primary threshold is computed at runtime from BTC realized
+    /// vol (vol-scaled — high-vol regimes get a looser threshold). This
+    /// env knob exists as an operator override; set to 0 to disable
+    /// signal-derivation and use this raw threshold instead.
+    pub order_flow_imbalance_threshold_override: f64,
+    /// V2 Signal 4 (own-fill asymmetry): during asymmetric-entry cooldown,
+    /// tighten entry max bid by penalty=(1-symmetry)*max_penalty.
+    /// Default 0.02 honors the spec's "tighten not block" intent — at
+    /// typical edge config a 0.05 cap drives max_bid below best_bid and
+    /// effectively re-arms the deleted asymmetric-entry cooldown.
+    pub asymmetric_fill_max_penalty: f64,
     /// Estimated Polygon gas cost per merge tx, in USDC. Used to penalize
     /// rescue EV. Env-tunable.
     pub merge_gas_cost_usd: f64,
@@ -327,11 +356,40 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_SPACING_TICKS",
                 1.0,
             ),
+            bar_phase_early_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_EARLY_CLIP_SCALE",
+                1.0,
+            ),
+            bar_phase_mid_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_MID_CLIP_SCALE",
+                0.6,
+            ),
+            bar_phase_late_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_LATE_CLIP_SCALE",
+                1.4,
+            ),
+            bar_phase_final_clip_scale: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_BAR_PHASE_FINAL_CLIP_SCALE",
+                0.0,
+            ),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
             entry_premium_bid_cap: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP",
                 0.97,
+            ),
+            // 0.0 = use signal-derived default (vol-scaled at runtime).
+            // Non-zero overrides with a fixed threshold (escape hatch).
+            order_flow_imbalance_threshold_override: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_ORDER_FLOW_IMBALANCE_THRESHOLD",
+                0.0,
+            ),
+            // Default 0.02 honors "tighten not block" — at 0.05 the penalty
+            // exceeds typical edge and re-arms the deleted asymmetric-entry
+            // cooldown. Operator can raise via env if needed.
+            asymmetric_fill_max_penalty: parse_f64(
+                "WHALE_PAIR_BTC_5M_MM_ASYMMETRIC_FILL_MAX_PENALTY",
+                0.02,
             ),
             merge_gas_cost_usd: parse_f64(
                 "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
@@ -366,9 +424,18 @@ impl Btc5mMmConfig {
             maker_safety_ticks: config.maker_safety_ticks.clamp(1.0, 10.0),
             entry_ladder_levels: config.entry_ladder_levels.clamp(1, 32),
             entry_ladder_spacing_ticks: config.entry_ladder_spacing_ticks.clamp(1.0, 10.0),
+            bar_phase_early_clip_scale: config.bar_phase_early_clip_scale.clamp(0.0, 3.0),
+            bar_phase_mid_clip_scale: config.bar_phase_mid_clip_scale.clamp(0.0, 3.0),
+            bar_phase_late_clip_scale: config.bar_phase_late_clip_scale.clamp(0.0, 3.0),
+            bar_phase_final_clip_scale: config.bar_phase_final_clip_scale.clamp(0.0, 3.0),
             cooldown_ms: config.cooldown_ms,
             taker_fee_coeff: config.taker_fee_coeff.max(0.0),
             entry_premium_bid_cap: config.entry_premium_bid_cap.clamp(0.50, 0.99),
+            order_flow_imbalance_threshold_override: config
+                .order_flow_imbalance_threshold_override
+                .abs()
+                .clamp(0.0, 1.0),
+            asymmetric_fill_max_penalty: config.asymmetric_fill_max_penalty.clamp(0.0, 0.10),
             merge_gas_cost_usd: config.merge_gas_cost_usd.max(0.0),
         }
     }
@@ -1665,6 +1732,33 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
     const ASYMMETRIC_FILL_SEVERE_SYMMETRY: f64 = 0.35;
     const ASYMMETRIC_FILL_MIN_TOTAL_QTY: f64 = 10.0;
+    /// Bar-phase definitions (V2 Signal 2). Hardcoded because these are
+    /// the *meaning* of "early/mid/late/final" within a bar — they were
+    /// chosen once based on whale notional-by-phase distribution. Operator
+    /// tunables are the per-phase clip multipliers in `Btc5mMmConfig`,
+    /// not these boundaries.
+    const BAR_PHASE_EARLY_END_RATIO: f64 = 0.20;
+    const BAR_PHASE_MID_END_RATIO: f64 = 0.70;
+    const BAR_PHASE_LATE_END_RATIO: f64 = 0.95;
+    /// Default bar window if `MarketContextRecord` lacks event timing.
+    /// 5min matches the btc-updown-5m family. For other families (e.g.
+    /// btc-updown-15m), supply correct timing via market_context.
+    const BAR_PHASE_DEFAULT_WINDOW_MS: u64 = 5 * 60 * 1_000;
+    /// Order-flow imbalance window (V2 Signal 1). 60s rolling — signal
+    /// definition, not an operator knob. Window enforcement lives in
+    /// `core::book::LegFlowState`; this const is the documented contract.
+    #[allow(dead_code)]
+    const FLOW_IMBALANCE_WINDOW_MS: u64 = 60_000;
+    /// Vol-scaled order-flow imbalance threshold defaults.
+    /// `threshold = base + slope * (1 - vol_normalized)`.
+    /// Calm regime (low vol) → tighter threshold (fires more readily on
+    /// any imbalance, since calm + one-sided flow = clean signal).
+    /// Hot regime (high vol) → looser threshold (noisy flow → less reliable).
+    const FLOW_IMBALANCE_THRESHOLD_BASE: f64 = 0.45;
+    const FLOW_IMBALANCE_THRESHOLD_SLOPE: f64 = 0.25;
+    /// Vol normalization point: realized 5m vol in bps that maps to
+    /// `vol_normalized = 1.0`. Above this → "high vol" → looser threshold.
+    const FLOW_IMBALANCE_VOL_REFERENCE_BPS: f64 = 80.0;
     const CONVEX_ACCUMULATION_MAX_BID: f64 = 0.45;
     const CONVEX_ACCUMULATION_MAX_AVG_COST: f64 = 0.55;
     /// Convex accumulation gets a smaller slice of the per-market budget than
@@ -2049,7 +2143,64 @@ impl Btc5mMmStrategy {
             .sum()
     }
 
-    fn dynamic_bid_clip_usd(&self, quote: &QuoteSnapshot, requested_clip_usd: f64) -> f64 {
+    fn bar_phase_clip_scale(
+        &self,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
+    ) -> Option<(f64, f64, u64, u64)> {
+        let remaining_ms = Self::time_remaining_ms(market_context, now_ms)?;
+        let bar_window_ms = market_context
+            .and_then(|ctx| {
+                ctx.event_start_time_ms.and_then(|start_ms| {
+                    ctx.event_end_time_ms
+                        .filter(|end_ms| *end_ms > start_ms)
+                        .map(|end_ms| end_ms - start_ms)
+                })
+            })
+            .unwrap_or(Self::BAR_PHASE_DEFAULT_WINDOW_MS)
+            .max(1_000);
+        let elapsed_ratio =
+            (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
+        let scale = if elapsed_ratio < Self::BAR_PHASE_EARLY_END_RATIO {
+            self.config.bar_phase_early_clip_scale
+        } else if elapsed_ratio < Self::BAR_PHASE_MID_END_RATIO {
+            self.config.bar_phase_mid_clip_scale
+        } else if elapsed_ratio < Self::BAR_PHASE_LATE_END_RATIO {
+            self.config.bar_phase_late_clip_scale
+        } else {
+            self.config.bar_phase_final_clip_scale
+        };
+        Some((scale, elapsed_ratio, remaining_ms, bar_window_ms))
+    }
+
+    /// Compute the order-flow imbalance threshold for this tick.
+    /// Vol-scaled by default; falls back to the operator override if set.
+    fn flow_imbalance_threshold(
+        &self,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+    ) -> f64 {
+        if self.config.order_flow_imbalance_threshold_override > 0.0 {
+            return self.config.order_flow_imbalance_threshold_override;
+        }
+        let vol_bps = btc_regime
+            .realized_vol_5m_bps
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS);
+        let vol_normalized =
+            (vol_bps / Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS).clamp(0.0, 1.0);
+        Self::FLOW_IMBALANCE_THRESHOLD_BASE
+            + Self::FLOW_IMBALANCE_THRESHOLD_SLOPE * (1.0 - vol_normalized)
+    }
+
+    fn dynamic_bid_clip_usd(
+        &self,
+        quote: &QuoteSnapshot,
+        requested_clip_usd: f64,
+        phase_scale: f64,
+    ) -> f64 {
+        if requested_clip_usd <= 0.0 || phase_scale <= 0.0 {
+            return 0.0;
+        }
         let visible_bid_notional = Self::top_notional(&quote.bid_levels, 3);
         let liquidity_cap =
             if visible_bid_notional > 0.0 && self.config.liquidity_clip_fraction > 0.0 {
@@ -2057,7 +2208,7 @@ impl Btc5mMmStrategy {
             } else {
                 self.config.max_clip_usd
             };
-        requested_clip_usd
+        (requested_clip_usd * phase_scale)
             .min(self.config.max_clip_usd)
             .min(liquidity_cap)
             .max(self.config.min_clip_usd)
@@ -2065,12 +2216,37 @@ impl Btc5mMmStrategy {
 
     fn paired_entry_clip_usd(
         &self,
+        market_id: &MarketId,
         left_quote: &QuoteSnapshot,
         right_quote: &QuoteSnapshot,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
     ) -> f64 {
-        self.dynamic_bid_clip_usd(left_quote, requested_clip_usd)
-            .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd))
+        let (phase_scale, elapsed_ratio, remaining_ms, bar_window_ms) = self
+            .bar_phase_clip_scale(market_context, now_ms)
+            .unwrap_or((
+                self.config.bar_phase_early_clip_scale,
+                0.0,
+                Self::BAR_PHASE_DEFAULT_WINDOW_MS,
+                Self::BAR_PHASE_DEFAULT_WINDOW_MS,
+            ));
+        if phase_scale <= 0.0 {
+            info!(
+                target: "strategy.bar_phase",
+                market = %market_id,
+                elapsed_ratio,
+                remaining_ms,
+                bar_window_ms,
+                phase_late_end_ratio = Self::BAR_PHASE_LATE_END_RATIO,
+                phase_scale,
+                threshold = self.config.bar_phase_final_clip_scale,
+                "paired entry suppressed by bar-phase pacing signal"
+            );
+            return 0.0;
+        }
+        self.dynamic_bid_clip_usd(left_quote, requested_clip_usd, phase_scale)
+            .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd, phase_scale))
     }
 
     fn paired_entry_quantity(
@@ -2081,6 +2257,8 @@ impl Btc5mMmStrategy {
         left_bid_price: f64,
         right_bid_price: f64,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
     ) -> Option<f64> {
         let clip_reference_price = left_bid_price.max(right_bid_price);
         let min_notional_reference_price = left_bid_price.min(right_bid_price);
@@ -2091,7 +2269,17 @@ impl Btc5mMmStrategy {
         {
             return None;
         }
-        let clip_usd = self.paired_entry_clip_usd(left_quote, right_quote, requested_clip_usd);
+        let clip_usd = self.paired_entry_clip_usd(
+            market_id,
+            left_quote,
+            right_quote,
+            requested_clip_usd,
+            market_context,
+            now_ms,
+        );
+        if clip_usd <= 0.0 {
+            return None;
+        }
         let raw_quantity = clip_usd / clip_reference_price;
         let required_quantity = self.required_order_quantity(min_notional_reference_price);
         let max_quantity = self.config.max_clip_usd / clip_reference_price;
@@ -2130,6 +2318,58 @@ impl Btc5mMmStrategy {
             "paired entry sizing decision"
         );
         Some(final_quantity)
+    }
+
+    fn suppress_paired_by_flow_imbalance(
+        &self,
+        market_id: &MarketId,
+        left_id: &InstrumentId,
+        left_quote: &QuoteSnapshot,
+        left_fair: f64,
+        right_id: &InstrumentId,
+        right_quote: &QuoteSnapshot,
+        right_fair: f64,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+    ) -> bool {
+        let threshold = self.flow_imbalance_threshold(btc_regime);
+        if threshold <= 0.0 {
+            return false;
+        }
+        let (expensive_leg, buy_qty_60s, sell_qty_60s) = if left_fair >= right_fair {
+            (
+                left_id,
+                left_quote.taker_buy_qty_60s,
+                left_quote.taker_sell_qty_60s,
+            )
+        } else {
+            (
+                right_id,
+                right_quote.taker_buy_qty_60s,
+                right_quote.taker_sell_qty_60s,
+            )
+        };
+        let total_qty_60s = buy_qty_60s + sell_qty_60s;
+        if total_qty_60s <= 1e-9 {
+            return false;
+        }
+        let imbalance = (buy_qty_60s - sell_qty_60s) / total_qty_60s;
+        if imbalance.abs() >= threshold {
+            info!(
+                target: "strategy.flow_imbalance",
+                market = %market_id,
+                expensive_leg = %expensive_leg,
+                expensive_leg_buy_qty_60s = buy_qty_60s,
+                expensive_leg_sell_qty_60s = sell_qty_60s,
+                expensive_leg_imbalance = imbalance,
+                threshold,
+                vol_5m_bps = ?btc_regime.realized_vol_5m_bps,
+                left_fair,
+                right_fair,
+                "paired entry suppressed by order-flow imbalance signal"
+            );
+            return true;
+        }
+        false
     }
 
     fn required_order_quantity(&self, reference_price: f64) -> f64 {
@@ -2608,6 +2848,50 @@ impl Btc5mMmStrategy {
         }
     }
 
+    fn market_fill_symmetry(&self, market_id: &MarketId, now_ms: EpochMillis) -> Option<f64> {
+        let state = self.market_states.get(market_id)?;
+        let mut by_instrument: HashMap<InstrumentId, f64> = HashMap::new();
+        for (_ts, instrument_id, qty) in state.recent_fills.iter().filter(|(ts, _, _)| {
+            now_ms.saturating_sub(*ts) <= Self::ASYMMETRIC_FILL_WINDOW_MS
+        }) {
+            *by_instrument.entry(instrument_id.clone()).or_default() += qty.max(0.0);
+        }
+        let total_qty: f64 = by_instrument.values().sum();
+        if total_qty < Self::ASYMMETRIC_FILL_MIN_TOTAL_QTY {
+            return None;
+        }
+        if by_instrument.len() < 2 {
+            return Some(0.0);
+        }
+        let min_qty = by_instrument
+            .values()
+            .fold(f64::INFINITY, |acc, qty| acc.min(*qty));
+        let max_qty = by_instrument
+            .values()
+            .fold(0.0_f64, |acc, qty| acc.max(*qty));
+        if max_qty <= 0.0 {
+            return None;
+        }
+        Some((min_qty / max_qty).clamp(0.0, 1.0))
+    }
+
+    fn asymmetric_fill_penalty(&self, market_id: &MarketId, now_ms: EpochMillis) -> f64 {
+        if self.config.asymmetric_fill_max_penalty <= 0.0 {
+            return 0.0;
+        }
+        let Some(state) = self.market_states.get(market_id) else {
+            return 0.0;
+        };
+        if !state
+            .asymmetric_entry_block_until_ms
+            .is_some_and(|until_ms| until_ms > now_ms)
+        {
+            return 0.0;
+        }
+        let symmetry = self.market_fill_symmetry(market_id, now_ms).unwrap_or(0.0);
+        (1.0 - symmetry).clamp(0.0, 1.0) * self.config.asymmetric_fill_max_penalty
+    }
+
     fn is_own_entry_fill(fill: &crate::types::FillReport) -> bool {
         fill.side == TradeSide::Buy
             && fill.close_method.is_none()
@@ -2641,7 +2925,7 @@ impl Btc5mMmStrategy {
         //   - has_inventory (manage existing position)
         //   - per-leg ENTRY_PREMIUM_BID_CAP inside build_paired_entry_ladder
         //   - capital caps (max_leg_cost, max_gross_cost) in risk engine
-        let _ = (left_fair, right_fair, btc_regime, market_mid_move);
+        let _ = (now_ms, left_fair, right_fair, btc_regime, market_mid_move);
         let next_mode = if has_inventory {
             Btc5mMmMarketMode::ManagingInventory
         } else {
@@ -2671,6 +2955,8 @@ impl Btc5mMmStrategy {
 
     fn candidate_ladder_bid_price(
         &self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
         quote: &QuoteSnapshot,
         fair: f64,
         leg_cost: f64,
@@ -2680,7 +2966,20 @@ impl Btc5mMmStrategy {
         level_index: usize,
     ) -> Option<f64> {
         let best_bid = Self::best_bid(quote)?;
-        let max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
+        let mut max_bid = self.max_bid_for(fair, leg_cost, gross_cost, edge_bps);
+        let asymmetric_penalty = self.asymmetric_fill_penalty(market_id, now_ms);
+        if asymmetric_penalty > 0.0 {
+            max_bid = (max_bid - asymmetric_penalty).clamp(0.0, 0.99);
+            info!(
+                target: "strategy.fill_asymmetry",
+                market = %market_id,
+                symmetry = self.market_fill_symmetry(market_id, now_ms),
+                max_penalty = self.config.asymmetric_fill_max_penalty,
+                applied_penalty = asymmetric_penalty,
+                adjusted_max_bid = max_bid,
+                "entry ladder max bid tightened by own-fill asymmetry signal"
+            );
+        }
         if best_bid <= 0.0 || max_bid <= 0.0 || (level_index == 0 && best_bid > max_bid) {
             return None;
         }
@@ -3099,6 +3398,8 @@ impl Btc5mMmStrategy {
         now_ms: EpochMillis,
     ) -> Option<OrderIntent> {
         let left_bid = self.candidate_ladder_bid_price(
+            market_id,
+            now_ms,
             left_quote,
             left_fair,
             left_cost,
@@ -3108,6 +3409,8 @@ impl Btc5mMmStrategy {
             0,
         );
         let right_bid = self.candidate_ladder_bid_price(
+            market_id,
+            now_ms,
             right_quote,
             right_fair,
             right_cost,
@@ -3445,6 +3748,7 @@ impl Btc5mMmStrategy {
         max_gross_cost_usd: f64,
         max_leg_cost_usd: f64,
         requested_clip_usd: f64,
+        market_context: Option<&MarketContextRecord>,
         venue_rules: Option<&VenueMarketRules>,
         now_ms: EpochMillis,
     ) -> Vec<OrderIntent> {
@@ -3459,6 +3763,8 @@ impl Btc5mMmStrategy {
             let effective_right_cost = right_cost + ladder_right_cost;
             let effective_gross_cost = gross_cost + ladder_gross_cost;
             let Some(left_bid_price) = self.candidate_ladder_bid_price(
+                market_id,
+                now_ms,
                 left_quote,
                 left_fair,
                 effective_left_cost,
@@ -3470,6 +3776,8 @@ impl Btc5mMmStrategy {
                 break;
             };
             let Some(right_bid_price) = self.candidate_ladder_bid_price(
+                market_id,
+                now_ms,
                 right_quote,
                 right_fair,
                 effective_right_cost,
@@ -3490,6 +3798,8 @@ impl Btc5mMmStrategy {
                 left_bid_price,
                 right_bid_price,
                 requested_clip_usd,
+                market_context,
+                now_ms,
             ) else {
                 break;
             };
@@ -3709,24 +4019,47 @@ impl Strategy for Btc5mMmStrategy {
                 let fill_scale = self.fill_rate_clip_scale(context.now_ms);
                 let scaled_clip = (self.config.base_clip_usd * fill_scale)
                     .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
+                let suppress_paired_flow = self.suppress_paired_by_flow_imbalance(
+                    &snapshot.market_id,
+                    &left_id,
+                    &left_quote,
+                    left_fair,
+                    &right_id,
+                    &right_quote,
+                    right_fair,
+                    &context.btc_regime,
+                );
+                // Signal 2 (bar-phase pacing) early-suppression: when we
+                // are in the final-phase window, do not even attempt to
+                // build the ladder. Composition-order requirement: this
+                // must run BEFORE entry_premium_bid_cap inside the ladder
+                // construction, so we evaluate it here.
+                let suppress_paired_phase = self
+                    .bar_phase_clip_scale(context.market_context.as_ref(), context.now_ms)
+                    .map(|(scale, _, _, _)| scale <= 0.0)
+                    .unwrap_or(false);
+                let suppress_paired = suppress_paired_flow || suppress_paired_phase;
                 if cooling_reason.is_none() {
-                    intents.extend(self.build_paired_entry_ladder(
-                        &snapshot.market_id,
-                        &left_id,
-                        &left_quote,
-                        left_fair,
-                        left_cost,
-                        &right_id,
-                        &right_quote,
-                        right_fair,
-                        right_cost,
-                        gross_cost,
+                    if !suppress_paired {
+                        intents.extend(self.build_paired_entry_ladder(
+                            &snapshot.market_id,
+                            &left_id,
+                            &left_quote,
+                            left_fair,
+                            left_cost,
+                            &right_id,
+                            &right_quote,
+                            right_fair,
+                            right_cost,
+                            gross_cost,
                         max_entry_gross_cost_usd,
                         max_entry_leg_cost_usd,
                         scaled_clip,
+                        context.market_context.as_ref(),
                         context.venue_rules.as_ref(),
                         context.now_ms,
                     ));
+                    }
                 }
                 if intents.is_empty() {
                     // Late-bar expensive-leg accumulation: capture favored-leg

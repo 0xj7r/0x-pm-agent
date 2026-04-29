@@ -51,6 +51,10 @@ pub struct PairedBookSignal {
     pub expensive_ask_notional_top3: Option<f64>,
     pub cheap_depth_imbalance_top3: Option<f64>,
     pub expensive_depth_imbalance_top3: Option<f64>,
+    pub cheap_taker_buy_qty_60s: f64,
+    pub cheap_taker_sell_qty_60s: f64,
+    pub expensive_taker_buy_qty_60s: f64,
+    pub expensive_taker_sell_qty_60s: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +604,10 @@ mod tests {
             expensive_ask_notional_top3: Some(expensive_ask * 100.0),
             cheap_depth_imbalance_top3: Some(0.0),
             expensive_depth_imbalance_top3: Some(0.0),
+            cheap_taker_buy_qty_60s: 0.0,
+            cheap_taker_sell_qty_60s: 0.0,
+            expensive_taker_buy_qty_60s: 0.0,
+            expensive_taker_sell_qty_60s: 0.0,
         }
     }
 

@@ -10,6 +10,96 @@ const TRADE_ACTIVITY_WINDOW_10S_MS: u64 = 10_000;
 const TRADE_ACTIVITY_WINDOW_30S_MS: u64 = 30_000;
 const TRADE_ACTIVITY_WINDOW_60S_MS: u64 = 60_000;
 const MAX_TRADE_ACTIVITY_ENTRIES: usize = 4_000;
+const LEE_READY_WINDOW_60S_MS: u64 = 60_000;
+const MAX_LEE_READY_ENTRIES: usize = 4_000;
+const LEE_READY_EPSILON: f64 = 1e-6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradeAggressor {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LegFlowState {
+    taker_buys: VecDeque<(u64, f64)>,
+    taker_sells: VecDeque<(u64, f64)>,
+    last_best_bid: Option<f64>,
+    last_best_ask: Option<f64>,
+}
+
+impl LegFlowState {
+    fn update_best_quotes(&mut self, best_bid: f64, best_ask: f64) {
+        self.last_best_bid = (best_bid.is_finite() && best_bid > 0.0).then_some(best_bid);
+        self.last_best_ask = (best_ask.is_finite() && best_ask > 0.0).then_some(best_ask);
+    }
+
+    fn prune(entries: &mut VecDeque<(u64, f64)>, now_ms: u64) {
+        while let Some((timestamp, _)) = entries.front().copied() {
+            if now_ms.saturating_sub(timestamp) <= LEE_READY_WINDOW_60S_MS {
+                break;
+            }
+            entries.pop_front();
+        }
+        while entries.len() > MAX_LEE_READY_ENTRIES {
+            entries.pop_front();
+        }
+    }
+
+    fn prune_all(&mut self, now_ms: u64) {
+        Self::prune(&mut self.taker_buys, now_ms);
+        Self::prune(&mut self.taker_sells, now_ms);
+    }
+
+    fn classify_trade(&self, trade_price: f64) -> Option<TradeAggressor> {
+        let best_bid = self.last_best_bid?;
+        let best_ask = self.last_best_ask?;
+        if best_bid <= 0.0 || best_ask <= 0.0 || best_ask < best_bid || !trade_price.is_finite() {
+            return None;
+        }
+        if (trade_price - best_ask).abs() <= LEE_READY_EPSILON || trade_price >= best_ask {
+            return Some(TradeAggressor::Buy);
+        }
+        if (trade_price - best_bid).abs() <= LEE_READY_EPSILON || trade_price <= best_bid {
+            return Some(TradeAggressor::Sell);
+        }
+        let dist_to_ask = (best_ask - trade_price).abs();
+        let dist_to_bid = (trade_price - best_bid).abs();
+        if dist_to_ask < dist_to_bid {
+            Some(TradeAggressor::Buy)
+        } else {
+            Some(TradeAggressor::Sell)
+        }
+    }
+
+    fn record_trade(&mut self, observed_at_ms: u64, trade_price: f64, trade_qty: f64) {
+        self.prune_all(observed_at_ms);
+        if !trade_qty.is_finite() || trade_qty <= 0.0 {
+            return;
+        }
+        match self.classify_trade(trade_price) {
+            Some(TradeAggressor::Buy) => self.taker_buys.push_back((observed_at_ms, trade_qty)),
+            Some(TradeAggressor::Sell) => self.taker_sells.push_back((observed_at_ms, trade_qty)),
+            None => {}
+        }
+    }
+
+    fn flow_qty_60s(&self, now_ms: u64) -> (f64, f64) {
+        let buy_qty = self
+            .taker_buys
+            .iter()
+            .filter(|(timestamp, _)| now_ms.saturating_sub(*timestamp) <= LEE_READY_WINDOW_60S_MS)
+            .map(|(_, qty)| *qty)
+            .sum();
+        let sell_qty = self
+            .taker_sells
+            .iter()
+            .filter(|(timestamp, _)| now_ms.saturating_sub(*timestamp) <= LEE_READY_WINDOW_60S_MS)
+            .map(|(_, qty)| *qty)
+            .sum();
+        (buy_qty, sell_qty)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Level {
@@ -32,6 +122,7 @@ pub struct BookState {
     pub depth_update_unix_ms: u64,
     last_update_mono: Option<Instant>,
     trade_events_unix_ms: VecDeque<u64>,
+    leg_flow: LegFlowState,
 }
 
 impl Default for BookState {
@@ -50,6 +141,7 @@ impl Default for BookState {
             depth_update_unix_ms: 0,
             last_update_mono: None,
             trade_events_unix_ms: VecDeque::new(),
+            leg_flow: LegFlowState::default(),
         }
     }
 }
@@ -89,6 +181,12 @@ impl BookState {
             depth_update_unix_ms: last_update_unix_ms,
             last_update_mono: None,
             trade_events_unix_ms: VecDeque::new(),
+            leg_flow: LegFlowState {
+                taker_buys: VecDeque::new(),
+                taker_sells: VecDeque::new(),
+                last_best_bid: (best_bid > 0.0).then_some(best_bid),
+                last_best_ask: (best_ask > 0.0).then_some(best_ask),
+            },
         }
     }
 
@@ -173,6 +271,10 @@ impl BookState {
         Some(now_unix_ms().saturating_sub(self.depth_update_unix_ms))
     }
 
+    pub fn taker_flow_qty_60s(&self, now_ms: u64) -> (f64, f64) {
+        self.leg_flow.flow_qty_60s(now_ms)
+    }
+
     fn update_levels(&mut self, bids: &[Level], asks: &[Level]) {
         if !bids.is_empty() {
             let mut sorted = normalize_levels(bids, true);
@@ -192,6 +294,8 @@ impl BookState {
                 self.best_ask_size = level.size;
             }
         }
+        self.leg_flow
+            .update_best_quotes(self.best_bid, self.best_ask);
     }
 }
 
@@ -303,11 +407,18 @@ impl BookStore {
                 .sort_by(|left, right| left.price.total_cmp(&right.price));
             book.asks.truncate(MAX_BOOK_LEVELS);
         }
+        book.leg_flow.update_best_quotes(book.best_bid, book.best_ask);
         book.touch();
         book.clone()
     }
 
-    pub async fn apply_last_trade(&self, asset_id: &str, price: f64) -> BookState {
+    pub async fn apply_last_trade(
+        &self,
+        asset_id: &str,
+        price: f64,
+        quantity: Option<f64>,
+        observed_at_ms: Option<u64>,
+    ) -> BookState {
         let mut guard = self.inner.write().await;
         let book = guard
             .entry(asset_id.to_string())
@@ -316,7 +427,9 @@ impl BookStore {
                 ..BookState::default()
             });
         book.last_trade_price = price;
-        let observed_at_ms = now_unix_ms();
+        let observed_at_ms = observed_at_ms.unwrap_or_else(now_unix_ms);
+        let trade_qty = quantity.unwrap_or(1.0);
+        book.leg_flow.record_trade(observed_at_ms, price, trade_qty);
         book.record_trade_event(observed_at_ms);
         book.last_update_unix_ms = observed_at_ms;
         book.last_update_mono = Some(Instant::now());
@@ -400,7 +513,127 @@ fn normalize_levels(levels: &[Level], highest_bid: bool) -> Vec<Level> {
 mod tests {
     use std::time::Duration;
 
-    use super::{BookStore, Level};
+    use super::{BookStore, LegFlowState, Level, TradeAggressor};
+
+    // ---- Lee-Ready classify_trade tests (V2 Signal 1 foundation) ----
+
+    fn flow_state_with(best_bid: f64, best_ask: f64) -> LegFlowState {
+        let mut s = LegFlowState::default();
+        s.update_best_quotes(best_bid, best_ask);
+        s
+    }
+
+    #[test]
+    fn classify_trade_at_ask_is_taker_buy() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.42), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_at_bid_is_taker_sell() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.40), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_above_ask_is_taker_buy() {
+        // Trade above the ask → buyer crossed past the visible quote
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.45), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_below_bid_is_taker_sell() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(0.38), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_inside_spread_closer_to_ask_is_buy() {
+        // Spread 0.40..0.50; trade at 0.47 → closer to 0.50 → buy
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.47), Some(TradeAggressor::Buy));
+    }
+
+    #[test]
+    fn classify_trade_inside_spread_closer_to_bid_is_sell() {
+        // Spread 0.40..0.50; trade at 0.43 → closer to 0.40 → sell
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.43), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_exactly_midspread_breaks_to_sell() {
+        // Tie at midspread: tick rule's standard fallback is "sell" via
+        // !(dist_to_ask < dist_to_bid). Documented behavior, not a bug.
+        let s = flow_state_with(0.40, 0.50);
+        assert_eq!(s.classify_trade(0.45), Some(TradeAggressor::Sell));
+    }
+
+    #[test]
+    fn classify_trade_inverted_spread_returns_none() {
+        // best_ask < best_bid (book momentarily inverted during dislocation)
+        let s = flow_state_with(0.50, 0.40);
+        assert_eq!(s.classify_trade(0.45), None);
+    }
+
+    #[test]
+    fn classify_trade_missing_best_bid_returns_none() {
+        let mut s = LegFlowState::default();
+        s.last_best_ask = Some(0.42);
+        // last_best_bid is None
+        assert_eq!(s.classify_trade(0.41), None);
+    }
+
+    #[test]
+    fn classify_trade_missing_best_ask_returns_none() {
+        let mut s = LegFlowState::default();
+        s.last_best_bid = Some(0.40);
+        // last_best_ask is None
+        assert_eq!(s.classify_trade(0.41), None);
+    }
+
+    #[test]
+    fn classify_trade_non_finite_price_returns_none() {
+        let s = flow_state_with(0.40, 0.42);
+        assert_eq!(s.classify_trade(f64::NAN), None);
+    }
+
+    // ---- prune correctness ----
+
+    #[test]
+    fn record_trade_drops_silently_when_book_unset() {
+        let mut s = LegFlowState::default();
+        // No best bid/ask → record_trade should be a no-op
+        s.record_trade(1_000, 0.40, 5.0);
+        assert!(s.taker_buys.is_empty());
+        assert!(s.taker_sells.is_empty());
+    }
+
+    #[test]
+    fn flow_qty_60s_excludes_old_entries() {
+        let mut s = flow_state_with(0.40, 0.42);
+        // Record a buy at t=0
+        s.record_trade(0, 0.42, 7.0);
+        // Record a buy at t=120s (well past 60s window)
+        s.record_trade(120_000, 0.42, 3.0);
+        // Now at 121s, only the t=120s entry should remain
+        let (buys, sells) = s.flow_qty_60s(121_000);
+        assert!((buys - 3.0).abs() < 1e-9, "expected only recent buy, got {buys}");
+        assert!(sells.abs() < 1e-9);
+    }
+
+    #[test]
+    fn prune_handles_non_monotonic_now_ms() {
+        // If a replay session feeds out-of-order timestamps, prune must
+        // not infinite-loop. saturating_sub of (now < entry_ts) returns 0,
+        // which is <= window, so we break the loop.
+        let mut s = flow_state_with(0.40, 0.42);
+        s.record_trade(10_000, 0.42, 1.0);
+        // now_ms < entry_ms — should not panic or hang
+        let (buys, _) = s.flow_qty_60s(5_000);
+        assert!((buys - 1.0).abs() < 1e-9);
+    }
 
     #[tokio::test]
     async fn snapshot_updates_top_levels() {
