@@ -3131,9 +3131,28 @@ async fn execute_execution_adapter(
                     execution_venue_map.remove(&intent.client_order_id);
                     continue;
                 }
-                match execution_adapter.submit(submit_req).await {
+                // Latency instrumentation (2026-04-29): measure two spans —
+                // wire_latency (submit call → adapter return) and
+                // pipeline_latency (intent creation → adapter return). Used
+                // to validate whether internal pipeline overhead is
+                // contributing to FAK no-match rejects.
+                let submit_call_start_ms = now_unix_ms();
+                let submit_result = execution_adapter.submit(submit_req).await;
+                let submit_ack_ms = now_unix_ms();
+                let wire_latency_ms = submit_ack_ms.saturating_sub(submit_call_start_ms);
+                let pipeline_latency_ms =
+                    submit_ack_ms.saturating_sub(intent.created_at_ms);
+                match submit_result {
                     Ok(ack) if ack.accepted => {
                         live_safety.consecutive_submit_errors = 0;
+                        debug!(
+                            target: "polymarket_exec::runtime::runner",
+                            mode = "live",
+                            client_order_id = %intent.client_order_id,
+                            wire_latency_ms,
+                            pipeline_latency_ms,
+                            "submit accepted"
+                        );
                         execution_venue_map
                             .insert(intent.client_order_id.clone(), ack.venue_order_id.clone());
                         let opened_outcome = runtime.on_order_opened_with_venue(
@@ -3191,6 +3210,8 @@ async fn execute_execution_adapter(
                             counts_against_budget,
                             immediate_live_stop,
                             active_order,
+                            wire_latency_ms,
+                            pipeline_latency_ms,
                             "submit ack-rejected by venue (full venue text)"
                         );
                         paper_order_ctx.remove(&intent.client_order_id);
