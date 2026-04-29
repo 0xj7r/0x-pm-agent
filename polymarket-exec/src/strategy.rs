@@ -1817,15 +1817,11 @@ impl Btc5mMmStrategy {
     // accumulation and keep this path focused on near-resolution convergence.
     const LATE_BAR_CORE_TIME_REMAINING_MS_MAX: u64 = 120_000;
     // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar core
-    // only runs in sufficiently active bars with realized volatility support.
-    // 2026-04-29: lowered from 50 → 5 paired with the vol-scaling fix in
-    // runtime::realized_vol_bps. The previous 50 was set against the
-    // mis-scaled per-tick σ; 50 was unreachable for normal BTC tape.
-    // After fix, this filters truly flat tape (vol < 5 bps over 5min)
-    // without blocking active-but-not-extreme regimes. Whale data shows
-    // late-bar accumulation correlates with vol but the threshold should
-    // be a "is BTC moving at all" filter, not a "high vol only" filter.
-    const LATE_BAR_CORE_MIN_VOL_BPS: f64 = 5.0;
+    // 2026-04-29: LATE_BAR_CORE_MIN_VOL_BPS removed; regime classifier
+    // (BtcRegime::favors_late_bar_core) subsumes the gate by checking
+    // trend-vs-noise composition rather than vol magnitude alone. Vol
+    // magnitude alone misclassifies "directional smooth" (low vol, big
+    // trend) as flat — exactly the regime late-bar-core wants to fire in.
     // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): require minimum
     // directional confirmation from spot vs price_to_beat.
     const LATE_BAR_CORE_MOMENTUM_FLOOR_BPS: f64 = 5.0;
@@ -3169,9 +3165,17 @@ impl Btc5mMmStrategy {
             return Some(format!("late-bar-core skip: ask {ask:.4} above ceiling"));
         }
 
-        let vol_bps = btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
-        if vol_bps < Self::LATE_BAR_CORE_MIN_VOL_BPS {
-            return Some(format!("late-bar-core skip: vol {vol_bps:.1}bps below min"));
+        // Regime gate: late-bar-core has +EV when BTC has a clear direction
+        // (DirectionalSmooth or TrendingVolatile). Other regimes (Flat,
+        // Whipsaw) lack the mispricing signal. Replaces the deleted
+        // LATE_BAR_CORE_MIN_VOL_BPS raw-vol threshold which couldn't
+        // distinguish "low vol because trending smooth" from "low vol
+        // because flat tape."
+        if !btc_regime.favors_late_bar_core() {
+            return Some(format!(
+                "late-bar-core skip: regime={:?} not favorable",
+                btc_regime.regime()
+            ));
         }
 
         let Some(leg_is_up) = Self::leg_is_up(expensive_leg_id, Some(ctx)) else {
