@@ -1746,6 +1746,13 @@ impl Btc5mMmStrategy {
     /// reliably get swept by other takers before our FAK lands. Two or
     /// more levels is the empirical minimum for survival.
     const MIN_RESCUE_ASK_LEVELS: usize = 2;
+    /// More permissive equivalents for SELL-unwind. Bids are structurally
+    /// more stable than asks in directional regimes — they accumulate
+    /// rather than being swept by faster takers. Reusing the BUY-rescue
+    /// thresholds blocked 4/4 SELL evaluations on 2026-04-29 even where
+    /// bids were almost certainly still fillable.
+    const MAX_SELL_UNWIND_BOOK_AGE_MS: u64 = 5_000;
+    const MIN_SELL_UNWIND_BID_LEVELS: usize = 1;
     const ASYMMETRIC_FILL_MODERATE_COOLDOWN_MS: u64 = 30_000;
     const ASYMMETRIC_FILL_SEVERE_COOLDOWN_MS: u64 = 90_000;
     const ASYMMETRIC_FILL_MODERATE_SYMMETRY: f64 = 0.65;
@@ -3860,23 +3867,25 @@ impl Btc5mMmStrategy {
             .filter(|l| l.price.is_finite() && l.price > 0.0)
             .map(|l| l.quantity)
             .sum();
-        if book_age_ms > Self::MAX_RESCUE_BOOK_AGE_MS {
+        if book_age_ms > Self::MAX_SELL_UNWIND_BOOK_AGE_MS {
             tracing::info!(
                 target: "strategy.sell_unwind_skip",
                 market = %market_id,
                 instrument = %instrument_id,
                 book_age_ms,
+                max_age_ms = Self::MAX_SELL_UNWIND_BOOK_AGE_MS,
                 reason = "book_stale",
                 "sell-unwind skipped due to stale book"
             );
             return None;
         }
-        if bid_levels_with_qty < Self::MIN_RESCUE_ASK_LEVELS {
+        if bid_levels_with_qty < Self::MIN_SELL_UNWIND_BID_LEVELS {
             tracing::info!(
                 target: "strategy.sell_unwind_skip",
                 market = %market_id,
                 instrument = %instrument_id,
                 bid_levels_with_qty,
+                min_required_levels = Self::MIN_SELL_UNWIND_BID_LEVELS,
                 total_bid_qty,
                 reason = "thin_bid_book",
                 "sell-unwind skipped due to thin bid book"
