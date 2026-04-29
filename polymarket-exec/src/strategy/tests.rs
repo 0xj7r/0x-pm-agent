@@ -1171,6 +1171,31 @@ fn btc_5m_mm_hedge_rescue_stops_after_attempt_cap() {
 }
 
 #[test]
+fn btc_5m_mm_hedge_rescue_attempt_cap_survives_leg_swap() {
+    let mut config = btc_5m_mm_test_config();
+    config.cooldown_ms = 100;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_id = MarketId::from("market-mm");
+    let up_id = InstrumentId::from("up");
+    let down_id = InstrumentId::from("down");
+
+    for now_ms in [1_000, 17_000, 33_000] {
+        strategy.record_rescue_attempt(&market_id, &up_id, &down_id, 5.0, now_ms);
+    }
+
+    let mut notes = Vec::new();
+    let allowed = strategy.can_emit_rescue(&market_id, &down_id, &up_id, 49_000, &mut notes);
+
+    assert!(
+        !allowed,
+        "leg swaps must not reset the per-market rescue cap"
+    );
+    assert!(notes
+        .iter()
+        .any(|note| note.contains("rescue attempt cap reached")));
+}
+
+#[test]
 fn btc_5m_mm_hedge_rescue_uses_rescue_clip_budget() {
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;

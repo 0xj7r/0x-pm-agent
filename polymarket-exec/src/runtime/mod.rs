@@ -49,6 +49,8 @@ const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_20M_MS: u64 = 20 * 60 * 1_000;
 const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
 const SIGNAL_SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 5_000;
+const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
+const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
 
 fn top_n_depth_qty(levels: &[crate::types::BookLevel], n: usize) -> Option<f64> {
     let total: f64 = levels
@@ -1117,8 +1119,16 @@ impl<S: Strategy> Runtime<S> {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
         let signature = MergeSignature::from_intent(&intent);
-        if let Some(blocked) = self.blocked_merge_by_market.get(market_id) {
-            if blocked.signature == signature {
+        if let Some((blocked_at_ms, blocked_reason)) = self
+            .blocked_merge_by_market
+            .get(market_id)
+            .and_then(|blocked| {
+                (blocked.signature == signature)
+                    .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
+            })
+        {
+            let blocked_for_ms = now_ms.saturating_sub(blocked_at_ms);
+            if blocked_for_ms < BLOCKED_MERGE_RETRY_AFTER_MS {
                 outcome.push_event(
                     self.event_log.push(
                         EventRecord::new(
@@ -1127,7 +1137,7 @@ impl<S: Strategy> Runtime<S> {
                             format!(
                                 "merge intent suppressed: matching CTF recycle is blocked \
                                  since {} reason={}",
-                                blocked.blocked_at_ms, blocked.reason
+                                blocked_at_ms, blocked_reason
                             ),
                         )
                         .with_market(market_id.clone()),
@@ -1135,6 +1145,20 @@ impl<S: Strategy> Runtime<S> {
                 );
                 return outcome;
             }
+            self.blocked_merge_by_market.remove(market_id);
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "blocked merge retry backoff elapsed after {blocked_for_ms}ms; \
+                             retrying CTF recycle reason={blocked_reason}"
+                        ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
         }
         if let Some(accepted) = self.accepted_merge_by_market.get(market_id) {
             if accepted.signature == signature {
@@ -2526,7 +2550,8 @@ impl<S: Strategy> Runtime<S> {
         }
 
         let mut same_market_positions = self.inventory.positions().filter(|position| {
-            position.market_id == managed.intent.market_id && position.quantity > 1e-9
+            position.market_id == managed.intent.market_id
+                && self.position_is_actionable_inventory(position)
         });
         let Some(position) = same_market_positions.next() else {
             return false;
@@ -2759,10 +2784,44 @@ impl<S: Strategy> Runtime<S> {
         }
     }
 
+    fn actionable_order_qty_for_market(&self, market_id: &MarketId) -> f64 {
+        self.venue_market_rules
+            .get(market_id)
+            .map(|rules| rules.minimum_order_size)
+            .filter(|quantity| quantity.is_finite() && *quantity > ACCOUNTING_QTY_EPSILON)
+            .unwrap_or(ACCOUNTING_QTY_EPSILON)
+    }
+
+    fn position_is_actionable_inventory(&self, position: &crate::inventory::PositionState) -> bool {
+        position.quantity.abs() + ACCOUNTING_QTY_EPSILON
+            >= self.actionable_order_qty_for_market(&position.market_id)
+    }
+
     fn market_has_inventory(&self, market_id: &MarketId) -> bool {
-        self.inventory
+        let positions = self
+            .inventory
             .positions()
-            .any(|position| &position.market_id == market_id && position.quantity.abs() > 1e-9)
+            .filter(|position| {
+                &position.market_id == market_id && position.quantity.abs() > ACCOUNTING_QTY_EPSILON
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            return false;
+        }
+
+        if positions.len() >= 2 {
+            let paired_quantity = positions
+                .iter()
+                .map(|position| position.quantity.abs())
+                .fold(f64::INFINITY, f64::min);
+            if paired_quantity.is_finite() && paired_quantity > ACCOUNTING_QTY_EPSILON {
+                return true;
+            }
+        }
+
+        positions
+            .iter()
+            .any(|position| self.position_is_actionable_inventory(position))
     }
 
     fn build_paired_book_signal(
@@ -3420,13 +3479,15 @@ fn generate_run_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedOrderStatus, Runtime, RuntimeConfig};
+    use super::{ManagedOrderStatus, Runtime, RuntimeConfig, BLOCKED_MERGE_RETRY_AFTER_MS};
     use crate::inventory::VenuePositionSnapshot;
     use crate::market_context::{MarketContextRecord, MarketContextStore};
     use crate::risk::RiskLimits;
     use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
     use crate::signals::unlawful_gate::UnlawfulGateConfig;
-    use crate::strategy::{NoopStrategy, Strategy, StrategyContext, StrategyDecision};
+    use crate::strategy::{
+        NoopStrategy, Strategy, StrategyContext, StrategyDecision, VenueMarketRules,
+    };
     use crate::types::{
         BookLevel, ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId,
         MarketSnapshot, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, TradeSide,
@@ -3873,6 +3934,117 @@ mod tests {
         assert!((merge.quantity - 6.5).abs() < 1e-9);
         assert!((merge.expected_cash_usd - 6.5).abs() < 1e-9);
         assert!((merge.expected_cost_usd - 5.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sub_venue_min_single_leg_dust_is_not_actionable_inventory() {
+        let market_id = MarketId::from("market-mm");
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+        runtime.set_venue_market_rules(
+            market_id.clone(),
+            VenueMarketRules {
+                minimum_order_size: 5.0,
+                minimum_tick_size: 0.01,
+                neg_risk: false,
+            },
+        );
+
+        runtime
+            .reconcile_venue_positions(
+                &[VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: None,
+                    instrument_id: InstrumentId::from("up"),
+                    quantity: 0.1882,
+                    average_cost_usd: 0.88,
+                    mark_price: Some(0.15),
+                    observed_at_ms: 10,
+                }],
+                11,
+            )
+            .expect("runtime venue reconciliation");
+
+        assert!(
+            !runtime.market_has_inventory(&market_id),
+            "sub-min single-leg residual should stay in accounting but not pin inventory mode"
+        );
+    }
+
+    #[test]
+    fn blocked_merge_retries_after_backoff_instead_of_permanent_suppression() {
+        let market_id = MarketId::from("market-mm");
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.20,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("first leg");
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.70,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("second leg");
+        runtime.block_pending_merge(&market_id, 12, "ctf revert");
+
+        let suppressed = runtime.plan_merge_command_for_market(&market_id, 13, "retry too soon");
+        assert!(
+            suppressed.commands.is_empty(),
+            "identical merge should still be suppressed during short backoff"
+        );
+
+        let retry = runtime.plan_merge_command_for_market(
+            &market_id,
+            12 + BLOCKED_MERGE_RETRY_AFTER_MS + 1,
+            "retry after reconcile",
+        );
+        assert!(
+            retry
+                .commands
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::Merge(_))),
+            "blocked merge must not be suppressed forever"
+        );
     }
 
     #[test]
