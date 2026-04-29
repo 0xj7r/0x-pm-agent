@@ -1376,6 +1376,31 @@ impl PolymarketExecutionAdapter {
     ) -> VenuePosition {
         let asset = position.asset.to_string();
         let condition_id = format!("{:#x}", position.condition_id);
+        let quantity = position.size.to_string().parse::<f64>().unwrap_or(0.0);
+        let average_cost_usd = {
+            let avg = position.avg_price.to_string().parse::<f64>().unwrap_or(0.0);
+            if avg.is_finite() && avg > 0.0 {
+                avg
+            } else {
+                let total_bought = position
+                    .total_bought
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+                let initial_value = position
+                    .initial_value
+                    .to_string()
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+                if quantity > 0.0 && total_bought.is_finite() && total_bought > 0.0 {
+                    total_bought / quantity
+                } else if quantity > 0.0 && initial_value.is_finite() && initial_value > 0.0 {
+                    initial_value / quantity
+                } else {
+                    0.0
+                }
+            }
+        };
         VenuePosition {
             market_id: MarketId::from(
                 market_id_by_asset
@@ -1385,8 +1410,8 @@ impl PolymarketExecutionAdapter {
             ),
             condition_id: Some(condition_id),
             instrument_id: InstrumentId::from(asset),
-            quantity: position.size.to_string().parse::<f64>().unwrap_or(0.0),
-            average_cost_usd: position.avg_price.to_string().parse::<f64>().unwrap_or(0.0),
+            quantity,
+            average_cost_usd,
             redeemable: position.redeemable,
             mergeable: position.mergeable,
             current_value_usd: position
@@ -2280,6 +2305,48 @@ mod tests {
         assert_eq!(venue.market_id, MarketId::from("runtime-market-1"));
         assert_eq!(venue.quantity, 2.25);
         assert_eq!(venue.average_cost_usd, 0.33);
+    }
+
+    #[test]
+    fn data_api_position_derives_avg_price_from_total_bought_when_avg_is_zero() {
+        let raw = serde_json::json!({
+            "proxyWallet": "0x1234567890abcdef1234567890abcdef12345678",
+            "asset": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "conditionId": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "size": 10.0,
+            "avgPrice": 0.0,
+            "initialValue": 5.0,
+            "currentValue": 4.0,
+            "cashPnl": -1.0,
+            "percentPnl": -20.0,
+            "totalBought": 5.0,
+            "realizedPnl": 0.0,
+            "percentRealizedPnl": 0.0,
+            "curPrice": 0.40,
+            "redeemable": false,
+            "mergeable": true,
+            "title": "Bitcoin Up or Down",
+            "slug": "btc-updown-5m",
+            "icon": "https://example.com/btc.png",
+            "eventSlug": "btc-updown",
+            "outcome": "Up",
+            "outcomeIndex": 0,
+            "oppositeOutcome": "Down",
+            "oppositeAsset": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "endDate": "2026-04-24",
+            "negativeRisk": false
+        });
+        let position: DataPosition = serde_json::from_value(raw).expect("data position");
+        let venue = PolymarketExecutionAdapter::venue_position_from_data_position(
+            &position,
+            &HashMap::new(),
+        );
+
+        assert!(
+            (venue.average_cost_usd - 0.5).abs() < 1e-9,
+            "venue avg_price=0 with total_bought=5.0/size=10 should derive avg_cost=0.5, got {}",
+            venue.average_cost_usd
+        );
     }
 
     #[test]
