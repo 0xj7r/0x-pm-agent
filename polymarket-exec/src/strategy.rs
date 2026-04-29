@@ -2616,13 +2616,9 @@ impl Btc5mMmStrategy {
         &self,
         left_fair: f64,
         right_fair: f64,
-        btc_regime: &crate::signals::BtcRegimeSnapshot,
+        _btc_regime: &crate::signals::BtcRegimeSnapshot,
         market_mid_move: Option<f64>,
     ) -> Btc5mMmMarketMode {
-        let trade_count_5m_ok = btc_regime.trade_count_5m >= 30;
-        let vol_5m = btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
-        let return_60s = btc_regime.return_60s_bps.unwrap_or(0.0).abs();
-
         let max_fair = left_fair.max(right_fair);
         if let Some(movement) = market_mid_move {
             if movement > Self::MARKET_MID_TREND_MAX_MOVE && max_fair > Self::ENTRY_PREMIUM_BID_CAP
@@ -2636,22 +2632,6 @@ impl Btc5mMmStrategy {
         if max_fair > Self::ENTRY_EXTREME_FAIR_CAP {
             return Btc5mMmMarketMode::Cooling {
                 reason: format!("premium fair cap: max_fair={max_fair:.3}"),
-                until_ms: None,
-            };
-        }
-        let has_btc_signal = btc_regime.observed_at_ms > 0;
-        if has_btc_signal && !trade_count_5m_ok && vol_5m < 1.0 {
-            return Btc5mMmMarketMode::Cooling {
-                reason: format!(
-                    "btc regime inactive: vol_5m={vol_5m:.2}bps trades_5m={}",
-                    btc_regime.trade_count_5m
-                ),
-                until_ms: None,
-            };
-        }
-        if return_60s > 15.0 {
-            return Btc5mMmMarketMode::Cooling {
-                reason: format!("btc regime trending: return_60s={return_60s:.2}bps"),
                 until_ms: None,
             };
         }
