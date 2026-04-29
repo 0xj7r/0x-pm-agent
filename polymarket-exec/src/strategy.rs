@@ -1675,7 +1675,7 @@ impl Btc5mMmStrategy {
     /// forget refresh on every book tick can produce 10+ bids per bar.
     /// 4 fires per bar gives 4 chances at the asymmetric payoff while
     /// bounding cumulative damage if signals all happen to be wrong.
-    const CONVEX_MAX_BIDS_PER_BAR: u32 = 8;
+    const CONVEX_MAX_BIDS_PER_BAR: u32 = 4;
     /// Fractional Kelly keeps convex accumulation proportional to measured
     /// edge instead of forcing the venue minimum on every eligible tick.
     const CONVEX_FRACTIONAL_KELLY: f64 = 0.25;
@@ -1688,12 +1688,12 @@ impl Btc5mMmStrategy {
     /// >5pp Polymarket book repricing in a single 5min bar. Below this,
     /// noise and short-term mean reversion dominate; above, the trend is
     /// real and bidding the cheap (against-trend) leg is adverse selection.
-    /// Bumped 2026-04-29 from 50 → 150: convex_accum should only skip when BTC
-    /// is in genuinely extreme adverse trend (~1.5% over 3 min). At 50 bps the
-    /// gate fired so often that convex barely ran — defeats the asymmetric
-    /// upside leg of the strategy. Whale data shows continuous cheap-leg
-    /// accumulation across most bars, not gated on macro trend.
-    const CONVEX_TREND_PERSISTENCE_BPS: f64 = 150.0;
+    /// Reverted 2026-04-29 from 150 → 50 after whale Apr 28 data showed
+    /// cheap-leg accumulation is only 3.5% of his total notional (mostly
+    /// incidental, not strategic). Loosening to 150 would have us buying
+    /// losing lottery tickets when whale doesn't. Convex stays as a heavily-
+    /// gated side bet, not a primary strategy.
+    const CONVEX_TREND_PERSISTENCE_BPS: f64 = 50.0;
     const HOLD_EV_MARGIN: f64 = 0.005;
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
