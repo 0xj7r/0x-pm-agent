@@ -189,7 +189,16 @@ impl BtcSignalStore {
             })
             .sum::<f64>()
             / returns.len() as f64;
-        Some(var.sqrt())
+        // Per-tick standard deviation σ_tick is in bps. Realized vol over the
+        // full window is σ_tick × sqrt(N) where N = number of returns observed.
+        // Without this scaling, the field name `realized_vol_5m_bps` reports
+        // ~0.02-0.05 bps (per-tick noise) on normal BTC tape, instead of the
+        // ~5-30 bps that downstream gates assume. That made
+        // LATE_BAR_CORE_MIN_VOL_BPS=50 unreachable and saturated Signal 1's
+        // vol-scaling at the most restrictive threshold. Bug fix 2026-04-29.
+        let sigma_tick = var.sqrt();
+        let scaled = sigma_tick * (returns.len() as f64).sqrt();
+        Some(scaled)
     }
 
     fn return_bps(&self, now_ms: u64, horizon_ms: u64) -> Option<f64> {

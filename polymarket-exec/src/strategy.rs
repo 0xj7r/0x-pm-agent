@@ -1818,7 +1818,14 @@ impl Btc5mMmStrategy {
     const LATE_BAR_CORE_TIME_REMAINING_MS_MAX: u64 = 120_000;
     // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar core
     // only runs in sufficiently active bars with realized volatility support.
-    const LATE_BAR_CORE_MIN_VOL_BPS: f64 = 50.0;
+    // 2026-04-29: lowered from 50 → 5 paired with the vol-scaling fix in
+    // runtime::realized_vol_bps. The previous 50 was set against the
+    // mis-scaled per-tick σ; 50 was unreachable for normal BTC tape.
+    // After fix, this filters truly flat tape (vol < 5 bps over 5min)
+    // without blocking active-but-not-extreme regimes. Whale data shows
+    // late-bar accumulation correlates with vol but the threshold should
+    // be a "is BTC moving at all" filter, not a "high vol only" filter.
+    const LATE_BAR_CORE_MIN_VOL_BPS: f64 = 5.0;
     // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): require minimum
     // directional confirmation from spot vs price_to_beat.
     const LATE_BAR_CORE_MOMENTUM_FLOOR_BPS: f64 = 5.0;
