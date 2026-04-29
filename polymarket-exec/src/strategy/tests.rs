@@ -1256,6 +1256,14 @@ fn btc_5m_mm_hedge_rescue_uses_rescue_clip_budget() {
 
 #[test]
 fn btc_5m_mm_hedge_rescue_can_upsize_to_venue_minimum_above_clip() {
+    // Strategy preference (post 2026-04-29 hold-to-resolution shift):
+    // when the held position's hold_ev only slightly trails rescue_ev,
+    // gas + taker fees on the rescue make hold the better expected value.
+    // This scenario (avg=0.40 with held_fair ≈ 0.382) lands in that
+    // territory, so the engine now holds rather than firing the upsized
+    // rescue. The upsize logic in build_rescue_intent_for_quantity is
+    // still exercised by other rescue scenarios where rescue_ev > hold_ev
+    // by a meaningful margin.
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
     config.hedge_rescue_clip_usd = 2.50;
@@ -1276,15 +1284,10 @@ fn btc_5m_mm_hedge_rescue_can_upsize_to_venue_minimum_above_clip() {
     let decision =
         strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.62, 0.64, 10));
 
-    assert_eq!(
-        decision.intents.len(),
-        1,
-        "rescue should not be suppressed just because venue minimum notional exceeds the clip"
+    assert!(
+        decision.intents.is_empty(),
+        "post-hold-shift: marginal rescue_ev should yield to hold-to-resolution"
     );
-    let hedge = &decision.intents[0];
-    assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
-    assert_eq!(hedge.quantity, 5.0);
-    assert!(hedge.quantity * hedge.limit_price > config.hedge_rescue_clip_usd);
 }
 
 #[test]
@@ -1430,7 +1433,51 @@ fn btc_5m_mm_partially_rescues_oversized_convex_inventory() {
 }
 
 #[test]
-fn btc_5m_mm_rescues_premium_stranded_inventory_even_when_mark_is_positive() {
+fn btc_5m_mm_holds_boundary_avg_cost_when_rescue_would_lock_in_loss_after_gas() {
+    // Position avg_cost=0.52 (just above CONVEX_ACCUMULATION_MAX_AVG_COST=0.50).
+    // Held_fair drifts to ~0.50 (mid-bar). Opposite ask is 0.50.
+    // rescue_ev_gross = 1 - 0.52 - 0.50 - taker_fee ≈ -0.038
+    // hold_ev = 0.50 - 0.52 = -0.02
+    // Even before gas, hold beats rescue. Pre-fix: forced rescue because
+    // cheap_positive fails at 0.52 > 0.50 and not late_confident → rescue.
+    // With gas baked into rescue_ev, rescue is even worse — hold is the
+    // correct choice here.
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("up"),
+        quantity: 5.0,
+        avg_price: 0.52,
+        mark_price: Some(0.50),
+        updated_at_ms: 1,
+    }];
+    let ctx = context(positions);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.49, 0.51, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.49, 0.51, 10));
+
+    assert!(
+        decision.intents.is_empty(),
+        "boundary-avg-cost stranded should hold to resolution; rescue locks in extra loss after gas. \
+         got intents: {:?}",
+        decision.intents.iter().map(|i| (i.quote_level_tag.as_deref(), i.limit_price)).collect::<Vec<_>>()
+    );
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("hold stranded")));
+}
+
+#[test]
+fn btc_5m_mm_holds_premium_stranded_inventory_when_mark_is_positive() {
+    // Renamed 2026-04-29: previous behavior was to ALWAYS rescue when
+    // avg_cost > CONVEX_ACCUMULATION_MAX_AVG_COST regardless of EV.
+    // New behavior: hold whenever hold_ev > rescue_ev (after gas + fees),
+    // because rescuing into a guaranteed smaller win when hold offers a
+    // larger expected win is irrational. Gas on the rescue would also
+    // burn a fraction of the realized P&L.
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
     let mut strategy = Btc5mMmStrategy::new(config);
@@ -1447,10 +1494,11 @@ fn btc_5m_mm_rescues_premium_stranded_inventory_even_when_mark_is_positive() {
     let decision =
         strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.36, 0.40, 10));
 
-    assert_eq!(decision.intents.len(), 1);
-    assert_eq!(
-        decision.intents[0].quote_level_tag.as_deref(),
-        Some("mm-hedge-rescue")
+    assert!(
+        decision.intents.is_empty(),
+        "post-hold-shift: positive-mark stranded should hold, not rescue. \
+         Got intents: {:?}",
+        decision.intents.iter().map(|i| i.quote_level_tag.as_deref()).collect::<Vec<_>>()
     );
 }
 
@@ -1494,7 +1542,12 @@ fn btc_5m_mm_late_bar_fair_can_hold_moderate_cost_winner() {
 }
 
 #[test]
-fn btc_5m_mm_one_sided_inventory_prioritizes_opposite_hedge_only() {
+fn btc_5m_mm_one_sided_inventory_holds_when_hold_ev_dominates() {
+    // Renamed 2026-04-29: previous behavior was to ALWAYS rescue one-sided
+    // inventory regardless of EV. New behavior: when held_fair (normalized)
+    // is high enough that hold_ev > rescue_ev_after_gas, hold to resolution
+    // instead. With UP at 0.80 avg and DOWN ask at 0.13, normalized fair
+    // implies UP ≈ 0.87, so hold_ev ≈ +0.07, rescue_ev ≈ +0.02 — hold wins.
     let mut config = btc_5m_mm_test_config();
     config.inventory_skew_bps = 0.0;
     config.base_clip_usd = 5.20;
@@ -1514,17 +1567,15 @@ fn btc_5m_mm_one_sided_inventory_prioritizes_opposite_hedge_only() {
     let decision =
         strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.11, 0.13, 10));
 
-    assert_eq!(decision.intents.len(), 1);
-    let hedge = &decision.intents[0];
-    assert_eq!(hedge.instrument_id, InstrumentId::from("down"));
-    assert_eq!(hedge.side, TradeSide::Buy);
-    assert_eq!(hedge.quote_level_tag.as_deref(), Some("mm-hedge-rescue"));
-    assert!(hedge.quantity >= 6.5);
-    assert!(hedge.quantity * hedge.limit_price >= 1.0 - 1e-9);
     assert!(
-        hedge.quantity * hedge.limit_price <= config.max_clip_usd + 1e-9,
-        "hedge rescue must stay within configured clip budget"
+        decision.intents.is_empty(),
+        "hold should win when held_fair(normalized) > avg_cost. Got intents: {:?}",
+        decision.intents.iter().map(|i| i.quote_level_tag.as_deref()).collect::<Vec<_>>()
     );
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("hold stranded")));
 }
 
 #[test]

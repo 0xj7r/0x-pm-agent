@@ -51,6 +51,12 @@ const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
 const SIGNAL_SNAPSHOT_PERSIST_INTERVAL_MS: u64 = 5_000;
 const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
+/// Minimum paired notional ($) to justify firing a merge transaction.
+/// Below this, gas (~$0.30 on Polygon) eats too much of the recycled $1
+/// per share; better to hold to resolution which captures the same $1
+/// payout for free. Whale data shows merge:redeem ≈ 0.07 — most paired
+/// inventory just resolves naturally.
+const MERGE_MIN_NOTIONAL_USD: f64 = 2.0;
 
 fn top_n_depth_qty(levels: &[crate::types::BookLevel], n: usize) -> Option<f64> {
     let total: f64 = levels
@@ -1118,6 +1124,30 @@ impl<S: Strategy> Runtime<S> {
         if intent.condition_id.is_none() {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
+
+        // Gas-friction gate: merging tiny paired inventory burns gas without
+        // recycling enough capital to be worthwhile. Each merge transaction
+        // costs ~$0.30 on Polygon; a $1.50 paired position would lose 20% to
+        // gas. Hold to resolution instead — the venue pays $1/share at
+        // resolution regardless, and resolution is gas-free.
+        if intent.expected_cash_usd + 1e-9 < MERGE_MIN_NOTIONAL_USD {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "merge skipped: paired notional ${:.4} below gas-friction threshold ${:.2}; \
+                             hold to resolution instead",
+                            intent.expected_cash_usd, MERGE_MIN_NOTIONAL_USD
+                        ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+
         let signature = MergeSignature::from_intent(&intent);
         if let Some((blocked_at_ms, blocked_reason)) = self
             .blocked_merge_by_market
@@ -3978,6 +4008,133 @@ mod tests {
         assert!(
             !runtime.market_has_inventory(&market_id),
             "sub-min single-leg residual should stay in accounting but not pin inventory mode"
+        );
+    }
+
+    #[test]
+    fn plan_merge_skips_tiny_paired_inventory_below_gas_threshold() {
+        let market_id = MarketId::from("market-mm");
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+        // Seed two tiny paired legs ($1.50 paired notional ~ 1.5 paired qty).
+        // Gas of ~$0.30 is 20% friction at this size — skip the merge and
+        // let positions resolve to capture the same $1/share without gas.
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.30,
+                quantity: 1.50,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("up leg");
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.65,
+                quantity: 1.50,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("down leg");
+
+        let outcome = runtime.plan_merge_command_for_market(
+            &market_id,
+            12,
+            "test trigger after paired inventory fills",
+        );
+
+        assert!(
+            outcome.commands.is_empty(),
+            "tiny paired inventory ($1.50 release) should be held to resolution, \
+             not merged at $0.30 gas (20% friction). Got commands: {:?}",
+            outcome.commands.len()
+        );
+        assert!(
+            runtime
+                .event_log()
+                .recent(20)
+                .iter()
+                .any(|event| event.message.contains("below gas-friction threshold")
+                    || event.message.contains("hold to resolution")),
+            "merge skip should emit a recognizable event for observability"
+        );
+    }
+
+    #[test]
+    fn plan_merge_fires_normally_for_substantial_paired_inventory() {
+        let market_id = MarketId::from("market-mm");
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            NoopStrategy,
+            MarketContextStore::empty(),
+        );
+        // Paired qty = 6.5 → $6.50 release. Worth the $0.30 gas.
+        runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.30,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 10,
+            })
+            .expect("up leg");
+        let second_outcome = runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: InstrumentId::from("down"),
+                side: TradeSide::Buy,
+                price: 0.65,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 11,
+            })
+            .expect("down leg");
+
+        // The second leg's on_fill should auto-plan the merge for substantial
+        // paired inventory.
+        assert!(
+            second_outcome.commands.iter().any(|cmd| matches!(cmd, RuntimeCommand::Merge(_))),
+            "$6.50 paired notional should fire merge on second leg fill (gas friction ~5%, within threshold). \
+             Got commands: {:?}",
+            second_outcome.commands.len()
         );
     }
 
