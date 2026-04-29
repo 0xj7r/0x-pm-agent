@@ -1005,6 +1005,306 @@ fn btc_5m_mm_allows_convex_cheap_leg_accumulation_when_pair_is_premium_blocked()
 }
 
 #[test]
+fn btc_5m_mm_late_bar_core_fires_when_all_gates_pass() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    let core_intents: Vec<_> = decision
+        .intents
+        .iter()
+        .filter(|intent| intent.quote_level_tag.as_deref() == Some("mm-late-bar-core:l1"))
+        .collect();
+    assert_eq!(
+        core_intents.len(),
+        1,
+        "should emit one late-bar-core intent"
+    );
+    assert!(
+        decision
+            .intents
+            .iter()
+            .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-convex-accum:l1")),
+        "late-bar core should take precedence over convex on the same tick"
+    );
+    let intent = core_intents[0];
+    assert_eq!(intent.instrument_id, InstrumentId::from("down"));
+    assert_eq!(intent.side, TradeSide::Buy);
+    assert!((intent.limit_price - 0.92).abs() < 1e-9);
+    assert!(intent.quantity * intent.limit_price <= 5.0 + 1e-9);
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_vol_too_low() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(20.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_direction_not_confirmed() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(100.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_time_remaining_too_low() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(20_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_time_remaining_too_high() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(150_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_expensive_ask_below_floor() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.83, 0.84, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_expensive_ask_above_ceiling() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.005, 0.01, 0));
+    // DOWN ask = 0.99 — above the bumped ceiling of 0.98.
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.985, 0.99, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_skips_when_already_holding_high_avg_cost() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let positions = vec![PositionState {
+        market_id: MarketId::from("market-mm"),
+        instrument_id: InstrumentId::from("down"),
+        quantity: 6.0,
+        avg_price: 0.90,
+        mark_price: Some(0.91),
+        updated_at_ms: 0,
+    }];
+    let ctx = context_at_with_market(positions, 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
+fn btc_5m_mm_late_bar_core_respects_per_bar_count_cap() {
+    let mut config = btc_5m_mm_test_config();
+    config.inventory_skew_bps = 0.0;
+    config.venue_min_order_quantity = 0.1;
+    config.min_order_quantity = 0.1;
+    config.min_order_notional_usd = 0.1;
+    let mut strategy = Btc5mMmStrategy::new(config);
+    let market_context = MarketContextRecord {
+        market_id: "market-mm".to_string(),
+        instrument_ids: vec!["up".to_string(), "down".to_string()],
+        price_to_beat: Some(100.0),
+        final_price: None,
+        event_start_time_ms: Some(0),
+        event_end_time_ms: Some(40_000),
+    };
+    let btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(99.0),
+        realized_vol_5m_bps: Some(70.0),
+        observed_at_ms: 0,
+        ..crate::signals::BtcRegimeSnapshot::default()
+    };
+    let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.05, 0.07, 0));
+
+    let state = strategy
+        .market_states
+        .entry(MarketId::from("market-mm"))
+        .or_default();
+    state.late_bar_core_bar_end_ms = Some(40_000);
+    state.late_bar_core_bids_this_bar = Btc5mMmStrategy::LATE_BAR_CORE_MAX_BIDS_PER_BAR;
+    state.late_bar_core_spend_this_bar_usd = 0.0;
+
+    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.92, 0.93, 0));
+
+    assert!(decision
+        .intents
+        .iter()
+        .all(|intent| intent.quote_level_tag.as_deref() != Some("mm-late-bar-core:l1")));
+}
+
+#[test]
 fn btc_5m_mm_convex_accumulation_skips_when_kelly_budget_is_below_venue_minimum() {
     let mut config = btc_5m_mm_test_config();
     config.min_edge_bps = 10.0;
@@ -1498,7 +1798,11 @@ fn btc_5m_mm_holds_premium_stranded_inventory_when_mark_is_positive() {
         decision.intents.is_empty(),
         "post-hold-shift: positive-mark stranded should hold, not rescue. \
          Got intents: {:?}",
-        decision.intents.iter().map(|i| i.quote_level_tag.as_deref()).collect::<Vec<_>>()
+        decision
+            .intents
+            .iter()
+            .map(|i| i.quote_level_tag.as_deref())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -1570,7 +1874,11 @@ fn btc_5m_mm_one_sided_inventory_holds_when_hold_ev_dominates() {
     assert!(
         decision.intents.is_empty(),
         "hold should win when held_fair(normalized) > avg_cost. Got intents: {:?}",
-        decision.intents.iter().map(|i| i.quote_level_tag.as_deref()).collect::<Vec<_>>()
+        decision
+            .intents
+            .iter()
+            .map(|i| i.quote_level_tag.as_deref())
+            .collect::<Vec<_>>()
     );
     assert!(decision
         .notes

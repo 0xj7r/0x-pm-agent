@@ -649,6 +649,12 @@ struct Btc5mMmMarketState {
     /// When this differs from the current bar's end_ms, we reset
     /// convex_bids_this_bar to 0 (new bar, fresh count).
     convex_bar_end_ms: Option<EpochMillis>,
+    /// Per-bar late-bar-core accumulation count.
+    late_bar_core_bids_this_bar: u32,
+    /// Bar anchor used for late-bar-core count/budget resets.
+    late_bar_core_bar_end_ms: Option<EpochMillis>,
+    /// Per-bar late-bar-core spend cap tracker (USD notional).
+    late_bar_core_spend_this_bar_usd: f64,
 }
 
 impl Btc5mMmMarketState {
@@ -1694,6 +1700,37 @@ impl Btc5mMmStrategy {
     /// losing lottery tickets when whale doesn't. Convex stays as a heavily-
     /// gated side bet, not a primary strategy.
     const CONVEX_TREND_PERSISTENCE_BPS: f64 = 50.0;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar path
+    // only targets venue-priced favored legs in the 0.85-0.97 band.
+    const LATE_BAR_CORE_PRICE_FLOOR: f64 = 0.85;
+    // V1 was 0.97; bumped 2026-04-29 to 0.98 after whale 6-day data showed
+    // 1069 trades at $0.98 vs only 124 at $0.99 — natural cliff is between
+    // $0.98 and $0.99. Captures ~7% more late-bar opportunities at slightly
+    // lower per-share margin.
+    const LATE_BAR_CORE_PRICE_CEILING: f64 = 0.98;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): avoid <30s
+    // remaining because maker queue/settlement race risk is too high.
+    const LATE_BAR_CORE_TIME_REMAINING_MS_MIN: u64 = 30_000;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): avoid early-bar
+    // accumulation and keep this path focused on near-resolution convergence.
+    const LATE_BAR_CORE_TIME_REMAINING_MS_MAX: u64 = 120_000;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar core
+    // only runs in sufficiently active bars with realized volatility support.
+    const LATE_BAR_CORE_MIN_VOL_BPS: f64 = 50.0;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): require minimum
+    // directional confirmation from spot vs price_to_beat.
+    const LATE_BAR_CORE_MOMENTUM_FLOOR_BPS: f64 = 5.0;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): per-market, per-
+    // bar spend cap for late-bar accumulation, isolated from convex budget.
+    const LATE_BAR_CORE_BUDGET_USD: f64 = 5.0;
+    // V1 was 4; bumped 2026-04-29 to 15 after whale data showed 20+ fills
+    // legging through $0.85-$0.97 within ~20s windows. Capital cap
+    // (LATE_BAR_CORE_BUDGET_USD) still bounds total exposure; this just
+    // allows full legging behavior when budget supports it.
+    const LATE_BAR_CORE_MAX_BIDS_PER_BAR: u32 = 15;
+    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar orders
+    // are fill-or-expire maker quotes with short GTD lifetime.
+    pub(crate) const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
     const HOLD_EV_MARGIN: f64 = 0.005;
     const HOLD_MIN_EDGE: f64 = 0.005;
     const LATE_BAR_FAIR_BLEND_WINDOW_MS: u64 = 90_000;
@@ -1824,6 +1861,9 @@ impl Btc5mMmStrategy {
                     // convex this bar yet").
                     convex_bids_this_bar: 0,
                     convex_bar_end_ms: None,
+                    late_bar_core_bids_this_bar: 0,
+                    late_bar_core_bar_end_ms: None,
+                    late_bar_core_spend_this_bar_usd: 0.0,
                 },
             );
         }
@@ -2569,7 +2609,9 @@ impl Btc5mMmStrategy {
                 .is_some_and(|client_order_id| {
                     let raw = client_order_id.as_str();
                     raw.starts_with("btc-5m-mm:")
-                        && (raw.contains(":mm-paired-bid:") || raw.contains(":mm-convex-accum:"))
+                        && (raw.contains(":mm-paired-bid:")
+                            || raw.contains(":mm-convex-accum:")
+                            || raw.contains(":mm-late-bar-core:"))
                         && !raw.contains(":mm-hedge-rescue:")
                 })
     }
@@ -2720,9 +2762,8 @@ impl Btc5mMmStrategy {
         } else {
             0.0
         };
-        let rescue_ev = Self::best_ask(opposite_quote).map(|ask| {
-            1.0 - avg_cost - ask - self.taker_fee_per_share(ask) - merge_gas_per_share
-        });
+        let rescue_ev = Self::best_ask(opposite_quote)
+            .map(|ask| 1.0 - avg_cost - ask - self.taker_fee_per_share(ask) - merge_gas_per_share);
         let remaining_ms = Self::time_remaining_ms(market_context, now_ms);
         let late_confident = remaining_ms.is_some_and(|remaining| remaining <= 60_000)
             && held_fair >= Self::LATE_BAR_HOLD_CONFIDENCE_FAIR
@@ -2798,6 +2839,133 @@ impl Btc5mMmStrategy {
     ///   3. trend-persistent (180s + 120s BTC return both against cheap leg
     ///      with magnitude > CONVEX_TREND_PERSISTENCE_BPS)
     ///   4. per-bar bid count (<= CONVEX_MAX_BIDS_PER_BAR for this bar)
+    fn late_bar_core_remaining_budget_usd(
+        &self,
+        market_id: &MarketId,
+        curr_bar_end: Option<EpochMillis>,
+    ) -> f64 {
+        if let Some(state) = self.market_states.get(market_id) {
+            let same_bar = matches!(
+                (state.late_bar_core_bar_end_ms, curr_bar_end),
+                (Some(a), Some(b)) if a == b
+            );
+            if same_bar {
+                return (Self::LATE_BAR_CORE_BUDGET_USD - state.late_bar_core_spend_this_bar_usd)
+                    .max(0.0);
+            }
+        }
+        Self::LATE_BAR_CORE_BUDGET_USD
+    }
+
+    /// Returns Some(reason) if late-bar expensive-leg accumulation should be
+    /// skipped this tick. None means "go ahead and call
+    /// build_late_bar_core_intent".
+    fn late_bar_core_skip_reason(
+        &self,
+        market_id: &MarketId,
+        expensive_leg_id: &InstrumentId,
+        expensive_leg_quote: &QuoteSnapshot,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
+        inventory: &InventorySnapshot,
+    ) -> Option<String> {
+        let Some(ctx) = market_context else {
+            return Some("late-bar-core skip: market context unavailable".to_string());
+        };
+        let Some(remaining_ms) = Self::time_remaining_ms(Some(ctx), now_ms) else {
+            return Some("late-bar-core skip: bar timing unavailable".to_string());
+        };
+        if remaining_ms < Self::LATE_BAR_CORE_TIME_REMAINING_MS_MIN {
+            return Some(format!(
+                "late-bar-core skip: too late, remaining={}ms",
+                remaining_ms
+            ));
+        }
+        if remaining_ms > Self::LATE_BAR_CORE_TIME_REMAINING_MS_MAX {
+            return Some(format!(
+                "late-bar-core skip: too early, remaining={}ms",
+                remaining_ms
+            ));
+        }
+
+        let Some(ask) = Self::best_ask(expensive_leg_quote) else {
+            return Some("late-bar-core skip: missing best ask".to_string());
+        };
+        if ask < Self::LATE_BAR_CORE_PRICE_FLOOR {
+            return Some(format!("late-bar-core skip: ask {ask:.4} below floor"));
+        }
+        if ask > Self::LATE_BAR_CORE_PRICE_CEILING {
+            return Some(format!("late-bar-core skip: ask {ask:.4} above ceiling"));
+        }
+
+        let vol_bps = btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
+        if vol_bps < Self::LATE_BAR_CORE_MIN_VOL_BPS {
+            return Some(format!("late-bar-core skip: vol {vol_bps:.1}bps below min"));
+        }
+
+        let Some(leg_is_up) = Self::leg_is_up(expensive_leg_id, Some(ctx)) else {
+            return Some("late-bar-core skip: unable to infer leg direction".to_string());
+        };
+        let Some(spot) = btc_regime.last_price else {
+            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+        };
+        let Some(price_to_beat) = ctx.price_to_beat else {
+            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+        };
+        if spot <= 0.0 || price_to_beat <= 0.0 {
+            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+        }
+        let direction_bps = ((spot / price_to_beat) - 1.0) * 10_000.0;
+        let confirmed = if leg_is_up {
+            direction_bps >= Self::LATE_BAR_CORE_MOMENTUM_FLOOR_BPS
+        } else {
+            direction_bps <= -Self::LATE_BAR_CORE_MOMENTUM_FLOOR_BPS
+        };
+        if !confirmed {
+            return Some(format!(
+                "late-bar-core skip: direction not confirmed (leg_is_up={leg_is_up} direction_bps={direction_bps:.1})"
+            ));
+        }
+
+        let curr_bar_end = ctx.event_end_time_ms;
+        if let Some(state) = self.market_states.get(market_id) {
+            let same_bar = matches!(
+                (state.late_bar_core_bar_end_ms, curr_bar_end),
+                (Some(a), Some(b)) if a == b
+            );
+            if same_bar {
+                if state.late_bar_core_bids_this_bar >= Self::LATE_BAR_CORE_MAX_BIDS_PER_BAR {
+                    return Some(format!(
+                        "late-bar-core skip: bar count cap reached ({} bids)",
+                        state.late_bar_core_bids_this_bar
+                    ));
+                }
+                if state.late_bar_core_spend_this_bar_usd >= Self::LATE_BAR_CORE_BUDGET_USD {
+                    return Some(format!(
+                        "late-bar-core skip: bar budget reached (${:.2})",
+                        state.late_bar_core_spend_this_bar_usd
+                    ));
+                }
+            }
+        }
+
+        for position in &inventory.positions {
+            if position.market_id == *market_id
+                && position.instrument_id == *expensive_leg_id
+                && position.quantity > 1e-9
+                && position.avg_price > 0.80
+            {
+                return Some(format!(
+                    "late-bar-core skip: avg_cost {:.4} too high to add",
+                    position.avg_price
+                ));
+            }
+        }
+
+        None
+    }
+
     fn convex_skip_reason(
         &self,
         market_id: &MarketId,
@@ -2869,6 +3037,82 @@ impl Btc5mMmStrategy {
             }
         }
         None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_late_bar_core_intent(
+        &self,
+        market_id: &MarketId,
+        expensive_leg_id: &InstrumentId,
+        expensive_leg_quote: &QuoteSnapshot,
+        expensive_leg_fair: f64,
+        expensive_leg_cost: f64,
+        gross_cost: f64,
+        max_gross_cost_usd: f64,
+        max_leg_cost_usd: f64,
+        remaining_bar_budget_usd: f64,
+        remaining_ms: u64,
+        venue_rules: Option<&VenueMarketRules>,
+        now_ms: EpochMillis,
+    ) -> Option<OrderIntent> {
+        let best_bid = Self::best_bid(expensive_leg_quote)?;
+        if best_bid < Self::LATE_BAR_CORE_PRICE_FLOOR {
+            return None;
+        }
+        let tick = self.tick_size(venue_rules);
+        let venue_min_qty = venue_rules
+            .map(|rules| rules.minimum_order_size)
+            .filter(|qty| qty.is_finite() && *qty > 0.0)
+            .unwrap_or(self.config.venue_min_order_quantity)
+            .max(self.required_order_quantity(best_bid));
+        let remaining_leg_usd = (max_leg_cost_usd - expensive_leg_cost).max(0.0);
+        let remaining_gross_usd = (max_gross_cost_usd - gross_cost).max(0.0);
+        let max_notional_usd = remaining_bar_budget_usd
+            .min(remaining_leg_usd)
+            .min(remaining_gross_usd)
+            .max(0.0);
+        if max_notional_usd <= 0.0 {
+            return None;
+        }
+        let max_quantity = max_notional_usd / best_bid;
+        if !max_quantity.is_finite() || max_quantity <= 0.0 {
+            return None;
+        }
+
+        let quantity = {
+            let floored = (max_quantity * 100.0).floor() / 100.0;
+            if floored + 1e-9 >= venue_min_qty {
+                floored
+            } else {
+                let min_rounded = (venue_min_qty * 100.0).ceil() / 100.0;
+                if min_rounded * best_bid <= max_notional_usd + 1e-9 {
+                    min_rounded
+                } else {
+                    return None;
+                }
+            }
+        };
+        if quantity + 1e-9 < venue_min_qty {
+            return None;
+        }
+
+        let price = Self::floor_to_tick(best_bid, tick);
+        Some(Self::build_order(
+            market_id.clone(),
+            expensive_leg_id.clone(),
+            TradeSide::Buy,
+            price,
+            quantity,
+            false,
+            "mm-late-bar-core:l1".to_string(),
+            format!(
+                "btc-5m-mm late-bar core accumulation: ask={:.4} bid={best_bid:.4} fair={expensive_leg_fair:.4} remaining_budget_usd={remaining_bar_budget_usd:.2} remaining_ms={remaining_ms} ttl_ms={}",
+                Self::best_ask(expensive_leg_quote).unwrap_or(0.0),
+                Self::LATE_BAR_CORE_TTL_MS,
+            ),
+            IntentKind::Entry,
+            now_ms,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3519,6 +3763,80 @@ impl Strategy for Btc5mMmStrategy {
                         context.venue_rules.as_ref(),
                         context.now_ms,
                     ));
+                }
+                if intents.is_empty() {
+                    // Late-bar expensive-leg accumulation: capture favored-leg
+                    // convergence near bar end before evaluating cheap-leg
+                    // convex accumulation. If both could fire on this tick,
+                    // late-bar-core takes precedence.
+                    let (
+                        expensive_leg_id,
+                        expensive_leg_quote,
+                        expensive_leg_fair,
+                        expensive_leg_cost,
+                    ) = if left_fair > right_fair {
+                        (&left_id, &left_quote, left_fair, left_cost)
+                    } else {
+                        (&right_id, &right_quote, right_fair, right_cost)
+                    };
+                    let late_skip = self.late_bar_core_skip_reason(
+                        &snapshot.market_id,
+                        expensive_leg_id,
+                        expensive_leg_quote,
+                        &context.btc_regime,
+                        context.market_context.as_ref(),
+                        context.now_ms,
+                        &context.inventory,
+                    );
+                    if let Some(reason) = late_skip {
+                        tracing::debug!(
+                            target: "strategy.late_bar_core_gate",
+                            market = %snapshot.market_id,
+                            reason,
+                            "late-bar core accumulation suppressed"
+                        );
+                    } else {
+                        let curr_bar_end = context
+                            .market_context
+                            .as_ref()
+                            .and_then(|record| record.event_end_time_ms);
+                        let remaining_bar_budget_usd = self
+                            .late_bar_core_remaining_budget_usd(&snapshot.market_id, curr_bar_end);
+                        let remaining_ms = Self::time_remaining_ms(
+                            context.market_context.as_ref(),
+                            context.now_ms,
+                        )
+                        .unwrap_or_default();
+                        if let Some(intent) = self.build_late_bar_core_intent(
+                            &snapshot.market_id,
+                            expensive_leg_id,
+                            expensive_leg_quote,
+                            expensive_leg_fair,
+                            expensive_leg_cost,
+                            gross_cost,
+                            max_entry_gross_cost_usd,
+                            max_entry_leg_cost_usd,
+                            remaining_bar_budget_usd,
+                            remaining_ms,
+                            context.venue_rules.as_ref(),
+                            context.now_ms,
+                        ) {
+                            let state = self
+                                .market_states
+                                .entry(snapshot.market_id.clone())
+                                .or_default();
+                            if state.late_bar_core_bar_end_ms != curr_bar_end {
+                                state.late_bar_core_bids_this_bar = 0;
+                                state.late_bar_core_spend_this_bar_usd = 0.0;
+                                state.late_bar_core_bar_end_ms = curr_bar_end;
+                            }
+                            state.late_bar_core_bids_this_bar =
+                                state.late_bar_core_bids_this_bar.saturating_add(1);
+                            state.late_bar_core_spend_this_bar_usd +=
+                                intent.limit_price * intent.quantity;
+                            intents.push(intent);
+                        }
+                    }
                 }
                 if intents.is_empty() {
                     let convex_skip = self.convex_skip_reason(
