@@ -3200,14 +3200,31 @@ impl Btc5mMmStrategy {
         let Some(leg_is_up) = Self::leg_is_up(expensive_leg_id, Some(ctx)) else {
             return Some("late-bar-core skip: unable to infer leg direction".to_string());
         };
+        // Diagnostic split (2026-04-29): the original combined reason
+        // produced 200 skips/12h on this branch, but didn't tell us which
+        // input was missing. Splitting into three distinct reasons so the
+        // skip-reason aggregator surfaces the actual data gap (spot WS lag,
+        // missing market_context price_to_beat, or invalid value).
         let Some(spot) = btc_regime.last_price else {
-            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+            return Some(
+                "late-bar-core skip: spot unavailable (btc_regime.last_price=None)".to_string(),
+            );
         };
         let Some(price_to_beat) = ctx.price_to_beat else {
-            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+            return Some(
+                "late-bar-core skip: price_to_beat unavailable (market_context not loaded)"
+                    .to_string(),
+            );
         };
-        if spot <= 0.0 || price_to_beat <= 0.0 {
-            return Some("late-bar-core skip: no spot/price_to_beat".to_string());
+        if spot <= 0.0 {
+            return Some(format!(
+                "late-bar-core skip: spot non-positive ({spot})"
+            ));
+        }
+        if price_to_beat <= 0.0 {
+            return Some(format!(
+                "late-bar-core skip: price_to_beat non-positive ({price_to_beat})"
+            ));
         }
         let direction_bps = ((spot / price_to_beat) - 1.0) * 10_000.0;
         let confirmed = if leg_is_up {
