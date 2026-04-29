@@ -206,6 +206,8 @@ mod tests {
                 ask_levels: vec![BookLevel::new(ask, 100.0)],
                 depth_observed_at_ms: Some(1_000),
                 last_trade_price: Some(mid),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
                 observed_at_ms: 1_000,
             },
         }

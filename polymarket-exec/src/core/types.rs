@@ -136,6 +136,8 @@ pub struct QuoteSnapshot {
     pub ask_levels: Vec<BookLevel>,
     pub depth_observed_at_ms: Option<EpochMillis>,
     pub last_trade_price: Option<f64>,
+    pub taker_buy_qty_60s: f64,
+    pub taker_sell_qty_60s: f64,
     pub observed_at_ms: EpochMillis,
 }
 
