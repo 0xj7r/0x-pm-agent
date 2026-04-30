@@ -182,6 +182,7 @@ fn btc_5m_mm_test_config() -> Btc5mMmConfig {
         order_flow_imbalance_threshold_override: 0.60,
         asymmetric_fill_max_penalty: 0.05,
         merge_gas_cost_usd: 0.30,
+        sell_unwind_enabled: true,
     }
 }
 
