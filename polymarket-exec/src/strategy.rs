@@ -866,6 +866,12 @@ enum SettlementLeg {
 pub struct StrategyDecision {
     pub intents: Vec<OrderIntent>,
     pub notes: Vec<String>,
+    /// When true, runtime submits the intents in this decision without
+    /// reconciling the full working quote set. Use for fill/close reactions
+    /// such as IOC rescues so existing maker quotes are not cancelled as
+    /// "no longer desired" just because the fill handler emitted only a
+    /// rescue intent.
+    pub preserve_quotes: bool,
 }
 
 impl StrategyDecision {
@@ -877,6 +883,7 @@ impl StrategyDecision {
         Self {
             intents: vec![intent],
             notes: Vec::new(),
+            preserve_quotes: false,
         }
     }
 
@@ -2581,6 +2588,15 @@ impl Btc5mMmStrategy {
         StrategyDecision {
             intents: Vec::new(),
             notes: vec![format!("btc-5m-mm no quote: {reason}")],
+            preserve_quotes: false,
+        }
+    }
+
+    fn preserve_quote_decision(notes: Vec<String>, intents: Vec<OrderIntent>) -> StrategyDecision {
+        StrategyDecision {
+            intents,
+            notes,
+            preserve_quotes: true,
         }
     }
 
@@ -4956,6 +4972,7 @@ impl Strategy for Btc5mMmStrategy {
                 return StrategyDecision {
                     intents,
                     notes: hold_notes,
+                    preserve_quotes: false,
                 };
             }
             return self.no_quote_decision(
@@ -4992,7 +5009,11 @@ impl Strategy for Btc5mMmStrategy {
             "btc-5m-mm quotes left={} fair={left_fair:.4} right={} fair={right_fair:.4} gross_cost={gross_cost:.2}",
             left_id, right_id
         ));
-        StrategyDecision { notes, intents }
+        StrategyDecision {
+            notes,
+            intents,
+            preserve_quotes: false,
+        }
     }
 
     fn on_fill(
@@ -5065,12 +5086,12 @@ impl Strategy for Btc5mMmStrategy {
         // sub-second pair completion latency.
         let market_state = match self.market_states.get(&fill.market_id) {
             Some(state) => state,
-            None => return StrategyDecision { notes, intents },
+            None => return Self::preserve_quote_decision(notes, intents),
         };
 
         // Need both outcome quotes cached to know what to lift.
         if market_state.quotes.len() < 2 {
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         }
 
         let mut sides: Vec<(InstrumentId, QuoteSnapshot)> = market_state
@@ -5093,7 +5114,7 @@ impl Strategy for Btc5mMmStrategy {
         if left_has == right_has {
             // Either both legs filled (no rescue needed) or both empty (impossible
             // since the fill we just got created at least one). No-op.
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         }
 
         // Throttle: skip if a rescue was emitted within cooldown_ms.
@@ -5103,7 +5124,7 @@ impl Strategy for Btc5mMmStrategy {
             .unwrap_or(true);
         if !throttle_ok {
             notes.push("on-fill rescue throttled".to_string());
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         }
 
         let Some((left_fair, right_fair)) = self.fair_values(
@@ -5115,7 +5136,7 @@ impl Strategy for Btc5mMmStrategy {
             context.market_context.as_ref(),
             context.now_ms,
         ) else {
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         };
 
         let held_quote = if left_has {
@@ -5149,7 +5170,7 @@ impl Strategy for Btc5mMmStrategy {
         );
         if exposure_decision.rescue_qty <= 1e-9 {
             notes.push(exposure_decision.reason);
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         }
         if !self.can_emit_rescue(
             &fill.market_id,
@@ -5158,7 +5179,7 @@ impl Strategy for Btc5mMmStrategy {
             context.now_ms,
             &mut notes,
         ) {
-            return StrategyDecision { notes, intents };
+            return Self::preserve_quote_decision(notes, intents);
         }
         let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
         let intent = self
@@ -5209,7 +5230,7 @@ impl Strategy for Btc5mMmStrategy {
             notes.push("on-fill IOC rescue emitted".to_string());
         }
 
-        StrategyDecision { notes, intents }
+        Self::preserve_quote_decision(notes, intents)
     }
 
     fn checkpoint_state(&self) -> Option<serde_json::Value> {
@@ -5624,6 +5645,7 @@ impl Strategy for GoatPairStrategy {
         StrategyDecision {
             intents,
             notes: Vec::new(),
+            preserve_quotes: false,
         }
     }
 
@@ -5646,6 +5668,7 @@ impl Strategy for GoatPairStrategy {
         StrategyDecision {
             intents: Vec::new(),
             notes: vec![note],
+            preserve_quotes: false,
         }
     }
 }
@@ -6774,7 +6797,11 @@ impl Strategy for UnlawfulShearStrategy {
                     }
                 }
                 notes.push("unlawful-shear closing window for attribution".to_string());
-                return StrategyDecision { intents, notes };
+                return StrategyDecision {
+                    intents,
+                    notes,
+                    preserve_quotes: false,
+                };
             }
         }
 
@@ -7160,14 +7187,22 @@ impl Strategy for UnlawfulShearStrategy {
                     "unlawful gate suppressed market mode={:?} actions_blocked",
                     mode
                 ));
-                return StrategyDecision { intents, notes };
+                return StrategyDecision {
+                    intents,
+                    notes,
+                    preserve_quotes: false,
+                };
             }
             if controller_blocked {
                 notes.push(format!(
                     "unlawful microstructure controller suppressed market mode={:?}",
                     mode
                 ));
-                return StrategyDecision { intents, notes };
+                return StrategyDecision {
+                    intents,
+                    notes,
+                    preserve_quotes: false,
+                };
             }
             return StrategyDecision::none();
         }
@@ -7194,7 +7229,11 @@ impl Strategy for UnlawfulShearStrategy {
             phase_clip_scale,
             self.window_elapsed_seconds(context)
         ));
-        StrategyDecision { intents, notes }
+        StrategyDecision {
+            intents,
+            notes,
+            preserve_quotes: false,
+        }
     }
 
     fn on_fill(
@@ -7216,6 +7255,7 @@ impl Strategy for UnlawfulShearStrategy {
         StrategyDecision {
             intents: Vec::new(),
             notes: vec![note],
+            preserve_quotes: false,
         }
     }
 }

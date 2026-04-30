@@ -2307,6 +2307,20 @@ impl<S: Strategy> Runtime<S> {
             )));
         }
 
+        if decision.preserve_quotes {
+            if !decision.intents.is_empty() {
+                outcome.push_event(self.event_log.push(EventRecord::new(
+                    EventCategory::Strategy,
+                    now_ms,
+                    "quote reconciliation skipped: preserving working quotes during close-side strategy reaction",
+                )));
+            }
+            for intent in decision.intents {
+                outcome.extend(self.accept_intent(intent, now_ms));
+            }
+            return outcome;
+        }
+
         let intents_in = decision.intents.len();
         let level_tags_in: Vec<String> = decision
             .intents
@@ -3686,6 +3700,25 @@ mod tests {
         }
     }
 
+    struct FillRescueStrategy {
+        rescue: OrderIntent,
+    }
+
+    impl Strategy for FillRescueStrategy {
+        fn name(&self) -> &str {
+            "fill-rescue"
+        }
+
+        fn on_fill(&mut self, _context: &StrategyContext, fill: &FillReport) -> StrategyDecision {
+            assert_eq!(fill.instrument_id, InstrumentId::from("up"));
+            StrategyDecision {
+                intents: vec![self.rescue.clone()],
+                notes: vec!["on-fill IOC rescue emitted".to_string()],
+                preserve_quotes: true,
+            }
+        }
+    }
+
     #[test]
     fn runtime_reserves_then_applies_fill() {
         let mut runtime = Runtime::new(
@@ -4587,6 +4620,68 @@ mod tests {
             pair_id: None,
             kind,
         }
+    }
+
+    #[test]
+    fn on_fill_rescue_preserves_working_pair_mate_quote() {
+        let left = btc_mm_intent("market-mm", "up", "mm-paired-bid:l1", 0.48);
+        let left_client_order_id = left.client_order_id.clone();
+        let right = btc_mm_intent("market-mm", "down", "mm-paired-bid:l1", 0.48);
+        let right_client_order_id = right.client_order_id.clone();
+        let rescue = btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.53);
+        let rescue_client_order_id = rescue.client_order_id.clone();
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            FillRescueStrategy { rescue },
+            MarketContextStore::empty(),
+        );
+
+        assert_eq!(runtime.accept_intent(left, 1).commands.len(), 1);
+        assert_eq!(runtime.accept_intent(right, 1).commands.len(), 1);
+
+        let outcome = runtime
+            .on_fill(FillReport {
+                order_id: None,
+                client_order_id: Some(left_client_order_id),
+                market_id: MarketId::from("market-mm"),
+                instrument_id: InstrumentId::from("up"),
+                side: TradeSide::Buy,
+                price: 0.48,
+                quantity: 6.5,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 2,
+            })
+            .expect("left fill should trigger rescue");
+
+        assert_eq!(
+            outcome
+                .commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Submit(_)))
+                .count(),
+            1
+        );
+        assert!(
+            outcome
+                .commands
+                .iter()
+                .all(|command| !matches!(command, RuntimeCommand::Cancel { .. })),
+            "on-fill rescue must not cancel the still-working paired mate"
+        );
+        assert!(runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == right_client_order_id));
+        assert!(runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
     }
 
     #[test]

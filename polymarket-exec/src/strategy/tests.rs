@@ -320,7 +320,7 @@ fn noop_stays_idle() {
         &snapshot("token-up", "market", 0.4, 0.5, 1),
     );
     assert!(
-        matches!(decision, StrategyDecision { intents: ref i, notes: ref n } if i.is_empty() && n.is_empty())
+        matches!(decision, StrategyDecision { intents: ref i, notes: ref n, .. } if i.is_empty() && n.is_empty())
     );
 }
 

@@ -298,6 +298,7 @@ impl Strategy for FixtureStrategy {
         StrategyDecision {
             intents,
             notes: Vec::new(),
+            preserve_quotes: false,
         }
     }
 }
