@@ -43,6 +43,7 @@ const DEFAULT_CONN_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DATA_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BINANCE_REST_BOOTSTRAP_URL: &str = "https://api.binance.com/api/v3/aggTrades";
 const DEFAULT_COINBASE_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
+const BINANCE_REST_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub enum SpotFeedSource {
@@ -149,7 +150,7 @@ impl SpotWsClient {
     async fn run_binance(&self, shutdown: CancellationToken) {
         let mut backoff = Duration::from_secs(1);
         while !shutdown.is_cancelled() {
-            self.bootstrap_binance_rest().await;
+            let _ = self.bootstrap_binance_rest(1_000).await;
             match self.run_once(shutdown.clone()).await {
                 Ok(()) => break,
                 Err(error) if shutdown.is_cancelled() => {
@@ -194,13 +195,15 @@ impl SpotWsClient {
         }
     }
 
-    async fn bootstrap_binance_rest(&self) {
+    async fn bootstrap_binance_rest(&self, limit: usize) -> usize {
         let Some(url) = self.binance_rest_bootstrap_url.as_deref() else {
-            return;
+            return 0;
         };
-        let request = reqwest::Client::new()
-            .get(url)
-            .query(&[("symbol", self.symbol.as_str()), ("limit", "1000")]);
+        let limit_string = limit.to_string();
+        let request = reqwest::Client::new().get(url).query(&[
+            ("symbol", self.symbol.as_str()),
+            ("limit", limit_string.as_str()),
+        ]);
         match request.send().await {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<Value>().await {
@@ -223,13 +226,26 @@ impl SpotWsClient {
                                 "bootstrapped BTC regime samples from Binance REST"
                             );
                         }
+                        forwarded
                     }
-                    Ok(_) => warn!("Binance REST bootstrap returned non-array payload"),
-                    Err(error) => warn!(error = ?error, "failed to decode Binance REST bootstrap"),
+                    Ok(_) => {
+                        warn!("Binance REST bootstrap returned non-array payload");
+                        0
+                    }
+                    Err(error) => {
+                        warn!(error = ?error, "failed to decode Binance REST bootstrap");
+                        0
+                    }
                 },
-                Err(error) => warn!(error = ?error, "Binance REST bootstrap returned error status"),
+                Err(error) => {
+                    warn!(error = ?error, "Binance REST bootstrap returned error status");
+                    0
+                }
             },
-            Err(error) => warn!(error = ?error, "Binance REST bootstrap request failed"),
+            Err(error) => {
+                warn!(error = ?error, "Binance REST bootstrap request failed");
+                0
+            }
         }
     }
 
@@ -242,6 +258,8 @@ impl SpotWsClient {
         let (mut write, mut read) = stream.split();
         let mut pings = interval(self.ping_interval);
         pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut rest_keepalive = interval(BINANCE_REST_KEEPALIVE_INTERVAL);
+        rest_keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // Two-rail liveness: connection rail tracks any frame, data rail
         // tracks only parsed aggTrade messages. Both must stay fresh.
@@ -282,6 +300,14 @@ impl SpotWsClient {
                         .send(Message::Ping(Vec::new().into()))
                         .await
                         .context("failed to send spot websocket ping")?;
+                }
+                _ = rest_keepalive.tick(), if self.binance_rest_bootstrap_url.is_some() => {
+                    // Keep signal windows warm even if WS becomes quiet.
+                    // Lightweight poll: small most-recent aggTrades slice.
+                    let forwarded = self.bootstrap_binance_rest(100).await;
+                    if forwarded > 0 {
+                        last_aggtrade_at = Instant::now();
+                    }
                 }
                 frame = read.next() => {
                     // Connection rail: any frame proves transport is alive.
@@ -327,6 +353,17 @@ impl SpotWsClient {
             .send(Message::Text(subscribe.to_string().into()))
             .await
             .context("failed to subscribe coinbase market trades")?;
+        // Coinbase Advanced Trade docs: channels can close after 60-90s
+        // without heartbeats. Keep fallback stream live by subscribing.
+        let heartbeat_subscribe = json!({
+            "type": "subscribe",
+            "product_ids": [self.coinbase_product_id],
+            "channel": "heartbeats",
+        });
+        write
+            .send(Message::Text(heartbeat_subscribe.to_string().into()))
+            .await
+            .context("failed to subscribe coinbase heartbeats")?;
 
         let mut pings = interval(self.ping_interval);
         pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
