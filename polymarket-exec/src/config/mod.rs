@@ -89,6 +89,15 @@ pub struct AppConfig {
     pub order_store_path: Option<PathBuf>,
     pub runtime_run_id: Option<String>,
     pub ping_interval: Duration,
+    /// Spot WS connection-rail staleness threshold. Any inbound frame
+    /// (text/binary/ping/pong) resets the timer. Used to detect TCP-level
+    /// silent stalls.
+    pub spot_ws_conn_stale_timeout: Duration,
+    /// Spot WS data-rail staleness threshold. Only successfully-parsed
+    /// aggTrade messages reset this timer. Used to detect subscription
+    /// drops where the venue keeps the connection alive but stops
+    /// sending the actual BTC trade tape.
+    pub spot_ws_data_stale_timeout: Duration,
     pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
     pub journal_rotate_bytes: Option<u64>,
@@ -317,6 +326,14 @@ impl AppConfig {
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
+        let spot_ws_conn_stale_timeout = parse_duration_ms(
+            "WHALE_PAIR_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS",
+            30_000,
+        )?;
+        let spot_ws_data_stale_timeout = parse_duration_ms(
+            "WHALE_PAIR_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS",
+            30_000,
+        )?;
         let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
         let journal_rotate_bytes = env::var("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
@@ -538,6 +555,8 @@ impl AppConfig {
             order_store_path,
             runtime_run_id,
             ping_interval,
+            spot_ws_conn_stale_timeout,
+            spot_ws_data_stale_timeout,
             market_context_path,
             journal_path,
             journal_rotate_bytes,

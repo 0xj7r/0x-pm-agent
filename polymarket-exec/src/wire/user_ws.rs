@@ -1,7 +1,13 @@
 //! Polymarket user websocket client for order/fill lifecycle event ingestion.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Same staleness pattern as spot_ws — bail and reconnect if no inbound
+/// frames arrive within this window. User WS only delivers when WE have
+/// fills/orders, so traffic is sparse — 90s is conservative for our
+/// use case (vs 30s spot, 60s market).
+const USER_WS_STALE_TIMEOUT: Duration = Duration::from_secs(90);
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -161,6 +167,7 @@ impl UserWsClient {
 
         let mut pings = interval(self.ping_interval);
         pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_frame_at = Instant::now();
 
         loop {
             tokio::select! {
@@ -185,12 +192,21 @@ impl UserWsClient {
                     anyhow::bail!("market subscription changed");
                 }
                 _ = pings.tick() => {
+                    let elapsed = last_frame_at.elapsed();
+                    if elapsed > USER_WS_STALE_TIMEOUT {
+                        anyhow::bail!(
+                            "user websocket silently stale: no frames for {}s (timeout={}s); forcing reconnect",
+                            elapsed.as_secs(),
+                            USER_WS_STALE_TIMEOUT.as_secs()
+                        );
+                    }
                     write
                         .send(Message::Text("PING".to_string().into()))
                         .await
                         .context("failed to send user websocket ping")?;
                 }
                 frame = read.next() => {
+                    last_frame_at = Instant::now();
                     match frame {
                         Some(Ok(Message::Text(text))) => self.handle_text(&text).await?,
                         Some(Ok(Message::Binary(_))) => {}

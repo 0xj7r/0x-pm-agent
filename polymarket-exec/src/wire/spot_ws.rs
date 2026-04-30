@@ -1,6 +1,6 @@
 //! Spot trade websocket client feeding BTC regime telemetry into the runtime.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -12,6 +12,30 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::metrics::AppMetrics;
+
+/// Two-rail liveness model for the spot websocket.
+///
+/// 2026-04-29 production incident: Binance spot WS silently stalled at
+/// 22:55 UTC, no messages for 2+ hours, no error events. Vol calculation's
+/// 5-min sliding window drained, regime classifier returned None,
+/// paired-MM ran without regime gate protection during a directional run.
+/// Material PnL bleed.
+///
+/// Single-rail "any frame received" liveness is INSUFFICIENT because the
+/// venue can keep the transport alive (control frames, pongs) while
+/// silently dropping the aggTrade subscription. We need both:
+///
+/// 1. **Connection rail**: any inbound frame proves the socket is alive.
+///    Resets on text/binary/ping/pong/close. Failure → bail and reconnect.
+/// 2. **Data rail**: only PARSED aggTrade messages reset this. Failure
+///    means the BTC trade tape isn't flowing — regime telemetry is
+///    going stale even if the connection appears healthy. Failure → bail
+///    and reconnect (more aggressive than just marking unhealthy because
+///    the strategy's regime gate is the load-bearing protection).
+///
+/// Defaults are env-configurable via `WHALE_PAIR_EXEC_SPOT_WS_*_TIMEOUT_MS`.
+const DEFAULT_CONN_STALE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_DATA_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct SpotTradeEvent {
@@ -25,6 +49,8 @@ pub struct SpotWsClient {
     url: String,
     symbol: String,
     ping_interval: Duration,
+    conn_stale_timeout: Duration,
+    data_stale_timeout: Duration,
     metrics: std::sync::Arc<AppMetrics>,
     event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
 }
@@ -37,10 +63,32 @@ impl SpotWsClient {
         metrics: std::sync::Arc<AppMetrics>,
         event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
     ) -> Self {
+        Self::with_timeouts(
+            url,
+            symbol,
+            ping_interval,
+            DEFAULT_CONN_STALE_TIMEOUT,
+            DEFAULT_DATA_STALE_TIMEOUT,
+            metrics,
+            event_tx,
+        )
+    }
+
+    pub fn with_timeouts(
+        url: String,
+        symbol: String,
+        ping_interval: Duration,
+        conn_stale_timeout: Duration,
+        data_stale_timeout: Duration,
+        metrics: std::sync::Arc<AppMetrics>,
+        event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
+    ) -> Self {
         Self {
             url,
             symbol: symbol.to_ascii_uppercase(),
             ping_interval,
+            conn_stale_timeout,
+            data_stale_timeout,
             metrics,
             event_tx,
         }
@@ -78,6 +126,12 @@ impl SpotWsClient {
         let mut pings = interval(self.ping_interval);
         pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // Two-rail liveness: connection rail tracks any frame, data rail
+        // tracks only parsed aggTrade messages. Both must stay fresh.
+        let now = Instant::now();
+        let mut last_frame_at = now;
+        let mut last_aggtrade_at = now;
+
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -85,14 +139,44 @@ impl SpotWsClient {
                     return Ok(());
                 }
                 _ = pings.tick() => {
+                    // Connection rail check: silent transport stall.
+                    let conn_elapsed = last_frame_at.elapsed();
+                    if conn_elapsed > self.conn_stale_timeout {
+                        anyhow::bail!(
+                            "spot websocket connection stale: no frames for {}s (timeout={}s); forcing reconnect",
+                            conn_elapsed.as_secs(),
+                            self.conn_stale_timeout.as_secs()
+                        );
+                    }
+                    // Data rail check: subscription dropped silently
+                    // (transport alive but aggTrade stream stopped).
+                    // This is the failure mode that produced the 2026-04-29
+                    // 2-hour regime-blind incident — control frames kept
+                    // arriving while the actual BTC tape went silent.
+                    let data_elapsed = last_aggtrade_at.elapsed();
+                    if data_elapsed > self.data_stale_timeout {
+                        anyhow::bail!(
+                            "spot websocket data stale: no aggTrade for {}s (timeout={}s); forcing reconnect",
+                            data_elapsed.as_secs(),
+                            self.data_stale_timeout.as_secs()
+                        );
+                    }
                     write
                         .send(Message::Ping(Vec::new().into()))
                         .await
                         .context("failed to send spot websocket ping")?;
                 }
                 frame = read.next() => {
+                    // Connection rail: any frame proves transport is alive.
+                    last_frame_at = Instant::now();
                     match frame {
-                        Some(Ok(Message::Text(text))) => self.handle_text(&text).await?,
+                        Some(Ok(Message::Text(text))) => {
+                            // Data rail is updated INSIDE handle_text only
+                            // when an aggTrade was successfully parsed.
+                            if self.handle_text(&text).await? {
+                                last_aggtrade_at = Instant::now();
+                            }
+                        }
                         Some(Ok(Message::Binary(_))) => {}
                         Some(Ok(Message::Ping(payload))) => {
                             write.send(Message::Pong(payload)).await.ok();
@@ -110,7 +194,13 @@ impl SpotWsClient {
         }
     }
 
-    async fn handle_text(&self, text: &str) -> Result<()> {
+    /// Returns `true` when a valid aggTrade was parsed and forwarded
+    /// downstream — used by the run loop's data-rail liveness tracker.
+    /// Returns `false` for non-aggTrade messages, wrong-symbol messages,
+    /// or aggTrades with invalid price/quantity. The connection rail
+    /// counts ANY received frame; the data rail counts ONLY this true
+    /// return.
+    async fn handle_text(&self, text: &str) -> Result<bool> {
         let payload: Value =
             serde_json::from_str(text).context("failed to decode spot websocket payload")?;
         let event_type = payload
@@ -119,7 +209,7 @@ impl SpotWsClient {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if event_type != "aggtrade" {
-            return Ok(());
+            return Ok(false);
         }
 
         let symbol = payload
@@ -128,7 +218,7 @@ impl SpotWsClient {
             .unwrap_or_default()
             .to_ascii_uppercase();
         if !symbol.is_empty() && symbol != self.symbol {
-            return Ok(());
+            return Ok(false);
         }
 
         let price = payload
@@ -146,7 +236,7 @@ impl SpotWsClient {
             .unwrap_or_else(now_unix_ms);
 
         let (Some(price), Some(quantity)) = (price, quantity) else {
-            return Ok(());
+            return Ok(false);
         };
 
         self.metrics.observe_market_message("spot_trade");
@@ -162,7 +252,7 @@ impl SpotWsClient {
                 observed_at_ms,
             });
         }
-        Ok(())
+        Ok(true)
     }
 }
 
