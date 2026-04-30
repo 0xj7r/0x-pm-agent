@@ -18,6 +18,9 @@ use crate::config::parser::{
 use crate::risk::RiskLimits;
 use crate::strategy::StrategyProfile;
 
+const DEFAULT_BINANCE_REST_BOOTSTRAP_URL: &str = "https://api.binance.com/api/v3/aggTrades";
+const DEFAULT_COINBASE_SPOT_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
+
 #[derive(Debug, Clone, Copy)]
 pub enum LogFormat {
     Pretty,
@@ -69,6 +72,8 @@ pub struct AppConfig {
     pub market_ws_url: String,
     pub user_ws_url: String,
     pub spot_ws_url: String,
+    pub spot_rest_bootstrap_url: Option<String>,
+    pub coinbase_spot_ws_url: Option<String>,
     pub spot_symbol: String,
     pub market_assets: Vec<String>,
     pub user_markets: Vec<String>,
@@ -281,6 +286,14 @@ impl AppConfig {
             "WHALE_PAIR_EXEC_SPOT_WS_URL",
             "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
         );
+        let spot_rest_bootstrap_url = parse_optional_url_with_default(
+            "WHALE_PAIR_EXEC_SPOT_REST_BOOTSTRAP_URL",
+            DEFAULT_BINANCE_REST_BOOTSTRAP_URL,
+        );
+        let coinbase_spot_ws_url = parse_optional_url_with_default(
+            "WHALE_PAIR_EXEC_COINBASE_SPOT_WS_URL",
+            DEFAULT_COINBASE_SPOT_WS_URL,
+        );
         let spot_symbol = env_or("WHALE_PAIR_EXEC_SPOT_SYMBOL", "BTCUSDT");
         let market_discovery_enabled = parse_bool("WHALE_PAIR_MARKET_DISCOVERY_ENABLED", false)?;
         let market_assets = if market_discovery_enabled {
@@ -326,14 +339,10 @@ impl AppConfig {
             2_000,
         )?;
         let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
-        let spot_ws_conn_stale_timeout = parse_duration_ms(
-            "WHALE_PAIR_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS",
-            30_000,
-        )?;
-        let spot_ws_data_stale_timeout = parse_duration_ms(
-            "WHALE_PAIR_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS",
-            30_000,
-        )?;
+        let spot_ws_conn_stale_timeout =
+            parse_duration_ms("WHALE_PAIR_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS", 30_000)?;
+        let spot_ws_data_stale_timeout =
+            parse_duration_ms("WHALE_PAIR_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS", 30_000)?;
         let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
         let journal_rotate_bytes = env::var("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
@@ -535,6 +544,8 @@ impl AppConfig {
             market_ws_url,
             user_ws_url,
             spot_ws_url,
+            spot_rest_bootstrap_url,
+            coinbase_spot_ws_url,
             spot_symbol,
             market_assets,
             user_markets,
@@ -626,6 +637,21 @@ fn should_load_dotenv() -> bool {
         ),
         Err(_) => true,
     }
+}
+
+fn parse_optional_url_with_default(key: &str, default: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .and_then(|value| {
+            let lowered = value.to_ascii_lowercase();
+            if value.is_empty() || matches!(lowered.as_str(), "0" | "false" | "off" | "none") {
+                None
+            } else {
+                Some(value)
+            }
+        })
+        .or_else(|| Some(default.to_string()))
 }
 
 fn parse_duration_ms_or_profile(key: &str, profile: Option<u64>, default: u64) -> Result<Duration> {

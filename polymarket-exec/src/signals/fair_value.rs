@@ -242,7 +242,10 @@ mod tests {
     #[test]
     fn fair_value_returns_no_signal_with_specific_reason() {
         let r = estimate_fair_value(f64::NAN, 100.0, 60.0, 5.0);
-        assert_eq!(r.model, FairValueModel::NoSignal(NoSignalReason::SpotInvalid));
+        assert_eq!(
+            r.model,
+            FairValueModel::NoSignal(NoSignalReason::SpotInvalid)
+        );
         assert_eq!(r.p_up, 0.5);
 
         let r = estimate_fair_value(100.0, 0.0, 60.0, 5.0);
@@ -258,13 +261,22 @@ mod tests {
         );
 
         let r = estimate_fair_value(100.0, 100.0, 60.0, 0.0);
-        assert_eq!(r.model, FairValueModel::NoSignal(NoSignalReason::VolInvalid));
+        assert_eq!(
+            r.model,
+            FairValueModel::NoSignal(NoSignalReason::VolInvalid)
+        );
 
         let r = estimate_fair_value(100.0, 100.0, 60.0, f64::NAN);
-        assert_eq!(r.model, FairValueModel::NoSignal(NoSignalReason::VolInvalid));
+        assert_eq!(
+            r.model,
+            FairValueModel::NoSignal(NoSignalReason::VolInvalid)
+        );
 
         let r = estimate_fair_value(-100.0, 100.0, 60.0, 5.0);
-        assert_eq!(r.model, FairValueModel::NoSignal(NoSignalReason::SpotInvalid));
+        assert_eq!(
+            r.model,
+            FairValueModel::NoSignal(NoSignalReason::SpotInvalid)
+        );
     }
 
     #[test]

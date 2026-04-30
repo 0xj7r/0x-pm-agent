@@ -379,10 +379,7 @@ impl Btc5mMmConfig {
             ),
             cooldown_ms: parse_u64("WHALE_PAIR_BTC_5M_MM_COOLDOWN_MS", 1_000),
             taker_fee_coeff: parse_f64("WHALE_PAIR_TAKER_FEE_COEFF", 0.072),
-            entry_premium_bid_cap: parse_f64(
-                "WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP",
-                0.97,
-            ),
+            entry_premium_bid_cap: parse_f64("WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP", 0.97),
             // 0.0 = use signal-derived default (vol-scaled at runtime).
             // Non-zero overrides with a fixed threshold (escape hatch).
             order_flow_imbalance_threshold_override: parse_f64(
@@ -396,14 +393,8 @@ impl Btc5mMmConfig {
                 "WHALE_PAIR_BTC_5M_MM_ASYMMETRIC_FILL_MAX_PENALTY",
                 0.02,
             ),
-            merge_gas_cost_usd: parse_f64(
-                "WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD",
-                0.30,
-            ),
-            sell_unwind_enabled: parse_bool(
-                "WHALE_PAIR_BTC_5M_MM_SELL_UNWIND_ENABLED",
-                true,
-            ),
+            merge_gas_cost_usd: parse_f64("WHALE_PAIR_BTC_5M_MM_MERGE_GAS_COST_USD", 0.30),
+            sell_unwind_enabled: parse_bool("WHALE_PAIR_BTC_5M_MM_SELL_UNWIND_ENABLED", true),
         };
         Self {
             base_clip_usd: config.base_clip_usd.max(0.01),
@@ -2202,8 +2193,7 @@ impl Btc5mMmStrategy {
             })
             .unwrap_or(Self::BAR_PHASE_DEFAULT_WINDOW_MS)
             .max(1_000);
-        let elapsed_ratio =
-            (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
+        let elapsed_ratio = (1.0 - (remaining_ms as f64 / bar_window_ms as f64)).clamp(0.0, 1.0);
         let scale = if elapsed_ratio < Self::BAR_PHASE_EARLY_END_RATIO {
             self.config.bar_phase_early_clip_scale
         } else if elapsed_ratio < Self::BAR_PHASE_MID_END_RATIO {
@@ -2218,10 +2208,7 @@ impl Btc5mMmStrategy {
 
     /// Compute the order-flow imbalance threshold for this tick.
     /// Vol-scaled by default; falls back to the operator override if set.
-    fn flow_imbalance_threshold(
-        &self,
-        btc_regime: &crate::signals::BtcRegimeSnapshot,
-    ) -> f64 {
+    fn flow_imbalance_threshold(&self, btc_regime: &crate::signals::BtcRegimeSnapshot) -> f64 {
         if self.config.order_flow_imbalance_threshold_override > 0.0 {
             return self.config.order_flow_imbalance_threshold_override;
         }
@@ -2229,8 +2216,7 @@ impl Btc5mMmStrategy {
             .realized_vol_5m_bps
             .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or(Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS);
-        let vol_normalized =
-            (vol_bps / Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS).clamp(0.0, 1.0);
+        let vol_normalized = (vol_bps / Self::FLOW_IMBALANCE_VOL_REFERENCE_BPS).clamp(0.0, 1.0);
         Self::FLOW_IMBALANCE_THRESHOLD_BASE
             + Self::FLOW_IMBALANCE_THRESHOLD_SLOPE * (1.0 - vol_normalized)
     }
@@ -2441,7 +2427,10 @@ impl Btc5mMmStrategy {
         let (buy_qty_60s, sell_qty_60s) = if left_fair >= right_fair {
             (left_quote.taker_buy_qty_60s, left_quote.taker_sell_qty_60s)
         } else {
-            (right_quote.taker_buy_qty_60s, right_quote.taker_sell_qty_60s)
+            (
+                right_quote.taker_buy_qty_60s,
+                right_quote.taker_sell_qty_60s,
+            )
         };
         let total_qty_60s = buy_qty_60s + sell_qty_60s;
         if total_qty_60s <= 1e-9 {
@@ -2935,9 +2924,11 @@ impl Btc5mMmStrategy {
     fn market_fill_symmetry(&self, market_id: &MarketId, now_ms: EpochMillis) -> Option<f64> {
         let state = self.market_states.get(market_id)?;
         let mut by_instrument: HashMap<InstrumentId, f64> = HashMap::new();
-        for (_ts, instrument_id, qty) in state.recent_fills.iter().filter(|(ts, _, _)| {
-            now_ms.saturating_sub(*ts) <= Self::ASYMMETRIC_FILL_WINDOW_MS
-        }) {
+        for (_ts, instrument_id, qty) in state
+            .recent_fills
+            .iter()
+            .filter(|(ts, _, _)| now_ms.saturating_sub(*ts) <= Self::ASYMMETRIC_FILL_WINDOW_MS)
+        {
             *by_instrument.entry(instrument_id.clone()).or_default() += qty.max(0.0);
         }
         let total_qty: f64 = by_instrument.values().sum();
@@ -3279,9 +3270,7 @@ impl Btc5mMmStrategy {
             );
         };
         if spot <= 0.0 {
-            return Some(format!(
-                "late-bar-core skip: spot non-positive ({spot})"
-            ));
+            return Some(format!("late-bar-core skip: spot non-positive ({spot})"));
         }
         if price_to_beat <= 0.0 {
             return Some(format!(
@@ -4354,6 +4343,23 @@ impl Strategy for Btc5mMmStrategy {
                         ),
                     );
                 }
+                if context.btc_regime.regime().is_none() {
+                    tracing::warn!(
+                        target: "strategy.btc_regime",
+                        market = %snapshot.market_id,
+                        last_price = ?context.btc_regime.last_price,
+                        vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
+                        return_180s_bps = ?context.btc_regime.return_180s_bps,
+                        observed_at_ms = context.btc_regime.observed_at_ms,
+                        age_ms = context.now_ms.saturating_sub(context.btc_regime.observed_at_ms),
+                        "fresh entry suppressed: btc regime incomplete"
+                    );
+                    return self.no_quote_decision(
+                        &snapshot.market_id,
+                        context.now_ms,
+                        "btc regime incomplete; suppressing fresh entries".to_string(),
+                    );
+                }
                 let mut cooling_reason = None;
                 if let Btc5mMmMarketMode::Cooling { reason, until_ms } = &market_mode {
                     if self.should_log_cooling_note(&snapshot.market_id, context.now_ms, reason) {
@@ -4396,8 +4402,8 @@ impl Strategy for Btc5mMmStrategy {
                     &context.btc_regime,
                 );
                 let raw_scaled_clip = self.config.base_clip_usd * fill_scale * flow_scale;
-                let scaled_clip = raw_scaled_clip
-                    .clamp(self.config.min_clip_usd, self.config.max_clip_usd);
+                let scaled_clip =
+                    raw_scaled_clip.clamp(self.config.min_clip_usd, self.config.max_clip_usd);
                 if (flow_scale - 1.0).abs() > 1e-6 {
                     tracing::info!(
                         target: "strategy.flow_scale",
@@ -4479,9 +4485,21 @@ impl Strategy for Btc5mMmStrategy {
                     expensive_leg_cost,
                     expensive_tick_committed_usd,
                 ) = if left_fair > right_fair {
-                    (&left_id, &left_quote, left_fair, left_cost, tick_committed_left_usd)
+                    (
+                        &left_id,
+                        &left_quote,
+                        left_fair,
+                        left_cost,
+                        tick_committed_left_usd,
+                    )
                 } else {
-                    (&right_id, &right_quote, right_fair, right_cost, tick_committed_right_usd)
+                    (
+                        &right_id,
+                        &right_quote,
+                        right_fair,
+                        right_cost,
+                        tick_committed_right_usd,
+                    )
                 };
                 let late_skip = self.late_bar_core_skip_reason(
                     &snapshot.market_id,
@@ -4499,8 +4517,8 @@ impl Strategy for Btc5mMmStrategy {
                     // bars not yet in the late-bar window. Keep info for
                     // skips that actually mean something (regime mismatch,
                     // price band, missing data).
-                    let is_timing_skip = reason.contains("too early")
-                        || reason.contains("too late");
+                    let is_timing_skip =
+                        reason.contains("too early") || reason.contains("too late");
                     if is_timing_skip {
                         tracing::debug!(
                             target: "strategy.late_bar_core_gate",
@@ -4524,13 +4542,11 @@ impl Strategy for Btc5mMmStrategy {
                         .market_context
                         .as_ref()
                         .and_then(|record| record.event_end_time_ms);
-                    let remaining_bar_budget_usd = self
-                        .late_bar_core_remaining_budget_usd(&snapshot.market_id, curr_bar_end);
-                    let remaining_ms = Self::time_remaining_ms(
-                        context.market_context.as_ref(),
-                        context.now_ms,
-                    )
-                    .unwrap_or_default();
+                    let remaining_bar_budget_usd =
+                        self.late_bar_core_remaining_budget_usd(&snapshot.market_id, curr_bar_end);
+                    let remaining_ms =
+                        Self::time_remaining_ms(context.market_context.as_ref(), context.now_ms)
+                            .unwrap_or_default();
                     if let Some(intent) = self.build_late_bar_core_intent(
                         &snapshot.market_id,
                         expensive_leg_id,

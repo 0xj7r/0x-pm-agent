@@ -10,6 +10,7 @@ use prometheus::{
 };
 
 use crate::book::BookState;
+use crate::signals::BtcRegimeSnapshot;
 use crate::types::{FillLiquidity, FillReport};
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +36,7 @@ pub struct AppMetrics {
     execution_adapter_connected: IntGauge,
     market_messages_total: IntCounterVec,
     user_messages_total: IntCounterVec,
+    spot_trade_events_total: IntCounterVec,
     reconnects_total: IntCounterVec,
     runtime_loop_seconds: Histogram,
     book_age_ms: GaugeVec,
@@ -45,6 +47,10 @@ pub struct AppMetrics {
     book_stale_events_total: IntCounter,
     market_last_message_age_ms: Gauge,
     user_last_message_age_ms: Gauge,
+    spot_last_trade_age_ms: GaugeVec,
+    btc_regime_ready: IntGauge,
+    btc_trade_count_5m: IntGauge,
+    btc_realized_vol_5m_bps: Gauge,
     last_reconcile_age_ms: Gauge,
     quote_ladder_count: IntGauge,
     quote_max_per_side_usd: Gauge,
@@ -86,6 +92,7 @@ pub struct AppMetrics {
     strategy_intents_total: IntCounterVec,
     market_last_message_unix_ms: AtomicU64,
     user_last_message_unix_ms: AtomicU64,
+    spot_last_trade_unix_ms: AtomicU64,
     last_reconcile_unix_ms: AtomicU64,
 }
 
@@ -96,6 +103,10 @@ pub struct ControlPlaneMetricsSnapshot {
     pub execution_adapter_connected: bool,
     pub market_last_message_age_ms: f64,
     pub user_last_message_age_ms: f64,
+    pub spot_last_trade_age_ms: f64,
+    pub btc_regime_ready: bool,
+    pub btc_trade_count_5m: usize,
+    pub btc_realized_vol_5m_bps: f64,
     pub last_reconcile_age_ms: f64,
     pub quote_ladder_count: usize,
     pub quote_max_per_side_usd: f64,
@@ -159,6 +170,13 @@ impl AppMetrics {
             ),
             &["event_type", "status"],
         )?;
+        let spot_trade_events_total = IntCounterVec::new(
+            Opts::new(
+                "spot_trade_events_total",
+                "BTC underlying trade events by source",
+            ),
+            &["source"],
+        )?;
         let reconnects_total = IntCounterVec::new(
             Opts::new("ws_reconnects_total", "Websocket reconnect attempts"),
             &["stream"],
@@ -198,6 +216,25 @@ impl AppMetrics {
         let user_last_message_age_ms = Gauge::with_opts(Opts::new(
             "user_ws_last_message_age_ms",
             "Age of the last user websocket message",
+        ))?;
+        let spot_last_trade_age_ms = GaugeVec::new(
+            Opts::new(
+                "spot_last_trade_age_ms",
+                "Age of the most recent BTC underlying trade by source",
+            ),
+            &["source"],
+        )?;
+        let btc_regime_ready = IntGauge::with_opts(Opts::new(
+            "btc_regime_ready",
+            "Whether BTC regime classification has required inputs",
+        ))?;
+        let btc_trade_count_5m = IntGauge::with_opts(Opts::new(
+            "btc_trade_count_5m",
+            "BTC underlying trade count in the runtime 5 minute signal window",
+        ))?;
+        let btc_realized_vol_5m_bps = Gauge::with_opts(Opts::new(
+            "btc_realized_vol_5m_bps",
+            "BTC underlying realized volatility over the runtime 5 minute signal window",
         ))?;
         let last_reconcile_age_ms = Gauge::with_opts(Opts::new(
             "last_reconcile_age_ms",
@@ -320,6 +357,7 @@ impl AppMetrics {
         registry.register(Box::new(execution_adapter_connected.clone()))?;
         registry.register(Box::new(market_messages_total.clone()))?;
         registry.register(Box::new(user_messages_total.clone()))?;
+        registry.register(Box::new(spot_trade_events_total.clone()))?;
         registry.register(Box::new(reconnects_total.clone()))?;
         registry.register(Box::new(runtime_loop_seconds.clone()))?;
         registry.register(Box::new(book_age_ms.clone()))?;
@@ -330,6 +368,10 @@ impl AppMetrics {
         registry.register(Box::new(book_stale_events_total.clone()))?;
         registry.register(Box::new(market_last_message_age_ms.clone()))?;
         registry.register(Box::new(user_last_message_age_ms.clone()))?;
+        registry.register(Box::new(spot_last_trade_age_ms.clone()))?;
+        registry.register(Box::new(btc_regime_ready.clone()))?;
+        registry.register(Box::new(btc_trade_count_5m.clone()))?;
+        registry.register(Box::new(btc_realized_vol_5m_bps.clone()))?;
         registry.register(Box::new(last_reconcile_age_ms.clone()))?;
         registry.register(Box::new(quote_ladder_count.clone()))?;
         registry.register(Box::new(quote_max_per_side_usd.clone()))?;
@@ -371,6 +413,7 @@ impl AppMetrics {
             execution_adapter_connected,
             market_messages_total,
             user_messages_total,
+            spot_trade_events_total,
             reconnects_total,
             runtime_loop_seconds,
             book_age_ms,
@@ -381,6 +424,10 @@ impl AppMetrics {
             book_stale_events_total,
             market_last_message_age_ms,
             user_last_message_age_ms,
+            spot_last_trade_age_ms,
+            btc_regime_ready,
+            btc_trade_count_5m,
+            btc_realized_vol_5m_bps,
             last_reconcile_age_ms,
             quote_ladder_count,
             quote_max_per_side_usd,
@@ -416,6 +463,7 @@ impl AppMetrics {
             strategy_intents_total,
             market_last_message_unix_ms: AtomicU64::new(0),
             user_last_message_unix_ms: AtomicU64::new(0),
+            spot_last_trade_unix_ms: AtomicU64::new(0),
             last_reconcile_unix_ms: AtomicU64::new(0),
         })
     }
@@ -450,6 +498,26 @@ impl AppMetrics {
             .with_label_values(&[event_type, status])
             .inc();
         self.touch_stream(StreamKind::User);
+    }
+
+    pub fn observe_spot_trade(&self, source: &str, observed_at_ms: u64) {
+        self.spot_trade_events_total
+            .with_label_values(&[source])
+            .inc();
+        self.spot_last_trade_unix_ms
+            .store(observed_at_ms, Ordering::Relaxed);
+        self.spot_last_trade_age_ms
+            .with_label_values(&[source])
+            .set(age_ms(observed_at_ms));
+    }
+
+    pub fn observe_btc_regime(&self, snapshot: &BtcRegimeSnapshot) {
+        self.btc_regime_ready
+            .set(if snapshot.regime().is_some() { 1 } else { 0 });
+        self.btc_trade_count_5m
+            .set(snapshot.trade_count_5m.min(i64::MAX as u64) as i64);
+        self.btc_realized_vol_5m_bps
+            .set(snapshot.realized_vol_5m_bps.unwrap_or(-1.0));
     }
 
     pub fn observe_book(&self, book: &BookState, stale_after: Duration) {
@@ -487,6 +555,10 @@ impl AppMetrics {
         self.user_last_message_age_ms.set(age_ms(
             self.user_last_message_unix_ms.load(Ordering::Relaxed),
         ));
+        let spot_last_trade_ms = self.spot_last_trade_unix_ms.load(Ordering::Relaxed);
+        self.spot_last_trade_age_ms
+            .with_label_values(&["any"])
+            .set(age_ms(spot_last_trade_ms));
         self.last_reconcile_age_ms
             .set(age_ms(self.last_reconcile_unix_ms.load(Ordering::Relaxed)));
     }
@@ -633,6 +705,13 @@ impl AppMetrics {
             execution_adapter_connected: self.execution_adapter_connected.get() != 0,
             market_last_message_age_ms: self.market_last_message_age_ms.get(),
             user_last_message_age_ms: self.user_last_message_age_ms.get(),
+            spot_last_trade_age_ms: self
+                .spot_last_trade_age_ms
+                .with_label_values(&["any"])
+                .get(),
+            btc_regime_ready: self.btc_regime_ready.get() != 0,
+            btc_trade_count_5m: self.btc_trade_count_5m.get().max(0) as usize,
+            btc_realized_vol_5m_bps: self.btc_realized_vol_5m_bps.get(),
             last_reconcile_age_ms: self.last_reconcile_age_ms.get(),
             quote_ladder_count: self.quote_ladder_count.get().max(0) as usize,
             quote_max_per_side_usd: self.quote_max_per_side_usd.get(),
