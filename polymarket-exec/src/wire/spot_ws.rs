@@ -44,6 +44,7 @@ const DEFAULT_DATA_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BINANCE_REST_BOOTSTRAP_URL: &str = "https://api.binance.com/api/v3/aggTrades";
 const DEFAULT_COINBASE_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
 const BINANCE_REST_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_DIRECT_FEED_CLOCK_SKEW_MS: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub enum SpotFeedSource {
@@ -66,6 +67,7 @@ impl SpotFeedSource {
 pub struct SpotTradeEvent {
     pub symbol: String,
     pub source: SpotFeedSource,
+    pub source_trade_id: Option<u64>,
     pub price: f64,
     pub quantity: f64,
     pub observed_at_ms: u64,
@@ -83,6 +85,7 @@ pub struct SpotWsClient {
     data_stale_timeout: Duration,
     metrics: Arc<AppMetrics>,
     last_binance_trade_ingest_ms: Arc<AtomicU64>,
+    last_binance_rest_trade_id: Arc<AtomicU64>,
     event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
 }
 
@@ -129,6 +132,7 @@ impl SpotWsClient {
             data_stale_timeout,
             metrics,
             last_binance_trade_ingest_ms: Arc::new(AtomicU64::new(0)),
+            last_binance_rest_trade_id: Arc::new(AtomicU64::new(0)),
             event_tx,
         }
     }
@@ -208,16 +212,22 @@ impl SpotWsClient {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<Value>().await {
                     Ok(Value::Array(rows)) => {
+                        let ingest_now_ms = now_unix_ms();
+                        let last_seen_id = self.last_binance_rest_trade_id.load(Ordering::Relaxed);
+                        let (events, max_forwarded_id) = normalize_binance_rest_events(
+                            &rows,
+                            &self.symbol,
+                            ingest_now_ms,
+                            last_seen_id,
+                        );
                         let mut forwarded = 0usize;
-                        for row in rows {
-                            if let Some(event) = parse_binance_rest_trade(
-                                &row,
-                                &self.symbol,
-                                SpotFeedSource::BinanceRestBootstrap,
-                            ) {
-                                self.forward_event(event);
-                                forwarded += 1;
-                            }
+                        for event in events {
+                            self.forward_event(event);
+                            forwarded += 1;
+                        }
+                        if max_forwarded_id > last_seen_id {
+                            self.last_binance_rest_trade_id
+                                .store(max_forwarded_id, Ordering::Relaxed);
                         }
                         if forwarded > 0 {
                             info!(
@@ -357,7 +367,6 @@ impl SpotWsClient {
         // without heartbeats. Keep fallback stream live by subscribing.
         let heartbeat_subscribe = json!({
             "type": "subscribe",
-            "product_ids": [self.coinbase_product_id],
             "channel": "heartbeats",
         });
         write
@@ -471,7 +480,7 @@ impl SpotWsClient {
         Ok(parsed_any)
     }
 
-    fn forward_event(&self, event: SpotTradeEvent) {
+    fn forward_event(&self, mut event: SpotTradeEvent) {
         let ingest_now_ms = now_unix_ms();
         if matches!(&event.source, SpotFeedSource::CoinbaseWs) {
             let last_binance = self.last_binance_trade_ingest_ms.load(Ordering::Relaxed);
@@ -484,6 +493,11 @@ impl SpotWsClient {
         } else {
             self.last_binance_trade_ingest_ms
                 .store(ingest_now_ms, Ordering::Relaxed);
+        }
+        if !matches!(&event.source, SpotFeedSource::BinanceRestBootstrap)
+            && event.observed_at_ms.abs_diff(ingest_now_ms) > MAX_DIRECT_FEED_CLOCK_SKEW_MS
+        {
+            event.observed_at_ms = ingest_now_ms;
         }
         self.metrics
             .observe_spot_trade(event.source.as_str(), event.observed_at_ms);
@@ -529,6 +543,7 @@ fn parse_binance_ws_trade(payload: &Value, expected_symbol: &str) -> Option<Spot
             symbol
         },
         source: SpotFeedSource::BinanceWs,
+        source_trade_id: payload.get("a").and_then(value_as_u64_opt),
         price,
         quantity,
         observed_at_ms,
@@ -555,10 +570,47 @@ fn parse_binance_rest_trade(
     Some(SpotTradeEvent {
         symbol: symbol.to_string(),
         source,
+        source_trade_id: payload.get("a").and_then(value_as_u64_opt),
         price,
         quantity,
         observed_at_ms,
     })
+}
+
+fn normalize_binance_rest_events(
+    rows: &[Value],
+    symbol: &str,
+    ingest_now_ms: u64,
+    last_seen_id: u64,
+) -> (Vec<SpotTradeEvent>, u64) {
+    let mut events = rows
+        .iter()
+        .filter_map(|row| {
+            parse_binance_rest_trade(row, symbol, SpotFeedSource::BinanceRestBootstrap)
+        })
+        .filter(|event| {
+            event
+                .source_trade_id
+                .map_or(true, |trade_id| trade_id > last_seen_id)
+        })
+        .collect::<Vec<_>>();
+    let max_event_ms = events
+        .iter()
+        .map(|event| event.observed_at_ms)
+        .max()
+        .unwrap_or(ingest_now_ms);
+    let max_forwarded_id = events
+        .iter()
+        .filter_map(|event| event.source_trade_id)
+        .max()
+        .unwrap_or(last_seen_id)
+        .max(last_seen_id);
+    events.sort_by_key(|event| event.observed_at_ms);
+    for event in &mut events {
+        let event_lag_ms = max_event_ms.saturating_sub(event.observed_at_ms);
+        event.observed_at_ms = ingest_now_ms.saturating_sub(event_lag_ms);
+    }
+    (events, max_forwarded_id)
 }
 
 fn parse_coinbase_trade(payload: &Value, product_id: &str) -> Option<SpotTradeEvent> {
@@ -582,6 +634,7 @@ fn parse_coinbase_trade(payload: &Value, product_id: &str) -> Option<SpotTradeEv
     Some(SpotTradeEvent {
         symbol: "BTCUSDT".to_string(),
         source: SpotFeedSource::CoinbaseWs,
+        source_trade_id: payload.get("trade_id").and_then(value_as_u64_opt),
         price,
         quantity,
         observed_at_ms,
@@ -604,6 +657,14 @@ fn parse_rfc3339_ms(raw: &str) -> Option<u64> {
 fn value_as_f64_opt(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_u64_opt(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
         Value::String(raw) => raw.parse().ok(),
         _ => None,
     }
@@ -636,10 +697,21 @@ mod tests {
     async fn raw_aggtrade_payload_forwards_spot_trade() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let client = client(tx);
+        let payload: Value = serde_json::from_str(
+            r#"{"e":"aggTrade","s":"BTCUSDT","a":"12345","p":"63420.50","q":"0.012","T":1714431008123}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_binance_ws_trade(&payload, "BTCUSDT")
+                .unwrap()
+                .observed_at_ms,
+            1714431008123
+        );
+        let started_ms = now_unix_ms();
 
         let parsed = client
             .handle_binance_text(
-                r#"{"e":"aggTrade","s":"BTCUSDT","p":"63420.50","q":"0.012","T":1714431008123}"#,
+                r#"{"e":"aggTrade","s":"BTCUSDT","a":"12345","p":"63420.50","q":"0.012","T":1714431008123}"#,
             )
             .await
             .unwrap();
@@ -648,19 +720,22 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.symbol, "BTCUSDT");
         assert_eq!(event.source.as_str(), "binance_ws");
+        assert_eq!(event.source_trade_id, Some(12_345));
         assert_eq!(event.price, 63420.50);
         assert_eq!(event.quantity, 0.012);
-        assert_eq!(event.observed_at_ms, 1714431008123);
+        assert!(event.observed_at_ms >= started_ms);
+        assert!(event.observed_at_ms <= now_unix_ms());
     }
 
     #[tokio::test]
     async fn combined_stream_aggtrade_payload_forwards_spot_trade() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let client = client(tx);
+        let started_ms = now_unix_ms();
 
         let parsed = client
             .handle_binance_text(
-                r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","s":"BTCUSDT","p":"63421.25","q":"0.020","T":1714431009000}}"#,
+                r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","s":"BTCUSDT","a":12346,"p":"63421.25","q":"0.020","T":1714431009000}}"#,
             )
             .await
             .unwrap();
@@ -669,9 +744,11 @@ mod tests {
         let event = rx.recv().await.unwrap();
         assert_eq!(event.symbol, "BTCUSDT");
         assert_eq!(event.source.as_str(), "binance_ws");
+        assert_eq!(event.source_trade_id, Some(12_346));
         assert_eq!(event.price, 63421.25);
         assert_eq!(event.quantity, 0.020);
-        assert_eq!(event.observed_at_ms, 1714431009000);
+        assert!(event.observed_at_ms >= started_ms);
+        assert!(event.observed_at_ms <= now_unix_ms());
     }
 
     #[tokio::test]
@@ -681,6 +758,75 @@ mod tests {
 
         let parsed = client
             .handle_binance_text(r#"{"result":null,"id":1}"#)
+            .await
+            .unwrap();
+
+        assert!(!parsed);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn binance_rest_events_are_deduped_and_shifted_to_ingest_timeline() {
+        let rows = vec![
+            json!({"a": "10", "p": "63400.00", "q": "0.010", "T": 1_714_431_000_000u64}),
+            json!({"a": "11", "p": "63401.00", "q": "0.020", "T": 1_714_431_001_000u64}),
+            json!({"a": "12", "p": "63402.00", "q": "0.030", "T": 1_714_431_003_000u64}),
+        ];
+
+        let (events, max_id) =
+            normalize_binance_rest_events(&rows, "BTCUSDT", 2_000_000_000_000, 10);
+
+        assert_eq!(max_id, 12);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source_trade_id, Some(11));
+        assert_eq!(events[1].source_trade_id, Some(12));
+        assert_eq!(events[0].observed_at_ms, 1_999_999_998_000);
+        assert_eq!(events[1].observed_at_ms, 2_000_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn coinbase_market_trades_payload_forwards_spot_trade() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = client(tx);
+        let payload: Value = serde_json::from_str(
+            r#"{"trade_id":"7015230","product_id":"BTC-USD","price":"63420.50","size":"0.012","side":"BUY","time":"2024-04-30T01:30:08.123456Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_coinbase_trade(&payload, "BTC-USD")
+                .unwrap()
+                .observed_at_ms,
+            1_714_440_608_123
+        );
+        let started_ms = now_unix_ms();
+
+        let parsed = client
+            .handle_coinbase_text(
+                r#"{"channel":"market_trades","client_id":"","timestamp":"2024-04-30T01:30:08.123456Z","sequence_num":42,"events":[{"type":"update","trades":[{"trade_id":"7015230","product_id":"BTC-USD","price":"63420.50","size":"0.012","side":"BUY","time":"2024-04-30T01:30:08.123456Z"}]}]}"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(parsed);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.symbol, "BTCUSDT");
+        assert_eq!(event.source.as_str(), "coinbase_ws");
+        assert_eq!(event.source_trade_id, Some(7_015_230));
+        assert_eq!(event.price, 63420.50);
+        assert_eq!(event.quantity, 0.012);
+        assert!(event.observed_at_ms >= started_ms);
+        assert!(event.observed_at_ms <= now_unix_ms());
+    }
+
+    #[tokio::test]
+    async fn coinbase_heartbeat_payload_does_not_refresh_data_rail() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client = client(tx);
+
+        let parsed = client
+            .handle_coinbase_text(
+                r#"{"channel":"heartbeats","client_id":"","timestamp":"2024-04-30T01:30:08Z","sequence_num":1,"events":[{"current_time":"2024-04-30 01:30:08.123456789 +0000 UTC","heartbeat_counter":"1"}]}"#,
+            )
             .await
             .unwrap();
 
