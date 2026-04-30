@@ -1286,10 +1286,12 @@ fn spawn_spot_ws(
     event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
-    let client = SpotWsClient::new(
+    let client = SpotWsClient::with_timeouts(
         config.spot_ws_url.clone(),
         config.spot_symbol.clone(),
         config.ping_interval,
+        config.spot_ws_conn_stale_timeout,
+        config.spot_ws_data_stale_timeout,
         metrics,
         event_tx,
     );
@@ -4800,6 +4802,8 @@ mod tests {
             order_store_path: None,
             runtime_run_id: None,
             ping_interval: std::time::Duration::from_secs(10),
+            spot_ws_conn_stale_timeout: std::time::Duration::from_secs(30),
+            spot_ws_data_stale_timeout: std::time::Duration::from_secs(30),
             market_context_path: None,
             journal_path: None,
             journal_rotate_bytes: None,

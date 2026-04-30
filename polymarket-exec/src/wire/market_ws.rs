@@ -1,7 +1,7 @@
 //! Polymarket market websocket client that maintains live order-book state.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -13,6 +13,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::book::{BookStore, Level};
+
+/// Same staleness pattern as spot_ws — bail and reconnect if no inbound
+/// frames arrive within this window. Polymarket book updates are slower
+/// than Binance trades (5-10s typical gap during quiet markets) but
+/// 60s without ANY frame indicates the connection has silently stalled.
+const MARKET_WS_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 use crate::metrics::{AppMetrics, StreamKind};
 
 pub struct MarketWsClient {
@@ -116,6 +122,7 @@ impl MarketWsClient {
 
         let mut pings = interval(self.ping_interval);
         pings.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_frame_at = Instant::now();
 
         loop {
             tokio::select! {
@@ -133,12 +140,21 @@ impl MarketWsClient {
                     anyhow::bail!("asset subscription changed");
                 }
                 _ = pings.tick() => {
+                    let elapsed = last_frame_at.elapsed();
+                    if elapsed > MARKET_WS_STALE_TIMEOUT {
+                        anyhow::bail!(
+                            "market websocket silently stale: no frames for {}s (timeout={}s); forcing reconnect",
+                            elapsed.as_secs(),
+                            MARKET_WS_STALE_TIMEOUT.as_secs()
+                        );
+                    }
                     write
                         .send(Message::Text("PING".to_string().into()))
                         .await
                         .context("failed to send market websocket ping")?;
                 }
                 frame = read.next() => {
+                    last_frame_at = Instant::now();
                     match frame {
                         Some(Ok(Message::Text(text))) => self.handle_text(&text).await?,
                         Some(Ok(Message::Binary(_))) => {}
