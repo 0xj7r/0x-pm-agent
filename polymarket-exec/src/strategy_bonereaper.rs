@@ -235,8 +235,8 @@ mod tests {
     fn emits_bid_one_tick_below_mid() {
         let mut s = BonereaperStrategy::with_defaults();
         let dec = s.on_market_snapshot(&ctx_running(2_000), &snap(0.50));
-        assert_eq!(dec.intents.len(), 1);
-        let intent = &dec.intents[0];
+        assert_eq!(dec.intents().len(), 1);
+        let intent = &dec.intents()[0];
         assert_eq!(intent.side, TradeSide::Buy);
         assert!((intent.limit_price - 0.49).abs() < 1e-9);
         assert_eq!(intent.kind, IntentKind::Entry);
@@ -272,7 +272,7 @@ mod tests {
         });
         let cheap = s.on_market_snapshot(&ctx_running(2_000), &snap(0.10));
         let expensive = s.on_market_snapshot(&ctx_running(2_000), &snap(0.90));
-        assert!(cheap.intents[0].quantity > expensive.intents[0].quantity);
+        assert!(cheap.intents()[0].quantity > expensive.intents()[0].quantity);
     }
 
     #[test]
@@ -280,6 +280,6 @@ mod tests {
         let mut s = BonereaperStrategy::with_defaults();
         let a = s.on_market_snapshot(&ctx_running(2_000), &snap(0.50));
         let b = s.on_market_snapshot(&ctx_running(2_001), &snap(0.55));
-        assert!(a.intents[0].limit_price < b.intents[0].limit_price);
+        assert!(a.intents()[0].limit_price < b.intents()[0].limit_price);
     }
 }
