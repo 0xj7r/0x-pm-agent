@@ -1834,9 +1834,17 @@ impl Btc5mMmStrategy {
     /// losing lottery tickets when whale doesn't. Convex stays as a heavily-
     /// gated side bet, not a primary strategy.
     const CONVEX_TREND_PERSISTENCE_BPS: f64 = 50.0;
-    // JUSTIFY: Asymmetric Core+Hedge V1 spec (2026-04-29): late-bar path
-    // only targets venue-priced favored legs in the 0.85-0.97 band.
-    const LATE_BAR_CORE_PRICE_FLOOR: f64 = 0.85;
+    // JUSTIFY: V1 spec used 0.85 floor for "clearly favored leg" only.
+    // 2026-04-30: lowered to 0.75 after observing 0 fires/12h despite
+    // ~200 ticks where regime + timing aligned. The 733 hits/3h on
+    // "ask below floor" suggested most candidate markets had favored
+    // leg at $0.75-$0.85 (becoming-favored, not yet clearly-favored).
+    // Trade-off: more catch of momentum-confirming bars, slightly
+    // higher reversal risk per fill (still far better than paired-bid
+    // adverse selection in the same regime). Direction-confirmation
+    // gate (spot >= price_to_beat × momentum_floor) still required —
+    // we only fire when the model agrees with the venue pricing.
+    const LATE_BAR_CORE_PRICE_FLOOR: f64 = 0.75;
     // V1 was 0.97; bumped 2026-04-29 to 0.98 after whale 6-day data showed
     // 1069 trades at $0.98 vs only 124 at $0.99 — natural cliff is between
     // $0.98 and $0.99. Captures ~7% more late-bar opportunities at slightly
@@ -4485,15 +4493,32 @@ impl Strategy for Btc5mMmStrategy {
                     &context.inventory,
                 );
                 if let Some(reason) = late_skip {
-                    tracing::info!(
-                        target: "strategy.late_bar_core_gate",
-                        market = %snapshot.market_id,
-                        reason,
-                        regime = ?context.btc_regime.regime(),
-                        vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
-                        return_180s_bps = ?context.btc_regime.return_180s_bps,
-                        "late-bar core accumulation suppressed"
-                    );
+                    // Demote expected timing-window skips to debug — they
+                    // dominate the log volume (15k+/3h, 92% of skips) but
+                    // carry no actionable signal because they're just
+                    // bars not yet in the late-bar window. Keep info for
+                    // skips that actually mean something (regime mismatch,
+                    // price band, missing data).
+                    let is_timing_skip = reason.contains("too early")
+                        || reason.contains("too late");
+                    if is_timing_skip {
+                        tracing::debug!(
+                            target: "strategy.late_bar_core_gate",
+                            market = %snapshot.market_id,
+                            reason,
+                            "late-bar core accumulation suppressed (timing)"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "strategy.late_bar_core_gate",
+                            market = %snapshot.market_id,
+                            reason,
+                            regime = ?context.btc_regime.regime(),
+                            vol_5m_bps = ?context.btc_regime.realized_vol_5m_bps,
+                            return_180s_bps = ?context.btc_regime.return_180s_bps,
+                            "late-bar core accumulation suppressed"
+                        );
+                    }
                 } else {
                     let curr_bar_end = context
                         .market_context
