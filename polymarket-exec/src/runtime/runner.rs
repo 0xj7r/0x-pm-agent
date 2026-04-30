@@ -1292,6 +1292,8 @@ fn spawn_spot_ws(
         config.ping_interval,
         config.spot_ws_conn_stale_timeout,
         config.spot_ws_data_stale_timeout,
+        config.spot_rest_bootstrap_url.clone(),
+        config.coinbase_spot_ws_url.clone(),
         metrics,
         event_tx,
     );
@@ -1412,6 +1414,7 @@ async fn run_runtime_loop(
                 match maybe_spot_event {
                     Some(event) => {
                         runtime.on_btc_trade(event.price, event.observed_at_ms);
+                        metrics.observe_btc_regime(&runtime.btc_regime_snapshot(now_unix_ms()));
                     }
                     None => {
                         spot_events_open = false;
@@ -3142,8 +3145,7 @@ async fn execute_execution_adapter(
                 let submit_result = execution_adapter.submit(submit_req).await;
                 let submit_ack_ms = now_unix_ms();
                 let wire_latency_ms = submit_ack_ms.saturating_sub(submit_call_start_ms);
-                let pipeline_latency_ms =
-                    submit_ack_ms.saturating_sub(intent.created_at_ms);
+                let pipeline_latency_ms = submit_ack_ms.saturating_sub(intent.created_at_ms);
                 match submit_result {
                     Ok(ack) if ack.accepted => {
                         live_safety.consecutive_submit_errors = 0;
@@ -4782,6 +4784,8 @@ mod tests {
             market_ws_url: "wss://example.invalid/market".to_string(),
             user_ws_url: "wss://example.invalid/user".to_string(),
             spot_ws_url: "wss://example.invalid/spot".to_string(),
+            spot_rest_bootstrap_url: None,
+            coinbase_spot_ws_url: None,
             spot_symbol: "btcusdt".to_string(),
             market_assets: Vec::new(),
             user_markets: Vec::new(),

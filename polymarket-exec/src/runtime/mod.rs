@@ -888,10 +888,7 @@ impl<S: Strategy> Runtime<S> {
                 // pending-detection tracker and the engaged-block set.
                 self.markets_with_drift_first_seen_ms
                     .remove(&delta.market_id);
-                if self
-                    .markets_with_unresolved_drift
-                    .remove(&delta.market_id)
-                {
+                if self.markets_with_unresolved_drift.remove(&delta.market_id) {
                     self.event_log.push(
                         EventRecord::new(
                             EventCategory::Inventory,
@@ -1648,6 +1645,10 @@ impl<S: Strategy> Runtime<S> {
         self.btc_signals.record_trade(price, observed_at_ms);
     }
 
+    pub fn btc_regime_snapshot(&self, now_ms: EpochMillis) -> GateBtcRegimeSnapshot {
+        self.btc_signals.snapshot(now_ms)
+    }
+
     pub fn on_fill(&mut self, mut fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
         fill.market_id =
             self.canonical_market_id_for_instrument(&fill.instrument_id, &fill.market_id);
@@ -2312,7 +2313,8 @@ impl<S: Strategy> Runtime<S> {
             .iter()
             .map(|i| i.quote_level_tag.clone().unwrap_or_default())
             .collect();
-        let desired_pre = DesiredQuoteSet::from_intents(decision.intents, &self.quote_engine_config);
+        let desired_pre =
+            DesiredQuoteSet::from_intents(decision.intents, &self.quote_engine_config);
         let quotes_after_from_intents = desired_pre.quotes.len();
         let desired = desired_pre.with_stale_gate(
             now_ms,
@@ -4167,12 +4169,10 @@ mod tests {
             outcome.commands.len()
         );
         assert!(
-            runtime
-                .event_log()
-                .recent(20)
-                .iter()
-                .any(|event| event.message.contains("below gas-friction threshold")
-                    || event.message.contains("hold to resolution")),
+            runtime.event_log().recent(20).iter().any(|event| event
+                .message
+                .contains("below gas-friction threshold")
+                || event.message.contains("hold to resolution")),
             "merge skip should emit a recognizable event for observability"
         );
     }

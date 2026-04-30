@@ -407,7 +407,8 @@ impl BookStore {
                 .sort_by(|left, right| left.price.total_cmp(&right.price));
             book.asks.truncate(MAX_BOOK_LEVELS);
         }
-        book.leg_flow.update_best_quotes(book.best_bid, book.best_ask);
+        book.leg_flow
+            .update_best_quotes(book.best_bid, book.best_ask);
         book.touch();
         book.clone()
     }
@@ -619,7 +620,10 @@ mod tests {
         s.record_trade(120_000, 0.42, 3.0);
         // Now at 121s, only the t=120s entry should remain
         let (buys, sells) = s.flow_qty_60s(121_000);
-        assert!((buys - 3.0).abs() < 1e-9, "expected only recent buy, got {buys}");
+        assert!(
+            (buys - 3.0).abs() < 1e-9,
+            "expected only recent buy, got {buys}"
+        );
         assert!(sells.abs() < 1e-9);
     }
 

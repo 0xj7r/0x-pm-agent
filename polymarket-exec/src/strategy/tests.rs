@@ -80,7 +80,7 @@ fn context_at_with_cash(
         open_orders_for_market: 0,
         market_context: None,
         unlawful_signal: None,
-        btc_regime: crate::signals::BtcRegimeSnapshot::default(),
+        btc_regime: complete_btc_regime(now_ms),
         venue_rules: None,
     }
 }
@@ -138,8 +138,23 @@ fn context_with_unlawful_signal(
         open_orders_for_market,
         market_context: None,
         unlawful_signal,
-        btc_regime: crate::signals::BtcRegimeSnapshot::default(),
+        btc_regime: complete_btc_regime(now_ms),
         venue_rules: None,
+    }
+}
+
+fn complete_btc_regime(now_ms: u64) -> crate::signals::BtcRegimeSnapshot {
+    crate::signals::BtcRegimeSnapshot {
+        last_price: Some(50_000.0),
+        realized_vol_5m_bps: Some(6.0),
+        realized_vol_15m_bps: Some(12.0),
+        trade_count_5m: 9_000,
+        trade_count_15m: 9_000,
+        return_30s_bps: Some(0.0),
+        return_60s_bps: Some(0.0),
+        return_120s_bps: Some(0.0),
+        return_180s_bps: Some(0.0),
+        observed_at_ms: now_ms,
     }
 }
 
@@ -384,6 +399,27 @@ fn btc_5m_mm_quotes_maker_bids_on_both_outcomes() {
         .intents
         .iter()
         .all(|intent| intent.quantity >= strategy.config.venue_min_order_quantity));
+}
+
+#[test]
+fn btc_5m_mm_suppresses_fresh_entries_when_btc_regime_incomplete() {
+    let mut strategy = Btc5mMmStrategy::new(btc_5m_mm_test_config());
+    let mut ctx = context(Vec::new());
+    ctx.btc_regime = crate::signals::BtcRegimeSnapshot {
+        last_price: Some(50_000.0),
+        return_180s_bps: Some(0.0),
+        observed_at_ms: ctx.now_ms,
+        ..Default::default()
+    };
+    strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.48, 0.52, 10));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.48, 0.52, 10));
+
+    assert!(decision.intents.is_empty());
+    assert!(decision
+        .notes
+        .iter()
+        .any(|note| note.contains("btc regime incomplete; suppressing fresh entries")));
 }
 
 #[test]
@@ -1394,7 +1430,8 @@ fn btc_5m_mm_late_bar_core_skips_when_expensive_ask_above_ceiling() {
     let ctx = context_at_with_market(Vec::new(), 0, market_context, btc_regime);
     strategy.on_market_snapshot(&ctx, &snapshot("up", "market-mm", 0.005, 0.01, 0));
     // DOWN ask = 0.99 — above the bumped ceiling of 0.98.
-    let decision = strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.985, 0.99, 0));
+    let decision =
+        strategy.on_market_snapshot(&ctx, &snapshot("down", "market-mm", 0.985, 0.99, 0));
 
     assert!(decision
         .intents
