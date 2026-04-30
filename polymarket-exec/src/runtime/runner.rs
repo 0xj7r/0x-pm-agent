@@ -1413,8 +1413,9 @@ async fn run_runtime_loop(
             maybe_spot_event = spot_events.recv(), if spot_events_open => {
                 match maybe_spot_event {
                     Some(event) => {
-                        runtime.on_btc_trade(event.price, event.observed_at_ms);
-                        metrics.observe_btc_regime(&runtime.btc_regime_snapshot(now_unix_ms()));
+                        let ingested_at_ms = now_unix_ms();
+                        runtime.on_btc_trade(event.price, ingested_at_ms);
+                        metrics.observe_btc_regime(&runtime.btc_regime_snapshot(ingested_at_ms));
                     }
                     None => {
                         spot_events_open = false;
