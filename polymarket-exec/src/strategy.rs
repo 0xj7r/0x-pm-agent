@@ -862,33 +862,87 @@ enum SettlementLeg {
     Unknown,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct StrategyDecision {
-    pub intents: Vec<OrderIntent>,
-    pub notes: Vec<String>,
-    /// When true, runtime submits the intents in this decision without
-    /// reconciling the full working quote set. Use for fill/close reactions
-    /// such as IOC rescues so existing maker quotes are not cancelled as
-    /// "no longer desired" just because the fill handler emitted only a
-    /// rescue intent.
-    pub preserve_quotes: bool,
+#[derive(Debug, Clone, Copy)]
+pub enum StrategyDecisionSuppressionKind {
+    /// Preserve open paired quotes but suppress only paired entry path execution.
+    SoftPause,
+    /// Suppress entry paths and stop all non-required trading behavior.
+    HardRiskOff,
+}
+
+#[derive(Clone, Debug)]
+pub enum StrategyDecision {
+    /// No-op decision with optional notes.
+    Noop { notes: Vec<String> },
+    /// Reconcile against the full returned quote set (default for snapshots).
+    QuoteSet {
+        intents: Vec<OrderIntent>,
+        notes: Vec<String>,
+    },
+    /// Apply intents only; do not reconcile quote inventory first.
+    Reactive {
+        intents: Vec<OrderIntent>,
+        notes: Vec<String>,
+    },
+    /// Skip execution and optionally preserve or unwind current working state
+    /// according to the suppression policy.
+    Suppress {
+        kind: StrategyDecisionSuppressionKind,
+        notes: Vec<String>,
+    },
 }
 
 impl StrategyDecision {
     pub fn none() -> Self {
-        Self::default()
+        Self::Noop { notes: Vec::new() }
     }
 
     pub fn single(intent: OrderIntent) -> Self {
-        Self {
+        Self::QuoteSet {
             intents: vec![intent],
             notes: Vec::new(),
-            preserve_quotes: false,
+        }
+    }
+
+    pub fn quote_set(intents: Vec<OrderIntent>, notes: Vec<String>) -> Self {
+        Self::QuoteSet { intents, notes }
+    }
+
+    pub fn reactive(intents: Vec<OrderIntent>, notes: Vec<String>) -> Self {
+        Self::Reactive { intents, notes }
+    }
+
+    pub fn suppress(kind: StrategyDecisionSuppressionKind, notes: Vec<String>) -> Self {
+        Self::Suppress { kind, notes }
+    }
+
+    pub fn intents(&self) -> &[OrderIntent] {
+        match self {
+            Self::Noop { .. } => &[],
+            Self::QuoteSet { intents, .. } => intents.as_slice(),
+            Self::Reactive { intents, .. } => intents.as_slice(),
+            Self::Suppress { .. } => &[],
+        }
+    }
+
+    pub fn notes(&self) -> &[String] {
+        match self {
+            Self::Noop { notes } => notes.as_slice(),
+            Self::QuoteSet { notes, .. } => notes.as_slice(),
+            Self::Reactive { notes, .. } => notes.as_slice(),
+            Self::Suppress { notes, .. } => notes.as_slice(),
+        }
+    }
+
+    pub fn suppress_kind(&self) -> Option<StrategyDecisionSuppressionKind> {
+        match self {
+            Self::Suppress { kind, .. } => Some(*kind),
+            _ => None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.intents.is_empty() && self.notes.is_empty()
+        self.intents().is_empty() && self.notes().is_empty()
     }
 }
 
@@ -1732,6 +1786,7 @@ impl Btc5mMmStrategy {
     const ASYMMETRIC_FILL_WINDOW_MS: u64 = 120_000;
     const RESCUE_INFLIGHT_TTL_MS: u64 = 15_000;
     const MAX_RESCUE_ATTEMPTS_PER_SIGNATURE: u32 = 3;
+    const MAX_LOST_FROM_RESCUE_PAYOUT: f64 = 1.0;
     /// Polymarket V2 rejects marketable BUY orders below $1 notional. Keep this
     /// as a protocol invariant so stale live env cannot emit invalid rescues.
     const MARKETABLE_BUY_MIN_NOTIONAL_USD: f64 = 1.0;
@@ -2521,6 +2576,26 @@ impl Btc5mMmStrategy {
         true
     }
 
+    fn rescue_is_not_guaranteed_loss(
+        &self,
+        stranded_avg_cost: f64,
+        lift_quote: &QuoteSnapshot,
+        notes: &mut Vec<String>,
+    ) -> bool {
+        let Some(lift_ask) = Self::best_ask(lift_quote) else {
+            notes.push("rescue blocked: missing opposite ask for no-loss gate".to_string());
+            return false;
+        };
+        if stranded_avg_cost + lift_ask > Self::MAX_LOST_FROM_RESCUE_PAYOUT {
+            notes.push(format!(
+                "rescue blocked by pair-cost gate: avg_cost={stranded_avg_cost:.4} opposite_ask={lift_ask:.4} sum={:.4}",
+                stranded_avg_cost + lift_ask
+            ));
+            return false;
+        }
+        true
+    }
+
     fn record_rescue_attempt(
         &mut self,
         market_id: &MarketId,
@@ -2585,19 +2660,7 @@ impl Btc5mMmStrategy {
             return StrategyDecision::none();
         }
         state.last_no_quote_note_ms = Some(now_ms);
-        StrategyDecision {
-            intents: Vec::new(),
-            notes: vec![format!("btc-5m-mm no quote: {reason}")],
-            preserve_quotes: false,
-        }
-    }
-
-    fn preserve_quote_decision(notes: Vec<String>, intents: Vec<OrderIntent>) -> StrategyDecision {
-        StrategyDecision {
-            intents,
-            notes,
-            preserve_quotes: true,
-        }
+        StrategyDecision::quote_set(Vec::new(), vec![format!("btc-5m-mm no quote: {reason}")])
     }
 
     fn should_log_cooling_note(
@@ -4749,7 +4812,13 @@ impl Strategy for Btc5mMmStrategy {
                     context.market_context.as_ref(),
                     context.now_ms,
                 );
+                let no_loss_rescue_gate = self.rescue_is_not_guaranteed_loss(
+                    exposure_decision.avg_cost,
+                    lift_quote,
+                    &mut hold_notes,
+                );
                 let rescue_ok = throttle_ok
+                    && no_loss_rescue_gate
                     && exposure_decision.rescue_qty > 1e-9
                     && self.can_emit_rescue(
                         &snapshot.market_id,
@@ -4892,7 +4961,13 @@ impl Strategy for Btc5mMmStrategy {
                         context.market_context.as_ref(),
                         context.now_ms,
                     );
+                    let no_loss_rescue_gate = self.rescue_is_not_guaranteed_loss(
+                        exposure_decision.avg_cost,
+                        lift_quote,
+                        &mut hold_notes,
+                    );
                     let rescue_ok = throttle_ok
+                        && no_loss_rescue_gate
                         && exposure_decision.rescue_qty > 1e-9
                         && self.can_emit_rescue(
                             &snapshot.market_id,
@@ -4968,12 +5043,11 @@ impl Strategy for Btc5mMmStrategy {
         }
 
         if intents.is_empty() {
+            if left_has_inventory || right_has_inventory {
+                return StrategyDecision::reactive(intents, hold_notes);
+            }
             if !hold_notes.is_empty() {
-                return StrategyDecision {
-                    intents,
-                    notes: hold_notes,
-                    preserve_quotes: false,
-                };
+                return StrategyDecision::quote_set(intents, hold_notes);
             }
             return self.no_quote_decision(
                 &snapshot.market_id,
@@ -5009,10 +5083,13 @@ impl Strategy for Btc5mMmStrategy {
             "btc-5m-mm quotes left={} fair={left_fair:.4} right={} fair={right_fair:.4} gross_cost={gross_cost:.2}",
             left_id, right_id
         ));
-        StrategyDecision {
-            notes,
-            intents,
-            preserve_quotes: false,
+        let rescue_only = intents
+            .iter()
+            .all(|intent| intent.kind == IntentKind::Close);
+        if rescue_only {
+            StrategyDecision::reactive(intents, notes)
+        } else {
+            StrategyDecision::quote_set(intents, notes)
         }
     }
 
@@ -5086,12 +5163,12 @@ impl Strategy for Btc5mMmStrategy {
         // sub-second pair completion latency.
         let market_state = match self.market_states.get(&fill.market_id) {
             Some(state) => state,
-            None => return Self::preserve_quote_decision(notes, intents),
+            None => return StrategyDecision::reactive(intents, notes),
         };
 
         // Need both outcome quotes cached to know what to lift.
         if market_state.quotes.len() < 2 {
-            return Self::preserve_quote_decision(notes, intents);
+            return StrategyDecision::reactive(intents, notes);
         }
 
         let mut sides: Vec<(InstrumentId, QuoteSnapshot)> = market_state
@@ -5114,7 +5191,7 @@ impl Strategy for Btc5mMmStrategy {
         if left_has == right_has {
             // Either both legs filled (no rescue needed) or both empty (impossible
             // since the fill we just got created at least one). No-op.
-            return Self::preserve_quote_decision(notes, intents);
+            return StrategyDecision::reactive(intents, notes);
         }
 
         // Throttle: skip if a rescue was emitted within cooldown_ms.
@@ -5124,7 +5201,7 @@ impl Strategy for Btc5mMmStrategy {
             .unwrap_or(true);
         if !throttle_ok {
             notes.push("on-fill rescue throttled".to_string());
-            return Self::preserve_quote_decision(notes, intents);
+            return StrategyDecision::reactive(intents, notes);
         }
 
         let Some((left_fair, right_fair)) = self.fair_values(
@@ -5136,7 +5213,7 @@ impl Strategy for Btc5mMmStrategy {
             context.market_context.as_ref(),
             context.now_ms,
         ) else {
-            return Self::preserve_quote_decision(notes, intents);
+            return StrategyDecision::reactive(intents, notes);
         };
 
         let held_quote = if left_has {
@@ -5170,16 +5247,20 @@ impl Strategy for Btc5mMmStrategy {
         );
         if exposure_decision.rescue_qty <= 1e-9 {
             notes.push(exposure_decision.reason);
-            return Self::preserve_quote_decision(notes, intents);
+            return StrategyDecision::reactive(intents, notes);
         }
-        if !self.can_emit_rescue(
-            &fill.market_id,
-            &stranded_id,
-            &lift_id,
-            context.now_ms,
-            &mut notes,
-        ) {
-            return Self::preserve_quote_decision(notes, intents);
+        let no_loss_rescue_gate =
+            self.rescue_is_not_guaranteed_loss(exposure_decision.avg_cost, &lift_quote, &mut notes);
+        let rescue_ok = no_loss_rescue_gate
+            && self.can_emit_rescue(
+                &fill.market_id,
+                &stranded_id,
+                &lift_id,
+                context.now_ms,
+                &mut notes,
+            );
+        if !rescue_ok {
+            return StrategyDecision::reactive(intents, notes);
         }
         let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
         let intent = self
@@ -5230,7 +5311,7 @@ impl Strategy for Btc5mMmStrategy {
             notes.push("on-fill IOC rescue emitted".to_string());
         }
 
-        Self::preserve_quote_decision(notes, intents)
+        StrategyDecision::reactive(intents, notes)
     }
 
     fn checkpoint_state(&self) -> Option<serde_json::Value> {
@@ -5642,11 +5723,7 @@ impl Strategy for GoatPairStrategy {
         if intents.is_empty() {
             return StrategyDecision::none();
         }
-        StrategyDecision {
-            intents,
-            notes: Vec::new(),
-            preserve_quotes: false,
-        }
+        StrategyDecision::quote_set(intents, Vec::new())
     }
 
     fn on_fill(
@@ -5665,11 +5742,7 @@ impl Strategy for GoatPairStrategy {
             fill.price,
             fill.fee_usd
         );
-        StrategyDecision {
-            intents: Vec::new(),
-            notes: vec![note],
-            preserve_quotes: false,
-        }
+        StrategyDecision::quote_set(Vec::new(), vec![note])
     }
 }
 
@@ -6797,11 +6870,7 @@ impl Strategy for UnlawfulShearStrategy {
                     }
                 }
                 notes.push("unlawful-shear closing window for attribution".to_string());
-                return StrategyDecision {
-                    intents,
-                    notes,
-                    preserve_quotes: false,
-                };
+                return StrategyDecision::quote_set(intents, notes);
             }
         }
 
@@ -7187,22 +7256,14 @@ impl Strategy for UnlawfulShearStrategy {
                     "unlawful gate suppressed market mode={:?} actions_blocked",
                     mode
                 ));
-                return StrategyDecision {
-                    intents,
-                    notes,
-                    preserve_quotes: false,
-                };
+                return StrategyDecision::quote_set(intents, notes);
             }
             if controller_blocked {
                 notes.push(format!(
                     "unlawful microstructure controller suppressed market mode={:?}",
                     mode
                 ));
-                return StrategyDecision {
-                    intents,
-                    notes,
-                    preserve_quotes: false,
-                };
+                return StrategyDecision::quote_set(intents, notes);
             }
             return StrategyDecision::none();
         }
@@ -7229,11 +7290,7 @@ impl Strategy for UnlawfulShearStrategy {
             phase_clip_scale,
             self.window_elapsed_seconds(context)
         ));
-        StrategyDecision {
-            intents,
-            notes,
-            preserve_quotes: false,
-        }
+        StrategyDecision::quote_set(intents, notes)
     }
 
     fn on_fill(
@@ -7252,11 +7309,7 @@ impl Strategy for UnlawfulShearStrategy {
             fill.price,
             fill.fee_usd
         );
-        StrategyDecision {
-            intents: Vec::new(),
-            notes: vec![note],
-            preserve_quotes: false,
-        }
+        StrategyDecision::quote_set(Vec::new(), vec![note])
     }
 }
 

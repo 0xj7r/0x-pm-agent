@@ -33,7 +33,8 @@ use crate::strategy::{
     BtcRegimeSnapshot as StrategyBtcRegimeSnapshot,
     MarketActivitySignal as StrategyMarketActivitySignal,
     PairedBookSignal as StrategyPairedBookSignal, SessionBucket as StrategySessionBucket, Strategy,
-    StrategyContext, StrategyDecision, UnlawfulExecutionMode as StrategyExecutionMode,
+    StrategyContext, StrategyDecision, StrategyDecisionSuppressionKind,
+    UnlawfulExecutionMode as StrategyExecutionMode,
     UnlawfulSignalSnapshot as StrategyUnlawfulSignalSnapshot, VenueMarketRules,
 };
 use crate::types::{
@@ -2299,7 +2300,7 @@ impl<S: Strategy> Runtime<S> {
         now_ms: EpochMillis,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
-        for note in decision.notes {
+        for note in decision.notes() {
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Strategy,
                 now_ms,
@@ -2307,101 +2308,117 @@ impl<S: Strategy> Runtime<S> {
             )));
         }
 
-        if decision.preserve_quotes {
-            if !decision.intents.is_empty() {
+        match decision {
+            StrategyDecision::Noop { .. } => {}
+            StrategyDecision::Reactive { intents, .. } => {
+                if !intents.is_empty() {
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Strategy,
+                        now_ms,
+                        "quote reconciliation skipped: preserving working quotes during close-side strategy reaction",
+                    )));
+                }
+                for intent in intents {
+                    outcome.extend(self.accept_intent(intent, now_ms));
+                }
+            }
+            StrategyDecision::Suppress { kind, .. } => match kind {
+                StrategyDecisionSuppressionKind::SoftPause => {
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Strategy,
+                        now_ms,
+                        "strategy suppression: soft pause requested (preserving open entry quotes)",
+                    )));
+                }
+                StrategyDecisionSuppressionKind::HardRiskOff => {
+                    outcome.extend(self.riskoff_and_cancel_entry_orders(
+                        now_ms,
+                        "strategy suppression: hard risk-off",
+                    ));
+                }
+            },
+            StrategyDecision::QuoteSet { intents, .. } => {
+                let intents_in = intents.len();
+                let level_tags_in: Vec<String> = intents
+                    .iter()
+                    .map(|i| i.quote_level_tag.clone().unwrap_or_default())
+                    .collect();
+                let desired_pre = DesiredQuoteSet::from_intents(intents, &self.quote_engine_config);
+                let quotes_after_from_intents = desired_pre.quotes.len();
+                let desired = desired_pre.with_stale_gate(
+                    now_ms,
+                    &self.last_quotes,
+                    StaleMode::Remove,
+                    |snapshot, now| {
+                        snapshot.is_none_or(|quote| {
+                            now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
+                        })
+                    },
+                );
+                let quotes_after_stale_gate = desired.quotes.len();
+                if intents_in > 0 {
+                    tracing::info!(
+                        target: "ladder.diag",
+                        intents_in,
+                        quotes_after_from_intents,
+                        quotes_after_stale_gate,
+                        level_tags_in = ?level_tags_in,
+                        "ladder pipeline counts"
+                    );
+                }
+                let plan = self
+                    .quote_reconciler
+                    .plan(desired, &self.open_orders, now_ms);
                 outcome.push_event(self.event_log.push(EventRecord::new(
                     EventCategory::Strategy,
                     now_ms,
-                    "quote reconciliation skipped: preserving working quotes during close-side strategy reaction",
+                    format!(
+                        "quote reconciliation plan prepared ({} actions)",
+                        plan.actions.len()
+                    ),
                 )));
-            }
-            for intent in decision.intents {
-                outcome.extend(self.accept_intent(intent, now_ms));
-            }
-            return outcome;
-        }
-
-        let intents_in = decision.intents.len();
-        let level_tags_in: Vec<String> = decision
-            .intents
-            .iter()
-            .map(|i| i.quote_level_tag.clone().unwrap_or_default())
-            .collect();
-        let desired_pre =
-            DesiredQuoteSet::from_intents(decision.intents, &self.quote_engine_config);
-        let quotes_after_from_intents = desired_pre.quotes.len();
-        let desired = desired_pre.with_stale_gate(
-            now_ms,
-            &self.last_quotes,
-            StaleMode::Remove,
-            |snapshot, now| {
-                snapshot.is_none_or(|quote| {
-                    now.saturating_sub(quote.observed_at_ms) > self.quote_stale_ms
-                })
-            },
-        );
-        let quotes_after_stale_gate = desired.quotes.len();
-        if intents_in > 0 {
-            tracing::info!(
-                target: "ladder.diag",
-                intents_in,
-                quotes_after_from_intents,
-                quotes_after_stale_gate,
-                level_tags_in = ?level_tags_in,
-                "ladder pipeline counts"
-            );
-        }
-        let plan = self
-            .quote_reconciler
-            .plan(desired, &self.open_orders, now_ms);
-        outcome.push_event(self.event_log.push(EventRecord::new(
-            EventCategory::Strategy,
-            now_ms,
-            format!(
-                "quote reconciliation plan prepared ({} actions)",
-                plan.actions.len()
-            ),
-        )));
-        for note in plan.notes {
-            outcome.push_event(self.event_log.push(EventRecord::new(
-                EventCategory::Strategy,
-                now_ms,
-                note,
-            )));
-        }
-
-        for action in plan.actions {
-            match action {
-                QuoteAction::Keep(intent) => {
-                    outcome.push_event(
-                        self.event_log.push(
-                            EventRecord::new(EventCategory::Runtime, now_ms, "quote keep")
-                                .with_market(intent.market_id.clone())
-                                .with_instrument(intent.instrument_id.clone())
-                                .with_client_order(intent.client_order_id.clone()),
-                        ),
-                    );
-                }
-                QuoteAction::Cancel {
-                    client_order_id,
-                    reason,
-                } => {
-                    outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
-                }
-                QuoteAction::Replace {
-                    existing_client_order_id,
-                    replacement,
-                    cancel_reason,
-                } => {
-                    outcome.extend(self.request_cancel(
-                        &existing_client_order_id,
-                        cancel_reason,
+                for note in plan.notes {
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Strategy,
                         now_ms,
-                    ));
-                    outcome.extend(self.accept_intent(replacement, now_ms));
+                        note,
+                    )));
                 }
-                QuoteAction::Submit(intent) => {
-                    outcome.extend(self.accept_intent(intent, now_ms));
+
+                for action in plan.actions {
+                    match action {
+                        QuoteAction::Keep(intent) => {
+                            outcome.push_event(
+                                self.event_log.push(
+                                    EventRecord::new(EventCategory::Runtime, now_ms, "quote keep")
+                                        .with_market(intent.market_id.clone())
+                                        .with_instrument(intent.instrument_id.clone())
+                                        .with_client_order(intent.client_order_id.clone()),
+                                ),
+                            );
+                        }
+                        QuoteAction::Cancel {
+                            client_order_id,
+                            reason,
+                        } => {
+                            outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
+                        }
+                        QuoteAction::Replace {
+                            existing_client_order_id,
+                            replacement,
+                            cancel_reason,
+                        } => {
+                            outcome.extend(self.request_cancel(
+                                &existing_client_order_id,
+                                cancel_reason,
+                                now_ms,
+                            ));
+                            outcome.extend(self.accept_intent(replacement, now_ms));
+                        }
+                        QuoteAction::Submit(intent) => {
+                            outcome.extend(self.accept_intent(intent, now_ms));
+                        }
+                    }
                 }
             }
         }
@@ -3711,11 +3728,36 @@ mod tests {
 
         fn on_fill(&mut self, _context: &StrategyContext, fill: &FillReport) -> StrategyDecision {
             assert_eq!(fill.instrument_id, InstrumentId::from("up"));
-            StrategyDecision {
-                intents: vec![self.rescue.clone()],
-                notes: vec!["on-fill IOC rescue emitted".to_string()],
-                preserve_quotes: true,
+            StrategyDecision::reactive(
+                vec![self.rescue.clone()],
+                vec!["on-fill IOC rescue emitted".to_string()],
+            )
+        }
+    }
+
+    struct SnapshotRescueStrategy {
+        rescue: OrderIntent,
+        fired: bool,
+    }
+
+    impl Strategy for SnapshotRescueStrategy {
+        fn name(&self) -> &str {
+            "snapshot-rescue"
+        }
+
+        fn on_market_snapshot(
+            &mut self,
+            _context: &StrategyContext,
+            _snapshot: &MarketSnapshot,
+        ) -> StrategyDecision {
+            if self.fired {
+                return StrategyDecision::reactive(Vec::new(), Vec::new());
             }
+            self.fired = true;
+            StrategyDecision::reactive(
+                vec![self.rescue.clone()],
+                vec!["snapshot rescue".to_string()],
+            )
         }
     }
 
@@ -4676,6 +4718,83 @@ mod tests {
                 .all(|command| !matches!(command, RuntimeCommand::Cancel { .. })),
             "on-fill rescue must not cancel the still-working paired mate"
         );
+        assert!(runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == right_client_order_id));
+        assert!(runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
+    }
+
+    #[test]
+    fn on_market_snapshot_rescue_preserves_working_pair_mate_quote() {
+        let left = btc_mm_intent("market-mm", "up", "mm-paired-bid:l1", 0.48);
+        let left_client_order_id = left.client_order_id.clone();
+        let right = btc_mm_intent("market-mm", "down", "mm-paired-bid:l1", 0.52);
+        let right_client_order_id = right.client_order_id.clone();
+        let rescue = btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.53);
+        let rescue_client_order_id = rescue.client_order_id.clone();
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Running,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            SnapshotRescueStrategy {
+                rescue,
+                fired: false,
+            },
+            MarketContextStore::empty(),
+        );
+
+        assert_eq!(runtime.accept_intent(left, 1).commands.len(), 1);
+        assert_eq!(runtime.accept_intent(right, 1).commands.len(), 1);
+
+        let snapshot = MarketSnapshot {
+            market_id: MarketId::from("market-mm"),
+            instrument_id: InstrumentId::from("up"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.47, 4.0)),
+                best_ask: Some(BookLevel::new(0.48, 4.0)),
+                bid_levels: vec![BookLevel::new(0.47, 4.0)],
+                ask_levels: vec![BookLevel::new(0.48, 4.0)],
+                depth_observed_at_ms: Some(1),
+                last_trade_price: Some(0.48),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
+                observed_at_ms: 2,
+            },
+        };
+
+        let outcome = runtime
+            .on_market_snapshot(snapshot)
+            .expect("snapshot rescue should submit");
+
+        assert_eq!(
+            outcome
+                .commands
+                .iter()
+                .filter(|command| matches!(command, RuntimeCommand::Submit(_)))
+                .count(),
+            1
+        );
+        assert!(
+            outcome.commands.iter().all(|command| {
+                !matches!(
+                    command,
+                    RuntimeCommand::Cancel {
+                        client_order_id: _,
+                        reason: _
+                    }
+                )
+            }),
+            "snapshot rescue must not cancel the still-working paired mate"
+        );
+        assert!(runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == left_client_order_id));
         assert!(runtime
             .open_orders()
             .any(|managed| managed.intent.client_order_id == right_client_order_id));

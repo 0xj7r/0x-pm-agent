@@ -295,11 +295,7 @@ impl Strategy for FixtureStrategy {
                 snapshot.instrument_id.as_str().to_string(),
             ))
             .unwrap_or_default();
-        StrategyDecision {
-            intents,
-            notes: Vec::new(),
-            preserve_quotes: false,
-        }
+        StrategyDecision::quote_set(intents, Vec::new())
     }
 }
 
