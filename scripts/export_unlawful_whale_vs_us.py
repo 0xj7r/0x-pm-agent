@@ -99,8 +99,8 @@ def load_env_assignments(path: Path) -> dict[str, str]:
 
 def resolve_sleeve_paths(repo_root: Path, sleeve: SleeveConfig) -> dict[str, Path | None]:
     env_values = load_env_assignments(repo_root / sleeve.env_path)
-    order_store = env_values.get("WHALE_PAIR_ORDER_STORE_PATH")
-    journal_path = env_values.get("WHALE_PAIR_EXEC_JOURNAL_PATH")
+    order_store = env_values.get("PM_BTC_5M_ORDER_STORE_PATH")
+    journal_path = env_values.get("PM_BTC_5M_EXEC_JOURNAL_PATH")
     crate_root = repo_root / "polymarket-exec"
 
     def resolve_runtime_path(raw: str | None) -> Path | None:

@@ -189,7 +189,7 @@ pub struct AppConfig {
     pub paper_report_path: Option<PathBuf>,
     /// Phase 5 paper env: optional JSONL path for compact book-state
     /// snapshots. When set, every book update is appended; the resulting
-    /// file is the input to `WHALE_PAIR_EXEC_MODE=replay`. Useful in any
+    /// file is the input to `PM_BTC_5M_EXEC_MODE=replay`. Useful in any
     /// mode (paper, shadow_live, even live) for forensic post-hoc replay.
     pub book_snapshot_log_path: Option<PathBuf>,
     /// Phase 5 paper env: max depth levels per side captured in each book
@@ -214,23 +214,9 @@ impl AppConfig {
             let _ = dotenvy::dotenv();
         }
 
-        let service_name = env::var("PM_BTC_5M_EXEC_SERVICE_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                env::var("WHALE_PAIR_EXEC_SERVICE_NAME")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
+        let service_name = env_value("PM_BTC_5M_EXEC_SERVICE_NAME")
             .unwrap_or_else(|| "polymarket-exec".to_string());
-        let strategy_name = env::var("PM_BTC_5M_STRATEGY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                env::var("WHALE_PAIR_STRATEGY")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
+        let strategy_name = env_value("PM_BTC_5M_STRATEGY")
             .unwrap_or_else(|| "pair_cost_arb,paired_mm".to_string());
         let strategy_profile_paths = parse_strategy_profile_paths();
         let strategy_profile_path = strategy_profile_paths.first().cloned();
@@ -241,10 +227,10 @@ impl AppConfig {
         } else {
             Some(StrategyProfile::load_merged(&strategy_profile_paths)?)
         };
-        let paper_mode = parse_bool("WHALE_PAIR_PAPER_MODE", true)?;
+        let paper_mode = parse_bool("PM_BTC_5M_PAPER_MODE", true)?;
         let log_level = env_or("RUST_LOG", "info");
-        let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
-        let metrics_bind = parse_socket_addr("WHALE_PAIR_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
+        let log_format = parse_log_format(&env_or("PM_BTC_5M_EXEC_LOG_FORMAT", "pretty"))?;
+        let metrics_bind = parse_socket_addr("PM_BTC_5M_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
         let clob_api_url = env_or("POLYMARKET_CLOB_API_URL", "https://clob.polymarket.com");
         let data_api_url = env_or("POLYMARKET_DATA_API_URL", "https://data-api.polymarket.com");
         let relayer_url = env_or(
@@ -303,240 +289,236 @@ impl AppConfig {
             "wss://ws-subscriptions-clob.polymarket.com/ws/user",
         );
         let spot_ws_url = env_or(
-            "WHALE_PAIR_EXEC_SPOT_WS_URL",
+            "PM_BTC_5M_EXEC_SPOT_WS_URL",
             "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
         );
         let spot_rest_bootstrap_url = parse_optional_url_with_default(
-            "WHALE_PAIR_EXEC_SPOT_REST_BOOTSTRAP_URL",
+            "PM_BTC_5M_EXEC_SPOT_REST_BOOTSTRAP_URL",
             DEFAULT_BINANCE_REST_BOOTSTRAP_URL,
         );
         let coinbase_spot_ws_url = parse_optional_url_with_default(
-            "WHALE_PAIR_EXEC_COINBASE_SPOT_WS_URL",
+            "PM_BTC_5M_EXEC_COINBASE_SPOT_WS_URL",
             DEFAULT_COINBASE_SPOT_WS_URL,
         );
-        let spot_symbol = env_or("WHALE_PAIR_EXEC_SPOT_SYMBOL", "BTCUSDT");
-        let market_discovery_enabled = parse_bool("WHALE_PAIR_MARKET_DISCOVERY_ENABLED", false)?;
+        let spot_symbol = env_or("PM_BTC_5M_EXEC_SPOT_SYMBOL", "BTCUSDT");
+        let market_discovery_enabled = parse_bool("PM_BTC_5M_MARKET_DISCOVERY_ENABLED", false)?;
         let market_assets = if market_discovery_enabled {
-            split_csv_optional("WHALE_PAIR_ASSET_IDS")
+            split_csv_optional("PM_BTC_5M_ASSET_IDS")
         } else {
-            split_csv_required("WHALE_PAIR_ASSET_IDS")?
+            split_csv_required("PM_BTC_5M_ASSET_IDS")?
         };
-        let user_markets = split_csv_optional("WHALE_PAIR_USER_MARKETS");
+        let user_markets = split_csv_optional("PM_BTC_5M_USER_MARKETS");
         let market_discovery_interval =
-            parse_duration_ms("WHALE_PAIR_MARKET_DISCOVERY_INTERVAL_MS", 30_000)?;
+            parse_duration_ms("PM_BTC_5M_MARKET_DISCOVERY_INTERVAL_MS", 30_000)?;
         let market_discovery_window =
-            parse_duration_ms("WHALE_PAIR_MARKET_DISCOVERY_WINDOW_MS", 5 * 60 * 1_000)?;
+            parse_duration_ms("PM_BTC_5M_MARKET_DISCOVERY_WINDOW_MS", 5 * 60 * 1_000)?;
         let market_discovery_include_prev =
-            parse_usize("WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_PREV", 0)?;
+            parse_usize("PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_PREV", 0)?;
         let market_discovery_include_next =
-            parse_usize("WHALE_PAIR_MARKET_DISCOVERY_INCLUDE_NEXT", 0)?;
+            parse_usize("PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_NEXT", 0)?;
         let market_discovery_gamma_url = env_or(
-            "WHALE_PAIR_MARKET_DISCOVERY_GAMMA_URL",
+            "PM_BTC_5M_MARKET_DISCOVERY_GAMMA_URL",
             "https://gamma-api.polymarket.com/markets",
         );
         let market_discovery_slug_prefix =
-            env_or("WHALE_PAIR_MARKET_DISCOVERY_SLUG_PREFIX", "btc-updown-5m-");
+            env_or("PM_BTC_5M_MARKET_DISCOVERY_SLUG_PREFIX", "btc-updown-5m-");
         let market_discovery_families =
-            parse_market_discovery_families("WHALE_PAIR_MARKET_DISCOVERY_FAMILIES")?;
-        let runtime_loop_interval = parse_duration_ms("WHALE_PAIR_EXEC_LOOP_INTERVAL_MS", 1_000)?;
-        let summary_log_interval =
-            parse_duration_ms("WHALE_PAIR_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
+            parse_market_discovery_families("PM_BTC_5M_MARKET_DISCOVERY_FAMILIES")?;
+        let runtime_loop_interval = parse_duration_ms("PM_BTC_5M_EXEC_LOOP_INTERVAL_MS", 1_000)?;
+        let summary_log_interval = parse_duration_ms("PM_BTC_5M_EXEC_SUMMARY_INTERVAL_MS", 10_000)?;
         let order_reconcile_interval =
-            parse_duration_ms("WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS", 15_000)?;
+            parse_duration_ms("PM_BTC_5M_ORDER_RECONCILE_INTERVAL_MS", 15_000)?;
         let order_reconcile_stale_window =
-            parse_duration_ms("WHALE_PAIR_ORDER_RECONCILE_STALE_MS", 30_000)?;
+            parse_duration_ms("PM_BTC_5M_ORDER_RECONCILE_STALE_MS", 30_000)?;
         let runtime_checkpoint_interval =
-            parse_duration_ms("WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS", 30_000)?;
-        let order_store_path = parse_path_optional("WHALE_PAIR_ORDER_STORE_PATH");
-        let runtime_run_id = env_value("WHALE_PAIR_RUNTIME_RUN_ID")
-            .filter(|value| !value.trim().is_empty());
+            parse_duration_ms("PM_BTC_5M_RUNTIME_CHECKPOINT_INTERVAL_MS", 30_000)?;
+        let order_store_path = parse_path_optional("PM_BTC_5M_ORDER_STORE_PATH");
+        let runtime_run_id =
+            env_value("PM_BTC_5M_RUNTIME_RUN_ID").filter(|value| !value.trim().is_empty());
         let book_stale_after = parse_duration_ms_or_profile(
-            "WHALE_PAIR_EXEC_BOOK_STALE_MS",
+            "PM_BTC_5M_EXEC_BOOK_STALE_MS",
             strategy_profile
                 .as_ref()
                 .and_then(|profile| profile.risk.book_stale_ms),
             2_000,
         )?;
-        let ping_interval = parse_duration_ms("WHALE_PAIR_EXEC_PING_INTERVAL_MS", 10_000)?;
+        let ping_interval = parse_duration_ms("PM_BTC_5M_EXEC_PING_INTERVAL_MS", 10_000)?;
         let spot_ws_conn_stale_timeout =
-            parse_duration_ms("WHALE_PAIR_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS", 30_000)?;
+            parse_duration_ms("PM_BTC_5M_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS", 30_000)?;
         let spot_ws_data_stale_timeout =
-            parse_duration_ms("WHALE_PAIR_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS", 30_000)?;
-        let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
-        let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
-        let journal_rotate_bytes = env_value("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
+            parse_duration_ms("PM_BTC_5M_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS", 30_000)?;
+        let market_context_path = parse_path_optional("PM_BTC_5M_EXEC_MARKET_CONTEXT_PATH");
+        let journal_path = parse_path_optional("PM_BTC_5M_EXEC_JOURNAL_PATH");
+        let journal_rotate_bytes = env_value("PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES")
             .filter(|value| !value.trim().is_empty())
             .map(|value| {
                 value.parse::<u64>().with_context(|| {
                     format!(
-                        "failed to parse WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES as u64 from `{value}`"
+                        "failed to parse PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES as u64 from `{value}`"
                     )
                 })
             })
             .transpose()?;
-        let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
-        let event_log_capacity = parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
+        let starting_cash_usd = parse_f64("PM_BTC_5M_EXEC_STARTING_CASH_USD", 0.0)?;
+        let event_log_capacity = parse_usize("PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
-            parse_asset_market_map(&env_value("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default())?;
+            parse_asset_market_map(&env_value("PM_BTC_5M_INSTRUMENT_MARKETS").unwrap_or_default())?;
         let profile_inventory = strategy_profile.as_ref().map(|profile| &profile.inventory);
         let risk_limits = RiskLimits {
             max_order_notional_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_ORDER_NOTIONAL_USD",
+                "PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD",
                 profile_inventory.and_then(|profile| profile.max_order_notional_usd),
                 250.0,
             )?,
             max_gross_notional_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD",
+                "PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD",
                 profile_inventory.and_then(|profile| profile.max_gross_notional_usd),
                 1_000.0,
             )?,
             max_net_notional_per_market_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
+                "PM_BTC_5M_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
                 profile_inventory.and_then(|profile| profile.max_net_notional_per_market_usd),
                 500.0,
             )?,
             max_position_quantity_per_instrument: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
+                "PM_BTC_5M_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
                 profile_inventory.and_then(|profile| profile.max_position_quantity_per_instrument),
                 10_000.0,
             )?,
             min_free_cash_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MIN_FREE_CASH_USD",
+                "PM_BTC_5M_EXEC_MIN_FREE_CASH_USD",
                 profile_inventory.and_then(|profile| profile.min_free_cash_usd),
                 0.0,
             )?,
             min_free_cash_bps: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MIN_FREE_CASH_BPS",
+                "PM_BTC_5M_EXEC_MIN_FREE_CASH_BPS",
                 profile_inventory.and_then(|profile| profile.min_free_cash_bps),
                 0.0,
             )?,
             min_portfolio_equity_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MIN_PORTFOLIO_EQUITY_USD",
+                "PM_BTC_5M_EXEC_MIN_PORTFOLIO_EQUITY_USD",
                 profile_inventory.and_then(|profile| profile.min_portfolio_equity_usd),
                 0.0,
             )?,
             min_portfolio_equity_bps: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MIN_PORTFOLIO_EQUITY_BPS",
+                "PM_BTC_5M_EXEC_MIN_PORTFOLIO_EQUITY_BPS",
                 profile_inventory.and_then(|profile| profile.min_portfolio_equity_bps),
                 0.0,
             )?,
             max_session_loss_usd: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_SESSION_LOSS_USD",
+                "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_USD",
                 profile_inventory.and_then(|profile| profile.max_session_loss_usd),
                 0.0,
             )?,
             max_session_loss_bps: parse_f64_or_profile(
-                "WHALE_PAIR_EXEC_MAX_SESSION_LOSS_BPS",
+                "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_BPS",
                 profile_inventory.and_then(|profile| profile.max_session_loss_bps),
                 0.0,
             )?,
             max_open_orders_total: parse_usize_or_profile(
-                "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL",
+                "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL",
                 profile_inventory.and_then(|profile| profile.max_open_orders_total),
                 32,
             )?,
             max_open_orders_per_market: parse_usize_or_profile(
-                "WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+                "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
                 profile_inventory.and_then(|profile| profile.max_open_orders_per_market),
                 8,
             )?,
         };
         let user_auth = load_user_auth();
         let dashboard_whale_events_path =
-            parse_path_optional("WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH");
+            parse_path_optional("PM_BTC_5M_DASHBOARD_WHALE_EVENTS_PATH");
         let dashboard_refresh_ms =
-            parse_duration_ms("WHALE_PAIR_DASHBOARD_REFRESH_MS", 2_000)?.as_millis() as u64;
-        let dashboard_event_limit = parse_usize("WHALE_PAIR_DASHBOARD_EVENT_LIMIT", 200)?;
-        let audit_path = parse_path_optional("WHALE_PAIR_EXEC_AUDIT_PATH");
-        let live_post_only = parse_bool("WHALE_PAIR_LIVE_POST_ONLY", true)?;
-        let live_order_ttl = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_TTL_MS", 20_000)?;
-        let live_order_max_age = parse_duration_ms("WHALE_PAIR_LIVE_ORDER_MAX_AGE_MS", 25_000)?;
+            parse_duration_ms("PM_BTC_5M_DASHBOARD_REFRESH_MS", 2_000)?.as_millis() as u64;
+        let dashboard_event_limit = parse_usize("PM_BTC_5M_DASHBOARD_EVENT_LIMIT", 200)?;
+        let audit_path = parse_path_optional("PM_BTC_5M_EXEC_AUDIT_PATH");
+        let live_post_only = parse_bool("PM_BTC_5M_LIVE_POST_ONLY", true)?;
+        let live_order_ttl = parse_duration_ms("PM_BTC_5M_LIVE_ORDER_TTL_MS", 20_000)?;
+        let live_order_max_age = parse_duration_ms("PM_BTC_5M_LIVE_ORDER_MAX_AGE_MS", 25_000)?;
         let live_reconcile_missing_grace =
-            parse_duration_ms("WHALE_PAIR_LIVE_RECONCILE_MISSING_GRACE_MS", 5_000)?;
+            parse_duration_ms("PM_BTC_5M_LIVE_RECONCILE_MISSING_GRACE_MS", 5_000)?;
         let quote_min_order_age_default_ms = if paper_mode { 750 } else { 5_000 };
         let configured_quote_min_order_age = parse_duration_ms(
-            "WHALE_PAIR_QUOTE_MIN_ORDER_AGE_MS",
+            "PM_BTC_5M_QUOTE_MIN_ORDER_AGE_MS",
             quote_min_order_age_default_ms,
         )?;
         let quote_min_order_age =
             effective_quote_min_order_age(paper_mode, configured_quote_min_order_age);
-        let quote_churn_window = parse_duration_ms("WHALE_PAIR_QUOTE_CHURN_WINDOW_MS", 20_000)?;
-        let quote_hard_pull = parse_duration_ms("WHALE_PAIR_QUOTE_HARD_PULL_MS", 5_000)?;
-        let quote_max_churn_per_window = parse_usize("WHALE_PAIR_QUOTE_MAX_CHURN_PER_WINDOW", 12)?;
-        let quote_max_submit_per_window = parse_usize("WHALE_PAIR_QUOTE_MAX_SUBMIT_PER_WINDOW", 6)?;
+        let quote_churn_window = parse_duration_ms("PM_BTC_5M_QUOTE_CHURN_WINDOW_MS", 20_000)?;
+        let quote_hard_pull = parse_duration_ms("PM_BTC_5M_QUOTE_HARD_PULL_MS", 5_000)?;
+        let quote_max_churn_per_window = parse_usize("PM_BTC_5M_QUOTE_MAX_CHURN_PER_WINDOW", 12)?;
+        let quote_max_submit_per_window = parse_usize("PM_BTC_5M_QUOTE_MAX_SUBMIT_PER_WINDOW", 6)?;
         let quote_max_replace_per_window =
-            parse_usize("WHALE_PAIR_QUOTE_MAX_REPLACE_PER_WINDOW", 4)?;
-        let quote_max_cancel_per_window =
-            parse_usize("WHALE_PAIR_QUOTE_MAX_CANCEL_PER_WINDOW", 12)?;
-        let live_max_submit_errors = parse_usize("WHALE_PAIR_LIVE_MAX_SUBMIT_ERRORS", 1)?;
-        let live_max_cancel_errors = parse_usize("WHALE_PAIR_LIVE_MAX_CANCEL_ERRORS", 1)?;
+            parse_usize("PM_BTC_5M_QUOTE_MAX_REPLACE_PER_WINDOW", 4)?;
+        let quote_max_cancel_per_window = parse_usize("PM_BTC_5M_QUOTE_MAX_CANCEL_PER_WINDOW", 12)?;
+        let live_max_submit_errors = parse_usize("PM_BTC_5M_LIVE_MAX_SUBMIT_ERRORS", 1)?;
+        let live_max_cancel_errors = parse_usize("PM_BTC_5M_LIVE_MAX_CANCEL_ERRORS", 1)?;
         let live_kill_on_reconcile_mismatch =
-            parse_bool("WHALE_PAIR_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
-        let live_kill_switch_path = parse_path_optional("WHALE_PAIR_LIVE_KILL_SWITCH_PATH");
-        let live_pusd_auto_wrap = parse_bool("WHALE_PAIR_LIVE_PUSD_AUTO_WRAP", false)?;
-        let live_pusd_auto_wrap_min_usd =
-            parse_f64("WHALE_PAIR_LIVE_PUSD_AUTO_WRAP_MIN_USD", 0.01)?;
+            parse_bool("PM_BTC_5M_LIVE_KILL_ON_RECONCILE_MISMATCH", true)?;
+        let live_kill_switch_path = parse_path_optional("PM_BTC_5M_LIVE_KILL_SWITCH_PATH");
+        let live_pusd_auto_wrap = parse_bool("PM_BTC_5M_LIVE_PUSD_AUTO_WRAP", false)?;
+        let live_pusd_auto_wrap_min_usd = parse_f64("PM_BTC_5M_LIVE_PUSD_AUTO_WRAP_MIN_USD", 0.01)?;
         let live_risk_off_auto_recover =
-            parse_duration_ms("WHALE_PAIR_LIVE_RISK_OFF_AUTO_RECOVER_MS", 30_000)?;
-        let paper_min_fill_notional_usd =
-            parse_f64("WHALE_PAIR_PAPER_MIN_FILL_NOTIONAL_USD", 0.05)?;
-        let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
+            parse_duration_ms("PM_BTC_5M_LIVE_RISK_OFF_AUTO_RECOVER_MS", 30_000)?;
+        let paper_min_fill_notional_usd = parse_f64("PM_BTC_5M_PAPER_MIN_FILL_NOTIONAL_USD", 0.05)?;
+        let paper_max_fills_per_order = parse_usize("PM_BTC_5M_PAPER_MAX_FILLS_PER_ORDER", 3)?;
         let paper_min_fill_interval =
-            parse_duration_ms("WHALE_PAIR_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
-        let paper_market_close_at_ms = env_value("WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS")
+            parse_duration_ms("PM_BTC_5M_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
+        let paper_market_close_at_ms = env_value("PM_BTC_5M_PAPER_MARKET_CLOSE_AT_MS")
             .filter(|v| !v.trim().is_empty())
             .map(|v| {
                 v.trim().parse::<u64>().map_err(|err| {
-                    anyhow::anyhow!("invalid WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS: {err}")
+                    anyhow::anyhow!("invalid PM_BTC_5M_PAPER_MARKET_CLOSE_AT_MS: {err}")
                 })
             })
             .transpose()?;
         let paper_market_resolution_price =
-            env_value("WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE")
+            env_value("PM_BTC_5M_PAPER_MARKET_RESOLUTION_PRICE")
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| {
                     v.trim()
                         .parse::<f64>()
                         .map_err(|err| anyhow::anyhow!(
-                            "invalid WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE: {err}"
+                            "invalid PM_BTC_5M_PAPER_MARKET_RESOLUTION_PRICE: {err}"
                         ))
                         .and_then(|p| {
                             if (0.0..=1.0).contains(&p) {
                                 Ok(p)
                             } else {
                                 Err(anyhow::anyhow!(
-                                    "WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE must be in [0.0, 1.0], got {p}"
+                                    "PM_BTC_5M_PAPER_MARKET_RESOLUTION_PRICE must be in [0.0, 1.0], got {p}"
                                 ))
                             }
                         })
                 })
                 .transpose()?;
         let paper_submit_latency_ms =
-            parse_duration_ms("WHALE_PAIR_PAPER_SUBMIT_LATENCY_MS", 150)?.as_millis() as u64;
-        let paper_queue_depth_fraction = parse_f64("WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
+            parse_duration_ms("PM_BTC_5M_PAPER_SUBMIT_LATENCY_MS", 150)?.as_millis() as u64;
+        let paper_queue_depth_fraction = parse_f64("PM_BTC_5M_PAPER_QUEUE_DEPTH_FRACTION", 0.75)?;
         if !(0.0..=1.0).contains(&paper_queue_depth_fraction) {
             anyhow::bail!(
-                "WHALE_PAIR_PAPER_QUEUE_DEPTH_FRACTION must be in [0.0, 1.0], got {paper_queue_depth_fraction}"
+                "PM_BTC_5M_PAPER_QUEUE_DEPTH_FRACTION must be in [0.0, 1.0], got {paper_queue_depth_fraction}"
             );
         }
         let paper_post_only_reject_probability =
-            parse_f64("WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY", 0.85)?;
+            parse_f64("PM_BTC_5M_PAPER_POST_ONLY_REJECT_PROBABILITY", 0.85)?;
         if !(0.0..=1.0).contains(&paper_post_only_reject_probability) {
             anyhow::bail!(
-                "WHALE_PAIR_PAPER_POST_ONLY_REJECT_PROBABILITY must be in [0.0, 1.0], got {paper_post_only_reject_probability}"
+                "PM_BTC_5M_PAPER_POST_ONLY_REJECT_PROBABILITY must be in [0.0, 1.0], got {paper_post_only_reject_probability}"
             );
         }
         let paper_cancel_race_window_ms =
-            parse_duration_ms("WHALE_PAIR_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
-        let paper_report_path = parse_path_optional("WHALE_PAIR_PAPER_REPORT_PATH");
-        let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
-        let book_snapshot_max_levels = parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
-        let paper_maker_rebate_coeff = parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
-        let paper_taker_fee_coeff_override = env_value("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
+            parse_duration_ms("PM_BTC_5M_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
+        let paper_report_path = parse_path_optional("PM_BTC_5M_PAPER_REPORT_PATH");
+        let book_snapshot_log_path = parse_path_optional("PM_BTC_5M_BOOK_SNAPSHOT_LOG_PATH");
+        let book_snapshot_max_levels = parse_usize("PM_BTC_5M_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
+        let paper_maker_rebate_coeff = parse_f64("PM_BTC_5M_PAPER_MAKER_REBATE_COEFF", 0.0)?;
+        let paper_taker_fee_coeff_override = env_value("PM_BTC_5M_PAPER_TAKER_FEE_COEFF")
             .filter(|v| !v.trim().is_empty())
             .map(|v| v.trim().parse::<f64>())
             .transpose()
-            .map_err(|err| anyhow::anyhow!("invalid WHALE_PAIR_PAPER_TAKER_FEE_COEFF: {err}"))?;
+            .map_err(|err| anyhow::anyhow!("invalid PM_BTC_5M_PAPER_TAKER_FEE_COEFF: {err}"))?;
 
         Ok(Self {
             service_name,
@@ -645,7 +627,7 @@ impl AppConfig {
 }
 
 fn should_load_dotenv() -> bool {
-    match env_value("WHALE_PAIR_EXEC_LOAD_DOTENV") {
+    match env_value("PM_BTC_5M_EXEC_LOAD_DOTENV") {
         Some(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
@@ -670,7 +652,6 @@ fn parse_optional_url_with_default(key: &str, default: &str) -> Option<String> {
 
 fn parse_strategy_profile_paths() -> Vec<PathBuf> {
     env_value("PM_BTC_5M_STRATEGY_PROFILE_PATHS")
-        .or_else(|| env_value("WHALE_PAIR_STRATEGY_PROFILE_PATHS"))
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
@@ -680,7 +661,6 @@ fn parse_strategy_profile_paths() -> Vec<PathBuf> {
         })
         .filter(|paths| !paths.is_empty())
         .or_else(|| parse_path_optional("PM_BTC_5M_STRATEGY_PROFILE_PATH").map(|path| vec![path]))
-        .or_else(|| parse_path_optional("WHALE_PAIR_STRATEGY_PROFILE_PATH").map(|path| vec![path]))
         .unwrap_or_default()
 }
 
@@ -790,13 +770,13 @@ mod tests {
 
     #[test]
     fn dotenv_loading_can_be_disabled_for_service_envs() {
-        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "false");
+        std::env::set_var("PM_BTC_5M_EXEC_LOAD_DOTENV", "false");
         assert!(!should_load_dotenv());
-        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "0");
+        std::env::set_var("PM_BTC_5M_EXEC_LOAD_DOTENV", "0");
         assert!(!should_load_dotenv());
-        std::env::set_var("WHALE_PAIR_EXEC_LOAD_DOTENV", "true");
+        std::env::set_var("PM_BTC_5M_EXEC_LOAD_DOTENV", "true");
         assert!(should_load_dotenv());
-        std::env::remove_var("WHALE_PAIR_EXEC_LOAD_DOTENV");
+        std::env::remove_var("PM_BTC_5M_EXEC_LOAD_DOTENV");
     }
 
     #[test]

@@ -41,7 +41,7 @@ _Last updated: 2026-04-28_
   - Before increasing capital, set the correct `POLYMARKET_SIGNATURE_TYPE` and `POLYMARKET_FUNDER_ADDRESS` for the Polymarket Safe/proxy wallet, then rerun live smoke and balance/open-order reconciliation.
   - Do not treat EOA smoke success as proof that profile-wallet/Safe execution is configured correctly.
 - [x] Add settlement/redeem operations for resolved market positions.
-  - Auto-redeem now sweeps resolved venue positions, and successful auto-redeem triggers engine-side USDC.e -> pUSD collateral repair when `WHALE_PAIR_LIVE_PUSD_AUTO_WRAP=true`.
+  - Auto-redeem now sweeps resolved venue positions, and successful auto-redeem triggers engine-side USDC.e -> pUSD collateral repair when `PM_BTC_5M_LIVE_PUSD_AUTO_WRAP=true`.
   - Remaining hardening belongs under bankroll/accounting: explicit pUSD/USDC.e balance telemetry, gas-aware wrap thresholds, and durable settlement lifecycle records.
 - [ ] Finish venue-contract E2E tests without live funds.
   - Add mock CLOB + relayer HTTP fixtures for order submit/cancel, open-order sync, Data API positions, relayer nonce, relayer submit, and transaction polling.

@@ -8,14 +8,13 @@
 
 This spec is now implemented in `polymarket-exec` through the new modular strategy seam:
 
-- Live runtime selector supports `pair_cost_arb` and `btc_5m_pair_cost_arb`.
+- Live runtime selector supports `pair_cost_arb`, `paired_mm`, and `hybrid`.
 - Live runtime can run composite strategy lists such as `pair_cost_arb,paired_mm` through the existing `Runtime<StrategyMode>` hot path.
 - Strategy-specific knobs are loaded from YAML via `PM_BTC_5M_STRATEGY_PROFILE_PATHS` / `PM_BTC_5M_STRATEGY_PROFILE_PATH`.
 - Default live profile exists at `polymarket-exec/config/strategies/btc_5m_pair_cost_arb.live.yaml`.
 - Paired-MM has its own live profile at `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml`.
 - Hybrid runs should use `PM_BTC_5M_STRATEGY_PROFILE_PATHS=config/strategies/btc_5m_pair_cost_arb.live.yaml,config/strategies/btc_5m_paired_mm.live.yaml`; profiles are deep-merged in order.
-- Runtime config accepts the new `PM_BTC_5M_*` prefix for old `WHALE_PAIR_*` keys through parser aliases.
-- `btc_5m_mm` is now only a compatibility alias for the modular `paired_mm` strategy, not a legacy implementation.
+- Runtime config uses `PM_BTC_5M_*` as the only Polymarket BTC 5m env prefix; legacy env aliases were removed.
 - Legacy `unlawful_shear`, `goat_pair`, and `bonereaper` strategy implementations are removed from the active runtime selector.
 - The legacy `unlawful_gate` signal/runtime path has been removed; active runtime strategy modes are `pair_cost_arb`, `paired_mm`, and their hybrid composition.
 - Generic `strategies::StrategyRegistry` now supports both `paired_mm` and `pair_cost_arb`.
@@ -49,7 +48,7 @@ These are classic short-horizon binary MM problems. The original paired-MM appro
 
 ### 2. Strategy 1: Paired Market Making (Original – Still Fully Supported)
 
-**Identifier**: `paired_mm` (`btc_5m_mm` is a compatibility alias only)
+**Identifier**: `paired_mm`
 
 **Core philosophy**: Act as a true liquidity provider by posting **two-sided ladders** on both Yes and No, capturing spread + liquidity rewards + rebates while staying roughly delta-neutral.
 
@@ -73,7 +72,7 @@ These are classic short-horizon binary MM problems. The original paired-MM appro
 **Strengths**: Maximizes liquidity rewards (two-sided balance scores very high).  
 **Weaknesses**: Higher operational complexity; still vulnerable to stranded positions and whipsaw (your observed issues).
 
-Your existing `WHALE_PAIR_BTC_5M_MM_*` knobs (clip sizes, skew, ladder levels, etc.) remain fully functional for this strategy.
+Paired-MM-specific knobs now live in the paired-MM YAML profile, not in legacy env-only MM blocks.
 
 ---
 
@@ -156,7 +155,7 @@ Cheap leg = mid_price meaningfully below fair_price **AND** projected_pair_cost 
 
 ### 6. Configuration Refactor
 
-**Prefix change**: All old `WHALE_PAIR_*` → `PM_BTC_5M_*`.
+**Canonical prefix**: `PM_BTC_5M_*`.
 
 **Strategy selector** (in `.env`):
 ```env

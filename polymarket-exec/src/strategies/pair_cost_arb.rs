@@ -203,7 +203,12 @@ impl PairCostArbStrategy {
             return None;
         }
         let yes_avg = match leg {
-            Leg::Yes => weighted_avg(pair_cost.yes_qty, pair_cost.yes_avg_cost, buy_qty, buy_price),
+            Leg::Yes => weighted_avg(
+                pair_cost.yes_qty,
+                pair_cost.yes_avg_cost,
+                buy_qty,
+                buy_price,
+            ),
             Leg::No if pair_cost.yes_qty > 0.0 && pair_cost.yes_avg_cost > 0.0 => {
                 pair_cost.yes_avg_cost
             }
@@ -227,10 +232,7 @@ impl PairCostArbStrategy {
         target_pair_cost: f64,
     ) -> Option<(OrderIntent, f64)> {
         let (instrument_id, quote) = match leg {
-            Leg::Yes => (
-                &input.snapshot.yes_instrument_id,
-                &input.snapshot.yes_quote,
-            ),
+            Leg::Yes => (&input.snapshot.yes_instrument_id, &input.snapshot.yes_quote),
             Leg::No => (&input.snapshot.no_instrument_id, &input.snapshot.no_quote),
         };
         let mid = quote.mid_price()?;
@@ -281,13 +283,8 @@ impl PairCostArbStrategy {
             return None;
         }
 
-        let projected_pair_cost = self.projected_pair_cost(
-            &input.pair_cost,
-            &input.snapshot,
-            leg,
-            quantity,
-            bid_price,
-        )?;
+        let projected_pair_cost =
+            self.projected_pair_cost(&input.pair_cost, &input.snapshot, leg, quantity, bid_price)?;
         if projected_pair_cost > target_pair_cost {
             return None;
         }
@@ -374,8 +371,7 @@ where
             }
         } else if convex_winner.is_some() {
             notes.push(
-                "pair-cost recycle skipped: late-window convex winner excess is active"
-                    .to_string(),
+                "pair-cost recycle skipped: late-window convex winner excess is active".to_string(),
             );
         }
 
@@ -479,7 +475,10 @@ mod tests {
         }
     }
 
-    fn input(yes_quote: QuoteSnapshot, no_quote: QuoteSnapshot) -> StrategyInput<BinaryOutcomeMarket> {
+    fn input(
+        yes_quote: QuoteSnapshot,
+        no_quote: QuoteSnapshot,
+    ) -> StrategyInput<BinaryOutcomeMarket> {
         let market = BinaryOutcomeMarket::btc_5m(
             MarketId::from("market"),
             InstrumentId::from("yes"),
@@ -526,7 +525,10 @@ mod tests {
         let decision = strategy.on_tick(input(quote(0.48, 0.50), quote(0.28, 0.30)));
 
         assert_eq!(decision.intents().len(), 1);
-        assert_eq!(decision.intents()[0].instrument_id, InstrumentId::from("yes"));
+        assert_eq!(
+            decision.intents()[0].instrument_id,
+            InstrumentId::from("yes")
+        );
         assert_eq!(decision.intents()[0].side, TradeSide::Buy);
         assert_eq!(
             decision.intents()[0].quote_level_tag.as_deref(),

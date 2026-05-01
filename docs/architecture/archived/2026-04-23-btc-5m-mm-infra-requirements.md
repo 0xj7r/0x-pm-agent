@@ -182,9 +182,9 @@ Required responsibilities:
 
 - export previous/current/next BTC 5m windows
 - populate:
-  - `WHALE_PAIR_ASSET_IDS`
-  - `WHALE_PAIR_INSTRUMENT_MARKETS`
-  - `WHALE_PAIR_USER_MARKETS`
+  - `PM_BTC_5M_ASSET_IDS`
+  - `PM_BTC_5M_INSTRUMENT_MARKETS`
+  - `PM_BTC_5M_USER_MARKETS`
 - write:
   - `rust_runtime.env`
   - `rust_market_context.json`
@@ -272,11 +272,11 @@ Current live-auth and ops env surface:
   directly funded MetaMask EOA
 - `POLYMARKET_SIGNATURE_TYPE=gnosis_safe` plus `POLYMARKET_FUNDER_ADDRESS` only
   when the funded account is a Safe/proxy wallet
-- `WHALE_PAIR_EXEC_SPOT_WS_URL`
-- `WHALE_PAIR_EXEC_SPOT_SYMBOL`
-- `WHALE_PAIR_DASHBOARD_WHALE_EVENTS_PATH`
-- `WHALE_PAIR_DASHBOARD_REFRESH_MS`
-- `WHALE_PAIR_DASHBOARD_EVENT_LIMIT`
+- `PM_BTC_5M_EXEC_SPOT_WS_URL`
+- `PM_BTC_5M_EXEC_SPOT_SYMBOL`
+- `PM_BTC_5M_DASHBOARD_WHALE_EVENTS_PATH`
+- `PM_BTC_5M_DASHBOARD_REFRESH_MS`
+- `PM_BTC_5M_DASHBOARD_EVENT_LIMIT`
 
 ## 9. Current checked-in operator surfaces
 

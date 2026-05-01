@@ -131,7 +131,7 @@ new levels. Replace happens when book moves (level price changes).
 
 1. Default `ladder_levels = 1` initially (no behavior change).
 2. Ship + verify ladder produces correct intents in tests.
-3. Bump deploy script: `WHALE_PAIR_BTC_5M_MM_LADDER_LEVELS=3`.
+3. Bump the paired-MM YAML ladder levels to `3`.
 4. Observe 1h. If post-only crosses-book rate stays low, leave at 3.
 5. Try `ladder_levels=5` for more aggressive depth.
 

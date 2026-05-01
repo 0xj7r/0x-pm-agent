@@ -6,20 +6,20 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/go/polymarket-agent
-Environment=WHALE_PAIR_ROOT_DIR=%h/go/polymarket-agent
-Environment=WHALE_PAIR_EXEC_MODE=live_smoke
-Environment=WHALE_PAIR_PAPER_MODE=false
-Environment=WHALE_PAIR_CONTEXT_SOURCE=live
-Environment=WHALE_PAIR_INCLUDE_PREV=1
-Environment=WHALE_PAIR_INCLUDE_NEXT=1
+Environment=PM_EXEC_ROOT_DIR=%h/go/polymarket-agent
+Environment=PM_BTC_5M_EXEC_MODE=live_smoke
+Environment=PM_BTC_5M_PAPER_MODE=false
+Environment=PM_BTC_5M_CONTEXT_SOURCE=live
+Environment=PM_BTC_5M_INCLUDE_PREV=1
+Environment=PM_BTC_5M_INCLUDE_NEXT=1
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
-Environment=WHALE_PAIR_EXEC_BIN=%h/.local/bin/polymarket-exec
-Environment=WHALE_PAIR_LIVE_KILL_SWITCH_PATH=%h/.config/polymarket-exec/live.kill
+Environment=PM_EXEC_BIN=%h/.local/bin/polymarket-exec
+Environment=PM_BTC_5M_LIVE_KILL_SWITCH_PATH=%h/.config/polymarket-exec/live.kill
 EnvironmentFile=-%h/.config/polymarket-exec/common.env
 EnvironmentFile=-%h/.config/polymarket-exec/live.env
-ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/live" "$HOME/.config/polymarket-exec"'
-ExecStart=/usr/bin/env bash -lc 'exec "${WHALE_PAIR_EXEC_BIN}"'
+ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${PM_EXEC_ROOT_DIR}/data/runtime" "${PM_EXEC_ROOT_DIR}/data/execution/live" "$HOME/.config/polymarket-exec"'
+ExecStart=/usr/bin/env bash -lc 'exec "${PM_EXEC_BIN}"'
 # Keep the smoke bounded, but do not kill it before the order lifecycle check starts.
 TimeoutStartSec=600
 StandardOutput=journal

@@ -7,19 +7,19 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 WorkingDirectory=%h/go/polymarket-agent
-Environment=WHALE_PAIR_ROOT_DIR=%h/go/polymarket-agent
-Environment=WHALE_PAIR_CONTEXT_SOURCE=live
-Environment=WHALE_PAIR_INCLUDE_PREV=0
-Environment=WHALE_PAIR_INCLUDE_NEXT=0
-Environment=WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=45
-Environment=WHALE_PAIR_EXEC_LOAD_DOTENV=false
+Environment=PM_EXEC_ROOT_DIR=%h/go/polymarket-agent
+Environment=PM_BTC_5M_CONTEXT_SOURCE=live
+Environment=PM_BTC_5M_INCLUDE_PREV=0
+Environment=PM_BTC_5M_INCLUDE_NEXT=0
+Environment=PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=45
+Environment=PM_BTC_5M_EXEC_LOAD_DOTENV=false
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
-Environment=WHALE_PAIR_PYTHON_BIN=python3
-Environment=WHALE_PAIR_EXEC_BIN=%h/.local/bin/polymarket-exec
+Environment=PM_PYTHON_BIN=python3
+Environment=PM_EXEC_BIN=%h/.local/bin/polymarket-exec
 EnvironmentFile=-%h/.config/polymarket-exec/%i.env
-ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${WHALE_PAIR_ROOT_DIR}/data/runtime" "${WHALE_PAIR_ROOT_DIR}/data/execution/live" "${WHALE_PAIR_ROOT_DIR}/data/execution/audit"'
-ExecStart=/usr/bin/env bash -lc 'exec "${WHALE_PAIR_EXEC_BIN}"'
+ExecStartPre=/usr/bin/env bash -lc 'mkdir -p "${PM_EXEC_ROOT_DIR}/data/runtime" "${PM_EXEC_ROOT_DIR}/data/execution/live" "${PM_EXEC_ROOT_DIR}/data/execution/audit"'
+ExecStart=/usr/bin/env bash -lc 'exec "${PM_EXEC_BIN}"'
 Restart=always
 RestartSec=10
 TimeoutStopSec=20

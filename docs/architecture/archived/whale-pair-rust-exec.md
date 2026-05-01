@@ -25,13 +25,13 @@ This crate is a standalone execution-side scaffold for the whale-pair strategy. 
 
 ## Expected env
 
-- `WHALE_PAIR_ASSET_IDS`: comma-separated Polymarket asset IDs to subscribe
-- `WHALE_PAIR_USER_MARKETS`: optional comma-separated market/condition IDs for the user stream
+- `PM_BTC_5M_ASSET_IDS`: comma-separated Polymarket asset IDs to subscribe
+- `PM_BTC_5M_USER_MARKETS`: optional comma-separated market/condition IDs for the user stream
 - `POLYMARKET_API_KEY`
 - `POLYMARKET_API_SECRET`
 - `POLYMARKET_API_PASSPHRASE`
 - `POLYMARKET_MARKET_WS_URL` / `POLYMARKET_USER_WS_URL` if overrides are needed
-- `WHALE_PAIR_EXEC_METRICS_BIND`, `WHALE_PAIR_EXEC_BOOK_STALE_MS`, `WHALE_PAIR_EXEC_LOOP_INTERVAL_MS`
+- `PM_BTC_5M_EXEC_METRICS_BIND`, `PM_BTC_5M_EXEC_BOOK_STALE_MS`, `PM_BTC_5M_EXEC_LOOP_INTERVAL_MS`
 
 ## Intended next interfaces
 

@@ -2,19 +2,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PAPER_DIR="${WHALE_PAIR_ARCHIVE_PAPER_DIR:-$ROOT_DIR/polymarket-exec/data/execution/paper}"
-RUNTIME_DIR="${WHALE_PAIR_ARCHIVE_RUNTIME_DIR:-$ROOT_DIR/polymarket-exec/data/runtime}"
-ARCHIVE_S3_URI="${WHALE_PAIR_ARCHIVE_S3_URI:-}"
-STORAGE_CLASS="${WHALE_PAIR_ARCHIVE_STORAGE_CLASS:-DEEP_ARCHIVE}"
-MIN_AGE_MINUTES="${WHALE_PAIR_ARCHIVE_MIN_AGE_MINUTES:-15}"
-DELETE_AFTER_UPLOAD="${WHALE_PAIR_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD:-false}"
-INCLUDE_PRE_FIX="${WHALE_PAIR_ARCHIVE_INCLUDE_PRE_FIX:-true}"
-INCLUDE_RUNTIME_PRE_FIX="${WHALE_PAIR_ARCHIVE_INCLUDE_RUNTIME_PRE_FIX:-true}"
-INCLUDE_ROTATED_SEGMENTS="${WHALE_PAIR_ARCHIVE_INCLUDE_ROTATED_SEGMENTS:-true}"
-ACTIVE_JOURNAL_WARN_BYTES="${WHALE_PAIR_ARCHIVE_ACTIVE_JOURNAL_WARN_BYTES:-1073741824}"
-LIST_ONLY="${WHALE_PAIR_ARCHIVE_LIST_ONLY:-false}"
-DRY_RUN="${WHALE_PAIR_ARCHIVE_DRY_RUN:-false}"
-AWS_BIN="${WHALE_PAIR_AWS_BIN:-aws}"
+PAPER_DIR="${PM_BTC_5M_ARCHIVE_PAPER_DIR:-$ROOT_DIR/polymarket-exec/data/execution/paper}"
+RUNTIME_DIR="${PM_BTC_5M_ARCHIVE_RUNTIME_DIR:-$ROOT_DIR/polymarket-exec/data/runtime}"
+ARCHIVE_S3_URI="${PM_BTC_5M_ARCHIVE_S3_URI:-}"
+STORAGE_CLASS="${PM_BTC_5M_ARCHIVE_STORAGE_CLASS:-DEEP_ARCHIVE}"
+MIN_AGE_MINUTES="${PM_BTC_5M_ARCHIVE_MIN_AGE_MINUTES:-15}"
+DELETE_AFTER_UPLOAD="${PM_BTC_5M_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD:-false}"
+INCLUDE_PRE_FIX="${PM_BTC_5M_ARCHIVE_INCLUDE_PRE_FIX:-true}"
+INCLUDE_RUNTIME_PRE_FIX="${PM_BTC_5M_ARCHIVE_INCLUDE_RUNTIME_PRE_FIX:-true}"
+INCLUDE_ROTATED_SEGMENTS="${PM_BTC_5M_ARCHIVE_INCLUDE_ROTATED_SEGMENTS:-true}"
+ACTIVE_JOURNAL_WARN_BYTES="${PM_BTC_5M_ARCHIVE_ACTIVE_JOURNAL_WARN_BYTES:-1073741824}"
+LIST_ONLY="${PM_BTC_5M_ARCHIVE_LIST_ONLY:-false}"
+DRY_RUN="${PM_BTC_5M_ARCHIVE_DRY_RUN:-false}"
+AWS_BIN="${PM_BTC_5M_AWS_BIN:-aws}"
 
 log() {
   echo "[archive-paper-artifacts] $1"
@@ -43,7 +43,7 @@ require_ready() {
     return 0
   fi
   command -v "$AWS_BIN" >/dev/null 2>&1 || fail "aws cli not found: $AWS_BIN"
-  [[ -n "$ARCHIVE_S3_URI" ]] || fail "WHALE_PAIR_ARCHIVE_S3_URI is required"
+  [[ -n "$ARCHIVE_S3_URI" ]] || fail "PM_BTC_5M_ARCHIVE_S3_URI is required"
 }
 
 age_minutes() {
@@ -64,7 +64,7 @@ target_prefix() {
   if [[ -n "$ARCHIVE_S3_URI" ]]; then
     printf '%s' "${ARCHIVE_S3_URI%/}"
   else
-    printf '%s' "<set WHALE_PAIR_ARCHIVE_S3_URI>"
+    printf '%s' "<set PM_BTC_5M_ARCHIVE_S3_URI>"
   fi
 }
 
@@ -131,7 +131,7 @@ warn_about_unbounded_active_journals() {
     gib="$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1073741824 }')"
     if (( rotated_count == 0 )); then
       log "WARNING active journal exceeds threshold without any rotated segments present: ${path#$ROOT_DIR/} size=${gib}GiB threshold_bytes=$ACTIVE_JOURNAL_WARN_BYTES"
-      log "WARNING verify WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES is set in the actual launcher/systemd environment before relying on archive hygiene"
+      log "WARNING verify PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES is set in the actual launcher/systemd environment before relying on archive hygiene"
     else
       log "WARNING active journal remains above threshold: ${path#$ROOT_DIR/} size=${gib}GiB threshold_bytes=$ACTIVE_JOURNAL_WARN_BYTES"
     fi

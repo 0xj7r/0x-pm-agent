@@ -88,15 +88,7 @@ pub fn split_csv_optional(key: &str) -> Vec<String> {
 }
 
 pub fn env_value(key: &str) -> Option<String> {
-    pm_btc_5m_alias(key)
-        .and_then(|alias| env::var(alias).ok())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| env::var(key).ok())
-}
-
-pub fn pm_btc_5m_alias(key: &str) -> Option<String> {
-    key.strip_prefix("WHALE_PAIR_")
-        .map(|suffix| format!("PM_BTC_5M_{suffix}"))
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn lookup_first_env<F>(lookup: &F, keys: &[&str]) -> Option<String>
@@ -146,18 +138,16 @@ pub fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
         .map(str::trim)
         .filter(|pair| !pair.is_empty())
     {
-        let (asset_id, market_id) = pair
-            .split_once(':')
-            .with_context(|| {
-                format!(
-                    "failed to parse WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` as asset_id:market_id"
-                )
-            })?;
+        let (asset_id, market_id) = pair.split_once(':').with_context(|| {
+            format!(
+                "failed to parse PM_BTC_5M_INSTRUMENT_MARKETS entry `{pair}` as asset_id:market_id"
+            )
+        })?;
         let asset_id = asset_id.trim();
         let market_id = market_id.trim();
         if asset_id.is_empty() || market_id.is_empty() {
             bail!(
-                "WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` must have non-empty asset_id and market_id"
+                "PM_BTC_5M_INSTRUMENT_MARKETS entry `{pair}` must have non-empty asset_id and market_id"
             );
         }
         mapping.insert(asset_id.to_string(), market_id.to_string());
@@ -170,8 +160,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        env_or, load_user_auth_from_lookup, parse_asset_market_map, parse_bool, parse_log_format,
-        parse_path_optional, LogFormat,
+        load_user_auth_from_lookup, parse_asset_market_map, parse_bool, parse_log_format, LogFormat,
     };
 
     #[test]
@@ -186,39 +175,12 @@ mod tests {
 
     #[test]
     fn parses_missing_bool_with_default() {
-        assert!(parse_bool("WHALE_PAIR_PAPER_MODE_MISSING", true).unwrap());
+        assert!(parse_bool("PM_BTC_5M_PAPER_MODE_MISSING", true).unwrap());
     }
 
     #[test]
     fn parses_bool_from_text() {
-        assert!(!parse_bool("WHALE_PAIR_PAPER_MODE_NO", false).unwrap());
-    }
-
-    #[test]
-    fn whale_pair_keys_accept_pm_btc_5m_aliases() {
-        let bool_key = "WHALE_PAIR_ALIAS_BOOL_TEST";
-        let bool_alias = "PM_BTC_5M_ALIAS_BOOL_TEST";
-        let value_key = "WHALE_PAIR_ALIAS_VALUE_TEST";
-        let value_alias = "PM_BTC_5M_ALIAS_VALUE_TEST";
-        let path_key = "WHALE_PAIR_ALIAS_PATH_TEST";
-        let path_alias = "PM_BTC_5M_ALIAS_PATH_TEST";
-        std::env::remove_var(bool_key);
-        std::env::remove_var(value_key);
-        std::env::remove_var(path_key);
-        std::env::set_var(bool_alias, "true");
-        std::env::set_var(value_alias, "from-alias");
-        std::env::set_var(path_alias, "/tmp/from-alias");
-
-        assert!(parse_bool(bool_key, false).unwrap());
-        assert_eq!(env_or(value_key, "fallback"), "from-alias");
-        assert_eq!(
-            parse_path_optional(path_key).unwrap(),
-            std::path::PathBuf::from("/tmp/from-alias")
-        );
-
-        std::env::remove_var(bool_alias);
-        std::env::remove_var(value_alias);
-        std::env::remove_var(path_alias);
+        assert!(!parse_bool("PM_BTC_5M_PAPER_MODE_NO", false).unwrap());
     }
 
     #[test]
