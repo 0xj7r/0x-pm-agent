@@ -11,11 +11,21 @@ use tracing::info;
 
 use crate::inventory::{InventorySnapshot, PositionState};
 use crate::market_context::MarketContextRecord;
+use crate::market_making::paired_mm::{
+    build_ladder as build_signal_ladder, choose_capital_recycle,
+    choose_rescue as choose_signal_rescue, CapitalRecycleConfig, CapitalRecycleDecision,
+    LadderConfig as SignalLadderConfig, LadderLeg, PairCostTracker, PairedInventorySnapshot,
+    PairedMarketSnapshot, RescueAction, RescueConfig as SignalRescueConfig, RescueInputs,
+    RunningInventoryCaps, StoikovParams,
+};
+use crate::markets::{BinaryOutcomeMarket, MarketDescriptor};
 use crate::quote_engine::QuoteEngineConfig;
-use crate::signals::UnlawfulGateConfig;
+use crate::signals::{
+    estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel, UnlawfulGateConfig,
+};
 use crate::types::{
     BookLevel, ClientOrderId, EpochMillis, InstrumentId, IntentKind, MarketId, MarketSnapshot,
-    OrderIntent, QuoteSnapshot, RuntimeStatus, TradeSide,
+    OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, SuppressionScope, TradeSide,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,7 +804,15 @@ enum Btc5mMmMarketMode {
 struct Btc5mMmPersistedState {
     version: u32,
     market_states: Vec<Btc5mMmPersistedMarketState>,
+    auto_fill_states: Vec<Btc5mMmPersistedAutoFillState>,
     recent_fill_times: Vec<EpochMillis>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Btc5mMmPersistedAutoFillState {
+    market_id: String,
+    state: crate::market_making::paired_mm::AutoFillStateSnapshot,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -890,6 +908,15 @@ pub enum StrategyDecision {
         kind: StrategyDecisionSuppressionKind,
         notes: Vec<String>,
     },
+    /// Emit non-quote runtime commands such as merge/redeem/cancel.
+    ///
+    /// Submit commands are still passed through `Runtime::accept_intent`;
+    /// strategies must not bypass risk by smuggling order submits through
+    /// this variant.
+    Commands {
+        commands: Vec<RuntimeCommand>,
+        notes: Vec<String>,
+    },
 }
 
 impl StrategyDecision {
@@ -916,12 +943,16 @@ impl StrategyDecision {
         Self::Suppress { kind, notes }
     }
 
+    pub fn commands(commands: Vec<RuntimeCommand>, notes: Vec<String>) -> Self {
+        Self::Commands { commands, notes }
+    }
+
     pub fn intents(&self) -> &[OrderIntent] {
         match self {
             Self::Noop { .. } => &[],
             Self::QuoteSet { intents, .. } => intents.as_slice(),
             Self::Reactive { intents, .. } => intents.as_slice(),
-            Self::Suppress { .. } => &[],
+            Self::Suppress { .. } | Self::Commands { .. } => &[],
         }
     }
 
@@ -930,7 +961,7 @@ impl StrategyDecision {
             Self::Noop { notes } => notes.as_slice(),
             Self::QuoteSet { notes, .. } => notes.as_slice(),
             Self::Reactive { notes, .. } => notes.as_slice(),
-            Self::Suppress { notes, .. } => notes.as_slice(),
+            Self::Suppress { notes, .. } | Self::Commands { notes, .. } => notes.as_slice(),
         }
     }
 
@@ -942,7 +973,43 @@ impl StrategyDecision {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.intents().is_empty() && self.notes().is_empty()
+        match self {
+            Self::Commands {
+                commands, notes, ..
+            } => commands.is_empty() && notes.is_empty(),
+            _ => self.intents().is_empty() && self.notes().is_empty(),
+        }
+    }
+}
+
+impl From<crate::types::StrategyDecision> for StrategyDecision {
+    fn from(decision: crate::types::StrategyDecision) -> Self {
+        match decision {
+            crate::types::StrategyDecision::QuoteSet { intents, notes } => {
+                Self::quote_set(intents, notes)
+            }
+            crate::types::StrategyDecision::CapitalRecycle { intents, notes }
+            | crate::types::StrategyDecision::Rescue { intents, notes } => {
+                Self::reactive(intents, notes)
+            }
+            crate::types::StrategyDecision::Merge { intent, notes } => {
+                Self::commands(vec![RuntimeCommand::Merge(intent)], notes)
+            }
+            crate::types::StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                let kind = if preserve_quotes || scope == SuppressionScope::PairedOnly {
+                    StrategyDecisionSuppressionKind::SoftPause
+                } else {
+                    StrategyDecisionSuppressionKind::HardRiskOff
+                };
+                Self::suppress(kind, notes)
+            }
+            crate::types::StrategyDecision::Noop { notes } => Self::Noop { notes },
+        }
     }
 }
 
@@ -1643,21 +1710,24 @@ pub enum StrategyMode {
     Goat(GoatPairStrategy),
     Btc5mMm(Btc5mMmStrategy),
     UnlawfulShear(UnlawfulShearStrategy),
-    Bonereaper(crate::strategy_bonereaper::BonereaperStrategy),
     Noop(NoopStrategy),
 }
 
 impl StrategyMode {
-    pub fn from_name(name: &str, profile: Option<&StrategyProfile>) -> Self {
+    pub fn try_from_name(
+        name: &str,
+        profile: Option<&StrategyProfile>,
+    ) -> std::result::Result<Self, String> {
         match name {
-            "btc_5m_mm" => Self::Btc5mMm(Btc5mMmStrategy::with_defaults()),
-            "goat_pair" => Self::Goat(GoatPairStrategy::with_profile(profile)),
-            "noop" => Self::Noop(NoopStrategy),
-            "unlawful_shear" => Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile)),
-            "bonereaper" => {
-                Self::Bonereaper(crate::strategy_bonereaper::BonereaperStrategy::with_defaults())
-            }
-            _ => Self::UnlawfulShear(UnlawfulShearStrategy::with_defaults()),
+            "btc_5m_mm" | "paired_mm" => Ok(Self::Btc5mMm(Btc5mMmStrategy::with_defaults())),
+            "goat_pair" => Ok(Self::Goat(GoatPairStrategy::with_profile(profile))),
+            "noop" => Ok(Self::Noop(NoopStrategy)),
+            "unlawful_shear" => Ok(Self::UnlawfulShear(UnlawfulShearStrategy::with_profile(profile))),
+            "bonereaper" => Err(
+                "strategy 'bonereaper' is benchmark/research-only and is not selectable in the live runtime"
+                    .to_string(),
+            ),
+            other => Err(format!("unsupported strategy '{other}'")),
         }
     }
 
@@ -1666,7 +1736,6 @@ impl StrategyMode {
             Self::Btc5mMm(strategy) => strategy.taker_fee_coeff(),
             Self::Goat(strategy) => strategy.taker_fee_coeff(),
             Self::UnlawfulShear(strategy) => strategy.taker_fee_coeff(),
-            Self::Bonereaper(strategy) => strategy.taker_fee_coeff(),
             Self::Noop(_) => 0.0,
         }
     }
@@ -1676,7 +1745,6 @@ impl StrategyMode {
             Self::Btc5mMm(_) => None,
             Self::Goat(_) => None,
             Self::Noop(_) => None,
-            Self::Bonereaper(_) => None,
             Self::UnlawfulShear(strategy) => Some(strategy.unlawful_gate_config()),
         }
     }
@@ -1688,7 +1756,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.name(),
             Self::Goat(strategy) => strategy.name(),
             Self::UnlawfulShear(strategy) => strategy.name(),
-            Self::Bonereaper(strategy) => strategy.name(),
             Self::Noop(strategy) => strategy.name(),
         }
     }
@@ -1702,7 +1769,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_start(context),
             Self::Goat(strategy) => strategy.on_start(context),
             Self::UnlawfulShear(strategy) => strategy.on_start(context),
-            Self::Bonereaper(strategy) => strategy.on_start(context),
             Self::Noop(strategy) => strategy.on_start(context),
         }
     }
@@ -1716,7 +1782,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Goat(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::UnlawfulShear(strategy) => strategy.on_market_snapshot(context, snapshot),
-            Self::Bonereaper(strategy) => strategy.on_market_snapshot(context, snapshot),
             Self::Noop(strategy) => strategy.on_market_snapshot(context, snapshot),
         }
     }
@@ -1730,7 +1795,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.on_fill(context, fill),
             Self::Goat(strategy) => strategy.on_fill(context, fill),
             Self::UnlawfulShear(strategy) => strategy.on_fill(context, fill),
-            Self::Bonereaper(strategy) => strategy.on_fill(context, fill),
             Self::Noop(strategy) => strategy.on_fill(context, fill),
         }
     }
@@ -1740,7 +1804,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.checkpoint_state(),
             Self::Goat(strategy) => strategy.checkpoint_state(),
             Self::UnlawfulShear(strategy) => strategy.checkpoint_state(),
-            Self::Bonereaper(strategy) => strategy.checkpoint_state(),
             Self::Noop(strategy) => strategy.checkpoint_state(),
         }
     }
@@ -1753,7 +1816,6 @@ impl Strategy for StrategyMode {
             Self::Btc5mMm(strategy) => strategy.restore_checkpoint_state(state),
             Self::Goat(strategy) => strategy.restore_checkpoint_state(state),
             Self::UnlawfulShear(strategy) => strategy.restore_checkpoint_state(state),
-            Self::Bonereaper(strategy) => strategy.restore_checkpoint_state(state),
             Self::Noop(strategy) => strategy.restore_checkpoint_state(state),
         }
     }
@@ -1763,6 +1825,7 @@ impl Strategy for StrategyMode {
 pub struct Btc5mMmStrategy {
     config: Btc5mMmConfig,
     market_states: HashMap<MarketId, Btc5mMmMarketState>,
+    fill_auto_states: HashMap<MarketId, crate::market_making::paired_mm::AutoFillState>,
     /// Timestamps of recent fills (any leg, any market). Pruned to the
     /// last 5 minutes. Drives fill-rate-aware sizing: when fills are coming
     /// in, scale clip up; when none, scale down. Mirrors how whales
@@ -1942,6 +2005,7 @@ impl Btc5mMmStrategy {
         Self {
             config,
             market_states: HashMap::new(),
+            fill_auto_states: HashMap::new(),
             recent_fill_times: VecDeque::new(),
         }
     }
@@ -2017,6 +2081,14 @@ impl Btc5mMmStrategy {
                     last_fill_ms: state.last_fill_ms,
                 })
                 .collect(),
+            auto_fill_states: self
+                .fill_auto_states
+                .iter()
+                .map(|(market_id, state)| Btc5mMmPersistedAutoFillState {
+                    market_id: market_id.as_str().to_string(),
+                    state: state.snapshot(),
+                })
+                .collect(),
             recent_fill_times: self.recent_fill_times.iter().copied().collect(),
         }
     }
@@ -2065,6 +2137,17 @@ impl Btc5mMmStrategy {
                 },
             );
         }
+        self.fill_auto_states = persisted
+            .auto_fill_states
+            .into_iter()
+            .filter(|record| !record.market_id.trim().is_empty())
+            .map(|record| {
+                (
+                    MarketId::from(record.market_id),
+                    crate::market_making::paired_mm::AutoFillState::from_snapshot(record.state),
+                )
+            })
+            .collect();
         self.recent_fill_times = persisted
             .recent_fill_times
             .into_iter()
@@ -2283,6 +2366,7 @@ impl Btc5mMmStrategy {
             + Self::FLOW_IMBALANCE_THRESHOLD_SLOPE * (1.0 - vol_normalized)
     }
 
+    #[allow(dead_code)]
     fn dynamic_bid_clip_usd(
         &self,
         quote: &QuoteSnapshot,
@@ -2305,6 +2389,7 @@ impl Btc5mMmStrategy {
             .max(self.config.min_clip_usd)
     }
 
+    #[allow(dead_code)]
     fn paired_entry_clip_usd(
         &self,
         market_id: &MarketId,
@@ -2340,6 +2425,7 @@ impl Btc5mMmStrategy {
             .min(self.dynamic_bid_clip_usd(right_quote, requested_clip_usd, phase_scale))
     }
 
+    #[allow(dead_code)]
     fn paired_entry_quantity(
         &self,
         market_id: &MarketId,
@@ -2800,15 +2886,57 @@ impl Btc5mMmStrategy {
         let sum = left_biased + right_biased;
         if sum.is_finite() && sum > 0.0 {
             let book_fairs = (left_biased / sum, right_biased / sum);
+            let model_fairs = market_context.and_then(|ctx| {
+                let up_id = ctx.instrument_ids.first()?.as_str();
+                let price_to_beat = ctx.price_to_beat?;
+                let spot = btc_regime.last_price?;
+                let vol = btc_regime.realized_vol_5m_bps?;
+                let remaining_ms = Self::time_remaining_ms(Some(ctx), now_ms)
+                    .unwrap_or(Self::BAR_PHASE_DEFAULT_WINDOW_MS);
+                let tau = (remaining_ms as f64 / Self::BAR_PHASE_DEFAULT_WINDOW_MS as f64)
+                    .clamp(0.0, 1.0);
+                let momentum_return = btc_regime.return_60s_bps.unwrap_or_default() / 10_000.0;
+                let estimate = estimate_fair_value_with_momentum(
+                    spot,
+                    price_to_beat,
+                    tau,
+                    vol / 10_000.0,
+                    momentum_return,
+                );
+                if !matches!(
+                    estimate.model,
+                    FairValueModel::BsmBinary | FairValueModel::StepFunctionDecided
+                ) {
+                    return None;
+                }
+                if up_id == left_id.as_str() {
+                    Some((estimate.p_up, estimate.p_down, tau))
+                } else if up_id == right_id.as_str() {
+                    Some((estimate.p_down, estimate.p_up, tau))
+                } else {
+                    None
+                }
+            });
+            let base_fairs = if let Some((model_left, model_right, tau)) = model_fairs {
+                let model_weight = if tau <= 0.5 { 0.75 } else { 0.50 };
+                (
+                    (book_fairs.0 * (1.0 - model_weight) + model_left * model_weight)
+                        .clamp(0.001, 0.999),
+                    (book_fairs.1 * (1.0 - model_weight) + model_right * model_weight)
+                        .clamp(0.001, 0.999),
+                )
+            } else {
+                book_fairs
+            };
             if let Some((settlement_left, settlement_right, weight)) = self
                 .late_bar_settlement_fairs(left_id, right_id, btc_regime, market_context, now_ms)
             {
                 Some((
-                    (book_fairs.0 * (1.0 - weight) + settlement_left * weight).clamp(0.001, 0.999),
-                    (book_fairs.1 * (1.0 - weight) + settlement_right * weight).clamp(0.001, 0.999),
+                    (base_fairs.0 * (1.0 - weight) + settlement_left * weight).clamp(0.001, 0.999),
+                    (base_fairs.1 * (1.0 - weight) + settlement_right * weight).clamp(0.001, 0.999),
                 ))
             } else {
-                Some(book_fairs)
+                Some(base_fairs)
             }
         } else {
             None
@@ -3148,6 +3276,134 @@ impl Btc5mMmStrategy {
         price * self.config.taker_fee_coeff * price * (1.0 - price)
     }
 
+    fn record_auto_fill_from_context(
+        &mut self,
+        context: &StrategyContext,
+        fill: &crate::types::FillReport,
+    ) {
+        let Some(market_context) = context.market_context.as_ref() else {
+            return;
+        };
+        let Some(first_id) = market_context.instrument_ids.first() else {
+            return;
+        };
+        let Some(second_id) = market_context.instrument_ids.get(1) else {
+            return;
+        };
+        let leg = if fill.instrument_id.as_str() == first_id {
+            LadderLeg::Yes
+        } else if fill.instrument_id.as_str() == second_id {
+            LadderLeg::No
+        } else {
+            return;
+        };
+        let state = self
+            .fill_auto_states
+            .entry(fill.market_id.clone())
+            .or_insert_with(crate::market_making::paired_mm::AutoFillState::new);
+        for note in state.record_fill_by_leg(leg, fill) {
+            tracing::info!(
+                target: "strategy.auto_fill",
+                market_id = %fill.market_id,
+                instrument_id = %fill.instrument_id,
+                note = %note,
+                "recorded auto-fill state"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_capital_recycle_intent(
+        &self,
+        market_id: &MarketId,
+        left_id: &InstrumentId,
+        left_quote: &QuoteSnapshot,
+        left_fair: f64,
+        left_cost: f64,
+        right_id: &InstrumentId,
+        right_quote: &QuoteSnapshot,
+        right_fair: f64,
+        right_cost: f64,
+        market_context: Option<&MarketContextRecord>,
+        now_ms: EpochMillis,
+    ) -> Option<OrderIntent> {
+        let mut market =
+            BinaryOutcomeMarket::btc_5m(market_id.clone(), left_id.clone(), right_id.clone());
+        market.tick_size = self.config.maker_price_tick;
+        market.min_order_size = self.config.venue_min_order_quantity;
+        if let Some(context) = market_context {
+            market = market.with_context(context);
+        }
+
+        let left_qty = if left_fair > 0.0 {
+            left_cost / left_fair.max(self.config.maker_price_tick)
+        } else {
+            0.0
+        };
+        let right_qty = if right_fair > 0.0 {
+            right_cost / right_fair.max(self.config.maker_price_tick)
+        } else {
+            0.0
+        };
+        let decision = choose_capital_recycle(
+            &market,
+            &PairedMarketSnapshot {
+                market_id: market_id.clone(),
+                yes_instrument_id: left_id.clone(),
+                no_instrument_id: right_id.clone(),
+                yes_quote: left_quote.clone(),
+                no_quote: right_quote.clone(),
+            },
+            &PairedInventorySnapshot {
+                yes_qty: left_qty.max(0.0),
+                no_qty: right_qty.max(0.0),
+                yes_avg_cost: if left_qty > 0.0 {
+                    (left_cost / left_qty).clamp(0.0, 1.0)
+                } else {
+                    left_fair.clamp(0.0, 1.0)
+                },
+                no_avg_cost: if right_qty > 0.0 {
+                    (right_cost / right_qty).clamp(0.0, 1.0)
+                } else {
+                    right_fair.clamp(0.0, 1.0)
+                },
+                free_cash_usd: self.config.max_gross_cost_usd.max(0.0),
+                equity_usd: self.config.max_gross_cost_usd.max(0.0),
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.99,
+                min_imbalance_qty: self.config.venue_min_order_quantity,
+                max_buy_qty: self.config.hedge_rescue_clip_usd
+                    / self.config.maker_price_tick.max(0.01),
+                max_buy_notional_usd: self.config.hedge_rescue_clip_usd,
+                min_time_remaining_ms: 120_000,
+                max_light_side_spread: self.config.max_spread.max(0.01),
+                race_buffer_ticks: self.config.hedge_rescue_race_buffer_ticks.min(2.0),
+            },
+            now_ms,
+        );
+        match decision {
+            CapitalRecycleDecision::BuyLightSide { intent, reason, .. } => {
+                tracing::info!(
+                    target: "strategy.capital_recycle",
+                    market = %market_id,
+                    reason = %reason,
+                    "capital recycle intent built"
+                );
+                Some(intent)
+            }
+            CapitalRecycleDecision::Wait { reason } => {
+                tracing::debug!(
+                    target: "strategy.capital_recycle",
+                    market = %market_id,
+                    reason = %reason,
+                    "capital recycle skipped"
+                );
+                None
+            }
+        }
+    }
+
     fn decide_stranded_exposure(
         &self,
         held_id: &InstrumentId,
@@ -3179,8 +3435,9 @@ impl Btc5mMmStrategy {
         } else {
             0.0
         };
-        let rescue_ev = Self::best_ask(opposite_quote)
-            .map(|ask| 1.0 - avg_cost - ask - self.taker_fee_per_share(ask) - merge_gas_per_share);
+        let opposite_effective_ask = Self::best_ask(opposite_quote)
+            .map(|ask| ask + self.taker_fee_per_share(ask) + merge_gas_per_share);
+        let rescue_ev = opposite_effective_ask.map(|ask| 1.0 - avg_cost - ask);
         let remaining_ms = Self::time_remaining_ms(market_context, now_ms);
         let late_confident = remaining_ms.is_some_and(|remaining| remaining <= 60_000)
             && held_fair >= Self::LATE_BAR_HOLD_CONFIDENCE_FAIR
@@ -3188,9 +3445,26 @@ impl Btc5mMmStrategy {
             && avg_cost <= self.config.entry_premium_bid_cap;
         let cheap_positive =
             avg_cost <= Self::CONVEX_ACCUMULATION_MAX_AVG_COST && hold_ev >= Self::HOLD_MIN_EDGE;
-        let beats_rescue = rescue_ev
-            .map(|ev| hold_ev > ev + Self::HOLD_EV_MARGIN)
-            .unwrap_or(hold_ev >= Self::HOLD_MIN_EDGE);
+        let rescue_decision = choose_signal_rescue(
+            RescueInputs {
+                leg: LadderLeg::Yes,
+                stranded_qty,
+                avg_cost,
+                fair_win_prob: held_fair,
+                best_exit_bid: None,
+                opposite_best_ask: opposite_effective_ask,
+            },
+            SignalRescueConfig {
+                min_edge_bps: self.config.hedge_rescue_edge_bps,
+                max_rescue_qty: stranded_qty.max(0.0),
+                allow_sell_fallback: false,
+                require_no_guaranteed_loss: true,
+            },
+        );
+        let beats_rescue = !matches!(
+            rescue_decision.action,
+            RescueAction::BuyOppositeForMerge | RescueAction::SellStrandedLeg
+        );
         // Hold is preferred whenever it beats rescue OR rescue is unavailable.
         // The cheap_positive / late_confident flags only set the QUANTITY cap,
         // not whether to hold. Previously, those flags also gated the hold
@@ -4179,134 +4453,115 @@ impl Btc5mMmStrategy {
         right_quote: &QuoteSnapshot,
         right_fair: f64,
         right_cost: f64,
-        gross_cost: f64,
+        _gross_cost: f64,
         max_gross_cost_usd: f64,
         max_leg_cost_usd: f64,
         requested_clip_usd: f64,
+        btc_regime: &crate::signals::BtcRegimeSnapshot,
         market_context: Option<&MarketContextRecord>,
-        venue_rules: Option<&VenueMarketRules>,
+        _venue_rules: Option<&VenueMarketRules>,
         now_ms: EpochMillis,
     ) -> Vec<OrderIntent> {
-        let mut intents = Vec::new();
-        let mut ladder_left_cost = 0.0;
-        let mut ladder_right_cost = 0.0;
-        let mut ladder_gross_cost = 0.0;
-        let levels = self.config.entry_ladder_levels.max(1);
-
-        for level_index in 0..levels {
-            let effective_left_cost = left_cost + ladder_left_cost;
-            let effective_right_cost = right_cost + ladder_right_cost;
-            let effective_gross_cost = gross_cost + ladder_gross_cost;
-            let Some(left_bid_price) = self.candidate_ladder_bid_price(
-                market_id,
-                now_ms,
-                left_quote,
-                left_fair,
-                effective_left_cost,
-                effective_gross_cost,
-                self.config.min_edge_bps,
-                venue_rules,
-                level_index,
-            ) else {
-                break;
-            };
-            let Some(right_bid_price) = self.candidate_ladder_bid_price(
-                market_id,
-                now_ms,
-                right_quote,
-                right_fair,
-                effective_right_cost,
-                effective_gross_cost,
-                self.config.min_edge_bps,
-                venue_rules,
-                level_index,
-            ) else {
-                break;
-            };
-            if left_bid_price.max(right_bid_price) > self.config.entry_premium_bid_cap {
-                break;
-            }
-            let Some(raw_quantity) = self.paired_entry_quantity(
-                market_id,
-                left_quote,
-                right_quote,
-                left_bid_price,
-                right_bid_price,
-                requested_clip_usd,
-                market_context,
-                now_ms,
-            ) else {
-                break;
-            };
-
-            let remaining_left_usd = (max_leg_cost_usd - effective_left_cost).max(0.0);
-            let remaining_right_usd = (max_leg_cost_usd - effective_right_cost).max(0.0);
-            let remaining_gross_usd = (max_gross_cost_usd - effective_gross_cost).max(0.0);
-            let max_quantity_by_budget = (remaining_left_usd / left_bid_price)
-                .min(remaining_right_usd / right_bid_price)
-                .min(remaining_gross_usd / (left_bid_price + right_bid_price));
-            let min_quantity = self.required_order_quantity(left_bid_price.min(right_bid_price));
-            if !max_quantity_by_budget.is_finite() || max_quantity_by_budget + 1e-9 < min_quantity {
-                break;
-            }
-            let quantity = raw_quantity.min(max_quantity_by_budget).max(min_quantity);
-            let left_tag = format!("mm-paired-bid:l{}", level_index + 1);
-            let right_tag = left_tag.clone();
-            let max_left_bid = self.max_bid_for(
-                left_fair,
-                effective_left_cost,
-                effective_gross_cost,
-                self.config.min_edge_bps,
-            );
-            let max_right_bid = self.max_bid_for(
-                right_fair,
-                effective_right_cost,
-                effective_gross_cost,
-                self.config.min_edge_bps,
-            );
-            let Some(mut left_bid) = self.build_bid_intent_at_price(
-                market_id,
-                left_id,
-                left_bid_price,
-                left_fair,
-                max_left_bid,
-                effective_left_cost,
-                effective_gross_cost,
-                quantity,
-                &left_tag,
-                "btc-5m-mm paired ladder bid",
-                now_ms,
-            ) else {
-                break;
-            };
-            let Some(mut right_bid) = self.build_bid_intent_at_price(
-                market_id,
-                right_id,
-                right_bid_price,
-                right_fair,
-                max_right_bid,
-                effective_right_cost,
-                effective_gross_cost,
-                quantity,
-                &right_tag,
-                "btc-5m-mm paired ladder bid",
-                now_ms,
-            ) else {
-                break;
-            };
-
-            let pair_id = format!("pair-{market_id}-{now_ms}-l{}", level_index + 1);
-            left_bid.pair_id = Some(pair_id.clone());
-            right_bid.pair_id = Some(pair_id);
-            ladder_left_cost += left_bid.limit_price * left_bid.quantity;
-            ladder_right_cost += right_bid.limit_price * right_bid.quantity;
-            ladder_gross_cost += left_bid.limit_price * left_bid.quantity
-                + right_bid.limit_price * right_bid.quantity;
-            intents.push(left_bid);
-            intents.push(right_bid);
+        let mut market =
+            BinaryOutcomeMarket::btc_5m(market_id.clone(), left_id.clone(), right_id.clone());
+        market.tick_size = self.config.maker_price_tick;
+        market.min_order_size = self.config.venue_min_order_quantity;
+        if let Some(context) = market_context {
+            market = market.with_context(context);
         }
 
-        intents
+        let left_qty_estimate = if left_fair > 0.0 {
+            left_cost / left_fair.max(self.config.maker_price_tick)
+        } else {
+            0.0
+        };
+        let right_qty_estimate = if right_fair > 0.0 {
+            right_cost / right_fair.max(self.config.maker_price_tick)
+        } else {
+            0.0
+        };
+        let inventory = PairedInventorySnapshot {
+            yes_qty: left_qty_estimate.max(0.0),
+            no_qty: right_qty_estimate.max(0.0),
+            yes_avg_cost: left_fair.clamp(0.0, 1.0),
+            no_avg_cost: right_fair.clamp(0.0, 1.0),
+            free_cash_usd: max_gross_cost_usd.max(0.0),
+            equity_usd: max_gross_cost_usd.max(0.0),
+        };
+        let pair_cost = PairCostTracker::from_inventory(&inventory);
+        let fair_sum = (left_fair + right_fair).max(1e-9);
+        let fair_value = FairValueEstimate {
+            p_up: (left_fair / fair_sum).clamp(0.01, 0.99),
+            p_down: (right_fair / fair_sum).clamp(0.01, 0.99),
+            log_moneyness: 0.0,
+            sigma_remaining: 0.0,
+            time_remaining_s: market
+                .time_remaining_ms(now_ms)
+                .map(|ms| ms as f64 / 1_000.0)
+                .unwrap_or(Self::BAR_PHASE_DEFAULT_WINDOW_MS as f64 / 1_000.0),
+            model: FairValueModel::BsmBinary,
+        };
+
+        let max_depth = self.config.entry_ladder_levels.clamp(1, 8);
+        let config = SignalLadderConfig {
+            min_depth: 1,
+            max_depth,
+            low_vol_depth: max_depth,
+            high_vol_depth: max_depth,
+            late_bar_depth: 2.min(max_depth),
+            low_vol_spacing_ticks: self.config.entry_ladder_spacing_ticks.max(0.5),
+            normal_spacing_ticks: self.config.entry_ladder_spacing_ticks.max(1.0),
+            high_vol_spacing_ticks: (self.config.entry_ladder_spacing_ticks * 3.0).max(3.0),
+            imbalanced_spacing_multiplier: 2.0,
+            late_bar_cutoff_ms: 60_000,
+            base_clip_usd: requested_clip_usd.max(self.config.min_clip_usd),
+            fractional_kelly: 0.20,
+            max_clip_usd: self.config.max_clip_usd,
+            level_multipliers: vec![1.0, 1.8, 2.5, 3.5, 4.0, 4.5, 5.0, 5.5],
+            stoikov: StoikovParams {
+                gamma: (self.config.inventory_skew_bps / 10_000.0).clamp(0.001, 1.0),
+                k: 1.0,
+                max_skew: self.config.entry_premium_bid_cap.min(0.45),
+            },
+            caps: RunningInventoryCaps {
+                max_gross_cost_usd,
+                max_side_imbalance_qty: (max_leg_cost_usd / self.config.maker_price_tick.max(0.01))
+                    .max(self.config.venue_min_order_quantity),
+                max_entry_notional_usd: self.config.max_clip_usd.max(requested_clip_usd),
+            },
+            incentives: crate::signals::IncentiveSignal {
+                min_incentive_size: Some(self.config.venue_min_order_quantity),
+                max_incentive_spread: Some(self.config.max_spread),
+                maker_rebate_bps: None,
+                estimated_reward_edge_bps: None,
+            },
+        };
+
+        let result = build_signal_ladder(
+            &market,
+            &PairedMarketSnapshot {
+                market_id: market_id.clone(),
+                yes_instrument_id: left_id.clone(),
+                no_instrument_id: right_id.clone(),
+                yes_quote: left_quote.clone(),
+                no_quote: right_quote.clone(),
+            },
+            &inventory,
+            &fair_value,
+            btc_regime,
+            &pair_cost,
+            &config,
+            now_ms,
+        );
+
+        result
+            .intents
+            .into_iter()
+            .filter(|intent| {
+                intent.limit_price <= self.config.entry_premium_bid_cap
+                    && intent.notional_usd() >= self.config.min_order_notional_usd
+            })
+            .collect()
     }
 }
 
@@ -4539,6 +4794,7 @@ impl Strategy for Btc5mMmStrategy {
                         max_entry_gross_cost_usd,
                         max_entry_leg_cost_usd,
                         scaled_clip,
+                        &context.btc_regime,
                         context.market_context.as_ref(),
                         context.venue_rules.as_ref(),
                         context.now_ms,
@@ -4553,6 +4809,31 @@ impl Strategy for Btc5mMmStrategy {
                         }
                     }
                     intents.extend(paired);
+                }
+
+                if cooling_reason.is_none() {
+                    if let Some(intent) = self.build_capital_recycle_intent(
+                        &snapshot.market_id,
+                        &left_id,
+                        &left_quote,
+                        left_fair,
+                        left_cost + tick_committed_left_usd,
+                        &right_id,
+                        &right_quote,
+                        right_fair,
+                        right_cost + tick_committed_right_usd,
+                        context.market_context.as_ref(),
+                        context.now_ms,
+                    ) {
+                        let n = intent.notional_usd();
+                        tick_committed_gross_usd += n;
+                        if intent.instrument_id == left_id {
+                            tick_committed_left_usd += n;
+                        } else if intent.instrument_id == right_id {
+                            tick_committed_right_usd += n;
+                        }
+                        intents.push(intent);
+                    }
                 }
 
                 // Late-bar expensive-leg accumulation runs in parallel with paired-bid.
@@ -4817,8 +5098,7 @@ impl Strategy for Btc5mMmStrategy {
                     lift_quote,
                     &mut hold_notes,
                 );
-                let rescue_ok = throttle_ok
-                    && no_loss_rescue_gate
+                let can_attempt_close = throttle_ok
                     && exposure_decision.rescue_qty > 1e-9
                     && self.can_emit_rescue(
                         &snapshot.market_id,
@@ -4827,7 +5107,7 @@ impl Strategy for Btc5mMmStrategy {
                         context.now_ms,
                         &mut hold_notes,
                     );
-                let intent = if rescue_ok {
+                let intent = if can_attempt_close && no_loss_rescue_gate {
                     self.build_rescue_intent_for_quantity(
                         &snapshot.market_id,
                         lift_id,
@@ -4839,7 +5119,11 @@ impl Strategy for Btc5mMmStrategy {
                         "btc-5m-mm hedge rescue",
                         context.now_ms,
                     )
-                    .or_else(|| {
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    if can_attempt_close && self.config.sell_unwind_enabled {
                         self.build_sell_unwind_intent_for_quantity(
                             &snapshot.market_id,
                             held_id,
@@ -4851,10 +5135,10 @@ impl Strategy for Btc5mMmStrategy {
                             "btc-5m-mm hedge rescue",
                             context.now_ms,
                         )
-                    })
-                } else {
-                    None
-                };
+                    } else {
+                        None
+                    }
+                });
                 tracing::info!(
                     target: "strategy.rescue",
                     market = %snapshot.market_id,
@@ -4966,8 +5250,7 @@ impl Strategy for Btc5mMmStrategy {
                         lift_quote,
                         &mut hold_notes,
                     );
-                    let rescue_ok = throttle_ok
-                        && no_loss_rescue_gate
+                    let can_attempt_close = throttle_ok
                         && exposure_decision.rescue_qty > 1e-9
                         && self.can_emit_rescue(
                             &snapshot.market_id,
@@ -4976,7 +5259,7 @@ impl Strategy for Btc5mMmStrategy {
                             context.now_ms,
                             &mut hold_notes,
                         );
-                    let intent = if rescue_ok {
+                    let intent = if can_attempt_close && no_loss_rescue_gate {
                         self.build_rescue_intent_for_quantity(
                             &snapshot.market_id,
                             lift_id,
@@ -4988,7 +5271,11 @@ impl Strategy for Btc5mMmStrategy {
                             "btc-5m-mm asymmetric rescue",
                             context.now_ms,
                         )
-                        .or_else(|| {
+                    } else {
+                        None
+                    }
+                    .or_else(|| {
+                        if can_attempt_close && self.config.sell_unwind_enabled {
                             self.build_sell_unwind_intent_for_quantity(
                                 &snapshot.market_id,
                                 held_id,
@@ -5000,10 +5287,10 @@ impl Strategy for Btc5mMmStrategy {
                                 "btc-5m-mm asymmetric rescue",
                                 context.now_ms,
                             )
-                        })
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        }
+                    });
                     tracing::info!(
                         target: "strategy.rescue",
                         market = %snapshot.market_id,
@@ -5098,6 +5385,7 @@ impl Strategy for Btc5mMmStrategy {
         context: &StrategyContext,
         fill: &crate::types::FillReport,
     ) -> StrategyDecision {
+        self.record_auto_fill_from_context(context, fill);
         let mut notes = vec![format!(
             "btc-5m-mm fill {} {:?} qty={:.4}@{:.4}",
             fill.instrument_id, fill.side, fill.quantity, fill.price
@@ -5251,20 +5539,19 @@ impl Strategy for Btc5mMmStrategy {
         }
         let no_loss_rescue_gate =
             self.rescue_is_not_guaranteed_loss(exposure_decision.avg_cost, &lift_quote, &mut notes);
-        let rescue_ok = no_loss_rescue_gate
-            && self.can_emit_rescue(
-                &fill.market_id,
-                &stranded_id,
-                &lift_id,
-                context.now_ms,
-                &mut notes,
-            );
-        if !rescue_ok {
+        let can_attempt_close = self.can_emit_rescue(
+            &fill.market_id,
+            &stranded_id,
+            &lift_id,
+            context.now_ms,
+            &mut notes,
+        );
+        if !can_attempt_close {
             return StrategyDecision::reactive(intents, notes);
         }
         let gross_cost = Self::gross_cost_usd(&context.inventory, &fill.market_id);
-        let intent = self
-            .build_rescue_intent_for_quantity(
+        let intent = if no_loss_rescue_gate {
+            self.build_rescue_intent_for_quantity(
                 &fill.market_id,
                 &lift_id,
                 &lift_quote,
@@ -5275,7 +5562,11 @@ impl Strategy for Btc5mMmStrategy {
                 "btc-5m-mm on-fill rescue",
                 context.now_ms,
             )
-            .or_else(|| {
+        } else {
+            None
+        }
+        .or_else(|| {
+            if self.config.sell_unwind_enabled {
                 self.build_sell_unwind_intent_for_quantity(
                     &fill.market_id,
                     &stranded_id,
@@ -5287,7 +5578,10 @@ impl Strategy for Btc5mMmStrategy {
                     "btc-5m-mm on-fill rescue",
                     context.now_ms,
                 )
-            });
+            } else {
+                None
+            }
+        });
         tracing::info!(
             target: "strategy.on_fill_rescue",
             market = %fill.market_id,

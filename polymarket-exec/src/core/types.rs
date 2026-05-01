@@ -8,7 +8,9 @@ pub type EpochMillis = u64;
 
 macro_rules! id_type {
     ($name:ident) => {
-        #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        #[derive(
+            Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+        )]
         pub struct $name(String);
 
         impl $name {
@@ -60,7 +62,7 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TradeSide {
     Buy,
     Sell,
@@ -75,7 +77,7 @@ impl TradeSide {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FillLiquidity {
     Maker,
     Taker,
@@ -221,6 +223,56 @@ pub struct OrderIntent {
 }
 
 impl OrderIntent {
+    pub fn new_buy(
+        client_order_id: ClientOrderId,
+        market_id: MarketId,
+        instrument_id: InstrumentId,
+        limit_price: f64,
+        quantity: f64,
+        reason: impl Into<String>,
+        created_at_ms: EpochMillis,
+    ) -> Self {
+        Self {
+            client_order_id,
+            market_id,
+            instrument_id,
+            side: TradeSide::Buy,
+            limit_price,
+            quantity,
+            reduce_only: false,
+            reason: reason.into(),
+            quote_level_tag: None,
+            created_at_ms,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        }
+    }
+
+    pub fn new_sell(
+        client_order_id: ClientOrderId,
+        market_id: MarketId,
+        instrument_id: InstrumentId,
+        limit_price: f64,
+        quantity: f64,
+        reason: impl Into<String>,
+        created_at_ms: EpochMillis,
+    ) -> Self {
+        Self {
+            client_order_id,
+            market_id,
+            instrument_id,
+            side: TradeSide::Sell,
+            limit_price,
+            quantity,
+            reduce_only: true,
+            reason: reason.into(),
+            quote_level_tag: None,
+            created_at_ms,
+            pair_id: None,
+            kind: IntentKind::Close,
+        }
+    }
+
     pub fn notional_usd(&self) -> f64 {
         self.limit_price * self.quantity
     }
@@ -295,4 +347,174 @@ pub enum RuntimeCommand {
     Merge(MergeIntent),
     Redeem(RedeemIntent),
     Noop,
+}
+
+/// Market-making quote kind used for typed reporting and risk attribution.
+///
+/// This replaces string-prefix classification such as
+/// `mm-paired-bid:l1` / `mm-hedge-rescue` at new seams. Existing tags can
+/// still carry the human-readable venue/debug label, but decisions should
+/// pass through typed variants first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MmQuoteKind {
+    PairedEntry,
+    CapitalRecycle,
+    ConvexAccumulation,
+    HedgeRescue,
+    ReduceOnlyExit,
+    LateBarCore,
+}
+
+impl MmQuoteKind {
+    pub fn from_quote_level_tag(tag: &str) -> Option<Self> {
+        let tag = tag.to_ascii_lowercase();
+        if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
+            Some(Self::PairedEntry)
+        } else if tag.contains("capital-recycle") || tag.contains("buy-light") {
+            Some(Self::CapitalRecycle)
+        } else if tag.contains("convex") {
+            Some(Self::ConvexAccumulation)
+        } else if tag.contains("hedge-rescue") || tag.contains("rescue") {
+            Some(Self::HedgeRescue)
+        } else if tag.contains("sell-unwind") || tag.contains("reduce") {
+            Some(Self::ReduceOnlyExit)
+        } else if tag.contains("late-bar-core") {
+            Some(Self::LateBarCore)
+        } else {
+            None
+        }
+    }
+}
+
+/// Scope of a strategy suppression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SuppressionScope {
+    /// Skip paired-entry quotes only. Convex accumulation / close-side rescue
+    /// may still be valid.
+    PairedOnly,
+    /// Skip all entry paths. Close-side rescue and merge commands still pass
+    /// through the risk boundary.
+    AllEntry,
+    /// Runtime is degraded enough that no new venue action should be emitted
+    /// except explicit cancel/flatten logic owned by runtime.
+    AllActions,
+}
+
+/// Typed cooling / suppression reasons for strategy decisions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CoolingReason {
+    RuntimeDegraded,
+    BtcRegimeInactive,
+    AsymmetricFillCooldown,
+    PostFillCooldown,
+    PremiumFairCap,
+    MarketMidMoved,
+    BtcTrending,
+    GrossCostCap,
+    SideImbalanceCap,
+    EndOfBar,
+    NoSignal(String),
+    Other(String),
+}
+
+impl CoolingReason {
+    pub fn scope(&self) -> SuppressionScope {
+        match self {
+            Self::RuntimeDegraded
+            | Self::BtcRegimeInactive
+            | Self::AsymmetricFillCooldown
+            | Self::PostFillCooldown
+            | Self::GrossCostCap
+            | Self::SideImbalanceCap
+            | Self::EndOfBar => SuppressionScope::AllEntry,
+            Self::PremiumFairCap | Self::MarketMidMoved | Self::BtcTrending => {
+                SuppressionScope::PairedOnly
+            }
+            Self::NoSignal(_) | Self::Other(_) => SuppressionScope::AllEntry,
+        }
+    }
+}
+
+/// Typed strategy output for the new paired-MM seam.
+///
+/// The legacy crate still has `strategy::StrategyDecision`; this type is the
+/// target interface for the refactored engine. Strategy modules propose typed
+/// decisions; runtime/risk adapters approve, reject, or translate them into
+/// `RuntimeCommand`s.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum StrategyDecision {
+    QuoteSet {
+        intents: Vec<OrderIntent>,
+        notes: Vec<String>,
+    },
+    CapitalRecycle {
+        intents: Vec<OrderIntent>,
+        notes: Vec<String>,
+    },
+    Rescue {
+        intents: Vec<OrderIntent>,
+        notes: Vec<String>,
+    },
+    Merge {
+        intent: MergeIntent,
+        notes: Vec<String>,
+    },
+    Suppress {
+        scope: SuppressionScope,
+        reason: CoolingReason,
+        preserve_quotes: bool,
+        notes: Vec<String>,
+    },
+    Noop {
+        notes: Vec<String>,
+    },
+}
+
+impl StrategyDecision {
+    pub fn quote_set(intents: Vec<OrderIntent>, notes: Vec<String>) -> Self {
+        Self::QuoteSet { intents, notes }
+    }
+
+    pub fn rescue(intents: Vec<OrderIntent>, notes: Vec<String>) -> Self {
+        Self::Rescue { intents, notes }
+    }
+
+    pub fn capital_recycle(intents: Vec<OrderIntent>, notes: Vec<String>) -> Self {
+        Self::CapitalRecycle { intents, notes }
+    }
+
+    pub fn suppress(reason: CoolingReason, preserve_quotes: bool, notes: Vec<String>) -> Self {
+        let scope = reason.scope();
+        Self::Suppress {
+            scope,
+            reason,
+            preserve_quotes,
+            notes,
+        }
+    }
+
+    pub fn noop() -> Self {
+        Self::Noop { notes: Vec::new() }
+    }
+
+    pub fn intents(&self) -> &[OrderIntent] {
+        match self {
+            Self::QuoteSet { intents, .. }
+            | Self::CapitalRecycle { intents, .. }
+            | Self::Rescue { intents, .. } => intents,
+            Self::Merge { .. } | Self::Suppress { .. } | Self::Noop { .. } => &[],
+        }
+    }
+
+    pub fn into_runtime_commands(self) -> Vec<RuntimeCommand> {
+        match self {
+            Self::QuoteSet { intents, .. }
+            | Self::CapitalRecycle { intents, .. }
+            | Self::Rescue { intents, .. } => {
+                intents.into_iter().map(RuntimeCommand::Submit).collect()
+            }
+            Self::Merge { intent, .. } => vec![RuntimeCommand::Merge(intent)],
+            Self::Suppress { .. } | Self::Noop { .. } => Vec::new(),
+        }
+    }
 }

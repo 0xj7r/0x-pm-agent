@@ -6,8 +6,6 @@
 //! paying MATIC gas. This module wraps that flow so `relayer.merge_positions`
 //! and `relayer.redeem_positions` can dispatch to it transparently.
 
-use std::time::Duration;
-
 use alloy::network::EthereumWallet;
 use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -17,9 +15,11 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 
 use crate::wire::execution_adapter::ExecutionError;
+use crate::wire::polygon_rpc::{
+    missing_rpc_error, PolygonRpcConfig, DEFAULT_POLYGON_RPC_GAS_LIMIT,
+    DEFAULT_POLYGON_RPC_RECEIPT_TIMEOUT,
+};
 
-const DEFAULT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_GAS_LIMIT: u64 = 250_000;
 pub const POLYGON_CHAIN_ID: u64 = 137;
 pub const COLLATERAL_ONRAMP: Address = address!("93070a847efEf7F70739046A929D47a521F5B8ee");
 pub const USDCE: Address = address!("2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
@@ -41,9 +41,7 @@ sol! {
 
 #[derive(Clone)]
 pub struct EoaPolygonSubmitter {
-    rpc_url: String,
-    gas_limit: u64,
-    receipt_timeout: Duration,
+    rpc: PolygonRpcConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,14 +58,32 @@ pub struct PusdWrapReport {
 impl EoaPolygonSubmitter {
     pub fn new(rpc_url: String) -> Self {
         Self {
-            rpc_url,
-            gas_limit: DEFAULT_GAS_LIMIT,
-            receipt_timeout: DEFAULT_RECEIPT_TIMEOUT,
+            rpc: PolygonRpcConfig::from_parts(
+                rpc_url,
+                std::iter::empty::<String>(),
+                crate::wire::polygon_rpc::DEFAULT_POLYGON_RPC_REQUEST_TIMEOUT,
+                DEFAULT_POLYGON_RPC_RECEIPT_TIMEOUT,
+                DEFAULT_POLYGON_RPC_GAS_LIMIT,
+            ),
         }
     }
 
+    pub fn from_env(rpc_url: String) -> Self {
+        Self {
+            rpc: PolygonRpcConfig::from_primary_and_env(rpc_url),
+        }
+    }
+
+    pub fn with_rpc_config(rpc: PolygonRpcConfig) -> Self {
+        Self { rpc }
+    }
+
     pub fn rpc_url(&self) -> &str {
-        &self.rpc_url
+        self.rpc.primary_url().unwrap_or("")
+    }
+
+    pub fn rpc_config(&self) -> &PolygonRpcConfig {
+        &self.rpc
     }
 
     pub async fn ensure_pusd_from_usdce(
@@ -149,17 +165,33 @@ impl EoaPolygonSubmitter {
     }
 
     async fn eth_call(&self, to: Address, data: Bytes) -> Result<Bytes, ExecutionError> {
-        let url = self.rpc_url.parse::<reqwest::Url>().map_err(|error| {
-            ExecutionError::BadRequest(format!(
-                "invalid POLYGON_RPC_URL `{}`: {error}",
-                self.rpc_url
-            ))
-        })?;
-        let provider = ProviderBuilder::new().connect_http(url);
-        let request = TransactionRequest::default().to(to).input(data.into());
-        provider.call(request).await.map_err(|error| {
-            ExecutionError::TransientNetwork(format!("polygon eth_call failed: {error}"))
-        })
+        let mut last_error: Option<ExecutionError> = None;
+        for endpoint in self.rpc.endpoints() {
+            let url = match endpoint.url().parse::<reqwest::Url>() {
+                Ok(url) => url,
+                Err(error) => {
+                    last_error = Some(ExecutionError::BadRequest(format!(
+                        "invalid POLYGON_RPC_URL `{}`: {error}",
+                        endpoint.redacted_url()
+                    )));
+                    continue;
+                }
+            };
+            let provider = ProviderBuilder::new().connect_http(url);
+            let request = TransactionRequest::default()
+                .to(to)
+                .input(data.clone().into());
+            match provider.call(request).await {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => {
+                    last_error = Some(ExecutionError::TransientNetwork(format!(
+                        "polygon eth_call failed via {}: {error}",
+                        endpoint.redacted_url()
+                    )));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| missing_rpc_error("eth_call")))
     }
 
     /// Build, sign, submit, and await receipt for a single contract call.
@@ -171,10 +203,14 @@ impl EoaPolygonSubmitter {
         to: Address,
         data: Bytes,
     ) -> Result<B256, ExecutionError> {
-        let url = self.rpc_url.parse::<reqwest::Url>().map_err(|error| {
+        let primary = self
+            .rpc
+            .primary()
+            .ok_or_else(|| missing_rpc_error("transaction submit"))?;
+        let url = primary.url().parse::<reqwest::Url>().map_err(|error| {
             ExecutionError::BadRequest(format!(
                 "invalid POLYGON_RPC_URL `{}`: {error}",
-                self.rpc_url
+                primary.redacted_url()
             ))
         })?;
         let wallet = EthereumWallet::from(signer.clone());
@@ -186,7 +222,7 @@ impl EoaPolygonSubmitter {
             .from(from)
             .input(data.into())
             .value(U256::ZERO)
-            .gas_limit(self.gas_limit);
+            .gas_limit(self.rpc.gas_limit());
 
         let pending = provider.send_transaction(request).await.map_err(|error| {
             let text = error.to_string();
@@ -204,7 +240,7 @@ impl EoaPolygonSubmitter {
 
         let tx_hash = *pending.tx_hash();
         let receipt = pending
-            .with_timeout(Some(self.receipt_timeout))
+            .with_timeout(Some(self.rpc.receipt_timeout()))
             .get_receipt()
             .await
             .map_err(|error| {

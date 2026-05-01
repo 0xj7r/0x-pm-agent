@@ -2337,6 +2337,28 @@ impl<S: Strategy> Runtime<S> {
                     ));
                 }
             },
+            StrategyDecision::Commands { commands, .. } => {
+                for command in commands {
+                    match command {
+                        RuntimeCommand::Submit(intent) => {
+                            outcome.extend(self.accept_intent(intent, now_ms));
+                        }
+                        RuntimeCommand::Cancel {
+                            client_order_id,
+                            reason,
+                        } => {
+                            outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
+                        }
+                        RuntimeCommand::Merge(intent) => {
+                            outcome.push_command(RuntimeCommand::Merge(intent));
+                        }
+                        RuntimeCommand::Redeem(intent) => {
+                            outcome.push_command(RuntimeCommand::Redeem(intent));
+                        }
+                        RuntimeCommand::Noop => {}
+                    }
+                }
+            }
             StrategyDecision::QuoteSet { intents, .. } => {
                 let intents_in = intents.len();
                 let level_tags_in: Vec<String> = intents
@@ -3645,7 +3667,8 @@ mod tests {
     };
     use crate::types::{
         BookLevel, ClientOrderId, CloseMethod, FillLiquidity, FillReport, InstrumentId, MarketId,
-        MarketSnapshot, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, TradeSide,
+        MarketSnapshot, MergeIntent, OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus,
+        TradeSide,
     };
 
     use std::collections::HashMap;
@@ -3761,6 +3784,34 @@ mod tests {
         }
     }
 
+    struct MergeCommandStrategy;
+
+    impl Strategy for MergeCommandStrategy {
+        fn name(&self) -> &str {
+            "merge-command-test"
+        }
+
+        fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
+            StrategyDecision::commands(
+                vec![RuntimeCommand::Merge(MergeIntent {
+                    command_id: ClientOrderId::from("merge-1"),
+                    market_id: MarketId::from("market-1"),
+                    condition_id: Some("condition-1".to_string()),
+                    yes_instrument_id: InstrumentId::from("yes"),
+                    no_instrument_id: InstrumentId::from("no"),
+                    quantity: 3.0,
+                    expected_cash_usd: 3.0,
+                    expected_cost_usd: 2.85,
+                    expected_fee_usd: 0.0,
+                    expected_gas_usd: 0.0,
+                    reason: "test merge command".to_string(),
+                    created_at_ms: 1,
+                })],
+                vec!["merge command emitted".to_string()],
+            )
+        }
+    }
+
     #[test]
     fn runtime_reserves_then_applies_fill() {
         let mut runtime = Runtime::new(
@@ -3828,6 +3879,31 @@ mod tests {
             10.0
         );
         assert!((runtime.inventory().free_cash_usd() - 95.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn strategy_commands_emit_merge_without_quote_reconciliation() {
+        let mut runtime = Runtime::new(
+            RuntimeConfig {
+                starting_cash_usd: 100.0,
+                event_log_capacity: 128,
+                initial_status: RuntimeStatus::Starting,
+                ..RuntimeConfig::default()
+            },
+            RiskLimits::default(),
+            MergeCommandStrategy,
+            MarketContextStore::empty(),
+        );
+
+        let started = runtime.start(1);
+        assert_eq!(started.commands.len(), 1);
+        match &started.commands[0] {
+            RuntimeCommand::Merge(intent) => {
+                assert_eq!(intent.market_id, MarketId::from("market-1"));
+                assert_eq!(intent.quantity, 3.0);
+            }
+            other => panic!("expected merge command, got {other:?}"),
+        }
     }
 
     #[test]

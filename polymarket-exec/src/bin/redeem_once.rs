@@ -11,8 +11,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use polymarket_exec::wire::execution_adapter::PolymarketSignatureType;
 use polymarket_exec::wire::relayer::{
-    CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
-    DEFAULT_RELAYER_URL,
+    CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
 };
 
 #[tokio::main]
@@ -50,15 +49,16 @@ async fn main() -> Result<()> {
                 );
             }
             "-h" | "--help" => {
-                println!("redeem_once --condition-id 0x... [--index-sets 1,2] [--collateral 0x...]");
+                println!(
+                    "redeem_once --condition-id 0x... [--index-sets 1,2] [--collateral 0x...]"
+                );
                 return Ok(());
             }
             other => return Err(anyhow!("unknown arg: {other}")),
         }
     }
 
-    let condition_id =
-        condition_id.ok_or_else(|| anyhow!("--condition-id is required"))?;
+    let condition_id = condition_id.ok_or_else(|| anyhow!("--condition-id is required"))?;
 
     let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
         .or_else(|_| std::env::var("METAMASK_PRIVATE_KEY"))
@@ -67,8 +67,8 @@ async fn main() -> Result<()> {
         .context("failed to parse POLYMARKET_PRIVATE_KEY")?;
     let signer_address = format!("{:?}", signer.address());
 
-    let signature_type_raw = std::env::var("POLYMARKET_SIGNATURE_TYPE")
-        .unwrap_or_else(|_| "eoa".to_string());
+    let signature_type_raw =
+        std::env::var("POLYMARKET_SIGNATURE_TYPE").unwrap_or_else(|_| "eoa".to_string());
     let signature_type = PolymarketSignatureType::parse(&signature_type_raw)
         .map_err(|e| anyhow!("failed to parse signature type: {e:?}"))?;
     let signature_type_code = signature_type.as_polymarket_code();

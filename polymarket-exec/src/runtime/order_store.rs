@@ -58,7 +58,7 @@ impl OrderRecord {
             last_update_ms: intent.created_at_ms,
             reason: Some(intent.reason.clone()),
             strategy_tag: strategy_tag.into(),
-            quote_level_tag: None,
+            quote_level_tag: intent.quote_level_tag.clone(),
         }
     }
 }

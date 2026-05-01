@@ -1,7 +1,7 @@
 use super::{
     Btc5mMmConfig, Btc5mMmMarketMode, Btc5mMmMarketState, Btc5mMmRescueState, Btc5mMmStrategy,
     GoatPairConfig, GoatPairStrategy, NoopStrategy, QuoteSnapshot, Strategy, StrategyContext,
-    StrategyDecision,
+    StrategyDecision, StrategyMode,
 };
 use super::{
     BtcRegimeSnapshot, MarketActivitySignal, PairedBookSignal, SessionBucket,
@@ -141,6 +141,18 @@ fn context_with_unlawful_signal(
         btc_regime: complete_btc_regime(now_ms),
         venue_rules: None,
     }
+}
+
+#[test]
+fn live_strategy_selector_rejects_bonereaper_benchmark_mode() {
+    let error = StrategyMode::try_from_name("bonereaper", None).unwrap_err();
+    assert!(error.contains("benchmark/research-only"));
+}
+
+#[test]
+fn live_strategy_selector_aliases_paired_mm_to_btc_5m_mm_runtime() {
+    let strategy = StrategyMode::try_from_name("paired_mm", None).unwrap();
+    assert_eq!(strategy.name(), "btc_5m_mm");
 }
 
 fn complete_btc_regime(now_ms: u64) -> crate::signals::BtcRegimeSnapshot {

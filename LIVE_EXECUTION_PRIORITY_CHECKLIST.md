@@ -8,6 +8,14 @@ Apr 28 raw activity for the canonical maker-active wallet `0xb27bc932...` showed
 
 **Single highest-leverage next item: item 21 (operator calibration report).** Without it, no further fix can be validated as helpful or harmful. Treat as the immediate unlock; everything else compounds from it.
 
+## Session Anchor (2026-04-30)
+
+Three categories of bugs surfaced during a $370 overnight bleed and rogue-process incident. Items 57-69 below capture them. Bot is currently masked at the systemd level after the 09:25 UTC incident; do not unmask without working through items 57-61.
+
+Cross-validation: same day, whale `0xb27bc932...` was -$7K. So today's regime was hostile to ALL paired-MM operators, not just our bot. This does NOT excuse the engine/strategy bugs below — they were independently confirmed in the journal — but it does argue against pivoting strategy direction on N=1 bad day. Fix the engine and strategy-design bugs first; reassess strategy thesis after a longer measurement window.
+
+**Re-rank for capital safety:** items 57-58 (single-bar-wipeout strategy bugs) now precede item 21 in priority. Item 21 still gates tuning validation but item 57-58 gate "is it safe to leave the bot running unattended overnight." Without 57-58, kill switch alone is not sufficient — see item 60 (rogue process incident).
+
 ## P0 - Live Trading Blockers
 
 - [x] 1. Fix IOC/FOK/GTC V2 order expiration
@@ -279,6 +287,44 @@ TODO.md was archived 2026-04-29 to deduplicate against this checklist. Items bel
   - Issue: Whale Apr 28 + 35-day historical analysis (190K+ trades, r=0.688 vol↔late-exp correlation) shows late-bar expensive-leg accumulation is 13-25% of his notional, vol-driven. Our engine has no path for this — paired bidding handles 50/50 mid-prices, convex_accum (gated tightly) handles cheap-leg accumulation, but the LATE-BAR EXPENSIVE leg (where whale loads up at $0.85+ when one side is clearly winning) is missing.
   - Fix shape: New `late_bar_core_accumulation` path that fires when `time_remaining < 120s AND time_remaining > 30s AND expensive_leg_ask in [0.85, 0.97] AND realized_vol_5m_bps >= threshold AND macro_signal_confirms_direction`. Place passive limit at maker price.
   - See: `docs/strategy/asymmetric_core_hedge_spec.md` (TBD).
+
+## P8 — Items added 2026-04-30 (overnight bleed + rogue-process incident)
+
+These are added in priority order. 57-58 are highest because they are single-bar-wipeout-potential and one was confirmed firing live (457-share UP accumulation on market 2114119, $209 cost vs $40 cap, lucky positive resolution +$248). 60 is highest infra item because it confirmed that a process can run *outside* systemd's view and trade with no oversight.
+
+### Strategy-design (single-bar wipeout potential)
+
+- [ ] 57. **Per-market side-imbalance cap.** Confirmed bug 2026-04-30: bot accumulated 457 UP shares with 0 DOWN on market 2114119, $209 cost basis vs config cap `MAX_GROSS_COST_USD=40`. Mechanism: 20-level paired ladder regenerated every tick during a directional move; UP bids filled progressively as price fell, DOWN bids never filled because price was rising. Fix shape: `if abs(up_qty - down_qty) > N`, refuse new entry orders on the heavier side this tick. N should be derived from clip size (e.g., 5x typical clip) rather than constant.
+
+- [ ] 58. **Gross-cost cap applied to running total, not per-decision.** Same incident as 57. The `MAX_GROSS_COST_USD=40` cap is currently checked at decision time but ignores accumulated inventory. Fix shape: include filled-leg notional in cap evaluation. This cap is the second line of defense after 57; needed independently because 57 only fires for imbalanced positions and 58 catches accumulated balanced positions too.
+
+- [ ] 59. **Rescue path EV gate (no guaranteed-loss rescues).** Confirmed bug 2026-04-30: 82% of paired-bid → rescue chains had pair_cost > $1.00 over the 11h window. Bot would systematically lose money rescuing positions. Already addressed in the parked typed-enum patch via `rescue_is_not_guaranteed_loss` ($1.00 cap), but not currently in the live binary. Land as part of item 64 (typed decision contract) or as standalone if 64 slips.
+
+### Operational invariants
+
+- [ ] 60. **Singleton lock + process-list verification.** Confirmed bug 2026-04-30: a polymarket-exec process (PID 341835) was running OUTSIDE systemd starting at 08:47 UTC. Origin unknown; `systemctl --user stop` could not affect it because it was not registered with systemd. Bot accumulated $150+ in new positions during what we believed was a stopped state. Fix shape: (a) binary acquires exclusive `flock` on `${WHALE_PAIR_ROOT_DIR}/polymarket-exec.lock` at startup and refuses to start if held; auto-releases on exit. (b) deploy preflight (item 17) checks `pgrep polymarket-exec` matches systemd MainPID exactly. (c) post-deploy smoke check (item 18) verifies same. Lives under deployment pipeline (items 16-18).
+
+- [ ] 61. **End-of-bar inventory unwind/hedge.** Bot can accumulate during the bar and resolve at random binary outcome. Last 30s before resolution = pure 50/50 dice. Add: aggressive flatten or force-merge when `bar_remaining_ms < 30000` AND inventory is imbalanced.
+
+- [ ] 62. **Cooldown after one-sided fills before regenerating ladder.** Bot regenerates a 20-level ladder every tick. When one side keeps filling adversely, no cooldown stops the cascade. Add per-market entry cooldown of e.g. 5s after any one-sided fill until both sides have filled or the pair has merged.
+
+- [ ] 63. **Trend-aware ladder generation.** Ladder posts both sides symmetrically regardless of underlying trend. Use existing `BtcRegime` classifier to gate the trending-side ladder posts during `DirectionalSmooth` and `TrendingVolatile` regimes — quote only the side opposite the trend or skip both.
+
+### Architecture
+
+- [ ] 64. **Land typed `StrategyDecision` enum + EV-gated rescue.** Patch is currently parked in working tree (stashed during redeem_once deploy). Variants: Noop / Reactive / QuoteSet / Suppress { kind }. Replaces hidden bool `preserve_quotes`. Closes the rescue-tears-down-paired-quote bug class on both `on_fill` and `on_market_snapshot` paths. Test status when last verified: 300 passed / 14 failed (same 14 as HEAD baseline, pre-existing). The 14 failures need quarantine (item 67) before this can land cleanly. Do not bundle other tuning into the same patch (see `feedback_no_muddy_patch_stacks.md`).
+
+- [ ] 65. **`RiskEngine::approve(intent) -> Result<>` boundary.** Risk management currently lives inside the strategy. Architectural fix: introduce a Risk layer between strategy and execution that strategy cannot bypass. Items 57, 58, 67-style caps belong here, not in strategy.
+
+- [ ] 66. **Cross-market correlation cap.** Long UP across 5 sequential 5-min markets is a single directional bet, not a diversified market-make. Add aggregate "net directional exposure across all live markets" cap.
+
+### Process / quality
+
+- [ ] 67. **Quarantine the 14 pre-existing failing tests.** Mark with `#[ignore = "TODO ticket-N"]` or fix. Until the suite is honest, every patch ships against an unreadable baseline (we used A/B stash testing during item 64 verification because the baseline was red — that's a smell).
+
+- [ ] 68. **Env file hygiene.** `~/.config/polymarket-exec/btc_5m_mm_tinylive.env` has duplicate `POLYMARKET_SIGNATURE_TYPE` lines (`=2` and `=eoa`). Last-wins in shell `source` semantics so `eoa` (=0) takes effect, but this is a subtle footgun. Audit for other duplicates; consider tracked template (item 17 covers env validation in preflight).
+
+- [ ] 69. **Post-fill markout instrumentation.** Measure adverse selection directly: book mid 30s/60s after fill vs fill price. Without this, every tuning patch is guessing. Gate further tuning behind this landing. Related to item 21 (calibration report) but specifically for adverse-selection signal, not maker/taker classification.
 
 ## Archived
 
