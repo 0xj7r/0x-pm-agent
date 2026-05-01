@@ -908,11 +908,6 @@ impl HybridStrategy {
                     paired_mm = Some(PairedMmStrategy::new(profile.paired_mm_config()));
                 }
                 "noop" => {}
-                "unlawful_shear" | "goat_pair" | "bonereaper" | "strategy_bonereaper" => {
-                    return Err(format!(
-                        "legacy strategy '{name}' has been removed; use pair_cost_arb,paired_mm"
-                    ));
-                }
                 other => return Err(format!("unsupported strategy '{other}'")),
             }
         }
