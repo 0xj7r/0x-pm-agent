@@ -987,26 +987,6 @@ fn replay_reconcile_merge_recovery() {
 }
 
 #[test]
-fn unlawful_entry_window_valid_core_entry_and_hedge_probe() {
-    run_fixture("unlawful_entry_window");
-}
-
-#[test]
-fn unlawful_regime_closed_no_buy_intents() {
-    run_fixture("unlawful_regime_closed");
-}
-
-#[test]
-fn unlawful_merge_stall_drives_cleanup_only_actions() {
-    run_fixture("unlawful_merge_stall_cleanup");
-}
-
-#[test]
-fn unlawful_late_window_only_reduce_only_cleanup() {
-    run_fixture("unlawful_late_window_cleanup_only");
-}
-
-#[test]
 fn late_fill_after_cancel_applies_via_terminal_fill_correction() {
     run_fixture("late_fill_after_cancel");
 }

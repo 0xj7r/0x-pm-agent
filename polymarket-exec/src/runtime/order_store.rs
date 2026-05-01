@@ -64,55 +64,6 @@ impl OrderRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SignalSnapshotRecord {
-    pub run_id: String,
-    pub market_id: MarketId,
-    pub observed_at_ms: EpochMillis,
-    pub session_bucket: String,
-    pub mode: String,
-    pub aggression_tier: Option<String>,
-    pub cheap_instrument_id: InstrumentId,
-    pub expensive_instrument_id: InstrumentId,
-    pub cheap_bid: Option<f64>,
-    pub cheap_ask: Option<f64>,
-    pub expensive_bid: Option<f64>,
-    pub expensive_ask: Option<f64>,
-    pub price_gap: Option<f64>,
-    pub books_fresh: bool,
-    pub both_sides_present: bool,
-    pub cheap_spread: Option<f64>,
-    pub expensive_spread: Option<f64>,
-    pub cheap_bid_depth_top3_qty: Option<f64>,
-    pub cheap_ask_depth_top3_qty: Option<f64>,
-    pub expensive_bid_depth_top3_qty: Option<f64>,
-    pub expensive_ask_depth_top3_qty: Option<f64>,
-    pub cheap_bid_notional_top3: Option<f64>,
-    pub cheap_ask_notional_top3: Option<f64>,
-    pub expensive_bid_notional_top3: Option<f64>,
-    pub expensive_ask_notional_top3: Option<f64>,
-    pub cheap_depth_imbalance_top3: Option<f64>,
-    pub expensive_depth_imbalance_top3: Option<f64>,
-    pub btc_last_price: Option<f64>,
-    pub btc_realized_vol_5m_bps: Option<f64>,
-    pub btc_realized_vol_15m_bps: Option<f64>,
-    pub btc_trade_count_5m: u64,
-    pub btc_trade_count_15m: u64,
-    pub btc_return_30s_bps: Option<f64>,
-    pub btc_return_60s_bps: Option<f64>,
-    pub btc_observed_at_ms: EpochMillis,
-    pub activity_10s: u32,
-    pub activity_30s: u32,
-    pub activity_60s: u32,
-    pub activity_age_ms: Option<u64>,
-    pub first_fill_ms: Option<u64>,
-    pub first_merge_ms: Option<u64>,
-    pub elapsed_s: Option<u64>,
-    pub time_remaining_s: Option<u64>,
-    pub clip_scale: f64,
-    pub gate_reasons: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub enum OrderStoreError {
     Io(String),
     NotFound(ClientOrderId),
@@ -171,10 +122,6 @@ pub trait OrderStore {
         market_id: &MarketId,
         instrument_id: &InstrumentId,
     ) -> std::result::Result<Option<f64>, OrderStoreError>;
-    fn insert_signal_snapshot(
-        &mut self,
-        record: SignalSnapshotRecord,
-    ) -> std::result::Result<(), OrderStoreError>;
     fn put_strategy_state(
         &mut self,
         run_id: &str,
@@ -268,74 +215,6 @@ impl SqliteOrderStore {
 
         self.connection
             .execute(
-                "CREATE TABLE IF NOT EXISTS signal_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_id TEXT NOT NULL,
-                    market_id TEXT NOT NULL,
-                    observed_at_ms INTEGER NOT NULL,
-                    session_bucket TEXT NOT NULL,
-                    mode TEXT NOT NULL,
-                    aggression_tier TEXT,
-                    cheap_instrument_id TEXT NOT NULL,
-                    expensive_instrument_id TEXT NOT NULL,
-                    cheap_bid REAL,
-                    cheap_ask REAL,
-                    expensive_bid REAL,
-                    expensive_ask REAL,
-                    price_gap REAL,
-                    books_fresh INTEGER NOT NULL,
-                    both_sides_present INTEGER NOT NULL,
-                    cheap_spread REAL,
-                    expensive_spread REAL,
-                    cheap_bid_depth_top3_qty REAL,
-                    cheap_ask_depth_top3_qty REAL,
-                    expensive_bid_depth_top3_qty REAL,
-                    expensive_ask_depth_top3_qty REAL,
-                    cheap_bid_notional_top3 REAL,
-                    cheap_ask_notional_top3 REAL,
-                    expensive_bid_notional_top3 REAL,
-                    expensive_ask_notional_top3 REAL,
-                    cheap_depth_imbalance_top3 REAL,
-                    expensive_depth_imbalance_top3 REAL,
-                    btc_last_price REAL,
-                    btc_realized_vol_5m_bps REAL,
-                    btc_realized_vol_15m_bps REAL,
-                    btc_trade_count_5m INTEGER NOT NULL,
-                    btc_trade_count_15m INTEGER NOT NULL,
-                    btc_return_30s_bps REAL,
-                    btc_return_60s_bps REAL,
-                    btc_observed_at_ms INTEGER NOT NULL,
-                    activity_10s INTEGER NOT NULL,
-                    activity_30s INTEGER NOT NULL,
-                    activity_60s INTEGER NOT NULL,
-                    activity_age_ms INTEGER,
-                    first_fill_ms INTEGER,
-                    first_merge_ms INTEGER,
-                    elapsed_s INTEGER,
-                    time_remaining_s INTEGER,
-                    clip_scale REAL NOT NULL,
-                    gate_reasons TEXT NOT NULL
-                )",
-                (),
-            )
-            .map_err(|error| {
-                OrderStoreError::Sqlite(format!("failed to create signal_snapshots table: {error}"))
-            })?;
-
-        self.connection
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_signal_snapshots_market_time
-                 ON signal_snapshots (market_id, observed_at_ms)",
-                (),
-            )
-            .map_err(|error| {
-                OrderStoreError::Sqlite(format!(
-                    "failed to create signal_snapshots market-time index: {error}"
-                ))
-            })?;
-
-        self.connection
-            .execute(
                 "CREATE TABLE IF NOT EXISTS strategy_state (
                     strategy_tag TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
@@ -362,54 +241,6 @@ impl SqliteOrderStore {
                 OrderStoreError::Sqlite(format!("failed to create runtime_state table: {error}"))
             })?;
 
-        for (column, declaration) in [
-            ("cheap_spread", "REAL"),
-            ("expensive_spread", "REAL"),
-            ("cheap_bid_depth_top3_qty", "REAL"),
-            ("cheap_ask_depth_top3_qty", "REAL"),
-            ("expensive_bid_depth_top3_qty", "REAL"),
-            ("expensive_ask_depth_top3_qty", "REAL"),
-            ("cheap_bid_notional_top3", "REAL"),
-            ("cheap_ask_notional_top3", "REAL"),
-            ("expensive_bid_notional_top3", "REAL"),
-            ("expensive_ask_notional_top3", "REAL"),
-            ("cheap_depth_imbalance_top3", "REAL"),
-            ("expensive_depth_imbalance_top3", "REAL"),
-        ] {
-            self.ensure_column("signal_snapshots", column, declaration)?;
-        }
-
-        Ok(())
-    }
-
-    fn ensure_column(
-        &self,
-        table: &str,
-        column: &str,
-        declaration: &str,
-    ) -> std::result::Result<(), OrderStoreError> {
-        let pragma = format!("PRAGMA table_info({table})");
-        let exists = self
-            .connection
-            .prepare(&pragma)
-            .and_then(|mut stmt| {
-                let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                Ok(rows.filter_map(Result::ok).any(|name| name == column))
-            })
-            .map_err(|error| {
-                OrderStoreError::Sqlite(format!(
-                    "failed to inspect sqlite table info for {table}: {error}"
-                ))
-            })?;
-        if exists {
-            return Ok(());
-        }
-        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}");
-        self.connection.execute(&alter, ()).map_err(|error| {
-            OrderStoreError::Sqlite(format!(
-                "failed to add sqlite column {table}.{column}: {error}"
-            ))
-        })?;
         Ok(())
     }
 
@@ -880,118 +711,6 @@ impl OrderStore for SqliteOrderStore {
         Ok(Some((notional / quantity).max(0.0)))
     }
 
-    fn insert_signal_snapshot(
-        &mut self,
-        record: SignalSnapshotRecord,
-    ) -> std::result::Result<(), OrderStoreError> {
-        self.connection
-            .execute(
-                "INSERT INTO signal_snapshots (
-                    run_id,
-                    market_id,
-                    observed_at_ms,
-                    session_bucket,
-                    mode,
-                    aggression_tier,
-                    cheap_instrument_id,
-                    expensive_instrument_id,
-                    cheap_bid,
-                    cheap_ask,
-                    expensive_bid,
-                    expensive_ask,
-                    price_gap,
-                    books_fresh,
-                    both_sides_present,
-                    cheap_spread,
-                    expensive_spread,
-                    cheap_bid_depth_top3_qty,
-                    cheap_ask_depth_top3_qty,
-                    expensive_bid_depth_top3_qty,
-                    expensive_ask_depth_top3_qty,
-                    cheap_bid_notional_top3,
-                    cheap_ask_notional_top3,
-                    expensive_bid_notional_top3,
-                    expensive_ask_notional_top3,
-                    cheap_depth_imbalance_top3,
-                    expensive_depth_imbalance_top3,
-                    btc_last_price,
-                    btc_realized_vol_5m_bps,
-                    btc_realized_vol_15m_bps,
-                    btc_trade_count_5m,
-                    btc_trade_count_15m,
-                    btc_return_30s_bps,
-                    btc_return_60s_bps,
-                    btc_observed_at_ms,
-                    activity_10s,
-                    activity_30s,
-                    activity_60s,
-                    activity_age_ms,
-                    first_fill_ms,
-                    first_merge_ms,
-                    elapsed_s,
-                    time_remaining_s,
-                    clip_scale,
-                    gate_reasons
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                    ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-                    ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45
-                )",
-                params![
-                    record.run_id,
-                    record.market_id.as_str(),
-                    record.observed_at_ms as i64,
-                    record.session_bucket,
-                    record.mode,
-                    record.aggression_tier,
-                    record.cheap_instrument_id.as_str(),
-                    record.expensive_instrument_id.as_str(),
-                    record.cheap_bid,
-                    record.cheap_ask,
-                    record.expensive_bid,
-                    record.expensive_ask,
-                    record.price_gap,
-                    if record.books_fresh { 1 } else { 0 },
-                    if record.both_sides_present { 1 } else { 0 },
-                    record.cheap_spread,
-                    record.expensive_spread,
-                    record.cheap_bid_depth_top3_qty,
-                    record.cheap_ask_depth_top3_qty,
-                    record.expensive_bid_depth_top3_qty,
-                    record.expensive_ask_depth_top3_qty,
-                    record.cheap_bid_notional_top3,
-                    record.cheap_ask_notional_top3,
-                    record.expensive_bid_notional_top3,
-                    record.expensive_ask_notional_top3,
-                    record.cheap_depth_imbalance_top3,
-                    record.expensive_depth_imbalance_top3,
-                    record.btc_last_price,
-                    record.btc_realized_vol_5m_bps,
-                    record.btc_realized_vol_15m_bps,
-                    record.btc_trade_count_5m as i64,
-                    record.btc_trade_count_15m as i64,
-                    record.btc_return_30s_bps,
-                    record.btc_return_60s_bps,
-                    record.btc_observed_at_ms as i64,
-                    record.activity_10s as i64,
-                    record.activity_30s as i64,
-                    record.activity_60s as i64,
-                    record.activity_age_ms.map(|value| value as i64),
-                    record.first_fill_ms.map(|value| value as i64),
-                    record.first_merge_ms.map(|value| value as i64),
-                    record.elapsed_s.map(|value| value as i64),
-                    record.time_remaining_s.map(|value| value as i64),
-                    record.clip_scale,
-                    record.gate_reasons,
-                ],
-            )
-            .map_err(|error| {
-                OrderStoreError::Sqlite(format!("failed to insert signal snapshot: {error}"))
-            })?;
-        Ok(())
-    }
-
     fn put_strategy_state(
         &mut self,
         run_id: &str,
@@ -1097,7 +816,7 @@ impl OrderStore for SqliteOrderStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrderStore, OrderStoreError, SignalSnapshotRecord, SqliteOrderStore};
+    use super::{OrderStore, OrderStoreError, SqliteOrderStore};
     use crate::types::{
         ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, RuntimeStatus,
         TradeSide,
@@ -1359,73 +1078,6 @@ mod tests {
         store.insert(record.clone())?;
         let result = store.insert(record);
         assert!(matches!(result, Err(OrderStoreError::Conflict(_))));
-        Ok(())
-    }
-
-    #[test]
-    fn signal_snapshots_are_persisted() -> anyhow::Result<()> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("polymarket-exec-signal-store-{ts}.sqlite"));
-        let mut store = SqliteOrderStore::open(path)?;
-
-        store.insert_signal_snapshot(SignalSnapshotRecord {
-            run_id: "run-1".to_string(),
-            market_id: MarketId::from("mkt-1"),
-            observed_at_ms: 1234,
-            session_bucket: "Opportunistic".to_string(),
-            mode: "Manage".to_string(),
-            aggression_tier: Some("Light".to_string()),
-            cheap_instrument_id: InstrumentId::from("cheap-1"),
-            expensive_instrument_id: InstrumentId::from("expensive-1"),
-            cheap_bid: Some(0.39),
-            cheap_ask: Some(0.40),
-            expensive_bid: Some(0.59),
-            expensive_ask: Some(0.60),
-            price_gap: Some(0.20),
-            books_fresh: true,
-            both_sides_present: true,
-            cheap_spread: Some(0.01),
-            expensive_spread: Some(0.01),
-            cheap_bid_depth_top3_qty: Some(240.0),
-            cheap_ask_depth_top3_qty: Some(180.0),
-            expensive_bid_depth_top3_qty: Some(210.0),
-            expensive_ask_depth_top3_qty: Some(190.0),
-            cheap_bid_notional_top3: Some(93.0),
-            cheap_ask_notional_top3: Some(72.0),
-            expensive_bid_notional_top3: Some(123.9),
-            expensive_ask_notional_top3: Some(114.0),
-            cheap_depth_imbalance_top3: Some(0.142857),
-            expensive_depth_imbalance_top3: Some(0.05),
-            btc_last_price: Some(77700.0),
-            btc_realized_vol_5m_bps: Some(3.0),
-            btc_realized_vol_15m_bps: Some(5.0),
-            btc_trade_count_5m: 100,
-            btc_trade_count_15m: 150,
-            btc_return_30s_bps: Some(1.2),
-            btc_return_60s_bps: Some(2.4),
-            btc_observed_at_ms: 1200,
-            activity_10s: 50,
-            activity_30s: 100,
-            activity_60s: 150,
-            activity_age_ms: Some(250),
-            first_fill_ms: Some(1240),
-            first_merge_ms: None,
-            elapsed_s: Some(12),
-            time_remaining_s: Some(288),
-            clip_scale: 0.8,
-            gate_reasons: "none".to_string(),
-        })?;
-
-        let count: i64 =
-            store
-                .connection
-                .query_row("SELECT COUNT(*) FROM signal_snapshots", (), |row| {
-                    row.get(0)
-                })?;
-        assert_eq!(count, 1);
         Ok(())
     }
 
