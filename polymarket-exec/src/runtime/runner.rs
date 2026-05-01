@@ -225,10 +225,11 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
 
     // Build runtime with the same shape as live, but no order_store /
     // journal / live adapter. Replay is in-memory only.
-    let strategy = crate::strategy::StrategyMode::from_name(
+    let strategy = crate::strategy::StrategyMode::try_from_name(
         &config.strategy_name,
         config.strategy_profile.as_ref(),
-    );
+    )
+    .map_err(anyhow::Error::msg)?;
     // Capture fee coefficient before strategy is moved into Runtime so
     // replay's paper_fill_from_book_snapshot calls model fees correctly.
     // Bug fix: was passing 0.0, which made every replay-mode taker fill
@@ -881,7 +882,9 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let (market_assets_tx, market_assets_rx) =
         watch::channel(initial_universe.market_assets.clone());
     let (user_markets_tx, user_markets_rx) = watch::channel(initial_universe.user_markets.clone());
-    let strategy = StrategyMode::from_name(&config.strategy_name, config.strategy_profile.as_ref());
+    let strategy =
+        StrategyMode::try_from_name(&config.strategy_name, config.strategy_profile.as_ref())
+            .map_err(anyhow::Error::msg)?;
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();

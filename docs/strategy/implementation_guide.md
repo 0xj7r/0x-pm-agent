@@ -320,11 +320,11 @@ incrementing. Patched on 2026-04-29.
 **Symptom:** operator sets `quote.levels_per_side: 8` in profile JSON,
 ladder still emits 3 levels.
 
-**Root cause:** `StrategyMode::from_name("btc_5m_mm", profile)` ignores
+**Root cause:** `StrategyMode::try_from_name("btc_5m_mm", profile)` ignores
 the profile and calls `Btc5mMmConfig::from_env()`. The profile path
 is wired for other strategies but not this one.
 
-**Detection:** `grep -n 'StrategyMode::from_name\|btc_5m_mm.*profile'` —
+**Detection:** `grep -n 'StrategyMode::try_from_name\|btc_5m_mm.*profile'` —
 if no profile field flows into `Btc5mMmConfig`, none will take effect.
 
 **Fix path:** PR1 in the audit (`docs/strategy/audit_2026-04-29.md`) —

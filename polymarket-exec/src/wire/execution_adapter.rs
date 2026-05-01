@@ -1224,7 +1224,7 @@ impl PolymarketExecutionAdapter {
             })?;
         let recipient = self.trade_address.unwrap_or_else(|| self.signer.address());
         let min_wrap_amount = scaled_usdc_units(min_wrap_usd)?;
-        let submitter = EoaPolygonSubmitter::new(rpc_url.to_string());
+        let submitter = EoaPolygonSubmitter::from_env(rpc_url.to_string());
         submitter
             .ensure_pusd_from_usdce(&self.signer, recipient, min_wrap_amount)
             .await

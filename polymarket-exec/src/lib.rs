@@ -2,18 +2,21 @@
 
 pub mod config;
 pub mod core;
+pub mod data;
 pub mod event_log;
+pub mod infra;
 pub mod journal;
 pub mod logging;
 pub mod market_making;
+pub mod markets;
 pub mod metrics;
 pub mod paper;
 pub mod runtime;
 pub mod signals;
+pub mod strategies;
 pub mod strategy;
-pub mod strategy_bonereaper;
 pub mod wire;
 
-pub use core::{book, inventory, market_context, risk, types};
+pub use core::{book, inventory, lot_ledger, market_context, risk, types};
 pub use market_making as mm;
 pub use market_making::{merge_executor, pair_ledger, quote_engine, quote_reconciler};

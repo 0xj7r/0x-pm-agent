@@ -30,7 +30,7 @@ pub enum LogFormat {
 /// One slug-prefix / window pair that the discovery loop should sweep.
 ///
 /// The legacy single-family discovery uses `market_discovery_slug_prefix` plus
-/// `market_discovery_window`. Strategies like `bonereaper` need to span
+/// `market_discovery_window`. Multi-market strategies may need to span
 /// multiple families simultaneously (BTC 5m + ETH 5m + BTC 15m + ...), each
 /// with its own slug timestamp window. When `market_discovery_families` is
 /// non-empty the runner iterates these instead of the single-prefix path.

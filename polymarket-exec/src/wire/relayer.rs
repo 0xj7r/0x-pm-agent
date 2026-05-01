@@ -154,7 +154,7 @@ impl CtfRelayerClient {
                 .polygon_rpc_url
                 .as_ref()
                 .filter(|url| !url.trim().is_empty())
-                .map(|url| EoaPolygonSubmitter::new(url.clone()))
+                .map(|url| EoaPolygonSubmitter::from_env(url.clone()))
         } else {
             None
         };
