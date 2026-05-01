@@ -4,10 +4,10 @@
 //! with regime, visible book depth, time-to-bar-end, and inventory imbalance.
 //! It is pure: no venue calls, no state mutation, no runtime side effects.
 
-use crate::market_making::paired_mm::pair_cost_tracker::PairCostTracker;
+use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::paired_mm::risk_boundary::filter_entry_intents;
 use crate::market_making::paired_mm::stoikov::{stoikov_reservation_price, StoikovParams};
-use crate::market_making::paired_mm::types::{
+use crate::market_making::pairing::types::{
     LadderLeg, LadderRegime, PairedInventorySnapshot, PairedMarketSnapshot, RunningInventoryCaps,
 };
 use crate::markets::MarketDescriptor;

@@ -62,6 +62,10 @@ operational:
   asymmetric_fill_max_penalty: 0.02
   max_exposure_usd: 12
   max_session_loss_bps: 2500
+  enable_buy_light_side_rebalance: true
+  recycle_min_imbalance_qty: 5.0
+  recycle_min_time_remaining_ms: 90000
+  recycle_max_light_side_spread: 0.10
 
 # ── Metadata ─────────────────────────────────────────────────────────────────
 version: "1.0"

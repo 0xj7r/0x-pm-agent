@@ -19,7 +19,10 @@ This spec is now implemented in `polymarket-exec` through the new modular strate
 - Legacy `unlawful_shear`, `goat_pair`, and `bonereaper` strategy implementations are removed from the active runtime selector.
 - Generic `strategies::StrategyRegistry` now supports both `paired_mm` and `pair_cost_arb`.
 - Active source/config no longer exposes a live bonereaper strategy path.
-- Normal merge/capital recycling remains runtime-owned after fills; `pair_cost_arb` emits cheap-leg BUY intents and relies on the existing merge planner for matched inventory.
+- Shared YES/NO pairing primitives now live under `polymarket-exec/src/market_making/pairing/`.
+- `pair_cost_arb` owns the full Gabagool loop: cheap-leg BUYs, buy-light-side recycling, late-window convexity, and merge-trigger decisions.
+- `paired_mm` is now the two-sided ladder overlay only: Stoikov reservation pricing, dynamic depth/spacing, and quote emission.
+- Runtime remains the hard execution seam for actual `MergeIntent` submission and on-chain merge settlement.
 
 This document consolidates **the entire conversation history** — original paired-MM plan, live-testing pain points, all mathematical details, signals, risk engine, configuration, data requirements, infrastructure, and the full migration plan. It covers **both strategies** in depth so the receiving agent can perform a complete audit, analysis, and modular implementation.
 

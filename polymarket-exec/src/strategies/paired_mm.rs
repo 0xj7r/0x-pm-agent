@@ -85,23 +85,6 @@ where
             decision.ladder.diagnostics.no_reservation
         ));
 
-        if let Some(intent) = decision.capital_recycle_intent().cloned() {
-            return StrategyDecision::capital_recycle(vec![intent], notes);
-        }
-
-        if decision.should_emit_rescue() {
-            return StrategyDecision::rescue(
-                Vec::new(),
-                notes
-                    .into_iter()
-                    .chain(std::iter::once(
-                        "paired-mm rescue selected; concrete rescue intent builder not wired"
-                            .to_string(),
-                    ))
-                    .collect(),
-            );
-        }
-
         if let Some(reason) = PairedMmEngine::suppression_reason(&decision) {
             return StrategyDecision::suppress(reason, false, notes);
         }

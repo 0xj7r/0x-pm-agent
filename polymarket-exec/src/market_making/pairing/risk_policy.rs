@@ -4,7 +4,7 @@
 //! the engine should focus entirely on flattening because end-of-bar risk is
 //! too high.
 
-use crate::market_making::paired_mm::types::PairedInventorySnapshot;
+use crate::market_making::pairing::types::PairedInventorySnapshot;
 use crate::signals::BtcRegimeSnapshot;
 use crate::types::CoolingReason;
 

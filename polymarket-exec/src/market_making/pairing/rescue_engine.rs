@@ -1,6 +1,6 @@
 //! EV-gated rescue decisions for stranded one-sided inventory.
 
-use crate::market_making::paired_mm::types::LadderLeg;
+use crate::market_making::pairing::types::LadderLeg;
 use crate::types::OrderIntent;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

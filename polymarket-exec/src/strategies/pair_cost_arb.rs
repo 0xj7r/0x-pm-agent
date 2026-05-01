@@ -2,20 +2,27 @@
 //!
 //! This is the market-agnostic version of the Gabagool-style loop:
 //! buy only the cheap leg when fair-value edge and projected pair cost allow,
-//! then let runtime merge balanced inventory.
+//! buy the light side when that is the best route back to merge, and emit
+//! merge commands for balanced inventory.
 
-use crate::market_making::paired_mm::pair_cost_tracker::{Leg, PairCostTracker};
-use crate::market_making::paired_mm::types::PairedMarketSnapshot;
+use crate::market_making::pairing::capital_recycler::{
+    choose_capital_recycle, CapitalRecycleConfig, CapitalRecycleDecision,
+};
+use crate::market_making::pairing::pair_cost_tracker::{Leg, PairCostTracker};
+use crate::market_making::pairing::types::PairedMarketSnapshot;
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyInput, TradingStrategy};
 use crate::types::{
-    ClientOrderId, InstrumentId, IntentKind, OrderIntent, QuoteSnapshot, StrategyDecision,
+    ClientOrderId, InstrumentId, IntentKind, MergeIntent, OrderIntent, QuoteSnapshot,
+    StrategyDecision,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairCostArbStrategyConfig {
     pub pair_cost_threshold: f64,
     pub high_vol_pair_cost_threshold: f64,
+    pub min_merge_usd: f64,
+    pub merge_gas_cost_usd: f64,
     pub high_vol_atr_threshold: f64,
     pub pause_in_extreme_vol: bool,
     pub price_deviation_bps: f64,
@@ -28,6 +35,10 @@ pub struct PairCostArbStrategyConfig {
     pub convex_p_threshold: f64,
     pub avoid_rehedging_when_convex: bool,
     pub allow_extra_clip_on_winner: bool,
+    pub enable_buy_light_side_rebalance: bool,
+    pub recycle_min_imbalance_qty: f64,
+    pub recycle_min_time_remaining_ms: u64,
+    pub recycle_max_light_side_spread: f64,
     pub fractional_kelly: f64,
     pub capital_scale_factor: f64,
     pub maker_safety_ticks: f64,
@@ -38,6 +49,8 @@ impl Default for PairCostArbStrategyConfig {
         Self {
             pair_cost_threshold: 0.99,
             high_vol_pair_cost_threshold: 0.97,
+            min_merge_usd: 50.0,
+            merge_gas_cost_usd: 0.30,
             high_vol_atr_threshold: 0.00085,
             pause_in_extreme_vol: true,
             price_deviation_bps: 35.0,
@@ -50,6 +63,10 @@ impl Default for PairCostArbStrategyConfig {
             convex_p_threshold: 0.70,
             avoid_rehedging_when_convex: true,
             allow_extra_clip_on_winner: true,
+            enable_buy_light_side_rebalance: true,
+            recycle_min_imbalance_qty: 5.0,
+            recycle_min_time_remaining_ms: 90_000,
+            recycle_max_light_side_spread: 0.10,
             fractional_kelly: 0.15,
             capital_scale_factor: 1.0,
             maker_safety_ticks: 2.0,
@@ -108,6 +125,55 @@ impl PairCostArbStrategy {
             Leg::No => input.inventory.no_qty > input.inventory.yes_qty + 1e-9,
         };
         has_winner_excess.then_some(winner)
+    }
+
+    fn merge_intent<M: MarketDescriptor>(&self, input: &StrategyInput<M>) -> Option<MergeIntent> {
+        let quantity = input.inventory.yes_qty.min(input.inventory.no_qty).max(0.0);
+        if quantity <= 1e-9 {
+            return None;
+        }
+        let expected_cash_usd = quantity;
+        if expected_cash_usd + 1e-9 < self.config.min_merge_usd {
+            return None;
+        }
+        let expected_cost_usd = quantity * input.inventory.yes_avg_cost.max(0.0)
+            + quantity * input.inventory.no_avg_cost.max(0.0);
+        let pair_cost = if quantity > 0.0 {
+            expected_cost_usd / quantity
+        } else {
+            0.0
+        };
+        Some(MergeIntent {
+            command_id: ClientOrderId::from(format!(
+                "pair-cost-merge:{}:{:.8}:{}",
+                input.snapshot.market_id, quantity, input.now_ms
+            )),
+            market_id: input.snapshot.market_id.clone(),
+            condition_id: None,
+            yes_instrument_id: input.snapshot.yes_instrument_id.clone(),
+            no_instrument_id: input.snapshot.no_instrument_id.clone(),
+            quantity,
+            expected_cash_usd,
+            expected_cost_usd,
+            expected_fee_usd: 0.0,
+            expected_gas_usd: self.config.merge_gas_cost_usd.max(0.0),
+            reason: format!(
+                "pair-cost arb merge paired inventory qty={quantity:.4} pair_cost={pair_cost:.4}"
+            ),
+            created_at_ms: input.now_ms,
+        })
+    }
+
+    fn capital_recycle_config(&self, target_pair_cost: f64) -> CapitalRecycleConfig {
+        CapitalRecycleConfig {
+            pair_cost_target: target_pair_cost,
+            min_imbalance_qty: self.config.recycle_min_imbalance_qty.max(0.0),
+            max_buy_qty: 10_000.0,
+            max_buy_notional_usd: self.config.max_clip_usd.max(self.config.min_clip_usd),
+            min_time_remaining_ms: self.config.recycle_min_time_remaining_ms,
+            max_light_side_spread: self.config.recycle_max_light_side_spread.max(0.0),
+            race_buffer_ticks: self.config.maker_safety_ticks.max(0.0),
+        }
     }
 
     fn maker_bid_price<M: MarketDescriptor>(
@@ -263,20 +329,57 @@ where
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
-        if self.is_extreme_vol_paused(input.btc_regime.realized_vol_5m_bps) {
-            return StrategyDecision::Noop {
-                notes: vec!["pair-cost arb suppressed: extreme volatility pause".to_string()],
-            };
-        }
-
         let target = self.effective_pair_cost_target(input.btc_regime.realized_vol_5m_bps);
         let convex_winner = self.active_convex_winner(&input);
-        let mut candidates = Vec::new();
         let mut notes = vec![format!(
             "pair-cost arb fair p_up={:.4} p_down={:.4} target={:.4}",
             input.fair_value.p_up, input.fair_value.p_down, target
         )];
 
+        if let Some(intent) = self.merge_intent(&input) {
+            notes.push(format!(
+                "pair-cost merge emitted qty={:.4} expected_net_gain={:.4}",
+                intent.quantity,
+                intent.expected_net_gain_usd()
+            ));
+            return StrategyDecision::Merge { intent, notes };
+        }
+
+        if self.is_extreme_vol_paused(input.btc_regime.realized_vol_5m_bps) {
+            notes.push("pair-cost arb suppressed: extreme volatility pause".to_string());
+            return StrategyDecision::Noop { notes };
+        }
+
+        if self.config.enable_buy_light_side_rebalance && convex_winner.is_none() {
+            match choose_capital_recycle(
+                &input.market,
+                &input.snapshot,
+                &input.inventory,
+                self.capital_recycle_config(target),
+                input.now_ms,
+            ) {
+                CapitalRecycleDecision::BuyLightSide {
+                    intent,
+                    projected_pair_cost,
+                    reason,
+                    ..
+                } => {
+                    notes.push(reason);
+                    notes.push(format!(
+                        "pair-cost recycle emitted projected_pair_cost={projected_pair_cost:.4}"
+                    ));
+                    return StrategyDecision::capital_recycle(vec![intent], notes);
+                }
+                CapitalRecycleDecision::Wait { reason } => notes.push(reason),
+            }
+        } else if convex_winner.is_some() {
+            notes.push(
+                "pair-cost recycle skipped: late-window convex winner excess is active"
+                    .to_string(),
+            );
+        }
+
+        let mut candidates = Vec::new();
         let mut allow_leg = |leg: Leg| -> bool {
             let Some(winner) = convex_winner else {
                 return true;
@@ -357,7 +460,7 @@ fn strategy_client_order_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market_making::paired_mm::types::PairedInventorySnapshot;
+    use crate::market_making::pairing::types::PairedInventorySnapshot;
     use crate::markets::BinaryOutcomeMarket;
     use crate::signals::{BtcRegimeSnapshot, FairValueEstimate, FairValueModel};
     use crate::types::{BookLevel, MarketId, TradeSide};

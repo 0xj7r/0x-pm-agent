@@ -4,7 +4,7 @@
 //! decides whether a merge is worth emitting now based on paired quantity,
 //! notional, expected gain, gas, and batching thresholds.
 
-use crate::pair_ledger::MergeCandidate;
+use crate::market_making::pairing::pair_ledger::MergeCandidate;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MergePolicyConfig {
