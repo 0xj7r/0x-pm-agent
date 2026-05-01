@@ -19,34 +19,15 @@ use crate::market_making::paired_mm::{
 };
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketTenor, UnderlyingAsset};
 use crate::quote_engine::QuoteEngineConfig;
-use crate::signals::{
-    estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel, UnlawfulGateConfig,
-};
+use crate::signals::{estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel};
 use crate::signals::fair_value::NoSignalReason;
 use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
 use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{
-    BookLevel, EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot, OrderIntent,
-    QuoteSnapshot, RuntimeCommand, RuntimeStatus, SuppressionScope,
+    EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot, OrderIntent, QuoteSnapshot,
+    RuntimeCommand, RuntimeStatus, SuppressionScope,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionBucket {
-    Preferred,
-    Neutral,
-    Opportunistic,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnlawfulExecutionMode {
-    Standby,
-    Entry,
-    Manage,
-    Cleanup,
-    Flatten,
-}
 
 #[derive(Debug, Clone)]
 pub struct BtcRegimeSnapshot {
@@ -71,137 +52,6 @@ impl Default for BtcRegimeSnapshot {
             return_30s_bps: None,
             return_60s_bps: None,
             observed_at_ms: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PairedBookSignal {
-    pub cheap_instrument_id: InstrumentId,
-    pub expensive_instrument_id: InstrumentId,
-    pub cheap_bid: Option<BookLevel>,
-    pub cheap_ask: Option<BookLevel>,
-    pub expensive_bid: Option<BookLevel>,
-    pub expensive_ask: Option<BookLevel>,
-    pub price_gap: Option<f64>,
-    pub observed_at_ms: u64,
-    pub books_fresh: bool,
-    pub both_sides_present: bool,
-    pub cheap_spread: Option<f64>,
-    pub expensive_spread: Option<f64>,
-    pub cheap_bid_depth_top3_qty: Option<f64>,
-    pub cheap_ask_depth_top3_qty: Option<f64>,
-    pub expensive_bid_depth_top3_qty: Option<f64>,
-    pub expensive_ask_depth_top3_qty: Option<f64>,
-    pub cheap_bid_notional_top3: Option<f64>,
-    pub cheap_ask_notional_top3: Option<f64>,
-    pub expensive_bid_notional_top3: Option<f64>,
-    pub expensive_ask_notional_top3: Option<f64>,
-    pub cheap_depth_imbalance_top3: Option<f64>,
-    pub expensive_depth_imbalance_top3: Option<f64>,
-    pub cheap_taker_buy_qty_60s: f64,
-    pub cheap_taker_sell_qty_60s: f64,
-    pub expensive_taker_buy_qty_60s: f64,
-    pub expensive_taker_sell_qty_60s: f64,
-}
-
-impl PairedBookSignal {
-    pub fn with_ids(
-        cheap_instrument_id: InstrumentId,
-        expensive_instrument_id: InstrumentId,
-        cheap_bid: Option<BookLevel>,
-        cheap_ask: Option<BookLevel>,
-        expensive_bid: Option<BookLevel>,
-        expensive_ask: Option<BookLevel>,
-        observed_at_ms: u64,
-        books_fresh: bool,
-    ) -> Self {
-        let price_gap = cheap_ask.as_ref().and_then(|cheap| {
-            expensive_ask
-                .as_ref()
-                .map(|expensive| expensive.price - cheap.price)
-        });
-        let both_sides_present = cheap_bid.is_some()
-            && cheap_ask.is_some()
-            && expensive_bid.is_some()
-            && expensive_ask.is_some();
-        Self {
-            cheap_instrument_id,
-            expensive_instrument_id,
-            cheap_bid,
-            cheap_ask,
-            expensive_bid,
-            expensive_ask,
-            price_gap,
-            observed_at_ms,
-            books_fresh,
-            both_sides_present,
-            cheap_spread: None,
-            expensive_spread: None,
-            cheap_bid_depth_top3_qty: None,
-            cheap_ask_depth_top3_qty: None,
-            expensive_bid_depth_top3_qty: None,
-            expensive_ask_depth_top3_qty: None,
-            cheap_bid_notional_top3: None,
-            cheap_ask_notional_top3: None,
-            expensive_bid_notional_top3: None,
-            expensive_ask_notional_top3: None,
-            cheap_depth_imbalance_top3: None,
-            expensive_depth_imbalance_top3: None,
-            cheap_taker_buy_qty_60s: 0.0,
-            cheap_taker_sell_qty_60s: 0.0,
-            expensive_taker_buy_qty_60s: 0.0,
-            expensive_taker_sell_qty_60s: 0.0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct MarketActivitySignal {
-    pub last_trade_event_count_10s: u32,
-    pub last_trade_event_count_30s: u32,
-    pub last_trade_event_count_60s: u32,
-    pub last_trade_event_age_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UnlawfulSignalSnapshot {
-    pub session_bucket: SessionBucket,
-    pub mode: UnlawfulExecutionMode,
-    pub gate_reasons: Vec<String>,
-    pub btc: BtcRegimeSnapshot,
-    pub book: PairedBookSignal,
-    pub activity: MarketActivitySignal,
-    pub first_fill_ms: Option<u64>,
-    pub first_merge_ms: Option<u64>,
-    pub elapsed_s: Option<u64>,
-    pub time_remaining_s: Option<u64>,
-    pub clip_scale: f64,
-}
-
-impl Default for UnlawfulSignalSnapshot {
-    fn default() -> Self {
-        Self {
-            session_bucket: SessionBucket::Unknown,
-            mode: UnlawfulExecutionMode::Standby,
-            gate_reasons: Vec::new(),
-            btc: BtcRegimeSnapshot::default(),
-            book: PairedBookSignal::with_ids(
-                InstrumentId::from(""),
-                InstrumentId::from(""),
-                None,
-                None,
-                None,
-                None,
-                0,
-                false,
-            ),
-            activity: MarketActivitySignal::default(),
-            first_fill_ms: None,
-            first_merge_ms: None,
-            elapsed_s: None,
-            time_remaining_s: None,
-            clip_scale: 1.0,
         }
     }
 }
@@ -296,7 +146,6 @@ pub struct StrategyContext {
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
     pub market_context: Option<MarketContextRecord>,
-    pub unlawful_signal: Option<UnlawfulSignalSnapshot>,
     pub btc_regime: crate::signals::BtcRegimeSnapshot,
     pub venue_rules: Option<VenueMarketRules>,
 }
@@ -757,10 +606,6 @@ pub struct OperationalSection {
 pub trait Strategy {
     fn name(&self) -> &str;
 
-    fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
-        None
-    }
-
     fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
         StrategyDecision::none()
     }
@@ -833,10 +678,6 @@ impl Strategy for StrategyMode {
             Self::Hybrid(strategy) => strategy.name(),
             Self::Noop(strategy) => strategy.name(),
         }
-    }
-
-    fn unlawful_gate_config(&self) -> Option<UnlawfulGateConfig> {
-        None
     }
 
     fn on_start(&mut self, context: &StrategyContext) -> StrategyDecision {

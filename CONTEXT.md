@@ -17,6 +17,7 @@ This spec is now implemented in `polymarket-exec` through the new modular strate
 - Runtime config accepts the new `PM_BTC_5M_*` prefix for old `WHALE_PAIR_*` keys through parser aliases.
 - `btc_5m_mm` is now only a compatibility alias for the modular `paired_mm` strategy, not a legacy implementation.
 - Legacy `unlawful_shear`, `goat_pair`, and `bonereaper` strategy implementations are removed from the active runtime selector.
+- The legacy `unlawful_gate` signal/runtime path has been removed; active runtime strategy modes are `pair_cost_arb`, `paired_mm`, and their hybrid composition.
 - Generic `strategies::StrategyRegistry` now supports both `paired_mm` and `pair_cost_arb`.
 - Active source/config no longer exposes a live bonereaper strategy path.
 - Shared YES/NO pairing primitives now live under `polymarket-exec/src/market_making/pairing/`.
