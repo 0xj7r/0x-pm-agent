@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::markets::MarketDescriptor;
-use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
+use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::StrategyDecision;
 

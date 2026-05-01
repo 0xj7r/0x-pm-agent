@@ -16,8 +16,8 @@ behavior does not drift into shell wrappers or silent env mismatches.
 
 | Env var | Parsed in | Launcher coverage | Notes |
 |---|---|---|---|
-| `WHALE_PAIR_DISABLE_SINGLETON_LOCK` | `polymarket-exec/src/main.rs` | Optional operator override | Disables the live singleton lock. Paper mode bypasses the lock automatically. |
-| `WHALE_PAIR_EXEC_LOCK_PATH` | `polymarket-exec/src/main.rs` | Optional operator override | Overrides the default live lockfile path `/tmp/polymarket-exec.live.lock`. |
+| `PM_BTC_5M_DISABLE_SINGLETON_LOCK` | `polymarket-exec/src/main.rs` | Optional operator override | Disables the live singleton lock. Paper mode bypasses the lock automatically. |
+| `PM_BTC_5M_EXEC_LOCK_PATH` | `polymarket-exec/src/main.rs` | Optional operator override | Overrides the default live lockfile path `/tmp/polymarket-exec.live.lock`. |
 | `POLYGON_RPC_URL` | `polymarket-exec/src/config/mod.rs`, `polymarket-exec/src/wire/polygon_rpc.rs` | Required for EOA merge/redeem/wrap | Primary Polygon RPC endpoint. Transaction sends use only the primary endpoint to avoid duplicate broadcasts. |
 | `POLYGON_RPC_FAILOVER_URLS` | `polymarket-exec/src/wire/polygon_rpc.rs` | Optional operator override | Comma-separated failovers used for read/preflight calls such as `eth_call` / `eth_blockNumber`. |
 | `POLYGON_RPC_REQUEST_TIMEOUT_MS` | `polymarket-exec/src/wire/polygon_rpc.rs` | Optional operator override | Timeout for JSON-RPC health/preflight requests. |

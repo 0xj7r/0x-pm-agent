@@ -15,6 +15,7 @@ pub mod runtime;
 pub mod signals;
 pub mod strategies;
 pub mod strategy;
+pub mod strategy_profile;
 pub mod wire;
 
 pub use core::{book, inventory, lot_ledger, market_context, risk, types};

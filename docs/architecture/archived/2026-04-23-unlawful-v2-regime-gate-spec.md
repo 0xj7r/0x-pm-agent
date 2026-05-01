@@ -48,7 +48,7 @@ This spec should be implemented by extending those surfaces, not by replacing th
 
 Notes:
 
-- `WHALE_PAIR_STRATEGY_PROFILE_PATH` is still supported by the runtime, but it is optional
+- `PM_BTC_5M_STRATEGY_PROFILE_PATH` is still supported by the runtime, but it is optional
 - the current branch should be treated as `strategy mode + built-in defaults + env overrides`
 - if named sleeves are introduced, they should be added deliberately as new profile artifacts rather than assumed from the deleted historical path
 
@@ -588,8 +588,8 @@ pub struct UnlawfulSignalSnapshot {
 
 - `polymarket-exec/src/config/mod.rs`
   - add spot feed config:
-    - `WHALE_PAIR_EXEC_SPOT_WS_URL`
-    - `WHALE_PAIR_EXEC_SPOT_SYMBOL`
+    - `PM_BTC_5M_EXEC_SPOT_WS_URL`
+    - `PM_BTC_5M_EXEC_SPOT_SYMBOL`
   - load them into `AppConfig`
 
 - `polymarket-exec/src/strategy.rs`
@@ -611,7 +611,7 @@ pub struct UnlawfulSignalSnapshot {
   - increment market activity counters on `last_trade_price`
   - optionally count `price_change` as a softer flow signal
 
-- optional `WHALE_PAIR_STRATEGY_PROFILE_PATH` if we later reintroduce explicit named JSON profiles
+- optional `PM_BTC_5M_STRATEGY_PROFILE_PATH` if we later reintroduce explicit named JSON profiles
   - add the new `unlawful_shear` regime fields below
 
 ## 10. Exact Config Additions

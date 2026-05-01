@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
 
 fn maybe_acquire_singleton_lock(
 ) -> Result<Option<polymarket_exec::infra::preflight::LivePreflightGuard>> {
-    let paper_mode = std::env::var("WHALE_PAIR_PAPER_MODE")
+    let paper_mode = env_value("PM_BTC_5M_PAPER_MODE")
         .ok()
         .map(|value| {
             matches!(
@@ -19,7 +19,7 @@ fn maybe_acquire_singleton_lock(
             )
         })
         .unwrap_or(true);
-    let disabled = std::env::var("WHALE_PAIR_DISABLE_SINGLETON_LOCK")
+    let disabled = env_value("PM_BTC_5M_DISABLE_SINGLETON_LOCK")
         .ok()
         .map(|value| {
             matches!(
@@ -32,7 +32,7 @@ fn maybe_acquire_singleton_lock(
         return Ok(None);
     }
 
-    let lock_path = std::env::var("WHALE_PAIR_EXEC_LOCK_PATH")
+    let lock_path = env_value("PM_BTC_5M_EXEC_LOCK_PATH")
         .unwrap_or_else(|_| "/tmp/polymarket-exec.live.lock".to_string());
     let config = polymarket_exec::infra::preflight::LivePreflightConfig::new(
         lock_path,
@@ -41,4 +41,8 @@ fn maybe_acquire_singleton_lock(
     Ok(Some(polymarket_exec::infra::preflight::run_live_preflight(
         &config,
     )?))
+}
+
+fn env_value(key: &str) -> std::result::Result<String, std::env::VarError> {
+    std::env::var(key)
 }

@@ -6,19 +6,20 @@
 //! 2. entry ladders are generated only when hard risk state permits,
 //! 3. all output remains proposed intents for the runtime hard risk boundary.
 
-use crate::market_making::pairing::capital_recycler::{
-    choose_capital_recycle, CapitalRecycleConfig, CapitalRecycleDecision,
-};
 use crate::market_making::paired_mm::fill_automation::{
     AutoFillConfig, AutoFillDecision, AutoFillState,
 };
 use crate::market_making::paired_mm::ladder_builder::{
     build_ladder, LadderBuildResult, LadderConfig,
 };
+use crate::market_making::pairing::capital_recycler::{
+    choose_capital_recycle, CapitalRecycleConfig, CapitalRecycleDecision,
+};
 use crate::market_making::pairing::merge_policy::{
     choose_merge, MergePolicyConfig, MergePolicyDecision,
 };
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
+use crate::market_making::pairing::pair_ledger::MergeCandidate;
 use crate::market_making::pairing::rescue_engine::{
     choose_rescue, RescueAction, RescueConfig, RescueDecision, RescueInputs,
 };
@@ -27,7 +28,6 @@ use crate::market_making::pairing::risk_policy::{
 };
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
-use crate::market_making::pairing::pair_ledger::MergeCandidate;
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate};
 use crate::types::{CoolingReason, EpochMillis, FillReport};
 

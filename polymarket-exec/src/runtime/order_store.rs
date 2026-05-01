@@ -1090,21 +1090,21 @@ mod tests {
         let path = env::temp_dir().join(format!("polymarket-exec-strategy-state-{ts}.sqlite"));
         let mut store = SqliteOrderStore::open(path)?;
 
-        assert!(store.latest_strategy_state("btc_5m_mm")?.is_none());
+        assert!(store.latest_strategy_state("paired_mm")?.is_none());
 
         let first = serde_json::json!({
             "version": 1,
             "market_states": [{"market_id": "market-a"}],
         });
-        store.put_strategy_state("run-1", "btc_5m_mm", 10, &first)?;
-        assert_eq!(store.latest_strategy_state("btc_5m_mm")?, Some(first));
+        store.put_strategy_state("run-1", "paired_mm", 10, &first)?;
+        assert_eq!(store.latest_strategy_state("paired_mm")?, Some(first));
 
         let second = serde_json::json!({
             "version": 1,
             "market_states": [{"market_id": "market-b"}],
         });
-        store.put_strategy_state("run-2", "btc_5m_mm", 20, &second)?;
-        assert_eq!(store.latest_strategy_state("btc_5m_mm")?, Some(second));
+        store.put_strategy_state("run-2", "paired_mm", 20, &second)?;
+        assert_eq!(store.latest_strategy_state("paired_mm")?, Some(second));
         assert!(store.latest_strategy_state("other")?.is_none());
         Ok(())
     }

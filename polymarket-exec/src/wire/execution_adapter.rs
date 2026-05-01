@@ -2140,7 +2140,6 @@ fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {
     }
 }
 
-
 #[cfg(test)]
 #[path = "../../tests/unit/wire_execution_adapter.rs"]
 mod execution_adapter_tests;

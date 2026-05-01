@@ -28,6 +28,9 @@ use crate::runtime::market_universe::{
     fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
 };
 use crate::runtime::order_store::SqliteOrderStore;
+use crate::runtime::paper_fill::{
+    deterministic_hash_0_95, paper_fill_from_book_snapshot, paper_post_only_should_reject,
+};
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
@@ -35,9 +38,7 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{
-    serve_http, DashboardSnapshot, DashboardUiState,
-};
+use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -50,9 +51,15 @@ use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 
+fn runtime_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 pub async fn run() -> Result<()> {
     let mut config = AppConfig::from_env()?;
-    match std::env::var("WHALE_PAIR_EXEC_MODE")
+    match runtime_env("PM_BTC_5M_EXEC_MODE")
         .unwrap_or_default()
         .as_str()
     {
@@ -77,8 +84,8 @@ pub async fn run() -> Result<()> {
 /// replay clock, and writes a `PaperReportSummary` JSON.
 ///
 /// Inputs:
-/// - `WHALE_PAIR_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
-/// - `WHALE_PAIR_PAPER_REPORT_PATH`: optional. Where to write the
+/// - `PM_BTC_5M_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
+/// - `PM_BTC_5M_PAPER_REPORT_PATH`: optional. Where to write the
 ///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
 ///
 /// This is the foundation for A/B parameter calibration: change a paper
@@ -86,12 +93,10 @@ pub async fn run() -> Result<()> {
 /// replay against the same recorded log, and compare two report cards.
 async fn run_replay_cli(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
-    let input_path = std::env::var("WHALE_PAIR_REPLAY_INPUT_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+    let input_path = runtime_env("PM_BTC_5M_REPLAY_INPUT_PATH")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!("WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH")
+            anyhow::anyhow!("PM_BTC_5M_EXEC_MODE=replay requires PM_BTC_5M_REPLAY_INPUT_PATH")
         })?;
     let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
         let mut p = input_path.clone();
@@ -109,12 +114,9 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
         starting_cash_usd = config.starting_cash_usd,
         "replay mode engaged (strategy-driven)"
     );
-    let outcome = crate::paper::replay::replay_runtime_from_snapshots(
-        &config,
-        &input_path,
-        &output_path,
-    )
-    .await?;
+    let outcome =
+        crate::paper::replay::replay_runtime_from_snapshots(&config, &input_path, &output_path)
+            .await?;
     info!(
         target: "replay.complete",
         records_consumed = outcome.records_consumed,
@@ -132,7 +134,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
 /// behavior against the real book without exposing capital.
 ///
 /// Per the design doc, the safety contract is: paper_mode is forced true
-/// at this entry point regardless of WHALE_PAIR_PAPER_MODE — even if the
+/// at this entry point regardless of PM_BTC_5M_PAPER_MODE — even if the
 /// operator misconfigures the env, no live order can leave the engine.
 async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
     if !config.paper_mode {
@@ -159,12 +161,11 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
 async fn run_live_reconcile(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live reconcile mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live reconcile mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     let adapter = connect_live_adapter(&config).await?;
     let now_ms = now_unix_ms();
-    let after_ms = std::env::var("WHALE_PAIR_LIVE_RECONCILE_AFTER_MS")
-        .ok()
+    let after_ms = runtime_env("PM_BTC_5M_LIVE_RECONCILE_AFTER_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_else(|| now_ms.saturating_sub(60 * 60 * 1_000));
 
@@ -253,7 +254,7 @@ async fn run_live_reconcile(config: AppConfig) -> Result<()> {
 async fn run_live_smoke(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live smoke mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live smoke mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     if config
         .live_kill_switch_path
@@ -264,35 +265,29 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     }
     let adapter = connect_live_adapter(&config).await?;
 
-    let asset_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_ASSET_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let asset_id = runtime_env("PM_BTC_5M_LIVE_SMOKE_ASSET_ID")
         .or_else(|| config.market_assets.first().cloned())
         .ok_or_else(|| anyhow::anyhow!("live smoke mode requires an asset id"))?;
-    let market_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_MARKET_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let market_id = runtime_env("PM_BTC_5M_LIVE_SMOKE_MARKET_ID")
         .unwrap_or_else(|| config.market_id_for_asset(&asset_id));
-    let price = std::env::var("WHALE_PAIR_LIVE_SMOKE_PRICE")
-        .ok()
+    let price = runtime_env("PM_BTC_5M_LIVE_SMOKE_PRICE")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(0.01);
-    let notional = std::env::var("WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD")
-        .ok()
+    let notional = runtime_env("PM_BTC_5M_LIVE_SMOKE_NOTIONAL_USD")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0);
     if price <= 0.0 || notional <= 0.0 {
         anyhow::bail!("live smoke price and notional must be positive");
     }
-    let time_in_force = match std::env::var("WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE")
-        .unwrap_or_else(|_| "GTD".to_string())
+    let time_in_force = match runtime_env("PM_BTC_5M_LIVE_SMOKE_TIME_IN_FORCE")
+        .unwrap_or_else(|| "GTD".to_string())
         .trim()
         .to_ascii_uppercase()
         .as_str()
     {
         "GTC" => TimeInForce::Gtc,
         "GTD" => TimeInForce::Gtd,
-        other => anyhow::bail!("unsupported WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE={other}"),
+        other => anyhow::bail!("unsupported PM_BTC_5M_LIVE_SMOKE_TIME_IN_FORCE={other}"),
     };
     let now_ms = now_unix_ms();
     let ttl_ms = config.live_order_ttl.as_millis().max(5_000) as u64;
@@ -374,14 +369,11 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
 async fn run_live_cancel(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live cancel mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live cancel mode requires PM_BTC_5M_PAPER_MODE=false");
     }
-    let raw_order_ids = std::env::var("WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("live cancel mode requires WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
-        })?;
+    let raw_order_ids = runtime_env("PM_BTC_5M_LIVE_CANCEL_ORDER_IDS").ok_or_else(|| {
+        anyhow::anyhow!("live cancel mode requires PM_BTC_5M_LIVE_CANCEL_ORDER_IDS")
+    })?;
     let order_ids = raw_order_ids
         .split(',')
         .map(str::trim)
@@ -433,12 +425,12 @@ async fn run_live_cancel(config: AppConfig) -> Result<()> {
 /// `condition_id` through the relayer. Recovers stranded collateral
 /// from expired positions that would otherwise tie up capital.
 ///
-/// Honors `WHALE_PAIR_LIVE_REDEEM_DRY_RUN=true` to log the planned
+/// Honors `PM_BTC_5M_LIVE_REDEEM_DRY_RUN=true` to log the planned
 /// redemptions without submitting (useful before risking gas).
 async fn run_live_redeem(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live redeem mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live redeem mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     if config
         .live_kill_switch_path
@@ -447,7 +439,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
     {
         anyhow::bail!("live redeem blocked by active kill switch");
     }
-    let dry_run = std::env::var("WHALE_PAIR_LIVE_REDEEM_DRY_RUN")
+    let dry_run = runtime_env("PM_BTC_5M_LIVE_REDEEM_DRY_RUN")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -455,11 +447,9 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
             )
         })
         .unwrap_or(false);
-    let redeem_collateral_token_address =
-        std::env::var("POLYMARKET_REDEEM_COLLATERAL_TOKEN_ADDRESS")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+    let redeem_collateral_token_address = runtime_env("POLYMARKET_REDEEM_COLLATERAL_TOKEN_ADDRESS")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let adapter = connect_live_adapter(&config).await?;
     let balances = adapter.sync_balances().await?;
@@ -1113,17 +1103,15 @@ async fn run_runtime_loop(
     // Auto-redeem worker — periodic sweep that scans venue positions
     // for resolved markets and submits CTF redeems via the relayer.
     // Default interval 60s; disabled in paper mode (no real positions
-    // to redeem). Operator can disable via WHALE_PAIR_LIVE_AUTO_REDEEM=false
+    // to redeem). Operator can disable via PM_BTC_5M_LIVE_AUTO_REDEEM=false
     // (default true so live deployments don't accumulate stranded
     // collateral). 60s is well above the 5-min market cycle so we
     // never spam the relayer.
     let auto_redeem_enabled = !config.paper_mode
-        && std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM")
-            .ok()
+        && runtime_env("PM_BTC_5M_LIVE_AUTO_REDEEM")
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true);
-    let auto_redeem_period = std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC")
-        .ok()
+    let auto_redeem_period = runtime_env("PM_BTC_5M_LIVE_AUTO_REDEEM_PERIOD_SEC")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(60);
     let mut auto_redeem_ticks = interval(std::time::Duration::from_secs(auto_redeem_period));
@@ -1895,20 +1883,20 @@ fn parse_trade_side(raw: &str) -> TradeSide {
 }
 
 #[derive(Debug, Clone)]
-struct PaperOrderContext {
-    arrival_ms: u64,
-    queue_bias: f64,
-    last_attempt_ms: u64,
-    last_fill_ms: u64,
-    last_fill_book_update_ms: u64,
-    fill_count: usize,
+pub(super) struct PaperOrderContext {
+    pub(super) arrival_ms: u64,
+    pub(super) queue_bias: f64,
+    pub(super) last_attempt_ms: u64,
+    pub(super) last_fill_ms: u64,
+    pub(super) last_fill_book_update_ms: u64,
+    pub(super) fill_count: usize,
     /// Phase 2 paper env cancel race window: when a Cancel command is
     /// received in paper mode, this is set to observed_at_ms instead of
     /// removing the context. Subsequent ticks within the configured
     /// window may still apply a fill (mirrors the live race between
     /// venue cancel ack and an in-flight fill). Once the window
     /// elapses without a fill, the deferred cancel is applied.
-    cancel_requested_at_ms: Option<u64>,
+    pub(super) cancel_requested_at_ms: Option<u64>,
 }
 
 fn paper_order_context_mut<'a>(
@@ -3581,312 +3569,6 @@ fn portfolio_equity_floor_usd(risk_limits: &RiskLimits, starting_cash_usd: f64) 
     risk_limits.portfolio_equity_floor_usd(starting_cash_usd)
 }
 
-fn paper_fill_from_book_snapshot(
-    book: &BookState,
-    intent: &OrderIntent,
-    observed_at_ms: u64,
-    paper_fee_coeff: f64,
-    order_ctx: &mut PaperOrderContext,
-    remaining_qty: f64,
-    execution_policy: &ExecutionPolicy,
-) -> Option<FillReport> {
-    if remaining_qty <= 0.0 || intent.limit_price <= 0.0 {
-        return None;
-    }
-    if order_ctx.fill_count >= execution_policy.paper_max_fills_per_order {
-        return None;
-    }
-    if execution_policy.paper_submit_latency_ms > 0
-        && observed_at_ms.saturating_sub(order_ctx.arrival_ms)
-            < execution_policy.paper_submit_latency_ms
-    {
-        return None;
-    }
-    if order_ctx.last_fill_ms > 0
-        && observed_at_ms.saturating_sub(order_ctx.last_fill_ms)
-            < execution_policy.paper_min_fill_interval_ms
-    {
-        return None;
-    }
-    if book.last_update_unix_ms > 0
-        && order_ctx.last_fill_book_update_ms == book.last_update_unix_ms
-    {
-        return None;
-    }
-
-    let candidate_levels: Vec<_> = if matches!(intent.side, TradeSide::Buy) {
-        book.ask_levels()
-            .iter()
-            .filter(|level| level.price > 0.0 && level.price <= intent.limit_price)
-            .collect()
-    } else {
-        book.bid_levels()
-            .iter()
-            .filter(|level| level.price > 0.0 && level.price >= intent.limit_price)
-            .collect()
-    };
-    if candidate_levels.is_empty() {
-        return None;
-    }
-
-    let total_available: f64 = candidate_levels.iter().map(|level| level.size).sum();
-    if total_available <= 0.0 {
-        return None;
-    }
-
-    let best_opposite = candidate_levels[0].price;
-    let crossing = if matches!(intent.side, TradeSide::Buy) {
-        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
-    } else {
-        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
-    };
-    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
-        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
-    } else {
-        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
-    };
-    // Distinguish a fresh submit (could be TAKER if crossing) from a
-    // resting order that the book later moved into (always MAKER, fills
-    // at our limit). A real venue does not turn our resting limit into
-    // a taker just because the opposite side moved through us; we get
-    // price-improved as the maker. Fresh = within submit-latency window.
-    let order_age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms);
-    // "Fresh" = just arrived at venue; "resting" = strictly older than the
-    // submit-latency window. A fresh order that crosses on arrival is a
-    // taker; a resting order the book later moves into is a maker
-    // (price-improvement to whoever takes our resting bid).
-    let is_resting = order_age_ms > execution_policy.paper_submit_latency_ms;
-    let crosses_as_taker = crossing && !is_resting;
-    if !crossing {
-        let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
-        if order_age_ms < queue_wait_ms || !maker_trade_through {
-            return None;
-        }
-    }
-    // Maker fills land at OUR limit (the resting price). Taker fills
-    // (fresh order crossing the book) land at the opposite-side touch.
-    let best_fill_price = if crosses_as_taker {
-        best_opposite
-    } else {
-        intent.limit_price
-    };
-    let fill_ratio = paper_fill_ratio(
-        remaining_qty,
-        total_available,
-        book.last_update_unix_ms,
-        best_fill_price,
-        intent.limit_price,
-        order_ctx,
-        crossing,
-        observed_at_ms,
-    );
-    let target_fill_qty = (remaining_qty * fill_ratio)
-        .min(total_available)
-        .min(remaining_qty);
-    if target_fill_qty <= 0.0 {
-        return None;
-    }
-
-    let mut remaining = target_fill_qty;
-    let mut qty_filled = 0.0;
-    let mut amount = 0.0;
-    for (idx, level) in candidate_levels.iter().enumerate() {
-        if remaining <= 0.0 {
-            break;
-        }
-        // Phase 2 paper env: replace opaque queue_bias with explicit
-        // queue-depth-fraction model. Non-crossing maker orders can claim
-        // (1.0 - paper_queue_depth_fraction) of top-level size, representing
-        // the fraction of the queue ahead of us that has already cleared.
-        // Default 0.75 → we claim 25% of top-of-book per fill attempt.
-        // Reference: Moallemi-Yuan queue position valuation.
-        let level_ratio = if crossing {
-            1.0
-        } else if idx == 0 {
-            (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0)
-        } else {
-            0.0
-        };
-        let level_fill = (level.size * level_ratio).min(remaining);
-        if level_fill > 0.0 {
-            qty_filled += level_fill;
-            // Maker fills land at OUR limit (the resting price); taker
-            // fills walk the book at level prices.
-            let price_at_level = if crosses_as_taker {
-                level.price
-            } else {
-                intent.limit_price
-            };
-            amount += level_fill * price_at_level;
-            remaining -= level_fill;
-        }
-    }
-
-    if qty_filled <= 0.0 {
-        qty_filled = target_fill_qty.min(candidate_levels[0].size);
-        let fallback_price = if crosses_as_taker {
-            candidate_levels[0].price
-        } else {
-            intent.limit_price
-        };
-        amount = qty_filled * fallback_price;
-    }
-
-    if qty_filled <= 0.0 {
-        return None;
-    }
-
-    let price = if qty_filled > 0.0 {
-        amount / qty_filled
-    } else {
-        0.0
-    };
-    if price <= 0.0 {
-        return None;
-    }
-
-    // Same is_resting / crosses_as_taker invariant as the price assignment
-    // above. fill_ratio >= 0.75 alone does NOT make us a taker — a maker
-    // order can still claim a large fraction of top-of-book; it's just
-    // good queue position, not a crossing event.
-    let liquidity = if crosses_as_taker {
-        FillLiquidity::Taker
-    } else {
-        FillLiquidity::Maker
-    };
-    let notional = qty_filled * price;
-    if notional < execution_policy.paper_min_fill_notional_usd
-        && (remaining_qty * price) >= execution_policy.paper_min_fill_notional_usd
-    {
-        return None;
-    }
-    let effective_taker_coeff = execution_policy
-        .paper_taker_fee_coeff_override
-        .unwrap_or(paper_fee_coeff);
-    let fee_basis = price * (1.0 - price);
-    let fee = match liquidity {
-        FillLiquidity::Maker => -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis),
-        FillLiquidity::Taker => notional * effective_taker_coeff * fee_basis,
-        FillLiquidity::Unknown => notional * effective_taker_coeff * fee_basis,
-    };
-    order_ctx.last_fill_ms = observed_at_ms;
-    order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
-    order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
-
-    Some(FillReport {
-        order_id: None,
-        client_order_id: Some(intent.client_order_id.clone()),
-        market_id: intent.market_id.clone(),
-        instrument_id: intent.instrument_id.clone(),
-        side: intent.side,
-        price,
-        quantity: qty_filled,
-        fee_usd: fee,
-        liquidity,
-        close_method: None,
-        observed_at_ms,
-    })
-}
-
-fn paper_fill_ratio(
-    order_qty: f64,
-    available_qty: f64,
-    snapshot_unix_ms: u64,
-    fill_price: f64,
-    limit_price: f64,
-    order_ctx: &PaperOrderContext,
-    crossing: bool,
-    observed_at_ms: u64,
-) -> f64 {
-    if order_qty <= 0.0 || available_qty <= 0.0 || fill_price <= 0.0 || limit_price <= 0.0 {
-        return 0.0;
-    }
-
-    // Use observed_at_ms (the simulated/replay clock) instead of wall
-    // clock so replays produce deterministic fill ratios. Was a hidden
-    // bug: now_unix_ms() inside this function caused replay results to
-    // depend on how fast the host machine ran the loop.
-    let age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms.max(order_ctx.last_attempt_ms));
-    let age_pressure = if crossing {
-        0.15 + 0.30 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
-    } else {
-        0.02 + 0.18 * ((age_ms as f64 / 5_000.0).clamp(0.0, 1.0))
-    };
-    let size_pressure = 0.25 + 0.75 * (available_qty / (available_qty + order_qty));
-    let queue_pressure = 0.08 + order_ctx.queue_bias * 0.52;
-    let staleness_pressure = 0.30
-        + 0.60
-            * ((observed_at_ms.saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
-    let premium = ((limit_price - fill_price) / fill_price).max(0.0).min(1.0);
-    let limit_pressure = if crossing {
-        0.65
-    } else {
-        0.20 + (premium * 0.20)
-    };
-    (age_pressure * size_pressure * queue_pressure * staleness_pressure * limit_pressure)
-        .clamp(0.0, if crossing { 0.65 } else { 0.20 })
-}
-
-fn deterministic_hash_0_95(value: &str) -> f64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let normalized = (hash & 0xffff) as f64 / 65_536.0;
-    (0.05 + (normalized * 0.95)).min(1.0)
-}
-
-/// Deterministic [0, 1) value derived from a client_order_id and a book
-/// update timestamp. Used by paper-mode post-only rejection so that the
-/// same fixture replays produce the same accept/reject pattern across
-/// runs, while the decision varies per book update (matching real venue:
-/// a previously-rejected post-only may succeed when the book moves).
-fn deterministic_unit_hash(client_order_id: &str, book_update_ms: u64) -> f64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in client_order_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    for byte in book_update_ms.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    (hash & 0xffff_ffff) as f64 / 4_294_967_296.0
-}
-
-/// Phase 2 paper env: returns true when paper mode should reject a post-
-/// only intent because it would cross the book. Probabilistic (controlled
-/// by paper_post_only_reject_probability) and deterministic per
-/// (client_order_id, book.last_update_unix_ms).
-///
-/// Real Polymarket post-only orders that arrive while the book is crossing
-/// are rejected most of the time, but occasionally slip through as taker
-/// fills because the ack and the book update aren't atomic. This models
-/// that behavior in paper.
-fn paper_post_only_should_reject(
-    intent: &OrderIntent,
-    book: &BookState,
-    execution_policy: &ExecutionPolicy,
-) -> bool {
-    if !execution_policy.paper_mode {
-        return false;
-    }
-    if execution_policy.paper_post_only_reject_probability <= 0.0 {
-        return false;
-    }
-    let crossing = if matches!(intent.side, TradeSide::Buy) {
-        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
-    } else {
-        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
-    };
-    if !crossing {
-        return false;
-    }
-    let roll = deterministic_unit_hash(intent.client_order_id.as_str(), book.last_update_unix_ms);
-    roll < execution_policy.paper_post_only_reject_probability
-}
-
 fn venue_fill_key(fill: &VenueFill) -> String {
     format!(
         "{}:{}:{:.8}:{:.8}:{}",
@@ -3900,7 +3582,6 @@ fn now_unix_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
 
 #[cfg(test)]
 #[path = "../../tests/unit/runtime_runner.rs"]
