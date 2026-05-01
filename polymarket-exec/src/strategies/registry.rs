@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::markets::MarketDescriptor;
 use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
+use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::StrategyDecision;
 
@@ -25,12 +26,16 @@ impl StrategyKey {
 #[derive(Clone, Debug)]
 pub enum RegisteredStrategy {
     PairedMm(PairedMmStrategy),
+    PairCostArb(PairCostArbStrategy),
 }
 
 impl RegisteredStrategy {
     pub fn name(&self) -> &'static str {
         match self {
             Self::PairedMm(strategy) => <PairedMmStrategy as TradingStrategy<
+                crate::markets::BinaryOutcomeMarket,
+            >>::name(strategy),
+            Self::PairCostArb(strategy) => <PairCostArbStrategy as TradingStrategy<
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
         }
@@ -42,6 +47,7 @@ impl RegisteredStrategy {
     {
         match self {
             Self::PairedMm(strategy) => strategy.on_tick(input),
+            Self::PairCostArb(strategy) => strategy.on_tick(input),
         }
     }
 
@@ -51,6 +57,7 @@ impl RegisteredStrategy {
     {
         match self {
             Self::PairedMm(strategy) => strategy.on_fill(input),
+            Self::PairCostArb(strategy) => strategy.on_fill(input),
         }
     }
 }
@@ -77,11 +84,24 @@ impl StrategyRegistry {
         );
     }
 
+    pub fn register_pair_cost_arb(
+        &mut self,
+        market_id: impl Into<String>,
+        config: PairCostArbStrategyConfig,
+    ) {
+        let key = StrategyKey::new(market_id, "pair_cost_arb");
+        self.strategies.insert(
+            key,
+            RegisteredStrategy::PairCostArb(PairCostArbStrategy::new(config)),
+        );
+    }
+
     pub fn paired_mm_mut(&mut self, market_id: &str) -> Option<&mut PairedMmStrategy> {
         self.strategies
             .get_mut(&StrategyKey::new(market_id, "paired_mm"))
             .and_then(|strategy| match strategy {
                 RegisteredStrategy::PairedMm(strategy) => Some(strategy),
+                RegisteredStrategy::PairCostArb(_) => None,
             })
     }
 

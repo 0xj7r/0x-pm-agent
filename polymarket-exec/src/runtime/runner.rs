@@ -27,7 +27,7 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use crate::strategy::{Btc5mMmStrategy, Strategy, StrategyMode, VenueMarketRules};
+use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
@@ -46,6 +46,7 @@ use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
+const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone)]
 struct RuntimeMarketUniverse {
@@ -3735,7 +3736,7 @@ fn submit_request_from_intent(
         .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
         .or_else(|| {
             (!execution_policy.paper_mode && is_late_bar_core)
-                .then_some(observed_at_ms.saturating_add(Btc5mMmStrategy::LATE_BAR_CORE_TTL_MS))
+                .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
     let (time_in_force, post_only) = if is_hedge_rescue {
         (TimeInForce::Ioc, false)

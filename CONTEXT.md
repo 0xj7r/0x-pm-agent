@@ -4,6 +4,23 @@
 **Prepared for Agent Audit & Implementation**  
 **Date: May 01, 2026**
 
+## Implementation Status — 2026-05-01
+
+This spec is now implemented in `polymarket-exec` through the new modular strategy seam:
+
+- Live runtime selector supports `pair_cost_arb` and `btc_5m_pair_cost_arb`.
+- Live runtime can run composite strategy lists such as `pair_cost_arb,paired_mm` through the existing `Runtime<StrategyMode>` hot path.
+- Strategy-specific knobs are loaded from YAML via `PM_BTC_5M_STRATEGY_PROFILE_PATHS` / `PM_BTC_5M_STRATEGY_PROFILE_PATH`.
+- Default live profile exists at `polymarket-exec/config/strategies/btc_5m_pair_cost_arb.live.yaml`.
+- Paired-MM has its own live profile at `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml`.
+- Hybrid runs should use `PM_BTC_5M_STRATEGY_PROFILE_PATHS=config/strategies/btc_5m_pair_cost_arb.live.yaml,config/strategies/btc_5m_paired_mm.live.yaml`; profiles are deep-merged in order.
+- Runtime config accepts the new `PM_BTC_5M_*` prefix for old `WHALE_PAIR_*` keys through parser aliases.
+- `btc_5m_mm` is now only a compatibility alias for the modular `paired_mm` strategy, not a legacy implementation.
+- Legacy `unlawful_shear`, `goat_pair`, and `bonereaper` strategy implementations are removed from the active runtime selector.
+- Generic `strategies::StrategyRegistry` now supports both `paired_mm` and `pair_cost_arb`.
+- Active source/config no longer exposes a live bonereaper strategy path.
+- Normal merge/capital recycling remains runtime-owned after fills; `pair_cost_arb` emits cheap-leg BUY intents and relies on the existing merge planner for matched inventory.
+
 This document consolidates **the entire conversation history** — original paired-MM plan, live-testing pain points, all mathematical details, signals, risk engine, configuration, data requirements, infrastructure, and the full migration plan. It covers **both strategies** in depth so the receiving agent can perform a complete audit, analysis, and modular implementation.
 
 ---
@@ -28,7 +45,7 @@ These are classic short-horizon binary MM problems. The original paired-MM appro
 
 ### 2. Strategy 1: Paired Market Making (Original – Still Fully Supported)
 
-**Identifier**: `paired_mm` (or `btc_5m_mm`)
+**Identifier**: `paired_mm` (`btc_5m_mm` is a compatibility alias only)
 
 **Core philosophy**: Act as a true liquidity provider by posting **two-sided ladders** on both Yes and No, capturing spread + liquidity rewards + rebates while staying roughly delta-neutral.
 
@@ -362,7 +379,115 @@ clip_sizing:
 
 This keeps the config simple while giving you safe, testable clip sizes.
 
-Would you like me to update the full YAML in the comprehensive document with this change, or also give you the corresponding Rust config snippet for the scaler?
+## Testing 
+
+For a **high-frequency trading bot** like yours (Polymarket 5-min BTC Pair-Cost strategy + existing paired-MM engine), the testing strategy should be **TDD-first with BDD-style readability on top**. Here’s the precise recommendation:
+
+### Recommended Approach: **TDD-First + BDD-Inspired Naming + Property-Based Testing**
+
+| Layer              | Approach          | Why it fits your bot                                      | % of tests |
+|--------------------|-------------------|-----------------------------------------------------------|------------|
+| **Unit / Pure functions** | **TDD**           | Pair-cost math, fair-value model, projected_pair_cost, cheap-leg detection, EV calculations must be mathematically perfect | 60–70% |
+| **Property / Edge cases** | **Property-based** (proptest) | Floating-point precision, extreme vol, near-zero τ, merge edge cases | 15–20% |
+| **Integration / Strategy behavior** | **TDD + BDD-style** | Full decision loop, merge logic, late-window convexity | 15–20% |
+| **End-to-end simulation** | **Simulation tests** | Replay historical books + BTC ticks | 5% |
+
+**Why not pure BDD?**  
+BDD (cucumber-style) adds too much overhead for low-level quant logic. Instead, we get the **benefits of BDD** (readable, business-oriented tests) simply by writing very descriptive test names and using a clean test structure.
+
+### Concrete Test Configuration for Your Rust Engine
+
+#### 1. Core Testing Stack (add these to `Cargo.toml` if not present)
+
+```toml
+[dev-dependencies]
+proptest = "1.6"
+proptest-derive = "0.5"
+mockall = "0.13"
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"          # for mocking external APIs if needed
+```
+
+#### 2. Recommended Test Organization
+
+```
+tests/
+├── unit/                  # Pure TDD tests (most important)
+│   ├── pair_cost_math.rs
+│   ├── fair_value_model.rs
+│   ├── cheap_leg_signal.rs
+│   └── convexity_rule.rs
+├── property/              # proptest
+│   └── pair_cost_properties.rs
+├── integration/           # Strategy behavior (BDD-style naming)
+│   ├── strategy_decision_loop.rs
+│   ├── merge_behavior.rs
+│   └── late_window_convexity.rs
+├── simulation/            # Full historical replay
+│   └── backtest_replay.rs
+└── fixtures/              # test data (JSON books, BTC ticks, etc.)
+```
+
+#### 3. Example Test Styles (Copy-Paste Ready)
+
+**Unit / TDD example** (`tests/unit/pair_cost_math.rs`):
+
+```rust
+#[test]
+fn test_projected_pair_cost_buy_yes() {
+    let state = PairCostState { qty_yes: 1000.0, cost_yes: 520.0, qty_no: 800.0, cost_no: 360.0, ..Default::default() };
+    let result = state.projected_pair_cost(Leg::Yes, 200.0, 0.48);
+    assert!((result - 0.9833).abs() < 0.0001);
+}
+```
+
+**Property-based (critical for floats)**:
+
+```rust
+proptest! {
+    #[test]
+    fn pair_cost_always_between_0_and_2(
+        qty_yes in 0.0..10000.0,
+        cost_yes in 0.0..10000.0,
+        qty_no in 0.0..10000.0,
+        cost_no in 0.0..10000.0,
+    ) {
+        let state = PairCostState { qty_yes, cost_yes, qty_no, cost_no, ..Default::default() };
+        let pc = state.pair_cost();
+        prop_assert!(pc >= 0.0 && pc <= 2.0);
+    }
+}
+```
+
+**Integration / BDD-style** (readable like user stories):
+
+```rust
+#[tokio::test]
+async fn when_leg_is_cheap_and_pair_cost_below_threshold_then_buy_and_update_state() {
+    // Given a cheap YES leg with pair_cost = 0.982
+    // When the strategy runs its decision loop
+    // Then it should place a buy order on YES and update averages
+}
+```
+
+### Final Recommendations for Your Team
+
+1. **Start with TDD on the new Pair-Cost logic** (pair-cost math + cheap-leg signal + merge) — this is the highest ROI.
+2. **Use descriptive test names** so the tests read like BDD scenarios (no need for full Cucumber).
+3. **Require 100% test coverage** on all pure math functions (`PairCostState`, fair-value model, etc.).
+4. **Add a `tests::simulation` module** that replays real historical 5-min windows + orderbooks (this will catch most integration bugs).
+5. Run tests in CI with `cargo test --all-features` + proptest.
+
+This hybrid approach gives you:
+- Mathematical correctness (TDD)
+- Excellent readability and documentation (BDD-style names)
+- Robustness against edge cases (property tests)
+
+Would you like me to:
+- Write the full set of starter test files for the Pair-Cost strategy?
+- Or update the comprehensive audit document with a full “Testing Strategy” section?
+
+Just say the word and I’ll deliver it.
 
 **End of Document**
 ```
