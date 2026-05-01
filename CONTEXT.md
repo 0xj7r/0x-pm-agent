@@ -225,6 +225,145 @@ last_updated: "2026-05-01"
 
 This document is the **single source of truth**. The agent can now audit both strategies, implement the modular solution, and ensure the migration solves the original pain points while preserving full flexibility.
 
+
+**Fair-Value Model Math – Detailed Explanation**
+
+The **fair-value model** is the “brain” of the Pair-Cost Hedged Arbitrage strategy. It estimates the true probability that the 5-minute window will resolve **Up** (BTC ends ≥ window open price) given the current state of the market. This probability is then used to derive fair prices for YES and NO shares and to decide whether a leg is “cheap” enough to buy.
+
+### The Core Formula
+
+\[
+P(\text{Up}) = \Phi\left( \frac{\Delta_{\text{BTC}} + \mu \cdot \tau}{\sigma \sqrt{\tau}} \right)
+\]
+
+where \(\Phi\) is the **cumulative distribution function (CDF)** of the standard normal distribution (also called the probit function).
+
+### Variable Breakdown
+
+| Variable          | Meaning                                                                 | Typical Calculation / Source                          |
+|-------------------|-------------------------------------------------------------------------|-------------------------------------------------------|
+| \(\Delta_{\text{BTC}}\) | Signed percentage displacement of current BTC price from the window’s **open price** | \(\frac{\text{current\_price} - \text{window\_open\_price}}{\text{window\_open\_price}}\) |
+| \(\mu\)           | Short-term momentum drift (expected drift per unit time)               | EMA or linear regression of recent 10–30s BTC returns |
+| \(\tau\)          | Fraction of the 5-minute window still remaining                        | \(\frac{\text{seconds remaining}}{300}\)              |
+| \(\sigma\)        | Short-term realized volatility (annualized or scaled to window)        | Std dev of 30–90s BTC returns (scaled appropriately) |
+| \(\Phi(\cdot)\)   | Standard normal CDF                                                     | Full `norm.cdf()` or fast piecewise approximation     |
+
+### Intuitive Interpretation
+
+This is essentially a **Brownian-motion / diffusion model** adapted to the short 5-minute horizon:
+
+- The numerator \(\Delta_{\text{BTC}} + \mu \cdot \tau\) is the **expected total move** by the end of the window (current position + expected drift).
+- The denominator \(\sigma \sqrt{\tau}\) is the **expected uncertainty** (standard deviation of possible future moves).
+- Dividing them gives a **standardized z-score**.
+- Passing that z-score through the normal CDF \(\Phi\) converts it into a clean probability between 0 and 1.
+
+In plain English:  
+“If BTC has already moved +0.3% into the window and we still have 2 minutes left, how likely is it that the final move will still be positive after accounting for volatility and recent momentum?”
+
+### How It Is Used in the Strategy
+
+1. **Fair prices**:
+   - Fair YES price ≈ \(P(\text{Up})\)
+   - Fair NO price ≈ \(1 - P(\text{Up})\)
+
+2. **Cheap-leg detection** (the actual buy trigger):
+   - YES is cheap if:
+     \[
+     \text{YES mid price} < P(\text{Up}) - \text{price_deviation_bps}
+     \]
+     **and** projected pair_cost < threshold
+   - Same logic (mirrored) for NO.
+
+3. **Late-window convexity rule**:
+   - If \(P(\text{Up}) > 0.70\) (or \(P(\text{Down}) > 0.70\)) and time left < `late_window_sec`, deliberately allow excess on the high-conviction side instead of forcing a perfect hedge.
+
+### Practical Implementation Notes
+
+- **Speed**: Full normal CDF is fine, but most bots use a fast piecewise linear approximation (your config has `use_piecewise_approx: true`) because it runs in nanoseconds.
+- **Lookback periods**: \(\sigma\) and \(\mu\) are usually computed over the last 30–90 seconds of BTC ticks (Binance/Coinbase WS feed).
+- **Tuning**: The only free parameter you usually adjust is the weight on momentum (`momentum_weight`) or the cheap-leg deviation in bps (currently 35 bps in the YAML).
+- **Edge cases**: Very early in the window (\(\tau \approx 1\)) the model is close to 0.5. Very late in the window (\(\tau \approx 0\)) it becomes extremely sharp — which is exactly when you want the strongest cheap-leg and convexity signals.
+
+This model is deliberately simple yet powerful — it is the same one used in virtually all profitable 5-min/15-min BTC bots (including the original Gabagool clones). It turns raw price data into a calibrated probability that directly feeds the pair-cost guardrail and convexity rules.
+
+If you want the exact Rust pseudocode for this model or a numerical example with real numbers, just say the word!
+
+
+**Yes — you should use different (smaller) clip sizes for your tiny-live deployment.**
+
+### Why Different Clip Sizes Make Sense
+
+Your current tiny-live setup has `PM_BTC_5M_EXEC_STARTING_CASH_USD=50`.  
+The YAML values we gave earlier (`base_clip_usd: 1.5`, `max_clip_usd: 4.0`) are reasonable **full-live** defaults, but they are **too large** for $50 capital:
+
+- A $4 clip = 8% of your entire bankroll → too aggressive for testing.
+- You want to be able to run multiple overlapping 5-min windows and survive a few bad merges or gas fees.
+- Polymarket has venue minimum order quantities (~5 shares) and small gas costs on Polygon that become relatively expensive on tiny positions.
+- The goal of tiny-live is to validate the full logic (pair-cost updates, merge frequency, cheap-leg detection, convexity rule, etc.) with real money, **not** to maximize PnL yet.
+
+**Best practice** (used by almost all bots):
+- Have **deployment-specific scaling** of clip sizes.
+- Keep fractional Kelly logic the same.
+- Scale clips proportionally to available capital.
+
+### Recommended Tiny-Live Clip Sizing
+
+For your current $50 tiny-live wallet, use these values in the YAML:
+
+```yaml
+clip_sizing:
+  base_clip_usd: 0.75          # ~1.5% of $50
+  min_clip_usd: 0.25           # absolute floor
+  max_clip_usd: 2.0            # ~4% of $50 max per clip
+  fractional_kelly: 0.15       # unchanged
+```
+
+**Why these numbers?**
+- Base clip of $0.75 is small enough to allow many trades and multiple windows.
+- Max clip of $2.0 keeps worst-case exposure very safe.
+- Still large enough to test real merge mechanics and order flow.
+
+### How to Implement This Cleanly
+
+**Option 1 (Recommended)**: Add a capital scaler in the YAML
+
+```yaml
+clip_sizing:
+  base_clip_usd: 1.5
+  min_clip_usd: 0.5
+  max_clip_usd: 4.0
+  fractional_kelly: 0.15
+  capital_scale_factor: 0.5     # ← set to 0.5 for tiny-live, 1.0 for full live
+```
+
+Then in code the engine does:
+```rust
+effective_base = config.clip_sizing.base_clip_usd * config.clip_sizing.capital_scale_factor
+```
+
+**Option 2**: Separate YAML files
+- `btc_5m_pair_cost_arb.tinylive.yaml` → uses the smaller numbers above
+- `btc_5m_pair_cost_arb.live.yaml` → uses the larger full-live numbers
+
+### Final Recommendation for You Right Now
+
+Use **Option 1** (add `capital_scale_factor`) — it’s the cleanest long-term solution.
+
+For your immediate tiny-live deployment, set:
+
+```yaml
+clip_sizing:
+  base_clip_usd: 1.5
+  min_clip_usd: 0.5
+  max_clip_usd: 4.0
+  fractional_kelly: 0.15
+  capital_scale_factor: 0.5     # tiny-live scaling
+```
+
+This keeps the config simple while giving you safe, testable clip sizes.
+
+Would you like me to update the full YAML in the comprehensive document with this change, or also give you the corresponding Rust config snippet for the scaler?
+
 **End of Document**
 ```
 
