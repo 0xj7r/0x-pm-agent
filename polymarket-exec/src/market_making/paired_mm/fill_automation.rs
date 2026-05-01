@@ -14,10 +14,10 @@ use crate::core::lot_ledger::LotLedger;
 use crate::market_making::paired_mm::fill_cooldown::{
     FillCooldown, FillCooldownConfig, FillCooldownDecision,
 };
-use crate::market_making::paired_mm::rescue_engine::{
+use crate::market_making::pairing::rescue_engine::{
     choose_rescue, RescueAction, RescueConfig, RescueDecision, RescueInputs,
 };
-use crate::market_making::paired_mm::types::{LadderLeg, PairedMarketSnapshot};
+use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::FairValueEstimate;
 use crate::types::{CoolingReason, EpochMillis, FillReport, TradeSide};

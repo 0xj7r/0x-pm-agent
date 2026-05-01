@@ -5,7 +5,7 @@
 //! ladders. Runtime must still pass every intent through the hard risk engine
 //! before submission.
 
-use crate::market_making::paired_mm::types::{PairedInventorySnapshot, RunningInventoryCaps};
+use crate::market_making::pairing::types::{PairedInventorySnapshot, RunningInventoryCaps};
 use crate::types::{IntentKind, OrderIntent};
 
 #[derive(Clone, Debug, PartialEq)]

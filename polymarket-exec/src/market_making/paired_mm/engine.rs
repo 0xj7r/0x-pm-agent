@@ -6,7 +6,7 @@
 //! 2. entry ladders are generated only when hard risk state permits,
 //! 3. all output remains proposed intents for the runtime hard risk boundary.
 
-use crate::market_making::paired_mm::capital_recycler::{
+use crate::market_making::pairing::capital_recycler::{
     choose_capital_recycle, CapitalRecycleConfig, CapitalRecycleDecision,
 };
 use crate::market_making::paired_mm::fill_automation::{
@@ -15,19 +15,19 @@ use crate::market_making::paired_mm::fill_automation::{
 use crate::market_making::paired_mm::ladder_builder::{
     build_ladder, LadderBuildResult, LadderConfig,
 };
-use crate::market_making::paired_mm::merge_policy::{
+use crate::market_making::pairing::merge_policy::{
     choose_merge, MergePolicyConfig, MergePolicyDecision,
 };
-use crate::market_making::paired_mm::pair_cost_tracker::PairCostTracker;
-use crate::market_making::paired_mm::rescue_engine::{
+use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
+use crate::market_making::pairing::rescue_engine::{
     choose_rescue, RescueAction, RescueConfig, RescueDecision, RescueInputs,
 };
-use crate::market_making::paired_mm::risk_policy::{
+use crate::market_making::pairing::risk_policy::{
     evaluate_hard_policy, HardPolicyAction, HardPolicyConfig, HardPolicyDecision,
 };
-use crate::market_making::paired_mm::types::{PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
-use crate::pair_ledger::MergeCandidate;
+use crate::market_making::pairing::pair_ledger::MergeCandidate;
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate};
 use crate::types::{CoolingReason, EpochMillis, FillReport};
 

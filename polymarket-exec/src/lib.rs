@@ -19,4 +19,5 @@ pub mod wire;
 
 pub use core::{book, inventory, lot_ledger, market_context, risk, types};
 pub use market_making as mm;
-pub use market_making::{merge_executor, pair_ledger, quote_engine, quote_reconciler};
+pub use market_making::pairing::{merge_executor, pair_ledger};
+pub use market_making::{quote_engine, quote_reconciler};

@@ -5,7 +5,7 @@
 //! This small state machine suppresses new paired entries for a short window
 //! while rescue/merge logic catches up.
 
-use crate::market_making::paired_mm::types::LadderLeg;
+use crate::market_making::pairing::types::LadderLeg;
 use crate::types::EpochMillis;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

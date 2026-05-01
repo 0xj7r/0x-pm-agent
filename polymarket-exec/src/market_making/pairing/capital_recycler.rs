@@ -1,6 +1,6 @@
 //! Routine buy-light-side capital recycling.
 
-use crate::market_making::paired_mm::types::{
+use crate::market_making::pairing::types::{
     LadderLeg, PairedInventorySnapshot, PairedMarketSnapshot,
 };
 use crate::markets::MarketDescriptor;

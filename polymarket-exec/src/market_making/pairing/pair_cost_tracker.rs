@@ -1,6 +1,6 @@
 //! Pair-cost tracker for convex paired-MM accounting.
 
-use crate::market_making::paired_mm::types::{LadderLeg, PairedInventorySnapshot};
+use crate::market_making::pairing::types::{LadderLeg, PairedInventorySnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Leg {

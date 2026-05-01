@@ -378,6 +378,14 @@ impl StrategyProfile {
             .pair_cost
             .high_vol_threshold
             .unwrap_or(config.high_vol_pair_cost_threshold);
+        config.min_merge_usd = self
+            .pair_cost
+            .min_merge_usd
+            .unwrap_or(config.min_merge_usd);
+        config.merge_gas_cost_usd = self
+            .rescue
+            .merge_gas_cost_usd
+            .unwrap_or(config.merge_gas_cost_usd);
         config.high_vol_atr_threshold = self
             .signals
             .vol_regime
@@ -426,6 +434,22 @@ impl StrategyProfile {
             .convexity
             .allow_extra_clip_on_winner
             .unwrap_or(config.allow_extra_clip_on_winner);
+        config.enable_buy_light_side_rebalance = self
+            .operational
+            .enable_buy_light_side_rebalance
+            .unwrap_or(config.enable_buy_light_side_rebalance);
+        config.recycle_min_imbalance_qty = self
+            .operational
+            .recycle_min_imbalance_qty
+            .unwrap_or(config.recycle_min_imbalance_qty);
+        config.recycle_min_time_remaining_ms = self
+            .operational
+            .recycle_min_time_remaining_ms
+            .unwrap_or(config.recycle_min_time_remaining_ms);
+        config.recycle_max_light_side_spread = self
+            .operational
+            .recycle_max_light_side_spread
+            .unwrap_or(config.recycle_max_light_side_spread);
         config
     }
 
@@ -724,6 +748,10 @@ pub struct OperationalSection {
     pub asymmetric_fill_max_penalty: Option<f64>,
     pub max_exposure_usd: Option<f64>,
     pub max_session_loss_bps: Option<f64>,
+    pub enable_buy_light_side_rebalance: Option<bool>,
+    pub recycle_min_imbalance_qty: Option<f64>,
+    pub recycle_min_time_remaining_ms: Option<u64>,
+    pub recycle_max_light_side_spread: Option<f64>,
 }
 
 pub trait Strategy {

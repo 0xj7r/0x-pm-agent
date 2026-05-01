@@ -1,7 +1,7 @@
 //! Generic strategy traits for market-agnostic execution.
 
-use crate::market_making::paired_mm::pair_cost_tracker::PairCostTracker;
-use crate::market_making::paired_mm::types::{PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
+use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate};
 use crate::types::{EpochMillis, FillReport, StrategyDecision};
 
