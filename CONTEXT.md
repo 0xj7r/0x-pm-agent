@@ -1,15 +1,16 @@
-**Comprehensive Strategy Audit & Implementation Document**  
+```markdown
+# Comprehensive Strategy Audit & Implementation Document  
 **Polymarket BTC 5-Min Up/Down Markets**  
 **Prepared for Agent Audit & Implementation**  
 **Date: May 01, 2026**
 
-This document consolidates **the entire conversation history** — original paired-MM plan, live-testing pain points, all mathematical details, signals, risk engine, configuration, data requirements, infrastructure, and the full migration to the new strategy. It covers **both strategies** in depth so the receiving agent can perform a complete audit, analysis, and implementation.
+This document consolidates **the entire conversation history** — original paired-MM plan, live-testing pain points, all mathematical details, signals, risk engine, configuration, data requirements, infrastructure, and the full migration plan. It covers **both strategies** in depth so the receiving agent can perform a complete audit, analysis, and modular implementation.
 
 ---
 
 ### 1. Project Background & Live Testing Pain Points
 
-You are building a **production-grade Rust trading engine** (`polymarket-exec`) deployed on EU AWS (low-latency to Polymarket’s eu-west-2 CLOB). The engine is highly modular with folders such as `strategies/`, `signals/`, `market_making/`, `core/`, `runtime/`, `infra/`, etc.
+You are building a **production-grade Rust trading engine** (`polymarket-exec`) deployed on EU AWS (low-latency to Polymarket’s eu-west-2 CLOB). The engine is already highly modular with folders such as `strategies/`, `signals/`, `market_making/`, `core/`, `runtime/`, `infra/`, etc.
 
 **Market characteristics** (5-min BTC Up/Down binary markets):
 - New independent market every 5 minutes.
@@ -21,9 +22,13 @@ You are building a **production-grade Rust trading engine** (`polymarket-exec`) 
 - Lots of **accumulated one-sided positions** that cannot get filled → stranded → full resolution loss.
 - **Loss-making in whipsaw / volatile regimes** → repeated adverse fills without round-trip profits.
 
+These are classic short-horizon binary MM problems. The original paired-MM approach tried to solve them with aggressive inventory skew and rescue logic, but the Pair-Cost style solves them more elegantly while adding convex upside.
+
 ---
 
 ### 2. Strategy 1: Paired Market Making (Original – Still Fully Supported)
+
+**Identifier**: `paired_mm` (or `btc_5m_mm`)
 
 **Core philosophy**: Act as a true liquidity provider by posting **two-sided ladders** on both Yes and No, capturing spread + liquidity rewards + rebates while staying roughly delta-neutral.
 
@@ -42,8 +47,9 @@ You are building a **production-grade Rust trading engine** (`polymarket-exec`) 
   \Delta_\text{EV} = Q \times (P_\text{model} - \text{best_bid})
   \]
 - Vol-regime defense: widen spreads / reduce size / pause in high ATR/whipsaw.
+- Fair-value model (same as below).
 
-**Strengths**: Maximizes liquidity rewards.  
+**Strengths**: Maximizes liquidity rewards (two-sided balance scores very high).  
 **Weaknesses**: Higher operational complexity; still vulnerable to stranded positions and whipsaw (your observed issues).
 
 Your existing `WHALE_PAIR_BTC_5M_MM_*` knobs (clip sizes, skew, ladder levels, etc.) remain fully functional for this strategy.
@@ -51,6 +57,8 @@ Your existing `WHALE_PAIR_BTC_5M_MM_*` knobs (clip sizes, skew, ladder levels, e
 ---
 
 ### 3. Strategy 2: Pair-Cost Hedged Arbitrage (Gabagool-style / Recommended Primary)
+
+**Identifier**: `pair_cost_arb`
 
 **Core philosophy**: Pure opportunistic **cheap-leg arbitrage**. Never sell. Only buy the temporarily cheap leg, maintain pair-cost < threshold, merge balanced pairs instantly, and allow natural asymmetric excess for convex payoffs.
 
@@ -129,15 +137,20 @@ Cheap leg = mid_price meaningfully below fair_price **AND** projected_pair_cost 
 
 **Prefix change**: All old `WHALE_PAIR_*` → `PM_BTC_5M_*`.
 
-**Strategy selector**:
+**Strategy selector** (in `.env`):
 ```env
-PM_BTC_5M_STRATEGY=pair_cost_arb   # or btc_5m_mm for original
+PM_BTC_5M_STRATEGY=pair_cost_arb   # or paired_mm for original
 ```
 
-**Strategy-specific knobs** → moved to **YAML** (recommended) for type safety.
+**Strategy-specific knobs** → moved to **YAML** files (one per strategy) for type safety and clarity.
 
-**Full YAML** (`config/strategies/btc_5m_pair_cost_arb.live.yaml`):
+**Example YAML for Paired-MM** (`btc_5m_paired_mm.live.yaml`):
+```yaml
+strategy: paired_mm
+# (existing MM knobs can be migrated here or kept in .env)
+```
 
+**Full YAML for Pair-Cost Hedged Arbitrage** (`config/strategies/btc_5m_pair_cost_arb.live.yaml`):
 ```yaml
 strategy: pair_cost_arb
 
@@ -194,8 +207,8 @@ last_updated: "2026-05-01"
 
 ### 7. Implementation Roadmap
 
-1. Add `PairCostState` struct.
-2. Implement `PairCostArbStrategy: StrategyTrait`.
+1. Add `PairCostState` struct in `core/`.
+2. Implement `PairCostArbStrategy: StrategyTrait` in `strategies/`.
 3. Load YAML config via `serde`.
 4. Wire signals + cheap-leg detection.
 5. Add merge logic + convexity late-window rule.
@@ -210,4 +223,9 @@ last_updated: "2026-05-01"
 
 ---
 
-This document is the single source of truth. The agent can now audit both strategies, implement the modular solution, and ensure the migration solves the original pain points while preserving flexibility.
+This document is the **single source of truth**. The agent can now audit both strategies, implement the modular solution, and ensure the migration solves the original pain points while preserving full flexibility.
+
+**End of Document**
+```
+
+This is the complete, clean Markdown document you can copy and send directly to the other agent. Let me know if you need any final tweaks before handing it over!
