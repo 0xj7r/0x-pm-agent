@@ -11,9 +11,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::config::parser::{
-    env_or, load_user_auth, parse_asset_market_map, parse_bool, parse_duration_ms, parse_f64,
-    parse_log_format, parse_path_optional, parse_socket_addr, parse_usize, split_csv_optional,
-    split_csv_required,
+    env_or, env_value, load_user_auth, parse_asset_market_map, parse_bool, parse_duration_ms,
+    parse_f64, parse_log_format, parse_path_optional, parse_socket_addr, parse_usize,
+    split_csv_optional, split_csv_required,
 };
 use crate::risk::RiskLimits;
 use crate::strategy::StrategyProfile;
@@ -214,13 +214,33 @@ impl AppConfig {
             let _ = dotenvy::dotenv();
         }
 
-        let service_name = env_or("WHALE_PAIR_EXEC_SERVICE_NAME", "polymarket-exec");
-        let strategy_name = env_or("WHALE_PAIR_STRATEGY", "unlawful_shear");
-        let strategy_profile_path = parse_path_optional("WHALE_PAIR_STRATEGY_PROFILE_PATH");
-        let strategy_profile = strategy_profile_path
-            .as_deref()
-            .map(StrategyProfile::load)
-            .transpose()?;
+        let service_name = env::var("PM_BTC_5M_EXEC_SERVICE_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("WHALE_PAIR_EXEC_SERVICE_NAME")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| "polymarket-exec".to_string());
+        let strategy_name = env::var("PM_BTC_5M_STRATEGY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                env::var("WHALE_PAIR_STRATEGY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .unwrap_or_else(|| "pair_cost_arb,paired_mm".to_string());
+        let strategy_profile_paths = parse_strategy_profile_paths();
+        let strategy_profile_path = strategy_profile_paths.first().cloned();
+        let strategy_profile = if strategy_profile_paths.is_empty() {
+            None
+        } else if strategy_profile_paths.len() == 1 {
+            Some(StrategyProfile::load(&strategy_profile_paths[0])?)
+        } else {
+            Some(StrategyProfile::load_merged(&strategy_profile_paths)?)
+        };
         let paper_mode = parse_bool("WHALE_PAIR_PAPER_MODE", true)?;
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("WHALE_PAIR_EXEC_LOG_FORMAT", "pretty"))?;
@@ -328,8 +348,7 @@ impl AppConfig {
         let runtime_checkpoint_interval =
             parse_duration_ms("WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS", 30_000)?;
         let order_store_path = parse_path_optional("WHALE_PAIR_ORDER_STORE_PATH");
-        let runtime_run_id = env::var("WHALE_PAIR_RUNTIME_RUN_ID")
-            .ok()
+        let runtime_run_id = env_value("WHALE_PAIR_RUNTIME_RUN_ID")
             .filter(|value| !value.trim().is_empty());
         let book_stale_after = parse_duration_ms_or_profile(
             "WHALE_PAIR_EXEC_BOOK_STALE_MS",
@@ -345,8 +364,7 @@ impl AppConfig {
             parse_duration_ms("WHALE_PAIR_EXEC_SPOT_WS_DATA_STALE_TIMEOUT_MS", 30_000)?;
         let market_context_path = parse_path_optional("WHALE_PAIR_EXEC_MARKET_CONTEXT_PATH");
         let journal_path = parse_path_optional("WHALE_PAIR_EXEC_JOURNAL_PATH");
-        let journal_rotate_bytes = env::var("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
-            .ok()
+        let journal_rotate_bytes = env_value("WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES")
             .filter(|value| !value.trim().is_empty())
             .map(|value| {
                 value.parse::<u64>().with_context(|| {
@@ -359,7 +377,7 @@ impl AppConfig {
         let starting_cash_usd = parse_f64("WHALE_PAIR_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity = parse_usize("WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
-            parse_asset_market_map(&env::var("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default())?;
+            parse_asset_market_map(&env_value("WHALE_PAIR_INSTRUMENT_MARKETS").unwrap_or_default())?;
         let profile_inventory = strategy_profile.as_ref().map(|profile| &profile.inventory);
         let risk_limits = RiskLimits {
             max_order_notional_usd: parse_f64_or_profile(
@@ -465,8 +483,7 @@ impl AppConfig {
         let paper_max_fills_per_order = parse_usize("WHALE_PAIR_PAPER_MAX_FILLS_PER_ORDER", 3)?;
         let paper_min_fill_interval =
             parse_duration_ms("WHALE_PAIR_PAPER_MIN_FILL_INTERVAL_MS", 750)?;
-        let paper_market_close_at_ms = std::env::var("WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS")
-            .ok()
+        let paper_market_close_at_ms = env_value("WHALE_PAIR_PAPER_MARKET_CLOSE_AT_MS")
             .filter(|v| !v.trim().is_empty())
             .map(|v| {
                 v.trim().parse::<u64>().map_err(|err| {
@@ -475,8 +492,7 @@ impl AppConfig {
             })
             .transpose()?;
         let paper_market_resolution_price =
-            std::env::var("WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE")
-                .ok()
+            env_value("WHALE_PAIR_PAPER_MARKET_RESOLUTION_PRICE")
                 .filter(|v| !v.trim().is_empty())
                 .map(|v| {
                     v.trim()
@@ -516,8 +532,7 @@ impl AppConfig {
         let book_snapshot_log_path = parse_path_optional("WHALE_PAIR_BOOK_SNAPSHOT_LOG_PATH");
         let book_snapshot_max_levels = parse_usize("WHALE_PAIR_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
         let paper_maker_rebate_coeff = parse_f64("WHALE_PAIR_PAPER_MAKER_REBATE_COEFF", 0.0)?;
-        let paper_taker_fee_coeff_override = std::env::var("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
-            .ok()
+        let paper_taker_fee_coeff_override = env_value("WHALE_PAIR_PAPER_TAKER_FEE_COEFF")
             .filter(|v| !v.trim().is_empty())
             .map(|v| v.trim().parse::<f64>())
             .transpose()
@@ -630,18 +645,17 @@ impl AppConfig {
 }
 
 fn should_load_dotenv() -> bool {
-    match env::var("WHALE_PAIR_EXEC_LOAD_DOTENV") {
-        Ok(value) => !matches!(
+    match env_value("WHALE_PAIR_EXEC_LOAD_DOTENV") {
+        Some(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no"
         ),
-        Err(_) => true,
+        None => true,
     }
 }
 
 fn parse_optional_url_with_default(key: &str, default: &str) -> Option<String> {
-    env::var(key)
-        .ok()
+    env_value(key)
         .map(|v| v.trim().to_string())
         .and_then(|value| {
             let lowered = value.to_ascii_lowercase();
@@ -654,8 +668,24 @@ fn parse_optional_url_with_default(key: &str, default: &str) -> Option<String> {
         .or_else(|| Some(default.to_string()))
 }
 
+fn parse_strategy_profile_paths() -> Vec<PathBuf> {
+    env_value("PM_BTC_5M_STRATEGY_PROFILE_PATHS")
+        .or_else(|| env_value("WHALE_PAIR_STRATEGY_PROFILE_PATHS"))
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|paths| !paths.is_empty())
+        .or_else(|| parse_path_optional("PM_BTC_5M_STRATEGY_PROFILE_PATH").map(|path| vec![path]))
+        .or_else(|| parse_path_optional("WHALE_PAIR_STRATEGY_PROFILE_PATH").map(|path| vec![path]))
+        .unwrap_or_default()
+}
+
 fn parse_duration_ms_or_profile(key: &str, profile: Option<u64>, default: u64) -> Result<Duration> {
-    if env::var_os(key).is_some() {
+    if env_value(key).is_some() {
         parse_duration_ms(key, default)
     } else {
         Ok(Duration::from_millis(profile.unwrap_or(default)))
@@ -671,7 +701,7 @@ fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Dura
 }
 
 fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result<f64> {
-    if env::var_os(key).is_some() {
+    if env_value(key).is_some() {
         parse_f64(key, default)
     } else {
         Ok(profile.unwrap_or(default))
@@ -679,7 +709,7 @@ fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result
 }
 
 fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> Result<usize> {
-    if env::var_os(key).is_some() {
+    if env_value(key).is_some() {
         parse_usize(key, default)
     } else {
         Ok(profile.unwrap_or(default))
@@ -687,9 +717,8 @@ fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> 
 }
 
 fn parse_market_discovery_families(key: &str) -> Result<Vec<MarketDiscoveryFamily>> {
-    let raw = match env::var(key) {
-        Ok(value) => value,
-        Err(_) => return Ok(Vec::new()),
+    let Some(raw) = env_value(key) else {
+        return Ok(Vec::new());
     };
     let mut families = Vec::new();
     for entry in raw.split(',') {

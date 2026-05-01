@@ -73,11 +73,13 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         };
     }
 
-    let (light_leg, heavy_avg_cost, light_quote, light_instrument_id) =
+    let (light_leg, heavy_avg_cost, light_qty, light_avg_cost, light_quote, light_instrument_id) =
         if inventory.yes_qty > inventory.no_qty {
             (
                 LadderLeg::No,
                 inventory.yes_avg_cost,
+                inventory.no_qty,
+                inventory.no_avg_cost,
                 &snapshot.no_quote,
                 market.no_instrument_id().clone(),
             )
@@ -85,6 +87,8 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
             (
                 LadderLeg::Yes,
                 inventory.no_avg_cost,
+                inventory.yes_qty,
+                inventory.yes_avg_cost,
                 &snapshot.yes_quote,
                 market.yes_instrument_id().clone(),
             )
@@ -123,15 +127,6 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
     let tick_size = market.tick_size().max(0.0001);
     let limit_price = (best_ask + tick_size * config.race_buffer_ticks.max(0.0))
         .clamp(tick_size, 1.0 - tick_size);
-    let projected_pair_cost = heavy_avg_cost + limit_price;
-    if projected_pair_cost > config.pair_cost_target {
-        return CapitalRecycleDecision::Wait {
-            reason: format!(
-                "capital recycle wait: projected_pair_cost={projected_pair_cost:.4} target={:.4}",
-                config.pair_cost_target
-            ),
-        };
-    }
 
     let qty_by_notional = config.max_buy_notional_usd / limit_price.max(tick_size);
     let quantity = imbalance_qty.min(config.max_buy_qty).min(qty_by_notional);
@@ -147,6 +142,22 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
     if !quantity.is_finite() || quantity <= 0.0 {
         return CapitalRecycleDecision::Wait {
             reason: "capital recycle wait: computed quantity invalid".to_string(),
+        };
+    }
+
+    let projected_light_avg_cost =
+        if light_qty > 0.0 && light_avg_cost.is_finite() && light_avg_cost > 0.0 {
+            ((light_qty * light_avg_cost) + (quantity * limit_price)) / (light_qty + quantity)
+        } else {
+            limit_price
+        };
+    let projected_pair_cost = heavy_avg_cost + projected_light_avg_cost;
+    if projected_pair_cost > config.pair_cost_target {
+        return CapitalRecycleDecision::Wait {
+            reason: format!(
+                "capital recycle wait: projected_pair_cost={projected_pair_cost:.4} target={:.4}",
+                config.pair_cost_target
+            ),
         };
     }
 
@@ -254,5 +265,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn projected_pair_cost_uses_existing_light_side_average() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 10.0,
+                yes_avg_cost: 0.45,
+                no_avg_cost: 0.30,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.82,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            0,
+        );
+
+        let CapitalRecycleDecision::BuyLightSide {
+            projected_pair_cost,
+            ..
+        } = decision
+        else {
+            panic!("expected buy-light-side decision");
+        };
+
+        assert!((projected_pair_cost - 0.81).abs() < 1e-9);
     }
 }

@@ -12,11 +12,11 @@ use crate::config::LogFormat;
 use crate::config::UserWsAuth;
 
 pub fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+    env_value(key).unwrap_or_else(|| default.to_string())
 }
 
 pub fn parse_bool(key: &str, default_value: bool) -> Result<bool> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" | "yes" | "y" => Ok(true),
         "0" | "false" | "off" | "no" | "n" => Ok(false),
@@ -41,7 +41,7 @@ pub fn parse_socket_addr(key: &str, default: &str) -> Result<SocketAddr> {
 }
 
 pub fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
-    let raw = env::var(key).unwrap_or_else(|_| default_ms.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_ms.to_string());
     let value: u64 = raw
         .parse()
         .with_context(|| format!("failed to parse {key} as integer milliseconds"))?;
@@ -49,7 +49,7 @@ pub fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
 }
 
 pub fn parse_path_optional(key: &str) -> Option<PathBuf> {
-    let value = env::var(key).ok()?;
+    let value = env_value(key)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -58,13 +58,13 @@ pub fn parse_path_optional(key: &str) -> Option<PathBuf> {
 }
 
 pub fn parse_f64(key: &str, default_value: f64) -> Result<f64> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     raw.parse()
         .with_context(|| format!("failed to parse {key} as floating point number"))
 }
 
 pub fn parse_usize(key: &str, default_value: usize) -> Result<usize> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     raw.parse()
         .with_context(|| format!("failed to parse {key} as non-negative integer"))
 }
@@ -78,13 +78,25 @@ pub fn split_csv_required(key: &str) -> Result<Vec<String>> {
 }
 
 pub fn split_csv_optional(key: &str) -> Vec<String> {
-    env::var(key)
+    env_value(key)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+pub fn env_value(key: &str) -> Option<String> {
+    pm_btc_5m_alias(key)
+        .and_then(|alias| env::var(alias).ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env::var(key).ok())
+}
+
+pub fn pm_btc_5m_alias(key: &str) -> Option<String> {
+    key.strip_prefix("WHALE_PAIR_")
+        .map(|suffix| format!("PM_BTC_5M_{suffix}"))
 }
 
 fn lookup_first_env<F>(lookup: &F, keys: &[&str]) -> Option<String>
@@ -158,7 +170,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        load_user_auth_from_lookup, parse_asset_market_map, parse_bool, parse_log_format, LogFormat,
+        env_or, load_user_auth_from_lookup, parse_asset_market_map, parse_bool, parse_log_format,
+        parse_path_optional, LogFormat,
     };
 
     #[test]
@@ -179,6 +192,33 @@ mod tests {
     #[test]
     fn parses_bool_from_text() {
         assert!(!parse_bool("WHALE_PAIR_PAPER_MODE_NO", false).unwrap());
+    }
+
+    #[test]
+    fn whale_pair_keys_accept_pm_btc_5m_aliases() {
+        let bool_key = "WHALE_PAIR_ALIAS_BOOL_TEST";
+        let bool_alias = "PM_BTC_5M_ALIAS_BOOL_TEST";
+        let value_key = "WHALE_PAIR_ALIAS_VALUE_TEST";
+        let value_alias = "PM_BTC_5M_ALIAS_VALUE_TEST";
+        let path_key = "WHALE_PAIR_ALIAS_PATH_TEST";
+        let path_alias = "PM_BTC_5M_ALIAS_PATH_TEST";
+        std::env::remove_var(bool_key);
+        std::env::remove_var(value_key);
+        std::env::remove_var(path_key);
+        std::env::set_var(bool_alias, "true");
+        std::env::set_var(value_alias, "from-alias");
+        std::env::set_var(path_alias, "/tmp/from-alias");
+
+        assert!(parse_bool(bool_key, false).unwrap());
+        assert_eq!(env_or(value_key, "fallback"), "from-alias");
+        assert_eq!(
+            parse_path_optional(path_key).unwrap(),
+            std::path::PathBuf::from("/tmp/from-alias")
+        );
+
+        std::env::remove_var(bool_alias);
+        std::env::remove_var(value_alias);
+        std::env::remove_var(path_alias);
     }
 
     #[test]
