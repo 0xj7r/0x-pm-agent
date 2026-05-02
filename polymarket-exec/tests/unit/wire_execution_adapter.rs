@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::FillLiquidity;
 
 fn submit_req(time_in_force: TimeInForce, post_only: bool) -> SubmitOrderRequest {
     SubmitOrderRequest {
