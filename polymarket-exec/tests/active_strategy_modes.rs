@@ -165,6 +165,65 @@ fn pair_cost_arb_buys_fair_value_cheap_leg() {
 }
 
 #[test]
+fn pair_cost_arb_buys_no_when_down_leg_is_fair_value_cheap() {
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![]),
+        99.0,
+    );
+
+    let decision = drive_two_books(
+        "pair_cost_arb",
+        &ctx,
+        quote(0.61, 0.62, 120_000),
+        quote(0.34, 0.36, 120_000),
+    );
+
+    let intents = decision.intents();
+    assert_eq!(intents.len(), 1, "{decision:?}");
+    assert_eq!(intents[0].instrument_id, no_id);
+    assert_eq!(
+        intents[0].quote_level_tag.as_deref(),
+        Some("pair-cost-arb:cheap-leg:no")
+    );
+}
+
+#[test]
+fn pair_cost_arb_pauses_new_entry_in_extreme_volatility() {
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let mut ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![]),
+        101.0,
+    );
+    ctx.btc_regime.realized_vol_5m_bps = Some(20.0);
+
+    let decision = drive_two_books(
+        "pair_cost_arb",
+        &ctx,
+        quote(0.34, 0.36, 120_000),
+        quote(0.61, 0.62, 120_000),
+    );
+
+    assert!(decision.intents().is_empty(), "{decision:?}");
+    assert!(decision
+        .notes()
+        .iter()
+        .any(|note| note.contains("extreme volatility pause")));
+}
+
+#[test]
 fn pair_cost_arb_buys_light_side_to_recycle_after_whipsaw_fill() {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
