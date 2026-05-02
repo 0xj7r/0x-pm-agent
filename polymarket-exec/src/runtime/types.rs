@@ -43,6 +43,71 @@ pub enum ManagedOrderStatus {
     Quarantined,
 }
 
+impl ManagedOrderStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            ManagedOrderStatus::Filled
+                | ManagedOrderStatus::Cancelled
+                | ManagedOrderStatus::Rejected
+                | ManagedOrderStatus::Quarantined
+        )
+    }
+
+    pub fn can_transition_to(self, next: ManagedOrderStatus) -> bool {
+        use ManagedOrderStatus::*;
+        if self == next {
+            return true;
+        }
+
+        match self {
+            PendingSubmit => matches!(
+                next,
+                Submitted
+                    | Working
+                    | CancelRequested
+                    | Filled
+                    | Cancelled
+                    | Rejected
+                    | NeedsReconcile
+                    | Quarantined
+            ),
+            Submitted => matches!(
+                next,
+                Working
+                    | CancelRequested
+                    | Filled
+                    | Cancelled
+                    | Rejected
+                    | NeedsReconcile
+                    | Quarantined
+            ),
+            Working => matches!(
+                next,
+                CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile | Quarantined
+            ),
+            CancelRequested => {
+                matches!(
+                    next,
+                    Cancelled | Filled | Rejected | NeedsReconcile | Quarantined
+                )
+            }
+            Filled | Cancelled | Rejected | Quarantined => false,
+            NeedsReconcile => matches!(
+                next,
+                PendingSubmit
+                    | Submitted
+                    | Working
+                    | CancelRequested
+                    | Filled
+                    | Cancelled
+                    | Rejected
+                    | Quarantined
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagedOrder {
     pub intent: crate::types::OrderIntent,
