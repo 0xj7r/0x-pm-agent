@@ -7,6 +7,7 @@ pub mod execution_adapter;
 pub mod incentives_api;
 pub mod market_ws;
 pub mod polygon_rpc;
+mod raw_trades;
 pub mod relayer;
 pub mod spot_ws;
 pub mod user_ws;
