@@ -62,6 +62,9 @@ where
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
+        let btc_regime = input.btc_regime.regime();
+        let vol_5m_bps = input.btc_regime.realized_vol_5m_bps;
+        let ret180_bps = input.btc_regime.return_180s_bps;
         let decision = self.engine.decide(&PairedMmInput {
             market: input.market,
             snapshot: input.snapshot,
@@ -77,8 +80,11 @@ where
         let mut notes = decision.notes.clone();
         notes.extend(decision.ladder.diagnostics.notes.clone());
         notes.push(format!(
-            "paired-mm ladder regime={:?} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4}",
+            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4}",
             decision.ladder.diagnostics.regime,
+            btc_regime,
+            vol_5m_bps,
+            ret180_bps,
             decision.ladder.diagnostics.depth,
             decision.ladder.diagnostics.spacing_ticks,
             decision.ladder.diagnostics.yes_reservation,
