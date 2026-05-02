@@ -8,6 +8,8 @@
 use crate::market_making::pairing::types::{PairedInventorySnapshot, RunningInventoryCaps};
 use crate::types::{IntentKind, OrderIntent};
 
+const USD_EPSILON: f64 = 1e-6;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PairedMmRiskReject {
     GrossCostCap { gross_cost_usd: f64, cap_usd: f64 },
@@ -49,7 +51,7 @@ pub fn evaluate_entry_intent(
     }
 
     let gross_cost_usd = inventory.gross_cost_usd();
-    if gross_cost_usd >= caps.max_gross_cost_usd {
+    if gross_cost_usd + USD_EPSILON >= caps.max_gross_cost_usd {
         return PairedMmRiskDecision::reject(
             PairedMmRiskReject::GrossCostCap {
                 gross_cost_usd,
@@ -63,7 +65,7 @@ pub fn evaluate_entry_intent(
     }
 
     let notional_usd = intent.notional_usd();
-    if notional_usd > caps.max_entry_notional_usd {
+    if notional_usd > caps.max_entry_notional_usd + USD_EPSILON {
         return PairedMmRiskDecision::reject(
             PairedMmRiskReject::EntryNotionalCap {
                 notional_usd,
@@ -77,6 +79,43 @@ pub fn evaluate_entry_intent(
     }
 
     PairedMmRiskDecision::accept()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_making::pairing::types::RunningInventoryCaps;
+    use crate::types::{ClientOrderId, InstrumentId, MarketId, TradeSide};
+
+    fn entry_intent(price: f64, quantity: f64) -> OrderIntent {
+        OrderIntent {
+            client_order_id: ClientOrderId::from("test"),
+            market_id: MarketId::from("m"),
+            instrument_id: InstrumentId::from("yes"),
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity,
+            reduce_only: false,
+            reason: "test".to_string(),
+            quote_level_tag: Some("test".to_string()),
+            created_at_ms: 0,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        }
+    }
+
+    #[test]
+    fn accepts_entry_notional_at_cap_with_float_noise() {
+        let caps = RunningInventoryCaps {
+            max_entry_notional_usd: 5.0,
+            ..RunningInventoryCaps::default()
+        };
+        let intent = entry_intent(0.1, 50.000000001);
+
+        let decision = evaluate_entry_intent(&PairedInventorySnapshot::default(), &intent, &caps);
+
+        assert!(decision.accepted, "{decision:?}");
+    }
 }
 
 pub fn filter_entry_intents(
