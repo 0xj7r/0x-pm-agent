@@ -84,6 +84,7 @@ impl BookSnapshotWriter {
             serde_json::to_string(&record).context("failed to serialize BookSnapshotRecord")?;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
+        self.file.flush()?;
         self.bytes_written = self.bytes_written.saturating_add(line.len() as u64 + 1);
         Ok(())
     }

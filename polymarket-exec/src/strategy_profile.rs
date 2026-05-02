@@ -32,6 +32,7 @@ pub struct StrategyProfile {
     pub pair_cost: PairCostSection,
     pub clip_sizing: ClipSizingSection,
     pub convexity: ConvexitySection,
+    pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
     pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
@@ -257,6 +258,16 @@ impl StrategyProfile {
             .inventory_skew_bps
             .map(|bps| (bps / 10_000.0).max(0.0001))
             .unwrap_or(config.stoikov.gamma);
+        config.fair_value_anchoring.max_model_divergence = self
+            .fair_value
+            .max_model_divergence
+            .unwrap_or(config.fair_value_anchoring.max_model_divergence)
+            .clamp(0.0, 0.99);
+        config.fair_value_anchoring.model_influence_weight = self
+            .fair_value
+            .model_influence_weight
+            .unwrap_or(config.fair_value_anchoring.model_influence_weight)
+            .clamp(0.0, 1.0);
         config.caps = RunningInventoryCaps {
             max_gross_cost_usd: self
                 .inventory
@@ -389,6 +400,13 @@ pub struct ConvexitySection {
     pub max_excess_usd: Option<f64>,
     pub avoid_rehedging_when_convex: Option<bool>,
     pub allow_extra_clip_on_winner: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PairedMmFairValueSection {
+    pub max_model_divergence: Option<f64>,
+    pub model_influence_weight: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -209,9 +209,25 @@ async fn sweep_family_into(
                 if record.price_to_beat.is_none() {
                     match fetch_crypto_open_price(client, slug_prefix, window_ms, &record).await {
                         Ok(Some(open_price)) => {
+                            info!(
+                                target: "market_discovery",
+                                market_id = record.market_id,
+                                price_to_beat = open_price,
+                                "enriched crypto price_to_beat from Polymarket crypto-price API"
+                            );
                             record.price_to_beat = Some(open_price);
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            warn!(
+                                target: "market_discovery",
+                                market_id = record.market_id,
+                                slug_prefix,
+                                window_ms,
+                                start_ms = ?record.event_start_time_ms,
+                                end_ms = ?record.event_end_time_ms,
+                                "Polymarket crypto-price API enrichment skipped or returned no openPrice"
+                            );
+                        }
                         Err(error) => {
                             warn!(
                                 target: "market_discovery",
@@ -346,13 +362,15 @@ fn parse_gamma_market_record(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let instrument_ids = parse_gamma_token_ids(
+    let token_ids = parse_gamma_token_ids(
         value
             .get("clobTokenIds")
             .or_else(|| value.get("clobTokenIdsJson"))
             .or_else(|| value.get("token_ids_json"))
             .or_else(|| value.get("tokenIds")),
     );
+    let outcomes = parse_gamma_string_list(value.get("outcomes").or_else(|| value.get("outcome")));
+    let instrument_ids = order_up_down_token_ids(token_ids, outcomes);
     if instrument_ids.len() < 2 {
         return None;
     }
@@ -386,6 +404,10 @@ fn parse_gamma_market_record(
 }
 
 fn parse_gamma_token_ids(value: Option<&Value>) -> Vec<String> {
+    parse_gamma_string_list(value)
+}
+
+fn parse_gamma_string_list(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::Array(items)) => items
             .iter()
@@ -408,6 +430,28 @@ fn parse_gamma_token_ids(value: Option<&Value>) -> Vec<String> {
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+fn order_up_down_token_ids(token_ids: Vec<String>, outcomes: Vec<String>) -> Vec<String> {
+    if token_ids.len() < 2 || outcomes.len() != token_ids.len() {
+        return token_ids;
+    }
+
+    let mut up_token = None;
+    let mut down_token = None;
+    for (token_id, outcome) in token_ids.iter().zip(outcomes.iter()) {
+        let normalized = outcome.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "up" | "yes" => up_token = Some(token_id.clone()),
+            "down" | "no" => down_token = Some(token_id.clone()),
+            _ => {}
+        }
+    }
+
+    match (up_token, down_token) {
+        (Some(up), Some(down)) => vec![up, down],
+        _ => token_ids,
     }
 }
 
@@ -455,5 +499,22 @@ mod tests {
             format_utc_ms(1_777_744_800_000).as_deref(),
             Some("2026-05-02T18:00:00Z")
         );
+    }
+
+    #[test]
+    fn gamma_record_orders_up_token_before_down_token() {
+        let value = serde_json::json!({
+            "id": "m",
+            "slug": "btc-updown-5m-1777750200",
+            "outcomes": "[\"Down\", \"Up\"]",
+            "clobTokenIds": "[\"down-token\", \"up-token\"]",
+            "priceToBeat": null
+        });
+
+        let record = parse_gamma_market_record(&value, "btc-updown-5m-", 300_000).unwrap();
+
+        assert_eq!(record.instrument_ids, vec!["up-token", "down-token"]);
+        assert_eq!(record.event_start_time_ms, Some(1_777_750_200_000));
+        assert_eq!(record.event_end_time_ms, Some(1_777_750_500_000));
     }
 }
