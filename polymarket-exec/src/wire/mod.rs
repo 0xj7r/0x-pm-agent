@@ -5,6 +5,9 @@ pub mod clob_v2;
 pub mod eoa_polygon;
 pub mod execution_adapter;
 pub mod market_ws;
+pub mod raw_frame;
 pub mod relayer;
 pub mod spot_ws;
 pub mod user_ws;
+
+pub use raw_frame::RawFrame;

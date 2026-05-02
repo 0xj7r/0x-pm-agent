@@ -20,6 +20,7 @@ use crate::book::{BookStore, Level};
 /// 60s without ANY frame indicates the connection has silently stalled.
 const MARKET_WS_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 use crate::metrics::{AppMetrics, StreamKind};
+use crate::wire::raw_frame::{now_ns, RawFrame};
 
 pub struct MarketWsClient {
     url: String,
@@ -28,6 +29,7 @@ pub struct MarketWsClient {
     books: Arc<BookStore>,
     metrics: Arc<AppMetrics>,
     assets_rx: Option<watch::Receiver<Vec<String>>>,
+    raw_tap: Option<tokio::sync::mpsc::UnboundedSender<RawFrame>>,
 }
 
 impl MarketWsClient {
@@ -45,11 +47,20 @@ impl MarketWsClient {
             books,
             metrics,
             assets_rx: None,
+            raw_tap: None,
         }
     }
 
     pub fn with_asset_updates(mut self, assets_rx: watch::Receiver<Vec<String>>) -> Self {
         self.assets_rx = Some(assets_rx);
+        self
+    }
+
+    /// Optional tap for the live collector. When set, every parsed event is
+    /// cloned into a `RawFrame` and pushed to the channel. The trader uses
+    /// `None` and pays only an `Option::is_none` check per event.
+    pub fn with_raw_tap(mut self, tap: tokio::sync::mpsc::UnboundedSender<RawFrame>) -> Self {
+        self.raw_tap = Some(tap);
         self
     }
 
@@ -194,6 +205,20 @@ impl MarketWsClient {
     }
 
     async fn handle_event(&self, event: Value) -> Result<()> {
+        if let Some(tap) = &self.raw_tap {
+            let asset_id = event
+                .get("asset_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let observed_at_ns = now_ns();
+            let _ = tap.send(RawFrame {
+                source: "polymarket_market_ws",
+                asset_id,
+                observed_at_ns,
+                payload: event.clone(),
+            });
+        }
+
         let event_type = event
             .get("event_type")
             .and_then(Value::as_str)
