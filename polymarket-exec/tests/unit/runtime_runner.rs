@@ -109,6 +109,7 @@ fn runner_test_config() -> AppConfig {
         paper_post_only_reject_probability: 0.85,
         paper_cancel_race_window_ms: 500,
         paper_report_path: None,
+        shadow_quote_log_path: None,
         book_snapshot_log_path: None,
         book_snapshot_max_levels: 10,
         paper_maker_rebate_coeff: 0.0,
@@ -329,6 +330,7 @@ async fn live_execution_skips_needs_reconcile_submit_replay() {
         &execution_policy,
         &mut seen_venue_fill_keys,
         None,
+        None,
     )
     .await
     .expect("execute");
@@ -398,6 +400,7 @@ async fn live_execution_ignores_stale_submit_after_order_left_memory() {
         &execution_policy,
         &mut seen_venue_fill_keys,
         None,
+        None,
     )
     .await
     .expect("execute");
@@ -437,6 +440,7 @@ async fn live_sync_defers_recent_missing_working_order() {
         adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -497,6 +501,7 @@ async fn live_sync_applies_late_fill_after_order_left_open_memory() {
         adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -573,6 +578,7 @@ async fn live_sync_reconciles_non_empty_venue_position_snapshot() {
         adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -664,6 +670,7 @@ async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merg
         &execution_policy,
         &mut seen_venue_fill_keys,
         None,
+        None,
     )
     .await
     .expect("execute");
@@ -696,6 +703,7 @@ async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merg
         adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -794,6 +802,7 @@ async fn live_accepted_merge_suppresses_duplicate_but_allows_later_paired_invent
         &execution_policy,
         &mut seen_venue_fill_keys,
         None,
+        None,
     )
     .await
     .expect("first execute");
@@ -819,6 +828,7 @@ async fn live_accepted_merge_suppresses_duplicate_but_allows_later_paired_invent
         duplicate_snapshot_adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -851,6 +861,7 @@ async fn live_accepted_merge_suppresses_duplicate_but_allows_later_paired_invent
         later_inventory_adapter.clone(),
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -921,6 +932,7 @@ async fn live_sync_excludes_inactive_venue_positions_from_strategy_inventory() {
         &execution_policy,
         &mut seen_venue_fill_keys,
         None,
+        None,
     )
     .await
     .expect("execute");
@@ -982,6 +994,7 @@ async fn matched_cancel_reject_reconciles_without_risk_off() {
         adapter,
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await
@@ -1064,6 +1077,7 @@ async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions
         adapter,
         &execution_policy,
         &mut seen_venue_fill_keys,
+        None,
         None,
     )
     .await

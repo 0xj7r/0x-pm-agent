@@ -214,6 +214,13 @@ impl<S: Strategy> Runtime<S> {
         self.venue_market_rules.get(market_id).copied()
     }
 
+    pub fn market_context_record(
+        &self,
+        market_id: &MarketId,
+    ) -> Option<crate::market_context::MarketContextRecord> {
+        self.market_contexts.get(market_id).cloned()
+    }
+
     fn canonical_market_id_for_instrument(
         &self,
         instrument_id: &InstrumentId,

@@ -695,6 +695,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(crate::paper::snapshot::BookSnapshotWriter::open)
         .transpose()?;
+    let mut shadow_quote: Option<crate::paper::shadow_quote::ShadowQuoteWriter> = config
+        .shadow_quote_log_path
+        .as_deref()
+        .map(|path| {
+            crate::paper::shadow_quote::ShadowQuoteWriter::open(
+                path,
+                config.book_snapshot_max_levels,
+            )
+        })
+        .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -811,6 +821,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut audit,
         &mut paper_report,
         &mut book_snapshot,
+        &mut shadow_quote,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -885,6 +896,22 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 output = %snap.path().display(),
                 bytes_written = snap.bytes_written(),
                 "book snapshot log flushed"
+            );
+        }
+    }
+    if let Some(shadow) = shadow_quote.as_mut() {
+        if let Err(error) = shadow.flush() {
+            warn!(
+                target: "shadow_quote.flush",
+                output = %shadow.path().display(),
+                error = %error,
+                "failed to flush shadow quote log on shutdown"
+            );
+        } else {
+            info!(
+                target: "shadow_quote.flush",
+                output = %shadow.path().display(),
+                "shadow quote log flushed"
             );
         }
     }
@@ -1075,6 +1102,7 @@ async fn run_runtime_loop(
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
+    shadow_quote: &mut Option<crate::paper::shadow_quote::ShadowQuoteWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -1217,6 +1245,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1285,6 +1314,7 @@ async fn run_runtime_loop(
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
                                 paper_report.as_mut(),
+                                shadow_quote.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1333,6 +1363,7 @@ async fn run_runtime_loop(
                         execution_policy,
                         &mut seen_venue_fill_keys,
                         paper_report.as_mut(),
+                        shadow_quote.as_mut(),
                     )
                     .await?;
                     persist_runtime_outcome(
@@ -1369,6 +1400,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1406,6 +1438,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1477,6 +1510,7 @@ async fn run_runtime_loop(
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
                                 paper_report.as_mut(),
+                                shadow_quote.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1992,6 +2026,7 @@ async fn execute_execution_adapter(
     execution_policy: &ExecutionPolicy,
     seen_venue_fill_keys: &mut HashSet<String>,
     paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
+    shadow_quote: Option<&mut crate::paper::shadow_quote::ShadowQuoteWriter>,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -2001,6 +2036,7 @@ async fn execute_execution_adapter(
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
     let mut paper_report = paper_report;
+    let mut shadow_quote = shadow_quote;
 
     fn book_mid(book: &BookState) -> Option<f64> {
         if book.best_bid > 0.0 && book.best_ask > 0.0 {
@@ -2082,6 +2118,25 @@ async fn execute_execution_adapter(
                     let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
                         continue;
                     };
+                    if let Some(writer) = shadow_quote.as_deref_mut() {
+                        let market_context = runtime.market_context_record(&intent.market_id);
+                        let btc_regime = runtime.btc_regime_snapshot(observed_at_ms);
+                        if let Err(error) = writer.record(
+                            &intent,
+                            &book,
+                            observed_at_ms,
+                            market_context.and_then(|context| context.price_to_beat),
+                            btc_regime.last_price,
+                            btc_regime.realized_vol_5m_bps,
+                        ) {
+                            warn!(
+                                target: "shadow_quote",
+                                client_order_id = %intent.client_order_id,
+                                error = %error,
+                                "failed to write shadow quote record"
+                            );
+                        }
+                    }
                     if paper_post_only_should_reject(&intent, &book, execution_policy) {
                         if let Some(reporter) = paper_report.as_deref_mut() {
                             reporter.record_reject(

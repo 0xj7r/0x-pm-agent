@@ -16,6 +16,21 @@ use crate::signals::{
 };
 use crate::types::{ClientOrderId, EpochMillis, IntentKind, MmQuoteKind, OrderIntent, TradeSide};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FairValueAnchoringConfig {
+    pub max_model_divergence: f64,
+    pub model_influence_weight: f64,
+}
+
+impl Default for FairValueAnchoringConfig {
+    fn default() -> Self {
+        Self {
+            max_model_divergence: 0.10,
+            model_influence_weight: 0.30,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LadderConfig {
     pub min_depth: usize,
@@ -35,6 +50,7 @@ pub struct LadderConfig {
     pub stoikov: StoikovParams,
     pub caps: RunningInventoryCaps,
     pub incentives: IncentiveSignal,
+    pub fair_value_anchoring: FairValueAnchoringConfig,
 }
 
 impl Default for LadderConfig {
@@ -57,6 +73,7 @@ impl Default for LadderConfig {
             stoikov: StoikovParams::default(),
             caps: RunningInventoryCaps::default(),
             incentives: IncentiveSignal::default(),
+            fair_value_anchoring: FairValueAnchoringConfig::default(),
         }
     }
 }
@@ -96,7 +113,12 @@ pub fn build_ladder<M: MarketDescriptor>(
     let remaining_ms = market
         .time_remaining_ms(now_ms)
         .unwrap_or(market.window_ms());
-    let imbalance = inventory.imbalance_ratio().max(pair_cost.imbalance_ratio());
+    let absolute_imbalance_qty = inventory.side_imbalance_qty();
+    let imbalance = if absolute_imbalance_qty >= market.min_order_size().max(1.0) {
+        inventory.imbalance_ratio().max(pair_cost.imbalance_ratio())
+    } else {
+        0.0
+    };
     let visible_depth = snapshot.total_visible_levels();
 
     let (ladder_regime, depth, spacing_ticks) = dynamic_ladder_shape(
@@ -107,8 +129,8 @@ pub fn build_ladder<M: MarketDescriptor>(
         config,
     );
 
-    let yes_fair = usable_fair(fair_value, LadderLeg::Yes, snapshot);
-    let no_fair = usable_fair(fair_value, LadderLeg::No, snapshot);
+    let yes_fair = usable_fair(fair_value, LadderLeg::Yes, snapshot, config);
+    let no_fair = usable_fair(fair_value, LadderLeg::No, snapshot, config);
 
     let yes_reservation = stoikov_reservation_price(
         yes_fair,
@@ -147,6 +169,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             &mut intents,
             market,
             LadderLeg::Yes,
+            &snapshot.yes_quote,
             yes_reservation,
             depth,
             spacing_ticks,
@@ -159,6 +182,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             &mut intents,
             market,
             LadderLeg::No,
+            &snapshot.no_quote,
             no_reservation,
             depth,
             spacing_ticks,
@@ -248,19 +272,32 @@ fn usable_fair(
     fair_value: &FairValueEstimate,
     leg: LadderLeg,
     snapshot: &PairedMarketSnapshot,
+    config: &LadderConfig,
 ) -> f64 {
+    let quote = match leg {
+        LadderLeg::Yes => &snapshot.yes_quote,
+        LadderLeg::No => &snapshot.no_quote,
+    };
     let model_fair = match leg {
         LadderLeg::Yes => fair_value.p_up,
         LadderLeg::No => fair_value.p_down,
     };
     if model_fair.is_finite() && model_fair > 0.0 && model_fair < 1.0 {
-        return model_fair;
+        if let Some(book_mid) = quote.mid_price() {
+            return anchored_model_fair(model_fair, book_mid, config.fair_value_anchoring);
+        }
+        return model_fair.clamp(0.01, 0.99);
     }
-    let quote = match leg {
-        LadderLeg::Yes => &snapshot.yes_quote,
-        LadderLeg::No => &snapshot.no_quote,
-    };
     quote.mid_price().unwrap_or(0.5).clamp(0.01, 0.99)
+}
+
+fn anchored_model_fair(model_fair: f64, book_mid: f64, config: FairValueAnchoringConfig) -> f64 {
+    let weight = config.model_influence_weight.clamp(0.0, 1.0);
+    let max_divergence = config.max_model_divergence.clamp(0.0, 0.99);
+    let blended = book_mid + weight * (model_fair - book_mid);
+    blended
+        .clamp(book_mid - max_divergence, book_mid + max_divergence)
+        .clamp(0.01, 0.99)
 }
 
 fn kelly_clip_size(
@@ -306,6 +343,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
     intents: &mut Vec<OrderIntent>,
     market: &M,
     leg: LadderLeg,
+    quote: &crate::types::QuoteSnapshot,
     reservation: f64,
     depth: usize,
     spacing_ticks: f64,
@@ -335,8 +373,16 @@ fn append_leg_ladder<M: MarketDescriptor>(
             .copied()
             .unwrap_or_else(|| 1.0 + level as f64);
         let raw_price = reservation - (level as f64 * spacing_ticks * tick_size);
-        let limit_price =
-            align_down_to_tick(raw_price, tick_size).clamp(tick_size, 1.0 - tick_size);
+        let maker_bid_cap = quote
+            .best_ask
+            .as_ref()
+            .map(|ask| ask.price - tick_size)
+            .unwrap_or(1.0 - tick_size);
+        let limit_price = align_down_to_tick(raw_price.min(maker_bid_cap), tick_size)
+            .clamp(tick_size, 1.0 - tick_size);
+        if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
+            continue;
+        }
         let clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
         let reward_qty = config.incentives.min_reward_quantity().unwrap_or(0.0);
         let quantity = (clip_usd / limit_price.max(tick_size))
@@ -390,7 +436,7 @@ mod tests {
     use super::*;
     use crate::markets::BinaryOutcomeMarket;
     use crate::signals::FairValueModel;
-    use crate::types::{InstrumentId, MarketId, QuoteSnapshot};
+    use crate::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot};
 
     fn market() -> BinaryOutcomeMarket {
         let mut market = BinaryOutcomeMarket::btc_5m(
@@ -409,6 +455,22 @@ mod tests {
             no_instrument_id: InstrumentId::from("no"),
             yes_quote: QuoteSnapshot::default(),
             no_quote: QuoteSnapshot::default(),
+        }
+    }
+
+    fn snapshot_with_asks(yes_ask: f64, no_ask: f64) -> PairedMarketSnapshot {
+        PairedMarketSnapshot {
+            yes_quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new((yes_ask - 0.01).max(0.01), 10.0)),
+                best_ask: Some(BookLevel::new(yes_ask, 10.0)),
+                ..QuoteSnapshot::default()
+            },
+            no_quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new((no_ask - 0.01).max(0.01), 10.0)),
+                best_ask: Some(BookLevel::new(no_ask, 10.0)),
+                ..QuoteSnapshot::default()
+            },
+            ..snapshot()
         }
     }
 
@@ -456,5 +518,196 @@ mod tests {
             .intents
             .iter()
             .all(|intent| intent.instrument_id.as_str() == "no"));
+    }
+
+    #[test]
+    fn ladder_buy_quotes_do_not_cross_best_ask() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.80, 0.21),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.999,
+                p_down: 0.001,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig::default(),
+            0,
+        );
+
+        for intent in result.intents {
+            if intent.instrument_id.as_str() == "yes" {
+                assert!(intent.limit_price < 0.80);
+            }
+            if intent.instrument_id.as_str() == "no" {
+                assert!(intent.limit_price < 0.21);
+            }
+        }
+    }
+
+    #[test]
+    fn paired_mm_fair_is_anchored_to_book_mid_when_model_is_extreme() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.58, 0.43),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.999,
+                p_down: 0.001,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig::default(),
+            0,
+        );
+
+        assert!(result.diagnostics.yes_reservation < 0.70);
+        assert!(result.diagnostics.no_reservation > 0.30);
+    }
+
+    #[test]
+    fn paired_mm_fair_uses_weighted_model_pull_from_book_mid() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.56, 0.46),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.70,
+                p_down: 0.30,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig {
+                fair_value_anchoring: FairValueAnchoringConfig {
+                    max_model_divergence: 0.20,
+                    model_influence_weight: 0.25,
+                },
+                stoikov: StoikovParams {
+                    gamma: 0.0,
+                    k: 1.0,
+                    max_skew: 0.20,
+                },
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!((result.diagnostics.yes_reservation - 0.59125).abs() < 0.0001);
+        assert!((result.diagnostics.no_reservation - 0.41625).abs() < 0.0001);
+    }
+
+    #[test]
+    fn paired_mm_fair_caps_mild_model_pull_at_configured_divergence() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.56, 0.46),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.90,
+                p_down: 0.10,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig {
+                fair_value_anchoring: FairValueAnchoringConfig {
+                    max_model_divergence: 0.05,
+                    model_influence_weight: 1.0,
+                },
+                stoikov: StoikovParams {
+                    gamma: 0.0,
+                    k: 1.0,
+                    max_skew: 0.20,
+                },
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!((result.diagnostics.yes_reservation - 0.605).abs() < 0.0001);
+        assert!((result.diagnostics.no_reservation - 0.405).abs() < 0.0001);
+    }
+
+    #[test]
+    fn dust_fill_imbalance_does_not_force_inventory_imbalanced_ladder_shape() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.56, 0.46),
+            &PairedInventorySnapshot {
+                yes_qty: 0.3952,
+                no_qty: 0.0,
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig {
+                stoikov: StoikovParams {
+                    gamma: 0.0,
+                    k: 1.0,
+                    max_skew: 0.20,
+                },
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert_ne!(result.diagnostics.regime, LadderRegime::InventoryImbalanced);
     }
 }

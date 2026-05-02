@@ -23,6 +23,14 @@ quote:
   venue_min_order_quantity: 5.0
   entry_min_size_multiplier: 1.30
 
+# ── Fair-Value Anchoring ────────────────────────────────────────
+# Paired-MM is liquidity provision, not directional taking. The physical
+# fair-value model can pull quotes, but only within a bounded distance from
+# live book mid.
+fair_value:
+  max_model_divergence: 0.10
+  model_influence_weight: 0.30
+
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
   max_gross_notional_usd: 20.0
