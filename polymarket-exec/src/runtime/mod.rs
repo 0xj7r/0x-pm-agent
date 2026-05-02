@@ -2248,6 +2248,29 @@ impl<S: Strategy> Runtime<S> {
             );
             return outcome;
         }
+        if intent.kind == crate::types::IntentKind::Entry
+            && intent.side == TradeSide::Buy
+            && !is_rescue_intent
+            && self
+                .last_quotes
+                .get(&intent.instrument_id)
+                .and_then(|quote| quote.best_ask.as_ref())
+                .is_some_and(|ask| intent.limit_price >= ask.price)
+        {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "maker entry suppressed: latest book would cross best ask",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         // Drift block — incident #1 guard. Suppresses FRESH ENTRIES on
         // markets where local was flat but venue had positions (typically
         // post-restart before reconcile populated). MUST bypass for rescue
