@@ -102,6 +102,20 @@ impl DesiredQuoteSet {
         }
     }
 
+    fn strategy_priority(intent: &OrderIntent) -> u8 {
+        let tag = intent.quote_level_tag.as_deref().unwrap_or_default();
+        if tag.starts_with("pair-cost-arb") {
+            return 0;
+        }
+        if tag.starts_with("mm-capital-recycle") || intent.kind == crate::types::IntentKind::Close {
+            return 1;
+        }
+        if tag.starts_with("mm-paired-bid") {
+            return 10;
+        }
+        5
+    }
+
     pub fn from_intents(mut intents: Vec<OrderIntent>, config: &QuoteEngineConfig) -> Self {
         // Detect strategies that emit a pre-laddered intent set. Their level_tags
         // (e.g. "mm-paired-bid:l1", "mm-paired-bid:l2") already encode the level,
@@ -133,14 +147,14 @@ impl DesiredQuoteSet {
             let side = bucket[0].side;
             match side {
                 TradeSide::Buy => bucket.sort_by(|a, b| {
-                    b.limit_price
-                        .partial_cmp(&a.limit_price)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    Self::strategy_priority(a)
+                        .cmp(&Self::strategy_priority(b))
+                        .then_with(|| b.limit_price.total_cmp(&a.limit_price))
                 }),
                 TradeSide::Sell => bucket.sort_by(|a, b| {
-                    a.limit_price
-                        .partial_cmp(&b.limit_price)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    Self::strategy_priority(a)
+                        .cmp(&Self::strategy_priority(b))
+                        .then_with(|| a.limit_price.total_cmp(&b.limit_price))
                 }),
             }
 
@@ -336,6 +350,40 @@ mod tests {
         assert_eq!(desired.quotes[0].level, 0);
         assert_eq!(desired.quotes[1].level, 1);
         assert_eq!(desired.quotes[2].level, 2);
+    }
+
+    #[test]
+    fn desired_quote_set_prioritizes_pair_cost_over_mm_overlay_within_level_cap() {
+        let config = QuoteEngineConfig {
+            max_levels_per_side: 3,
+            skew_bps: 0.0,
+            ..QuoteEngineConfig::default()
+        };
+        let intents = vec![
+            intent("inst", TradeSide::Buy, 0.70, Some("mm-paired-bid:yes:l1")),
+            intent("inst", TradeSide::Buy, 0.69, Some("mm-paired-bid:yes:l2")),
+            intent("inst", TradeSide::Buy, 0.68, Some("mm-paired-bid:yes:l3")),
+            intent(
+                "inst",
+                TradeSide::Buy,
+                0.60,
+                Some("pair-cost-arb:cheap-leg:yes"),
+            ),
+        ];
+
+        let desired = DesiredQuoteSet::from_intents(intents, &config);
+        let tags = desired
+            .quotes
+            .iter()
+            .map(|quote| quote.intent.quote_level_tag.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        assert_eq!(desired.quotes.len(), 3);
+        assert!(
+            tags.iter()
+                .any(|tag| tag.starts_with("pair-cost-arb:cheap-leg:yes")),
+            "{tags:?}"
+        );
     }
 
     #[test]
