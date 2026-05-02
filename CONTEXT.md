@@ -146,7 +146,7 @@ Cheap leg = mid_price meaningfully below fair_price **AND** projected_pair_cost 
 - SQLite order store, journal, audit logs.
 
 **Critical addition**:
-- Polygon RPC (Dwellir full node — free tier for testing, **$49/mo paid tier strongly recommended for live**).
+- Polygon RPC (`POLYGON_RPC_URL`) from a low-latency provider. Current operator preference is Telonex; store the full Telonex HTTPS Polygon endpoint in the deployment env, not in git. Optional `POLYGON_RPC_FAILOVER_URLS` can hold comma-separated backup endpoints.
 
 **On-chain actions** (via RPC):
 - `split()` and `merge()` (frequent in Pair-Cost style).
