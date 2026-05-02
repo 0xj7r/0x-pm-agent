@@ -4,6 +4,7 @@ pub mod api;
 pub mod clob_v2;
 pub mod eoa_polygon;
 pub mod execution_adapter;
+mod execution_types;
 pub mod incentives_api;
 pub mod market_ws;
 pub mod polygon_rpc;

@@ -1,7 +1,9 @@
 //! Core runtime state machine: signal ingestion, strategy evaluation, and order lifecycle.
 
+mod attribution;
 mod audit;
 mod btc_signals;
+mod checkpoint;
 mod dashboard;
 mod execution_policy;
 mod live_auth;
@@ -41,7 +43,7 @@ use crate::types::{
     MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
-use serde::Serialize;
+pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
 use tracing::{info, warn};
 
 const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
@@ -52,102 +54,6 @@ const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
 /// payout for free. Whale data shows merge:redeem ≈ 0.07 — most paired
 /// inventory just resolves naturally.
 const MERGE_MIN_NOTIONAL_USD: f64 = 2.0;
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct RuntimeCheckpointOrder {
-    pub client_order_id: ClientOrderId,
-    pub venue_order_id: Option<crate::types::OrderId>,
-    pub market_id: MarketId,
-    pub instrument_id: InstrumentId,
-    pub side: crate::types::TradeSide,
-    pub limit_price: f64,
-    pub reduce_only: bool,
-    pub original_qty: f64,
-    pub remaining_qty: f64,
-    pub filled_qty: f64,
-    pub status: String,
-    pub submitted_at_ms: EpochMillis,
-    pub last_update_ms: EpochMillis,
-    pub reason: Option<String>,
-    pub strategy_tag: String,
-    pub quote_level_tag: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct RuntimeCheckpoint {
-    pub observed_at_ms: EpochMillis,
-    pub run_id: String,
-    pub name: String,
-    pub runtime_status: RuntimeStatus,
-    pub open_orders: Vec<RuntimeCheckpointOrder>,
-    pub needs_reconcile_orders: usize,
-    pub event_seq_checkpoint: u64,
-}
-
-impl ManagedOrderStatus {
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            ManagedOrderStatus::Filled
-                | ManagedOrderStatus::Cancelled
-                | ManagedOrderStatus::Rejected
-                | ManagedOrderStatus::Quarantined
-        )
-    }
-
-    pub fn can_transition_to(self, next: ManagedOrderStatus) -> bool {
-        use ManagedOrderStatus::*;
-        if self == next {
-            return true;
-        }
-
-        match self {
-            PendingSubmit => matches!(
-                next,
-                Submitted
-                    | Working
-                    | CancelRequested
-                    | Filled
-                    | Cancelled
-                    | Rejected
-                    | NeedsReconcile
-                    | Quarantined
-            ),
-            Submitted => matches!(
-                next,
-                Working
-                    | CancelRequested
-                    | Filled
-                    | Cancelled
-                    | Rejected
-                    | NeedsReconcile
-                    | Quarantined
-            ),
-            Working => matches!(
-                next,
-                CancelRequested | Filled | Cancelled | Rejected | NeedsReconcile | Quarantined
-            ),
-            CancelRequested => {
-                matches!(
-                    next,
-                    Cancelled | Filled | Rejected | NeedsReconcile | Quarantined
-                )
-            }
-            Filled | Cancelled | Rejected | Quarantined => false,
-            NeedsReconcile => matches!(
-                next,
-                PendingSubmit
-                    | Submitted
-                    | Working
-                    | CancelRequested
-                    | Filled
-                    | Cancelled
-                    | Rejected
-                    | Quarantined
-            ),
-        }
-    }
-}
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
