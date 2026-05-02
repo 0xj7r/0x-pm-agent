@@ -12,7 +12,7 @@ pub enum LadderLeg {
 pub enum LadderRegime {
     LowVolOscillating,
     Normal,
-    HighVolTrending,
+    DirectionalDefensive,
     LateBar,
     InventoryImbalanced,
 }

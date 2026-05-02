@@ -252,7 +252,7 @@ fn dynamic_ladder_shape(
             )
         }
         Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile) => (
-            LadderRegime::HighVolTrending,
+            LadderRegime::DirectionalDefensive,
             config
                 .high_vol_depth
                 .clamp(config.min_depth, config.max_depth),
@@ -314,7 +314,7 @@ fn kelly_clip_size(
     let regime_scale = match regime {
         LadderRegime::LowVolOscillating => 1.0,
         LadderRegime::Normal => 0.8,
-        LadderRegime::HighVolTrending => 0.5,
+        LadderRegime::DirectionalDefensive => 0.5,
         LadderRegime::LateBar => 0.35,
         LadderRegime::InventoryImbalanced => 0.35,
     };
