@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 use tokio::sync::{watch, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::AppConfig;
 use crate::market_context::{MarketContextRecord, MarketContextStore};
@@ -205,12 +205,96 @@ async fn sweep_family_into(
             continue;
         };
         for item in items {
-            if let Some(record) = parse_gamma_market_record(item, slug_prefix, window_ms) {
+            if let Some(mut record) = parse_gamma_market_record(item, slug_prefix, window_ms) {
+                if record.price_to_beat.is_none() {
+                    match fetch_crypto_open_price(client, slug_prefix, window_ms, &record).await {
+                        Ok(Some(open_price)) => {
+                            record.price_to_beat = Some(open_price);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(
+                                target: "market_discovery",
+                                market_id = record.market_id,
+                                error = %error,
+                                "failed to enrich crypto price_to_beat from Polymarket crypto-price API"
+                            );
+                        }
+                    }
+                }
                 out.push(record);
             }
         }
     }
     Ok(())
+}
+
+async fn fetch_crypto_open_price(
+    client: &reqwest::Client,
+    slug_prefix: &str,
+    window_ms: u64,
+    record: &MarketContextRecord,
+) -> Result<Option<f64>> {
+    let Some((symbol, variant)) = crypto_price_query_params(slug_prefix, window_ms) else {
+        return Ok(None);
+    };
+    let (Some(start_ms), Some(end_ms)) = (record.event_start_time_ms, record.event_end_time_ms)
+    else {
+        return Ok(None);
+    };
+    let Some(event_start_time) = format_utc_ms(start_ms) else {
+        return Ok(None);
+    };
+    let Some(end_date) = format_utc_ms(end_ms) else {
+        return Ok(None);
+    };
+
+    let payload = client
+        .get("https://polymarket.com/api/crypto/crypto-price")
+        .query(&[
+            ("symbol", symbol),
+            ("eventStartTime", event_start_time.as_str()),
+            ("variant", variant),
+            ("endDate", end_date.as_str()),
+        ])
+        .header("User-Agent", "polymarket-agent/1.0")
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<Value>()
+        .await?;
+
+    Ok(pick_gamma_f64(&payload, &["openPrice", "open_price"]))
+}
+
+fn crypto_price_query_params(
+    slug_prefix: &str,
+    window_ms: u64,
+) -> Option<(&'static str, &'static str)> {
+    let symbol = if slug_prefix.starts_with("btc-") {
+        "BTC"
+    } else if slug_prefix.starts_with("eth-") {
+        "ETH"
+    } else if slug_prefix.starts_with("sol-") {
+        "SOL"
+    } else {
+        return None;
+    };
+    let variant = match window_ms {
+        300_000 => "fiveminute",
+        900_000 => "fifteen",
+        3_600_000 => "hourly",
+        14_400_000 => "fourhour",
+        _ => return None,
+    };
+    Some((symbol, variant))
+}
+
+fn format_utc_ms(timestamp_ms: u64) -> Option<String> {
+    Utc.timestamp_millis_opt(timestamp_ms as i64)
+        .single()
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 fn select_runtime_market_records(
@@ -347,4 +431,29 @@ fn pick_gamma_f64(value: &Value, keys: &[&str]) -> Option<f64> {
         Value::String(raw) => raw.parse::<f64>().ok(),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_price_query_params_supports_short_crypto_windows() {
+        assert_eq!(
+            crypto_price_query_params("btc-updown-5m-", 300_000),
+            Some(("BTC", "fiveminute"))
+        );
+        assert_eq!(
+            crypto_price_query_params("eth-updown-15m-", 900_000),
+            Some(("ETH", "fifteen"))
+        );
+    }
+
+    #[test]
+    fn format_utc_ms_matches_polymarket_crypto_price_api_shape() {
+        assert_eq!(
+            format_utc_ms(1_777_744_800_000).as_deref(),
+            Some("2026-05-02T18:00:00Z")
+        );
+    }
 }
