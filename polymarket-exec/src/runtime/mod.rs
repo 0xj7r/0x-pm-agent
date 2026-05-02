@@ -5,6 +5,7 @@ mod btc_signals;
 mod dashboard;
 mod execution_policy;
 mod live_auth;
+mod live_health;
 mod market_universe;
 pub mod order_store;
 mod paper_fill;
