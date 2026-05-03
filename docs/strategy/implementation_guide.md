@@ -196,7 +196,7 @@ boundary.
 
 - `QuoteMatchKey` includes `level_tag`. Distinct ladder levels are
   distinct keys.
-- Submit/replace/cancel rate caps come from env (`WHALE_PAIR_QUOTE_*`).
+- Submit/replace/cancel rate caps come from env (`PM_BTC_5M_QUOTE_*`).
   Not in code defaults.
 - Close intents (hedge rescue) bypass the submit rate cap.
 
@@ -235,13 +235,13 @@ boundary.
 
 | Concept | Where it's defined | Override mechanism |
 |---|---|---|
-| Ladder depth | `WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_LEVELS` env | env only |
-| Ladder spacing | `WHALE_PAIR_BTC_5M_MM_ENTRY_LADDER_SPACING_TICKS` env | env only |
-| Per-leg bid cap | `WHALE_PAIR_BTC_5M_MM_ENTRY_PREMIUM_BID_CAP` env | env, default 0.97 |
-| Capital caps | `WHALE_PAIR_BTC_5M_MM_MAX_LEG_COST_USD` etc | env |
-| Risk caps | `WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_*` env | env |
-| TTL | `WHALE_PAIR_LIVE_ORDER_TTL_MS` env | env, default 20s |
-| Reconciler rate caps | `WHALE_PAIR_QUOTE_MAX_*` env | env |
+| Ladder depth | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
+| Ladder spacing | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
+| Per-leg bid cap | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
+| Capital caps | Strategy YAML + runtime risk caps | YAML / `PM_BTC_5M_EXEC_*` |
+| Risk caps | `PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_*` env | env |
+| TTL | `PM_BTC_5M_LIVE_ORDER_TTL_MS` env | env, default 20s |
+| Reconciler rate caps | `PM_BTC_5M_QUOTE_MAX_*` env | env |
 | Maker rebate behavior | venue-side; we just maintain `post_only=true` | n/a |
 | Suppression / cooling gates | **REMOVED** (2026-04-29) | n/a — should be signal-derived |
 
@@ -315,16 +315,16 @@ incrementing the counter unconditionally.
 **Fix:** classify the Err message through the same exclusion list before
 incrementing. Patched on 2026-04-29.
 
-### Bug 2 — Profile JSON has no effect on `btc_5m_mm`
+### Historical Bug 2 — Profile JSON had no effect on old `btc_5m_mm`
 
 **Symptom:** operator sets `quote.levels_per_side: 8` in profile JSON,
 ladder still emits 3 levels.
 
-**Root cause:** `StrategyMode::from_name("btc_5m_mm", profile)` ignores
-the profile and calls `Btc5mMmConfig::from_env()`. The profile path
-is wired for other strategies but not this one.
+**Root cause:** the old `btc_5m_mm` selector ignored the profile and called
+env-only config. The current active selectors are `paired_mm`, `pair_cost_arb`,
+and `hybrid`, all driven by YAML strategy profiles.
 
-**Detection:** `grep -n 'StrategyMode::from_name\|btc_5m_mm.*profile'` —
+**Detection:** `grep -n 'StrategyMode::try_from_name\|btc_5m_mm.*profile'` —
 if no profile field flows into `Btc5mMmConfig`, none will take effect.
 
 **Fix path:** PR1 in the audit (`docs/strategy/audit_2026-04-29.md`) —
@@ -391,7 +391,7 @@ bar-phase pacing, vol-scaled thresholds).
 (reconciler churn). If too long, stale quotes get filled at
 disadvantageous prices when the book moves.
 
-**Tunable:** `WHALE_PAIR_LIVE_ORDER_TTL_MS`. Current default 20s.
+**Tunable:** `PM_BTC_5M_LIVE_ORDER_TTL_MS`. Current default 20s.
 Whale's empirical bid persistence appears similar — leave at 20s
 unless you see a specific symptom.
 
@@ -449,8 +449,8 @@ ssh ubuntu@$AWS_LIVE_HOST 'cat ~/.config/polymarket-exec/btc_5m_mm_tinylive.env'
 - A constant in `strategy.rs` is gating behavior whale exhibits — promote
   to env or remove (follow `docs/strategy/audit_2026-04-29.md` PR list).
 - Logs show a known bug pattern from §6 — apply the listed fix.
-- Reconciler churn is tight — bump `WHALE_PAIR_QUOTE_MAX_SUBMIT_PER_WINDOW`.
-- TTL too aggressive/loose — bump `WHALE_PAIR_LIVE_ORDER_TTL_MS`.
+- Reconciler churn is tight — bump `PM_BTC_5M_QUOTE_MAX_SUBMIT_PER_WINDOW`.
+- TTL too aggressive/loose — bump `PM_BTC_5M_LIVE_ORDER_TTL_MS`.
 
 **Discuss with operator first:**
 - Touching `inventory.rs` (paired ledger) — a bug here causes

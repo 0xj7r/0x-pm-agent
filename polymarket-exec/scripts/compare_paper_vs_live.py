@@ -2,8 +2,8 @@
 """Compare shadow-live and tiny-live decision outputs by market/time window.
 
 Inputs may be either:
-  - PaperReportSummary JSON files from WHALE_PAIR_PAPER_REPORT_PATH
-  - Runtime journal JSONL files from WHALE_PAIR_EXEC_JOURNAL_PATH
+  - PaperReportSummary JSON files from PM_BTC_5M_PAPER_REPORT_PATH
+  - Runtime journal JSONL files from PM_BTC_5M_EXEC_JOURNAL_PATH
 
 The script intentionally compares decision surface, not fills economics. It
 answers whether shadow and live were trying to submit/cancel/suppress in the

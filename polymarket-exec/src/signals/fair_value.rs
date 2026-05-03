@@ -103,6 +103,30 @@ pub enum NoSignalReason {
     VolInvalid,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FairValueCalibration {
+    pub up_bias: f64,
+    pub min_probability: f64,
+    pub max_probability: f64,
+}
+
+impl FairValueCalibration {
+    pub fn apply(self, estimate: FairValueEstimate) -> FairValueEstimate {
+        let lo = self.min_probability.clamp(0.0, 0.5);
+        let hi = if self.max_probability > 0.0 {
+            self.max_probability.clamp(0.5, 1.0)
+        } else {
+            1.0
+        };
+        let p_up = (estimate.p_up + self.up_bias).clamp(lo, hi);
+        FairValueEstimate {
+            p_up,
+            p_down: (1.0 - p_up).clamp(0.0, 1.0),
+            ..estimate
+        }
+    }
+}
+
 impl std::fmt::Display for NoSignalReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -197,6 +221,86 @@ pub fn estimate_fair_value(
         log_moneyness,
         sigma_remaining,
         time_remaining_s,
+        model: FairValueModel::BsmBinary,
+    }
+}
+
+/// Momentum-aware binary probability for timed up/down markets.
+///
+/// This is the production rescue/hold model target:
+///
+/// `P(up) = Phi((delta + momentum * tau) / (sigma * sqrt(tau)))`
+///
+/// Inputs are dimensionless returns, not bps:
+/// - `spot_price` and `strike` produce `delta = (S-K)/K`.
+/// - `tau_fraction` is remaining time divided by total bar duration.
+/// - `sigma_return` is short-horizon realized std-dev over the bar.
+/// - `momentum_return` is recent drift over one bar-equivalent horizon.
+pub fn estimate_fair_value_with_momentum(
+    spot_price: f64,
+    strike: f64,
+    tau_fraction: f64,
+    sigma_return: f64,
+    momentum_return: f64,
+) -> FairValueEstimate {
+    let no_signal = |reason: NoSignalReason| FairValueEstimate {
+        p_up: 0.5,
+        p_down: 0.5,
+        log_moneyness: f64::NAN,
+        sigma_remaining: f64::NAN,
+        time_remaining_s: tau_fraction * BAR_TOTAL_DURATION_SECONDS,
+        model: FairValueModel::NoSignal(reason),
+    };
+
+    if !spot_price.is_finite() || spot_price <= 0.0 {
+        return no_signal(NoSignalReason::SpotInvalid);
+    }
+    if !strike.is_finite() || strike <= 0.0 {
+        return no_signal(NoSignalReason::StrikeInvalid);
+    }
+    if !tau_fraction.is_finite() || tau_fraction < 0.0 {
+        return no_signal(NoSignalReason::TimeRemainingInvalid);
+    }
+    if !sigma_return.is_finite() || sigma_return <= 0.0 {
+        return no_signal(NoSignalReason::VolInvalid);
+    }
+
+    let tau = tau_fraction.clamp(0.0, 1.0);
+    let delta = (spot_price - strike) / strike;
+    let log_moneyness = (spot_price / strike).ln();
+    if tau <= TIME_FLOOR_SECONDS / BAR_TOTAL_DURATION_SECONDS {
+        let p_up = if delta >= 0.0 { 1.0 } else { 0.0 };
+        return FairValueEstimate {
+            p_up,
+            p_down: 1.0 - p_up,
+            log_moneyness,
+            sigma_remaining: 0.0,
+            time_remaining_s: tau * BAR_TOTAL_DURATION_SECONDS,
+            model: FairValueModel::StepFunctionDecided,
+        };
+    }
+
+    let sigma_remaining = sigma_return * tau.sqrt();
+    if sigma_remaining <= 1e-12 {
+        let p_up = if delta >= 0.0 { 1.0 } else { 0.0 };
+        return FairValueEstimate {
+            p_up,
+            p_down: 1.0 - p_up,
+            log_moneyness,
+            sigma_remaining,
+            time_remaining_s: tau * BAR_TOTAL_DURATION_SECONDS,
+            model: FairValueModel::StepFunctionDecided,
+        };
+    }
+
+    let z = (delta + momentum_return * tau) / sigma_remaining;
+    let p_up = standard_normal_cdf(z).clamp(0.0, 1.0);
+    FairValueEstimate {
+        p_up,
+        p_down: (1.0 - p_up).clamp(0.0, 1.0),
+        log_moneyness,
+        sigma_remaining,
+        time_remaining_s: tau * BAR_TOTAL_DURATION_SECONDS,
         model: FairValueModel::BsmBinary,
     }
 }

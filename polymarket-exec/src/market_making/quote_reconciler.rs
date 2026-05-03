@@ -14,6 +14,8 @@ pub struct ReconcilerConfig {
     pub max_submit_per_window: usize,
     pub max_replace_per_window: usize,
     pub max_cancel_per_window: usize,
+    pub price_replace_threshold: f64,
+    pub quantity_replace_threshold: f64,
 }
 
 impl Default for ReconcilerConfig {
@@ -26,6 +28,8 @@ impl Default for ReconcilerConfig {
             max_submit_per_window: 6,
             max_replace_per_window: 4,
             max_cancel_per_window: 12,
+            price_replace_threshold: 0.02,
+            quantity_replace_threshold: 0.25,
         }
     }
 }
@@ -54,7 +58,7 @@ pub struct QuotePlan {
 #[derive(Clone, Copy, Debug)]
 enum ChurnGate {
     Allowed,
-    HardPull,
+    Throttle,
 }
 
 #[derive(Clone, Debug)]
@@ -178,14 +182,6 @@ impl QuoteReconciler {
         count + upcoming <= cap
     }
 
-    fn same_quote(current: &OrderIntent, desired: &OrderIntent) -> bool {
-        (current.quantity - desired.quantity).abs() <= 1e-9
-            && (current.limit_price - desired.limit_price).abs() <= 1e-9
-            && current.side == desired.side
-            && current.reduce_only == desired.reduce_only
-            && current.quote_level_tag == desired.quote_level_tag
-    }
-
     fn record_churn(&mut self, now_ms: EpochMillis, churn: usize) {
         let window_ms = self.config.churn_window_ms.max(1);
         Self::prune_window(&mut self.churn_events, now_ms, window_ms);
@@ -251,7 +247,7 @@ impl QuoteReconciler {
             let _ = events.pop_front();
         }
         if events.len() + upcoming_churn > self.config.max_churn_per_window {
-            ChurnGate::HardPull
+            ChurnGate::Throttle
         } else {
             ChurnGate::Allowed
         }
@@ -262,25 +258,35 @@ impl QuoteReconciler {
             .is_some_and(|until| now_ms <= until && until != 0)
     }
 
-    fn build_cancel_all(
+    fn build_keep_all(
         &self,
         open_orders: &HashMap<ClientOrderId, ManagedOrder>,
-        now_ms: EpochMillis,
     ) -> Vec<QuoteAction> {
         let mut actions = Vec::new();
         let mut keys = open_orders.keys().collect::<Vec<_>>();
         keys.sort_unstable();
         for client_order_id in keys {
             if let Some(order) = open_orders.get(client_order_id) {
-                if self.can_change(order, now_ms) {
-                    actions.push(QuoteAction::Cancel {
-                        client_order_id: client_order_id.clone(),
-                        reason: "hard pull refresh".to_string(),
-                    });
+                if order.remaining_qty() > 1e-9 {
+                    actions.push(QuoteAction::Keep(order.intent.clone()));
                 }
             }
         }
         actions
+    }
+
+    fn materially_different_quote(&self, current: &OrderIntent, desired: &OrderIntent) -> bool {
+        if current.side != desired.side
+            || current.reduce_only != desired.reduce_only
+            || current.quote_level_tag != desired.quote_level_tag
+        {
+            return true;
+        }
+
+        let price_threshold = self.config.price_replace_threshold.max(0.0);
+        let quantity_threshold = self.config.quantity_replace_threshold.max(0.0);
+        (current.limit_price - desired.limit_price).abs() > price_threshold
+            || (current.quantity - desired.quantity).abs() > quantity_threshold
     }
 
     pub fn plan(
@@ -291,9 +297,8 @@ impl QuoteReconciler {
     ) -> QuotePlan {
         let mut plan = QuotePlan::default();
         if self.should_hard_pull(now_ms) {
-            plan.actions
-                .extend(self.build_cancel_all(open_orders, now_ms));
-            plan.notes.push("hard pull active".to_string());
+            plan.actions.extend(self.build_keep_all(open_orders));
+            plan.notes.push("quote churn throttle active".to_string());
             return plan;
         }
 
@@ -342,7 +347,7 @@ impl QuoteReconciler {
             }
 
             let (existing_id, existing_order) = matches.remove(0);
-            if Self::same_quote(&existing_order.intent, &desired_intent) {
+            if !self.materially_different_quote(&existing_order.intent, &desired_intent) {
                 plan.actions
                     .push(QuoteAction::Keep(existing_order.intent.clone()));
             } else if self.can_change(existing_order, now_ms) {
@@ -410,10 +415,10 @@ impl QuoteReconciler {
             }
         }
 
-        if let ChurnGate::HardPull = self.evaluate_churn(now_ms, planned_churn) {
+        if let ChurnGate::Throttle = self.evaluate_churn(now_ms, planned_churn) {
             self.hard_pull_until_ms = Some(now_ms.saturating_add(self.config.hard_pull_ms));
-            plan.actions = self.build_cancel_all(open_orders, now_ms);
-            plan.notes.push("hard pull triggered".to_string());
+            plan.actions = self.build_keep_all(open_orders);
+            plan.notes.push("quote churn throttle triggered".to_string());
             return plan;
         }
 
@@ -523,6 +528,7 @@ mod tests {
             max_submit_per_window: 6,
             max_replace_per_window: 4,
             max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
         });
         let desired = crate::quote_engine::DesiredQuoteSet {
             quotes: vec![crate::quote_engine::DesiredQuote {
@@ -557,8 +563,9 @@ mod tests {
             max_submit_per_window: 6,
             max_replace_per_window: 4,
             max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
         });
-        let mut replacement = intent("replacement", 0.21);
+        let mut replacement = intent("replacement", 0.23);
         replacement.quote_level_tag = Some("lvl-1".to_string());
         let desired = crate::quote_engine::DesiredQuoteSet {
             quotes: vec![crate::quote_engine::DesiredQuote {
@@ -592,6 +599,7 @@ mod tests {
             max_submit_per_window: 6,
             max_replace_per_window: 4,
             max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
         });
         let mut replacement = intent("replacement", 0.21);
         replacement.quote_level_tag = Some("lvl-1".to_string());
@@ -620,6 +628,7 @@ mod tests {
             max_submit_per_window: 0,
             max_replace_per_window: 4,
             max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
         });
         let desired = crate::quote_engine::DesiredQuoteSet {
             quotes: vec![crate::quote_engine::DesiredQuote {

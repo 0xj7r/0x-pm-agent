@@ -12,11 +12,11 @@ use crate::config::LogFormat;
 use crate::config::UserWsAuth;
 
 pub fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+    env_value(key).unwrap_or_else(|| default.to_string())
 }
 
 pub fn parse_bool(key: &str, default_value: bool) -> Result<bool> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" | "yes" | "y" => Ok(true),
         "0" | "false" | "off" | "no" | "n" => Ok(false),
@@ -41,7 +41,7 @@ pub fn parse_socket_addr(key: &str, default: &str) -> Result<SocketAddr> {
 }
 
 pub fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
-    let raw = env::var(key).unwrap_or_else(|_| default_ms.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_ms.to_string());
     let value: u64 = raw
         .parse()
         .with_context(|| format!("failed to parse {key} as integer milliseconds"))?;
@@ -49,7 +49,7 @@ pub fn parse_duration_ms(key: &str, default_ms: u64) -> Result<Duration> {
 }
 
 pub fn parse_path_optional(key: &str) -> Option<PathBuf> {
-    let value = env::var(key).ok()?;
+    let value = env_value(key)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -58,13 +58,13 @@ pub fn parse_path_optional(key: &str) -> Option<PathBuf> {
 }
 
 pub fn parse_f64(key: &str, default_value: f64) -> Result<f64> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     raw.parse()
         .with_context(|| format!("failed to parse {key} as floating point number"))
 }
 
 pub fn parse_usize(key: &str, default_value: usize) -> Result<usize> {
-    let raw = env::var(key).unwrap_or_else(|_| default_value.to_string());
+    let raw = env_value(key).unwrap_or_else(|| default_value.to_string());
     raw.parse()
         .with_context(|| format!("failed to parse {key} as non-negative integer"))
 }
@@ -78,13 +78,17 @@ pub fn split_csv_required(key: &str) -> Result<Vec<String>> {
 }
 
 pub fn split_csv_optional(key: &str) -> Vec<String> {
-    env::var(key)
+    env_value(key)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+pub fn env_value(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn lookup_first_env<F>(lookup: &F, keys: &[&str]) -> Option<String>
@@ -134,18 +138,16 @@ pub fn parse_asset_market_map(raw: &str) -> Result<HashMap<String, String>> {
         .map(str::trim)
         .filter(|pair| !pair.is_empty())
     {
-        let (asset_id, market_id) = pair
-            .split_once(':')
-            .with_context(|| {
-                format!(
-                    "failed to parse WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` as asset_id:market_id"
-                )
-            })?;
+        let (asset_id, market_id) = pair.split_once(':').with_context(|| {
+            format!(
+                "failed to parse PM_BTC_5M_INSTRUMENT_MARKETS entry `{pair}` as asset_id:market_id"
+            )
+        })?;
         let asset_id = asset_id.trim();
         let market_id = market_id.trim();
         if asset_id.is_empty() || market_id.is_empty() {
             bail!(
-                "WHALE_PAIR_INSTRUMENT_MARKETS entry `{pair}` must have non-empty asset_id and market_id"
+                "PM_BTC_5M_INSTRUMENT_MARKETS entry `{pair}` must have non-empty asset_id and market_id"
             );
         }
         mapping.insert(asset_id.to_string(), market_id.to_string());
@@ -173,12 +175,12 @@ mod tests {
 
     #[test]
     fn parses_missing_bool_with_default() {
-        assert!(parse_bool("WHALE_PAIR_PAPER_MODE_MISSING", true).unwrap());
+        assert!(parse_bool("PM_BTC_5M_PAPER_MODE_MISSING", true).unwrap());
     }
 
     #[test]
     fn parses_bool_from_text() {
-        assert!(!parse_bool("WHALE_PAIR_PAPER_MODE_NO", false).unwrap());
+        assert!(!parse_bool("PM_BTC_5M_PAPER_MODE_NO", false).unwrap());
     }
 
     #[test]
