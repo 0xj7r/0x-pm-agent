@@ -129,7 +129,10 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         .clamp(tick_size, 1.0 - tick_size);
 
     let venue_min_qty = market.min_order_size().max(0.0);
-    let qty_by_notional = config.max_buy_notional_usd / limit_price.max(tick_size);
+    let venue_min_notional_usd = venue_min_qty * limit_price;
+    let effective_max_buy_notional_usd =
+        config.max_buy_notional_usd.max(venue_min_notional_usd);
+    let qty_by_notional = effective_max_buy_notional_usd / limit_price.max(tick_size);
     let quantity = imbalance_qty
         .max(venue_min_qty)
         .min(config.max_buy_qty)
@@ -325,6 +328,38 @@ mod tests {
                 min_imbalance_qty: 1.0,
                 max_buy_qty: 10.0,
                 max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            0,
+        );
+
+        let CapitalRecycleDecision::BuyLightSide { intent, .. } = decision else {
+            panic!("expected venue-minimum recycle buy");
+        };
+
+        assert_eq!(intent.quantity, 5.0);
+    }
+
+    #[test]
+    fn recycle_notional_cap_floors_to_venue_minimum() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.45,
+                no_avg_cost: 0.42,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.90,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 1.0,
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
