@@ -53,6 +53,7 @@ signals:
 
   cheap_leg:
     price_deviation_bps: 35          # How far below fair value to consider "cheap"
+    max_entry_price: 0.55            # Fresh cheap-leg entry only; recycle may buy light side to merge
     order_flow_imbalance_threshold: 0.0
 
   vol_regime:

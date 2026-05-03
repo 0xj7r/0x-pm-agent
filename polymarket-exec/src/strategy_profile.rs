@@ -111,6 +111,12 @@ impl StrategyProfile {
             .cheap_leg
             .price_deviation_bps
             .unwrap_or(config.price_deviation_bps);
+        config.max_fresh_entry_price = self
+            .signals
+            .cheap_leg
+            .max_entry_price
+            .unwrap_or(config.max_fresh_entry_price)
+            .clamp(0.0, 0.99);
         config.min_edge_bps = self.pair_cost.min_edge_bps.unwrap_or(config.min_edge_bps);
         config.base_clip_usd = self
             .clip_sizing
@@ -525,6 +531,7 @@ pub struct FairValueSection {
 #[serde(default)]
 pub struct CheapLegSection {
     pub price_deviation_bps: Option<f64>,
+    pub max_entry_price: Option<f64>,
     pub order_flow_imbalance_threshold: Option<f64>,
 }
 

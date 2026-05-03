@@ -26,6 +26,7 @@ pub struct PairCostArbStrategyConfig {
     pub high_vol_atr_threshold: f64,
     pub pause_in_extreme_vol: bool,
     pub price_deviation_bps: f64,
+    pub max_fresh_entry_price: f64,
     pub min_edge_bps: f64,
     pub base_clip_usd: f64,
     pub min_clip_usd: f64,
@@ -61,6 +62,7 @@ impl Default for PairCostArbStrategyConfig {
             high_vol_atr_threshold: 0.00085,
             pause_in_extreme_vol: true,
             price_deviation_bps: 35.0,
+            max_fresh_entry_price: 0.55,
             min_edge_bps: 100.0,
             base_clip_usd: 1.5,
             min_clip_usd: 0.5,
@@ -205,6 +207,19 @@ impl PairCostArbStrategy {
         (price >= tick && price < best_ask).then_some(price)
     }
 
+    fn book_cheapest_leg<M: MarketDescriptor>(&self, input: &StrategyInput<M>) -> Option<Leg> {
+        let yes_mid = input.snapshot.yes_quote.mid_price()?;
+        let no_mid = input.snapshot.no_quote.mid_price()?;
+        if !yes_mid.is_finite() || !no_mid.is_finite() {
+            return None;
+        }
+        if yes_mid <= no_mid {
+            Some(Leg::Yes)
+        } else {
+            Some(Leg::No)
+        }
+    }
+
     fn projected_pair_cost(
         &self,
         pair_cost: &PairCostTracker,
@@ -300,8 +315,8 @@ impl PairCostArbStrategy {
         }
 
         let tick = input.market.tick_size().max(0.001);
-        let limit_price = (best_bid - tick * self.config.maker_safety_ticks.max(0.0))
-            .clamp(tick, 1.0 - tick);
+        let limit_price =
+            (best_bid - tick * self.config.maker_safety_ticks.max(0.0)).clamp(tick, 1.0 - tick);
         let qty = (excess_qty * self.config.rescue_max_fraction.clamp(0.0, 1.0))
             .min(excess_qty)
             .max(0.0);
@@ -364,6 +379,9 @@ impl PairCostArbStrategy {
 
         let max_bid = (fair_price - self.config.min_edge_bps / 10_000.0).clamp(0.0, 0.99);
         let bid_price = self.maker_bid_price(&input.market, quote, max_bid)?;
+        if bid_price > self.config.max_fresh_entry_price {
+            return None;
+        }
         let edge_scale = ((fair_price - mid) / required_edge.max(1e-9)).clamp(1.0, 3.0);
         let clip_usd = (self.config.base_clip_usd
             * self.config.capital_scale_factor
@@ -445,10 +463,19 @@ where
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
         let target = self.effective_pair_cost_target(input.btc_regime.realized_vol_5m_bps);
         let convex_winner = self.active_convex_winner(&input);
+        let book_cheapest_leg = self.book_cheapest_leg(&input);
         let mut notes = vec![format!(
             "pair-cost arb fair p_up={:.4} p_down={:.4} target={:.4}",
             input.fair_value.p_up, input.fair_value.p_down, target
         )];
+        if let (Some(yes_mid), Some(no_mid)) = (
+            input.snapshot.yes_quote.mid_price(),
+            input.snapshot.no_quote.mid_price(),
+        ) {
+            notes.push(format!(
+                "pair-cost arb book_mid yes={yes_mid:.4} no={no_mid:.4} fresh_entry_leg={book_cheapest_leg:?}"
+            ));
+        }
 
         if let Some(intent) = self.merge_intent(&input) {
             notes.push(format!(
@@ -517,19 +544,18 @@ where
             true
         };
 
-        if allow_leg(Leg::Yes) {
-            if let Some(candidate) =
-                self.cheap_leg_intent(&input, Leg::Yes, input.fair_value.p_up, target)
-            {
-                candidates.push(candidate);
+        if let Some(leg) = book_cheapest_leg {
+            if allow_leg(leg) {
+                let fair_price = match leg {
+                    Leg::Yes => input.fair_value.p_up,
+                    Leg::No => input.fair_value.p_down,
+                };
+                if let Some(candidate) = self.cheap_leg_intent(&input, leg, fair_price, target) {
+                    candidates.push(candidate);
+                }
             }
-        }
-        if allow_leg(Leg::No) {
-            if let Some(candidate) =
-                self.cheap_leg_intent(&input, Leg::No, input.fair_value.p_down, target)
-            {
-                candidates.push(candidate);
-            }
+        } else {
+            notes.push("pair-cost cheap-leg wait: missing usable book mids".to_string());
         }
         candidates.sort_by(|left, right| {
             left.1
@@ -638,13 +664,13 @@ mod tests {
     }
 
     #[test]
-    fn buys_only_the_fair_value_cheap_leg_when_pair_cost_allows() {
+    fn buys_only_the_book_cheap_leg_when_pair_cost_allows() {
         let mut strategy = PairCostArbStrategy::new(PairCostArbStrategyConfig {
             min_edge_bps: 35.0,
             ..Default::default()
         });
 
-        let decision = strategy.on_tick(input(quote(0.48, 0.50), quote(0.28, 0.30)));
+        let decision = strategy.on_tick(input(quote(0.28, 0.30), quote(0.64, 0.66)));
 
         assert_eq!(decision.intents().len(), 1);
         assert_eq!(
@@ -655,6 +681,26 @@ mod tests {
         assert_eq!(
             decision.intents()[0].quote_level_tag.as_deref(),
             Some("pair-cost-arb:cheap-leg:yes")
+        );
+    }
+
+    #[test]
+    fn refuses_to_buy_expensive_winning_side_even_when_under_model_fair() {
+        let mut strategy = PairCostArbStrategy::new(PairCostArbStrategyConfig {
+            min_edge_bps: 35.0,
+            ..Default::default()
+        });
+
+        let decision = strategy.on_tick(input(quote(0.92, 0.94), quote(0.04, 0.06)));
+
+        assert_eq!(decision.intents().len(), 1);
+        assert_eq!(
+            decision.intents()[0].instrument_id,
+            InstrumentId::from("no")
+        );
+        assert_eq!(
+            decision.intents()[0].quote_level_tag.as_deref(),
+            Some("pair-cost-arb:cheap-leg:no")
         );
     }
 
@@ -674,11 +720,11 @@ mod tests {
     fn caps_new_asymmetric_excess() {
         let mut strategy = PairCostArbStrategy::new(PairCostArbStrategyConfig {
             min_edge_bps: 35.0,
-            max_excess_usd: 1.0,
+            max_excess_usd: 0.1,
             ..Default::default()
         });
 
-        let decision = strategy.on_tick(input(quote(0.48, 0.50), quote(0.28, 0.30)));
+        let decision = strategy.on_tick(input(quote(0.28, 0.30), quote(0.64, 0.66)));
 
         assert!(decision.intents().is_empty());
     }
