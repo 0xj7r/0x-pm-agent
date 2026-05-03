@@ -36,13 +36,24 @@ polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "data", "hea
 chrono = "0.4.44"
 aws-config = "1.5"
 aws-sdk-firehose = "1.40"
+aws-sdk-s3 = "1.40"
 hostname = "0.4"
+arrow = "54"
+parquet = "54"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2.5"
+flate2 = "1.0"
 
 [dev-dependencies]
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tempfile = "3.10"
 
 [[bin]]
 name = "live_collector"
 path = "src/bin/live_collector.rs"
+
+[[bin]]
+name = "backtest_runner"
+path = "src/bin/backtest_runner.rs"
