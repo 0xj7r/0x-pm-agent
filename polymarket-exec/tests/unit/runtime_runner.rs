@@ -11,7 +11,7 @@ use crate::market_context::MarketContextStore;
 use crate::metrics::StreamKind;
 use crate::risk::RiskLimits;
 use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
-use crate::strategy::NoopStrategy;
+use crate::strategy::{NoopStrategy, StrategyProfile};
 use crate::wire::execution_adapter::{
     CancelOrderAck, ExecutionError, MergePositionsAck, MergePositionsRequest, SubmitOrderAck,
     VenueBalances, VenueFill, VenuePosition,
@@ -1327,6 +1327,51 @@ fn live_degraded_auto_recover_promotes_running_after_healthy_window() {
 
     let recovered =
         auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
+    assert_eq!(runtime.status(), RuntimeStatus::Running);
+    assert!(!recovered.event_seqs.is_empty());
+    assert!(runtime
+        .event_log()
+        .recent(4)
+        .iter()
+        .any(|event| event.message.contains("runtime degraded auto-recovered")));
+}
+
+#[test]
+fn live_degraded_auto_recover_allows_connected_idle_user_ws() {
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Degraded,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        StrategyMode::Noop(NoopStrategy),
+        MarketContextStore::empty(),
+    );
+    let metrics = AppMetrics::new().expect("metrics");
+    metrics.set_stream_connected(StreamKind::Market, true);
+    metrics.set_stream_connected(StreamKind::User, true);
+    metrics.set_execution_adapter_connected(true);
+    metrics.observe_user_message("order", "matched");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    metrics.refresh_stream_ages();
+    let mut config = runner_test_config();
+    config.strategy_profile = Some(StrategyProfile {
+        health: crate::strategy::ProfileHealth {
+            user_ws_stale_ms: Some(0),
+            ..Default::default()
+        },
+        ..StrategyProfile::default()
+    });
+    let live_safety = LiveSafetyState {
+        last_venue_cash_usd: Some(100.0),
+        ..LiveSafetyState::default()
+    };
+
+    let recovered =
+        auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
+
     assert_eq!(runtime.status(), RuntimeStatus::Running);
     assert!(!recovered.event_seqs.is_empty());
     assert!(runtime

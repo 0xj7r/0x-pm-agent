@@ -123,14 +123,13 @@ fn live_health_failures(
     if !snapshot.user_ws_connected && snapshot.user_last_message_age_ms >= 0.0 {
         health_failures.push("user websocket disconnected".to_string());
     }
-    if snapshot.user_last_message_age_ms >= 0.0
-        && snapshot.user_last_message_age_ms > user_stale_ms as f64
-    {
-        health_failures.push(format!(
-            "user websocket stale age_ms={:.0} max_ms={user_stale_ms}",
-            snapshot.user_last_message_age_ms
-        ));
-    }
+    // User WS is an authenticated event stream, not a heartbeat stream. It can
+    // be legitimately idle for long periods when we have no fills/cancels. Do
+    // not treat a connected-but-quiet User WS as unhealthy, otherwise one
+    // fail-closed reconcile incident can leave the live runtime permanently
+    // degraded and flat even after REST reconcile is clean. Disconnection is
+    // still a hard health failure above.
+    let _ = user_stale_ms;
     if !snapshot.execution_adapter_connected {
         health_failures.push("execution adapter disconnected".to_string());
     }
