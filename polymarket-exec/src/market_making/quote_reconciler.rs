@@ -207,6 +207,22 @@ impl QuoteReconciler {
         self.cancel_events.push_back(now_ms);
     }
 
+    pub fn record_accepted_actions(
+        &mut self,
+        now_ms: EpochMillis,
+        submits: usize,
+        replaces: usize,
+        cancels: usize,
+    ) {
+        let churn = submits
+            .saturating_add(replaces.saturating_mul(2))
+            .saturating_add(cancels);
+        self.record_churn(now_ms, churn);
+        (0..submits).for_each(|_| self.record_submit(now_ms));
+        (0..replaces).for_each(|_| self.record_replace(now_ms));
+        (0..cancels).for_each(|_| self.record_cancel(now_ms));
+    }
+
     fn can_submit(&self, now_ms: EpochMillis, upcoming: usize) -> bool {
         Self::within_rate_cap(
             &self.submit_events,
@@ -418,14 +434,11 @@ impl QuoteReconciler {
         if let ChurnGate::Throttle = self.evaluate_churn(now_ms, planned_churn) {
             self.hard_pull_until_ms = Some(now_ms.saturating_add(self.config.hard_pull_ms));
             plan.actions = self.build_keep_all(open_orders);
-            plan.notes.push("quote churn throttle triggered".to_string());
+            plan.notes
+                .push("quote churn throttle triggered".to_string());
             return plan;
         }
 
-        self.record_churn(now_ms, planned_churn);
-        (0..planned_submits).for_each(|_| self.record_submit(now_ms));
-        (0..planned_replaces).for_each(|_| self.record_replace(now_ms));
-        (0..planned_cancels).for_each(|_| self.record_cancel(now_ms));
         if pending_replacements > 0 {
             plan.notes.push(format!(
                 "reconciler prepared {} replace(s)",
@@ -644,6 +657,46 @@ mod tests {
         let plan = reconciler.plan(desired, &HashMap::new(), 2);
         assert!(plan.actions.is_empty());
         assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("submit rate cap reached")));
+    }
+
+    #[test]
+    fn quote_reconciler_does_not_burn_submit_cap_until_action_accepted() {
+        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
+            min_order_age_ms: 0,
+            max_churn_per_window: 16,
+            churn_window_ms: 10_000,
+            hard_pull_ms: 5_000,
+            max_submit_per_window: 1,
+            max_replace_per_window: 4,
+            max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
+        });
+        let desired = crate::quote_engine::DesiredQuoteSet {
+            quotes: vec![crate::quote_engine::DesiredQuote {
+                intent: intent("new", 0.22),
+                level: 0,
+                is_cleanup: false,
+                suppress_if_stale: false,
+                expires_at_ms: None,
+            }],
+            stale_quote_max_age_ms: None,
+            quote_expiry_ms: None,
+        };
+
+        let first = reconciler.plan(desired.clone(), &HashMap::new(), 2);
+        let second = reconciler.plan(desired.clone(), &HashMap::new(), 3);
+
+        assert_eq!(first.actions.len(), 1);
+        assert_eq!(second.actions.len(), 1);
+
+        reconciler.record_accepted_actions(4, 1, 0, 0);
+        let third = reconciler.plan(desired, &HashMap::new(), 5);
+
+        assert!(third.actions.is_empty());
+        assert!(third
             .notes
             .iter()
             .any(|note| note.contains("submit rate cap reached")));

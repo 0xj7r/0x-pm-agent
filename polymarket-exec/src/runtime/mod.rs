@@ -2128,6 +2128,10 @@ impl<S: Strategy> Runtime<S> {
                     )));
                 }
 
+                let mut accepted_quote_submits = 0usize;
+                let mut accepted_quote_replaces = 0usize;
+                let mut accepted_quote_cancels = 0usize;
+
                 for action in plan.actions {
                     match action {
                         QuoteAction::Keep(intent) => {
@@ -2144,25 +2148,70 @@ impl<S: Strategy> Runtime<S> {
                             client_order_id,
                             reason,
                         } => {
-                            outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
+                            let cancel_outcome =
+                                self.request_cancel(&client_order_id, reason, now_ms);
+                            if cancel_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Cancel { .. }))
+                            {
+                                accepted_quote_cancels += 1;
+                            }
+                            outcome.extend(cancel_outcome);
                         }
                         QuoteAction::Replace {
                             existing_client_order_id,
                             replacement,
                             cancel_reason,
                         } => {
-                            outcome.extend(self.request_cancel(
+                            let cancel_outcome = self.request_cancel(
                                 &existing_client_order_id,
                                 cancel_reason,
                                 now_ms,
-                            ));
-                            outcome.extend(self.accept_intent(replacement, now_ms));
+                            );
+                            let cancel_accepted = cancel_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Cancel { .. }));
+                            outcome.extend(cancel_outcome);
+
+                            let submit_outcome = self.accept_intent(replacement, now_ms);
+                            let submit_accepted = submit_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Submit(_)));
+                            outcome.extend(submit_outcome);
+
+                            if cancel_accepted && submit_accepted {
+                                accepted_quote_replaces += 1;
+                            } else {
+                                if cancel_accepted {
+                                    accepted_quote_cancels += 1;
+                                }
+                                if submit_accepted {
+                                    accepted_quote_submits += 1;
+                                }
+                            }
                         }
                         QuoteAction::Submit(intent) => {
-                            outcome.extend(self.accept_intent(intent, now_ms));
+                            let submit_outcome = self.accept_intent(intent, now_ms);
+                            if submit_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Submit(_)))
+                            {
+                                accepted_quote_submits += 1;
+                            }
+                            outcome.extend(submit_outcome);
                         }
                     }
                 }
+                self.quote_reconciler.record_accepted_actions(
+                    now_ms,
+                    accepted_quote_submits,
+                    accepted_quote_replaces,
+                    accepted_quote_cancels,
+                );
             }
         }
         outcome
