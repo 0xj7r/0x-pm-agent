@@ -2432,6 +2432,21 @@ impl<S: Strategy> Runtime<S> {
             );
             return outcome;
         }
+        if is_rescue_intent && self.has_active_close_order_for_market(&intent.market_id) {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "close-side intent suppressed: active close-side order already pending",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         if intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !is_rescue_intent
@@ -2791,6 +2806,15 @@ impl<S: Strategy> Runtime<S> {
             .values()
             .filter(|managed| &managed.intent.market_id == market_id)
             .count()
+    }
+
+    fn has_active_close_order_for_market(&self, market_id: &MarketId) -> bool {
+        self.open_orders.values().any(|managed| {
+            &managed.intent.market_id == market_id
+                && !managed.status.is_terminal()
+                && (managed.intent.kind == crate::types::IntentKind::Close
+                    || managed.intent.reduce_only)
+        })
     }
 
     fn open_buy_notional_total_usd(&self) -> f64 {
