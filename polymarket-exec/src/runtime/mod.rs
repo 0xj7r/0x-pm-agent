@@ -1030,12 +1030,32 @@ impl<S: Strategy> Runtime<S> {
             return None;
         }
 
-        let quantity = positions[0].quantity.min(positions[1].quantity);
+        let ordered_positions = self
+            .market_contexts
+            .get(market_id)
+            .and_then(|record| {
+                if record.instrument_ids.len() < 2 {
+                    return None;
+                }
+                let yes_id = InstrumentId::from(record.instrument_ids[0].clone());
+                let no_id = InstrumentId::from(record.instrument_ids[1].clone());
+                let yes_position = positions
+                    .iter()
+                    .find(|position| position.instrument_id == yes_id)?;
+                let no_position = positions
+                    .iter()
+                    .find(|position| position.instrument_id == no_id)?;
+                Some((*yes_position, *no_position))
+            })
+            .unwrap_or((positions[0], positions[1]));
+
+        let (yes_position, no_position) = ordered_positions;
+        let quantity = yes_position.quantity.min(no_position.quantity);
         if quantity <= 1e-9 {
             return None;
         }
         let expected_cost_usd =
-            quantity * positions[0].avg_price + quantity * positions[1].avg_price;
+            quantity * yes_position.avg_price + quantity * no_position.avg_price;
 
         Some(MergeIntent {
             command_id: ClientOrderId::from(format!(
@@ -1044,8 +1064,8 @@ impl<S: Strategy> Runtime<S> {
             )),
             market_id: market_id.clone(),
             condition_id: self.condition_id_by_market.get(market_id).cloned(),
-            yes_instrument_id: positions[0].instrument_id.clone(),
-            no_instrument_id: positions[1].instrument_id.clone(),
+            yes_instrument_id: yes_position.instrument_id.clone(),
+            no_instrument_id: no_position.instrument_id.clone(),
             quantity,
             expected_cash_usd: quantity,
             expected_cost_usd,
@@ -2274,6 +2294,8 @@ impl<S: Strategy> Runtime<S> {
                 }
             }
             StrategyDecision::QuoteSet { intents, .. } => {
+                let intents =
+                    self.filter_incomplete_paired_entry_intents(intents, now_ms, &mut outcome);
                 let intents_in = intents.len();
                 let level_tags_in: Vec<String> = intents
                     .iter()
@@ -2408,6 +2430,68 @@ impl<S: Strategy> Runtime<S> {
             }
         }
         outcome
+    }
+
+    fn filter_incomplete_paired_entry_intents(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        now_ms: EpochMillis,
+        outcome: &mut RuntimeOutcome,
+    ) -> Vec<OrderIntent> {
+        let mut pair_instrument_count: HashMap<String, HashSet<InstrumentId>> = HashMap::new();
+        for intent in &intents {
+            if !Self::is_paired_entry_intent(intent) {
+                continue;
+            }
+            let Some(pair_id) = intent.pair_id.as_ref() else {
+                continue;
+            };
+            pair_instrument_count
+                .entry(pair_id.clone())
+                .or_default()
+                .insert(intent.instrument_id.clone());
+        }
+
+        intents
+            .into_iter()
+            .filter(|intent| {
+                if !Self::is_paired_entry_intent(intent) {
+                    return true;
+                }
+                let Some(pair_id) = intent.pair_id.as_ref() else {
+                    return true;
+                };
+                let complete = pair_instrument_count
+                    .get(pair_id)
+                    .is_some_and(|instruments| instruments.len() >= 2);
+                if complete {
+                    return true;
+                }
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "paired entry intent suppressed: incomplete pair group pair_id={pair_id}"
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                false
+            })
+            .collect()
+    }
+
+    fn is_paired_entry_intent(intent: &OrderIntent) -> bool {
+        intent.kind == crate::types::IntentKind::Entry
+            && intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
     }
 
     fn accept_intent(&mut self, intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
