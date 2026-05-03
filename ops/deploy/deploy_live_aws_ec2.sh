@@ -94,7 +94,15 @@ ssh_base "
 "
 
 log "installing user service templates"
-ssh_base "cd '$REMOTE_RELEASE_DIR' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
+ssh_base "
+  set -euo pipefail
+  cd '$REMOTE_RELEASE_DIR'
+  mkdir -p \"\$HOME/.config/systemd/user\"
+  for unit in polymarket-exec/ops/systemd/*.service polymarket-exec/ops/systemd/*.timer; do
+    [ -e \"\$unit\" ] || continue
+    install -m 0644 \"\$unit\" \"\$HOME/.config/systemd/user/\$(basename \"\$unit\")\"
+  done
+"
 
 if [[ "$SKIP_BUILD" == "1" ]]; then
   log "skipping build (AWS_LIVE_SKIP_BUILD=1)"
