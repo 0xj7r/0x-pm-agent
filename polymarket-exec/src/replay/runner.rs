@@ -30,6 +30,7 @@ use crate::replay::fill_sim::{
     FillSimConfig, FillSimulator, SimulatedFill, SimulatedRejection, StrategyOrderIntent,
 };
 use crate::replay::risk_trace::RiskRejection;
+use crate::replay::synthesizer::EventSynthesizer;
 
 /// What a window outputs. Aggregated into the run summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -99,39 +100,33 @@ pub fn run_window<S: ReplayStrategy>(
 ) -> WindowSummary {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut sim = FillSimulator::new(cfg.fill_sim.clone());
+        let mut synthesizer = EventSynthesizer::new();
         let mut intents_submitted: u64 = 0;
         let mut risk_rejections: Vec<RiskRejection> = Vec::new();
         for event in events {
-            // Strategy reacts to event first
-            let mut decision = strategy.on_event(event);
-            risk_rejections.append(&mut decision.risk_rejections);
-            for intent in decision.submits {
-                sim.submit(intent);
-                intents_submitted += 1;
+            // Synthesize any window-open / window-close markers triggered
+            // by this event and dispatch them through the strategy and
+            // simulator FIRST so the strategy sees, e.g., `price_to_beat`
+            // before the `market_meta` it derives from. The synthesizer
+            // is a pure function of prior events (no clock, no RNG) so
+            // determinism holds.
+            let synthetic_events = synthesizer.on_event(event);
+            for synth in &synthetic_events {
+                dispatch_event(
+                    strategy,
+                    &mut sim,
+                    synth,
+                    &mut intents_submitted,
+                    &mut risk_rejections,
+                );
             }
-            let event_ms = (event.received_ns / 1_000_000) as u64;
-            for coid in decision.cancels {
-                sim.cancel(&coid, event_ms);
-            }
-            // Apply event to simulator (matches against resting orders).
-            // The to_vec() is required: we re-enter sim with submit/cancel
-            // inside the loop body, which would otherwise overlap a borrow.
-            let fills_before = sim.fills().len();
-            sim.on_event(event);
-            let fills_after = sim.fills().len();
-            #[allow(clippy::unnecessary_to_owned)]
-            let new_fills = sim.fills()[fills_before..fills_after].to_vec();
-            for fill in new_fills {
-                let mut decision = strategy.on_fill(&fill);
-                risk_rejections.append(&mut decision.risk_rejections);
-                for intent in decision.submits {
-                    sim.submit(intent);
-                    intents_submitted += 1;
-                }
-                for coid in decision.cancels {
-                    sim.cancel(&coid, event_ms);
-                }
-            }
+            dispatch_event(
+                strategy,
+                &mut sim,
+                event,
+                &mut intents_submitted,
+                &mut risk_rejections,
+            );
         }
         (
             sim.fills().to_vec(),
@@ -160,6 +155,44 @@ pub fn run_window<S: ReplayStrategy>(
             risk_rejections: Vec::new(),
             status: WindowStatus::Panicked,
         },
+    }
+}
+
+/// Dispatch a single `event` (real or synthetic) through the strategy
+/// and simulator. Hoisted out of `run_window` so the synthesizer's
+/// derived events flow through the same code path as real ones.
+fn dispatch_event<S: ReplayStrategy>(
+    strategy: &mut S,
+    sim: &mut FillSimulator,
+    event: &Event,
+    intents_submitted: &mut u64,
+    risk_rejections: &mut Vec<RiskRejection>,
+) {
+    let mut decision = strategy.on_event(event);
+    risk_rejections.append(&mut decision.risk_rejections);
+    for intent in decision.submits {
+        sim.submit(intent);
+        *intents_submitted += 1;
+    }
+    let event_ms = (event.received_ns / 1_000_000) as u64;
+    for coid in decision.cancels {
+        sim.cancel(&coid, event_ms);
+    }
+    let fills_before = sim.fills().len();
+    sim.on_event(event);
+    let fills_after = sim.fills().len();
+    #[allow(clippy::unnecessary_to_owned)]
+    let new_fills = sim.fills()[fills_before..fills_after].to_vec();
+    for fill in new_fills {
+        let mut decision = strategy.on_fill(&fill);
+        risk_rejections.append(&mut decision.risk_rejections);
+        for intent in decision.submits {
+            sim.submit(intent);
+            *intents_submitted += 1;
+        }
+        for coid in decision.cancels {
+            sim.cancel(&coid, event_ms);
+        }
     }
 }
 

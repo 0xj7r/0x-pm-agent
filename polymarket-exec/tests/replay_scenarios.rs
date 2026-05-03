@@ -14,9 +14,11 @@ mod scenario_builder;
 
 use std::path::Path;
 
-use polymarket_exec::collector::schema::Event;
-use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset, Side};
-use polymarket_exec::replay::runner::{run_window, RunnerConfig, WindowStatus, WindowSummary};
+use polymarket_exec::collector::schema::{Event, EventType, Source};
+use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset, Side, SimulatedFill};
+use polymarket_exec::replay::runner::{
+    run_window, ReplayDecision, ReplayStrategy, RunnerConfig, WindowStatus, WindowSummary,
+};
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
 use polymarket_exec::strategy_profile::StrategyProfile;
 
@@ -255,4 +257,82 @@ fn scenario_6_stale_btc_feed_no_trade() {
     let (events, exp) = stale_btc_feed_no_trade();
     let s = run(&events, paired_mm_profile(), FillQuality::Base);
     assert_invariants(&s, &exp);
+}
+
+/// Tracking strategy used by `synthesizer_injects_price_to_beat_into_stream`.
+/// Records every event the runner dispatches so we can assert the synthetic
+/// `price_to_beat` event is interleaved alongside real events at the
+/// expected `received_ns`.
+struct EventRecorder {
+    seen: Vec<(EventType, Source, i64, Option<String>)>,
+}
+
+impl ReplayStrategy for EventRecorder {
+    fn on_event(&mut self, event: &Event) -> ReplayDecision {
+        self.seen.push((
+            event.event_type,
+            event.source.clone(),
+            event.received_ns,
+            event.market_slug.clone(),
+        ));
+        ReplayDecision::default()
+    }
+    fn on_fill(&mut self, _fill: &SimulatedFill) -> ReplayDecision {
+        ReplayDecision::default()
+    }
+}
+
+/// Phase 3d-a invariant: scenario 1 has a single `market_meta` followed by
+/// btc ticks, books, and trades. The replay synthesizer must inject a
+/// synthetic `price_to_beat` event into the dispatched stream, and the
+/// strategy adapter must observe it. Asserts the synthetic event lands
+/// with `source = synthesizer`, `event_type = price_to_beat`, and
+/// `received_ns` equal to the first BTC tick's `received_ns` (the
+/// synthesizer pins the emit timestamp to the first oracle sample).
+#[test]
+fn synthesizer_injects_price_to_beat_into_stream() {
+    let (events, _) = flat_50_50_paired_mm();
+    let cfg = RunnerConfig {
+        window_id: "synth-injection".into(),
+        fill_sim: FillSimConfig {
+            latency: LatencyPreset::Nominal,
+            fill_quality: FillQuality::Base,
+            seed: 0xC0FFEE,
+            cancel_credit_fraction: 0.5,
+        },
+        max_window_failures: 0,
+    };
+    let mut recorder = EventRecorder { seen: Vec::new() };
+    let summary = run_window(&mut recorder, &events, &cfg);
+    assert_eq!(summary.status, WindowStatus::Ok);
+
+    let synth_events: Vec<_> = recorder
+        .seen
+        .iter()
+        .filter(|(et, src, _, _)| {
+            *et == EventType::PriceToBeat && *src == Source::Synthesizer
+        })
+        .collect();
+    assert_eq!(
+        synth_events.len(),
+        1,
+        "expected exactly 1 synthetic price_to_beat in dispatched stream, got {}",
+        synth_events.len()
+    );
+
+    // The synthesizer emits price_to_beat once the first BTC tick arrives
+    // (market_meta lands first but no oracle is observed yet, so
+    // emission defers to the first btc_tick). Assert the synthetic
+    // event's received_ns matches the first BTC tick's received_ns.
+    let first_btc_tick_ns = events
+        .iter()
+        .find(|e| e.event_type == EventType::BtcTick)
+        .map(|e| e.received_ns)
+        .expect("scenario 1 has BTC ticks");
+    assert_eq!(
+        synth_events[0].2, first_btc_tick_ns,
+        "synthetic price_to_beat must land at the first BTC tick's received_ns"
+    );
+    let slug = synth_events[0].3.as_deref();
+    assert_eq!(slug, Some("btc-5m-flat-5050"));
 }
