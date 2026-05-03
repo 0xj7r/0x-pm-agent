@@ -55,8 +55,9 @@ impl StrategyProfile {
     }
 
     fn load_value(path: &Path) -> Result<serde_json::Value> {
-        let raw = fs::read_to_string(path)?;
-        match path
+        let resolved_path = resolve_profile_path(path);
+        let raw = fs::read_to_string(&resolved_path)?;
+        match resolved_path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase())
@@ -327,6 +328,19 @@ impl StrategyProfile {
     pub fn momentum_weight(&self) -> f64 {
         self.signals.fair_value.momentum_weight.unwrap_or(0.65)
     }
+}
+
+fn resolve_profile_path(path: &Path) -> PathBuf {
+    if path.exists() || path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let repo_root_path = Path::new("polymarket-exec").join(path);
+    if repo_root_path.exists() {
+        return repo_root_path;
+    }
+
+    path.to_path_buf()
 }
 
 fn merge_json_values(target: &mut serde_json::Value, incoming: serde_json::Value) {
