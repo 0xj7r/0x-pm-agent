@@ -255,6 +255,8 @@ fn parse_event_type(s: &str) -> Result<EventType> {
         "market_meta" => EventType::MarketMeta,
         "heartbeat" => EventType::Heartbeat,
         "gap" => EventType::Gap,
+        "price_to_beat" => EventType::PriceToBeat,
+        "resolution" => EventType::Resolution,
         other => anyhow::bail!("unknown event_type {other}"),
     })
 }
@@ -267,6 +269,7 @@ fn parse_source(s: &str) -> Result<Source> {
         "binance_aggtrade" => Source::BinanceAggtrade,
         "coinbase_match" => Source::CoinbaseMatch,
         "collector" => Source::Collector,
+        "synthesizer" => Source::Synthesizer,
         other => anyhow::bail!("unknown source {other}"),
     })
 }
