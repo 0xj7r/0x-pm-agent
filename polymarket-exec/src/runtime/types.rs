@@ -15,6 +15,7 @@ pub struct RuntimeConfig {
     pub quote_engine_config: QuoteEngineConfig,
     pub quote_stale_ms: u64,
     pub require_initial_reconcile_before_entry: bool,
+    pub min_merge_notional_usd: f64,
 }
 
 impl Default for RuntimeConfig {
@@ -26,6 +27,7 @@ impl Default for RuntimeConfig {
             quote_engine_config: QuoteEngineConfig::default(),
             quote_stale_ms: 10_000,
             require_initial_reconcile_before_entry: false,
+            min_merge_notional_usd: 0.0,
         }
     }
 }

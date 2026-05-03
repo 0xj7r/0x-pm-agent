@@ -48,12 +48,6 @@ use tracing::{info, warn};
 
 const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
-/// Minimum paired notional ($) to justify firing a merge transaction.
-/// Below this, gas (~$0.30 on Polygon) eats too much of the recycled $1
-/// per share; better to hold to resolution which captures the same $1
-/// payout for free. Whale data shows merge:redeem ≈ 0.07 — most paired
-/// inventory just resolves naturally.
-const MERGE_MIN_NOTIONAL_USD: f64 = 2.0;
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
@@ -70,6 +64,7 @@ pub struct Runtime<S: Strategy> {
     quote_reconciler: QuoteReconciler,
     quote_engine_config: QuoteEngineConfig,
     quote_stale_ms: u64,
+    min_merge_notional_usd: f64,
     btc_signals: BtcSignalStore,
     market_activity: HashMap<InstrumentId, GateMarketActivitySignal>,
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
@@ -167,6 +162,7 @@ impl<S: Strategy> Runtime<S> {
             quote_reconciler: QuoteReconciler::default(),
             quote_engine_config: config.quote_engine_config,
             quote_stale_ms: config.quote_stale_ms,
+            min_merge_notional_usd: config.min_merge_notional_usd.max(0.0),
             btc_signals: BtcSignalStore::default(),
             market_activity: HashMap::new(),
             first_fill_by_market: HashMap::new(),
@@ -892,21 +888,18 @@ impl<S: Strategy> Runtime<S> {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
 
-        // Gas-friction gate: merging tiny paired inventory burns gas without
-        // recycling enough capital to be worthwhile. Each merge transaction
-        // costs ~$0.30 on Polygon; a $1.50 paired position would lose 20% to
-        // gas. Hold to resolution instead — the venue pays $1/share at
-        // resolution regardless, and resolution is gas-free.
-        if intent.expected_cash_usd + 1e-9 < MERGE_MIN_NOTIONAL_USD {
+        // Dust/noise gate: keep this profile-driven. Polygon merge fees are
+        // negligible for us, so tiny-live and paper should be able to recycle
+        // very small paired inventory while production can still avoid dust.
+        if intent.expected_cash_usd + 1e-9 < self.min_merge_notional_usd {
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         now_ms,
                         format!(
-                            "merge skipped: paired notional ${:.4} below gas-friction threshold ${:.2}; \
-                             hold to resolution instead",
-                            intent.expected_cash_usd, MERGE_MIN_NOTIONAL_USD
+                            "merge skipped: paired notional ${:.4} below min merge notional ${:.4}",
+                            intent.expected_cash_usd, self.min_merge_notional_usd
                         ),
                     )
                     .with_market(market_id.clone()),
@@ -2347,6 +2340,11 @@ impl<S: Strategy> Runtime<S> {
         let risk_context = RiskContext {
             open_orders_total: self.open_orders.len(),
             open_orders_for_market: self.open_orders_for_market(&intent.market_id),
+            open_buy_notional_total_usd: self.open_buy_notional_total_usd(),
+            open_signed_notional_for_market_usd: self
+                .open_signed_notional_for_market_usd(&intent.market_id),
+            open_position_qty_for_instrument: self
+                .open_position_qty_for_instrument(&intent.instrument_id),
             starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
@@ -2573,6 +2571,40 @@ impl<S: Strategy> Runtime<S> {
             .values()
             .filter(|managed| &managed.intent.market_id == market_id)
             .count()
+    }
+
+    fn open_buy_notional_total_usd(&self) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal()
+                    && matches!(managed.intent.side, crate::types::TradeSide::Buy)
+                    && !managed.intent.reduce_only
+            })
+            .map(|managed| managed.intent.limit_price * managed.remaining_qty())
+            .sum()
+    }
+
+    fn open_signed_notional_for_market_usd(&self, market_id: &crate::types::MarketId) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal() && &managed.intent.market_id == market_id
+            })
+            .map(|managed| {
+                managed.intent.limit_price * managed.remaining_qty() * managed.intent.side.sign()
+            })
+            .sum()
+    }
+
+    fn open_position_qty_for_instrument(&self, instrument_id: &crate::types::InstrumentId) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal() && &managed.intent.instrument_id == instrument_id
+            })
+            .map(|managed| managed.remaining_qty() * managed.intent.side.sign())
+            .sum()
     }
 
     fn record_status_persist(

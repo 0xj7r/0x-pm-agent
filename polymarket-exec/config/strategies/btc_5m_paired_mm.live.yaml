@@ -33,11 +33,17 @@ fair_value:
 
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
-  max_gross_notional_usd: 20.0
-  max_net_notional_per_market_usd: 10.0
-  max_stranded_leg_usd: 10.0
-  max_gross_cost_usd: 20.0
-  max_leg_cost_usd: 10.0
+  max_gross_notional_usd: 80.0
+  max_net_notional_per_market_usd: 35.0
+  max_stranded_leg_usd: 35.0
+  max_gross_cost_usd: 80.0
+  max_leg_cost_usd: 35.0
+
+# ── Pair / Merge Recycling ─────────────────────────────────────
+# Polygon merge fees are negligible for our setup; keep this low so tiny-live
+# and paper validate the intended merge-first capital recycling path.
+pair:
+  min_merge_notional_usd: 0.10
 
 # ── Rescue / Merge Logic ────────────────────────────────────────
 rescue:

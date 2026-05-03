@@ -393,6 +393,8 @@ struct IntentRecord {
     market_id: MarketId,
     instrument_id: InstrumentId,
     side: TradeSide,
+    limit_price: f64,
+    quantity: f64,
     leg: Leg,
 }
 
@@ -629,6 +631,8 @@ impl ReplayStrategyAdapter {
                 market_id: market.market_id.clone(),
                 instrument_id: intent.instrument_id.clone(),
                 side: intent.side,
+                limit_price: intent.limit_price,
+                quantity: intent.quantity,
                 leg,
             },
         );
@@ -740,9 +744,30 @@ impl ReplayStrategyAdapter {
             .values()
             .filter(|r| r.market_id == market.market_id)
             .count();
+        let open_buy_notional_total_usd = self
+            .open_intents
+            .values()
+            .filter(|record| matches!(record.side, TradeSide::Buy))
+            .map(|record| record.limit_price * record.quantity)
+            .sum();
+        let open_signed_notional_for_market_usd = self
+            .open_intents
+            .values()
+            .filter(|record| record.market_id == market.market_id)
+            .map(|record| record.limit_price * record.quantity * record.side.sign())
+            .sum();
+        let open_position_qty_for_instrument = self
+            .open_intents
+            .values()
+            .filter(|record| record.instrument_id == intent.instrument_id)
+            .map(|record| record.quantity * record.side.sign())
+            .sum();
         let ctx = RiskContext {
             open_orders_total: live_total,
             open_orders_for_market: live_for_market,
+            open_buy_notional_total_usd,
+            open_signed_notional_for_market_usd,
+            open_position_qty_for_instrument,
             starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
@@ -949,7 +974,7 @@ mod tests {
     use super::*;
     use crate::collector::schema::Source;
     use crate::replay::fill_sim::{FillSimConfig, LatencyPreset};
-    use crate::replay::runner::{run_window, RunnerConfig, WindowStatus};
+    use crate::replay::runner::{RunnerConfig, WindowStatus, run_window};
     use serde_json::json;
 
     fn evt(received_ns: i64, event_type: EventType) -> Event {

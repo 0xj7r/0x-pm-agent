@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -30,7 +30,7 @@ use crate::runtime::live_health::{
     needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
-    fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
+    RuntimeMarketUniverse, fetch_btc_5m_market_contexts, refresh_runtime_market_universe,
 };
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
@@ -43,7 +43,7 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
+use crate::wire::api::{DashboardSnapshot, DashboardUiState, serve_http};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -642,6 +642,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .and_then(|profile| profile.quote.min_quote_age_ms)
                 .unwrap_or(10_000),
             require_initial_reconcile_before_entry: !config.paper_mode,
+            min_merge_notional_usd: config
+                .strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.pair.min_merge_notional_usd)
+                .unwrap_or_default(),
         },
         config.risk_limits.clone(),
         strategy,

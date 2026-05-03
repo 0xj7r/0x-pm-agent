@@ -1,4 +1,4 @@
-use super::{ManagedOrderStatus, Runtime, RuntimeConfig, BLOCKED_MERGE_RETRY_AFTER_MS};
+use super::{BLOCKED_MERGE_RETRY_AFTER_MS, ManagedOrderStatus, Runtime, RuntimeConfig};
 use crate::inventory::VenuePositionSnapshot;
 use crate::market_context::{MarketContextRecord, MarketContextStore};
 use crate::risk::RiskLimits;
@@ -14,8 +14,8 @@ use crate::types::{
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -601,13 +601,14 @@ fn sub_venue_min_single_leg_dust_is_not_actionable_inventory() {
 }
 
 #[test]
-fn plan_merge_skips_tiny_paired_inventory_below_gas_threshold() {
+fn plan_merge_respects_profile_min_merge_notional() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(
         RuntimeConfig {
             starting_cash_usd: 100.0,
             event_log_capacity: 128,
             initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 2.0,
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
@@ -615,8 +616,8 @@ fn plan_merge_skips_tiny_paired_inventory_below_gas_threshold() {
         MarketContextStore::empty(),
     );
     // Seed two tiny paired legs ($1.50 paired notional ~ 1.5 paired qty).
-    // Gas of ~$0.30 is 20% friction at this size — skip the merge and
-    // let positions resolve to capture the same $1/share without gas.
+    // The configured merge-notional gate is a dust/noise control, not a
+    // Polygon gas-friction rule.
     runtime
         .on_fill(FillReport {
             order_id: None,
@@ -656,17 +657,67 @@ fn plan_merge_skips_tiny_paired_inventory_below_gas_threshold() {
 
     assert!(
         outcome.commands.is_empty(),
-        "tiny paired inventory ($1.50 release) should be held to resolution, \
-             not merged at $0.30 gas (20% friction). Got commands: {:?}",
+        "tiny paired inventory should respect the configured min merge notional. \
+             Got commands: {:?}",
         outcome.commands.len()
     );
     assert!(
-        runtime.event_log().recent(20).iter().any(|event| event
-            .message
-            .contains("below gas-friction threshold")
-            || event.message.contains("hold to resolution")),
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("below min merge notional")),
         "merge skip should emit a recognizable event for observability"
     );
+}
+
+#[test]
+fn plan_merge_allows_tiny_paired_inventory_when_min_merge_notional_is_zero() {
+    let market_id = MarketId::from("market-mm");
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 0.0,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            price: 0.30,
+            quantity: 1.50,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 10,
+        })
+        .expect("up leg");
+    let outcome = runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            price: 0.65,
+            quantity: 1.50,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 11,
+        })
+        .expect("down leg");
+
+    assert_eq!(outcome.commands.len(), 1);
 }
 
 #[test]
@@ -683,7 +734,7 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
         NoopStrategy,
         MarketContextStore::empty(),
     );
-    // Paired qty = 6.5 → $6.50 release. Worth the $0.30 gas.
+    // Paired qty = 6.5 -> $6.50 release.
     runtime
         .on_fill(FillReport {
             order_id: None,
@@ -718,11 +769,14 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
     // The second leg's on_fill should auto-plan the merge for substantial
     // paired inventory.
     assert!(
-            second_outcome.commands.iter().any(|cmd| matches!(cmd, RuntimeCommand::Merge(_))),
-            "$6.50 paired notional should fire merge on second leg fill (gas friction ~5%, within threshold). \
+        second_outcome
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, RuntimeCommand::Merge(_))),
+        "$6.50 paired notional should fire merge on second leg fill (gas friction ~5%, within threshold). \
              Got commands: {:?}",
-            second_outcome.commands.len()
-        );
+        second_outcome.commands.len()
+    );
 }
 
 #[test]
@@ -856,9 +910,11 @@ fn reduce_only_sell_cleanup_is_suppressed_when_merge_is_pending() {
     );
 
     assert!(outcome.commands.is_empty());
-    assert!(runtime
-        .open_orders()
-        .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1")));
+    assert!(
+        runtime
+            .open_orders()
+            .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1"))
+    );
 }
 
 #[test]
@@ -1050,12 +1106,16 @@ fn on_fill_rescue_preserves_working_pair_mate_quote() {
             .all(|command| !matches!(command, RuntimeCommand::Cancel { .. })),
         "on-fill rescue must not cancel the still-working paired mate"
     );
-    assert!(runtime
-        .open_orders()
-        .any(|managed| managed.intent.client_order_id == right_client_order_id));
-    assert!(runtime
-        .open_orders()
-        .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
+    assert!(
+        runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == right_client_order_id)
+    );
+    assert!(
+        runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == rescue_client_order_id)
+    );
 }
 
 #[test]
@@ -1124,15 +1184,21 @@ fn on_market_snapshot_rescue_preserves_working_pair_mate_quote() {
         }),
         "snapshot rescue must not cancel the still-working paired mate"
     );
-    assert!(runtime
-        .open_orders()
-        .any(|managed| managed.intent.client_order_id == left_client_order_id));
-    assert!(runtime
-        .open_orders()
-        .any(|managed| managed.intent.client_order_id == right_client_order_id));
-    assert!(runtime
-        .open_orders()
-        .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
+    assert!(
+        runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == left_client_order_id)
+    );
+    assert!(
+        runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == right_client_order_id)
+    );
+    assert!(
+        runtime
+            .open_orders()
+            .any(|managed| managed.intent.client_order_id == rescue_client_order_id)
+    );
 }
 
 #[test]
@@ -1158,9 +1224,11 @@ fn degraded_runtime_suppresses_entries_but_accepts_close_intents() {
     );
     assert_eq!(close.commands.len(), 1);
     assert_eq!(runtime.open_orders().count(), 1);
-    assert!(runtime
-        .open_orders()
-        .all(|managed| managed.intent.kind == crate::types::IntentKind::Close));
+    assert!(
+        runtime
+            .open_orders()
+            .all(|managed| managed.intent.kind == crate::types::IntentKind::Close)
+    );
 }
 
 #[test]
@@ -1182,9 +1250,11 @@ fn live_runtime_suppresses_entries_until_initial_position_reconcile() {
         runtime.accept_intent(btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44), 1);
     assert!(early_entry.commands.is_empty());
     assert_eq!(runtime.open_orders().count(), 0);
-    assert!(runtime.event_log().recent(4).iter().any(|event| event
-        .message
-        .contains("initial venue position reconcile has not completed")));
+    assert!(runtime.event_log().recent(4).iter().any(|event| {
+        event
+            .message
+            .contains("initial venue position reconcile has not completed")
+    }));
 
     let rescue = runtime.accept_intent(
         btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.55),
@@ -1655,11 +1725,13 @@ fn recover_from_store_restores_strategy_checkpoint_state() {
     let outcome = recovered.recover_from_store(20, 5_000);
     assert!(restored.load(Ordering::SeqCst));
     assert!(!outcome.event_seqs.is_empty());
-    assert!(recovered
-        .event_log()
-        .recent(8)
-        .iter()
-        .any(|event| event.message.contains("restored strategy state")));
+    assert!(
+        recovered
+            .event_log()
+            .recent(8)
+            .iter()
+            .any(|event| event.message.contains("restored strategy state"))
+    );
 }
 
 #[test]
@@ -1712,9 +1784,11 @@ fn recover_from_store_restores_sticky_riskoff_status() {
     let start_outcome = recovered.start(30);
     assert_eq!(recovered.status(), RuntimeStatus::RiskOff);
     assert!(start_outcome.commands.is_empty());
-    assert!(recovered.event_log().recent(8).iter().any(|event| event
-        .message
-        .contains("restored runtime status from durable store status=RiskOff")));
+    assert!(recovered.event_log().recent(8).iter().any(|event| {
+        event
+            .message
+            .contains("restored runtime status from durable store status=RiskOff")
+    }));
 }
 
 #[test]
