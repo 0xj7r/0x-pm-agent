@@ -232,6 +232,17 @@ impl AppConfig {
             Some(StrategyProfile::load_merged(&strategy_profile_paths)?)
         };
         let paper_mode = parse_bool("PM_BTC_5M_PAPER_MODE", true)?;
+        if !paper_mode
+            && strategy_profile.is_none()
+            && strategy_name
+                .split([',', '+'])
+                .map(str::trim)
+                .any(|name| !name.is_empty() && name != "noop")
+        {
+            anyhow::bail!(
+                "live strategy `{strategy_name}` requires PM_BTC_5M_STRATEGY_PROFILE_PATH or PM_BTC_5M_STRATEGY_PROFILE_PATHS"
+            );
+        }
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("PM_BTC_5M_EXEC_LOG_FORMAT", "pretty"))?;
         let metrics_bind = parse_socket_addr("PM_BTC_5M_EXEC_METRICS_BIND", "0.0.0.0:9108")?;

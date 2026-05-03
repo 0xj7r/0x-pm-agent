@@ -8,20 +8,20 @@ strategy: paired_mm
 
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
-  levels_per_side: 6
-  base_clip_usd: 1.50
-  min_clip_usd: 0.50
-  max_clip_usd: 6.0
+  levels_per_side: 2
+  base_clip_usd: 0.75
+  min_clip_usd: 0.25
+  max_clip_usd: 5.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
   min_top_depth_notional_usd: 2.0
-  min_order_notional_usd: 1.0
-  entry_ladder_levels: 6
+  min_order_notional_usd: 0.50
+  entry_ladder_levels: 2
   entry_ladder_spacing_ticks: 1.0
   maker_safety_ticks: 2.0
   venue_min_order_quantity: 5.0
-  entry_min_size_multiplier: 1.30
+  entry_min_size_multiplier: 1.00
 
 # ── Fair-Value Anchoring ────────────────────────────────────────
 # Paired-MM is liquidity provision, not directional taking. The physical
@@ -33,12 +33,16 @@ fair_value:
 
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
-  max_gross_notional_usd: 60.0
-  max_net_notional_per_market_usd: 25.0
-  max_order_notional_usd: 6.0
-  max_stranded_leg_usd: 25.0
-  max_gross_cost_usd: 60.0
-  max_leg_cost_usd: 25.0
+  max_gross_notional_usd: 20.0
+  max_net_notional_per_market_usd: 10.0
+  max_order_notional_usd: 5.0
+  max_position_quantity_per_instrument: 75.0
+  max_open_orders_total: 12
+  max_open_orders_per_market: 6
+  max_stranded_leg_usd: 10.0
+  max_gross_cost_usd: 20.0
+  max_leg_cost_usd: 10.0
+  max_side_imbalance_qty: 20.0
 
 # ── Pair / Merge Recycling ─────────────────────────────────────
 # Polygon merge fees are negligible for our setup; keep this low so tiny-live
@@ -48,8 +52,8 @@ pair:
 
 # ── Rescue / Merge Logic ────────────────────────────────────────
 rescue:
-  hedge_rescue_clip_usd: 2.50
-  hedge_rescue_max_qty: 25.0
+  hedge_rescue_clip_usd: 1.00
+  hedge_rescue_max_qty: 10.0
   hedge_rescue_edge_bps: 25
   hedge_rescue_race_buffer_ticks: 3.0
   sell_unwind_enabled: true

@@ -2652,7 +2652,14 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn is_btc_mm_buy_intent(intent: &OrderIntent) -> bool {
-        intent.client_order_id.as_str().starts_with("btc-5m-mm:")
+        let legacy_btc_mm = intent.client_order_id.as_str().starts_with("btc-5m-mm:");
+        let paired_entry_tag = intent
+            .quote_level_tag
+            .as_deref()
+            .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+            .is_some_and(|kind| kind == crate::types::MmQuoteKind::PairedEntry);
+        (legacy_btc_mm || paired_entry_tag)
+            && intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !intent.reduce_only
     }
