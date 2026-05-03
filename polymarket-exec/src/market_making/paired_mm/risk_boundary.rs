@@ -16,6 +16,7 @@ const USD_EPSILON: f64 = 1e-6;
 pub enum PairedMmRiskReject {
     GrossCostCap { gross_cost_usd: f64, cap_usd: f64 },
     EntryNotionalCap { notional_usd: f64, cap_usd: f64 },
+    EntryQuantityCap { quantity: f64, cap_qty: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,6 +81,19 @@ pub fn evaluate_entry_intent(
         );
     }
 
+    if intent.quantity > caps.max_side_imbalance_qty + USD_EPSILON {
+        return PairedMmRiskDecision::reject(
+            PairedMmRiskReject::EntryQuantityCap {
+                quantity: intent.quantity,
+                cap_qty: caps.max_side_imbalance_qty,
+            },
+            format!(
+                "paired-mm entry quantity cap exceeded quantity={:.4} cap={:.4}",
+                intent.quantity, caps.max_side_imbalance_qty
+            ),
+        );
+    }
+
     PairedMmRiskDecision::accept()
 }
 
@@ -117,6 +131,24 @@ mod tests {
         let decision = evaluate_entry_intent(&PairedInventorySnapshot::default(), &intent, &caps);
 
         assert!(decision.accepted, "{decision:?}");
+    }
+
+    #[test]
+    fn rejects_entry_that_can_exceed_side_imbalance_cap_by_itself() {
+        let caps = RunningInventoryCaps {
+            max_entry_notional_usd: 5.0,
+            max_side_imbalance_qty: 20.0,
+            ..RunningInventoryCaps::default()
+        };
+        let intent = entry_intent(0.10, 50.0);
+
+        let decision = evaluate_entry_intent(&PairedInventorySnapshot::default(), &intent, &caps);
+
+        assert!(!decision.accepted, "{decision:?}");
+        assert!(matches!(
+            decision.reject,
+            Some(PairedMmRiskReject::EntryQuantityCap { .. })
+        ));
     }
 }
 
