@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::core::risk::RiskLimits;
 use crate::market_making::paired_mm::{
     CapitalRecycleConfig, HardPolicyConfig, LadderConfig, MergePolicyConfig, RescueConfig,
     RunningInventoryCaps,
@@ -327,6 +328,49 @@ impl StrategyProfile {
 
     pub fn momentum_weight(&self) -> f64 {
         self.signals.fair_value.momentum_weight.unwrap_or(0.65)
+    }
+
+    /// Build a `RiskLimits` snapshot from the profile's `inventory:`
+    /// section. Each cap defaults to the corresponding `RiskLimits`
+    /// default when the profile leaves it unset, mirroring the live
+    /// runtime's `Runtime::new` mapping.
+    pub fn risk_limits(&self) -> RiskLimits {
+        let defaults = RiskLimits::default();
+        let inv = &self.inventory;
+        RiskLimits {
+            max_order_notional_usd: inv
+                .max_order_notional_usd
+                .unwrap_or(defaults.max_order_notional_usd),
+            max_gross_notional_usd: inv
+                .max_gross_notional_usd
+                .unwrap_or(defaults.max_gross_notional_usd),
+            max_net_notional_per_market_usd: inv
+                .max_net_notional_per_market_usd
+                .unwrap_or(defaults.max_net_notional_per_market_usd),
+            max_position_quantity_per_instrument: inv
+                .max_position_quantity_per_instrument
+                .unwrap_or(defaults.max_position_quantity_per_instrument),
+            min_free_cash_usd: inv.min_free_cash_usd.unwrap_or(defaults.min_free_cash_usd),
+            min_free_cash_bps: inv.min_free_cash_bps.unwrap_or(defaults.min_free_cash_bps),
+            min_portfolio_equity_usd: inv
+                .min_portfolio_equity_usd
+                .unwrap_or(defaults.min_portfolio_equity_usd),
+            min_portfolio_equity_bps: inv
+                .min_portfolio_equity_bps
+                .unwrap_or(defaults.min_portfolio_equity_bps),
+            max_session_loss_usd: inv
+                .max_session_loss_usd
+                .unwrap_or(defaults.max_session_loss_usd),
+            max_session_loss_bps: inv
+                .max_session_loss_bps
+                .unwrap_or(defaults.max_session_loss_bps),
+            max_open_orders_total: inv
+                .max_open_orders_total
+                .unwrap_or(defaults.max_open_orders_total),
+            max_open_orders_per_market: inv
+                .max_open_orders_per_market
+                .unwrap_or(defaults.max_open_orders_per_market),
+        }
     }
 }
 

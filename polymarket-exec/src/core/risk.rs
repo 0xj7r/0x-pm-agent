@@ -1,5 +1,7 @@
 //! Pre-trade risk limits and reject reasoning for order intents.
 
+use serde::{Deserialize, Serialize};
+
 use crate::event_log::{EventCategory, EventMetrics, EventRecord};
 use crate::inventory::InventoryState;
 use crate::types::{EpochMillis, OrderIntent, StrategyDecision, TradeSide};
@@ -75,7 +77,8 @@ pub struct RiskContext {
     pub now_ms: EpochMillis,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RiskRejectReason {
     InvalidOrder,
     OrderNotionalTooLarge,
