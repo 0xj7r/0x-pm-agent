@@ -8,7 +8,8 @@ use polymarket_exec::strategy::{
     Strategy, StrategyContext, StrategyDecision, StrategyMode, StrategyProfile, VenueMarketRules,
 };
 use polymarket_exec::types::{
-    BookLevel, InstrumentId, MarketId, MarketSnapshot, QuoteSnapshot, RuntimeCommand, RuntimeStatus,
+    BookLevel, InstrumentId, MarketId, MarketLedgerState, MarketSnapshot, QuoteSnapshot,
+    RuntimeCommand, RuntimeStatus,
 };
 
 fn quote(bid: f64, ask: f64, now_ms: u64) -> QuoteSnapshot {
@@ -97,6 +98,7 @@ fn context(
         inventory,
         open_orders_total: 0,
         open_orders_for_market: 0,
+        market_ledger_state: MarketLedgerState::Flat,
         market_context: Some(market_context(market_id, yes_id, no_id)),
         btc_regime: BtcRegimeSnapshot {
             last_price: Some(spot),

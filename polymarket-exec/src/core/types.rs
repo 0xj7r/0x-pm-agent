@@ -62,6 +62,36 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
+/// Per-market execution state derived by the runtime from orders, inventory,
+/// venue reconciliation, and merge lifecycle state.
+///
+/// Strategies use this to distinguish fresh entry from close-side repair. The
+/// runtime remains the authority for accepting or rejecting resulting intents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketLedgerState {
+    #[default]
+    Flat,
+    QuotingPaired,
+    PartiallyFilled,
+    Recycling,
+    MergePending,
+    Drifted,
+    Resolved,
+}
+
+impl MarketLedgerState {
+    pub fn allows_fresh_entry(self) -> bool {
+        matches!(self, Self::Flat | Self::QuotingPaired)
+    }
+
+    pub fn allows_close_side(self) -> bool {
+        matches!(
+            self,
+            Self::PartiallyFilled | Self::Recycling | Self::MergePending | Self::Drifted
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TradeSide {
     Buy,
