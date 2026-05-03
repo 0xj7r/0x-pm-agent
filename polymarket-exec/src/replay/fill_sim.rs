@@ -221,23 +221,16 @@ struct LiveBook {
 
 impl LiveBook {
     fn best_bid_ticks(&self) -> Option<i64> {
-        self.bids.iter().rev().find_map(|(p, sz)| {
-            if *sz > 0.0 {
-                Some(*p)
-            } else {
-                None
-            }
-        })
+        self.bids
+            .iter()
+            .rev()
+            .find_map(|(p, sz)| if *sz > 0.0 { Some(*p) } else { None })
     }
 
     fn best_ask_ticks(&self) -> Option<i64> {
-        self.asks.iter().find_map(|(p, sz)| {
-            if *sz > 0.0 {
-                Some(*p)
-            } else {
-                None
-            }
-        })
+        self.asks
+            .iter()
+            .find_map(|(p, sz)| if *sz > 0.0 { Some(*p) } else { None })
     }
 
     /// Total visible size on `side` at-or-better than `price_ticks`. "Better"
@@ -712,13 +705,7 @@ mod tests {
         StrategyOrderIntent::passive(coid, asset, side, price, size, placed_ms)
     }
 
-    fn book_event(
-        received_ns: i64,
-        asset: &str,
-        side: &str,
-        price: &str,
-        size: &str,
-    ) -> Event {
+    fn book_event(received_ns: i64, asset: &str, side: &str, price: &str, size: &str) -> Event {
         Event {
             v: 1,
             ts_ns: received_ns - 1,
@@ -906,9 +893,7 @@ mod tests {
         });
         // Seed an ask at 0.55. A buy post-only at 0.55 would cross.
         sim.on_event(&book_event(500_000_000, "asset-a", "sell", "0.55", "10"));
-        let mut po = StrategyOrderIntent::passive(
-            "po-1", "asset-a", Side::Buy, 0.55, 5.0, 1_000,
-        );
+        let mut po = StrategyOrderIntent::passive("po-1", "asset-a", Side::Buy, 0.55, 5.0, 1_000);
         po.post_only = true;
         sim.submit(po);
         assert_eq!(sim.fills().len(), 0);
@@ -929,9 +914,7 @@ mod tests {
         });
         sim.on_event(&book_event(500_000_000, "asset-a", "sell", "0.55", "20"));
         sim.on_event(&book_event(500_000_001, "asset-a", "sell", "0.56", "30"));
-        let mut take = StrategyOrderIntent::passive(
-            "t1", "asset-a", Side::Buy, 0.56, 35.0, 1_000,
-        );
+        let mut take = StrategyOrderIntent::passive("t1", "asset-a", Side::Buy, 0.56, 35.0, 1_000);
         take.aggressive = true;
         sim.submit(take);
         let fills = sim.fills();

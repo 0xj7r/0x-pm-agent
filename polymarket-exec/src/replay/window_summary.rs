@@ -210,9 +210,7 @@ impl WindowAccumulator {
     }
 
     pub fn ingest_event(&mut self, event: &Event) {
-        if event.event_type == EventType::BookSnapshot
-            || event.event_type == EventType::BookDelta
-        {
+        if event.event_type == EventType::BookSnapshot || event.event_type == EventType::BookDelta {
             // Keep mid-price samples per asset for markout windows.
             if let (Some(asset), Some(price_str)) =
                 (event.asset_id.as_deref(), event.price.as_deref())
@@ -513,8 +511,7 @@ mod tests {
 
     #[test]
     fn ingest_fill_accumulates_realized_pnl() {
-        let mut acc =
-            WindowAccumulator::new("w1", "m1", "slug-1", "btc_5m", 0, 10_000_000_000);
+        let mut acc = WindowAccumulator::new("w1", "m1", "slug-1", "btc_5m", 0, 10_000_000_000);
         // Buy 10 @ 0.55 and sell 10 @ 0.60 → net realized 0.5
         let buy = SimulatedFill {
             client_order_id: "b".into(),
@@ -557,8 +554,7 @@ mod tests {
 
     #[test]
     fn markout_picks_nearest_pre_window_mid_sample() {
-        let mut acc =
-            WindowAccumulator::new("w1", "m1", "slug-1", "btc_5m", 0, 60_000_000_000);
+        let mut acc = WindowAccumulator::new("w1", "m1", "slug-1", "btc_5m", 0, 60_000_000_000);
         // Mid samples for asset-a at t=1s,2s,3s,4s with rising price.
         for (i, p) in [(1, "0.50"), (2, "0.51"), (3, "0.52"), (4, "0.53")] {
             acc.ingest_event(&book_event(
