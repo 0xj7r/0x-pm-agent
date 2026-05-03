@@ -1139,6 +1139,14 @@ impl<S: Strategy> Runtime<S> {
             .filter(|client_order_id| !seen.contains(client_order_id))
             .collect::<Vec<_>>();
         for client_order_id in missing_from_store {
+            if let Some(record) = self.durable_terminal_order(&client_order_id) {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable store terminal state removed active runtime order",
+                ));
+                continue;
+            }
             let needs_reconcile = self
                 .open_orders
                 .get(&client_order_id)
@@ -1153,6 +1161,69 @@ impl<S: Strategy> Runtime<S> {
             }
         }
 
+        outcome
+    }
+
+    fn durable_terminal_order(&self, client_order_id: &ClientOrderId) -> Option<OrderRecord> {
+        let Some(order_store) = self.order_store.as_ref() else {
+            return None;
+        };
+        match order_store.get(client_order_id) {
+            Ok(Some(record)) if record.status.is_terminal() => Some(record),
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    run_id = %self.run_id,
+                    client_order_id = %client_order_id,
+                    error = ?error,
+                    "failed to read durable order while reconciling terminal state"
+                );
+                None
+            }
+        }
+    }
+
+    fn remove_active_order_after_durable_terminal(
+        &mut self,
+        record: OrderRecord,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+        let Some(managed) = self.open_orders.remove(&record.client_order_id) else {
+            return outcome;
+        };
+        if let Some(release) = self
+            .inventory
+            .release_reservation(&record.client_order_id, now_ms)
+        {
+            outcome.push_event(
+                self.event_log
+                    .push(release.to_event("released reservation after durable terminal sync")),
+            );
+        }
+        info!(
+            run_id = %self.run_id,
+            client_order_id = %record.client_order_id,
+            durable_status = ?record.status,
+            reason,
+            "removed active order because durable order state is terminal"
+        );
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Runtime,
+                    now_ms,
+                    format!(
+                        "removed active order after durable terminal {:?}: {}",
+                        record.status, reason
+                    ),
+                )
+                .with_market(managed.intent.market_id)
+                .with_instrument(managed.intent.instrument_id)
+                .with_client_order(record.client_order_id),
+            ),
+        );
         outcome
     }
 
@@ -2765,6 +2836,14 @@ impl<S: Strategy> Runtime<S> {
             .collect::<Vec<_>>();
 
         for client_order_id in to_quarantine {
+            if let Some(record) = self.durable_terminal_order(&client_order_id) {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "stale needs-reconcile order already terminal in durable store",
+                ));
+                continue;
+            }
             outcome.extend(self.set_order_status(
                 &client_order_id,
                 ManagedOrderStatus::Quarantined,
