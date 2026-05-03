@@ -32,9 +32,9 @@ use polymarket_exec::replay::manifest::{
     SCHEMA_VERSION,
 };
 use polymarket_exec::replay::reader::read_local_filtered;
-use polymarket_exec::replay::runner::{
-    run_run, ReplayDecision, ReplayStrategy, RunnerConfig, WindowStatus, WindowSummary,
-};
+use polymarket_exec::replay::runner::{run_run, RunnerConfig, WindowStatus, WindowSummary};
+use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
+use polymarket_exec::strategy_profile::StrategyProfile;
 
 /// Backtest CLI. Mirrors the spec's clap::Parser shape.
 #[derive(Parser, Debug)]
@@ -140,23 +140,6 @@ fn parse_market_filter(s: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
-}
-
-/// No-op replay strategy: a placeholder until the StrategyRegistry adapter
-/// lands in a follow-up PR. Submits no intents, accepts no fills. The bin
-/// still exercises the full event-replay path for determinism validation.
-struct NoopStrategy;
-
-impl ReplayStrategy for NoopStrategy {
-    fn on_event(&mut self, _event: &Event) -> ReplayDecision {
-        ReplayDecision::default()
-    }
-    fn on_fill(
-        &mut self,
-        _fill: &polymarket_exec::replay::fill_sim::SimulatedFill,
-    ) -> ReplayDecision {
-        ReplayDecision::default()
-    }
 }
 
 fn run_main(cli: Cli) -> Result<i32> {
@@ -274,7 +257,12 @@ fn run_main(cli: Cli) -> Result<i32> {
         max_window_failures: cli.max_window_failures,
     };
 
-    let summaries = match run_run(windows, &runner_cfg, |_| NoopStrategy) {
+    // Load profile and instantiate the strategy adapter for each window.
+    let profile = StrategyProfile::load(&cli.strategy_profile)
+        .with_context(|| format!("load strategy profile {}", cli.strategy_profile.display()))?;
+    let summaries = match run_run(windows, &runner_cfg, |_| {
+        ReplayStrategyAdapter::from_profile(profile.clone())
+    }) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("run aborted: {e}");

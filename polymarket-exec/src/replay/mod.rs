@@ -19,3 +19,4 @@ pub mod fill_sim;
 pub mod manifest;
 pub mod reader;
 pub mod runner;
+pub mod strategy_adapter;
