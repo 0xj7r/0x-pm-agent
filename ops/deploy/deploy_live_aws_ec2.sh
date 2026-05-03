@@ -92,6 +92,7 @@ ssh_base "
   command -v rsync >/dev/null
   rsync -a --delete \
     --exclude '.git' \
+    --exclude '.venv/' \
     --exclude 'data/' \
     --exclude 'target/' \
     '$REMOTE_RELEASE_DIR/' '$REMOTE_WORKDIR/'

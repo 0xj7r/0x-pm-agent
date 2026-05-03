@@ -6,7 +6,7 @@ use crate::market_making::paired_mm::{
 };
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::StrategyDecision;
+use crate::types::{CoolingReason, StrategyDecision};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairedMmStrategyConfig {
@@ -65,6 +65,14 @@ where
         let btc_regime = input.btc_regime.regime();
         let vol_5m_bps = input.btc_regime.realized_vol_5m_bps;
         let ret180_bps = input.btc_regime.return_180s_bps;
+        let imbalance_qty = input.inventory.side_imbalance_qty();
+        let recycle_only_threshold = self
+            .engine
+            .config()
+            .capital_recycle
+            .min_imbalance_qty
+            .max(input.market.min_order_size());
+        let recycle_only = imbalance_qty >= recycle_only_threshold;
         let decision = self.engine.decide(&PairedMmInput {
             market: input.market,
             snapshot: input.snapshot,
@@ -94,6 +102,13 @@ where
         if let Some(intent) = decision.capital_recycle_intent().cloned() {
             notes.push("paired-mm capital recycle emitted".to_string());
             return StrategyDecision::capital_recycle(vec![intent], notes);
+        }
+
+        if recycle_only {
+            notes.push(format!(
+                "paired-mm recycle-only: suppressing fresh paired-entry ladder imbalance_qty={imbalance_qty:.4} threshold={recycle_only_threshold:.4}"
+            ));
+            return StrategyDecision::suppress(CoolingReason::SideImbalanceCap, false, notes);
         }
 
         if let Some(reason) = PairedMmEngine::suppression_reason(&decision) {
