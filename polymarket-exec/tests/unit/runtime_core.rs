@@ -1,4 +1,4 @@
-use super::{BLOCKED_MERGE_RETRY_AFTER_MS, ManagedOrderStatus, Runtime, RuntimeConfig};
+use super::{ManagedOrderStatus, Runtime, RuntimeConfig, BLOCKED_MERGE_RETRY_AFTER_MS};
 use crate::inventory::VenuePositionSnapshot;
 use crate::market_context::{MarketContextRecord, MarketContextStore};
 use crate::risk::RiskLimits;
@@ -14,8 +14,8 @@ use crate::types::{
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -910,11 +910,9 @@ fn reduce_only_sell_cleanup_is_suppressed_when_merge_is_pending() {
     );
 
     assert!(outcome.commands.is_empty());
-    assert!(
-        runtime
-            .open_orders()
-            .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1"))
-    );
+    assert!(runtime
+        .open_orders()
+        .all(|managed| managed.intent.client_order_id != ClientOrderId::from("cleanup-sell-1")));
 }
 
 #[test]
@@ -1106,16 +1104,12 @@ fn on_fill_rescue_preserves_working_pair_mate_quote() {
             .all(|command| !matches!(command, RuntimeCommand::Cancel { .. })),
         "on-fill rescue must not cancel the still-working paired mate"
     );
-    assert!(
-        runtime
-            .open_orders()
-            .any(|managed| managed.intent.client_order_id == right_client_order_id)
-    );
-    assert!(
-        runtime
-            .open_orders()
-            .any(|managed| managed.intent.client_order_id == rescue_client_order_id)
-    );
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == right_client_order_id));
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
 }
 
 #[test]
@@ -1184,21 +1178,15 @@ fn on_market_snapshot_rescue_preserves_working_pair_mate_quote() {
         }),
         "snapshot rescue must not cancel the still-working paired mate"
     );
-    assert!(
-        runtime
-            .open_orders()
-            .any(|managed| managed.intent.client_order_id == left_client_order_id)
-    );
-    assert!(
-        runtime
-            .open_orders()
-            .any(|managed| managed.intent.client_order_id == right_client_order_id)
-    );
-    assert!(
-        runtime
-            .open_orders()
-            .any(|managed| managed.intent.client_order_id == rescue_client_order_id)
-    );
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == left_client_order_id));
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == right_client_order_id));
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == rescue_client_order_id));
 }
 
 #[test]
@@ -1224,11 +1212,9 @@ fn degraded_runtime_suppresses_entries_but_accepts_close_intents() {
     );
     assert_eq!(close.commands.len(), 1);
     assert_eq!(runtime.open_orders().count(), 1);
-    assert!(
-        runtime
-            .open_orders()
-            .all(|managed| managed.intent.kind == crate::types::IntentKind::Close)
-    );
+    assert!(runtime
+        .open_orders()
+        .all(|managed| managed.intent.kind == crate::types::IntentKind::Close));
 }
 
 #[test]
@@ -1609,6 +1595,69 @@ fn recover_from_store_reconstructs_orders_and_marks_uncertain_submits() {
 }
 
 #[test]
+fn stale_needs_reconcile_order_uses_durable_terminal_state_instead_of_quarantine() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("polymarket-exec-terminal-sync-{ts}.sqlite"));
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    let client_order_id = ClientOrderId::from("coid-terminal-sync");
+    let intent = OrderIntent {
+        client_order_id: client_order_id.clone(),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.41,
+        quantity: 5.0,
+        reduce_only: false,
+        reason: "recover".to_string(),
+        quote_level_tag: None,
+        created_at_ms: 10,
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let mut record = OrderRecord::from_intent("run-1", &intent, "single-shot");
+    record.status = ManagedOrderStatus::NeedsReconcile;
+    record.last_update_ms = 10;
+    store.insert(record).unwrap();
+
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Starting,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        SingleShotStrategy { fired: false },
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+    runtime.recover_from_store(20, 5_000);
+    assert_eq!(runtime.open_order_snapshots().len(), 1);
+
+    let mut external_store = SqliteOrderStore::open(&path).unwrap();
+    external_store
+        .update_status(&client_order_id, ManagedOrderStatus::Filled, 30)
+        .unwrap();
+    drop(external_store);
+
+    let outcome = runtime.quarantine_stale_needs_reconcile_orders(20_000, 100);
+
+    assert!(!outcome.event_seqs.is_empty());
+    assert!(runtime.open_order_snapshots().is_empty());
+    let store_record = SqliteOrderStore::open(&path)
+        .unwrap()
+        .get(&client_order_id)
+        .unwrap()
+        .expect("order record");
+    assert_eq!(store_record.status, ManagedOrderStatus::Filled);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn venue_position_reconciliation_recovers_missing_cost_basis_from_filled_buys() {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1725,13 +1774,11 @@ fn recover_from_store_restores_strategy_checkpoint_state() {
     let outcome = recovered.recover_from_store(20, 5_000);
     assert!(restored.load(Ordering::SeqCst));
     assert!(!outcome.event_seqs.is_empty());
-    assert!(
-        recovered
-            .event_log()
-            .recent(8)
-            .iter()
-            .any(|event| event.message.contains("restored strategy state"))
-    );
+    assert!(recovered
+        .event_log()
+        .recent(8)
+        .iter()
+        .any(|event| event.message.contains("restored strategy state")));
 }
 
 #[test]
