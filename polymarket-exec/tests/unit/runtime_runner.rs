@@ -1073,6 +1073,88 @@ async fn matched_cancel_reject_reconciles_without_risk_off() {
 }
 
 #[tokio::test]
+async fn matched_cancel_reject_does_not_replay_cancel_next_cycle() {
+    let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
+    let client_order_id = ClientOrderId::from("client-working");
+    let cancel_outcome =
+        runtime.request_cancel_order(&client_order_id, now_unix_ms(), "test cancel race");
+
+    let adapter = Arc::new(RecordingAdapter {
+        cancel_reject_message: Some("matched orders can't be canceled".to_string()),
+        ..RecordingAdapter::default()
+    });
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets = vec!["token-1".to_string()];
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map =
+        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = live_test_policy();
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        cancel_outcome,
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter.clone(),
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("first execute");
+
+    assert_eq!(
+        adapter.cancelled.lock().expect("cancelled lock").as_slice(),
+        &[client_order_id.clone()]
+    );
+    let status_after_reject = runtime
+        .open_order_snapshots()
+        .into_iter()
+        .find(|managed| managed.intent.client_order_id == client_order_id)
+        .map(|managed| managed.status);
+    assert_eq!(
+        status_after_reject,
+        Some(ManagedOrderStatus::NeedsReconcile)
+    );
+    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        RuntimeOutcome::default(),
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter.clone(),
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("second execute");
+
+    assert_eq!(
+        adapter.cancelled.lock().expect("cancelled lock").as_slice(),
+        &[client_order_id]
+    );
+    assert_eq!(live_safety.consecutive_cancel_errors, 0);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+}
+
+#[tokio::test]
 async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions() {
     let mut runtime = Runtime::new(
         RuntimeConfig {

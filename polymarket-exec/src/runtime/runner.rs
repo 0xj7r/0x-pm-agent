@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -30,7 +30,7 @@ use crate::runtime::live_health::{
     needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
-    RuntimeMarketUniverse, fetch_btc_5m_market_contexts, refresh_runtime_market_universe,
+    fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
 };
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
@@ -43,7 +43,7 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{DashboardSnapshot, DashboardUiState, serve_http};
+use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -2095,6 +2095,15 @@ async fn execute_execution_adapter(
             execution_policy.live_order_max_age_ms,
         );
         stage_outcome_commands(&mut combined, &mut queue, stale_cancel_outcome);
+        let mut queued_cancel_ids: HashSet<ClientOrderId> = queue
+            .iter()
+            .filter_map(|command| match command {
+                RuntimeCommand::Cancel {
+                    client_order_id, ..
+                } => Some(client_order_id.clone()),
+                _ => None,
+            })
+            .collect();
         let mut dedupe = HashSet::new();
         for managed in runtime.open_order_snapshots() {
             if managed.remaining_qty() <= 0.0 {
@@ -2121,10 +2130,20 @@ async fn execute_execution_adapter(
                     client_order_id = %client_order_id,
                     "order requires reconciliation; skipping automatic submit replay"
                 ),
-                ManagedOrderStatus::CancelRequested => queue.push_back(RuntimeCommand::Cancel {
-                    client_order_id,
-                    reason: "recovering live order".to_string(),
-                }),
+                ManagedOrderStatus::CancelRequested => {
+                    if queued_cancel_ids.insert(client_order_id.clone()) {
+                        queue.push_back(RuntimeCommand::Cancel {
+                            client_order_id,
+                            reason: "recovering live order".to_string(),
+                        });
+                    } else {
+                        debug!(
+                            mode = "live",
+                            client_order_id = %client_order_id,
+                            "cancel already queued in current execution cycle"
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -2528,7 +2547,15 @@ async fn execute_execution_adapter(
                             "cancel rejected by venue; treating order state as uncertain"
                         );
                         metrics.observe_uncertain_submit();
-                        if !uncertain_cancel {
+                        if uncertain_cancel {
+                            combined.extend(runtime.mark_order_needs_reconcile(
+                                &client_order_id,
+                                ack.accepted_at_ms,
+                                format!(
+                                    "cancel rejected because venue order is likely terminal; awaiting fill/cancel sync: {reason}"
+                                ),
+                            ));
+                        } else {
                             combined.extend(runtime.mark_order_needs_reconcile(
                                 &client_order_id,
                                 ack.accepted_at_ms,
