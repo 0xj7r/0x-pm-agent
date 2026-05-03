@@ -21,6 +21,21 @@ clip_sizing:
   fractional_kelly: 0.15
   capital_scale_factor: 0.5          # 0.5 = tiny-live ($50), 1.0 = full live
 
+# ── Hard Runtime Risk Boundary ──────────────────────────────────────────────
+# These caps are enforced below strategy logic. They intentionally mirror the
+# current conservative live profile so sparse env files cannot fall back to
+# broad runtime defaults.
+inventory:
+  max_order_notional_usd: 5.0
+  max_gross_notional_usd: 40.0
+  max_net_notional_per_market_usd: 20.0
+  max_position_quantity_per_instrument: 250.0
+  min_free_cash_usd: 25.0
+  min_free_cash_bps: 2500
+  max_session_loss_bps: 2500
+  max_open_orders_total: 8
+  max_open_orders_per_market: 4
+
 # ── Convexity & Late-Window Amplification (source of asymmetric wins) ────────
 convexity:
   late_window_sec: 120               # Seconds remaining to start allowing excess
