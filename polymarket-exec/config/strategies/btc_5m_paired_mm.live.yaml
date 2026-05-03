@@ -8,16 +8,16 @@ strategy: paired_mm
 
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
-  levels_per_side: 3
-  base_clip_usd: 1.10
-  min_clip_usd: 0.25
-  max_clip_usd: 5.0
+  levels_per_side: 6
+  base_clip_usd: 2.00
+  min_clip_usd: 0.50
+  max_clip_usd: 8.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
   min_top_depth_notional_usd: 2.0
   min_order_notional_usd: 1.0
-  entry_ladder_levels: 3
+  entry_ladder_levels: 6
   entry_ladder_spacing_ticks: 1.0
   maker_safety_ticks: 2.0
   venue_min_order_quantity: 5.0
@@ -35,6 +35,7 @@ fair_value:
 inventory:
   max_gross_notional_usd: 80.0
   max_net_notional_per_market_usd: 35.0
+  max_order_notional_usd: 8.0
   max_stranded_leg_usd: 35.0
   max_gross_cost_usd: 80.0
   max_leg_cost_usd: 35.0
