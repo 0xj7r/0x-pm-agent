@@ -305,6 +305,14 @@ impl QuoteReconciler {
             || (current.quantity - desired.quantity).abs() > quantity_threshold
     }
 
+    fn is_paired_entry(intent: &OrderIntent) -> bool {
+        intent.kind == crate::types::IntentKind::Entry
+            && intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
+    }
+
     pub fn plan(
         &mut self,
         desired: crate::quote_engine::DesiredQuoteSet,
@@ -418,6 +426,15 @@ impl QuoteReconciler {
             if !self.materially_different_quote(&existing_order.intent, &desired_intent) {
                 plan.actions
                     .push(QuoteAction::Keep(existing_order.intent.clone()));
+            } else if Self::is_paired_entry(&existing_order.intent)
+                || Self::is_paired_entry(&desired_intent)
+            {
+                plan.actions
+                    .push(QuoteAction::Keep(existing_order.intent.clone()));
+                plan.notes.push(
+                    "paired entry replace suppressed: keeping existing maker leg until fill/cancel"
+                        .to_string(),
+                );
             } else if self.can_change(existing_order, now_ms) {
                 if self.can_replace(now_ms, planned_replaces + 1) {
                     plan.actions.push(QuoteAction::Replace {
