@@ -1637,6 +1637,7 @@ impl<S: Strategy> Runtime<S> {
                     next_status = Some(ManagedOrderStatus::Working);
                 }
             }
+            let mut durable_terminal_after_fill = None;
             if persist_fill || !self.open_orders.contains_key(client_order_id) {
                 if let Some(store) = self.order_store.as_mut() {
                     if let Err(error) = store.apply_fill(client_order_id, executed_qty, now_ms) {
@@ -1648,6 +1649,18 @@ impl<S: Strategy> Runtime<S> {
                         );
                     }
                 }
+                if !remove_after {
+                    durable_terminal_after_fill = self.durable_terminal_order(client_order_id);
+                }
+            }
+            if let Some(record) = durable_terminal_after_fill {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable fill state marked order terminal",
+                ));
+                next_status = None;
+                remove_after = false;
             }
             if let Some(status) = next_status {
                 outcome.extend(self.set_order_status(
@@ -2080,6 +2093,12 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             reason.as_str(),
         ));
+        if !matches!(
+            self.open_orders.get(client_order_id).map(|managed| managed.status),
+            Some(ManagedOrderStatus::CancelRequested)
+        ) {
+            return outcome;
+        }
         outcome.push_command(RuntimeCommand::Cancel {
             client_order_id: client_order_id.clone(),
             reason: reason.clone(),
@@ -2745,7 +2764,7 @@ impl<S: Strategy> Runtime<S> {
         client_order_id: &ClientOrderId,
         status: ManagedOrderStatus,
         updated_at_ms: EpochMillis,
-    ) {
+    ) -> Option<OrderRecord> {
         if let Some(store) = self.order_store.as_mut() {
             if let Err(error) = store.update_status(client_order_id, status, updated_at_ms) {
                 warn!(
@@ -2755,8 +2774,10 @@ impl<S: Strategy> Runtime<S> {
                     status = ?status,
                     "failed to persist status transition"
                 );
+                return self.durable_terminal_order(client_order_id);
             }
         }
+        None
     }
 
     fn set_order_status(
@@ -2767,6 +2788,17 @@ impl<S: Strategy> Runtime<S> {
         reason: &str,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        if let Some(record) = self.durable_terminal_order(client_order_id) {
+            if record.status != status || !status.is_terminal() {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable terminal state won status transition",
+                ));
+                return outcome;
+            }
+        }
+        let mut terminal_after_persist = None;
         match self.open_orders.get_mut(client_order_id) {
             Some(managed) => {
                 if managed.status == status {
@@ -2805,7 +2837,8 @@ impl<S: Strategy> Runtime<S> {
                         .with_instrument(managed.intent.instrument_id.clone()),
                     ),
                 );
-                self.record_status_persist(client_order_id, status, now_ms);
+                terminal_after_persist =
+                    self.record_status_persist(client_order_id, status, now_ms);
             }
             None => {
                 warn!(
@@ -2816,6 +2849,13 @@ impl<S: Strategy> Runtime<S> {
                 );
             }
         };
+        if let Some(record) = terminal_after_persist {
+            outcome.extend(self.remove_active_order_after_durable_terminal(
+                record,
+                now_ms,
+                "durable terminal state won status persist conflict",
+            ));
+        }
         outcome
     }
 
