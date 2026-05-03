@@ -104,7 +104,7 @@ else
     set -euo pipefail
     cd '$REMOTE_RELEASE_DIR'
     CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\")
-    CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec
+    CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec --bin polymarket-exec
     install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
     ln -sfn \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\" \"\$HOME/.local/bin/polymarket-exec\"
     test -x \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
