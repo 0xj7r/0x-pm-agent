@@ -88,7 +88,7 @@ pub enum Side {
 }
 
 /// Outcome record emitted whenever the simulator matches an intent.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimulatedFill {
     pub client_order_id: String,
     pub asset_id: String,
