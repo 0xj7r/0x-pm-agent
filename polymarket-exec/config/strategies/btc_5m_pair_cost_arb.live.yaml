@@ -15,11 +15,11 @@ pair_cost:
 
 # ── Clip Sizing (fractional Kelly) ───────────────────────────────────────────
 clip_sizing:
-  base_clip_usd: 1.5
-  min_clip_usd: 0.5
+  base_clip_usd: 6.0
+  min_clip_usd: 1.0
   max_clip_usd: 5.0
-  fractional_kelly: 0.15
-  capital_scale_factor: 0.5          # 0.5 = tiny-live ($50), 1.0 = full live
+  fractional_kelly: 0.25
+  capital_scale_factor: 1.0          # Live validation scale; hard caps below still bound exposure
 
 # ── Hard Runtime Risk Boundary ──────────────────────────────────────────────
 # These caps are enforced below strategy logic. They intentionally mirror the
