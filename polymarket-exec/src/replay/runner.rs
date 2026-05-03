@@ -213,14 +213,14 @@ mod tests {
             if !self.placed {
                 self.placed = true;
                 return ReplayDecision {
-                    submits: vec![StrategyOrderIntent {
-                        client_order_id: "passive-1".into(),
-                        asset_id: event.asset_id.clone().unwrap_or_default(),
-                        side: Side::Sell,
-                        price: 0.55,
-                        size: 100.0,
-                        placed_ms: (event.received_ns / 1_000_000) as u64,
-                    }],
+                    submits: vec![StrategyOrderIntent::passive(
+                        "passive-1",
+                        event.asset_id.clone().unwrap_or_default(),
+                        Side::Sell,
+                        0.55,
+                        100.0,
+                        (event.received_ns / 1_000_000) as u64,
+                    )],
                     cancels: vec![],
                 };
             }

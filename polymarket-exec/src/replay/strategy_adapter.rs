@@ -605,6 +605,15 @@ impl ReplayStrategyAdapter {
             } else {
                 now_ms
             },
+            // Live trader's `OrderIntent` does not yet expose a typed
+            // aggressive/post-only flag, so the adapter defaults to the
+            // resting maker semantics. Hedge-rescue (Close) intents are
+            // FAK-style aggressive lifts; mark them as taker so the fill
+            // simulator crosses the book immediately. This preserves the
+            // "rescue completes the pair" invariant exercised by scenario
+            // fixture #4.
+            aggressive: matches!(intent.kind, IntentKind::Close),
+            post_only: false,
         })
     }
 

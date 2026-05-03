@@ -16,7 +16,7 @@ use std::path::Path;
 
 use polymarket_exec::collector::schema::{Event, EventType, Source};
 use polymarket_exec::replay::fill_sim::{
-    FillSimConfig, LatencyPreset, Side, SimulatedFill, StrategyOrderIntent,
+    FillQuality, FillSimConfig, LatencyPreset, Side, SimulatedFill, StrategyOrderIntent,
 };
 use polymarket_exec::replay::manifest::{canonicalize, compute_run_id, WindowPlan};
 use polymarket_exec::replay::reader::{
@@ -99,14 +99,14 @@ impl ReplayStrategy for PassiveAsk {
         if !self.placed && event.event_type == EventType::BookSnapshot {
             self.placed = true;
             return ReplayDecision {
-                submits: vec![StrategyOrderIntent {
-                    client_order_id: "ask-1".into(),
-                    asset_id: event.asset_id.clone().unwrap(),
-                    side: Side::Sell,
-                    price: 0.55,
-                    size: 100.0,
-                    placed_ms: (event.received_ns / 1_000_000) as u64,
-                }],
+                submits: vec![StrategyOrderIntent::passive(
+                    "ask-1",
+                    event.asset_id.clone().unwrap(),
+                    Side::Sell,
+                    0.55,
+                    100.0,
+                    (event.received_ns / 1_000_000) as u64,
+                )],
                 cancels: vec![],
             };
         }
@@ -122,6 +122,7 @@ fn replay_with(events: &[Event]) -> Vec<SimulatedFill> {
         window_id: "golden-1".into(),
         fill_sim: FillSimConfig {
             latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
             seed: 0xC0FFEE,
             cancel_credit_fraction: 0.5,
         },
@@ -365,6 +366,7 @@ fn run_paired_mm_window(events: &[Event]) -> polymarket_exec::replay::runner::Wi
         window_id: "btc_5m/golden".into(),
         fill_sim: FillSimConfig {
             latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
             seed: 0xC0FFEE,
             cancel_credit_fraction: 0.5,
         },
