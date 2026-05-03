@@ -193,6 +193,11 @@ pub fn build_ladder<M: MarketDescriptor>(
             config,
             now_ms,
         );
+        normalize_paired_entry_quantities(
+            &mut yes_intents,
+            &mut no_intents,
+            market.min_order_size(),
+        );
         interleave_leg_ladders(&mut intents, yes_intents, no_intents);
     }
 
@@ -450,6 +455,37 @@ fn interleave_leg_ladders(
     }
 }
 
+fn normalize_paired_entry_quantities(
+    yes_intents: &mut Vec<OrderIntent>,
+    no_intents: &mut Vec<OrderIntent>,
+    min_order_size: f64,
+) {
+    if yes_intents.is_empty() || no_intents.is_empty() {
+        return;
+    }
+
+    let min_order_size = min_order_size.max(0.0);
+    let mut normalized_yes = Vec::with_capacity(yes_intents.len().min(no_intents.len()));
+    let mut normalized_no = Vec::with_capacity(yes_intents.len().min(no_intents.len()));
+
+    for (mut yes, mut no) in std::mem::take(yes_intents)
+        .into_iter()
+        .zip(std::mem::take(no_intents).into_iter())
+    {
+        let paired_quantity = yes.quantity.min(no.quantity);
+        if !paired_quantity.is_finite() || paired_quantity < min_order_size {
+            continue;
+        }
+        yes.quantity = paired_quantity;
+        no.quantity = paired_quantity;
+        normalized_yes.push(yes);
+        normalized_no.push(no);
+    }
+
+    *yes_intents = normalized_yes;
+    *no_intents = normalized_no;
+}
+
 fn align_down_to_tick(price: f64, tick_size: f64) -> f64 {
     if !price.is_finite() || tick_size <= 0.0 {
         return price;
@@ -537,10 +573,7 @@ mod tests {
             .iter()
             .map(|intent| intent.quote_level_tag.as_deref().unwrap())
             .collect();
-        assert_eq!(
-            tags,
-            vec!["yes:l1", "no:l1", "yes:l2", "no:l2", "yes:l3"]
-        );
+        assert_eq!(tags, vec!["yes:l1", "no:l1", "yes:l2", "no:l2", "yes:l3"]);
     }
 
     #[test]
@@ -623,6 +656,65 @@ mod tests {
             if intent.instrument_id.as_str() == "no" {
                 assert!(intent.limit_price < 0.21);
             }
+        }
+    }
+
+    #[test]
+    fn paired_entry_levels_use_equal_share_quantity_on_both_legs() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.11, 0.91),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &PairCostTracker::default(),
+            &LadderConfig {
+                max_depth: 2,
+                low_vol_depth: 2,
+                base_clip_usd: 5.0,
+                max_clip_usd: 5.0,
+                stoikov: StoikovParams {
+                    gamma: 0.0,
+                    k: 1.0,
+                    max_skew: 0.20,
+                },
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        let yes: Vec<&OrderIntent> = result
+            .intents
+            .iter()
+            .filter(|intent| intent.instrument_id.as_str() == "yes")
+            .collect();
+        let no: Vec<&OrderIntent> = result
+            .intents
+            .iter()
+            .filter(|intent| intent.instrument_id.as_str() == "no")
+            .collect();
+
+        assert_eq!(yes.len(), no.len());
+        assert!(!yes.is_empty());
+        for (yes, no) in yes.iter().zip(no.iter()) {
+            assert!(
+                (yes.quantity - no.quantity).abs() < 1e-9,
+                "yes={yes:?} no={no:?}"
+            );
         }
     }
 
