@@ -108,6 +108,7 @@ impl ReplayStrategy for PassiveAsk {
                     (event.received_ns / 1_000_000) as u64,
                 )],
                 cancels: vec![],
+                risk_rejections: vec![],
             };
         }
         ReplayDecision::default()
