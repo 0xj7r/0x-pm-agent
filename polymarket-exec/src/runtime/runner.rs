@@ -2040,6 +2040,13 @@ async fn execute_execution_adapter(
 
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
+    let mut queued_submit_ids: HashSet<ClientOrderId> = queue
+        .iter()
+        .filter_map(|command| match command {
+            RuntimeCommand::Submit(intent) => Some(intent.client_order_id.clone()),
+            _ => None,
+        })
+        .collect();
     let mut paper_report = paper_report;
     let mut shadow_quote = shadow_quote;
 
@@ -2099,7 +2106,15 @@ async fn execute_execution_adapter(
             }
             match managed.status {
                 ManagedOrderStatus::PendingSubmit => {
-                    queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
+                    if queued_submit_ids.insert(client_order_id.clone()) {
+                        queue.push_back(RuntimeCommand::Submit(managed.intent.clone()));
+                    } else {
+                        debug!(
+                            mode = "live",
+                            client_order_id = %client_order_id,
+                            "pending submit already queued in current execution cycle"
+                        );
+                    }
                 }
                 ManagedOrderStatus::NeedsReconcile => debug!(
                     mode = "live",

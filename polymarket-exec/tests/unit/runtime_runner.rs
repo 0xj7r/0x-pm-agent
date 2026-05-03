@@ -412,6 +412,67 @@ async fn live_execution_ignores_stale_submit_after_order_left_memory() {
 }
 
 #[tokio::test]
+async fn live_execution_does_not_replay_pending_submit_already_in_current_queue() {
+    let client_order_id = ClientOrderId::from("client-fresh-pending");
+    let mut runtime = runtime_with_recovered_order(
+        client_order_id.clone(),
+        ManagedOrderStatus::PendingSubmit,
+        now_unix_ms(),
+        "polymarket-exec-live-pending-replay",
+    );
+    let intent = OrderIntent {
+        client_order_id: client_order_id.clone(),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.40,
+        quantity: 5.0,
+        reduce_only: false,
+        reason: "fresh pending submit".to_string(),
+        quote_level_tag: None,
+        created_at_ms: now_unix_ms(),
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let mut initial_outcome = RuntimeOutcome::default();
+    initial_outcome.push_command(RuntimeCommand::Submit(intent));
+
+    let adapter = Arc::new(RecordingAdapter::default());
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets: Vec<String> = Vec::new();
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map = HashMap::new();
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = live_test_policy();
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        initial_outcome,
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter.clone(),
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("execute");
+
+    assert_eq!(
+        adapter.submitted.lock().expect("submitted lock").as_slice(),
+        &[client_order_id]
+    );
+}
+
+#[tokio::test]
 async fn live_sync_defers_recent_missing_working_order() {
     let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
     let adapter = Arc::new(RecordingAdapter::default());
