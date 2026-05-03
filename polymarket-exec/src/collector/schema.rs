@@ -18,6 +18,10 @@ pub enum Source {
     BinanceAggtrade,
     CoinbaseMatch,
     Collector,
+    /// Emitted by the replay-side `EventSynthesizer` for derived events
+    /// (Phase 3d-a: `price_to_beat` at window-open and `resolution` at
+    /// window-close). Never produced by the live collector path.
+    Synthesizer,
 }
 
 /// Canonical event-type enum. Snake-case matches the schema-contract.
@@ -33,6 +37,14 @@ pub enum EventType {
     MarketMeta,
     Heartbeat,
     Gap,
+    /// Synthesized at the start of a window. Carries the BTC oracle price
+    /// observed at window-open, the strike, and the asserted window
+    /// timing. Phase 3d-a: emitted only by the replay synthesizer.
+    PriceToBeat,
+    /// Synthesized at the close of a window. Carries the resolved winning
+    /// outcome and the oracle price at close. Phase 3d-a: emitted only by
+    /// the replay synthesizer.
+    Resolution,
 }
 
 /// Canonical record. Field order matches the contract for human readability.
@@ -114,6 +126,14 @@ mod tests {
             "\"market_meta\""
         );
         assert_eq!(serde_json::to_string(&EventType::Gap).unwrap(), "\"gap\"");
+        assert_eq!(
+            serde_json::to_string(&EventType::PriceToBeat).unwrap(),
+            "\"price_to_beat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventType::Resolution).unwrap(),
+            "\"resolution\""
+        );
     }
 
     #[test]
@@ -129,6 +149,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Source::Collector).unwrap(),
             "\"collector\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Source::Synthesizer).unwrap(),
+            "\"synthesizer\""
         );
     }
 

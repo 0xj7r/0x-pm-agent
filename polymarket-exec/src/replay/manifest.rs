@@ -22,7 +22,7 @@ pub const SCHEMA_VERSION: u32 = Event::SCHEMA_VERSION;
 /// Internal version of the fill-simulator. Bumped whenever the matching
 /// algorithm changes; participates in the run-id hash so backtest output
 /// is keyed to the simulator that produced it.
-pub const FILL_SIM_VERSION: &str = "phase3c-2026-05-03";
+pub const FILL_SIM_VERSION: &str = "phase3d-2026-05-03";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowPlan {

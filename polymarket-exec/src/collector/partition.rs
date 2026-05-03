@@ -44,6 +44,8 @@ pub fn event_type_str(et: EventType) -> &'static str {
         EventType::MarketMeta => "market_meta",
         EventType::Heartbeat => "heartbeat",
         EventType::Gap => "gap",
+        EventType::PriceToBeat => "price_to_beat",
+        EventType::Resolution => "resolution",
     }
 }
 
@@ -111,12 +113,32 @@ mod tests {
             EventType::MarketMeta,
             EventType::Heartbeat,
             EventType::Gap,
+            EventType::PriceToBeat,
+            EventType::Resolution,
         ];
-        let mut strs = names.iter().map(|et| event_type_str(*et)).collect::<Vec<_>>();
+        let mut strs = names
+            .iter()
+            .map(|et| event_type_str(*et))
+            .collect::<Vec<_>>();
         strs.sort_unstable();
         let len_before = strs.len();
         strs.dedup();
         assert_eq!(strs.len(), len_before);
+    }
+
+    #[test]
+    fn synthesized_event_types_route_to_dedicated_partitions() {
+        let p = make_event(EventType::PriceToBeat, "btc_5m", Some("btc-up-or-down"));
+        let key = partition_for(&p);
+        assert_eq!(key.event_type, "price_to_beat");
+        assert_eq!(key.market_type, "btc_5m");
+        assert_eq!(key.slug.as_deref(), Some("btc-up-or-down"));
+
+        let r = make_event(EventType::Resolution, "btc_5m", Some("btc-up-or-down"));
+        let key = partition_for(&r);
+        assert_eq!(key.event_type, "resolution");
+        assert_eq!(key.market_type, "btc_5m");
+        assert_eq!(key.slug.as_deref(), Some("btc-up-or-down"));
     }
 
     #[test]
