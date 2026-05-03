@@ -1914,17 +1914,68 @@ impl<S: Strategy> Runtime<S> {
         reason: impl Into<String>,
     ) -> RuntimeOutcome {
         let reason = reason.into();
+        let mut preserved_repair_quotes = Vec::new();
         let ids = self
             .open_orders
             .values()
-            .filter(|managed| managed.intent.kind != crate::types::IntentKind::Close)
-            .map(|managed| managed.intent.client_order_id.clone())
+            .filter_map(|managed| {
+                if managed.intent.kind == crate::types::IntentKind::Close {
+                    return None;
+                }
+                if self.entry_quote_repairs_one_sided_inventory(managed) {
+                    preserved_repair_quotes.push((
+                        managed.intent.client_order_id.clone(),
+                        managed.intent.market_id.clone(),
+                        managed.intent.instrument_id.clone(),
+                    ));
+                    return None;
+                }
+                Some(managed.intent.client_order_id.clone())
+            })
             .collect::<Vec<_>>();
         let mut outcome = RuntimeOutcome::default();
+        for (client_order_id, market_id, instrument_id) in preserved_repair_quotes {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "preserved opposite-leg entry quote as one-sided inventory repair",
+                    )
+                    .with_market(market_id)
+                    .with_instrument(instrument_id)
+                    .with_client_order(client_order_id),
+                ),
+            );
+        }
         for client_order_id in ids {
             outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));
         }
         outcome
+    }
+
+    fn entry_quote_repairs_one_sided_inventory(&self, managed: &ManagedOrder) -> bool {
+        if managed.intent.kind != crate::types::IntentKind::Entry
+            || managed.intent.side != crate::types::TradeSide::Buy
+            || managed.intent.reduce_only
+        {
+            return false;
+        }
+
+        let mut actionable_positions = self
+            .inventory
+            .positions()
+            .filter(|position| {
+                position.market_id == managed.intent.market_id
+                    && self.position_is_actionable_inventory(position)
+            })
+            .collect::<Vec<_>>();
+        if actionable_positions.len() != 1 {
+            return false;
+        }
+
+        let heavy_position = actionable_positions.remove(0);
+        heavy_position.instrument_id != managed.intent.instrument_id
     }
 
     pub fn request_cancel_orders_not_in_instruments(
@@ -2447,6 +2498,21 @@ impl<S: Strategy> Runtime<S> {
             );
             return outcome;
         }
+        if is_rescue_intent && self.has_entry_repair_order_in_flight(&intent) {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "close-side intent waiting: opposite-leg entry repair order already in flight",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         if intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !is_rescue_intent
@@ -2815,6 +2881,16 @@ impl<S: Strategy> Runtime<S> {
                 && !managed.status.is_terminal()
                 && (managed.intent.kind == crate::types::IntentKind::Close
                     || managed.intent.reduce_only)
+        })
+    }
+
+    fn has_entry_repair_order_in_flight(&self, intent: &OrderIntent) -> bool {
+        self.open_orders.values().any(|managed| {
+            managed.remaining_qty() > 1e-9
+                && !managed.status.is_terminal()
+                && managed.intent.market_id == intent.market_id
+                && managed.intent.instrument_id == intent.instrument_id
+                && self.entry_quote_repairs_one_sided_inventory(managed)
         })
     }
 
