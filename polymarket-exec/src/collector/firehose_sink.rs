@@ -62,14 +62,28 @@ impl AwsFirehose {
 #[async_trait]
 impl FirehosePutRecordBatch for AwsFirehose {
     async fn put_record_batch(&self, records: Vec<Record>) -> Result<(), String> {
-        self.client
+        let output = self
+            .client
             .put_record_batch()
             .delivery_stream_name(&self.delivery_stream)
             .set_records(Some(records))
             .send()
             .await
-            .map(|_| ())
-            .map_err(|e| format!("{e}"))
+            .map_err(|e| format!("{e}"))?;
+
+        let failed = output.failed_put_count();
+        if failed > 0 {
+            let first_error = output
+                .request_responses()
+                .iter()
+                .find_map(|entry| entry.error_code())
+                .unwrap_or("unknown");
+            return Err(format!(
+                "firehose accepted batch with {failed} failed records; first_error={first_error}"
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -149,6 +163,7 @@ impl FirehoseSink {
                 state.last_flush_at = Instant::now();
                 return;
             }
+            state.buffer_bytes = 0;
             std::mem::take(&mut state.buffer)
         };
         let record_count = drained.len();
@@ -171,20 +186,20 @@ impl FirehoseSink {
         let elapsed = started.elapsed();
 
         let mut state = self.state.lock().await;
-        state.buffer_bytes = 0;
         state.last_flush_at = Instant::now();
         state.last_flush_latency = Some(elapsed);
         match result {
             Ok(()) => {
-                state.events_processed_total =
-                    state.events_processed_total.saturating_add(record_count as u64);
+                state.events_processed_total = state
+                    .events_processed_total
+                    .saturating_add(record_count as u64);
                 debug!(records = record_count, elapsed_ms = %elapsed.as_millis(), "firehose flush ok");
             }
             Err(err) => {
-                state.records_dropped_total =
-                    state.records_dropped_total.saturating_add(record_count as u64);
-                state.firehose_throttle_count =
-                    state.firehose_throttle_count.saturating_add(1);
+                state.records_dropped_total = state
+                    .records_dropped_total
+                    .saturating_add(record_count as u64);
+                state.firehose_throttle_count = state.firehose_throttle_count.saturating_add(1);
                 warn!(
                     error = %err,
                     records_dropped = record_count,

@@ -226,22 +226,42 @@ async fn converter_loop(
     shutdown: CancellationToken,
 ) {
     let mut gap = GapDetector::new();
+    let mut raw_open = true;
+    let mut events_open = true;
     loop {
+        if !raw_open && !events_open {
+            break;
+        }
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            Some(frame) = raw_rx.recv() => {
-                if let Some(event) = raw_frame_to_event(frame) {
-                    if let Some(synthetic) = gap.observe(&event) {
-                        let _ = sink.enqueue(&synthetic).await;
+            frame = raw_rx.recv(), if raw_open => {
+                match frame {
+                    Some(frame) => {
+                        if let Some(event) = raw_frame_to_event(frame) {
+                            if let Some(synthetic) = gap.observe(&event) {
+                                enqueue_event(&sink, &synthetic).await;
+                            }
+                            enqueue_event(&sink, &event).await;
+                        }
                     }
-                    let _ = sink.enqueue(&event).await;
+                    None => raw_open = false,
                 }
             }
-            Some(event) = events_rx.recv() => {
-                let _ = sink.enqueue(&event).await;
+            event = events_rx.recv(), if events_open => {
+                match event {
+                    Some(event) => enqueue_event(&sink, &event).await,
+                    None => events_open = false,
+                }
             }
-            else => break,
         }
+    }
+}
+
+async fn enqueue_event(sink: &FirehoseSink, event: &Event) {
+    match sink.enqueue(event).await {
+        Ok(true) => sink.flush_now().await,
+        Ok(false) => {}
+        Err(error) => warn!(error = ?error, "failed to serialize collector event; dropping"),
     }
 }
 
@@ -513,5 +533,81 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use aws_sdk_firehose::types::Record;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
+
+    struct RecordingFirehose {
+        calls: AtomicUsize,
+        batches: Mutex<Vec<Vec<Record>>>,
+    }
+
+    impl RecordingFirehose {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                batches: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl polymarket_exec::collector::firehose_sink::FirehosePutRecordBatch for RecordingFirehose {
+        async fn put_record_batch(&self, records: Vec<Record>) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.batches.lock().await.push(records);
+            Ok(())
+        }
+    }
+
+    fn event(idx: i64) -> Event {
+        Event {
+            v: 1,
+            ts_ns: idx,
+            received_ns: idx,
+            event_type: EventType::BtcTick,
+            market_type: "_global".into(),
+            market_slug: None,
+            asset_id: None,
+            side: None,
+            price: Some("100000.0".into()),
+            size: Some("0.01".into()),
+            sequence: Some(idx),
+            source: Source::BinanceAggtrade,
+            raw: json!({"idx": idx}),
+        }
+    }
+
+    #[tokio::test]
+    async fn converter_flushes_when_firehose_batch_limit_is_reached() {
+        let backend = RecordingFirehose::new();
+        let sink = Arc::new(FirehoseSink::new(backend.clone()));
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<RawFrame>();
+        let (events_tx, events_rx) = mpsc::unbounded_channel::<Event>();
+
+        for idx in 0..polymarket_exec::collector::firehose_sink::MAX_RECORDS_PER_BATCH {
+            events_tx.send(event(idx as i64)).expect("send event");
+        }
+        drop(raw_tx);
+        drop(events_tx);
+
+        converter_loop(raw_rx, events_rx, sink.clone(), CancellationToken::new()).await;
+
+        let batches = backend.batches.lock().await;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].len(),
+            polymarket_exec::collector::firehose_sink::MAX_RECORDS_PER_BATCH
+        );
+        assert_eq!(sink.snapshot().await.events_buffered, 0);
     }
 }
