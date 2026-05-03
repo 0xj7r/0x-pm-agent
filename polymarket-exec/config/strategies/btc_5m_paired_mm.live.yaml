@@ -9,9 +9,9 @@ strategy: paired_mm
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
   levels_per_side: 6
-  base_clip_usd: 3.00
+  base_clip_usd: 1.50
   min_clip_usd: 0.50
-  max_clip_usd: 10.0
+  max_clip_usd: 6.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
@@ -33,12 +33,12 @@ fair_value:
 
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
-  max_gross_notional_usd: 150.0
-  max_net_notional_per_market_usd: 60.0
-  max_order_notional_usd: 10.0
-  max_stranded_leg_usd: 60.0
-  max_gross_cost_usd: 150.0
-  max_leg_cost_usd: 60.0
+  max_gross_notional_usd: 60.0
+  max_net_notional_per_market_usd: 25.0
+  max_order_notional_usd: 6.0
+  max_stranded_leg_usd: 25.0
+  max_gross_cost_usd: 60.0
+  max_leg_cost_usd: 25.0
 
 # ── Pair / Merge Recycling ─────────────────────────────────────
 # Polygon merge fees are negligible for our setup; keep this low so tiny-live
