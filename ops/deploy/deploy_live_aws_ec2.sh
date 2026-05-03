@@ -8,6 +8,7 @@ REMOTE_USER="${AWS_LIVE_USER:-ubuntu}"
 REMOTE_PORT="${AWS_LIVE_PORT:-22}"
 REMOTE_KEY="${AWS_LIVE_KEY_PATH:-$HOME/.ssh/polymarket_aws_live}"
 REMOTE_RELEASE_ROOT="${AWS_LIVE_RELEASE_ROOT:-/home/$REMOTE_USER/go/polymarket-agent-releases}"
+REMOTE_WORKDIR="${AWS_LIVE_WORKDIR:-/home/$REMOTE_USER/go/polymarket-agent}"
 REMOTE_CARGO_TARGET_DIR="${AWS_LIVE_CARGO_TARGET_DIR:-/home/$REMOTE_USER/.cache/polymarket-agent-cargo-target}"
 AWS_REGION="${AWS_REGION:-eu-west-1}"
 DEPLOY_REF="${AWS_LIVE_REF:-origin/main}"
@@ -71,7 +72,7 @@ log "probing ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
 ssh_base 'hostname && whoami && uname -a'
 
 log "creating remote release root: $REMOTE_RELEASE_ROOT"
-ssh_base "mkdir -p '$REMOTE_RELEASE_ROOT' '$REMOTE_CARGO_TARGET_DIR' \"\$HOME/.local/bin\""
+ssh_base "mkdir -p '$REMOTE_RELEASE_ROOT' '$REMOTE_WORKDIR' '$REMOTE_CARGO_TARGET_DIR' \"\$HOME/.local/bin\""
 
 log "uploading clean source archive"
 rsync_base "$ARCHIVE_PATH" "${REMOTE_USER}@${REMOTE_HOST}:/tmp/polymarket-agent-${DEPLOY_SHORT}.tar"
@@ -84,6 +85,17 @@ ssh_base "
 "
 
 REMOTE_RELEASE_DIR="$REMOTE_RELEASE_ROOT/polymarket-agent-${DEPLOY_SHORT}"
+
+log "syncing clean release source into runtime working directory: $REMOTE_WORKDIR"
+ssh_base "
+  set -euo pipefail
+  command -v rsync >/dev/null
+  rsync -a --delete \
+    --exclude '.git' \
+    --exclude 'data/' \
+    --exclude 'target/' \
+    '$REMOTE_RELEASE_DIR/' '$REMOTE_WORKDIR/'
+"
 
 log "verifying remote toolchain"
 ssh_base "
@@ -146,6 +158,9 @@ Deploy complete.
 
 Remote root:
   $REMOTE_RELEASE_DIR
+
+Runtime working directory:
+  $REMOTE_WORKDIR
 
 Deployed ref:
   $DEPLOY_REF ($DEPLOY_COMMIT)

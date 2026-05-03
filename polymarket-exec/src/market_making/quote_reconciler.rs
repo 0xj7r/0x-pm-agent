@@ -1,6 +1,6 @@
 //! Desired-vs-working quote diff logic that minimizes unnecessary cancel/replace churn.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::runtime::types::{ManagedOrder, ManagedOrderStatus};
 use crate::types::{ClientOrderId, EpochMillis, OrderIntent};
@@ -334,13 +334,34 @@ impl QuoteReconciler {
             value.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         }
 
+        let desired_quotes = desired.quotes;
+        let mut desired_pair_counts: HashMap<String, usize> = HashMap::new();
+        let mut missing_pair_submit_counts: HashMap<String, usize> = HashMap::new();
+        for desired_quote in &desired_quotes {
+            let Some(pair_id) = desired_quote.intent.pair_id.as_ref() else {
+                continue;
+            };
+            if desired_quote.intent.kind != crate::types::IntentKind::Entry {
+                continue;
+            }
+            *desired_pair_counts.entry(pair_id.clone()).or_default() += 1;
+            let key = QuoteMatchKey::from_intent(&desired_quote.intent);
+            if !by_key.contains_key(&key) {
+                *missing_pair_submit_counts
+                    .entry(pair_id.clone())
+                    .or_default() += 1;
+            }
+        }
+        let mut suppressed_pair_submits: HashSet<String> = HashSet::new();
+        let mut pair_submit_budget_checked: HashSet<String> = HashSet::new();
+
         let mut pending_replacements = 0usize;
         let mut planned_churn = 0usize;
         let mut planned_submits = 0usize;
         let mut planned_replaces = 0usize;
         let mut planned_cancels = 0usize;
 
-        for desired_quote in desired.quotes {
+        for desired_quote in desired_quotes {
             let desired_intent = desired_quote.intent;
             let key = QuoteMatchKey::from_intent(&desired_intent);
             // Hedge-rescue IOC orders are CLOSE operations that need to fill
@@ -352,6 +373,37 @@ impl QuoteReconciler {
             let is_rescue = desired_intent.kind == crate::types::IntentKind::Close;
             let mut matches = by_key.remove(&key).unwrap_or_default();
             if matches.is_empty() {
+                if !is_rescue {
+                    if let Some(pair_id) = desired_intent.pair_id.as_ref() {
+                        if suppressed_pair_submits.contains(pair_id) {
+                            continue;
+                        }
+                        let desired_pair_count =
+                            desired_pair_counts.get(pair_id).copied().unwrap_or(1);
+                        if desired_pair_count < 2 {
+                            suppressed_pair_submits.insert(pair_id.clone());
+                            plan.notes.push(format!(
+                                "paired submit suppressed: incomplete desired pair pair_id={pair_id}"
+                            ));
+                            continue;
+                        }
+                        if pair_submit_budget_checked.insert(pair_id.clone()) {
+                            let missing_pair_count = missing_pair_submit_counts
+                                .get(pair_id)
+                                .copied()
+                                .unwrap_or(1);
+                            if missing_pair_count > 1
+                                && !self.can_submit(now_ms, planned_submits + missing_pair_count)
+                            {
+                                suppressed_pair_submits.insert(pair_id.clone());
+                                plan.notes.push(format!(
+                                    "paired submit rate cap reached pair_id={pair_id} missing={missing_pair_count}"
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                }
                 if is_rescue || self.can_submit(now_ms, planned_submits + 1) {
                     plan.actions.push(QuoteAction::Submit(desired_intent));
                     planned_submits += 1;
