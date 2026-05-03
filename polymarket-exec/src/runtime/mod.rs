@@ -2157,20 +2157,40 @@ impl<S: Strategy> Runtime<S> {
                     outcome.push_event(self.event_log.push(EventRecord::new(
                         EventCategory::Strategy,
                         now_ms,
-                        "quote reconciliation skipped: preserving working quotes during close-side strategy reaction",
+                        "close-side strategy reaction: cancelling entry quotes before recycle/rescue",
                     )));
+                    outcome.extend(self.request_cancel_entry_orders(
+                        now_ms,
+                        "close-side strategy reaction",
+                    ));
                 }
                 for intent in intents {
                     outcome.extend(self.accept_intent(intent, now_ms));
                 }
             }
-            StrategyDecision::Suppress { kind, .. } => match kind {
+            StrategyDecision::Suppress {
+                kind,
+                preserve_quotes,
+                ..
+            } => match kind {
                 StrategyDecisionSuppressionKind::SoftPause => {
-                    outcome.push_event(self.event_log.push(EventRecord::new(
-                        EventCategory::Strategy,
-                        now_ms,
-                        "strategy suppression: soft pause requested (preserving open entry quotes)",
-                    )));
+                    if preserve_quotes {
+                        outcome.push_event(self.event_log.push(EventRecord::new(
+                            EventCategory::Strategy,
+                            now_ms,
+                            "strategy suppression: soft pause requested (preserving open entry quotes)",
+                        )));
+                    } else {
+                        outcome.push_event(self.event_log.push(EventRecord::new(
+                            EventCategory::Strategy,
+                            now_ms,
+                            "strategy suppression: soft pause requested (cancelling open entry quotes)",
+                        )));
+                        outcome.extend(self.request_cancel_entry_orders(
+                            now_ms,
+                            "strategy suppression: cancel entry quotes",
+                        ));
+                    }
                 }
                 StrategyDecisionSuppressionKind::HardRiskOff => {
                     outcome.extend(self.riskoff_and_cancel_entry_orders(

@@ -75,6 +75,7 @@ pub enum StrategyDecision {
     },
     Suppress {
         kind: StrategyDecisionSuppressionKind,
+        preserve_quotes: bool,
         notes: Vec<String>,
     },
 }
@@ -103,8 +104,16 @@ impl StrategyDecision {
         Self::Commands { commands, notes }
     }
 
-    pub fn suppress(kind: StrategyDecisionSuppressionKind, notes: Vec<String>) -> Self {
-        Self::Suppress { kind, notes }
+    pub fn suppress(
+        kind: StrategyDecisionSuppressionKind,
+        preserve_quotes: bool,
+        notes: Vec<String>,
+    ) -> Self {
+        Self::Suppress {
+            kind,
+            preserve_quotes,
+            notes,
+        }
     }
 
     pub fn intents(&self) -> &[OrderIntent] {
@@ -417,8 +426,8 @@ impl HybridStrategy {
             crate::types::StrategyDecision::Suppress {
                 scope,
                 reason,
+                preserve_quotes,
                 notes,
-                ..
             } => {
                 let kind = match scope {
                     SuppressionScope::AllActions => StrategyDecisionSuppressionKind::HardRiskOff,
@@ -428,7 +437,7 @@ impl HybridStrategy {
                 };
                 let mut notes = notes;
                 notes.push(format!("strategy suppressed: {reason:?} scope={scope:?}"));
-                StrategyDecision::suppress(kind, notes)
+                StrategyDecision::suppress(kind, preserve_quotes, notes)
             }
             crate::types::StrategyDecision::Noop { notes } => StrategyDecision::Noop { notes },
         }
@@ -441,6 +450,7 @@ impl HybridStrategy {
         let mut commands = Vec::new();
         let mut hard_suppressed = false;
         let mut soft_suppressed = false;
+        let mut soft_preserve_quotes = true;
 
         for decision in decisions {
             match decision {
@@ -470,11 +480,15 @@ impl HybridStrategy {
                 }
                 StrategyDecision::Suppress {
                     kind,
+                    preserve_quotes,
                     notes: decision_notes,
                 } => {
                     match kind {
                         StrategyDecisionSuppressionKind::HardRiskOff => hard_suppressed = true,
-                        StrategyDecisionSuppressionKind::SoftPause => soft_suppressed = true,
+                        StrategyDecisionSuppressionKind::SoftPause => {
+                            soft_suppressed = true;
+                            soft_preserve_quotes &= preserve_quotes;
+                        }
                     }
                     notes.extend(decision_notes);
                 }
@@ -482,7 +496,11 @@ impl HybridStrategy {
         }
 
         if hard_suppressed {
-            return StrategyDecision::suppress(StrategyDecisionSuppressionKind::HardRiskOff, notes);
+            return StrategyDecision::suppress(
+                StrategyDecisionSuppressionKind::HardRiskOff,
+                false,
+                notes,
+            );
         }
         if !commands.is_empty() {
             return StrategyDecision::commands(commands, notes);
@@ -495,7 +513,11 @@ impl HybridStrategy {
             return StrategyDecision::quote_set(quote_intents, notes);
         }
         if soft_suppressed {
-            return StrategyDecision::suppress(StrategyDecisionSuppressionKind::SoftPause, notes);
+            return StrategyDecision::suppress(
+                StrategyDecisionSuppressionKind::SoftPause,
+                soft_preserve_quotes,
+                notes,
+            );
         }
         StrategyDecision::Noop { notes }
     }
