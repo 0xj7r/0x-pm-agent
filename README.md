@@ -22,29 +22,29 @@ paper-mode simulation or unsigned/raw HTTP as tiny-live ready.
 
 ## Key env vars
 
-- `WHALE_PAIR_ASSET_IDS`
-- `WHALE_PAIR_INSTRUMENT_MARKETS` as `asset_id:market_id[,asset_id:market_id...]`
-- `WHALE_PAIR_EXEC_STARTING_CASH_USD`
-- `WHALE_PAIR_EXEC_EVENT_LOG_CAPACITY`
-- `WHALE_PAIR_EXEC_MAX_ORDER_NOTIONAL_USD`
-- `WHALE_PAIR_EXEC_MAX_GROSS_NOTIONAL_USD`
-- `WHALE_PAIR_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD`
-- `WHALE_PAIR_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT`
-- `WHALE_PAIR_EXEC_MIN_FREE_CASH_USD`
-- `WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_TOTAL`
-- `WHALE_PAIR_EXEC_MAX_OPEN_ORDERS_PER_MARKET`
-- `WHALE_PAIR_PAPER_MODE` (`true|false`, default `true`)
-- `WHALE_PAIR_INSTRUMENT_MARKETS` as `asset_id:market_id[,asset_id:market_id...]`
-- `WHALE_PAIR_ACCUMULATE_PRICE_MAX`
-- `WHALE_PAIR_AGGRESSIVE_PRICE_MAX`
-- `WHALE_PAIR_BASE_CLIP_USD`
-- `WHALE_PAIR_AGGRESSIVE_CLIP_USD`
-- `WHALE_PAIR_MAX_GROSS_COST_USD`
-- `WHALE_PAIR_COMPLETION_MIN_PNL_PER_SHARE`
-- `WHALE_PAIR_MAX_IMBALANCE_RATIO`
-- `WHALE_PAIR_TAKER_FEE_COEFF`
+- `PM_BTC_5M_ASSET_IDS`
+- `PM_BTC_5M_INSTRUMENT_MARKETS` as `asset_id:market_id[,asset_id:market_id...]`
+- `PM_BTC_5M_EXEC_STARTING_CASH_USD`
+- `PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY`
+- `PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD`
+- `PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD`
+- `PM_BTC_5M_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD`
+- `PM_BTC_5M_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT`
+- `PM_BTC_5M_EXEC_MIN_FREE_CASH_USD`
+- `PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL`
+- `PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET`
+- `PM_BTC_5M_PAPER_MODE` (`true|false`, default `true`)
+- `PM_BTC_5M_INSTRUMENT_MARKETS` as `asset_id:market_id[,asset_id:market_id...]`
+- `PM_BTC_5M_ACCUMULATE_PRICE_MAX`
+- `PM_BTC_5M_AGGRESSIVE_PRICE_MAX`
+- `PM_BTC_5M_BASE_CLIP_USD`
+- `PM_BTC_5M_AGGRESSIVE_CLIP_USD`
+- `PM_BTC_5M_MAX_GROSS_COST_USD`
+- `PM_BTC_5M_COMPLETION_MIN_PNL_PER_SHARE`
+- `PM_BTC_5M_MAX_IMBALANCE_RATIO`
+- `PM_BTC_5M_TAKER_FEE_COEFF`
 
-If `WHALE_PAIR_INSTRUMENT_MARKETS` is omitted, the runtime falls back to treating each asset id as its own market id. That is coherent for compile/test purposes but not sufficient for real paired execution.
+If `PM_BTC_5M_INSTRUMENT_MARKETS` is omitted, the runtime falls back to treating each asset id as its own market id. That is coherent for compile/test purposes but not sufficient for real paired execution.
 
 ## Main remaining runtime gaps
 

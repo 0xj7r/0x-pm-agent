@@ -5,8 +5,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde_json::Value;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -15,27 +13,37 @@ use tracing::{debug, info, warn};
 
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
-use crate::event_log::EventLog;
 use crate::inventory::VenuePositionSnapshot;
 use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::quote_reconciler::ReconcilerConfig;
-use crate::risk::RiskLimits;
+use crate::runtime::attribution::persist_runtime_outcome;
 use crate::runtime::audit::AuditWriter;
+use crate::runtime::dashboard::refresh_dashboard_state;
+use crate::runtime::execution_policy::{ExecutionPolicy, ExecutionSyncReport, LiveSafetyState};
 use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
+#[cfg(test)]
+use crate::runtime::live_health::portfolio_equity_floor_usd;
+use crate::runtime::live_health::{
+    auto_recover_live_riskoff, enforce_capital_guard, enforce_live_health,
+    needs_reconcile_order_count,
+};
+use crate::runtime::market_universe::{
+    fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
+};
 use crate::runtime::order_store::SqliteOrderStore;
+use crate::runtime::paper_fill::{
+    deterministic_hash_0_95, paper_fill_from_book_snapshot, paper_post_only_should_reject,
+};
 use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use crate::strategy::{Btc5mMmStrategy, Strategy, StrategyMode, VenueMarketRules};
+use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{
-    serve_http, DashboardBook, DashboardEvent, DashboardOrder, DashboardPosition,
-    DashboardSnapshot, DashboardUiState,
-};
+use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
@@ -45,125 +53,17 @@ use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
-const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
+const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 
-#[derive(Debug, Clone)]
-struct RuntimeMarketUniverse {
-    market_assets: Vec<String>,
-    user_markets: Vec<String>,
-    market_id_by_asset: HashMap<String, String>,
-}
-
-impl RuntimeMarketUniverse {
-    fn from_config_and_context(config: &AppConfig, contexts: &MarketContextStore) -> Self {
-        let context_assets = contexts.asset_ids();
-        let context_markets = contexts.market_ids();
-        let context_map = contexts.asset_market_map();
-        Self {
-            market_assets: if context_assets.is_empty() {
-                config.market_assets.clone()
-            } else {
-                context_assets
-            },
-            user_markets: if context_markets.is_empty() {
-                config.user_markets.clone()
-            } else {
-                context_markets
-            },
-            market_id_by_asset: if context_map.is_empty() {
-                config.market_id_by_asset.clone()
-            } else {
-                context_map
-            },
-        }
-    }
-
-    fn market_id_for_asset(&self, config: &AppConfig, asset_id: &str) -> String {
-        self.market_id_by_asset
-            .get(asset_id)
-            .cloned()
-            .or_else(|| config.market_id_by_asset.get(asset_id).cloned())
-            .unwrap_or_else(|| asset_id.to_string())
-    }
-}
-
-#[derive(Debug, Default)]
-struct LiveSafetyState {
-    consecutive_submit_errors: usize,
-    consecutive_cancel_errors: usize,
-    consecutive_reconcile_mismatches: usize,
-    last_venue_cash_usd: Option<f64>,
-    last_venue_position_count: usize,
-    last_venue_balance_observed_at_ms: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-struct ExecutionSyncReport {
-    open_order_count: usize,
-    balance_synced: bool,
-    venue_cash_usd: Option<f64>,
-    venue_position_count: usize,
-    venue_positions_authoritative: bool,
-    venue_balance_observed_at_ms: Option<u64>,
-    venue_fills: Vec<VenueFill>,
-    venue_positions: Vec<VenuePosition>,
-    errors: usize,
-    missing_local_orders: Vec<ClientOrderId>,
-    pending_missing_local_orders: Vec<ClientOrderId>,
-}
-
-#[derive(Debug, Clone)]
-struct ExecutionPolicy {
-    paper_mode: bool,
-    live_post_only: bool,
-    live_order_ttl_ms: u64,
-    live_order_max_age_ms: u64,
-    live_reconcile_missing_grace_ms: u64,
-    live_max_submit_errors: usize,
-    live_max_cancel_errors: usize,
-    live_kill_on_reconcile_mismatch: bool,
-    paper_min_fill_notional_usd: f64,
-    paper_max_fills_per_order: usize,
-    paper_min_fill_interval_ms: u64,
-    paper_market_close_at_ms: Option<u64>,
-    paper_market_resolution_price: Option<f64>,
-    paper_submit_latency_ms: u64,
-    paper_queue_depth_fraction: f64,
-    paper_post_only_reject_probability: f64,
-    paper_cancel_race_window_ms: u64,
-    paper_maker_rebate_coeff: f64,
-    paper_taker_fee_coeff_override: Option<f64>,
-}
-
-impl ExecutionPolicy {
-    fn from_config(config: &AppConfig) -> Self {
-        Self {
-            paper_mode: config.paper_mode,
-            live_post_only: config.live_post_only,
-            live_order_ttl_ms: config.live_order_ttl.as_millis() as u64,
-            live_order_max_age_ms: config.live_order_max_age.as_millis() as u64,
-            live_reconcile_missing_grace_ms: config.live_reconcile_missing_grace.as_millis() as u64,
-            live_max_submit_errors: config.live_max_submit_errors,
-            live_max_cancel_errors: config.live_max_cancel_errors,
-            live_kill_on_reconcile_mismatch: config.live_kill_on_reconcile_mismatch,
-            paper_min_fill_notional_usd: config.paper_min_fill_notional_usd,
-            paper_max_fills_per_order: config.paper_max_fills_per_order,
-            paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
-            paper_market_close_at_ms: config.paper_market_close_at_ms,
-            paper_market_resolution_price: config.paper_market_resolution_price,
-            paper_submit_latency_ms: config.paper_submit_latency_ms,
-            paper_queue_depth_fraction: config.paper_queue_depth_fraction,
-            paper_post_only_reject_probability: config.paper_post_only_reject_probability,
-            paper_cancel_race_window_ms: config.paper_cancel_race_window_ms,
-            paper_maker_rebate_coeff: config.paper_maker_rebate_coeff,
-            paper_taker_fee_coeff_override: config.paper_taker_fee_coeff_override,
-        }
-    }
+fn runtime_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 pub async fn run() -> Result<()> {
     let mut config = AppConfig::from_env()?;
-    match std::env::var("WHALE_PAIR_EXEC_MODE")
+    match runtime_env("PM_BTC_5M_EXEC_MODE")
         .unwrap_or_default()
         .as_str()
     {
@@ -188,8 +88,8 @@ pub async fn run() -> Result<()> {
 /// replay clock, and writes a `PaperReportSummary` JSON.
 ///
 /// Inputs:
-/// - `WHALE_PAIR_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
-/// - `WHALE_PAIR_PAPER_REPORT_PATH`: optional. Where to write the
+/// - `PM_BTC_5M_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
+/// - `PM_BTC_5M_PAPER_REPORT_PATH`: optional. Where to write the
 ///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
 ///
 /// This is the foundation for A/B parameter calibration: change a paper
@@ -197,12 +97,10 @@ pub async fn run() -> Result<()> {
 /// replay against the same recorded log, and compare two report cards.
 async fn run_replay_cli(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
-    let input_path = std::env::var("WHALE_PAIR_REPLAY_INPUT_PATH")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+    let input_path = runtime_env("PM_BTC_5M_REPLAY_INPUT_PATH")
         .map(std::path::PathBuf::from)
         .ok_or_else(|| {
-            anyhow::anyhow!("WHALE_PAIR_EXEC_MODE=replay requires WHALE_PAIR_REPLAY_INPUT_PATH")
+            anyhow::anyhow!("PM_BTC_5M_EXEC_MODE=replay requires PM_BTC_5M_REPLAY_INPUT_PATH")
         })?;
     let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
         let mut p = input_path.clone();
@@ -220,169 +118,13 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
         starting_cash_usd = config.starting_cash_usd,
         "replay mode engaged (strategy-driven)"
     );
-    let records = crate::paper::replay::read_snapshot_log(&input_path)?;
-    let started_at_ms = records.first().map(|r| r.t).unwrap_or_else(now_unix_ms);
-
-    // Build runtime with the same shape as live, but no order_store /
-    // journal / live adapter. Replay is in-memory only.
-    let strategy = crate::strategy::StrategyMode::from_name(
-        &config.strategy_name,
-        config.strategy_profile.as_ref(),
-    );
-    // Capture fee coefficient before strategy is moved into Runtime so
-    // replay's paper_fill_from_book_snapshot calls model fees correctly.
-    // Bug fix: was passing 0.0, which made every replay-mode taker fill
-    // appear fee-free and inflated reported P&L.
-    let replay_taker_fee_coeff = strategy.taker_fee_coeff();
-    let mut runtime = Runtime::new(
-        crate::runtime::types::RuntimeConfig {
-            starting_cash_usd: config.starting_cash_usd,
-            event_log_capacity: config.event_log_capacity,
-            initial_status: RuntimeStatus::Running,
-            quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
-            quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
-            require_initial_reconcile_before_entry: false,
-        },
-        config.risk_limits.clone(),
-        strategy,
-        MarketContextStore::empty(),
-    );
-
-    let execution_policy = ExecutionPolicy::from_config(&config);
-    let mut paper_order_ctx: HashMap<ClientOrderId, PaperOrderContext> = HashMap::new();
-    let mut report = crate::paper::report::PaperReportWriter::new(
-        format!("replay-{}", now_unix_ms()),
-        "replay",
-        output_path.clone(),
-        started_at_ms,
-    );
-
-    let mut submits = 0usize;
-    let mut fills = 0usize;
-    let mut rejects = 0usize;
-    let mut cancels = 0usize;
-
-    for record in records.iter() {
-        let asset = record.asset.clone();
-        let book = crate::paper::replay::ReplayBookRecord {
-            t: record.t,
-            asset: record.asset.clone(),
-            bids: record.bids.clone(),
-            asks: record.asks.clone(),
-            last_trade: record.last_trade,
-        }
-        .into_book_state();
-        // Retry-fill loop: attempt fills against this book on any existing
-        // open order in the same instrument that hasn't filled yet.
-        // Mirrors the production retry loop in execute_execution_adapter.
-        let asset_instrument = InstrumentId::from(asset.as_str());
-        let retry_targets: Vec<crate::runtime::types::ManagedOrder> = runtime
-            .open_order_snapshots()
-            .into_iter()
-            .filter(|m| m.intent.instrument_id == asset_instrument && m.remaining_qty() > 1e-9)
-            .collect();
-        for managed in retry_targets {
-            let intent = managed.intent.clone();
-            let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
-                Some((book.best_bid + book.best_ask) * 0.5)
-            } else {
-                None
-            };
-            let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
-            if let Some(fill) = paper_fill_from_book_snapshot(
-                &book,
-                &intent,
-                record.t,
-                replay_taker_fee_coeff,
-                ctx,
-                managed.remaining_qty(),
-                &execution_policy,
-            ) {
-                report.record_fill(&fill, mid_at_submit);
-                fills += 1;
-                runtime.on_fill(fill)?;
-            }
-        }
-        let market_id = MarketId::from(config.market_id_for_asset(&asset));
-        let instrument_id = InstrumentId::from(asset.as_str());
-
-        let outcome = runtime.on_book_state(market_id.clone(), instrument_id.clone(), &book)?;
-        for command in outcome.commands {
-            match command {
-                RuntimeCommand::Submit(intent) => {
-                    submits += 1;
-                    if paper_post_only_should_reject(&intent, &book, &execution_policy) {
-                        report.record_reject(
-                            &intent.client_order_id,
-                            &intent.market_id,
-                            &intent.instrument_id,
-                            intent.limit_price,
-                            "post-only-cross-paper",
-                            record.t,
-                        );
-                        rejects += 1;
-                        runtime.on_order_rejected(
-                            &intent.client_order_id,
-                            "post-only-cross-paper",
-                            record.t,
-                        );
-                        continue;
-                    }
-                    let mid_at_submit = if book.best_bid > 0.0 && book.best_ask > 0.0 {
-                        Some((book.best_bid + book.best_ask) * 0.5)
-                    } else {
-                        None
-                    };
-                    if let Some(mid) = mid_at_submit {
-                        report.record_submit_edge(
-                            intent.side,
-                            intent.limit_price,
-                            intent.quantity,
-                            mid,
-                            record.t,
-                        );
-                    }
-                    let ctx = paper_order_context_mut(&mut paper_order_ctx, &intent, record.t);
-                    if let Some(fill) = paper_fill_from_book_snapshot(
-                        &book,
-                        &intent,
-                        record.t,
-                        replay_taker_fee_coeff,
-                        ctx,
-                        intent.quantity,
-                        &execution_policy,
-                    ) {
-                        report.record_fill(&fill, mid_at_submit);
-                        fills += 1;
-                        runtime.on_fill(fill)?;
-                    } else {
-                        runtime.on_order_opened(&intent.client_order_id, record.t);
-                    }
-                }
-                RuntimeCommand::Cancel {
-                    client_order_id,
-                    reason,
-                } => {
-                    cancels += 1;
-                    paper_order_ctx.remove(&client_order_id);
-                    runtime.on_order_cancelled(&client_order_id, reason, record.t);
-                }
-                RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
-                    // Replay does not exercise relayer/redeem in-process;
-                    // treated as no-ops. Production runs handle these via
-                    // execute_execution_adapter.
-                }
-            }
-        }
-    }
-    report.flush()?;
+    let outcome =
+        crate::paper::replay::replay_runtime_from_snapshots(&config, &input_path, &output_path)
+            .await?;
     info!(
         target: "replay.complete",
-        records_consumed = records.len(),
-        submits,
-        fills,
-        rejects,
-        cancels,
+        records_consumed = outcome.records_consumed,
+        assets_seen = outcome.assets_seen,
         report = %output_path.display(),
         "replay finished"
     );
@@ -396,7 +138,7 @@ async fn run_replay_cli(config: AppConfig) -> Result<()> {
 /// behavior against the real book without exposing capital.
 ///
 /// Per the design doc, the safety contract is: paper_mode is forced true
-/// at this entry point regardless of WHALE_PAIR_PAPER_MODE — even if the
+/// at this entry point regardless of PM_BTC_5M_PAPER_MODE — even if the
 /// operator misconfigures the env, no live order can leave the engine.
 async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
     if !config.paper_mode {
@@ -423,12 +165,11 @@ async fn run_shadow_live(mut config: AppConfig) -> Result<()> {
 async fn run_live_reconcile(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live reconcile mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live reconcile mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     let adapter = connect_live_adapter(&config).await?;
     let now_ms = now_unix_ms();
-    let after_ms = std::env::var("WHALE_PAIR_LIVE_RECONCILE_AFTER_MS")
-        .ok()
+    let after_ms = runtime_env("PM_BTC_5M_LIVE_RECONCILE_AFTER_MS")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_else(|| now_ms.saturating_sub(60 * 60 * 1_000));
 
@@ -517,7 +258,7 @@ async fn run_live_reconcile(config: AppConfig) -> Result<()> {
 async fn run_live_smoke(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live smoke mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live smoke mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     if config
         .live_kill_switch_path
@@ -528,35 +269,29 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
     }
     let adapter = connect_live_adapter(&config).await?;
 
-    let asset_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_ASSET_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let asset_id = runtime_env("PM_BTC_5M_LIVE_SMOKE_ASSET_ID")
         .or_else(|| config.market_assets.first().cloned())
         .ok_or_else(|| anyhow::anyhow!("live smoke mode requires an asset id"))?;
-    let market_id = std::env::var("WHALE_PAIR_LIVE_SMOKE_MARKET_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let market_id = runtime_env("PM_BTC_5M_LIVE_SMOKE_MARKET_ID")
         .unwrap_or_else(|| config.market_id_for_asset(&asset_id));
-    let price = std::env::var("WHALE_PAIR_LIVE_SMOKE_PRICE")
-        .ok()
+    let price = runtime_env("PM_BTC_5M_LIVE_SMOKE_PRICE")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(0.01);
-    let notional = std::env::var("WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD")
-        .ok()
+    let notional = runtime_env("PM_BTC_5M_LIVE_SMOKE_NOTIONAL_USD")
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(1.0);
     if price <= 0.0 || notional <= 0.0 {
         anyhow::bail!("live smoke price and notional must be positive");
     }
-    let time_in_force = match std::env::var("WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE")
-        .unwrap_or_else(|_| "GTD".to_string())
+    let time_in_force = match runtime_env("PM_BTC_5M_LIVE_SMOKE_TIME_IN_FORCE")
+        .unwrap_or_else(|| "GTD".to_string())
         .trim()
         .to_ascii_uppercase()
         .as_str()
     {
         "GTC" => TimeInForce::Gtc,
         "GTD" => TimeInForce::Gtd,
-        other => anyhow::bail!("unsupported WHALE_PAIR_LIVE_SMOKE_TIME_IN_FORCE={other}"),
+        other => anyhow::bail!("unsupported PM_BTC_5M_LIVE_SMOKE_TIME_IN_FORCE={other}"),
     };
     let now_ms = now_unix_ms();
     let ttl_ms = config.live_order_ttl.as_millis().max(5_000) as u64;
@@ -638,14 +373,11 @@ async fn run_live_smoke(config: AppConfig) -> Result<()> {
 async fn run_live_cancel(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live cancel mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live cancel mode requires PM_BTC_5M_PAPER_MODE=false");
     }
-    let raw_order_ids = std::env::var("WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("live cancel mode requires WHALE_PAIR_LIVE_CANCEL_ORDER_IDS")
-        })?;
+    let raw_order_ids = runtime_env("PM_BTC_5M_LIVE_CANCEL_ORDER_IDS").ok_or_else(|| {
+        anyhow::anyhow!("live cancel mode requires PM_BTC_5M_LIVE_CANCEL_ORDER_IDS")
+    })?;
     let order_ids = raw_order_ids
         .split(',')
         .map(str::trim)
@@ -697,12 +429,12 @@ async fn run_live_cancel(config: AppConfig) -> Result<()> {
 /// `condition_id` through the relayer. Recovers stranded collateral
 /// from expired positions that would otherwise tie up capital.
 ///
-/// Honors `WHALE_PAIR_LIVE_REDEEM_DRY_RUN=true` to log the planned
+/// Honors `PM_BTC_5M_LIVE_REDEEM_DRY_RUN=true` to log the planned
 /// redemptions without submitting (useful before risking gas).
 async fn run_live_redeem(config: AppConfig) -> Result<()> {
     crate::logging::init(&config)?;
     if config.paper_mode {
-        anyhow::bail!("live redeem mode requires WHALE_PAIR_PAPER_MODE=false");
+        anyhow::bail!("live redeem mode requires PM_BTC_5M_PAPER_MODE=false");
     }
     if config
         .live_kill_switch_path
@@ -711,7 +443,7 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
     {
         anyhow::bail!("live redeem blocked by active kill switch");
     }
-    let dry_run = std::env::var("WHALE_PAIR_LIVE_REDEEM_DRY_RUN")
+    let dry_run = runtime_env("PM_BTC_5M_LIVE_REDEEM_DRY_RUN")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -719,11 +451,9 @@ async fn run_live_redeem(config: AppConfig) -> Result<()> {
             )
         })
         .unwrap_or(false);
-    let redeem_collateral_token_address =
-        std::env::var("POLYMARKET_REDEEM_COLLATERAL_TOKEN_ADDRESS")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+    let redeem_collateral_token_address = runtime_env("POLYMARKET_REDEEM_COLLATERAL_TOKEN_ADDRESS")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
 
     let adapter = connect_live_adapter(&config).await?;
     let balances = adapter.sync_balances().await?;
@@ -881,7 +611,9 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let (market_assets_tx, market_assets_rx) =
         watch::channel(initial_universe.market_assets.clone());
     let (user_markets_tx, user_markets_rx) = watch::channel(initial_universe.user_markets.clone());
-    let strategy = StrategyMode::from_name(&config.strategy_name, config.strategy_profile.as_ref());
+    let strategy =
+        StrategyMode::try_from_name(&config.strategy_name, config.strategy_profile.as_ref())
+            .map_err(anyhow::Error::msg)?;
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();
@@ -962,6 +694,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .book_snapshot_log_path
         .as_deref()
         .map(crate::paper::snapshot::BookSnapshotWriter::open)
+        .transpose()?;
+    let mut shadow_quote: Option<crate::paper::shadow_quote::ShadowQuoteWriter> = config
+        .shadow_quote_log_path
+        .as_deref()
+        .map(|path| {
+            crate::paper::shadow_quote::ShadowQuoteWriter::open(
+                path,
+                config.book_snapshot_max_levels,
+            )
+        })
         .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
@@ -1079,6 +821,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut audit,
         &mut paper_report,
         &mut book_snapshot,
+        &mut shadow_quote,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -1153,6 +896,22 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 output = %snap.path().display(),
                 bytes_written = snap.bytes_written(),
                 "book snapshot log flushed"
+            );
+        }
+    }
+    if let Some(shadow) = shadow_quote.as_mut() {
+        if let Err(error) = shadow.flush() {
+            warn!(
+                target: "shadow_quote.flush",
+                output = %shadow.path().display(),
+                error = %error,
+                "failed to flush shadow quote log on shutdown"
+            );
+        } else {
+            info!(
+                target: "shadow_quote.flush",
+                output = %shadow.path().display(),
+                "shadow quote log flushed"
             );
         }
     }
@@ -1343,6 +1102,7 @@ async fn run_runtime_loop(
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
+    shadow_quote: &mut Option<crate::paper::shadow_quote::ShadowQuoteWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -1375,17 +1135,15 @@ async fn run_runtime_loop(
     // Auto-redeem worker — periodic sweep that scans venue positions
     // for resolved markets and submits CTF redeems via the relayer.
     // Default interval 60s; disabled in paper mode (no real positions
-    // to redeem). Operator can disable via WHALE_PAIR_LIVE_AUTO_REDEEM=false
+    // to redeem). Operator can disable via PM_BTC_5M_LIVE_AUTO_REDEEM=false
     // (default true so live deployments don't accumulate stranded
     // collateral). 60s is well above the 5-min market cycle so we
     // never spam the relayer.
     let auto_redeem_enabled = !config.paper_mode
-        && std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM")
-            .ok()
+        && runtime_env("PM_BTC_5M_LIVE_AUTO_REDEEM")
             .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
             .unwrap_or(true);
-    let auto_redeem_period = std::env::var("WHALE_PAIR_LIVE_AUTO_REDEEM_PERIOD_SEC")
-        .ok()
+    let auto_redeem_period = runtime_env("PM_BTC_5M_LIVE_AUTO_REDEEM_PERIOD_SEC")
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(60);
     let mut auto_redeem_ticks = interval(std::time::Duration::from_secs(auto_redeem_period));
@@ -1487,6 +1245,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1555,6 +1314,7 @@ async fn run_runtime_loop(
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
                                 paper_report.as_mut(),
+                                shadow_quote.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1603,6 +1363,7 @@ async fn run_runtime_loop(
                         execution_policy,
                         &mut seen_venue_fill_keys,
                         paper_report.as_mut(),
+                        shadow_quote.as_mut(),
                     )
                     .await?;
                     persist_runtime_outcome(
@@ -1639,6 +1400,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1676,6 +1438,7 @@ async fn run_runtime_loop(
                             execution_policy,
                             &mut seen_venue_fill_keys,
                             paper_report.as_mut(),
+                            shadow_quote.as_mut(),
                         )
                         .await?;
                         persist_runtime_outcome(
@@ -1747,6 +1510,7 @@ async fn run_runtime_loop(
                                 execution_policy,
                                 &mut seen_venue_fill_keys,
                                 paper_report.as_mut(),
+                                shadow_quote.as_mut(),
                             )
                             .await?;
                             persist_runtime_outcome(
@@ -1962,580 +1726,6 @@ async fn run_runtime_loop(
     }
 }
 
-async fn refresh_runtime_market_universe(
-    config: &AppConfig,
-    runtime: &mut Runtime<StrategyMode>,
-    market_universe: &Arc<RwLock<RuntimeMarketUniverse>>,
-    market_assets_tx: &watch::Sender<Vec<String>>,
-    user_markets_tx: &watch::Sender<Vec<String>>,
-    now_ms: u64,
-) -> Result<Option<RuntimeOutcome>> {
-    let contexts = fetch_btc_5m_market_contexts(config, now_ms).await?;
-    if contexts.len() == 0 {
-        anyhow::bail!("market discovery returned no BTC 5m markets");
-    }
-    let next = RuntimeMarketUniverse::from_config_and_context(config, &contexts);
-    if next.market_assets.is_empty() {
-        anyhow::bail!("market discovery returned no token ids");
-    }
-
-    let mut guard = market_universe.write().await;
-    let changed = guard.market_assets != next.market_assets
-        || guard.user_markets != next.user_markets
-        || guard.market_id_by_asset != next.market_id_by_asset;
-    if !changed {
-        return Ok(None);
-    }
-
-    let active_instruments = next
-        .market_assets
-        .iter()
-        .map(|asset| InstrumentId::from(asset.as_str()))
-        .collect::<HashSet<_>>();
-    let mut outcome = runtime.replace_market_contexts(contexts, now_ms, "gamma market discovery");
-    outcome.extend(runtime.request_cancel_orders_not_in_instruments(
-        &active_instruments,
-        now_ms,
-        "market universe rolled; cancel stale-market quote",
-    ));
-
-    *guard = next.clone();
-    let _ = market_assets_tx.send(next.market_assets.clone());
-    let _ = user_markets_tx.send(next.user_markets.clone());
-    info!(
-        target: "market_discovery",
-        asset_count = next.market_assets.len(),
-        market_count = next.user_markets.len(),
-        markets = ?next.user_markets,
-        "runtime market universe refreshed"
-    );
-    Ok(Some(outcome))
-}
-
-async fn fetch_btc_5m_market_contexts(
-    config: &AppConfig,
-    now_ms: u64,
-) -> Result<MarketContextStore> {
-    let records = fetch_btc_5m_gamma_records(config, now_ms).await?;
-    let selected = select_runtime_market_records(
-        records,
-        now_ms,
-        config.market_discovery_include_prev,
-        config.market_discovery_include_next,
-    );
-    Ok(MarketContextStore::from_records(
-        selected,
-        Some("gamma-api:engine-discovery".to_string()),
-        Some(now_ms),
-    ))
-}
-
-async fn fetch_btc_5m_gamma_records(
-    config: &AppConfig,
-    now_ms: u64,
-) -> Result<Vec<crate::market_context::MarketContextRecord>> {
-    let client = reqwest::Client::new();
-    let mut records = Vec::new();
-    if config.market_discovery_families.is_empty() {
-        let window_ms = config.market_discovery_window.as_millis().max(1) as u64;
-        sweep_family_into(
-            &client,
-            &config.market_discovery_gamma_url,
-            &config.market_discovery_slug_prefix,
-            window_ms,
-            config.market_discovery_include_prev,
-            config.market_discovery_include_next,
-            now_ms,
-            &mut records,
-        )
-        .await?;
-    } else {
-        for family in &config.market_discovery_families {
-            let window_ms = family.window.as_millis().max(1) as u64;
-            sweep_family_into(
-                &client,
-                &config.market_discovery_gamma_url,
-                &family.prefix,
-                window_ms,
-                config.market_discovery_include_prev,
-                config.market_discovery_include_next,
-                now_ms,
-                &mut records,
-            )
-            .await?;
-        }
-    }
-    records.sort_by_key(|record| {
-        (
-            record.event_start_time_ms.unwrap_or_default(),
-            record.event_end_time_ms.unwrap_or_default(),
-            record.market_id.clone(),
-        )
-    });
-    records.dedup_by(|left, right| left.market_id == right.market_id);
-    Ok(records)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn sweep_family_into(
-    client: &reqwest::Client,
-    gamma_url: &str,
-    slug_prefix: &str,
-    window_ms: u64,
-    include_prev: usize,
-    include_next: usize,
-    now_ms: u64,
-    out: &mut Vec<crate::market_context::MarketContextRecord>,
-) -> Result<()> {
-    let current_start_ms = now_ms - (now_ms % window_ms);
-    let start_offset = -(include_prev as i64);
-    let end_offset = include_next as i64;
-    for offset in start_offset..=end_offset {
-        let start_ms = if offset < 0 {
-            current_start_ms.saturating_sub((-offset as u64) * window_ms)
-        } else {
-            current_start_ms.saturating_add((offset as u64) * window_ms)
-        };
-        let slug = format!("{slug_prefix}{}", start_ms / 1_000);
-        let payload = client
-            .get(gamma_url)
-            .query(&[("slug", slug.as_str())])
-            .header("User-Agent", "polymarket-agent/1.0")
-            .header("Accept", "application/json")
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?;
-        let Some(items) = payload.as_array() else {
-            continue;
-        };
-        for item in items {
-            if let Some(record) = parse_gamma_market_record(item, slug_prefix, window_ms) {
-                out.push(record);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn select_runtime_market_records(
-    records: Vec<crate::market_context::MarketContextRecord>,
-    now_ms: u64,
-    include_prev: usize,
-    include_next: usize,
-) -> Vec<crate::market_context::MarketContextRecord> {
-    let mut previous = records
-        .iter()
-        .filter(|record| record.event_end_time_ms.is_some_and(|end| end < now_ms))
-        .cloned()
-        .collect::<Vec<_>>();
-    let active = records
-        .iter()
-        .filter(|record| record.is_active_btc_5m_window(now_ms))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut upcoming = records
-        .into_iter()
-        .filter(|record| {
-            record
-                .event_start_time_ms
-                .is_some_and(|start| start > now_ms)
-        })
-        .collect::<Vec<_>>();
-    previous.sort_by_key(|record| std::cmp::Reverse(record.event_end_time_ms.unwrap_or_default()));
-    upcoming.sort_by_key(|record| record.event_start_time_ms.unwrap_or_default());
-
-    let mut selected = previous.into_iter().take(include_prev).collect::<Vec<_>>();
-    selected.reverse();
-    selected.extend(active);
-    selected.extend(upcoming.into_iter().take(include_next));
-    selected
-}
-
-fn parse_gamma_market_record(
-    value: &Value,
-    slug_prefix: &str,
-    window_ms: u64,
-) -> Option<crate::market_context::MarketContextRecord> {
-    let slug = value.get("slug")?.as_str()?.trim();
-    if !slug.starts_with(slug_prefix) {
-        return None;
-    }
-    let market_id = value
-        .get("id")
-        .or_else(|| value.get("market_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    let instrument_ids = parse_gamma_token_ids(
-        value
-            .get("clobTokenIds")
-            .or_else(|| value.get("clobTokenIdsJson"))
-            .or_else(|| value.get("token_ids_json"))
-            .or_else(|| value.get("tokenIds")),
-    );
-    if instrument_ids.len() < 2 {
-        return None;
-    }
-    let start_ms = parse_gamma_time_ms(
-        value
-            .get("event_start_time")
-            .or_else(|| value.get("eventStartTime"))
-            .or_else(|| value.get("startTime"))
-            .or_else(|| value.get("startDate"))
-            .or_else(|| value.get("start_date")),
-    )
-    .or_else(|| parse_start_ms_from_btc_slug(slug));
-    let end_ms = parse_gamma_time_ms(
-        value
-            .get("endDate")
-            .or_else(|| value.get("end_date"))
-            .or_else(|| value.get("endTime"))
-            .or_else(|| value.get("end_time")),
-    )
-    .or_else(|| start_ms.map(|start| start.saturating_add(window_ms)));
-    let start_ms = start_ms.or_else(|| end_ms.map(|end| end.saturating_sub(window_ms)));
-
-    Some(crate::market_context::MarketContextRecord {
-        market_id: market_id.to_string(),
-        instrument_ids: instrument_ids.into_iter().take(2).collect(),
-        price_to_beat: pick_gamma_f64(value, &["priceToBeat", "price_to_beat"]),
-        final_price: pick_gamma_f64(value, &["finalPrice", "final_price"]),
-        event_start_time_ms: start_ms,
-        event_end_time_ms: end_ms,
-    })
-}
-
-fn parse_gamma_token_ids(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .filter(|item| !item.trim().is_empty())
-            .collect(),
-        Some(Value::String(raw)) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                return parse_gamma_token_ids(Some(&parsed));
-            }
-            trimmed
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect()
-        }
-        _ => Vec::new(),
-    }
-}
-
-fn parse_gamma_time_ms(value: Option<&Value>) -> Option<u64> {
-    let raw = value?.as_str()?;
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|ts| ts.with_timezone(&Utc).timestamp_millis().max(0) as u64)
-}
-
-fn parse_start_ms_from_btc_slug(slug: &str) -> Option<u64> {
-    slug.rsplit('-')
-        .next()
-        .and_then(|part| part.parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1_000))
-}
-
-fn pick_gamma_f64(value: &Value, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| match value.get(*key)? {
-        Value::Number(number) => number.as_f64(),
-        Value::String(raw) => raw.parse::<f64>().ok(),
-        _ => None,
-    })
-}
-
-async fn refresh_dashboard_state(
-    runtime: &mut Runtime<StrategyMode>,
-    books: &Arc<BookStore>,
-    metrics: &AppMetrics,
-    config: &AppConfig,
-    dashboard: Arc<RwLock<DashboardSnapshot>>,
-    market_assets: &[String],
-    strategy_name: &str,
-    event_limit: usize,
-) -> Result<()> {
-    let inventory_snapshot = runtime.inventory().snapshot();
-    let open_order_snapshots = runtime.open_order_snapshots();
-    let books = books.snapshots(market_assets).await;
-    let now_ms = now_unix_ms();
-    let profile = config.strategy_profile.as_ref();
-    metrics.refresh_stream_ages();
-
-    let open_orders: Vec<DashboardOrder> = open_order_snapshots
-        .iter()
-        .cloned()
-        .map(|managed| DashboardOrder {
-            client_order_id: managed.intent.client_order_id.as_str().to_string(),
-            market_id: managed.intent.market_id.as_str().to_string(),
-            instrument_id: managed.intent.instrument_id.as_str().to_string(),
-            side: format!("{:?}", managed.intent.side),
-            status: format!("{:?}", managed.status),
-            created_at_ms: managed.intent.created_at_ms,
-            last_update_ms: managed.last_update_ms,
-            limit_price: managed.intent.limit_price,
-            quantity: managed.intent.quantity,
-            cumulative_filled_qty: managed.cumulative_filled_qty,
-            remaining_qty: managed.remaining_qty(),
-            reserved_cash_usd: managed.reserved_cash_usd,
-        })
-        .collect();
-
-    let mut yes_qty = 0.0;
-    let mut no_qty = 0.0;
-    let mut yes_notional_usd = 0.0;
-    let mut no_notional_usd = 0.0;
-    let mut unrealized_pnl_usd = 0.0;
-    let positions: Vec<DashboardPosition> = inventory_snapshot
-        .positions
-        .into_iter()
-        .map(|position| {
-            let unrealized = (position.mark_or_cost() - position.avg_price) * position.quantity;
-            let is_yes_like = is_yes_like(&position.instrument_id.as_str().to_ascii_lowercase());
-            let quantity = position.quantity.abs();
-            let notional = quantity * position.mark_or_cost();
-            if is_yes_like {
-                yes_qty += quantity;
-                yes_notional_usd += notional;
-            } else {
-                no_qty += quantity;
-                no_notional_usd += notional;
-            }
-            unrealized_pnl_usd += unrealized;
-            DashboardPosition {
-                market_id: position.market_id.as_str().to_string(),
-                instrument_id: position.instrument_id.as_str().to_string(),
-                quantity: position.quantity,
-                avg_price: position.avg_price,
-                mark_price: position.mark_price,
-                updated_at_ms: position.updated_at_ms,
-                gross_notional_usd: position.gross_notional_usd(),
-                unrealized_pnl_usd: unrealized,
-            }
-        })
-        .collect();
-
-    let mut book_mid_by_asset = HashMap::new();
-    let books_state: Vec<DashboardBook> = books
-        .into_iter()
-        .map(|book| {
-            let mid_price = if book.best_bid > 0.0 && book.best_ask > 0.0 {
-                Some((book.best_bid + book.best_ask) * 0.5)
-            } else {
-                None
-            };
-            if let Some(mid) = mid_price {
-                book_mid_by_asset.insert(book.asset_id.clone(), mid);
-            }
-            let bids = book
-                .bid_levels()
-                .iter()
-                .take(5)
-                .map(|level| (level.price, level.size))
-                .collect::<Vec<_>>();
-            let asks = book
-                .ask_levels()
-                .iter()
-                .take(5)
-                .map(|level| (level.price, level.size))
-                .collect::<Vec<_>>();
-            DashboardBook {
-                asset_id: book.asset_id.clone(),
-                best_bid: book.best_bid,
-                best_bid_size: book.best_bid_size,
-                best_ask: book.best_ask,
-                best_ask_size: book.best_ask_size,
-                spread: book.spread,
-                mid_price,
-                last_trade_price: book.last_trade_price,
-                age_ms: book.age_ms(),
-                bids,
-                asks,
-            }
-        })
-        .collect();
-
-    let quote_snapshot = profile
-        .map(|profile| profile.quote.clone())
-        .unwrap_or_default();
-    let quote_ladder_count = open_order_snapshots
-        .iter()
-        .filter(|managed| managed.remaining_qty() > 0.0 && managed.intent.quote_level_tag.is_some())
-        .count();
-    let quote_edge_bps = if quote_ladder_count == 0 {
-        0.0
-    } else {
-        let mut total_edge_bps = 0.0;
-        let mut matched_quotes = 0.0;
-        for managed in open_order_snapshots {
-            if managed.remaining_qty() <= 0.0 {
-                continue;
-            }
-            let Some(mid_price) = book_mid_by_asset.get(managed.intent.instrument_id.as_str())
-            else {
-                continue;
-            };
-            if *mid_price <= 0.0 {
-                continue;
-            }
-            let edge_bps = match managed.intent.side {
-                crate::types::TradeSide::Buy => {
-                    ((*mid_price - managed.intent.limit_price) / *mid_price) * 10_000.0
-                }
-                crate::types::TradeSide::Sell => {
-                    ((managed.intent.limit_price - *mid_price) / *mid_price) * 10_000.0
-                }
-            };
-            total_edge_bps += edge_bps;
-            matched_quotes += 1.0;
-        }
-        if matched_quotes > 0.0 {
-            total_edge_bps / matched_quotes
-        } else {
-            0.0
-        }
-    };
-    let quote_age_ms = runtime
-        .open_order_snapshots()
-        .into_iter()
-        .map(|managed| now_ms.saturating_sub(managed.last_update_ms) as f64)
-        .fold(0.0, f64::max);
-    metrics.set_quote_metrics(
-        quote_ladder_count,
-        quote_snapshot.max_quote_per_side_usd.unwrap_or(0.0),
-        quote_snapshot.min_edge_bps.unwrap_or(0.0),
-        quote_snapshot.skew_cap_bps.unwrap_or(0.0),
-        quote_snapshot.refresh_interval_ms.unwrap_or(0),
-        quote_edge_bps,
-        quote_age_ms,
-    );
-
-    let merge_candidate_qty = yes_qty.min(no_qty);
-    let stranded_yes_qty = (yes_qty - no_qty).max(0.0);
-    let stranded_no_qty = (no_qty - yes_qty).max(0.0);
-    let inventory_skew_usd = (yes_notional_usd - no_notional_usd).abs();
-    metrics.set_pair_metrics(stranded_yes_qty, stranded_no_qty, merge_candidate_qty);
-    metrics.set_risk_metrics(inventory_skew_usd);
-
-    let control_plane_metrics = metrics.snapshot();
-    let net_edge_usd_total = inventory_snapshot.realized_pnl_usd + unrealized_pnl_usd
-        - control_plane_metrics.fees_usd_total
-        + control_plane_metrics.rebates_usd_total;
-    metrics.set_economics_metrics(
-        inventory_snapshot.realized_pnl_usd,
-        unrealized_pnl_usd,
-        net_edge_usd_total,
-    );
-    let control_plane_metrics = metrics.snapshot();
-
-    let recent_events: Vec<DashboardEvent> = runtime
-        .event_log()
-        .recent(event_limit)
-        .into_iter()
-        .map(|event| DashboardEvent {
-            seq: event.seq,
-            observed_at_ms: event.observed_at_ms,
-            category: format!("{:?}", event.category),
-            message: event.message,
-            market_id: event.market_id.map(|value| value.to_string()),
-            instrument_id: event.instrument_id.map(|value| value.to_string()),
-            client_order_id: event.client_order_id.map(|value| value.to_string()),
-            order_id: event.order_id.map(|value| value.to_string()),
-            price: event.metrics.price,
-            quantity: event.metrics.quantity,
-            notional_usd: event.metrics.notional_usd,
-            cash_delta_usd: event.metrics.cash_delta_usd,
-            position_delta: event.metrics.position_delta,
-            free_cash_after_usd: event.metrics.free_cash_after_usd,
-            gross_exposure_after_usd: event.metrics.gross_exposure_after_usd,
-        })
-        .collect();
-
-    let now_ms = now_unix_ms();
-    let mut snapshot = dashboard.write().await;
-    *snapshot = DashboardSnapshot {
-        status: format!("{:?}", runtime.status()),
-        strategy_name: strategy_name.to_string(),
-        market_assets: market_assets.to_vec(),
-        free_cash_usd: inventory_snapshot.free_cash_usd,
-        reserved_cash_usd: inventory_snapshot.reserved_cash_usd,
-        total_cash_usd: inventory_snapshot.total_cash_usd,
-        realized_pnl_usd: inventory_snapshot.realized_pnl_usd,
-        gross_exposure_usd: inventory_snapshot.gross_exposure_usd,
-        event_log_len: runtime.event_log().len(),
-        event_last_seq: runtime.event_log().latest_seq(),
-        generated_at_ms: now_ms,
-        positions,
-        open_orders,
-        books: books_state,
-        recent_events,
-        control_plane: crate::wire::api::RuntimeControlPlaneState {
-            profile_name: profile.map(|profile| profile.profile_name.clone()),
-            profile_version: profile.and_then(|profile| profile.version.clone()),
-            market_context_version: Some(runtime.market_context_version().to_string()),
-            quote: crate::wire::api::QuoteControlPlaneState {
-                ladder_count: control_plane_metrics.quote_ladder_count,
-                max_quote_per_side_usd: control_plane_metrics.quote_max_per_side_usd,
-                min_edge_bps: control_plane_metrics.quote_min_edge_bps,
-                skew_cap_bps: control_plane_metrics.quote_skew_cap_bps,
-                refresh_interval_ms: control_plane_metrics.quote_refresh_interval_ms as u64,
-                edge_bps: control_plane_metrics.quote_edge_bps,
-                age_ms: control_plane_metrics.quote_age_ms,
-            },
-            fill: crate::wire::api::FillControlPlaneState {
-                total: control_plane_metrics.fill_total,
-                maker_total: control_plane_metrics.fill_maker_total,
-                taker_total: control_plane_metrics.fill_taker_total,
-                maker_share: control_plane_metrics.fill_maker_share,
-                notional_usd_total: control_plane_metrics.fill_notional_usd_total,
-            },
-            pair: crate::wire::api::PairControlPlaneState {
-                completed_qty_total: control_plane_metrics.pair_completed_qty_total,
-                stranded_yes_qty: control_plane_metrics.stranded_yes_qty,
-                stranded_no_qty: control_plane_metrics.stranded_no_qty,
-                merge_candidate_qty: control_plane_metrics.merge_candidate_qty,
-                merge_latency_ms: control_plane_metrics.merge_latency_ms,
-            },
-            risk: crate::wire::api::RiskControlPlaneState {
-                book_stale_events_total: control_plane_metrics.book_stale_events_total,
-                reconcile_failures_total: control_plane_metrics.reconcile_failures_total,
-                runtime_riskoff_transitions_total: control_plane_metrics
-                    .runtime_riskoff_transitions_total,
-                uncertain_submit_total: control_plane_metrics.uncertain_submit_total,
-                inventory_skew_usd: control_plane_metrics.inventory_skew_usd,
-            },
-            economics: crate::wire::api::EconomicsControlPlaneState {
-                realized_pnl_usd: control_plane_metrics.realized_pnl_usd,
-                unrealized_pnl_usd: control_plane_metrics.unrealized_pnl_usd,
-                fees_usd_total: control_plane_metrics.fees_usd_total,
-                rebates_usd_total: control_plane_metrics.rebates_usd_total,
-                net_edge_usd_total: control_plane_metrics.net_edge_usd_total,
-            },
-            health: crate::wire::api::HealthControlPlaneState {
-                market_ws_connected: control_plane_metrics.market_ws_connected,
-                user_ws_connected: control_plane_metrics.user_ws_connected,
-                execution_adapter_connected: control_plane_metrics.execution_adapter_connected,
-                venue_cash_usd: control_plane_metrics.venue_cash_usd,
-                venue_position_count: control_plane_metrics.venue_position_count,
-                last_market_message_age_ms: control_plane_metrics.market_last_message_age_ms,
-                last_user_message_age_ms: control_plane_metrics.user_last_message_age_ms,
-                last_reconcile_age_ms: control_plane_metrics.last_reconcile_age_ms,
-            },
-        },
-    };
-    Ok(())
-}
-
 fn handle_user_event(
     runtime: &mut Runtime<StrategyMode>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
@@ -2731,20 +1921,20 @@ fn parse_trade_side(raw: &str) -> TradeSide {
 }
 
 #[derive(Debug, Clone)]
-struct PaperOrderContext {
-    arrival_ms: u64,
-    queue_bias: f64,
-    last_attempt_ms: u64,
-    last_fill_ms: u64,
-    last_fill_book_update_ms: u64,
-    fill_count: usize,
+pub(super) struct PaperOrderContext {
+    pub(super) arrival_ms: u64,
+    pub(super) queue_bias: f64,
+    pub(super) last_attempt_ms: u64,
+    pub(super) last_fill_ms: u64,
+    pub(super) last_fill_book_update_ms: u64,
+    pub(super) fill_count: usize,
     /// Phase 2 paper env cancel race window: when a Cancel command is
     /// received in paper mode, this is set to observed_at_ms instead of
     /// removing the context. Subsequent ticks within the configured
     /// window may still apply a fill (mirrors the live race between
     /// venue cancel ack and an in-flight fill). Once the window
     /// elapses without a fill, the deferred cancel is applied.
-    cancel_requested_at_ms: Option<u64>,
+    pub(super) cancel_requested_at_ms: Option<u64>,
 }
 
 fn paper_order_context_mut<'a>(
@@ -2776,136 +1966,9 @@ fn parse_fill_liquidity(raw: &Option<String>) -> FillLiquidity {
     }
 }
 
-fn is_yes_like(raw: &str) -> bool {
-    raw.contains("yes")
-        || raw.contains("up")
-        || raw.contains("long")
-        || raw.contains("bull")
-        || raw.contains("call")
-}
-
 async fn join_task(name: &str, handle: JoinHandle<()>) {
     if let Err(error) = handle.await {
         warn!(task = name, error = ?error, "background task join failed");
-    }
-}
-
-fn persist_runtime_outcome(
-    journal: &mut Option<JournalWriter>,
-    metrics: &AppMetrics,
-    event_log: &EventLog,
-    paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
-    source: &str,
-    outcome: RuntimeOutcome,
-) -> Result<()> {
-    if !outcome.event_seqs.is_empty() {
-        info!(
-            source,
-            event_count = outcome.event_seqs.len(),
-            latest_seq = outcome.event_seqs.last().copied().unwrap_or_default(),
-            "runtime accepted hot-path update"
-        );
-    }
-
-    let records = if let Some(first_seq) = outcome.event_seqs.first().copied() {
-        event_log.snapshot_since(first_seq.saturating_sub(1))
-    } else {
-        Vec::new()
-    };
-    record_strategy_attribution(metrics, &records, &outcome.commands);
-    if let Some(report) = paper_report {
-        report.record_runtime_outcome(&records, &outcome.commands, now_unix_ms());
-    }
-
-    if let Some(writer) = journal.as_mut() {
-        for record in &records {
-            writer.append_event(record)?;
-        }
-        for command in &outcome.commands {
-            writer.append_command(command)?;
-        }
-        writer.flush()?;
-    }
-
-    Ok(())
-}
-
-fn record_strategy_attribution(
-    metrics: &AppMetrics,
-    records: &[crate::event_log::EventRecord],
-    commands: &[RuntimeCommand],
-) {
-    for record in records {
-        if let Some(event) = classify_runtime_event(record.message.as_str()) {
-            metrics.observe_strategy_event(event);
-        }
-    }
-    for command in commands {
-        if let Some(intent) = classify_runtime_command(command) {
-            metrics.observe_strategy_intent(intent);
-        }
-    }
-}
-
-fn classify_runtime_event(message: &str) -> Option<&'static str> {
-    if message.contains("entry-fill asymmetry cooldown")
-        || message.contains("asymmetric entry-fill cooldown")
-    {
-        return Some("asym_fill_cooldown");
-    }
-    if message.contains("market mid moved") {
-        return Some("market_mid_trend_gate");
-    }
-    if message.contains("btc regime flat") {
-        return Some("btc_flat_gate");
-    }
-    if message.contains("btc regime trending") {
-        return Some("btc_trend_gate");
-    }
-    if message.contains("premium fair cap") {
-        return Some("premium_fair_gate");
-    }
-    if message.contains("hold stranded positive-asymmetry") {
-        return Some("hold_positive_asym");
-    }
-    if message.contains("rescue stranded leg") {
-        return Some("rescue_ev_selected");
-    }
-    if message.contains("on-fill IOC rescue emitted") {
-        return Some("on_fill_rescue");
-    }
-    if message.contains("on-fill rescue throttled") {
-        return Some("rescue_throttled");
-    }
-    if message.contains("paired entry ladder rejected") {
-        return Some("entry_ladder_rejected");
-    }
-    if message.contains("inventory management rejected") {
-        return Some("inventory_management_rejected");
-    }
-    if message.contains("market context replaced") {
-        return Some("market_rollover");
-    }
-    if message.contains("runtime degraded") {
-        return Some("runtime_degraded");
-    }
-    if message.contains("runtime risk-off") {
-        return Some("runtime_riskoff");
-    }
-    None
-}
-
-fn classify_runtime_command(command: &RuntimeCommand) -> Option<&'static str> {
-    let RuntimeCommand::Submit(intent) = command else {
-        return None;
-    };
-    match intent.quote_level_tag.as_deref().unwrap_or_default() {
-        tag if tag.starts_with("mm-paired-bid") => Some("paired_ladder"),
-        tag if tag.starts_with("mm-convex-accum") => Some("convex_accum"),
-        tag if tag.starts_with("mm-hedge-rescue") => Some("hedge_rescue"),
-        tag if tag.starts_with("mm-reduce") => Some("reduce_cleanup"),
-        "" => Some("untagged_submit"),
-        _ => Some("other_submit"),
     }
 }
 
@@ -2963,6 +2026,7 @@ async fn execute_execution_adapter(
     execution_policy: &ExecutionPolicy,
     seen_venue_fill_keys: &mut HashSet<String>,
     paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
+    shadow_quote: Option<&mut crate::paper::shadow_quote::ShadowQuoteWriter>,
 ) -> Result<RuntimeOutcome> {
     let mut combined = RuntimeOutcome {
         commands: Vec::new(),
@@ -2972,6 +2036,7 @@ async fn execute_execution_adapter(
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
     let mut paper_report = paper_report;
+    let mut shadow_quote = shadow_quote;
 
     fn book_mid(book: &BookState) -> Option<f64> {
         if book.best_bid > 0.0 && book.best_ask > 0.0 {
@@ -3053,6 +2118,25 @@ async fn execute_execution_adapter(
                     let Some(book) = books.snapshot(intent.instrument_id.as_str()).await else {
                         continue;
                     };
+                    if let Some(writer) = shadow_quote.as_deref_mut() {
+                        let market_context = runtime.market_context_record(&intent.market_id);
+                        let btc_regime = runtime.btc_regime_snapshot(observed_at_ms);
+                        if let Err(error) = writer.record(
+                            &intent,
+                            &book,
+                            observed_at_ms,
+                            market_context.and_then(|context| context.price_to_beat),
+                            btc_regime.last_price,
+                            btc_regime.realized_vol_5m_bps,
+                        ) {
+                            warn!(
+                                target: "shadow_quote",
+                                client_order_id = %intent.client_order_id,
+                                error = %error,
+                                "failed to write shadow quote record"
+                            );
+                        }
+                    }
                     if paper_post_only_should_reject(&intent, &book, execution_policy) {
                         if let Some(reporter) = paper_report.as_deref_mut() {
                             reporter.record_reject(
@@ -3704,14 +2788,6 @@ fn stage_outcome_commands(
     combined.event_seqs.extend(outcome.event_seqs);
 }
 
-fn needs_reconcile_order_count(runtime: &Runtime<StrategyMode>) -> usize {
-    runtime
-        .open_order_snapshots()
-        .into_iter()
-        .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
-        .count()
-}
-
 fn submit_request_from_intent(
     intent: &OrderIntent,
     observed_at_ms: u64,
@@ -3732,7 +2808,7 @@ fn submit_request_from_intent(
         .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
         .or_else(|| {
             (!execution_policy.paper_mode && is_late_bar_core)
-                .then_some(observed_at_ms.saturating_add(Btc5mMmStrategy::LATE_BAR_CORE_TTL_MS))
+                .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
     let (time_in_force, post_only) = if is_hedge_rescue {
         (TimeInForce::Ioc, false)
@@ -4218,519 +3294,6 @@ fn cancel_stale_live_orders(
     outcome
 }
 
-fn enforce_live_health(
-    runtime: &mut Runtime<StrategyMode>,
-    metrics: &AppMetrics,
-    config: &AppConfig,
-    live_safety: &LiveSafetyState,
-    now_ms: u64,
-    started_at_ms: u64,
-) -> RuntimeOutcome {
-    if config.paper_mode || runtime.status() != RuntimeStatus::Running {
-        return RuntimeOutcome::default();
-    }
-    if now_ms.saturating_sub(started_at_ms) < LIVE_HEALTH_STARTUP_GRACE_MS {
-        return RuntimeOutcome::default();
-    }
-    let (health_failures, risk_failures) =
-        live_health_failures(runtime, metrics, config, live_safety);
-
-    if health_failures.is_empty() && risk_failures.is_empty() {
-        RuntimeOutcome::default()
-    } else if health_failures.is_empty() {
-        metrics.observe_riskoff_transition();
-        runtime.riskoff_and_cancel_entry_orders(
-            now_ms,
-            format!("live risk limit failure: {}", risk_failures.join("; ")),
-        )
-    } else {
-        metrics.observe_riskoff_transition();
-        let mut failures = health_failures;
-        failures.extend(risk_failures);
-        runtime.degrade_and_cancel_all(
-            now_ms,
-            format!("live health failure: {}", failures.join("; ")),
-        )
-    }
-}
-
-fn auto_recover_live_riskoff(
-    runtime: &mut Runtime<StrategyMode>,
-    metrics: &AppMetrics,
-    config: &AppConfig,
-    live_safety: &LiveSafetyState,
-    now_ms: u64,
-    started_at_ms: u64,
-) -> RuntimeOutcome {
-    if config.paper_mode
-        || !matches!(
-            runtime.status(),
-            RuntimeStatus::RiskOff | RuntimeStatus::Degraded
-        )
-        || config.live_risk_off_auto_recover.is_zero()
-    {
-        return RuntimeOutcome::default();
-    }
-    let recover_after_ms = config
-        .live_risk_off_auto_recover
-        .as_millis()
-        .max(LIVE_HEALTH_STARTUP_GRACE_MS as u128) as u64;
-    if now_ms.saturating_sub(started_at_ms) < recover_after_ms {
-        return RuntimeOutcome::default();
-    }
-    let (health_failures, risk_failures) =
-        live_health_failures(runtime, metrics, config, live_safety);
-    if health_failures.is_empty() && risk_failures.is_empty() {
-        runtime.recover_live_blocked_status(
-            now_ms,
-            format!("live health checks passed for {recover_after_ms}ms"),
-        )
-    } else {
-        RuntimeOutcome::default()
-    }
-}
-
-fn live_health_failures(
-    runtime: &Runtime<StrategyMode>,
-    metrics: &AppMetrics,
-    config: &AppConfig,
-    live_safety: &LiveSafetyState,
-) -> (Vec<String>, Vec<String>) {
-    let snapshot = metrics.snapshot();
-    let market_stale_ms = config
-        .strategy_profile
-        .as_ref()
-        .and_then(|profile| profile.health.market_ws_stale_ms)
-        .unwrap_or(config.book_stale_after.as_millis() as u64 * 3);
-    let user_stale_ms = config
-        .strategy_profile
-        .as_ref()
-        .and_then(|profile| profile.health.user_ws_stale_ms)
-        .unwrap_or(30_000);
-    let mut health_failures = Vec::new();
-    let mut risk_failures = Vec::new();
-    if !snapshot.market_ws_connected {
-        health_failures.push("market websocket disconnected".to_string());
-    }
-    if snapshot.market_last_message_age_ms >= 0.0
-        && snapshot.market_last_message_age_ms > market_stale_ms as f64
-    {
-        health_failures.push(format!(
-            "market websocket stale age_ms={:.0} max_ms={market_stale_ms}",
-            snapshot.market_last_message_age_ms
-        ));
-    }
-    if !snapshot.user_ws_connected && snapshot.user_last_message_age_ms >= 0.0 {
-        health_failures.push("user websocket disconnected".to_string());
-    }
-    if snapshot.user_last_message_age_ms >= 0.0
-        && snapshot.user_last_message_age_ms > user_stale_ms as f64
-    {
-        health_failures.push(format!(
-            "user websocket stale age_ms={:.0} max_ms={user_stale_ms}",
-            snapshot.user_last_message_age_ms
-        ));
-    }
-    if !snapshot.execution_adapter_connected {
-        health_failures.push("execution adapter disconnected".to_string());
-    }
-    let free_cash_floor_usd = config
-        .risk_limits
-        .free_cash_floor_usd(config.starting_cash_usd);
-    match live_safety.last_venue_cash_usd {
-        Some(cash_usd) if cash_usd < free_cash_floor_usd => {
-            risk_failures.push(format!(
-                "venue cash below floor cash={cash_usd:.4} floor={:.4}",
-                free_cash_floor_usd
-            ));
-        }
-        Some(_) => {}
-        None => health_failures.push("venue balance has not synced".to_string()),
-    }
-    let needs_reconcile = needs_reconcile_order_count(runtime);
-    if needs_reconcile > 0 {
-        health_failures.push(format!(
-            "orders need reconciliation count={needs_reconcile}"
-        ));
-    }
-    if runtime.inventory().gross_exposure_usd() > config.risk_limits.max_gross_notional_usd {
-        risk_failures.push(format!(
-            "gross exposure exceeded cap exposure={:.4} cap={:.4}",
-            runtime.inventory().gross_exposure_usd(),
-            config.risk_limits.max_gross_notional_usd
-        ));
-    }
-    if let Some(equity_floor_usd) =
-        portfolio_equity_floor_usd(&config.risk_limits, config.starting_cash_usd)
-    {
-        let local_equity_usd =
-            runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
-        if local_equity_usd < equity_floor_usd {
-            risk_failures.push(format!(
-                "local portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
-            ));
-        }
-        if let Some(venue_cash_usd) = live_safety.last_venue_cash_usd {
-            let venue_marked_equity_usd = venue_cash_usd + runtime.inventory().gross_exposure_usd();
-            if venue_marked_equity_usd < equity_floor_usd {
-                risk_failures.push(format!(
-                    "venue marked equity below floor equity={venue_marked_equity_usd:.4} floor={equity_floor_usd:.4}"
-                ));
-            }
-        }
-    }
-    if let Some(path) = config.live_kill_switch_path.as_ref() {
-        if path.exists() {
-            health_failures.push(format!(
-                "operator kill switch active path={}",
-                path.display()
-            ));
-        }
-    }
-
-    (health_failures, risk_failures)
-}
-
-fn enforce_capital_guard(
-    runtime: &mut Runtime<StrategyMode>,
-    metrics: &AppMetrics,
-    risk_limits: &RiskLimits,
-    starting_cash_usd: f64,
-    now_ms: u64,
-    mode: &str,
-) -> RuntimeOutcome {
-    if runtime.status() != RuntimeStatus::Running {
-        return RuntimeOutcome::default();
-    }
-    let Some(equity_floor_usd) = portfolio_equity_floor_usd(risk_limits, starting_cash_usd) else {
-        return RuntimeOutcome::default();
-    };
-
-    let local_equity_usd =
-        runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
-    if local_equity_usd >= equity_floor_usd {
-        return RuntimeOutcome::default();
-    }
-
-    metrics.observe_riskoff_transition();
-    runtime.riskoff_and_cancel_entry_orders(
-        now_ms,
-        format!(
-            "{mode} capital guard: portfolio equity below floor equity={local_equity_usd:.4} floor={equity_floor_usd:.4}"
-        ),
-    )
-}
-
-fn portfolio_equity_floor_usd(risk_limits: &RiskLimits, starting_cash_usd: f64) -> Option<f64> {
-    risk_limits.portfolio_equity_floor_usd(starting_cash_usd)
-}
-
-fn paper_fill_from_book_snapshot(
-    book: &BookState,
-    intent: &OrderIntent,
-    observed_at_ms: u64,
-    paper_fee_coeff: f64,
-    order_ctx: &mut PaperOrderContext,
-    remaining_qty: f64,
-    execution_policy: &ExecutionPolicy,
-) -> Option<FillReport> {
-    if remaining_qty <= 0.0 || intent.limit_price <= 0.0 {
-        return None;
-    }
-    if order_ctx.fill_count >= execution_policy.paper_max_fills_per_order {
-        return None;
-    }
-    if execution_policy.paper_submit_latency_ms > 0
-        && observed_at_ms.saturating_sub(order_ctx.arrival_ms)
-            < execution_policy.paper_submit_latency_ms
-    {
-        return None;
-    }
-    if order_ctx.last_fill_ms > 0
-        && observed_at_ms.saturating_sub(order_ctx.last_fill_ms)
-            < execution_policy.paper_min_fill_interval_ms
-    {
-        return None;
-    }
-    if book.last_update_unix_ms > 0
-        && order_ctx.last_fill_book_update_ms == book.last_update_unix_ms
-    {
-        return None;
-    }
-
-    let candidate_levels: Vec<_> = if matches!(intent.side, TradeSide::Buy) {
-        book.ask_levels()
-            .iter()
-            .filter(|level| level.price > 0.0 && level.price <= intent.limit_price)
-            .collect()
-    } else {
-        book.bid_levels()
-            .iter()
-            .filter(|level| level.price > 0.0 && level.price >= intent.limit_price)
-            .collect()
-    };
-    if candidate_levels.is_empty() {
-        return None;
-    }
-
-    let total_available: f64 = candidate_levels.iter().map(|level| level.size).sum();
-    if total_available <= 0.0 {
-        return None;
-    }
-
-    let best_opposite = candidate_levels[0].price;
-    let crossing = if matches!(intent.side, TradeSide::Buy) {
-        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
-    } else {
-        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
-    };
-    let maker_trade_through = if matches!(intent.side, TradeSide::Buy) {
-        book.last_trade_price > 0.0 && book.last_trade_price <= intent.limit_price
-    } else {
-        book.last_trade_price > 0.0 && book.last_trade_price >= intent.limit_price
-    };
-    // Distinguish a fresh submit (could be TAKER if crossing) from a
-    // resting order that the book later moved into (always MAKER, fills
-    // at our limit). A real venue does not turn our resting limit into
-    // a taker just because the opposite side moved through us; we get
-    // price-improved as the maker. Fresh = within submit-latency window.
-    let order_age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms);
-    // "Fresh" = just arrived at venue; "resting" = strictly older than the
-    // submit-latency window. A fresh order that crosses on arrival is a
-    // taker; a resting order the book later moves into is a maker
-    // (price-improvement to whoever takes our resting bid).
-    let is_resting = order_age_ms > execution_policy.paper_submit_latency_ms;
-    let crosses_as_taker = crossing && !is_resting;
-    if !crossing {
-        let queue_wait_ms = 1_000 + (order_ctx.queue_bias * 3_000.0) as u64;
-        if order_age_ms < queue_wait_ms || !maker_trade_through {
-            return None;
-        }
-    }
-    // Maker fills land at OUR limit (the resting price). Taker fills
-    // (fresh order crossing the book) land at the opposite-side touch.
-    let best_fill_price = if crosses_as_taker {
-        best_opposite
-    } else {
-        intent.limit_price
-    };
-    let fill_ratio = paper_fill_ratio(
-        remaining_qty,
-        total_available,
-        book.last_update_unix_ms,
-        best_fill_price,
-        intent.limit_price,
-        order_ctx,
-        crossing,
-        observed_at_ms,
-    );
-    let target_fill_qty = (remaining_qty * fill_ratio)
-        .min(total_available)
-        .min(remaining_qty);
-    if target_fill_qty <= 0.0 {
-        return None;
-    }
-
-    let mut remaining = target_fill_qty;
-    let mut qty_filled = 0.0;
-    let mut amount = 0.0;
-    for (idx, level) in candidate_levels.iter().enumerate() {
-        if remaining <= 0.0 {
-            break;
-        }
-        // Phase 2 paper env: replace opaque queue_bias with explicit
-        // queue-depth-fraction model. Non-crossing maker orders can claim
-        // (1.0 - paper_queue_depth_fraction) of top-level size, representing
-        // the fraction of the queue ahead of us that has already cleared.
-        // Default 0.75 → we claim 25% of top-of-book per fill attempt.
-        // Reference: Moallemi-Yuan queue position valuation.
-        let level_ratio = if crossing {
-            1.0
-        } else if idx == 0 {
-            (1.0 - execution_policy.paper_queue_depth_fraction).max(0.0)
-        } else {
-            0.0
-        };
-        let level_fill = (level.size * level_ratio).min(remaining);
-        if level_fill > 0.0 {
-            qty_filled += level_fill;
-            // Maker fills land at OUR limit (the resting price); taker
-            // fills walk the book at level prices.
-            let price_at_level = if crosses_as_taker {
-                level.price
-            } else {
-                intent.limit_price
-            };
-            amount += level_fill * price_at_level;
-            remaining -= level_fill;
-        }
-    }
-
-    if qty_filled <= 0.0 {
-        qty_filled = target_fill_qty.min(candidate_levels[0].size);
-        let fallback_price = if crosses_as_taker {
-            candidate_levels[0].price
-        } else {
-            intent.limit_price
-        };
-        amount = qty_filled * fallback_price;
-    }
-
-    if qty_filled <= 0.0 {
-        return None;
-    }
-
-    let price = if qty_filled > 0.0 {
-        amount / qty_filled
-    } else {
-        0.0
-    };
-    if price <= 0.0 {
-        return None;
-    }
-
-    // Same is_resting / crosses_as_taker invariant as the price assignment
-    // above. fill_ratio >= 0.75 alone does NOT make us a taker — a maker
-    // order can still claim a large fraction of top-of-book; it's just
-    // good queue position, not a crossing event.
-    let liquidity = if crosses_as_taker {
-        FillLiquidity::Taker
-    } else {
-        FillLiquidity::Maker
-    };
-    let notional = qty_filled * price;
-    if notional < execution_policy.paper_min_fill_notional_usd
-        && (remaining_qty * price) >= execution_policy.paper_min_fill_notional_usd
-    {
-        return None;
-    }
-    let effective_taker_coeff = execution_policy
-        .paper_taker_fee_coeff_override
-        .unwrap_or(paper_fee_coeff);
-    let fee_basis = price * (1.0 - price);
-    let fee = match liquidity {
-        FillLiquidity::Maker => -(notional * execution_policy.paper_maker_rebate_coeff * fee_basis),
-        FillLiquidity::Taker => notional * effective_taker_coeff * fee_basis,
-        FillLiquidity::Unknown => notional * effective_taker_coeff * fee_basis,
-    };
-    order_ctx.last_fill_ms = observed_at_ms;
-    order_ctx.last_fill_book_update_ms = book.last_update_unix_ms;
-    order_ctx.fill_count = order_ctx.fill_count.saturating_add(1);
-
-    Some(FillReport {
-        order_id: None,
-        client_order_id: Some(intent.client_order_id.clone()),
-        market_id: intent.market_id.clone(),
-        instrument_id: intent.instrument_id.clone(),
-        side: intent.side,
-        price,
-        quantity: qty_filled,
-        fee_usd: fee,
-        liquidity,
-        close_method: None,
-        observed_at_ms,
-    })
-}
-
-fn paper_fill_ratio(
-    order_qty: f64,
-    available_qty: f64,
-    snapshot_unix_ms: u64,
-    fill_price: f64,
-    limit_price: f64,
-    order_ctx: &PaperOrderContext,
-    crossing: bool,
-    observed_at_ms: u64,
-) -> f64 {
-    if order_qty <= 0.0 || available_qty <= 0.0 || fill_price <= 0.0 || limit_price <= 0.0 {
-        return 0.0;
-    }
-
-    // Use observed_at_ms (the simulated/replay clock) instead of wall
-    // clock so replays produce deterministic fill ratios. Was a hidden
-    // bug: now_unix_ms() inside this function caused replay results to
-    // depend on how fast the host machine ran the loop.
-    let age_ms = observed_at_ms.saturating_sub(order_ctx.arrival_ms.max(order_ctx.last_attempt_ms));
-    let age_pressure = if crossing {
-        0.15 + 0.30 * ((age_ms as f64 / 3_000.0).clamp(0.0, 1.0))
-    } else {
-        0.02 + 0.18 * ((age_ms as f64 / 5_000.0).clamp(0.0, 1.0))
-    };
-    let size_pressure = 0.25 + 0.75 * (available_qty / (available_qty + order_qty));
-    let queue_pressure = 0.08 + order_ctx.queue_bias * 0.52;
-    let staleness_pressure = 0.30
-        + 0.60
-            * ((observed_at_ms.saturating_sub(snapshot_unix_ms) as f64 / 2_000.0).clamp(0.0, 1.0));
-    let premium = ((limit_price - fill_price) / fill_price).max(0.0).min(1.0);
-    let limit_pressure = if crossing {
-        0.65
-    } else {
-        0.20 + (premium * 0.20)
-    };
-    (age_pressure * size_pressure * queue_pressure * staleness_pressure * limit_pressure)
-        .clamp(0.0, if crossing { 0.65 } else { 0.20 })
-}
-
-fn deterministic_hash_0_95(value: &str) -> f64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let normalized = (hash & 0xffff) as f64 / 65_536.0;
-    (0.05 + (normalized * 0.95)).min(1.0)
-}
-
-/// Deterministic [0, 1) value derived from a client_order_id and a book
-/// update timestamp. Used by paper-mode post-only rejection so that the
-/// same fixture replays produce the same accept/reject pattern across
-/// runs, while the decision varies per book update (matching real venue:
-/// a previously-rejected post-only may succeed when the book moves).
-fn deterministic_unit_hash(client_order_id: &str, book_update_ms: u64) -> f64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in client_order_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    for byte in book_update_ms.to_le_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    (hash & 0xffff_ffff) as f64 / 4_294_967_296.0
-}
-
-/// Phase 2 paper env: returns true when paper mode should reject a post-
-/// only intent because it would cross the book. Probabilistic (controlled
-/// by paper_post_only_reject_probability) and deterministic per
-/// (client_order_id, book.last_update_unix_ms).
-///
-/// Real Polymarket post-only orders that arrive while the book is crossing
-/// are rejected most of the time, but occasionally slip through as taker
-/// fills because the ack and the book update aren't atomic. This models
-/// that behavior in paper.
-fn paper_post_only_should_reject(
-    intent: &OrderIntent,
-    book: &BookState,
-    execution_policy: &ExecutionPolicy,
-) -> bool {
-    if !execution_policy.paper_mode {
-        return false;
-    }
-    if execution_policy.paper_post_only_reject_probability <= 0.0 {
-        return false;
-    }
-    let crossing = if matches!(intent.side, TradeSide::Buy) {
-        book.best_ask > 0.0 && intent.limit_price >= book.best_ask
-    } else {
-        book.best_bid > 0.0 && intent.limit_price <= book.best_bid
-    };
-    if !crossing {
-        return false;
-    }
-    let roll = deterministic_unit_hash(intent.client_order_id.as_str(), book.last_update_unix_ms);
-    roll < execution_policy.paper_post_only_reject_probability
-}
-
 fn venue_fill_key(fill: &VenueFill) -> String {
     format!(
         "{}:{}:{:.8}:{:.8}:{}",
@@ -4738,7 +3301,7 @@ fn venue_fill_key(fill: &VenueFill) -> String {
     )
 }
 
-fn now_unix_ms() -> u64 {
+pub(super) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -4746,1824 +3309,5 @@ fn now_unix_ms() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use std::sync::Mutex;
-
-    use crate::book::Level;
-    use crate::config::{LogFormat, MarketDiscoveryFamily};
-    use crate::market_context::MarketContextStore;
-    use crate::metrics::StreamKind;
-    use crate::risk::RiskLimits;
-    use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
-    use crate::strategy::NoopStrategy;
-    use crate::wire::execution_adapter::{
-        CancelOrderAck, ExecutionError, MergePositionsAck, MergePositionsRequest, SubmitOrderAck,
-        VenueBalances, VenueFill, VenuePosition,
-    };
-
-    fn runner_test_config() -> AppConfig {
-        AppConfig {
-            service_name: "test".to_string(),
-            strategy_name: "noop".to_string(),
-            paper_mode: false,
-            log_level: "info".to_string(),
-            log_format: LogFormat::Pretty,
-            metrics_bind: "127.0.0.1:0".parse().unwrap(),
-            clob_api_url: "https://clob.polymarket.com".to_string(),
-            data_api_url: "https://data-api.polymarket.com".to_string(),
-            relayer_url: "https://relayer-v2.polymarket.com".to_string(),
-            relayer_api_key: None,
-            relayer_api_key_address: None,
-            ctf_contract_address: "0x0000000000000000000000000000000000000000".to_string(),
-            ctf_collateral_token_address: "0x0000000000000000000000000000000000000000".to_string(),
-            collateral_token_address: "0x0000000000000000000000000000000000000000".to_string(),
-            collateral_decimals: 6,
-            proxy_wallet_address: None,
-            polygon_rpc_url: None,
-            market_ws_url: "wss://example.invalid/market".to_string(),
-            user_ws_url: "wss://example.invalid/user".to_string(),
-            spot_ws_url: "wss://example.invalid/spot".to_string(),
-            spot_rest_bootstrap_url: None,
-            coinbase_spot_ws_url: None,
-            spot_symbol: "btcusdt".to_string(),
-            market_assets: Vec::new(),
-            user_markets: Vec::new(),
-            market_discovery_enabled: false,
-            market_discovery_interval: std::time::Duration::from_secs(60),
-            market_discovery_window: std::time::Duration::from_secs(300),
-            market_discovery_include_prev: 0,
-            market_discovery_include_next: 0,
-            market_discovery_gamma_url: "https://gamma-api.polymarket.com".to_string(),
-            market_discovery_slug_prefix: "btc-updown-5m".to_string(),
-            market_discovery_families: Vec::<MarketDiscoveryFamily>::new(),
-            runtime_loop_interval: std::time::Duration::from_millis(250),
-            summary_log_interval: std::time::Duration::from_secs(30),
-            order_reconcile_interval: std::time::Duration::from_secs(10),
-            order_reconcile_stale_window: std::time::Duration::from_secs(5),
-            runtime_checkpoint_interval: std::time::Duration::from_secs(30),
-            book_stale_after: std::time::Duration::from_secs(5),
-            order_store_path: None,
-            runtime_run_id: None,
-            ping_interval: std::time::Duration::from_secs(10),
-            spot_ws_conn_stale_timeout: std::time::Duration::from_secs(30),
-            spot_ws_data_stale_timeout: std::time::Duration::from_secs(30),
-            market_context_path: None,
-            journal_path: None,
-            journal_rotate_bytes: None,
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            market_id_by_asset: HashMap::new(),
-            risk_limits: RiskLimits::default(),
-            strategy_profile_path: None,
-            strategy_profile: None,
-            user_auth: None,
-            dashboard_whale_events_path: None,
-            dashboard_refresh_ms: 1_000,
-            dashboard_event_limit: 100,
-            audit_path: None,
-            clob_version: "v2".to_string(),
-            clob_v2_builder_code: crate::wire::clob_v2::BYTES32_ZERO.to_string(),
-            clob_v2_metadata: crate::wire::clob_v2::BYTES32_ZERO.to_string(),
-            clob_v2_neg_risk: false,
-            live_post_only: true,
-            live_order_ttl: std::time::Duration::from_secs(60),
-            live_order_max_age: std::time::Duration::from_secs(60),
-            live_reconcile_missing_grace: std::time::Duration::from_secs(5),
-            quote_min_order_age: std::time::Duration::from_millis(250),
-            quote_churn_window: std::time::Duration::from_secs(10),
-            quote_hard_pull: std::time::Duration::from_secs(30),
-            quote_max_churn_per_window: 12,
-            quote_max_submit_per_window: 6,
-            quote_max_replace_per_window: 4,
-            quote_max_cancel_per_window: 12,
-            live_max_submit_errors: 1,
-            live_max_cancel_errors: 1,
-            live_kill_on_reconcile_mismatch: true,
-            live_kill_switch_path: None,
-            live_pusd_auto_wrap: false,
-            live_pusd_auto_wrap_min_usd: 0.01,
-            live_risk_off_auto_recover: std::time::Duration::from_secs(30),
-            paper_min_fill_notional_usd: 0.05,
-            paper_max_fills_per_order: 3,
-            paper_min_fill_interval: std::time::Duration::from_millis(750),
-            paper_market_close_at_ms: None,
-            paper_market_resolution_price: None,
-            paper_submit_latency_ms: 150,
-            paper_queue_depth_fraction: 0.75,
-            paper_post_only_reject_probability: 0.85,
-            paper_cancel_race_window_ms: 500,
-            paper_report_path: None,
-            book_snapshot_log_path: None,
-            book_snapshot_max_levels: 10,
-            paper_maker_rebate_coeff: 0.0,
-            paper_taker_fee_coeff_override: None,
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingAdapter {
-        submitted: Mutex<Vec<ClientOrderId>>,
-        cancelled: Mutex<Vec<ClientOrderId>>,
-        merged: Mutex<Vec<MergePositionsRequest>>,
-        submit_reject_message: Option<String>,
-        cancel_reject_message: Option<String>,
-        merge_accept: bool,
-        open_orders: Vec<crate::wire::execution_adapter::VenueOpenOrder>,
-        fills: Vec<VenueFill>,
-        balances: Option<VenueBalances>,
-        pusd_wrap_min_usd: Mutex<Vec<f64>>,
-        pusd_wrap_fails: bool,
-    }
-
-    #[async_trait]
-    impl ExecutionAdapter for RecordingAdapter {
-        async fn submit(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
-            self.submitted
-                .lock()
-                .expect("submitted lock")
-                .push(req.client_order_id.clone());
-            if let Some(message) = self.submit_reject_message.clone() {
-                return Ok(SubmitOrderAck {
-                    client_order_id: req.client_order_id,
-                    venue_order_id: Some(OrderId::from("venue-submit")),
-                    accepted: false,
-                    accepted_at_ms: req.submitted_at_ms,
-                    venue_message: Some(message),
-                });
-            }
-            Ok(SubmitOrderAck {
-                client_order_id: req.client_order_id,
-                venue_order_id: Some(OrderId::from("venue-submit")),
-                accepted: true,
-                accepted_at_ms: req.submitted_at_ms,
-                venue_message: None,
-            })
-        }
-
-        async fn cancel(&self, req: CancelOrderRequest) -> Result<CancelOrderAck, ExecutionError> {
-            self.cancelled
-                .lock()
-                .expect("cancelled lock")
-                .push(req.client_order_id.clone());
-            if let Some(message) = self.cancel_reject_message.clone() {
-                return Ok(CancelOrderAck {
-                    client_order_id: req.client_order_id,
-                    venue_order_id: req.venue_order_id,
-                    accepted: false,
-                    accepted_at_ms: req.submitted_at_ms,
-                    venue_message: Some(message),
-                });
-            }
-            Ok(CancelOrderAck {
-                client_order_id: req.client_order_id,
-                venue_order_id: req.venue_order_id,
-                accepted: true,
-                accepted_at_ms: req.submitted_at_ms,
-                venue_message: Some("cancelled".to_string()),
-            })
-        }
-
-        async fn merge_positions(
-            &self,
-            req: MergePositionsRequest,
-        ) -> Result<MergePositionsAck, ExecutionError> {
-            self.merged.lock().expect("merged lock").push(req.clone());
-            if !self.merge_accept {
-                return Err(ExecutionError::BadRequest(
-                    "test adapter merge not implemented".to_string(),
-                ));
-            }
-            Ok(MergePositionsAck {
-                command_id: req.command_id,
-                accepted: true,
-                accepted_at_ms: req.submitted_at_ms,
-                venue_message: Some("test merge accepted".to_string()),
-            })
-        }
-
-        async fn ensure_pusd_collateral_from_usdce(
-            &self,
-            min_wrap_usd: f64,
-        ) -> Result<Option<crate::wire::eoa_polygon::PusdWrapReport>, ExecutionError> {
-            self.pusd_wrap_min_usd
-                .lock()
-                .expect("pusd wrap lock")
-                .push(min_wrap_usd);
-            if self.pusd_wrap_fails {
-                return Err(ExecutionError::TransientNetwork(
-                    "test polygon rpc throttle".to_string(),
-                ));
-            }
-            Ok(None)
-        }
-
-        async fn sync_open_orders(
-            &self,
-        ) -> Result<Vec<crate::wire::execution_adapter::VenueOpenOrder>, ExecutionError> {
-            Ok(self.open_orders.clone())
-        }
-
-        async fn sync_balances(&self) -> Result<VenueBalances, ExecutionError> {
-            Ok(self.balances.clone().unwrap_or(VenueBalances {
-                cash_usd: 0.0,
-                positions: Vec::new(),
-                positions_authoritative: false,
-                observed_at_ms: 0,
-            }))
-        }
-
-        async fn sync_recent_fills(
-            &self,
-            _after_ms: u64,
-        ) -> Result<Vec<VenueFill>, ExecutionError> {
-            Ok(self.fills.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
-        let mut config = runner_test_config();
-        config.live_pusd_auto_wrap = true;
-        config.live_pusd_auto_wrap_min_usd = 2.50;
-        let adapter = RecordingAdapter::default();
-
-        maybe_auto_wrap_pusd_after_redeem(&config, &adapter).await;
-
-        assert_eq!(
-            adapter
-                .pusd_wrap_min_usd
-                .lock()
-                .expect("pusd wrap lock")
-                .as_slice(),
-            &[2.50]
-        );
-    }
-
-    #[tokio::test]
-    async fn pusd_auto_wrap_after_redeem_is_disabled_by_config() {
-        let mut config = runner_test_config();
-        config.live_pusd_auto_wrap = false;
-        let adapter = RecordingAdapter::default();
-
-        maybe_auto_wrap_pusd_after_redeem(&config, &adapter).await;
-
-        assert!(adapter
-            .pusd_wrap_min_usd
-            .lock()
-            .expect("pusd wrap lock")
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn pusd_auto_wrap_startup_error_is_non_fatal() {
-        let mut config = runner_test_config();
-        config.live_pusd_auto_wrap = true;
-        config.live_pusd_auto_wrap_min_usd = 2.50;
-        let adapter = RecordingAdapter {
-            pusd_wrap_fails: true,
-            ..RecordingAdapter::default()
-        };
-
-        maybe_auto_wrap_pusd_at_startup(&config, &adapter).await;
-
-        assert_eq!(
-            adapter
-                .pusd_wrap_min_usd
-                .lock()
-                .expect("pusd wrap lock")
-                .as_slice(),
-            &[2.50]
-        );
-    }
-
-    #[tokio::test]
-    async fn live_execution_skips_needs_reconcile_submit_replay() {
-        let mut runtime = runtime_with_recovered_needs_reconcile_order();
-        let adapter = Arc::new(RecordingAdapter {
-            open_orders: vec![crate::wire::execution_adapter::VenueOpenOrder {
-                venue_order_id: OrderId::from("venue-1"),
-                client_order_id: Some(ClientOrderId::from("client-reconcile")),
-                market_id: MarketId::from("market-1"),
-                instrument_id: InstrumentId::from("token-1"),
-                side: TradeSide::Buy,
-                limit_price: 0.40,
-                original_qty: 5.0,
-                remaining_qty: 5.0,
-                created_at_ms: 1,
-            }],
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert!(outcome.commands.is_empty());
-        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
-        assert!(runtime.open_order_snapshots().into_iter().all(|managed| {
-            managed.intent.client_order_id != ClientOrderId::from("client-reconcile")
-        }));
-    }
-
-    #[tokio::test]
-    async fn live_execution_ignores_stale_submit_after_order_left_memory() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        let stale_client_id = ClientOrderId::from("client-filled-before-submit-ack");
-        let stale_intent = OrderIntent {
-            client_order_id: stale_client_id,
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.40,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "stale queued submit".to_string(),
-            quote_level_tag: None,
-            created_at_ms: now_unix_ms(),
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let mut initial_outcome = RuntimeOutcome::default();
-        initial_outcome.push_command(RuntimeCommand::Submit(stale_intent));
-
-        let adapter = Arc::new(RecordingAdapter {
-            submit_reject_message: Some("execution venue rejected submit".to_string()),
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            initial_outcome,
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
-        assert_eq!(live_safety.consecutive_submit_errors, 0);
-        assert_ne!(runtime.status(), RuntimeStatus::Degraded);
-        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
-    }
-
-    #[tokio::test]
-    async fn live_sync_defers_recent_missing_working_order() {
-        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
-        let adapter = Arc::new(RecordingAdapter::default());
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::from([(
-            ClientOrderId::from("client-working"),
-            Some(OrderId::from("venue-1")),
-        )]);
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-        assert!(adapter.cancelled.lock().expect("cancelled lock").is_empty());
-        let order = runtime
-            .open_order_snapshots()
-            .into_iter()
-            .find(|managed| managed.intent.client_order_id == ClientOrderId::from("client-working"))
-            .expect("managed order");
-        assert_eq!(order.status, ManagedOrderStatus::Working);
-    }
-
-    #[tokio::test]
-    async fn live_sync_applies_late_fill_after_order_left_open_memory() {
-        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
-        let client_order_id = ClientOrderId::from("client-working");
-        runtime.on_order_cancelled(&client_order_id, "test cancel before fill", now_unix_ms());
-        assert!(runtime.open_order_snapshots().is_empty());
-
-        let adapter = Arc::new(RecordingAdapter {
-            fills: vec![VenueFill {
-                venue_order_id: OrderId::from("venue-1"),
-                client_order_id: None,
-                market_id: MarketId::from("market-1"),
-                instrument_id: InstrumentId::from("token-1"),
-                side: TradeSide::Buy,
-                price: 0.40,
-                quantity: 5.0,
-                fee_usd: 0.0,
-                liquidity: FillLiquidity::Maker,
-                observed_at_ms: now_unix_ms(),
-            }],
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map =
-            HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        let position = runtime
-            .inventory()
-            .position(&InstrumentId::from("token-1"))
-            .expect("late fill should create inventory");
-        assert_eq!(position.quantity, 5.0);
-        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-        assert_eq!(metrics.snapshot().fill_total, 1);
-        assert_eq!(metrics.snapshot().fill_maker_total, 1);
-    }
-
-    #[tokio::test]
-    async fn live_sync_reconciles_non_empty_venue_position_snapshot() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        assert_eq!(
-            runtime
-                .inventory()
-                .position_qty(&InstrumentId::from("down")),
-            0.0
-        );
-
-        let now_ms = now_unix_ms();
-        let adapter = Arc::new(RecordingAdapter {
-            balances: Some(VenueBalances {
-                cash_usd: 74.89,
-                positions: vec![VenuePosition {
-                    market_id: MarketId::from("market-mm"),
-                    condition_id: None,
-                    instrument_id: InstrumentId::from("down"),
-                    quantity: 6.5,
-                    average_cost_usd: 0.80,
-                    redeemable: false,
-                    mergeable: false,
-                    current_value_usd: 0.0,
-                }],
-                positions_authoritative: true,
-                observed_at_ms: now_ms,
-            }),
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets = vec!["down".to_string()];
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        let position = runtime
-            .inventory()
-            .position(&InstrumentId::from("down"))
-            .expect("venue position should reconcile into runtime inventory");
-        assert_eq!(position.quantity, 6.5);
-        assert_eq!(position.avg_price, 0.80);
-        assert!((runtime.inventory().free_cash_usd() - 74.89).abs() < 1e-9);
-        assert_eq!(runtime.stranded_inventory().len(), 1);
-        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-        assert_eq!(metrics.snapshot().venue_position_count, 1);
-    }
-
-    #[tokio::test]
-    async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merge() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-
-        let now_ms = now_unix_ms();
-        let adapter = Arc::new(RecordingAdapter {
-            balances: Some(VenueBalances {
-                cash_usd: 80.0,
-                positions: vec![
-                    VenuePosition {
-                        market_id: MarketId::from("market-mm"),
-                        condition_id: Some(
-                            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                                .to_string(),
-                        ),
-                        instrument_id: InstrumentId::from("up"),
-                        quantity: 6.5,
-                        average_cost_usd: 0.20,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: 1.30,
-                    },
-                    VenuePosition {
-                        market_id: MarketId::from("market-mm"),
-                        condition_id: Some(
-                            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                                .to_string(),
-                        ),
-                        instrument_id: InstrumentId::from("down"),
-                        quantity: 6.5,
-                        average_cost_usd: 0.79,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: 5.13,
-                    },
-                ],
-                positions_authoritative: true,
-                observed_at_ms: now_ms,
-            }),
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets = vec!["up".to_string(), "down".to_string()];
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert!(outcome
-            .commands
-            .iter()
-            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
-        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
-        assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
-        let merges = adapter.merged.lock().expect("merged lock");
-        assert_eq!(merges.len(), 1);
-        assert_eq!(
-            merges[0].condition_id.as_deref(),
-            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
-        );
-        drop(merges);
-
-        let second_outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("second execute");
-
-        assert!(!second_outcome
-            .commands
-            .iter()
-            .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
-        let merges = adapter.merged.lock().expect("merged lock");
-        assert_eq!(
-            merges.len(),
-            1,
-            "non-retryable merge failure must not resubmit identical CTF recycle tx"
-        );
-    }
-
-    #[tokio::test]
-    async fn live_accepted_merge_suppresses_duplicate_but_allows_later_paired_inventory() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-
-        fn paired_balances(quantity: f64, now_ms: u64) -> VenueBalances {
-            VenueBalances {
-                cash_usd: 80.0,
-                positions: vec![
-                    VenuePosition {
-                        market_id: MarketId::from("market-mm"),
-                        condition_id: Some(
-                            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                                .to_string(),
-                        ),
-                        instrument_id: InstrumentId::from("up"),
-                        quantity,
-                        average_cost_usd: 0.20,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: quantity * 0.20,
-                    },
-                    VenuePosition {
-                        market_id: MarketId::from("market-mm"),
-                        condition_id: Some(
-                            "0x1111111111111111111111111111111111111111111111111111111111111111"
-                                .to_string(),
-                        ),
-                        instrument_id: InstrumentId::from("down"),
-                        quantity,
-                        average_cost_usd: 0.79,
-                        redeemable: false,
-                        mergeable: true,
-                        current_value_usd: quantity * 0.79,
-                    },
-                ],
-                positions_authoritative: true,
-                observed_at_ms: now_ms,
-            }
-        }
-
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets = vec!["up".to_string(), "down".to_string()];
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let now_ms = now_unix_ms();
-        let first_adapter = Arc::new(RecordingAdapter {
-            merge_accept: true,
-            balances: Some(paired_balances(10.0, now_ms)),
-            ..RecordingAdapter::default()
-        });
-
-        execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            first_adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("first execute");
-
-        assert_eq!(runtime.status(), RuntimeStatus::Running);
-        assert_eq!(first_adapter.merged.lock().expect("merged lock").len(), 1);
-
-        let duplicate_snapshot_adapter = Arc::new(RecordingAdapter {
-            merge_accept: true,
-            balances: Some(paired_balances(10.0, now_ms + 1)),
-            ..RecordingAdapter::default()
-        });
-        execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            duplicate_snapshot_adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("duplicate execute");
-
-        assert!(
-            duplicate_snapshot_adapter
-                .merged
-                .lock()
-                .expect("merged lock")
-                .is_empty(),
-            "identical post-ack venue snapshot must not resubmit the same CTF merge"
-        );
-
-        let later_inventory_adapter = Arc::new(RecordingAdapter {
-            merge_accept: true,
-            balances: Some(paired_balances(12.0, now_ms + 2)),
-            ..RecordingAdapter::default()
-        });
-        execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            later_inventory_adapter.clone(),
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("later execute");
-
-        let later_merges = later_inventory_adapter.merged.lock().expect("merged lock");
-        assert_eq!(
-            later_merges.len(),
-            1,
-            "later changed paired inventory should plan and submit a fresh merge"
-        );
-        assert_eq!(later_merges[0].quantity, 12.0);
-    }
-
-    #[tokio::test]
-    async fn live_sync_excludes_inactive_venue_positions_from_strategy_inventory() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-
-        let now_ms = now_unix_ms();
-        let adapter = Arc::new(RecordingAdapter {
-            balances: Some(VenueBalances {
-                cash_usd: 74.89,
-                positions: vec![VenuePosition {
-                    market_id: MarketId::from("old-market"),
-                    condition_id: None,
-                    instrument_id: InstrumentId::from("old-token"),
-                    quantity: 6.5,
-                    average_cost_usd: 0.80,
-                    redeemable: false,
-                    mergeable: false,
-                    current_value_usd: 0.0,
-                }],
-                positions_authoritative: true,
-                observed_at_ms: now_ms,
-            }),
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets = vec!["active-token".to_string()];
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter,
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert_eq!(metrics.snapshot().venue_position_count, 1);
-        assert_eq!(
-            runtime
-                .inventory()
-                .position_qty(&InstrumentId::from("old-token")),
-            0.0
-        );
-        assert_eq!(runtime.inventory().gross_exposure_usd(), 0.0);
-        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-    }
-
-    #[tokio::test]
-    async fn matched_cancel_reject_reconciles_without_risk_off() {
-        let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
-        let client_order_id = ClientOrderId::from("client-working");
-        let cancel_outcome =
-            runtime.request_cancel_order(&client_order_id, now_unix_ms(), "test cancel race");
-
-        let adapter = Arc::new(RecordingAdapter {
-            cancel_reject_message: Some("matched orders can't be canceled".to_string()),
-            fills: vec![VenueFill {
-                venue_order_id: OrderId::from("venue-1"),
-                client_order_id: None,
-                market_id: MarketId::from("market-1"),
-                instrument_id: InstrumentId::from("token-1"),
-                side: TradeSide::Buy,
-                price: 0.40,
-                quantity: 5.0,
-                fee_usd: 0.0,
-                liquidity: FillLiquidity::Maker,
-                observed_at_ms: now_unix_ms(),
-            }],
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets = vec!["token-1".to_string()];
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map =
-            HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            cancel_outcome,
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter,
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert_ne!(runtime.status(), RuntimeStatus::Degraded);
-        assert_eq!(live_safety.consecutive_cancel_errors, 0);
-        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
-        assert_eq!(
-            runtime
-                .inventory()
-                .position_qty(&InstrumentId::from("token-1")),
-            5.0
-        );
-    }
-
-    #[tokio::test]
-    async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        let now_ms = now_unix_ms();
-        runtime
-            .reconcile_venue_positions(
-                &[VenuePositionSnapshot {
-                    market_id: MarketId::from("market-mm"),
-                    condition_id: None,
-                    instrument_id: InstrumentId::from("down"),
-                    quantity: 6.5,
-                    average_cost_usd: 0.80,
-                    mark_price: None,
-                    observed_at_ms: now_ms,
-                }],
-                now_ms,
-            )
-            .expect("seed inventory");
-        assert_eq!(
-            runtime
-                .inventory()
-                .position_qty(&InstrumentId::from("down")),
-            6.5
-        );
-
-        let adapter = Arc::new(RecordingAdapter {
-            balances: Some(VenueBalances {
-                cash_usd: 80.0,
-                positions: Vec::new(),
-                positions_authoritative: true,
-                observed_at_ms: now_ms.saturating_add(1),
-            }),
-            ..RecordingAdapter::default()
-        });
-        let metrics = AppMetrics::new().expect("metrics");
-        let assets: Vec<String> = Vec::new();
-        let books = Arc::new(BookStore::new(&assets));
-        let mut paper_order_ctx = HashMap::new();
-        let mut execution_venue_map = HashMap::new();
-        let mut live_safety = LiveSafetyState::default();
-        let execution_policy = live_test_policy();
-        let mut seen_venue_fill_keys = HashSet::new();
-
-        let _outcome = execute_execution_adapter(
-            &mut runtime,
-            &books,
-            &assets,
-            0.0,
-            &metrics,
-            RuntimeOutcome::default(),
-            &mut paper_order_ctx,
-            &mut execution_venue_map,
-            &mut live_safety,
-            adapter,
-            &execution_policy,
-            &mut seen_venue_fill_keys,
-            None,
-        )
-        .await
-        .expect("execute");
-
-        assert_eq!(
-            runtime
-                .inventory()
-                .position_qty(&InstrumentId::from("down")),
-            0.0
-        );
-        assert_eq!(metrics.snapshot().venue_position_count, 0);
-        assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-    }
-
-    #[test]
-    fn user_fill_resolves_client_order_from_venue_order_id() {
-        let execution_venue_map = HashMap::from([(
-            ClientOrderId::from("client-1"),
-            Some(OrderId::from("venue-1")),
-        )]);
-
-        assert_eq!(
-            resolve_user_event_client_order_id(None, Some("venue-1"), &execution_venue_map),
-            Some("client-1".to_string())
-        );
-        assert_eq!(
-            resolve_user_event_client_order_id(
-                Some("client-direct".to_string()),
-                Some("venue-1"),
-                &execution_venue_map,
-            ),
-            Some("client-direct".to_string())
-        );
-    }
-
-    #[test]
-    fn live_submit_request_uses_post_only_gtd_with_expiry() {
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-ttl"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.40,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test live lifecycle".to_string(),
-            quote_level_tag: Some("lvl-1:test".to_string()),
-            created_at_ms: 10,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = live_test_policy();
-        let request = submit_request_from_intent(&intent, 1_000, &policy);
-        assert!(request.post_only);
-        assert_eq!(request.time_in_force, TimeInForce::Gtd);
-        assert_eq!(request.expires_at_ms, Some(21_000));
-    }
-
-    #[test]
-    fn late_bar_core_submit_uses_gtd_with_60s_ttl_and_post_only() {
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-late-core"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.93,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test late bar core".to_string(),
-            quote_level_tag: Some("mm-late-bar-core:l1".to_string()),
-            created_at_ms: 10,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = live_test_policy();
-        let request = submit_request_from_intent(&intent, 1_000, &policy);
-        assert_eq!(request.time_in_force, TimeInForce::Gtd);
-        assert!(request.post_only);
-        assert_eq!(request.expires_at_ms, Some(61_000));
-    }
-
-    #[test]
-    fn generic_post_only_submit_reject_does_not_consume_live_budget() {
-        assert!(!submit_rejection_counts_against_live_budget(
-            "execution venue rejected submit",
-            true
-        ));
-        assert!(submit_rejection_counts_against_live_budget(
-            "execution venue rejected submit",
-            false
-        ));
-        assert!(submit_rejection_counts_against_live_budget(
-            "insufficient balance",
-            true
-        ));
-    }
-
-    #[test]
-    fn portfolio_equity_floor_uses_stricter_absolute_or_session_loss_floor() {
-        let risk_limits = RiskLimits {
-            min_portfolio_equity_usd: 60.0,
-            max_session_loss_usd: 25.0,
-            ..RiskLimits::default()
-        };
-
-        assert_eq!(portfolio_equity_floor_usd(&risk_limits, 100.0), Some(75.0));
-
-        let risk_limits = RiskLimits {
-            min_portfolio_equity_usd: 90.0,
-            max_session_loss_usd: 25.0,
-            ..RiskLimits::default()
-        };
-
-        assert_eq!(portfolio_equity_floor_usd(&risk_limits, 100.0), Some(90.0));
-        assert_eq!(
-            portfolio_equity_floor_usd(&RiskLimits::default(), 100.0),
-            None
-        );
-    }
-
-    #[test]
-    fn capital_guard_sets_riskoff_when_marked_equity_breaks_floor() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Running,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        runtime
-            .on_fill(FillReport {
-                order_id: None,
-                client_order_id: None,
-                market_id: MarketId::from("market-1"),
-                instrument_id: InstrumentId::from("token-1"),
-                side: TradeSide::Buy,
-                price: 0.60,
-                quantity: 100.0,
-                fee_usd: 0.0,
-                liquidity: FillLiquidity::Maker,
-                close_method: None,
-                observed_at_ms: 1,
-            })
-            .expect("fill");
-        runtime
-            .reconcile_venue_positions(
-                &[VenuePositionSnapshot {
-                    market_id: MarketId::from("market-1"),
-                    condition_id: None,
-                    instrument_id: InstrumentId::from("token-1"),
-                    quantity: 100.0,
-                    average_cost_usd: 0.60,
-                    mark_price: Some(0.30),
-                    observed_at_ms: 2,
-                }],
-                2,
-            )
-            .expect("reconcile");
-
-        let metrics = AppMetrics::new().expect("metrics");
-        let outcome = enforce_capital_guard(
-            &mut runtime,
-            &metrics,
-            &RiskLimits {
-                max_session_loss_usd: 20.0,
-                ..RiskLimits::default()
-            },
-            100.0,
-            3,
-            "paper",
-        );
-
-        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
-        assert!(!outcome.event_seqs.is_empty());
-        assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
-    }
-
-    #[test]
-    fn live_riskoff_auto_recover_promotes_running_after_healthy_window() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::RiskOff,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        let metrics = AppMetrics::new().expect("metrics");
-        metrics.set_stream_connected(StreamKind::Market, true);
-        metrics.set_stream_connected(StreamKind::User, true);
-        metrics.set_execution_adapter_connected(true);
-        let config = runner_test_config();
-        let live_safety = LiveSafetyState {
-            last_venue_cash_usd: Some(100.0),
-            ..LiveSafetyState::default()
-        };
-
-        let early =
-            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 5_000, 0);
-        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
-        assert!(early.event_seqs.is_empty());
-
-        let recovered =
-            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
-        assert_eq!(runtime.status(), RuntimeStatus::Running);
-        assert!(!recovered.event_seqs.is_empty());
-        assert!(runtime
-            .event_log()
-            .recent(4)
-            .iter()
-            .any(|event| event.message.contains("runtime risk-off auto-recovered")));
-    }
-
-    #[test]
-    fn live_degraded_auto_recover_promotes_running_after_healthy_window() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Degraded,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        let metrics = AppMetrics::new().expect("metrics");
-        metrics.set_stream_connected(StreamKind::Market, true);
-        metrics.set_stream_connected(StreamKind::User, true);
-        metrics.set_execution_adapter_connected(true);
-        let config = runner_test_config();
-        let live_safety = LiveSafetyState {
-            last_venue_cash_usd: Some(100.0),
-            ..LiveSafetyState::default()
-        };
-
-        let early =
-            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 5_000, 0);
-        assert_eq!(runtime.status(), RuntimeStatus::Degraded);
-        assert!(early.event_seqs.is_empty());
-
-        let recovered =
-            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
-        assert_eq!(runtime.status(), RuntimeStatus::Running);
-        assert!(!recovered.event_seqs.is_empty());
-        assert!(runtime
-            .event_log()
-            .recent(4)
-            .iter()
-            .any(|event| event.message.contains("runtime degraded auto-recovered")));
-    }
-
-    #[test]
-    fn live_riskoff_auto_recover_stays_riskoff_when_health_not_clean() {
-        let mut runtime = Runtime::new(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::RiskOff,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-        );
-        let metrics = AppMetrics::new().expect("metrics");
-        metrics.set_stream_connected(StreamKind::Market, true);
-        metrics.set_stream_connected(StreamKind::User, true);
-        metrics.set_execution_adapter_connected(true);
-        let config = runner_test_config();
-        let live_safety = LiveSafetyState::default();
-
-        let outcome =
-            auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
-        assert_eq!(runtime.status(), RuntimeStatus::RiskOff);
-        assert!(outcome.event_seqs.is_empty());
-    }
-
-    #[test]
-    fn conservative_paper_fill_does_not_refill_same_book_update() {
-        let now_ms = now_unix_ms();
-        let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-paper"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.50,
-            quantity: 20.0,
-            reduce_only: false,
-            reason: "test paper fill".to_string(),
-            quote_level_tag: None,
-            created_at_ms: now_ms,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = paper_test_policy();
-        let mut ctx = PaperOrderContext {
-            arrival_ms: now_ms,
-            queue_bias: 0.5,
-            last_attempt_ms: now_ms,
-            last_fill_ms: 0,
-            last_fill_book_update_ms: 0,
-            fill_count: 0,
-            cancel_requested_at_ms: None,
-        };
-        // Past the paper_submit_latency_ms gate (Phase 2 conservative model).
-        let after_latency_ms = now_ms + policy.paper_submit_latency_ms + 50;
-        let first = paper_fill_from_book_snapshot(
-            &book,
-            &intent,
-            after_latency_ms,
-            0.0,
-            &mut ctx,
-            intent.quantity,
-            &policy,
-        )
-        .expect("first fill");
-        assert!(first.notional_usd() >= policy.paper_min_fill_notional_usd);
-        let second = paper_fill_from_book_snapshot(
-            &book,
-            &intent,
-            after_latency_ms + 1_000,
-            0.0,
-            &mut ctx,
-            intent.quantity - first.quantity,
-            &policy,
-        );
-        assert!(second.is_none());
-    }
-
-    #[test]
-    fn paper_post_only_should_reject_returns_false_outside_paper_mode() {
-        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-postonly"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.51,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test post-only".to_string(),
-            quote_level_tag: None,
-            created_at_ms: 1_000,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = live_test_policy();
-        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
-    }
-
-    #[test]
-    fn paper_post_only_should_reject_skips_non_crossing_orders() {
-        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.55, 100.0, 0.50, 1_000);
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-postonly-noncross"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.50,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test post-only no cross".to_string(),
-            quote_level_tag: None,
-            created_at_ms: 1_000,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = paper_test_policy();
-        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
-    }
-
-    #[test]
-    fn paper_post_only_should_reject_at_high_probability_when_crossing() {
-        let book = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
-        let mut policy = paper_test_policy();
-        policy.paper_post_only_reject_probability = 1.0;
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-postonly-cross"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.51,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test post-only cross".to_string(),
-            quote_level_tag: None,
-            created_at_ms: 1_000,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        // probability 1.0 always rejects when crossing
-        assert!(paper_post_only_should_reject(&intent, &book, &policy));
-        // probability 0.0 never rejects
-        policy.paper_post_only_reject_probability = 0.0;
-        assert!(!paper_post_only_should_reject(&intent, &book, &policy));
-    }
-
-    #[test]
-    fn paper_post_only_reject_decision_is_deterministic_per_book_update() {
-        let book_a = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 1_000);
-        let book_b = BookState::from_top_of_book("token-1", 0.49, 100.0, 0.50, 100.0, 0.50, 2_000);
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-determinism"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.51,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "determinism".to_string(),
-            quote_level_tag: None,
-            created_at_ms: 1_000,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let mut policy = paper_test_policy();
-        policy.paper_post_only_reject_probability = 0.5;
-        // Same book, same decision repeated
-        let r1 = paper_post_only_should_reject(&intent, &book_a, &policy);
-        let r2 = paper_post_only_should_reject(&intent, &book_a, &policy);
-        assert_eq!(r1, r2, "same book update must give same decision");
-        // Decision varies independently across book updates (one of these is
-        // exceedingly unlikely to fail; if it ever does, the hash is broken).
-        let _r_b = paper_post_only_should_reject(&intent, &book_b, &policy);
-    }
-
-    #[test]
-    fn resting_order_when_book_moves_into_us_fills_as_maker_at_limit() {
-        // Real venue: resting limit buy at 0.45; book moves so best_ask
-        // drops to 0.43; a new sell at 0.45 hits our resting buy → we
-        // fill at 0.45 (our limit) as MAKER (price improvement to seller).
-        // The paper model used to misclassify this as Taker at 0.43.
-        let now_ms = now_unix_ms();
-        // Arrival in the past so order is "resting" (past submit-latency).
-        let arrival_ms = now_ms - 5_000;
-        let mut book =
-            BookState::from_top_of_book("token-1", 0.42, 150.0, 0.43, 150.0, 0.43, now_ms);
-        book.bids = vec![Level {
-            price: 0.42,
-            size: 150.0,
-        }];
-        book.asks = vec![Level {
-            price: 0.43,
-            size: 150.0,
-        }];
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-resting-maker"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.45,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test resting maker fill".to_string(),
-            quote_level_tag: None,
-            created_at_ms: arrival_ms,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let mut policy = paper_test_policy();
-        policy.paper_post_only_reject_probability = 0.0; // skip reject path
-        let mut ctx = PaperOrderContext {
-            arrival_ms,
-            queue_bias: 0.5,
-            last_attempt_ms: arrival_ms,
-            last_fill_ms: 0,
-            last_fill_book_update_ms: 0,
-            fill_count: 0,
-            cancel_requested_at_ms: None,
-        };
-        let fill = paper_fill_from_book_snapshot(
-            &book,
-            &intent,
-            now_ms,
-            0.0,
-            &mut ctx,
-            intent.quantity,
-            &policy,
-        )
-        .expect("expected resting maker fill when book crossed into us");
-        assert!(
-            matches!(fill.liquidity, FillLiquidity::Maker),
-            "expected Maker liquidity for resting order book moved into us, got {:?}",
-            fill.liquidity
-        );
-        assert!(
-            (fill.price - 0.45).abs() < 1e-9,
-            "expected fill at our limit price 0.45, got {}",
-            fill.price
-        );
-    }
-
-    #[test]
-    fn fresh_submit_into_crossed_book_fills_as_taker_at_opposite() {
-        // Counterexample: a brand-new submit at 0.45 when book ask is
-        // already at 0.43 IS a taker scenario (we crossed at submit time).
-        // Fill at best_opposite 0.43 with Taker liquidity.
-        let now_ms = now_unix_ms();
-        let mut book =
-            BookState::from_top_of_book("token-1", 0.42, 150.0, 0.43, 150.0, 0.43, now_ms);
-        book.bids = vec![Level {
-            price: 0.42,
-            size: 150.0,
-        }];
-        book.asks = vec![Level {
-            price: 0.43,
-            size: 150.0,
-        }];
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-fresh-taker"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.45,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test fresh taker".to_string(),
-            quote_level_tag: None,
-            created_at_ms: now_ms,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let mut policy = paper_test_policy();
-        policy.paper_post_only_reject_probability = 0.0; // bypass reject for the test
-        policy.paper_min_fill_notional_usd = 0.0; // allow tiny initial fill ratio
-                                                  // arrival_ms == now_ms; well within submit-latency window (default 150ms).
-        let mut ctx = PaperOrderContext {
-            arrival_ms: now_ms,
-            queue_bias: 0.5,
-            last_attempt_ms: now_ms,
-            last_fill_ms: 0,
-            last_fill_book_update_ms: 0,
-            fill_count: 0,
-            cancel_requested_at_ms: None,
-        };
-        // submit-latency gate would normally suppress; advance the
-        // observed_at_ms by exactly the latency window so a fill is
-        // possible but order is still "fresh" (not aged past it).
-        let observed = now_ms + policy.paper_submit_latency_ms;
-        let fill = paper_fill_from_book_snapshot(
-            &book,
-            &intent,
-            observed,
-            0.0,
-            &mut ctx,
-            intent.quantity,
-            &policy,
-        )
-        .expect("expected taker fill at submit-latency boundary");
-        assert!(
-            matches!(fill.liquidity, FillLiquidity::Taker),
-            "expected Taker for fresh crossing submit, got {:?}",
-            fill.liquidity
-        );
-        assert!(
-            (fill.price - 0.43).abs() < 1e-9,
-            "expected fill at best_ask 0.43, got {}",
-            fill.price
-        );
-    }
-
-    #[test]
-    fn paper_submit_latency_gate_suppresses_fill_until_window_passes() {
-        let now_ms = now_unix_ms();
-        let book = BookState::from_top_of_book("token-1", 0.48, 100.0, 0.50, 100.0, 0.50, now_ms);
-        let intent = OrderIntent {
-            client_order_id: ClientOrderId::from("client-latency"),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.50,
-            quantity: 20.0,
-            reduce_only: false,
-            reason: "test latency gate".to_string(),
-            quote_level_tag: None,
-            created_at_ms: now_ms,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        };
-        let policy = paper_test_policy();
-        assert!(
-            policy.paper_submit_latency_ms >= 100,
-            "test assumes default >= 100ms; got {}",
-            policy.paper_submit_latency_ms
-        );
-        let mut ctx = PaperOrderContext {
-            arrival_ms: now_ms,
-            queue_bias: 0.5,
-            last_attempt_ms: now_ms,
-            last_fill_ms: 0,
-            last_fill_book_update_ms: 0,
-            fill_count: 0,
-            cancel_requested_at_ms: None,
-        };
-        // Within latency window: suppressed.
-        let inside = paper_fill_from_book_snapshot(
-            &book,
-            &intent,
-            now_ms + policy.paper_submit_latency_ms - 1,
-            0.0,
-            &mut ctx,
-            intent.quantity,
-            &policy,
-        );
-        assert!(
-            inside.is_none(),
-            "expected no fill inside latency window, got {inside:?}"
-        );
-        // Past latency window with fresh book update: allowed.
-        let later_book = BookState::from_top_of_book(
-            "token-1",
-            0.48,
-            100.0,
-            0.50,
-            100.0,
-            0.50,
-            now_ms + policy.paper_submit_latency_ms + 50,
-        );
-        let outside = paper_fill_from_book_snapshot(
-            &later_book,
-            &intent,
-            now_ms + policy.paper_submit_latency_ms + 50,
-            0.0,
-            &mut ctx,
-            intent.quantity,
-            &policy,
-        );
-        assert!(outside.is_some(), "expected fill past latency window");
-    }
-
-    fn live_test_policy() -> ExecutionPolicy {
-        ExecutionPolicy {
-            paper_mode: false,
-            live_post_only: true,
-            live_order_ttl_ms: 20_000,
-            live_order_max_age_ms: 25_000,
-            live_reconcile_missing_grace_ms: 5_000,
-            live_max_submit_errors: 1,
-            live_max_cancel_errors: 1,
-            live_kill_on_reconcile_mismatch: true,
-            paper_min_fill_notional_usd: 0.05,
-            paper_max_fills_per_order: 3,
-            paper_min_fill_interval_ms: 750,
-            paper_market_close_at_ms: None,
-            paper_market_resolution_price: None,
-            paper_submit_latency_ms: 150,
-            paper_queue_depth_fraction: 0.75,
-            paper_post_only_reject_probability: 0.85,
-            paper_cancel_race_window_ms: 500,
-            paper_maker_rebate_coeff: 0.0,
-            paper_taker_fee_coeff_override: None,
-        }
-    }
-
-    #[test]
-    fn deterministic_v2_amount_rejections_require_immediate_live_stop() {
-        assert!(submit_rejection_requires_immediate_live_stop(
-            "V2 SDK build_sign_and_post: Api error: status 400 Bad Request: invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals, taker amount a max of 4 decimals"
-        ));
-        assert!(submit_rejection_requires_immediate_live_stop(
-            "Validation: invalid: Unable to build Order: Size 9.090909 has 6 decimal places"
-        ));
-        assert!(!submit_rejection_requires_immediate_live_stop(
-            "invalid post-only order: order crosses book"
-        ));
-    }
-
-    fn paper_test_policy() -> ExecutionPolicy {
-        ExecutionPolicy {
-            paper_mode: true,
-            ..live_test_policy()
-        }
-    }
-
-    fn runtime_with_recovered_needs_reconcile_order() -> Runtime<StrategyMode> {
-        runtime_with_recovered_order(
-            ClientOrderId::from("client-reconcile"),
-            ManagedOrderStatus::NeedsReconcile,
-            1,
-            "polymarket-exec-live-reconcile-replay",
-        )
-    }
-
-    fn runtime_with_recovered_working_order(last_update_ms: u64) -> Runtime<StrategyMode> {
-        runtime_with_recovered_order(
-            ClientOrderId::from("client-working"),
-            ManagedOrderStatus::Working,
-            last_update_ms,
-            "polymarket-exec-live-working-replay",
-        )
-    }
-
-    fn runtime_with_recovered_order(
-        client_order_id: ClientOrderId,
-        status: ManagedOrderStatus,
-        last_update_ms: u64,
-        path_prefix: &str,
-    ) -> Runtime<StrategyMode> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("{path_prefix}-{ts}.sqlite"));
-        let mut store = SqliteOrderStore::open(&path).expect("store");
-        let mut record = OrderRecord::from_intent(
-            "run-test",
-            &OrderIntent {
-                client_order_id,
-                market_id: MarketId::from("market-1"),
-                instrument_id: InstrumentId::from("token-1"),
-                side: TradeSide::Buy,
-                limit_price: 0.40,
-                quantity: 5.0,
-                reduce_only: false,
-                reason: "test recovered live order".to_string(),
-                quote_level_tag: None,
-                created_at_ms: last_update_ms,
-                pair_id: None,
-                kind: crate::types::IntentKind::Entry,
-            },
-            "noop",
-        );
-        record.status = status;
-        record.last_update_ms = last_update_ms;
-        store.insert(record).expect("insert order");
-
-        let mut runtime = Runtime::new_with_order_store(
-            RuntimeConfig {
-                starting_cash_usd: 100.0,
-                event_log_capacity: 128,
-                initial_status: RuntimeStatus::Starting,
-                ..RuntimeConfig::default()
-            },
-            RiskLimits::default(),
-            StrategyMode::Noop(NoopStrategy),
-            MarketContextStore::empty(),
-            Some(Box::new(store)),
-            "run-test".to_string(),
-        );
-        runtime.recover_from_store(10_000, 100);
-        let _ = std::fs::remove_file(path);
-        runtime
-    }
-}
+#[path = "../../tests/unit/runtime_runner.rs"]
+mod runner_tests;

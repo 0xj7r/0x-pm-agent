@@ -89,9 +89,9 @@ the same PR's commit message even if you ship V1.
 Launcher (`scripts/*.sh`) env exports MUST match what `config/mod.rs`
 parses, exactly. We've shipped 2 silent-failure bugs from this:
 
-- `WHALE_PAIR_JOURNAL_PATH` (launcher) vs `WHALE_PAIR_EXEC_JOURNAL_PATH`
+- `PM_BTC_5M_JOURNAL_PATH` (launcher) vs `PM_BTC_5M_EXEC_JOURNAL_PATH`
   (parser) → tinylive ran with no decision log on disk.
-- `WHALE_PAIR_LIVE_AUTO_REDEEM` parsed by binary but never set by any
+- `PM_BTC_5M_LIVE_AUTO_REDEEM` parsed by binary but never set by any
   launcher → auto-redeem silently disabled in production.
 
 **Before shipping any new env knob:** grep both directions

@@ -104,6 +104,13 @@ pub struct RelayerSubmitAck {
     pub transaction_hash: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtfMergeDryRunReport {
+    pub from: Address,
+    pub to: Address,
+    pub calldata_hex: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayPayload {
@@ -154,7 +161,7 @@ impl CtfRelayerClient {
                 .polygon_rpc_url
                 .as_ref()
                 .filter(|url| !url.trim().is_empty())
-                .map(|url| EoaPolygonSubmitter::new(url.clone()))
+                .map(|url| EoaPolygonSubmitter::from_env(url.clone()))
         } else {
             None
         };
@@ -189,6 +196,29 @@ impl CtfRelayerClient {
                 "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
             ))),
         }
+    }
+
+    pub async fn dry_run_merge_positions(
+        &self,
+        request: &CtfMergeRequest,
+    ) -> Result<CtfMergeDryRunReport, ExecutionError> {
+        let rpc_url = self.config.polygon_rpc_url.as_ref().ok_or_else(|| {
+            ExecutionError::BadRequest(
+                "CTF merge dry-run requires POLYGON_RPC_URL to be configured".to_string(),
+            )
+        })?;
+        let submitter = EoaPolygonSubmitter::from_env(rpc_url.clone());
+        let to = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let from = self.merge_actor_address(&request.signer)?;
+        let calldata = self.merge_positions_calldata(&request.condition_id, request.quantity)?;
+        submitter
+            .simulate_call(from, to, Bytes::from(calldata.clone()))
+            .await?;
+        Ok(CtfMergeDryRunReport {
+            from,
+            to,
+            calldata_hex: calldata.encode_hex_with_prefix(),
+        })
     }
 
     pub async fn redeem_positions(
@@ -242,6 +272,16 @@ impl CtfRelayerClient {
             state: Some("MINED".to_string()),
             transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
         })
+    }
+
+    fn merge_actor_address(&self, signer: &PrivateKeySigner) -> Result<Address, ExecutionError> {
+        match self.config.signature_type_code {
+            0 => Ok(signer.address()),
+            1 => self.proxy_wallet(signer.address()),
+            other => Err(ExecutionError::BadRequest(format!(
+                "CTF merge dry-run supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+            ))),
+        }
     }
 
     async fn submit_eoa_redeem(

@@ -6,8 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/go/polymarket-agent
-Environment=WHALE_PAIR_ROOT_DIR=%h/go/polymarket-agent
-Environment=WHALE_PAIR_AWS_BIN=aws
+Environment=PM_EXEC_ROOT_DIR=%h/go/polymarket-agent
+Environment=PM_BTC_5M_AWS_BIN=aws
 EnvironmentFile=-%h/.config/polymarket-exec/common.env
-ExecStart=/usr/bin/env bash -lc '$WHALE_PAIR_ROOT_DIR/polymarket-exec/scripts/archive_paper_artifacts.sh'
-
+ExecStart=/usr/bin/env bash -lc '$PM_EXEC_ROOT_DIR/polymarket-exec/scripts/archive_paper_artifacts.sh'

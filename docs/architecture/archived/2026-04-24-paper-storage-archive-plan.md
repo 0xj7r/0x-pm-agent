@@ -16,7 +16,7 @@ Do **not** use Postgres/Supabase for raw paper journal storage in v1.
 ### Hot path
 
 - `polymarket-exec` can now rotate journals locally with:
-  - `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES`
+  - `PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES`
 - the runtime SQLite now stores:
   - durable orders
   - compact unlawful signal snapshots
@@ -65,17 +65,17 @@ rotation may not actually be enabled in the live launcher environment.
 Set in `~/.config/polymarket-exec/common.env` or `.env`:
 
 ```bash
-WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES=268435456
-WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent
-WHALE_PAIR_ARCHIVE_STORAGE_CLASS=DEEP_ARCHIVE
-WHALE_PAIR_ARCHIVE_MIN_AGE_MINUTES=30
-WHALE_PAIR_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=false
-WHALE_PAIR_ARCHIVE_INCLUDE_PRE_FIX=true
-WHALE_PAIR_ARCHIVE_INCLUDE_RUNTIME_PRE_FIX=true
-WHALE_PAIR_ARCHIVE_INCLUDE_ROTATED_SEGMENTS=true
-WHALE_PAIR_ARCHIVE_ACTIVE_JOURNAL_WARN_BYTES=1073741824
-WHALE_PAIR_ARCHIVE_LIST_ONLY=false
-WHALE_PAIR_ARCHIVE_DRY_RUN=false
+PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES=268435456
+PM_BTC_5M_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent
+PM_BTC_5M_ARCHIVE_STORAGE_CLASS=DEEP_ARCHIVE
+PM_BTC_5M_ARCHIVE_MIN_AGE_MINUTES=30
+PM_BTC_5M_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=false
+PM_BTC_5M_ARCHIVE_INCLUDE_PRE_FIX=true
+PM_BTC_5M_ARCHIVE_INCLUDE_RUNTIME_PRE_FIX=true
+PM_BTC_5M_ARCHIVE_INCLUDE_ROTATED_SEGMENTS=true
+PM_BTC_5M_ARCHIVE_ACTIVE_JOURNAL_WARN_BYTES=1073741824
+PM_BTC_5M_ARCHIVE_LIST_ONLY=false
+PM_BTC_5M_ARCHIVE_DRY_RUN=false
 ```
 
 Recommended defaults:
@@ -93,22 +93,22 @@ Recommended defaults:
 Dry-run archive pass:
 
 ```bash
-WHALE_PAIR_ARCHIVE_DRY_RUN=true \
-WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
+PM_BTC_5M_ARCHIVE_DRY_RUN=true \
+PM_BTC_5M_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
 polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Cheap local candidate listing with no AWS dependency:
 
 ```bash
-WHALE_PAIR_ARCHIVE_LIST_ONLY=true \
+PM_BTC_5M_ARCHIVE_LIST_ONLY=true \
 polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Manual archive pass:
 
 ```bash
-WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
+PM_BTC_5M_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
 polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
@@ -137,7 +137,7 @@ If local disk is critically full:
 
 Before trusting the archive path, verify both of these:
 
-1. `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES` is present in the real host env
+1. `PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES` is present in the real host env
    that systemd or the launcher is using, not just in `.env.example`.
 2. Rotated segments are actually appearing under
    `polymarket-exec/data/execution/paper/*/journal.<ts>.jsonl`.
@@ -156,7 +156,7 @@ Use this order:
 1. Run a cheap local listing first:
 
 ```bash
-WHALE_PAIR_ARCHIVE_LIST_ONLY=true \
+PM_BTC_5M_ARCHIVE_LIST_ONLY=true \
 polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
@@ -169,8 +169,8 @@ aws sts get-caller-identity
 3. Then do a non-destructive upload test:
 
 ```bash
-WHALE_PAIR_ARCHIVE_DRY_RUN=true \
-WHALE_PAIR_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
+PM_BTC_5M_ARCHIVE_DRY_RUN=true \
+PM_BTC_5M_ARCHIVE_S3_URI=s3://your-bucket/polymarket-agent \
 polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 

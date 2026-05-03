@@ -47,8 +47,8 @@ polymarket-exec/scripts/run_sleeve.sh unlawful_broad_hours
 Notes:
 
 - Launcher refreshes prev/current/next BTC 5m slate every `45s` by default.
-- Override with `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=<n>`.
-- Set `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=0` to disable auto-refresh supervision.
+- Override with `PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=<n>`.
+- Set `PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=0` to disable auto-refresh supervision.
 
 ## Tests and validation
 
@@ -157,7 +157,7 @@ Runtime writes under crate-local data paths:
 
 Before any live capital:
 
-- run `WHALE_PAIR_EXEC_MODE=live_smoke` submit/open-sync/cancel/disappear check
+- run `PM_BTC_5M_EXEC_MODE=live_smoke` submit/open-sync/cancel/disappear check
 - verify startup reconciliation against venue open orders
 - ensure user websocket auth + event flow are healthy
 - keep one sleeve and tiny notional until post-trade reconciliation is stable
