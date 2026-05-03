@@ -91,6 +91,11 @@ where
             decision.ladder.diagnostics.no_reservation
         ));
 
+        if let Some(intent) = decision.capital_recycle_intent().cloned() {
+            notes.push("paired-mm capital recycle emitted".to_string());
+            return StrategyDecision::capital_recycle(vec![intent], notes);
+        }
+
         if let Some(reason) = PairedMmEngine::suppression_reason(&decision) {
             return StrategyDecision::suppress(reason, false, notes);
         }

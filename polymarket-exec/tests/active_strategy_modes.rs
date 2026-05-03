@@ -358,6 +358,44 @@ fn paired_mm_emits_two_sided_ladder_quotes() {
 }
 
 #[test]
+fn paired_mm_emits_capital_recycle_when_inventory_is_one_sided() {
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![position(&market_id, &yes_id, 20.0, 0.20, 120_000)]),
+        100.0,
+    );
+
+    let decision = drive_two_books(
+        "paired_mm",
+        &ctx,
+        quote(0.70, 0.71, 120_000),
+        quote(0.20, 0.21, 120_000),
+    );
+
+    assert!(
+        matches!(decision, StrategyDecision::Reactive { .. }),
+        "{decision:?}"
+    );
+    let intents = decision.intents();
+    assert_eq!(intents.len(), 1, "{decision:?}");
+    assert_eq!(intents[0].instrument_id, no_id);
+    assert_eq!(
+        intents[0].quote_level_tag.as_deref(),
+        Some("mm-capital-recycle:no:CapitalRecycle")
+    );
+    assert!(decision
+        .notes()
+        .iter()
+        .any(|note| note.contains("paired-mm capital recycle emitted")));
+}
+
+#[test]
 fn hybrid_mode_combines_pair_cost_and_paired_mm_outputs() {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
@@ -471,10 +509,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(paired_mm_config.capital_recycle.pair_cost_target, 0.99);
     assert_eq!(paired_mm_config.capital_recycle.min_imbalance_qty, 5.0);
     assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 25.0);
-    assert_eq!(
-        paired_mm_config.capital_recycle.max_buy_notional_usd,
-        2.50
-    );
+    assert_eq!(paired_mm_config.capital_recycle.max_buy_notional_usd, 2.50);
     assert_eq!(
         paired_mm_config.capital_recycle.min_time_remaining_ms,
         90_000
