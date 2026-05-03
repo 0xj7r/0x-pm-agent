@@ -134,8 +134,8 @@ elif [[ -n "$RESTART_CMD" ]]; then
   log "running custom restart command"
   ssh_base "$RESTART_CMD"
 elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
-  log "running poly-safe-restart for ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
-  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
+  log "running poly-safe-restart for ${AWS_LIVE_SLEEVE:-btc_5m_paired_mm_tinylive}"
+  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh ${AWS_LIVE_SLEEVE:-btc_5m_paired_mm_tinylive}"
 else
   log "poly-safe-restart.sh not found on remote; skipping (manual restart required)"
 fi
@@ -153,8 +153,9 @@ Deployed ref:
 Persistent remote Cargo target dir:
   $REMOTE_CARGO_TARGET_DIR
 
-Tinylive env to edit on the AWS host:
-  ~/.config/polymarket-exec/btc_5m_hybrid_tinylive.env
+Tinylive envs to edit on the AWS host:
+  paired-MM live:      ~/.config/polymarket-exec/btc_5m_paired_mm_tinylive.env
+  pair-cost/hybrid:    ~/.config/polymarket-exec/btc_5m_hybrid_tinylive.env
 
 Operator kill switch:
   touch ~/.config/polymarket-exec/live.kill
