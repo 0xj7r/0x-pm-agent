@@ -57,7 +57,16 @@ fn dedup_key(e: &Event) -> DedupKey {
 /// Stable sort key: `(received_ns, market_slug, asset_id, sequence,
 /// event_type, source)`. The repeated tuple shape lets us delegate to
 /// `Vec::sort_by_key` without writing a comparator.
-fn sort_key(e: &Event) -> (i64, Option<String>, Option<String>, Option<i64>, &'static str, String) {
+fn sort_key(
+    e: &Event,
+) -> (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    &'static str,
+    String,
+) {
     (
         e.received_ns,
         e.market_slug.clone(),
@@ -158,10 +167,10 @@ fn record_batch_to_events(batch: &arrow::record_batch::RecordBatch) -> Result<Ve
             .and_then(|i| batch.column(i).as_any().downcast_ref::<Int64Array>())
             .map(|a| a.value(row))
             .context("received_ns column required")?;
-        let event_type_str = string_at(batch, event_type_col, row)
-            .context("event_type value required")?;
-        let market_type = string_at(batch, market_type_col, row)
-            .context("market_type value required")?;
+        let event_type_str =
+            string_at(batch, event_type_col, row).context("event_type value required")?;
+        let market_type =
+            string_at(batch, market_type_col, row).context("market_type value required")?;
         let market_slug = market_slug_col.and_then(|i| string_at(batch, i, row));
         let asset_id = asset_id_col.and_then(|i| string_at(batch, i, row));
         let side = side_col.and_then(|i| string_at(batch, i, row));
@@ -275,9 +284,8 @@ pub fn read_jsonl_file(path: &Path) -> Result<Vec<Event>> {
     let buf = BufReader::new(reader);
     let mut events = Vec::new();
     for (idx, line) in buf.lines().enumerate() {
-        let line = line.with_context(|| {
-            format!("failed to read jsonl {} line {}", path.display(), idx + 1)
-        })?;
+        let line = line
+            .with_context(|| format!("failed to read jsonl {} line {}", path.display(), idx + 1))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -316,9 +324,11 @@ pub fn read_local_filtered(path: &Path, dt_filter: Option<&[String]>) -> Result<
         }
         let p = entry.path();
         if let Some(filter) = dt_filter {
-            let matched = p
-                .components()
-                .any(|c| filter.iter().any(|f| c.as_os_str() == format!("dt={f}").as_str()));
+            let matched = p.components().any(|c| {
+                filter
+                    .iter()
+                    .any(|f| c.as_os_str() == format!("dt={f}").as_str())
+            });
             if !matched {
                 continue;
             }
@@ -326,8 +336,9 @@ pub fn read_local_filtered(path: &Path, dt_filter: Option<&[String]>) -> Result<
         match p.extension().and_then(|e| e.to_str()) {
             Some("parquet") => events.extend(read_parquet_file(p)?),
             Some("jsonl") | Some("ndjson") => events.extend(read_jsonl_file(p)?),
-            Some("gz") if p.to_string_lossy().ends_with(".jsonl.gz")
-                || p.to_string_lossy().ends_with(".ndjson.gz") =>
+            Some("gz")
+                if p.to_string_lossy().ends_with(".jsonl.gz")
+                    || p.to_string_lossy().ends_with(".ndjson.gz") =>
             {
                 events.extend(read_jsonl_file(p)?)
             }
@@ -372,10 +383,12 @@ pub fn write_parquet_file(path: &Path, events: &[Event]) -> Result<()> {
     let v: Vec<u32> = events.iter().map(|e| e.v).collect();
     let ts_ns: Vec<i64> = events.iter().map(|e| e.ts_ns).collect();
     let received_ns: Vec<i64> = events.iter().map(|e| e.received_ns).collect();
-    let event_type: Vec<&str> = events.iter().map(|e| event_type_str(e.event_type)).collect();
+    let event_type: Vec<&str> = events
+        .iter()
+        .map(|e| event_type_str(e.event_type))
+        .collect();
     let market_type: Vec<&str> = events.iter().map(|e| e.market_type.as_str()).collect();
-    let market_slug: Vec<Option<&str>> =
-        events.iter().map(|e| e.market_slug.as_deref()).collect();
+    let market_slug: Vec<Option<&str>> = events.iter().map(|e| e.market_slug.as_deref()).collect();
     let asset_id: Vec<Option<&str>> = events.iter().map(|e| e.asset_id.as_deref()).collect();
     let side: Vec<Option<&str>> = events.iter().map(|e| e.side.as_deref()).collect();
     let price: Vec<Option<&str>> = events.iter().map(|e| e.price.as_deref()).collect();
@@ -488,11 +501,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let f1 = sub.join("a.jsonl");
         let f2 = sub.join("b.jsonl");
-        write_jsonl_file(
-            &f1,
-            &[make_event(100, "x", 1, EventType::BookDelta)],
-        )
-        .unwrap();
+        write_jsonl_file(&f1, &[make_event(100, "x", 1, EventType::BookDelta)]).unwrap();
         write_jsonl_file(
             &f2,
             &[
@@ -555,7 +564,7 @@ mod tests {
         let result = dedupe_and_sort(events);
         assert!(result.len() < len_before);
         assert_eq!(result.len(), 90); // 3 cells * 30 unique
-        // Sorted ascending by received_ns
+                                      // Sorted ascending by received_ns
         for w in result.windows(2) {
             assert!(w[0].received_ns <= w[1].received_ns);
         }

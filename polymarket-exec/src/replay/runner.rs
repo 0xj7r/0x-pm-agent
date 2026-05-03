@@ -96,11 +96,15 @@ pub fn run_window<S: ReplayStrategy>(
             for coid in decision.cancels {
                 sim.cancel(&coid, event_ms);
             }
-            // Apply event to simulator (matches against resting orders)
+            // Apply event to simulator (matches against resting orders).
+            // The to_vec() is required: we re-enter sim with submit/cancel
+            // inside the loop body, which would otherwise overlap a borrow.
             let fills_before = sim.fills().len();
             sim.on_event(event);
             let fills_after = sim.fills().len();
-            for fill in sim.fills()[fills_before..fills_after].to_vec() {
+            #[allow(clippy::unnecessary_to_owned)]
+            let new_fills = sim.fills()[fills_before..fills_after].to_vec();
+            for fill in new_fills {
                 let decision = strategy.on_fill(&fill);
                 for intent in decision.submits {
                     sim.submit(intent);
@@ -172,7 +176,14 @@ mod tests {
     use crate::collector::schema::{EventType, Source};
     use crate::replay::fill_sim::{LatencyPreset, Side};
 
-    fn evt(received_ns: i64, et: EventType, asset: &str, side: &str, price: &str, size: &str) -> Event {
+    fn evt(
+        received_ns: i64,
+        et: EventType,
+        asset: &str,
+        side: &str,
+        price: &str,
+        size: &str,
+    ) -> Event {
         Event {
             v: 1,
             ts_ns: received_ns - 1,
@@ -224,9 +235,30 @@ mod tests {
     #[test]
     fn run_window_executes_event_loop_and_collects_fills() {
         let events = vec![
-            evt(1_000_000_000, EventType::BookSnapshot, "asset-a", "buy", "0.55", "100"),
-            evt(2_000_000_000, EventType::Trade, "asset-a", "buy", "0.55", "60"),
-            evt(3_000_000_000, EventType::Trade, "asset-a", "buy", "0.55", "40"),
+            evt(
+                1_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "60",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "40",
+            ),
         ];
         let cfg = RunnerConfig {
             window_id: "w1".into(),
@@ -268,8 +300,22 @@ mod tests {
     #[test]
     fn run_window_catches_strategy_panic_and_marks_window() {
         let events = vec![
-            evt(1_000_000_000, EventType::BookDelta, "asset-a", "buy", "0.5", "10"),
-            evt(2_000_000_000, EventType::Trade, "asset-a", "buy", "0.5", "10"),
+            evt(
+                1_000_000_000,
+                EventType::BookDelta,
+                "asset-a",
+                "buy",
+                "0.5",
+                "10",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.5",
+                "10",
+            ),
         ];
         let cfg = RunnerConfig {
             window_id: "w-bad".into(),
@@ -286,11 +332,25 @@ mod tests {
         let mut windows = BTreeMap::new();
         windows.insert(
             "a".to_string(),
-            vec![evt(1_000_000_000, EventType::BookDelta, "a", "buy", "0.5", "1")],
+            vec![evt(
+                1_000_000_000,
+                EventType::BookDelta,
+                "a",
+                "buy",
+                "0.5",
+                "1",
+            )],
         );
         windows.insert(
             "b".to_string(),
-            vec![evt(2_000_000_000, EventType::BookDelta, "a", "buy", "0.5", "1")],
+            vec![evt(
+                2_000_000_000,
+                EventType::BookDelta,
+                "a",
+                "buy",
+                "0.5",
+                "1",
+            )],
         );
         let cfg = RunnerConfig {
             window_id: String::new(),
@@ -305,9 +365,30 @@ mod tests {
     fn deterministic_runs_produce_identical_summaries() {
         // Same inputs twice → byte-identical fills vector.
         let events = vec![
-            evt(1_000_000_000, EventType::BookSnapshot, "asset-a", "buy", "0.55", "100"),
-            evt(2_000_000_000, EventType::Trade, "asset-a", "buy", "0.55", "60"),
-            evt(3_000_000_000, EventType::Trade, "asset-a", "buy", "0.55", "40"),
+            evt(
+                1_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "60",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "40",
+            ),
         ];
         let cfg = RunnerConfig {
             window_id: "w1".into(),
@@ -317,8 +398,14 @@ mod tests {
             },
             max_window_failures: 0,
         };
-        let mut s1 = PassiveAskStrategy { placed: false, on_fill_count: 0 };
-        let mut s2 = PassiveAskStrategy { placed: false, on_fill_count: 0 };
+        let mut s1 = PassiveAskStrategy {
+            placed: false,
+            on_fill_count: 0,
+        };
+        let mut s2 = PassiveAskStrategy {
+            placed: false,
+            on_fill_count: 0,
+        };
         let r1 = run_window(&mut s1, &events, &cfg);
         let r2 = run_window(&mut s2, &events, &cfg);
         assert_eq!(r1, r2);
