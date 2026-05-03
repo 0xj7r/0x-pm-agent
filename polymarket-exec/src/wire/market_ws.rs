@@ -20,6 +20,7 @@ use crate::book::{BookStore, Level};
 /// 60s without ANY frame indicates the connection has silently stalled.
 const MARKET_WS_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 use crate::metrics::{AppMetrics, StreamKind};
+use crate::wire::raw_frame::{now_ns, RawFrame};
 
 pub struct MarketWsClient {
     url: String,
@@ -28,6 +29,7 @@ pub struct MarketWsClient {
     books: Arc<BookStore>,
     metrics: Arc<AppMetrics>,
     assets_rx: Option<watch::Receiver<Vec<String>>>,
+    raw_tap: Option<tokio::sync::mpsc::UnboundedSender<RawFrame>>,
 }
 
 impl MarketWsClient {
@@ -45,11 +47,20 @@ impl MarketWsClient {
             books,
             metrics,
             assets_rx: None,
+            raw_tap: None,
         }
     }
 
     pub fn with_asset_updates(mut self, assets_rx: watch::Receiver<Vec<String>>) -> Self {
         self.assets_rx = Some(assets_rx);
+        self
+    }
+
+    /// Optional tap for the live collector. When set, every parsed event is
+    /// cloned into a `RawFrame` and pushed to the channel. The trader uses
+    /// `None` and pays only an `Option::is_none` check per event.
+    pub fn with_raw_tap(mut self, tap: tokio::sync::mpsc::UnboundedSender<RawFrame>) -> Self {
+        self.raw_tap = Some(tap);
         self
     }
 
@@ -204,6 +215,7 @@ impl MarketWsClient {
                     "unknown"
                 }
             });
+        self.tap_event(&event, event_type);
 
         match event_type {
             "book" => {
@@ -304,6 +316,49 @@ impl MarketWsClient {
 
         Ok(())
     }
+
+    fn tap_event(&self, event: &Value, event_type: &str) {
+        let Some(tap) = &self.raw_tap else {
+            return;
+        };
+        let observed_at_ns = now_ns();
+        if event_type == "price_change" {
+            let changes = event
+                .get("price_changes")
+                .or_else(|| event.get("pc"))
+                .and_then(Value::as_array);
+            if let Some(changes) = changes {
+                for change in changes {
+                    let mut payload = change.clone();
+                    if let Value::Object(map) = &mut payload {
+                        map.entry("event_type".to_string())
+                            .or_insert_with(|| Value::String("price_change".to_string()));
+                        for key in ["market", "market_slug", "market_type", "timestamp"] {
+                            if !map.contains_key(key) {
+                                if let Some(value) = event.get(key) {
+                                    map.insert(key.to_string(), value.clone());
+                                }
+                            }
+                        }
+                    }
+                    let _ = tap.send(RawFrame {
+                        source: "polymarket_market_ws",
+                        asset_id: raw_frame_asset_id(&payload),
+                        observed_at_ns,
+                        payload,
+                    });
+                }
+                return;
+            }
+        }
+
+        let _ = tap.send(RawFrame {
+            source: "polymarket_market_ws",
+            asset_id: raw_frame_asset_id(event),
+            observed_at_ns,
+            payload: event.clone(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +373,48 @@ mod tests {
         let assets = rx.borrow_and_update().clone();
         assert_eq!(assets, vec!["new".to_string()]);
         assert!(!rx.has_changed().expect("sender open"));
+    }
+
+    #[test]
+    fn raw_tap_expands_price_change_items() {
+        let metrics = Arc::new(AppMetrics::new().expect("metrics"));
+        let books = Arc::new(BookStore::new(&[]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = MarketWsClient::new(
+            "wss://example.test".to_string(),
+            Vec::new(),
+            Duration::from_secs(15),
+            books,
+            metrics,
+        )
+        .with_raw_tap(tx);
+
+        let event = json!({
+            "event_type": "price_change",
+            "market": "btc-updown-5m-1777634400",
+            "market_type": "btc_5m",
+            "timestamp": 1777634400000_i64,
+            "price_changes": [
+                {"asset_id": "asset-a", "price": "0.51", "size": "10"},
+                {"asset_id": "asset-b", "price": "0.49", "size": "12"}
+            ]
+        });
+
+        client.tap_event(&event, "price_change");
+
+        let first = rx.try_recv().expect("first expanded frame");
+        let second = rx.try_recv().expect("second expanded frame");
+        assert_eq!(first.asset_id.as_deref(), Some("asset-a"));
+        assert_eq!(second.asset_id.as_deref(), Some("asset-b"));
+        assert_eq!(
+            first.payload.get("event_type").and_then(Value::as_str),
+            Some("price_change")
+        );
+        assert_eq!(
+            first.payload.get("market").and_then(Value::as_str),
+            Some("btc-updown-5m-1777634400")
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -347,6 +444,14 @@ fn value_as_str(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn raw_frame_asset_id(value: &Value) -> Option<String> {
+    value
+        .get("asset_id")
+        .or_else(|| value.get("a"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn value_as_f64_opt(value: &Value) -> Option<f64> {

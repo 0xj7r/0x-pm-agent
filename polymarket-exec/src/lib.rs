@@ -1,5 +1,6 @@
 //! Crate module graph with compatibility re-exports for core and market-making surfaces.
 
+pub mod collector;
 pub mod config;
 pub mod core;
 pub mod data;
