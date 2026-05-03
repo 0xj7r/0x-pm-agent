@@ -316,18 +316,18 @@ def runtime_env_lines(markets: list[MarketRecord]) -> list[str]:
             instrument_market_pairs.append(f"{token_id}:{market.market_id}")
 
     lines = [
-        f"WHALE_PAIR_ASSET_IDS={','.join(asset_ids)}",
-        f"WHALE_PAIR_INSTRUMENT_MARKETS={','.join(instrument_market_pairs)}",
-        f"WHALE_PAIR_USER_MARKETS={','.join(market_ids)}",
+        f"PM_BTC_5M_ASSET_IDS={','.join(asset_ids)}",
+        f"PM_BTC_5M_INSTRUMENT_MARKETS={','.join(instrument_market_pairs)}",
+        f"PM_BTC_5M_USER_MARKETS={','.join(market_ids)}",
     ]
     if latest is not None:
-        lines.append(f"WHALE_PAIR_LATEST_MARKET_SLUG={latest.slug}")
+        lines.append(f"PM_BTC_5M_LATEST_MARKET_SLUG={latest.slug}")
         if latest.event_end_time_ms is not None:
             end_iso = datetime.fromtimestamp(
                 latest.event_end_time_ms / 1000.0,
                 tz=timezone.utc,
             ).isoformat()
-            lines.append(f"WHALE_PAIR_LATEST_MARKET_END_TIME={end_iso}")
+            lines.append(f"PM_BTC_5M_LATEST_MARKET_END_TIME={end_iso}")
     return lines
 
 

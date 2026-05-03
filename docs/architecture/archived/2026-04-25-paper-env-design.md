@@ -44,7 +44,7 @@ A paper run produces journal events and dashboard metrics but no structured "rep
 The audit logs (`audit.jsonl`) and market WS snapshots exist, but there is no tooling to feed a recorded session back through the engine deterministically and compare paper decisions to what actually happened live.
 
 **Gap 8: Shadow-live mode does not exist.**
-Running the engine against live market data feeds without submitting to the CLOB is not currently a named mode. The closest is `WHALE_PAIR_PAPER_MODE=true` with live feeds connected, but the venue reconciliation loop is also disabled in paper mode (`apply_sync_report` returns early on line 2259). A shadow-live run would connect market WS and spot WS but route all submits through the paper adapter, so strategy decisions track the live book exactly.
+Running the engine against live market data feeds without submitting to the CLOB is not currently a named mode. The closest is `PM_BTC_5M_PAPER_MODE=true` with live feeds connected, but the venue reconciliation loop is also disabled in paper mode (`apply_sync_report` returns early on line 2259). A shadow-live run would connect market WS and spot WS but route all submits through the paper adapter, so strategy decisions track the live book exactly.
 
 ---
 
@@ -68,7 +68,7 @@ This mode exists and works. The gap is that the 12 scenarios do not currently co
 **Good for:** Stress-testing the fill model under controlled book shapes, verifying the report card output, calibrating the latency model.
 **Does not validate:** Real-world book dynamics, actual top-of-book sizes, real fill rates.
 
-Activate with `WHALE_PAIR_PAPER_MODE=true` plus a synthetic book injector that drives `BookStore` from a JSON book sequence file. No code changes to `run_with_config`; the injector replaces `spawn_market_ws`.
+Activate with `PM_BTC_5M_PAPER_MODE=true` plus a synthetic book injector that drives `BookStore` from a JSON book sequence file. No code changes to `run_with_config`; the injector replaces `spawn_market_ws`.
 
 ### Mode C: Shadow-Live (existing feeds, paper fills)
 
@@ -77,7 +77,7 @@ Activate with `WHALE_PAIR_PAPER_MODE=true` plus a synthetic book injector that d
 **Good for:** End-to-end validation of strategy decisions against the real book. Answers "what would we have done, and what would we have filled, if we had been live?"
 **Does not validate:** Venue ack latency, post-only reject frequency under live load, wallet/auth correctness.
 
-This is the primary new mode. It requires a named env: `WHALE_PAIR_EXEC_MODE=shadow_live` + `WHALE_PAIR_PAPER_MODE=true`. The runner already supports live market WS in paper mode; the only addition is connecting `user_ws` in paper mode (currently suppressed when `user_auth` is absent, but can be enabled for observation without submitting).
+This is the primary new mode. It requires a named env: `PM_BTC_5M_EXEC_MODE=shadow_live` + `PM_BTC_5M_PAPER_MODE=true`. The runner already supports live market WS in paper mode; the only addition is connecting `user_ws` in paper mode (currently suppressed when `user_auth` is absent, but can be enabled for observation without submitting).
 
 ### Mode D: Historical Replay
 
@@ -181,7 +181,7 @@ This is lightweight: one line per market WS update per asset. With two assets an
 
 ### 4.2 Replay binary
 
-Add a `replay` subcommand (or `WHALE_PAIR_EXEC_MODE=replay`) that:
+Add a `replay` subcommand (or `PM_BTC_5M_EXEC_MODE=replay`) that:
 
 1. Loads the book snapshot log into an in-memory time-ordered sequence.
 2. Instantiates `Runtime` with the same config as the original session.
@@ -303,7 +303,7 @@ New file: `src/paper/report.rs`. Changes to `runner.rs` and `config/mod.rs`.
 
 Depends on Phase 3.
 
-- [ ] Add `WHALE_PAIR_EXEC_MODE=shadow_live` as a named mode in `run()`.
+- [ ] Add `PM_BTC_5M_EXEC_MODE=shadow_live` as a named mode in `run()`.
 - [ ] In shadow-live mode, connect `market_ws`, `spot_ws`, and `user_ws` (read-only, for whale observation). Route submits through `PaperExecutionAdapter`. Do not call `apply_sync_report` for balance/position reconciliation.
 - [ ] Log whale fills from `user_ws` events that arrive for non-local order IDs into the report card's `vs_whale` section.
 - [ ] Write a shadow-live env file: `env/btc_5m_mm_shadowlive.env`.
@@ -316,7 +316,7 @@ Depends on Phase 4. This is the most involved phase.
 
 - [ ] Add `book_snapshot_log_path: Option<PathBuf>` to `AppConfig`.
 - [ ] In `run_runtime_loop`, after each book snapshot is received, append a compact record to the snapshot log.
-- [ ] Add `WHALE_PAIR_EXEC_MODE=replay` that: loads a snapshot log, instantiates `Runtime`, replays snapshots using a replay clock, routes submits through the upgraded paper fill model, writes a replay journal and report card.
+- [ ] Add `PM_BTC_5M_EXEC_MODE=replay` that: loads a snapshot log, instantiates `Runtime`, replays snapshots using a replay clock, routes submits through the upgraded paper fill model, writes a replay journal and report card.
 - [ ] Thread `clock_ms` through `paper_fill_from_book_snapshot` (Phase 2 prerequisite already handles this).
 - [ ] Write `scripts/compare_replay.py`: reads `audit.jsonl` + `replay_journal.jsonl`, aligns by timestamp, produces a diff table of decisions and fill outcomes.
 

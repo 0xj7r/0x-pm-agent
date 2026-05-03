@@ -30,12 +30,12 @@ Do not work around this with unsigned/raw HTTP calls or paper adapter semantics.
 
 Tiny-live may only start after:
 
-- `WHALE_PAIR_PAPER_MODE=false` is deliberate and reviewed
+- `PM_BTC_5M_PAPER_MODE=false` is deliberate and reviewed
 - signed CLOB credentials or L1 private-key auth are present and scoped to the tiny-live wallet
 - the user websocket is authenticated and producing order/fill events
 - startup reconciliation has been tested against the venue open-order source
 - the first funded run uses one sleeve, one host, and the smallest practical size
-- `WHALE_PAIR_EXEC_MODE=live_smoke` has completed submit, visible-open-order sync,
+- `PM_BTC_5M_EXEC_MODE=live_smoke` has completed submit, visible-open-order sync,
   cancel, and post-cancel sync before any strategy sleeve is allowed to trade
 
 ## 2. Available sleeve presets
@@ -80,7 +80,7 @@ polymarket-exec/scripts/run_sleeve.sh goat_pair_baseline
 What it does:
 
 - resolves `polymarket-exec/env/<name>.env`
-- exports `WHALE_PAIR_SLEEVE_ENV_PATH`
+- exports `PM_BTC_5M_SLEEVE_ENV_PATH`
 - calls `polymarket-exec/scripts/run_unlawful_shear_paper.sh`
 - regenerates:
   - `data/research/wallet_research/unlawful-shear/rust_runtime.env`
@@ -91,8 +91,8 @@ What it does:
 
 Override the refresh cadence with:
 
-- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=<n>`
-- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC=0` to disable refresh supervision
+- `PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=<n>`
+- `PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=0` to disable refresh supervision
 
 The rolling refresh is a launcher/control-plane responsibility, not a strategy signal.
 On an always-on host it should stay enabled so the sleeves keep rotating onto fresh
@@ -136,14 +136,14 @@ Persistent state:
 To verify the export/env/bootstrap path without starting Rust:
 
 ```bash
-WHALE_PAIR_SKIP_CARGO_RUN=true polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
+PM_BTC_5M_SKIP_CARGO_RUN=true polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
 ```
 
 For offline fallback:
 
 ```bash
-WHALE_PAIR_CONTEXT_SOURCE=db \
-WHALE_PAIR_SKIP_CARGO_RUN=true \
+PM_BTC_5M_CONTEXT_SOURCE=db \
+PM_BTC_5M_SKIP_CARGO_RUN=true \
 polymarket-exec/scripts/run_sleeve.sh unlawful_baseline
 ```
 
@@ -196,7 +196,7 @@ Manual:
 Startup reconciliation:
 
 1. On startup, the runtime opens the configured SQLite order store.
-2. Active rows older than `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`, default
+2. Active rows older than `PM_BTC_5M_ORDER_RECONCILE_STALE_MS`, default
    `30000ms`, are moved toward `NeedsReconcile`.
 3. A startup checkpoint is written to the journal.
 4. In paper, confirm old `CancelRequested` rows do not remain stuck after restart.
@@ -264,31 +264,31 @@ paper host as the permanent live trading plane.
 
 Paper mode still needs a small number of explicit host surfaces:
 
-- `WHALE_PAIR_ROOT_DIR`
-- `WHALE_PAIR_CONTEXT_SOURCE`
-- `WHALE_PAIR_INCLUDE_PREV`
-- `WHALE_PAIR_INCLUDE_NEXT`
-- `WHALE_PAIR_CONTEXT_REFRESH_INTERVAL_SEC`
-- `WHALE_PAIR_PYTHON_BIN`
-- `WHALE_PAIR_CARGO_BIN`
-- `WHALE_PAIR_EXEC_SPOT_WS_URL`
-- `WHALE_PAIR_EXEC_SPOT_SYMBOL`
+- `PM_BTC_5M_ROOT_DIR`
+- `PM_BTC_5M_CONTEXT_SOURCE`
+- `PM_BTC_5M_INCLUDE_PREV`
+- `PM_BTC_5M_INCLUDE_NEXT`
+- `PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC`
+- `PM_BTC_5M_PYTHON_BIN`
+- `PM_BTC_5M_CARGO_BIN`
+- `PM_BTC_5M_EXEC_SPOT_WS_URL`
+- `PM_BTC_5M_EXEC_SPOT_SYMBOL`
 - `POLYMARKET_MARKET_WS_URL`
 - `POLYMARKET_USER_WS_URL`
-- `WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS`
-- `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`
-- `WHALE_PAIR_RUNTIME_CHECKPOINT_INTERVAL_MS`
-- `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES`
+- `PM_BTC_5M_ORDER_RECONCILE_INTERVAL_MS`
+- `PM_BTC_5M_ORDER_RECONCILE_STALE_MS`
+- `PM_BTC_5M_RUNTIME_CHECKPOINT_INTERVAL_MS`
+- `PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES`
 - `RUST_LOG`
 - `RUST_BACKTRACE`
 
 The rolling exporter generates these at launch:
 
-- `WHALE_PAIR_ASSET_IDS`
-- `WHALE_PAIR_INSTRUMENT_MARKETS`
-- `WHALE_PAIR_USER_MARKETS`
-- `WHALE_PAIR_LATEST_MARKET_SLUG`
-- `WHALE_PAIR_LATEST_MARKET_END_TIME`
+- `PM_BTC_5M_ASSET_IDS`
+- `PM_BTC_5M_INSTRUMENT_MARKETS`
+- `PM_BTC_5M_USER_MARKETS`
+- `PM_BTC_5M_LATEST_MARKET_SLUG`
+- `PM_BTC_5M_LATEST_MARKET_END_TIME`
 
 Paper mode does not require:
 
@@ -327,17 +327,17 @@ Hot state stays local and sleeve-specific:
 
 Off-disk policy:
 
-- enable `WHALE_PAIR_EXEC_JOURNAL_ROTATE_BYTES=268435456`
+- enable `PM_BTC_5M_EXEC_JOURNAL_ROTATE_BYTES=268435456`
 - archive rotated journal segments and explicit backup directories to S3
 - use `DEEP_ARCHIVE` for cold paper logs unless active replay access is needed
 - do not delete local active `journal.jsonl`
-- only enable `WHALE_PAIR_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=true` after S3
+- only enable `PM_BTC_5M_ARCHIVE_DELETE_LOCAL_AFTER_UPLOAD=true` after S3
   object existence has been verified
 
 Run a local candidate listing before trusting credentials:
 
 ```bash
-WHALE_PAIR_ARCHIVE_LIST_ONLY=true polymarket-exec/scripts/archive_paper_artifacts.sh
+PM_BTC_5M_ARCHIVE_LIST_ONLY=true polymarket-exec/scripts/archive_paper_artifacts.sh
 ```
 
 Detailed archive procedure:
@@ -377,13 +377,13 @@ Before tiny-live, fill:
 - `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and
   `POLYMARKET_API_PASSPHRASE` if you want the user websocket enabled from
   process start
-- `WHALE_PAIR_PAPER_MODE=false`
+- `PM_BTC_5M_PAPER_MODE=false`
 - `POLYMARKET_MARKET_WS_URL`
 - `POLYMARKET_USER_WS_URL`
-- `WHALE_PAIR_EXEC_SPOT_WS_URL`
-- `WHALE_PAIR_EXEC_SPOT_SYMBOL`
-- `WHALE_PAIR_ORDER_RECONCILE_INTERVAL_MS`
-- `WHALE_PAIR_ORDER_RECONCILE_STALE_MS`
+- `PM_BTC_5M_EXEC_SPOT_WS_URL`
+- `PM_BTC_5M_EXEC_SPOT_SYMBOL`
+- `PM_BTC_5M_ORDER_RECONCILE_INTERVAL_MS`
+- `PM_BTC_5M_ORDER_RECONCILE_STALE_MS`
 
 And verify:
 
@@ -432,12 +432,12 @@ Validated smoke configuration:
 Live smoke mode:
 
 ```bash
-WHALE_PAIR_EXEC_MODE=live_smoke \
-WHALE_PAIR_PAPER_MODE=false \
-WHALE_PAIR_LIVE_SMOKE_ASSET_ID=<outcome-token-id> \
-WHALE_PAIR_LIVE_SMOKE_MARKET_ID=<market-id> \
-WHALE_PAIR_LIVE_SMOKE_PRICE=0.01 \
-WHALE_PAIR_LIVE_SMOKE_NOTIONAL_USD=1.0 \
+PM_BTC_5M_EXEC_MODE=live_smoke \
+PM_BTC_5M_PAPER_MODE=false \
+PM_BTC_5M_LIVE_SMOKE_ASSET_ID=<outcome-token-id> \
+PM_BTC_5M_LIVE_SMOKE_MARKET_ID=<market-id> \
+PM_BTC_5M_LIVE_SMOKE_PRICE=0.01 \
+PM_BTC_5M_LIVE_SMOKE_NOTIONAL_USD=1.0 \
 cargo run -p polymarket-exec
 ```
 
@@ -460,9 +460,9 @@ Do not start tiny-live until all of these are true:
 - market slate export is working from `--source live`
 - metrics and health endpoints are reachable
 - microstructure controller is enabled and visible in decision notes
-- `WHALE_PAIR_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH=true` is set for live
+- `PM_BTC_5M_UNLAWFUL_SHEAR_MICROSTRUCTURE_REQUIRE_DEPTH=true` is set for live
 - signed CLOB API/SDK is the only live order submission/cancel path
-- `WHALE_PAIR_EXEC_MODE=live_smoke` has passed on the live host
+- `PM_BTC_5M_EXEC_MODE=live_smoke` has passed on the live host
 - startup reconciliation against venue open orders is manually verified
 - top-3 ask notional caps are tighter than max order notional
 - stale `CancelRequested` orders transition to `NeedsReconcile`
@@ -509,9 +509,9 @@ polymarket-exec/ops/systemd/install_user_paper_services.sh
 ```
 
 5. Edit `~/.config/polymarket-exec/common.env`:
-   - set `WHALE_PAIR_ROOT_DIR`
+   - set `PM_BTC_5M_ROOT_DIR`
    - confirm BTC spot WS URL and symbol
-   - keep `WHALE_PAIR_CONTEXT_SOURCE=live`
+   - keep `PM_BTC_5M_CONTEXT_SOURCE=live`
 6. Enable lingering:
 
 ```bash

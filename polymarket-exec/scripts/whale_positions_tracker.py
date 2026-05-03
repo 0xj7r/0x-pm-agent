@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Poll whale wallets for live positions and append to JSONL.
 
-Why this exists: the whale strategies (unlawful_shear, Bonereaper,
-xuanxuan008, penny-tail) carry directional information in WHICH side
-they're holding and HOW LARGE the position is. Knowing this in real
-time lets a future signal-aware strategy lean with whales we trust.
+Why this exists: benchmark whale wallets carry directional information
+in WHICH side they're holding and HOW LARGE the position is. Knowing this
+in real time lets a future signal-aware strategy lean with wallets we trust.
 
 This is intentionally a Python polling script (not a Rust runtime
 module) so we can iterate cheaply without touching the live trading
@@ -23,7 +22,6 @@ Usage:
 
 Wallets tracked (default set; override with --wallets):
   unlawful-shear  0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82
-  bonereaper      0xeebde7a0e019a63e6b476eb425505b7b3e6eba30
   xuanxuan008     0xcfb103c37c0234f524c632d964ed31f117b5f694
   split-sell      0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad
   penny-tail      0x7da07b2a8b009a406198677debda46ad651b6be2
@@ -46,7 +44,6 @@ DEFAULT_USER_AGENT = "polymarket-exec-whale-tracker/1.0"
 
 DEFAULT_WALLETS = {
     "unlawful-shear": "0xb27bc932bf8110d8f78e55da7d5f0497a18b5b82",
-    "bonereaper": "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
     "xuanxuan008": "0xcfb103c37c0234f524c632d964ed31f117b5f694",
     "split-sell": "0xe51b3d64da5b0b8a07a55f8bb3c3170237f73cad",
     "penny-tail": "0x7da07b2a8b009a406198677debda46ad651b6be2",

@@ -9,7 +9,7 @@ Usage:
         path/to/variant.json [--output diff.md]
 
 Phase 5 of the paper env design. The Rust replay binary
-(WHALE_PAIR_EXEC_MODE=replay) writes the report; this script does the
+(PM_BTC_5M_EXEC_MODE=replay) writes the report; this script does the
 comparison so iteration on knobs doesn't require recompilation.
 """
 

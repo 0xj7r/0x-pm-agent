@@ -99,8 +99,8 @@ pub struct QueueStats {
     pub late_fill_after_cancel_count: usize,
 }
 
-/// Comparison against an external whale-fill stream (e.g. unlawful-shear's
-/// on-chain fills) over the same time window as this paper session.
+/// Comparison against an external benchmark wallet fill stream over the same
+/// time window as this paper session.
 /// Populated by `record_whale_fill_observed` calls; emitted in the
 /// summary so operators can spot under/over-fill vs. the whale.
 #[derive(Clone, Debug, Default, Serialize)]

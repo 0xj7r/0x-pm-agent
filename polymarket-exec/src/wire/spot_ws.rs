@@ -38,7 +38,7 @@ use crate::metrics::AppMetrics;
 ///    and reconnect (more aggressive than just marking unhealthy because
 ///    the strategy's regime gate is the load-bearing protection).
 ///
-/// Defaults are env-configurable via `WHALE_PAIR_EXEC_SPOT_WS_*_TIMEOUT_MS`.
+/// Defaults are env-configurable via `PM_BTC_5M_EXEC_SPOT_WS_*_TIMEOUT_MS`.
 const DEFAULT_CONN_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_DATA_STALE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BINANCE_REST_BOOTSTRAP_URL: &str = "https://api.binance.com/api/v3/aggTrades";
