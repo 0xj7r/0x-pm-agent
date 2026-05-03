@@ -4,4 +4,5 @@
 
 pub mod replay;
 pub mod report;
+pub mod shadow_quote;
 pub mod snapshot;

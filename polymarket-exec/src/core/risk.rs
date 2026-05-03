@@ -2,7 +2,7 @@
 
 use crate::event_log::{EventCategory, EventMetrics, EventRecord};
 use crate::inventory::InventoryState;
-use crate::types::{EpochMillis, OrderIntent, TradeSide};
+use crate::types::{EpochMillis, OrderIntent, StrategyDecision, TradeSide};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RiskLimits {
@@ -97,6 +97,19 @@ pub struct RiskDecision {
     pub projected_free_cash_usd: f64,
     pub projected_gross_notional_usd: f64,
     pub projected_market_net_notional_usd: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrategyRiskDecision {
+    pub accepted_intents: Vec<OrderIntent>,
+    pub rejected: Vec<(OrderIntent, RiskDecision)>,
+    pub evaluated_at_ms: EpochMillis,
+}
+
+impl StrategyRiskDecision {
+    pub fn all_accepted(&self) -> bool {
+        self.rejected.is_empty()
+    }
 }
 
 impl RiskDecision {
@@ -348,6 +361,31 @@ impl RiskEngine {
             projected_free_cash_usd,
             projected_gross_notional_usd,
             projected_market_net_notional_usd,
+        }
+    }
+
+    pub fn approve_strategy_decision(
+        &self,
+        inventory: &InventoryState,
+        decision: &StrategyDecision,
+        context: &RiskContext,
+    ) -> StrategyRiskDecision {
+        let mut accepted_intents = Vec::new();
+        let mut rejected = Vec::new();
+
+        for intent in decision.intents() {
+            let risk = self.evaluate(inventory, intent, context);
+            if risk.accepted {
+                accepted_intents.push(intent.clone());
+            } else {
+                rejected.push((intent.clone(), risk));
+            }
+        }
+
+        StrategyRiskDecision {
+            accepted_intents,
+            rejected,
+            evaluated_at_ms: context.now_ms,
         }
     }
 

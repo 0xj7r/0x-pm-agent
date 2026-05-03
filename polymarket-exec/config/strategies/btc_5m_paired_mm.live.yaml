@@ -1,0 +1,89 @@
+# ================================================
+# Polymarket BTC 5-Min Paired Market Making
+# Two-sided paired-bid / merge-recycle strategy profile
+# Version: 1.0 (May 2026)
+# ================================================
+
+strategy: paired_mm
+
+# ── Quote & Ladder Controls ─────────────────────────────────────
+quote:
+  levels_per_side: 3
+  base_clip_usd: 1.10
+  min_clip_usd: 0.25
+  max_clip_usd: 5.0
+  min_edge_bps: 75
+  inventory_skew_bps: 150
+  max_spread: 0.08
+  min_top_depth_notional_usd: 2.0
+  min_order_notional_usd: 1.0
+  entry_ladder_levels: 3
+  entry_ladder_spacing_ticks: 1.0
+  maker_safety_ticks: 2.0
+  venue_min_order_quantity: 5.0
+  entry_min_size_multiplier: 1.30
+
+# ── Fair-Value Anchoring ────────────────────────────────────────
+# Paired-MM is liquidity provision, not directional taking. The physical
+# fair-value model can pull quotes, but only within a bounded distance from
+# live book mid.
+fair_value:
+  max_model_divergence: 0.10
+  model_influence_weight: 0.30
+
+# ── Inventory & Risk Limits ─────────────────────────────────────
+inventory:
+  max_gross_notional_usd: 20.0
+  max_net_notional_per_market_usd: 10.0
+  max_stranded_leg_usd: 10.0
+  max_gross_cost_usd: 20.0
+  max_leg_cost_usd: 10.0
+
+# ── Rescue / Merge Logic ────────────────────────────────────────
+rescue:
+  hedge_rescue_clip_usd: 2.50
+  hedge_rescue_max_qty: 25.0
+  hedge_rescue_edge_bps: 25
+  hedge_rescue_race_buffer_ticks: 3.0
+  sell_unwind_enabled: true
+  merge_gas_cost_usd: 0.30
+
+# ── Signal & Momentum Tilt ──────────────────────────────────────
+signals:
+  momentum_tilt_per_bps: 0.0001
+  momentum_max_tilt: 0.02
+  order_flow_imbalance_threshold: 0.0
+  asymmetric_fill_max_penalty: 0.02
+
+# ── Time / Bar Phase Scaling ────────────────────────────────────
+bar_phase:
+  early_clip_scale: 1.0
+  mid_clip_scale: 0.6
+  late_clip_scale: 1.4
+  final_clip_scale: 0.0
+
+# ── Vol Regime & EV Controls ────────────────────────────────────
+vol_regime:
+  high_vol_spread_multiplier: 2.0
+  high_vol_size_reduction: 0.5
+
+ev:
+  hold_vs_rescue_buffer_bps: 15   # extra edge required to hold instead of rescue
+
+# ── Operational ─────────────────────────────────────────────────
+operational:
+  cooldown_ms: 1000
+  max_entry_free_cash_bps: 6000
+  max_rescue_free_cash_bps: 5000
+  taker_fee_coeff: 0.072
+  recycle_min_imbalance_qty: 5.0
+  recycle_min_time_remaining_ms: 90000
+  recycle_max_light_side_spread: 0.10
+
+# ── Tiny-Live / Deployment Scaling ──────────────────────────────
+scaling:
+  capital_scale_factor: 0.5       # 0.5 = tiny-live ($50), 1.0 = full live
+
+version: "1.0"
+last_updated: "2026-05-01"
+description: "Paired two-sided BTC 5m market-making profile with merge-first inventory recycling"

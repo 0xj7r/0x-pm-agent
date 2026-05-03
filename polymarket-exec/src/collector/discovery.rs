@@ -22,12 +22,12 @@ use super::schema::{Event, EventType, Source};
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
-struct MarketSnapshot {
-    slug: String,
-    market_type: String,
-    asset_ids: Vec<String>,
-    strike: Option<f64>,
-    end_time_ms: Option<i64>,
+pub struct MarketSnapshot {
+    pub slug: String,
+    pub market_type: String,
+    pub asset_ids: Vec<String>,
+    pub strike: Option<f64>,
+    pub end_time_ms: Option<i64>,
 }
 
 /// Owned config for the discovery loop.
