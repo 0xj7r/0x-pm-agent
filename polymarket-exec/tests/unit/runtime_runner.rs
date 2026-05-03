@@ -658,7 +658,7 @@ async fn live_sync_reconciles_non_empty_venue_position_snapshot() {
 }
 
 #[tokio::test]
-async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merge() {
+async fn live_sync_blocks_failed_merge_without_global_riskoff() {
     let mut runtime = Runtime::new(
         RuntimeConfig {
             starting_cash_usd: 100.0,
@@ -740,8 +740,8 @@ async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merg
         .commands
         .iter()
         .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
-    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
+    assert_eq!(runtime.status(), RuntimeStatus::Running);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
     assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
     let merges = adapter.merged.lock().expect("merged lock");
     assert_eq!(merges.len(), 1);
@@ -774,7 +774,7 @@ async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merg
         .commands
         .iter()
         .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+    assert_eq!(runtime.status(), RuntimeStatus::Running);
     let merges = adapter.merged.lock().expect("merged lock");
     assert_eq!(
         merges.len(),
