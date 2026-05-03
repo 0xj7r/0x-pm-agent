@@ -428,3 +428,57 @@ fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
         StrategyMode::try_from_name(expected, Some(&profile)).expect("supported strategy");
     }
 }
+
+#[test]
+fn active_strategy_yaml_profiles_drive_strategy_configs() {
+    let pair_cost_profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/btc_5m_pair_cost_arb.live.yaml",
+    ))
+    .expect("pair-cost profile");
+    let pair_cost_config = pair_cost_profile.pair_cost_arb_config();
+    assert_eq!(pair_cost_config.pair_cost_threshold, 0.99);
+    assert_eq!(pair_cost_config.high_vol_pair_cost_threshold, 0.97);
+    assert_eq!(pair_cost_config.base_clip_usd, 1.5);
+    assert_eq!(pair_cost_config.max_clip_usd, 5.0);
+    assert_eq!(pair_cost_config.rescue_enabled, true);
+    assert_eq!(pair_cost_config.rescue_late_window_sec, 90);
+    assert_eq!(pair_cost_config.rescue_rehedge_pair_cost_threshold, 1.03);
+    assert_eq!(pair_cost_config.recycle_min_imbalance_qty, 5.0);
+    assert_eq!(pair_cost_config.recycle_min_time_remaining_ms, 90_000);
+
+    let paired_mm_profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/btc_5m_paired_mm.live.yaml",
+    ))
+    .expect("paired-mm profile");
+    let paired_mm_config = paired_mm_profile.paired_mm_config();
+    assert_eq!(paired_mm_config.ladder.max_depth, 3);
+    assert_eq!(paired_mm_config.ladder.base_clip_usd, 1.10);
+    assert_eq!(paired_mm_config.ladder.max_clip_usd, 5.0);
+    assert_eq!(
+        paired_mm_config
+            .ladder
+            .fair_value_anchoring
+            .max_model_divergence,
+        0.10
+    );
+    assert_eq!(
+        paired_mm_config
+            .ladder
+            .fair_value_anchoring
+            .model_influence_weight,
+        0.30
+    );
+    assert_eq!(paired_mm_config.capital_recycle.pair_cost_target, 0.99);
+    assert_eq!(paired_mm_config.capital_recycle.min_imbalance_qty, 5.0);
+    assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 25.0);
+    assert_eq!(
+        paired_mm_config.capital_recycle.max_buy_notional_usd,
+        2.50
+    );
+    assert_eq!(
+        paired_mm_config.capital_recycle.min_time_remaining_ms,
+        90_000
+    );
+    assert_eq!(paired_mm_config.capital_recycle.max_light_side_spread, 0.10);
+    assert_eq!(paired_mm_config.capital_recycle.race_buffer_ticks, 3.0);
+}

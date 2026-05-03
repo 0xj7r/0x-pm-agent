@@ -161,6 +161,31 @@ impl StrategyProfile {
             .operational
             .recycle_max_light_side_spread
             .unwrap_or(config.recycle_max_light_side_spread);
+        config.rescue_enabled = self.rescue.enabled.unwrap_or(config.rescue_enabled);
+        config.rescue_late_window_sec = self
+            .rescue
+            .late_window_sec
+            .unwrap_or(config.rescue_late_window_sec);
+        config.rescue_min_excess_usd = self
+            .rescue
+            .min_excess_usd
+            .unwrap_or(config.rescue_min_excess_usd);
+        config.rescue_hold_threshold = self
+            .rescue
+            .hold_threshold
+            .unwrap_or(config.rescue_hold_threshold);
+        config.rescue_threshold = self
+            .rescue
+            .rescue_threshold
+            .unwrap_or(config.rescue_threshold);
+        config.rescue_max_fraction = self
+            .rescue
+            .max_rescue_fraction
+            .unwrap_or(config.rescue_max_fraction);
+        config.rescue_rehedge_pair_cost_threshold = self
+            .rescue
+            .rehedge_pair_cost_threshold
+            .unwrap_or(config.rescue_rehedge_pair_cost_threshold);
         config
     }
 
@@ -200,14 +225,26 @@ impl StrategyProfile {
                 .pair_cost
                 .threshold
                 .unwrap_or(config.capital_recycle.pair_cost_target),
-            min_imbalance_qty: config.capital_recycle.min_imbalance_qty,
-            max_buy_qty: config.capital_recycle.max_buy_qty,
+            min_imbalance_qty: self
+                .operational
+                .recycle_min_imbalance_qty
+                .unwrap_or(config.capital_recycle.min_imbalance_qty),
+            max_buy_qty: self
+                .rescue
+                .hedge_rescue_max_qty
+                .unwrap_or(config.capital_recycle.max_buy_qty),
             max_buy_notional_usd: self
                 .rescue
                 .hedge_rescue_clip_usd
                 .unwrap_or(config.capital_recycle.max_buy_notional_usd),
-            min_time_remaining_ms: 120_000,
-            max_light_side_spread: config.capital_recycle.max_light_side_spread,
+            min_time_remaining_ms: self
+                .operational
+                .recycle_min_time_remaining_ms
+                .unwrap_or(config.capital_recycle.min_time_remaining_ms),
+            max_light_side_spread: self
+                .operational
+                .recycle_max_light_side_spread
+                .unwrap_or(config.capital_recycle.max_light_side_spread),
             race_buffer_ticks: self
                 .rescue
                 .hedge_rescue_race_buffer_ticks
@@ -458,7 +495,15 @@ pub struct HybridMmSection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RescueSection {
+    pub enabled: Option<bool>,
+    pub late_window_sec: Option<u64>,
+    pub min_excess_usd: Option<f64>,
+    pub hold_threshold: Option<f64>,
+    pub rescue_threshold: Option<f64>,
+    pub max_rescue_fraction: Option<f64>,
+    pub rehedge_pair_cost_threshold: Option<f64>,
     pub hedge_rescue_clip_usd: Option<f64>,
+    pub hedge_rescue_max_qty: Option<f64>,
     pub hedge_rescue_edge_bps: Option<f64>,
     pub hedge_rescue_race_buffer_ticks: Option<f64>,
     pub sell_unwind_enabled: Option<bool>,
