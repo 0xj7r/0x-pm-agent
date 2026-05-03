@@ -42,6 +42,13 @@ pub struct PairCostArbStrategyConfig {
     pub fractional_kelly: f64,
     pub capital_scale_factor: f64,
     pub maker_safety_ticks: f64,
+    pub rescue_enabled: bool,
+    pub rescue_late_window_sec: u64,
+    pub rescue_min_excess_usd: f64,
+    pub rescue_hold_threshold: f64,
+    pub rescue_threshold: f64,
+    pub rescue_max_fraction: f64,
+    pub rescue_rehedge_pair_cost_threshold: f64,
 }
 
 impl Default for PairCostArbStrategyConfig {
@@ -70,6 +77,13 @@ impl Default for PairCostArbStrategyConfig {
             fractional_kelly: 0.15,
             capital_scale_factor: 1.0,
             maker_safety_ticks: 2.0,
+            rescue_enabled: true,
+            rescue_late_window_sec: 90,
+            rescue_min_excess_usd: 4.0,
+            rescue_hold_threshold: 0.0,
+            rescue_threshold: -0.04,
+            rescue_max_fraction: 0.35,
+            rescue_rehedge_pair_cost_threshold: 1.02,
         }
     }
 }
@@ -224,6 +238,109 @@ impl PairCostArbStrategy {
         Some(yes_avg + no_avg)
     }
 
+    fn late_window_rescue_intent<M: MarketDescriptor>(
+        &self,
+        input: &StrategyInput<M>,
+    ) -> Option<(OrderIntent, String)> {
+        if !self.config.rescue_enabled {
+            return None;
+        }
+        let remaining_ms = input.market.time_remaining_ms(input.now_ms)?;
+        if remaining_ms > self.config.rescue_late_window_sec.saturating_mul(1_000) {
+            return None;
+        }
+
+        let (leg, excess_qty, avg_cost, fair_win_prob, quote, instrument_id) =
+            if input.inventory.yes_qty > input.inventory.no_qty {
+                (
+                    Leg::Yes,
+                    input.inventory.yes_qty - input.inventory.no_qty,
+                    input.inventory.yes_avg_cost,
+                    input.fair_value.p_up,
+                    &input.snapshot.yes_quote,
+                    input.snapshot.yes_instrument_id.clone(),
+                )
+            } else if input.inventory.no_qty > input.inventory.yes_qty {
+                (
+                    Leg::No,
+                    input.inventory.no_qty - input.inventory.yes_qty,
+                    input.inventory.no_avg_cost,
+                    input.fair_value.p_down,
+                    &input.snapshot.no_quote,
+                    input.snapshot.no_instrument_id.clone(),
+                )
+            } else {
+                return None;
+            };
+
+        let best_bid = quote.best_bid.as_ref()?.price;
+        if !best_bid.is_finite() || best_bid <= 0.0 {
+            return None;
+        }
+        let excess_usd = excess_qty * best_bid;
+        if excess_usd + 1e-9 < self.config.rescue_min_excess_usd {
+            return None;
+        }
+
+        let opposite_ask = match leg {
+            Leg::Yes => input.snapshot.no_quote.best_ask.as_ref()?.price,
+            Leg::No => input.snapshot.yes_quote.best_ask.as_ref()?.price,
+        };
+        let rehedge_pair_cost = avg_cost + opposite_ask;
+        if rehedge_pair_cost <= self.config.rescue_rehedge_pair_cost_threshold {
+            return None;
+        }
+
+        let delta_ev = (fair_win_prob.clamp(0.0, 1.0) - best_bid) * excess_qty;
+        if delta_ev >= self.config.rescue_hold_threshold {
+            return None;
+        }
+        if delta_ev > self.config.rescue_threshold {
+            return None;
+        }
+
+        let tick = input.market.tick_size().max(0.001);
+        let limit_price = (best_bid - tick * self.config.maker_safety_ticks.max(0.0))
+            .clamp(tick, 1.0 - tick);
+        let qty = (excess_qty * self.config.rescue_max_fraction.clamp(0.0, 1.0))
+            .min(excess_qty)
+            .max(0.0);
+        if qty * limit_price < self.config.min_clip_usd {
+            return None;
+        }
+
+        let leg_name = match leg {
+            Leg::Yes => "yes",
+            Leg::No => "no",
+        };
+        let mut intent = OrderIntent::new_sell(
+            strategy_client_order_id(
+                "pair-cost-rescue",
+                &instrument_id,
+                leg_name,
+                limit_price,
+                qty,
+                input.now_ms,
+            ),
+            input.snapshot.market_id.clone(),
+            instrument_id,
+            limit_price,
+            qty,
+            format!(
+                "pair-cost late-window EV rescue sell {leg_name} delta_ev={delta_ev:.4} fair={fair_win_prob:.4} bid={best_bid:.4} rehedge_pair_cost={rehedge_pair_cost:.4}"
+            ),
+            input.now_ms,
+        );
+        intent.quote_level_tag = Some(format!("pair-cost-arb:ev-rescue:{leg_name}"));
+        intent.kind = IntentKind::Close;
+        Some((
+            intent,
+            format!(
+                "pair-cost EV rescue emitted leg={leg:?} qty={qty:.4} delta_ev={delta_ev:.4} rehedge_pair_cost={rehedge_pair_cost:.4}"
+            ),
+        ))
+    }
+
     fn cheap_leg_intent<M: MarketDescriptor>(
         &self,
         input: &StrategyInput<M>,
@@ -373,6 +490,11 @@ where
             notes.push(
                 "pair-cost recycle skipped: late-window convex winner excess is active".to_string(),
             );
+        }
+
+        if let Some((intent, reason)) = self.late_window_rescue_intent(&input) {
+            notes.push(reason);
+            return StrategyDecision::rescue(vec![intent], notes);
         }
 
         let mut candidates = Vec::new();
@@ -559,5 +681,37 @@ mod tests {
         let decision = strategy.on_tick(input(quote(0.48, 0.50), quote(0.28, 0.30)));
 
         assert!(decision.intents().is_empty());
+    }
+
+    #[test]
+    fn late_window_ev_rescue_sells_fraction_of_bad_excess() {
+        let mut strategy = PairCostArbStrategy::new(PairCostArbStrategyConfig {
+            rescue_enabled: true,
+            rescue_late_window_sec: 90,
+            rescue_min_excess_usd: 2.0,
+            rescue_threshold: -0.04,
+            rescue_rehedge_pair_cost_threshold: 1.02,
+            min_edge_bps: 35.0,
+            ..Default::default()
+        });
+        let mut input = input(quote(0.30, 0.32), quote(0.82, 0.84));
+        input.market.event_end_ms = Some(80_000);
+        input.now_ms = 10;
+        input.inventory.yes_qty = 20.0;
+        input.inventory.no_qty = 5.0;
+        input.inventory.yes_avg_cost = 0.60;
+        input.inventory.no_avg_cost = 0.35;
+        input.fair_value.p_up = 0.05;
+        input.fair_value.p_down = 0.95;
+
+        let decision = strategy.on_tick(input);
+
+        assert_eq!(decision.intents().len(), 1);
+        assert_eq!(decision.intents()[0].side, TradeSide::Sell);
+        assert_eq!(decision.intents()[0].kind, IntentKind::Close);
+        assert_eq!(
+            decision.intents()[0].quote_level_tag.as_deref(),
+            Some("pair-cost-arb:ev-rescue:yes")
+        );
     }
 }

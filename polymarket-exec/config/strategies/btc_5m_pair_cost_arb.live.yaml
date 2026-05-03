@@ -17,7 +17,7 @@ pair_cost:
 clip_sizing:
   base_clip_usd: 1.5
   min_clip_usd: 0.5
-  max_clip_usd: 4.0
+  max_clip_usd: 5.0
   fractional_kelly: 0.15
   capital_scale_factor: 0.5          # 0.5 = tiny-live ($50), 1.0 = full live
 
@@ -52,6 +52,13 @@ hybrid_mm:
 
 # ── Rescue / EV Hold Logic ───────────────────────────────────────────────────
 rescue:
+  enabled: true
+  late_window_sec: 90
+  min_excess_usd: 5.0
+  hold_threshold: 0.0
+  rescue_threshold: -0.06
+  max_rescue_fraction: 0.25
+  rehedge_pair_cost_threshold: 1.03
   hedge_rescue_edge_bps: 25
   max_gross_cost_usd: 12
   max_gross_cost_bps: 300

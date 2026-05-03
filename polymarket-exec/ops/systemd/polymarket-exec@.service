@@ -8,10 +8,10 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=%h/go/polymarket-agent
 Environment=PM_EXEC_ROOT_DIR=%h/go/polymarket-agent
-Environment=PM_BTC_5M_CONTEXT_SOURCE=live
-Environment=PM_BTC_5M_INCLUDE_PREV=0
-Environment=PM_BTC_5M_INCLUDE_NEXT=0
-Environment=PM_BTC_5M_CONTEXT_REFRESH_INTERVAL_SEC=45
+Environment=PM_BTC_5M_MARKET_DISCOVERY_ENABLED=true
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_PREV=0
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_NEXT=0
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INTERVAL_MS=30000
 Environment=PM_BTC_5M_EXEC_LOAD_DOTENV=false
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1

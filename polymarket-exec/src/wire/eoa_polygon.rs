@@ -165,6 +165,24 @@ impl EoaPolygonSubmitter {
     }
 
     async fn eth_call(&self, to: Address, data: Bytes) -> Result<Bytes, ExecutionError> {
+        self.eth_call_from(None, to, data).await
+    }
+
+    pub async fn simulate_call(
+        &self,
+        from: Address,
+        to: Address,
+        data: Bytes,
+    ) -> Result<Bytes, ExecutionError> {
+        self.eth_call_from(Some(from), to, data).await
+    }
+
+    async fn eth_call_from(
+        &self,
+        from: Option<Address>,
+        to: Address,
+        data: Bytes,
+    ) -> Result<Bytes, ExecutionError> {
         let mut last_error: Option<ExecutionError> = None;
         for endpoint in self.rpc.endpoints() {
             let url = match endpoint.url().parse::<reqwest::Url>() {
@@ -178,9 +196,12 @@ impl EoaPolygonSubmitter {
                 }
             };
             let provider = ProviderBuilder::new().connect_http(url);
-            let request = TransactionRequest::default()
+            let mut request = TransactionRequest::default()
                 .to(to)
                 .input(data.clone().into());
+            if let Some(from) = from {
+                request = request.from(from);
+            }
             match provider.call(request).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(error) => {

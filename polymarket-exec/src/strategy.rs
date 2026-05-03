@@ -285,6 +285,8 @@ pub struct HybridStrategy {
     paired_mm: Option<PairedMmStrategy>,
     quotes_by_market: HashMap<MarketId, HashMap<InstrumentId, QuoteSnapshot>>,
     momentum_weight: f64,
+    mm_overlay_capital_pct: f64,
+    mm_overlay_max_levels_per_side: usize,
 }
 
 impl HybridStrategy {
@@ -296,13 +298,23 @@ impl HybridStrategy {
         let profile = profile.unwrap_or(&default_profile);
         let mut pair_cost_arb = None;
         let mut paired_mm = None;
+        let pair_cost_requested = requested.iter().any(|name| name == "pair_cost_arb");
+        let paired_mm_requested = requested.iter().any(|name| name == "paired_mm");
+        let hybrid_overlay_enabled = if pair_cost_requested && paired_mm_requested {
+            profile.hybrid_mm.enabled.unwrap_or(true)
+        } else {
+            true
+        };
+
         for name in requested {
             match name.as_str() {
                 "pair_cost_arb" => {
                     pair_cost_arb = Some(PairCostArbStrategy::new(profile.pair_cost_arb_config()));
                 }
                 "paired_mm" => {
-                    paired_mm = Some(PairedMmStrategy::new(profile.paired_mm_config()));
+                    if hybrid_overlay_enabled {
+                        paired_mm = Some(PairedMmStrategy::new(profile.paired_mm_config()));
+                    }
                 }
                 "noop" => {}
                 other => return Err(format!("unsupported strategy '{other}'")),
@@ -318,6 +330,16 @@ impl HybridStrategy {
             paired_mm,
             quotes_by_market: HashMap::new(),
             momentum_weight: profile.momentum_weight(),
+            mm_overlay_capital_pct: if pair_cost_requested && paired_mm_requested {
+                profile.hybrid_mm.capital_pct.unwrap_or(0.15).clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            mm_overlay_max_levels_per_side: if pair_cost_requested && paired_mm_requested {
+                1
+            } else {
+                usize::MAX
+            },
         })
     }
 
@@ -477,6 +499,54 @@ impl HybridStrategy {
         }
         StrategyDecision::Noop { notes }
     }
+
+    fn cap_mm_overlay_decision(
+        &self,
+        decision: StrategyDecision,
+        free_cash_usd: f64,
+        pair_cost_active: bool,
+    ) -> StrategyDecision {
+        let StrategyDecision::QuoteSet { intents, mut notes } = decision else {
+            return decision;
+        };
+        if !pair_cost_active && self.mm_overlay_capital_pct >= 1.0 {
+            return StrategyDecision::QuoteSet { intents, notes };
+        }
+
+        let cap_usd = (free_cash_usd * self.mm_overlay_capital_pct).max(0.0);
+        let mut used_usd = 0.0;
+        let mut levels_by_side: HashMap<(InstrumentId, crate::types::TradeSide), usize> =
+            HashMap::new();
+        let original_count = intents.len();
+        let mut kept = Vec::with_capacity(original_count);
+
+        for intent in intents {
+            let notional = intent.limit_price.max(0.0) * intent.quantity.max(0.0);
+            let side_key = (intent.instrument_id.clone(), intent.side);
+            let side_levels = levels_by_side.entry(side_key).or_insert(0);
+            if *side_levels >= self.mm_overlay_max_levels_per_side {
+                continue;
+            }
+            if used_usd + notional > cap_usd + 1e-9 {
+                continue;
+            }
+            used_usd += notional;
+            *side_levels += 1;
+            kept.push(intent);
+        }
+
+        if kept.len() < original_count {
+            notes.push(format!(
+                "hybrid mm overlay budget clipped kept={} dropped={} cap_usd={cap_usd:.4} used_usd={used_usd:.4}",
+                kept.len(),
+                original_count - kept.len(),
+            ));
+        }
+        StrategyDecision::QuoteSet {
+            intents: kept,
+            notes,
+        }
+    }
 }
 
 impl Strategy for HybridStrategy {
@@ -505,11 +575,19 @@ impl Strategy for HybridStrategy {
             };
         };
         let mut decisions = Vec::new();
+        let mut pair_cost_active = false;
         if let Some(strategy) = self.pair_cost_arb.as_mut() {
-            decisions.push(Self::convert(strategy.on_tick(input.clone())));
+            let decision = Self::convert(strategy.on_tick(input.clone()));
+            pair_cost_active = !decision.intents().is_empty();
+            decisions.push(decision);
         }
         if let Some(strategy) = self.paired_mm.as_mut() {
-            decisions.push(Self::convert(strategy.on_tick(input)));
+            let decision = Self::convert(strategy.on_tick(input));
+            decisions.push(self.cap_mm_overlay_decision(
+                decision,
+                context.inventory.free_cash_usd,
+                pair_cost_active,
+            ));
         }
         Self::combine(decisions)
     }

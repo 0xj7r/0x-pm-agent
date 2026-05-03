@@ -9,9 +9,10 @@ WorkingDirectory=%h/go/polymarket-agent
 Environment=PM_EXEC_ROOT_DIR=%h/go/polymarket-agent
 Environment=PM_BTC_5M_EXEC_MODE=live_smoke
 Environment=PM_BTC_5M_PAPER_MODE=false
-Environment=PM_BTC_5M_CONTEXT_SOURCE=live
-Environment=PM_BTC_5M_INCLUDE_PREV=1
-Environment=PM_BTC_5M_INCLUDE_NEXT=1
+Environment=PM_BTC_5M_MARKET_DISCOVERY_ENABLED=true
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_PREV=0
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_NEXT=1
+Environment=PM_BTC_5M_MARKET_DISCOVERY_INTERVAL_MS=30000
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 Environment=PM_EXEC_BIN=%h/.local/bin/polymarket-exec

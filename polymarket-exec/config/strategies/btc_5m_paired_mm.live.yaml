@@ -42,6 +42,7 @@ inventory:
 # ── Rescue / Merge Logic ────────────────────────────────────────
 rescue:
   hedge_rescue_clip_usd: 2.50
+  hedge_rescue_max_qty: 25.0
   hedge_rescue_edge_bps: 25
   hedge_rescue_race_buffer_ticks: 3.0
   sell_unwind_enabled: true
@@ -75,6 +76,9 @@ operational:
   max_entry_free_cash_bps: 6000
   max_rescue_free_cash_bps: 5000
   taker_fee_coeff: 0.072
+  recycle_min_imbalance_qty: 5.0
+  recycle_min_time_remaining_ms: 90000
+  recycle_max_light_side_spread: 0.10
 
 # ── Tiny-Live / Deployment Scaling ──────────────────────────────
 scaling:

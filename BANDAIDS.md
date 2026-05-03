@@ -18,6 +18,11 @@ behavior does not drift into shell wrappers or silent env mismatches.
 |---|---|---|---|
 | `PM_BTC_5M_DISABLE_SINGLETON_LOCK` | `polymarket-exec/src/main.rs` | Optional operator override | Disables the live singleton lock. Paper mode bypasses the lock automatically. |
 | `PM_BTC_5M_EXEC_LOCK_PATH` | `polymarket-exec/src/main.rs` | Optional operator override | Overrides the default live lockfile path `/tmp/polymarket-exec.live.lock`. |
+| `PM_BTC_5M_STRATEGY` | `polymarket-exec/src/config/mod.rs`, `polymarket-exec/src/strategy.rs` | `polymarket-exec/ops/env/*.env.example`, `polymarket-exec/.env.example` | Active strategy set. Production hybrid is `pair_cost_arb,paired_mm`. |
+| `PM_BTC_5M_STRATEGY_PROFILE_PATHS` | `polymarket-exec/src/config/mod.rs`, `polymarket-exec/src/strategy_profile.rs` | `polymarket-exec/ops/env/*.env.example`, `polymarket-exec/.env.example` | Comma-separated YAML/JSON strategy profiles. Later profiles merge over earlier profiles. |
+| `PM_BTC_5M_MARKET_DISCOVERY_ENABLED` | `polymarket-exec/src/config/mod.rs`, `polymarket-exec/src/runtime/market_universe.rs` | `polymarket-exec/ops/env/*.env.example`, `polymarket-exec/.env.example`, systemd units | Enables dynamic BTC 5m discovery. Required for rolling live/tinylive without static token ids. |
+| `PM_BTC_5M_MARKET_DISCOVERY_INCLUDE_PREV/NEXT` | `polymarket-exec/src/config/mod.rs` | `polymarket-exec/ops/env/*.env.example`, `polymarket-exec/.env.example`, systemd units | Controls adjacent-window discovery. Runtime filters out markets missing `price_to_beat`. |
+| `PM_BTC_5M_MARKET_DISCOVERY_INTERVAL_MS` | `polymarket-exec/src/config/mod.rs` | `polymarket-exec/ops/env/*.env.example`, `polymarket-exec/.env.example`, systemd units | Discovery refresh cadence. |
 | `POLYGON_RPC_URL` | `polymarket-exec/src/config/mod.rs`, `polymarket-exec/src/wire/polygon_rpc.rs` | Required for EOA merge/redeem/wrap | Primary Polygon RPC endpoint. Transaction sends use only the primary endpoint to avoid duplicate broadcasts. |
 | `POLYGON_RPC_FAILOVER_URLS` | `polymarket-exec/src/wire/polygon_rpc.rs` | Optional operator override | Comma-separated failovers used for read/preflight calls such as `eth_call` / `eth_blockNumber`. |
 | `POLYGON_RPC_REQUEST_TIMEOUT_MS` | `polymarket-exec/src/wire/polygon_rpc.rs` | Optional operator override | Timeout for JSON-RPC health/preflight requests. |

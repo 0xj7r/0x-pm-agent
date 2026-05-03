@@ -128,8 +128,12 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
     let limit_price = (best_ask + tick_size * config.race_buffer_ticks.max(0.0))
         .clamp(tick_size, 1.0 - tick_size);
 
+    let venue_min_qty = market.min_order_size().max(0.0);
     let qty_by_notional = config.max_buy_notional_usd / limit_price.max(tick_size);
-    let quantity = imbalance_qty.min(config.max_buy_qty).min(qty_by_notional);
+    let quantity = imbalance_qty
+        .max(venue_min_qty)
+        .min(config.max_buy_qty)
+        .min(qty_by_notional);
     if quantity + 1e-9 < market.min_order_size() {
         return CapitalRecycleDecision::Wait {
             reason: format!(
@@ -301,5 +305,37 @@ mod tests {
         };
 
         assert!((projected_pair_cost - 0.81).abs() < 1e-9);
+    }
+
+    #[test]
+    fn buys_venue_minimum_when_imbalance_is_smaller_than_min_order() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 7.0,
+                no_qty: 4.0,
+                yes_avg_cost: 0.45,
+                no_avg_cost: 0.42,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.90,
+                min_imbalance_qty: 1.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            0,
+        );
+
+        let CapitalRecycleDecision::BuyLightSide { intent, .. } = decision else {
+            panic!("expected venue-minimum recycle buy");
+        };
+
+        assert_eq!(intent.quantity, 5.0);
     }
 }
