@@ -36,6 +36,13 @@ impl MarketRegistry {
             .collect()
     }
 
+    /// Iterate every registered market regardless of bar-window state.
+    /// Used by callers (e.g. the replay adapter) that need to enumerate
+    /// markets the strategy is bound to without imposing a time gate.
+    pub fn iter(&self) -> impl Iterator<Item = &BinaryOutcomeMarket> {
+        self.markets.values()
+    }
+
     pub fn len(&self) -> usize {
         self.markets.len()
     }

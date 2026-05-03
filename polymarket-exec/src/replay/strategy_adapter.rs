@@ -21,12 +21,12 @@ use serde_yaml::Value as YamlValue;
 
 use crate::collector::schema::{Event, EventType};
 use crate::core::types::{
-    BookLevel, ClientOrderId, FillLiquidity, FillReport, IntentKind, InstrumentId, MarketId,
+    BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, IntentKind, MarketId,
     OrderIntent, QuoteSnapshot, StrategyDecision, TradeSide,
 };
-use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketRegistry, UnderlyingAsset};
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketRegistry, UnderlyingAsset};
 use crate::replay::fill_sim::{Side, SimulatedFill, StrategyOrderIntent};
 use crate::replay::runner::{ReplayDecision, ReplayStrategy};
 use crate::signals::fair_value::NoSignalReason;
@@ -54,14 +54,22 @@ impl AssetBook {
             .filter(|(_, sz)| **sz > 0.0)
             .map(|(p, sz)| BookLevel::new(ticks_to_price(*p), *sz))
             .collect();
-        bid_levels.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+        bid_levels.sort_by(|a, b| {
+            b.price
+                .partial_cmp(&a.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut ask_levels: Vec<BookLevel> = self
             .asks
             .iter()
             .filter(|(_, sz)| **sz > 0.0)
             .map(|(p, sz)| BookLevel::new(ticks_to_price(*p), *sz))
             .collect();
-        ask_levels.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+        ask_levels.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let best_bid = bid_levels.first().cloned();
         let best_ask = ask_levels.first().cloned();
         QuoteSnapshot {
@@ -206,11 +214,7 @@ impl BtcRegimeAggregator {
             return None;
         }
         let mean = returns.iter().copied().sum::<f64>() / returns.len() as f64;
-        let var = returns
-            .iter()
-            .map(|r| (r - mean).powi(2))
-            .sum::<f64>()
-            / returns.len() as f64;
+        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         Some(var.sqrt() * 10_000.0)
     }
 
@@ -398,6 +402,18 @@ impl ReplayStrategyAdapter {
         self.registry.len()
     }
 
+    /// Test/inspection accessor: returns the most recently observed
+    /// `StrategyInput` for a market. Returns None if no quotes/markets are
+    /// registered yet. Used by debugging tests to verify wiring.
+    pub fn build_input_snapshot(
+        &self,
+        market_id: &MarketId,
+        now_ms: u64,
+    ) -> Option<StrategyInput<BinaryOutcomeMarket>> {
+        let market = self.markets.get(market_id)?.clone();
+        self.build_input_for_market(&market, now_ms)
+    }
+
     fn enabled_strategy(&self) -> EnabledStrategy {
         match self.profile.strategy.as_deref() {
             Some("pair_cost_arb") => EnabledStrategy::PairCostArb,
@@ -461,13 +477,11 @@ impl ReplayStrategyAdapter {
     }
 
     /// All markets the adapter knows about. Used to drive on_tick across the
-    /// registry on every relevant event.
+    /// registry on every relevant event. We do not gate by `active_at` here:
+    /// the adapter's job is to drive the strategy whenever it has an input,
+    /// and the strategy itself owns end-of-bar/late-window logic.
     fn all_markets(&self) -> Vec<BinaryOutcomeMarket> {
-        let mut out = Vec::new();
-        for market in self.markets.active_at(u64::MAX) {
-            out.push(market.clone());
-        }
-        out
+        self.markets.iter().cloned().collect()
     }
 
     fn build_input_for_market(
@@ -488,11 +502,10 @@ impl ReplayStrategyAdapter {
             .inventories
             .get(&market.market_id)
             .map(InventoryState::snapshot)
-            .unwrap_or_else(|| {
-                let mut s = PairedInventorySnapshot::default();
-                s.free_cash_usd = self.starting_cash_usd;
-                s.equity_usd = self.starting_cash_usd;
-                s
+            .unwrap_or_else(|| PairedInventorySnapshot {
+                free_cash_usd: self.starting_cash_usd,
+                equity_usd: self.starting_cash_usd,
+                ..Default::default()
             });
         let pair_cost = PairCostTracker::from_inventory(&inventory);
         let btc_regime = self.btc_regime.snapshot();
@@ -538,8 +551,7 @@ impl ReplayStrategyAdapter {
         };
         let tau = market.time_remaining_fraction(now_ms);
         let momentum_weight = self.profile.momentum_weight().clamp(0.0, 5.0);
-        let momentum_return =
-            regime.return_60s_bps.unwrap_or(0.0) / 10_000.0 * momentum_weight;
+        let momentum_return = regime.return_60s_bps.unwrap_or(0.0) / 10_000.0 * momentum_weight;
         crate::signals::fair_value::estimate_fair_value_with_momentum(
             spot,
             strike,
@@ -614,16 +626,16 @@ impl ReplayStrategyAdapter {
                         // post a phantom sell that fills against trade flow,
                         // double-counting the position.
                         let inv = self.inventories.get(&market.market_id);
-                        let qty_avail = match (
-                            inv,
-                            intent.instrument_id == market.yes_instrument_id,
-                        ) {
-                            (Some(state), true) => state.yes_qty,
-                            (Some(state), false) if intent.instrument_id == market.no_instrument_id => {
-                                state.no_qty
-                            }
-                            _ => 0.0,
-                        };
+                        let qty_avail =
+                            match (inv, intent.instrument_id == market.yes_instrument_id) {
+                                (Some(state), true) => state.yes_qty,
+                                (Some(state), false)
+                                    if intent.instrument_id == market.no_instrument_id =>
+                                {
+                                    state.no_qty
+                                }
+                                _ => 0.0,
+                            };
                         if qty_avail < intent.quantity {
                             continue;
                         }
