@@ -40,7 +40,7 @@ use crate::strategy::{
 };
 use crate::types::{
     ClientOrderId, CloseMethod, EpochMillis, FillLiquidity, FillReport, InstrumentId, MarketId,
-    MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
+    MarketLedgerState, MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
@@ -2112,7 +2112,9 @@ impl<S: Strategy> Runtime<S> {
             reason.as_str(),
         ));
         if !matches!(
-            self.open_orders.get(client_order_id).map(|managed| managed.status),
+            self.open_orders
+                .get(client_order_id)
+                .map(|managed| managed.status),
             Some(ManagedOrderStatus::CancelRequested)
         ) {
             return outcome;
@@ -2159,10 +2161,9 @@ impl<S: Strategy> Runtime<S> {
                         now_ms,
                         "close-side strategy reaction: cancelling entry quotes before recycle/rescue",
                     )));
-                    outcome.extend(self.request_cancel_entry_orders(
-                        now_ms,
-                        "close-side strategy reaction",
-                    ));
+                    outcome.extend(
+                        self.request_cancel_entry_orders(now_ms, "close-side strategy reaction"),
+                    );
                 }
                 for intent in intents {
                     outcome.extend(self.accept_intent(intent, now_ms));
@@ -2691,6 +2692,9 @@ impl<S: Strategy> Runtime<S> {
     ) -> StrategyContext {
         let market_context = market_id.and_then(|id| self.market_contexts.get(id).cloned());
         let venue_rules = market_id.and_then(|id| self.venue_market_rules.get(id).copied());
+        let market_ledger_state = market_id
+            .map(|id| self.market_ledger_state(id))
+            .unwrap_or(MarketLedgerState::Flat);
         StrategyContext {
             now_ms,
             runtime_status: self.status,
@@ -2699,10 +2703,29 @@ impl<S: Strategy> Runtime<S> {
             open_orders_for_market: market_id
                 .map(|id| self.open_orders_for_market(id))
                 .unwrap_or(0),
+            market_ledger_state,
             market_context,
             btc_regime: self.btc_signals.snapshot(now_ms),
             venue_rules,
         }
+    }
+
+    fn market_ledger_state(&self, market_id: &MarketId) -> MarketLedgerState {
+        if self.pending_merge_by_market.contains_key(market_id)
+            || self.accepted_merge_by_market.contains_key(market_id)
+        {
+            return MarketLedgerState::MergePending;
+        }
+        if self.markets_with_unresolved_drift.contains(market_id) {
+            return MarketLedgerState::Drifted;
+        }
+        if self.market_has_inventory(market_id) {
+            return MarketLedgerState::Recycling;
+        }
+        if self.open_orders_for_market(market_id) > 0 {
+            return MarketLedgerState::QuotingPaired;
+        }
+        MarketLedgerState::Flat
     }
 
     fn actionable_order_qty_for_market(&self, market_id: &MarketId) -> f64 {

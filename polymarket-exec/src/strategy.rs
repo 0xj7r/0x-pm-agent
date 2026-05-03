@@ -19,8 +19,8 @@ use crate::strategies::paired_mm::PairedMmStrategy;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 pub use crate::strategy_profile::*;
 use crate::types::{
-    EpochMillis, FillReport, InstrumentId, MarketId, MarketSnapshot, OrderIntent, QuoteSnapshot,
-    RuntimeCommand, RuntimeStatus, SuppressionScope,
+    EpochMillis, FillReport, InstrumentId, IntentKind, MarketId, MarketLedgerState, MarketSnapshot,
+    OrderIntent, QuoteSnapshot, RuntimeCommand, RuntimeStatus, SuppressionScope,
 };
 
 #[derive(Debug, Clone)]
@@ -159,6 +159,7 @@ pub struct StrategyContext {
     pub inventory: InventorySnapshot,
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
+    pub market_ledger_state: MarketLedgerState,
     pub market_context: Option<MarketContextRecord>,
     pub btc_regime: crate::signals::BtcRegimeSnapshot,
     pub venue_rules: Option<VenueMarketRules>,
@@ -340,7 +341,11 @@ impl HybridStrategy {
             quotes_by_market: HashMap::new(),
             momentum_weight: profile.momentum_weight(),
             mm_overlay_capital_pct: if pair_cost_requested && paired_mm_requested {
-                profile.hybrid_mm.capital_pct.unwrap_or(0.15).clamp(0.0, 1.0)
+                profile
+                    .hybrid_mm
+                    .capital_pct
+                    .unwrap_or(0.15)
+                    .clamp(0.0, 1.0)
             } else {
                 1.0
             },
@@ -569,6 +574,74 @@ impl HybridStrategy {
             notes,
         }
     }
+
+    fn filter_for_market_state(
+        decision: StrategyDecision,
+        context: &StrategyContext,
+    ) -> StrategyDecision {
+        let fresh_entry_allowed = context.runtime_status == RuntimeStatus::Running
+            && context.market_ledger_state.allows_fresh_entry();
+        if fresh_entry_allowed {
+            return decision;
+        }
+
+        let reason = format!(
+            "strategy adapter close-side-only: runtime_status={:?} market_ledger_state={:?}",
+            context.runtime_status, context.market_ledger_state
+        );
+
+        match decision {
+            StrategyDecision::QuoteSet { mut notes, .. } => {
+                notes.push(format!("{reason}; dropped fresh quote set"));
+                StrategyDecision::suppress(StrategyDecisionSuppressionKind::SoftPause, false, notes)
+            }
+            StrategyDecision::Reactive { intents, mut notes } => {
+                let original_count = intents.len();
+                let kept = intents
+                    .into_iter()
+                    .filter(|intent| intent.kind == IntentKind::Close || intent.reduce_only)
+                    .collect::<Vec<_>>();
+                if kept.is_empty() {
+                    notes.push(format!(
+                        "{reason}; dropped {original_count} non-close reactive intents"
+                    ));
+                    StrategyDecision::suppress(
+                        StrategyDecisionSuppressionKind::SoftPause,
+                        false,
+                        notes,
+                    )
+                } else {
+                    if kept.len() < original_count {
+                        notes.push(format!(
+                            "{reason}; kept {} close-side intents and dropped {} entry intents",
+                            kept.len(),
+                            original_count - kept.len()
+                        ));
+                    } else {
+                        notes.push(format!("{reason}; allowing close-side repair"));
+                    }
+                    StrategyDecision::reactive(kept, notes)
+                }
+            }
+            StrategyDecision::Commands {
+                commands,
+                mut notes,
+            } => {
+                if commands.is_empty() {
+                    notes.push(format!("{reason}; no close-side commands"));
+                    StrategyDecision::Noop { notes }
+                } else {
+                    notes.push(format!("{reason}; allowing close-side command"));
+                    StrategyDecision::Commands { commands, notes }
+                }
+            }
+            StrategyDecision::Noop { mut notes } => {
+                notes.push(format!("{reason}; no repair action"));
+                StrategyDecision::Noop { notes }
+            }
+            StrategyDecision::Suppress { .. } => decision,
+        }
+    }
 }
 
 impl Strategy for HybridStrategy {
@@ -588,9 +661,6 @@ impl Strategy for HybridStrategy {
         snapshot: &MarketSnapshot,
     ) -> StrategyDecision {
         self.update_quote_cache(snapshot);
-        if context.runtime_status != RuntimeStatus::Running {
-            return StrategyDecision::none();
-        }
         let Some(input) = self.build_input(context, &snapshot.market_id) else {
             return StrategyDecision::Noop {
                 notes: vec!["strategy adapter waiting for paired yes/no books".to_string()],
@@ -599,17 +669,21 @@ impl Strategy for HybridStrategy {
         let mut decisions = Vec::new();
         let mut pair_cost_active = false;
         if let Some(strategy) = self.pair_cost_arb.as_mut() {
-            let decision = Self::convert(strategy.on_tick(input.clone()));
+            let decision = Self::filter_for_market_state(
+                Self::convert(strategy.on_tick(input.clone())),
+                context,
+            );
             pair_cost_active = !decision.intents().is_empty();
             decisions.push(decision);
         }
         if let Some(strategy) = self.paired_mm.as_mut() {
             let decision = Self::convert(strategy.on_tick(input));
-            decisions.push(self.cap_mm_overlay_decision(
+            let decision = self.cap_mm_overlay_decision(
                 decision,
                 context.inventory.free_cash_usd,
                 pair_cost_active,
-            ));
+            );
+            decisions.push(Self::filter_for_market_state(decision, context));
         }
         Self::combine(decisions)
     }
