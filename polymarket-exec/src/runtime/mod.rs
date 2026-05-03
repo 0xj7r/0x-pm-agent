@@ -668,15 +668,33 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(stranded.market_id.clone()),
             );
         }
-        let active_markets = venue_positions
-            .iter()
-            .filter(|position| position.quantity.abs() > DRIFT_QTY_EPSILON)
-            .map(|position| position.market_id.clone())
-            .collect::<HashSet<_>>();
-        self.accepted_merge_by_market
-            .retain(|market_id, _| active_markets.contains(market_id));
+        self.clear_accepted_merges_after_venue_reconcile(observed_at_ms);
         self.initial_reconcile_complete = true;
         Ok(report)
+    }
+
+    fn clear_accepted_merges_after_venue_reconcile(&mut self, observed_at_ms: EpochMillis) {
+        let accepted_markets = self
+            .accepted_merge_by_market
+            .iter()
+            .filter_map(|(market_id, accepted)| {
+                (observed_at_ms >= accepted.accepted_at_ms).then(|| market_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for market_id in accepted_markets {
+            if self.accepted_merge_by_market.remove(&market_id).is_some() {
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        observed_at_ms,
+                        "accepted merge latch cleared after venue position reconciliation; \
+                         remaining paired inventory may plan a fresh merge",
+                    )
+                    .with_market(market_id),
+                );
+            }
+        }
     }
 
     fn resolved_venue_cost_basis_usd(

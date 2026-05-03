@@ -974,6 +974,97 @@ fn blocked_merge_retries_after_backoff_instead_of_permanent_suppression() {
 }
 
 #[test]
+fn accepted_merge_latch_clears_after_post_accept_venue_reconcile() {
+    let market_id = MarketId::from("market-mm");
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            price: 0.20,
+            quantity: 5.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 10,
+        })
+        .expect("first leg");
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            price: 0.70,
+            quantity: 5.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 11,
+        })
+        .expect("second leg");
+
+    runtime.mark_pending_merge_accepted(&market_id, 12);
+    let duplicate_before_reconcile =
+        runtime.plan_merge_command_for_market(&market_id, 13, "duplicate before reconcile");
+    assert!(
+        duplicate_before_reconcile.commands.is_empty(),
+        "identical merge should still be suppressed before a post-accept venue reconcile"
+    );
+
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("up"),
+                    quantity: 5.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 14,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 5.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 14,
+                },
+            ],
+            14,
+        )
+        .expect("venue reconcile after accepted merge");
+
+    let fresh_merge =
+        runtime.plan_merge_command_for_market(&market_id, 15, "remaining paired inventory");
+    assert!(
+        fresh_merge
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Merge(_))),
+        "post-accept venue reconcile must clear the accepted latch so remaining paired inventory can merge"
+    );
+}
+
+#[test]
 fn reduce_only_sell_cleanup_is_suppressed_when_merge_is_pending() {
     let mut runtime = Runtime::new(
         RuntimeConfig {
