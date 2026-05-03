@@ -136,25 +136,37 @@ fn golden_fixture_replay_is_deterministic_across_runs() {
     let fixture = build_fixture();
     let f1 = replay_with(&fixture);
     let f2 = replay_with(&fixture);
-    let s1 = serde_json::to_string(&f1.iter().map(|f| {
-        // Build a stable JSON projection.
-        json!({
-            "client_order_id": f.client_order_id,
-            "asset_id": f.asset_id,
-            "side": format!("{:?}", f.side),
-            "price": f.price,
-            "size": f.size,
-            "fill_ms": f.fill_ms,
-        })
-    }).collect::<Vec<_>>()).unwrap();
-    let s2 = serde_json::to_string(&f2.iter().map(|f| json!({
-        "client_order_id": f.client_order_id,
-        "asset_id": f.asset_id,
-        "side": format!("{:?}", f.side),
-        "price": f.price,
-        "size": f.size,
-        "fill_ms": f.fill_ms,
-    })).collect::<Vec<_>>()).unwrap();
+    let s1 = serde_json::to_string(
+        &f1.iter()
+            .map(|f| {
+                // Build a stable JSON projection.
+                json!({
+                    "client_order_id": f.client_order_id,
+                    "asset_id": f.asset_id,
+                    "side": format!("{:?}", f.side),
+                    "price": f.price,
+                    "size": f.size,
+                    "fill_ms": f.fill_ms,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let s2 = serde_json::to_string(
+        &f2.iter()
+            .map(|f| {
+                json!({
+                    "client_order_id": f.client_order_id,
+                    "asset_id": f.asset_id,
+                    "side": format!("{:?}", f.side),
+                    "price": f.price,
+                    "size": f.size,
+                    "fill_ms": f.fill_ms,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     assert_eq!(s1, s2, "two runs must produce byte-identical fills");
 }
 

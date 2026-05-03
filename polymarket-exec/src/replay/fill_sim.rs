@@ -323,7 +323,14 @@ mod tests {
         }
     }
 
-    fn intent(coid: &str, asset: &str, side: Side, price: f64, size: f64, placed_ms: u64) -> StrategyOrderIntent {
+    fn intent(
+        coid: &str,
+        asset: &str,
+        side: Side,
+        price: f64,
+        size: f64,
+        placed_ms: u64,
+    ) -> StrategyOrderIntent {
         StrategyOrderIntent {
             client_order_id: coid.into(),
             asset_id: asset.into(),
@@ -393,7 +400,7 @@ mod tests {
         });
         sim.submit(intent("o1", "asset-a", Side::Sell, 0.55, 100.0, 1_000));
         sim.cancel("o1", 1_100); // cancel arrives at 1150
-        // Trade at 1_140 ms (before cancel arrival) still matches
+                                 // Trade at 1_140 ms (before cancel arrival) still matches
         sim.on_event(&trade_event(1_140_000_000, "asset-a", "buy", "0.55", "100"));
         assert_eq!(sim.fills().len(), 1);
     }
@@ -406,7 +413,13 @@ mod tests {
         });
         sim.submit(intent("o1", "asset-a", Side::Sell, 0.55, 100.0, 1_000));
         // public sell taker (hits the bid) does not match a resting ask
-        sim.on_event(&trade_event(2_000_000_000, "asset-a", "sell", "0.55", "100"));
+        sim.on_event(&trade_event(
+            2_000_000_000,
+            "asset-a",
+            "sell",
+            "0.55",
+            "100",
+        ));
         assert_eq!(sim.fills().len(), 0);
     }
 

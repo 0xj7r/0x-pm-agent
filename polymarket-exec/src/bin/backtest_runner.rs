@@ -38,7 +38,11 @@ use polymarket_exec::replay::runner::{
 
 /// Backtest CLI. Mirrors the spec's clap::Parser shape.
 #[derive(Parser, Debug)]
-#[command(name = "backtest_runner", version, about = "Phase 3a deterministic backtest runner")]
+#[command(
+    name = "backtest_runner",
+    version,
+    about = "Phase 3a deterministic backtest runner"
+)]
 struct Cli {
     /// RFC3339 inclusive start of the replay window.
     #[arg(long)]
@@ -147,7 +151,10 @@ impl ReplayStrategy for NoopStrategy {
     fn on_event(&mut self, _event: &Event) -> ReplayDecision {
         ReplayDecision::default()
     }
-    fn on_fill(&mut self, _fill: &polymarket_exec::replay::fill_sim::SimulatedFill) -> ReplayDecision {
+    fn on_fill(
+        &mut self,
+        _fill: &polymarket_exec::replay::fill_sim::SimulatedFill,
+    ) -> ReplayDecision {
         ReplayDecision::default()
     }
 }
@@ -164,7 +171,10 @@ fn run_main(cli: Cli) -> Result<i32> {
 
     // Load + canonicalize profile.
     if !cli.strategy_profile.exists() {
-        anyhow::bail!("--strategy-profile not found: {}", cli.strategy_profile.display());
+        anyhow::bail!(
+            "--strategy-profile not found: {}",
+            cli.strategy_profile.display()
+        );
     }
     let profile_yaml = fs::read_to_string(&cli.strategy_profile)
         .with_context(|| format!("read profile {}", cli.strategy_profile.display()))?;
@@ -327,4 +337,3 @@ fn main() -> ExitCode {
         }
     }
 }
-
