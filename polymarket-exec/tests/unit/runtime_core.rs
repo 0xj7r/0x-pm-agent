@@ -54,6 +54,41 @@ impl Strategy for SingleShotStrategy {
     }
 }
 
+struct PassiveSingleShotStrategy {
+    fired: bool,
+}
+
+impl Strategy for PassiveSingleShotStrategy {
+    fn name(&self) -> &str {
+        "passive-single-shot"
+    }
+
+    fn on_market_snapshot(
+        &mut self,
+        context: &StrategyContext,
+        snapshot: &MarketSnapshot,
+    ) -> StrategyDecision {
+        if self.fired || context.runtime_status != RuntimeStatus::Running {
+            return StrategyDecision::none();
+        }
+        self.fired = true;
+        StrategyDecision::single(OrderIntent {
+            client_order_id: ClientOrderId::from("client-1"),
+            market_id: snapshot.market_id.clone(),
+            instrument_id: snapshot.instrument_id.clone(),
+            side: TradeSide::Buy,
+            limit_price: snapshot.quote.best_bid.as_ref().unwrap().price,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "enter-passive".into(),
+            quote_level_tag: None,
+            created_at_ms: snapshot.quote.observed_at_ms,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        })
+    }
+}
+
 struct StatefulTestStrategy {
     restored: Arc<AtomicBool>,
     state: serde_json::Value,
@@ -163,7 +198,7 @@ fn runtime_reserves_then_applies_fill() {
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
-        SingleShotStrategy { fired: false },
+        PassiveSingleShotStrategy { fired: false },
         MarketContextStore::empty(),
     );
 
@@ -193,7 +228,7 @@ fn runtime_reserves_then_applies_fill() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
-    assert!((runtime.inventory().free_cash_usd() - 96.0).abs() < 1e-9);
+    assert!((runtime.inventory().free_cash_usd() - 96.1).abs() < 1e-9);
     assert_eq!(runtime.open_orders().count(), 1);
 
     runtime
@@ -203,7 +238,7 @@ fn runtime_reserves_then_applies_fill() {
             market_id: MarketId::from("market-1"),
             instrument_id: InstrumentId::from("token-1"),
             side: TradeSide::Buy,
-            price: 0.40,
+            price: 0.39,
             quantity: 10.0,
             fee_usd: 0.10,
             liquidity: FillLiquidity::Taker,
@@ -219,7 +254,7 @@ fn runtime_reserves_then_applies_fill() {
             .position_qty(&InstrumentId::from("token-1")),
         10.0
     );
-    assert!((runtime.inventory().free_cash_usd() - 95.9).abs() < 1e-9);
+    assert!((runtime.inventory().free_cash_usd() - 96.0).abs() < 1e-9);
 }
 
 #[test]
@@ -257,7 +292,7 @@ fn late_partial_fill_after_cancel_request_keeps_cancel_pending() {
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
-        SingleShotStrategy { fired: false },
+        PassiveSingleShotStrategy { fired: false },
         MarketContextStore::empty(),
     );
 
@@ -306,6 +341,98 @@ fn late_partial_fill_after_cancel_request_keeps_cancel_pending() {
             .position_qty(&InstrumentId::from("token-1")),
         4.0
     );
+}
+
+#[test]
+fn durable_dust_fill_terminal_removes_active_order_before_cancel() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("polymarket-exec-dust-fill-{ts}.sqlite"));
+    let store = SqliteOrderStore::open(&path).unwrap();
+    let client_order_id = ClientOrderId::from("client-1");
+
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Starting,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        PassiveSingleShotStrategy { fired: false },
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-dust-fill".to_string(),
+    );
+
+    runtime.start(1);
+    let quote_outcome = runtime
+        .on_market_snapshot(MarketSnapshot {
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.39, 100.0)),
+                best_ask: Some(BookLevel::new(0.40, 100.0)),
+                bid_levels: vec![BookLevel::new(0.39, 100.0)],
+                ask_levels: vec![BookLevel::new(0.40, 100.0)],
+                depth_observed_at_ms: Some(2),
+                last_trade_price: Some(0.40),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
+                observed_at_ms: 2,
+            },
+        })
+        .expect("quote");
+    assert_eq!(
+        quote_outcome.commands.len(),
+        1,
+        "events: {:?}",
+        runtime
+            .event_log()
+            .recent(8)
+            .iter()
+            .map(|event| event.message.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(runtime.open_orders().count(), 1);
+    runtime.on_order_opened(&client_order_id, 3);
+
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: Some(client_order_id.clone()),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            price: 0.40,
+            quantity: 9.995,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 4,
+        })
+        .expect("fill");
+
+    assert!(
+        runtime.open_order_snapshots().is_empty(),
+        "durable dust-complete fill must remove stale active order before quote churn can cancel it"
+    );
+    let cancel_outcome = runtime.request_cancel(&client_order_id, "desired changed", 5);
+    assert!(
+        cancel_outcome.commands.is_empty(),
+        "terminal durable fill must not emit a venue cancel"
+    );
+
+    let record = SqliteOrderStore::open(&path)
+        .unwrap()
+        .get(&client_order_id)
+        .unwrap()
+        .expect("order record");
+    assert_eq!(record.status, ManagedOrderStatus::Filled);
+    assert_eq!(record.remaining_qty, 0.0);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
