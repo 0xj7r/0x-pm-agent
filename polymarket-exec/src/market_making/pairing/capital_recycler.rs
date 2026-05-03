@@ -6,6 +6,8 @@ use crate::market_making::pairing::types::{
 use crate::markets::MarketDescriptor;
 use crate::types::{ClientOrderId, EpochMillis, IntentKind, MmQuoteKind, OrderIntent, TradeSide};
 
+const MIN_MARKETABLE_BUY_NOTIONAL_USD: f64 = 1.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CapitalRecycleConfig {
     pub pair_cost_target: f64,
@@ -129,12 +131,21 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         .clamp(tick_size, 1.0 - tick_size);
 
     let venue_min_qty = market.min_order_size().max(0.0);
-    let venue_min_notional_usd = venue_min_qty * limit_price;
-    let effective_max_buy_notional_usd =
-        config.max_buy_notional_usd.max(venue_min_notional_usd);
+    let min_buy_notional_usd =
+        (venue_min_qty * limit_price).max(MIN_MARKETABLE_BUY_NOTIONAL_USD);
+    let min_buy_qty = venue_min_qty.max(min_buy_notional_usd / limit_price.max(tick_size));
+    if min_buy_qty > config.max_buy_qty + 1e-9 {
+        return CapitalRecycleDecision::Wait {
+            reason: format!(
+                "capital recycle wait: min buy qty {:.4} exceeds max buy qty {:.4}",
+                min_buy_qty, config.max_buy_qty
+            ),
+        };
+    }
+    let effective_max_buy_notional_usd = config.max_buy_notional_usd.max(min_buy_notional_usd);
     let qty_by_notional = effective_max_buy_notional_usd / limit_price.max(tick_size);
     let quantity = imbalance_qty
-        .max(venue_min_qty)
+        .max(min_buy_qty)
         .min(config.max_buy_qty)
         .min(qty_by_notional);
     if quantity + 1e-9 < market.min_order_size() {
@@ -308,6 +319,45 @@ mod tests {
         };
 
         assert!((projected_pair_cost - 0.81).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recycle_market_buy_meets_minimum_notional_on_cheap_light_side() {
+        let mut snapshot = snapshot();
+        snapshot.no_quote = QuoteSnapshot {
+            best_bid: Some(BookLevel::new(0.03, 10.0)),
+            best_ask: Some(BookLevel::new(0.04, 10.0)),
+            ..QuoteSnapshot::default()
+        };
+
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot,
+            &PairedInventorySnapshot {
+                yes_qty: 50.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.90,
+                no_avg_cost: 0.04,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.99,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 50.0,
+                max_buy_notional_usd: 5.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            0,
+        );
+
+        let CapitalRecycleDecision::BuyLightSide { intent, .. } = decision else {
+            panic!("expected buy-light-side decision");
+        };
+
+        assert!(intent.quantity * intent.limit_price >= MIN_MARKETABLE_BUY_NOTIONAL_USD);
     }
 
     #[test]
