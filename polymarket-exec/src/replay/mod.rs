@@ -21,3 +21,4 @@ pub mod reader;
 pub mod risk_trace;
 pub mod runner;
 pub mod strategy_adapter;
+pub mod window_summary;
