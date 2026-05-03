@@ -78,6 +78,7 @@ pub struct UserWsClient {
     metrics: Arc<AppMetrics>,
     event_tx: Option<mpsc::UnboundedSender<UserOrderEvent>>,
     markets_rx: Option<watch::Receiver<Vec<String>>>,
+    raw_tap: Option<mpsc::UnboundedSender<crate::wire::raw_frame::RawFrame>>,
 }
 
 impl UserWsClient {
@@ -97,7 +98,18 @@ impl UserWsClient {
             metrics,
             event_tx,
             markets_rx: None,
+            raw_tap: None,
         }
+    }
+
+    /// Optional tap for the live collector. When set, every parsed user-ws
+    /// event is cloned into a `RawFrame`. The trader uses `None`.
+    pub fn with_raw_tap(
+        mut self,
+        tap: mpsc::UnboundedSender<crate::wire::raw_frame::RawFrame>,
+    ) -> Self {
+        self.raw_tap = Some(tap);
+        self
     }
 
     pub fn with_market_updates(mut self, markets_rx: watch::Receiver<Vec<String>>) -> Self {
@@ -246,6 +258,19 @@ impl UserWsClient {
     }
 
     async fn handle_event(&self, event: Value) -> Result<()> {
+        if let Some(tap) = &self.raw_tap {
+            let asset_id = event
+                .get("asset_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let _ = tap.send(crate::wire::raw_frame::RawFrame {
+                source: "polymarket_user_ws",
+                asset_id,
+                observed_at_ns: crate::wire::raw_frame::now_ns(),
+                payload: event.clone(),
+            });
+        }
+
         let event_type = event
             .get("event_type")
             .and_then(Value::as_str)

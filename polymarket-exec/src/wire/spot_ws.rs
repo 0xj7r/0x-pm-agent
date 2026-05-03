@@ -87,6 +87,7 @@ pub struct SpotWsClient {
     last_binance_trade_ingest_ms: Arc<AtomicU64>,
     last_binance_rest_trade_id: Arc<AtomicU64>,
     event_tx: Option<mpsc::UnboundedSender<SpotTradeEvent>>,
+    raw_tap: Option<mpsc::UnboundedSender<crate::wire::raw_frame::RawFrame>>,
 }
 
 impl SpotWsClient {
@@ -134,7 +135,18 @@ impl SpotWsClient {
             last_binance_trade_ingest_ms: Arc::new(AtomicU64::new(0)),
             last_binance_rest_trade_id: Arc::new(AtomicU64::new(0)),
             event_tx,
+            raw_tap: None,
         }
+    }
+
+    /// Optional tap for the live collector. When set, every parsed Binance or
+    /// Coinbase frame is cloned into a `RawFrame`. The trader uses `None`.
+    pub fn with_raw_tap(
+        mut self,
+        tap: mpsc::UnboundedSender<crate::wire::raw_frame::RawFrame>,
+    ) -> Self {
+        self.raw_tap = Some(tap);
+        self
     }
 
     pub async fn run(self, shutdown: CancellationToken) {
@@ -453,6 +465,14 @@ impl SpotWsClient {
         }
 
         if let Some(event) = parse_binance_ws_trade(payload, &self.symbol) {
+            if let Some(tap) = &self.raw_tap {
+                let _ = tap.send(crate::wire::raw_frame::RawFrame {
+                    source: "binance_aggtrade",
+                    asset_id: None,
+                    observed_at_ns: crate::wire::raw_frame::now_ns(),
+                    payload: payload.clone(),
+                });
+            }
             self.forward_event(event);
             return Ok(true);
         }
@@ -472,6 +492,14 @@ impl SpotWsClient {
             };
             for trade in trades {
                 if let Some(parsed) = parse_coinbase_trade(trade, &self.coinbase_product_id) {
+                    if let Some(tap) = &self.raw_tap {
+                        let _ = tap.send(crate::wire::raw_frame::RawFrame {
+                            source: "coinbase_match",
+                            asset_id: None,
+                            observed_at_ns: crate::wire::raw_frame::now_ns(),
+                            payload: trade.clone(),
+                        });
+                    }
                     self.forward_event(parsed);
                     parsed_any = true;
                 }

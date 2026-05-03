@@ -34,3 +34,15 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 polymarket-client-sdk = { version = "0.4.4", features = ["clob", "data", "heartbeats"] }
 polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "data", "heartbeats", "tracing"] }
 chrono = "0.4.44"
+aws-config = "1.5"
+aws-sdk-firehose = "1.40"
+hostname = "0.4"
+
+[dev-dependencies]
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[[bin]]
+name = "live_collector"
+path = "src/bin/live_collector.rs"
