@@ -478,6 +478,11 @@ pub async fn replay_runtime_from_snapshots(
             quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
             quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
             require_initial_reconcile_before_entry: false,
+            min_merge_notional_usd: config
+                .strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.pair.min_merge_notional_usd)
+                .unwrap_or_default(),
         },
         config.risk_limits.clone(),
         strategy,

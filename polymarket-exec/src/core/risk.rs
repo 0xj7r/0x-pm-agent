@@ -73,6 +73,9 @@ impl RiskLimits {
 pub struct RiskContext {
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
+    pub open_buy_notional_total_usd: f64,
+    pub open_signed_notional_for_market_usd: f64,
+    pub open_position_qty_for_instrument: f64,
     pub starting_cash_usd: f64,
     pub now_ms: EpochMillis,
 }
@@ -242,7 +245,8 @@ impl RiskEngine {
             );
         }
 
-        let current_position_qty = inventory.position_qty(&order.instrument_id);
+        let current_position_qty =
+            inventory.position_qty(&order.instrument_id) + context.open_position_qty_for_instrument;
         let projected_position_qty = current_position_qty + (order.quantity * order.side.sign());
         if !is_rescue
             && projected_position_qty.abs() > self.limits.max_position_quantity_per_instrument
@@ -317,7 +321,8 @@ impl RiskEngine {
             );
         }
 
-        let current_gross = inventory.gross_exposure_usd();
+        let current_gross =
+            inventory.gross_exposure_usd() + context.open_buy_notional_total_usd.max(0.0);
         let projected_gross_notional_usd = match order.side {
             TradeSide::Buy => current_gross + notional,
             TradeSide::Sell => {
@@ -342,9 +347,11 @@ impl RiskEngine {
             );
         }
 
-        let projected_market_net_notional_usd =
-            (inventory.net_exposure_for_market_usd(&order.market_id) + order.signed_notional_usd())
-                .abs();
+        let projected_market_net_notional_usd = (inventory
+            .net_exposure_for_market_usd(&order.market_id)
+            + context.open_signed_notional_for_market_usd
+            + order.signed_notional_usd())
+        .abs();
         if projected_market_net_notional_usd > self.limits.max_net_notional_per_market_usd {
             return self.reject(
                 RiskRejectReason::MarketNetExposureTooLarge,
@@ -542,6 +549,90 @@ mod tests {
             decision.reject_reason,
             Some(RiskRejectReason::PortfolioEquityTooLow)
         );
+    }
+
+    #[test]
+    fn rejects_entry_when_open_bids_would_push_gross_over_cap() {
+        let inventory = InventoryState::new(100.0);
+        let risk = RiskEngine::new(RiskLimits {
+            max_gross_notional_usd: 25.0,
+            max_order_notional_usd: 10.0,
+            ..RiskLimits::default()
+        });
+        let order = OrderIntent {
+            client_order_id: ClientOrderId::from("order-open-aware"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 20.0,
+            reduce_only: false,
+            reason: "test".into(),
+            quote_level_tag: None,
+            created_at_ms: 3,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        };
+
+        let decision = risk.evaluate(
+            &inventory,
+            &order,
+            &RiskContext {
+                open_buy_notional_total_usd: 20.0,
+                starting_cash_usd: 100.0,
+                now_ms: 4,
+                ..RiskContext::default()
+            },
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.reject_reason,
+            Some(RiskRejectReason::GrossExposureTooLarge)
+        );
+        assert_eq!(decision.projected_gross_notional_usd, 30.0);
+    }
+
+    #[test]
+    fn rejects_entry_when_open_same_market_bids_would_push_net_over_cap() {
+        let inventory = InventoryState::new(100.0);
+        let risk = RiskEngine::new(RiskLimits {
+            max_net_notional_per_market_usd: 25.0,
+            max_order_notional_usd: 10.0,
+            ..RiskLimits::default()
+        });
+        let order = OrderIntent {
+            client_order_id: ClientOrderId::from("order-open-net-aware"),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            limit_price: 0.50,
+            quantity: 20.0,
+            reduce_only: false,
+            reason: "test".into(),
+            quote_level_tag: None,
+            created_at_ms: 3,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        };
+
+        let decision = risk.evaluate(
+            &inventory,
+            &order,
+            &RiskContext {
+                open_signed_notional_for_market_usd: 20.0,
+                starting_cash_usd: 100.0,
+                now_ms: 4,
+                ..RiskContext::default()
+            },
+        );
+
+        assert!(!decision.accepted);
+        assert_eq!(
+            decision.reject_reason,
+            Some(RiskRejectReason::MarketNetExposureTooLarge)
+        );
+        assert_eq!(decision.projected_market_net_notional_usd, 30.0);
     }
 
     #[test]
