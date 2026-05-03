@@ -2696,12 +2696,16 @@ async fn execute_execution_adapter(
                             "execution venue rejected merge positions".to_string()
                         });
                         runtime.block_pending_merge(&intent.market_id, ack.accepted_at_ms, &reason);
-                        metrics.observe_riskoff_transition();
-                        let degrade_outcome = runtime.degrade_and_cancel_all(
-                            ack.accepted_at_ms,
-                            format!("live merge rejected; risk-off until recycle path is fixed: {reason}"),
+                        warn!(
+                            mode = "live",
+                            market_id = %intent.market_id,
+                            yes_instrument_id = %intent.yes_instrument_id,
+                            no_instrument_id = %intent.no_instrument_id,
+                            quantity = intent.quantity,
+                            command_id = %intent.command_id,
+                            reason = %reason,
+                            "live merge rejected; blocking identical CTF recycle without global risk-off"
                         );
-                        stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                     }
                     Err(error) => {
                         if error.is_retryable() {
@@ -2720,14 +2724,16 @@ async fn execute_execution_adapter(
                                 observed_at_ms,
                                 error.to_string(),
                             );
-                            metrics.observe_riskoff_transition();
-                            let degrade_outcome = runtime.degrade_and_cancel_all(
-                                observed_at_ms,
-                                format!(
-                                    "live merge failed; risk-off until recycle path is fixed: {error}"
-                                ),
+                            warn!(
+                                mode = "live",
+                                market_id = %intent.market_id,
+                                yes_instrument_id = %intent.yes_instrument_id,
+                                no_instrument_id = %intent.no_instrument_id,
+                                quantity = intent.quantity,
+                                command_id = %intent.command_id,
+                                error = %error,
+                                "live merge failed; blocking identical CTF recycle without global risk-off"
                             );
-                            stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                         }
                     }
                 }
