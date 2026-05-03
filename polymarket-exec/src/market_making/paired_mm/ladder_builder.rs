@@ -165,8 +165,10 @@ pub fn build_ladder<M: MarketDescriptor>(
 
     let mut intents = Vec::with_capacity(depth * 2);
     if inventory.gross_cost_usd() < config.caps.max_gross_cost_usd {
+        let mut yes_intents = Vec::with_capacity(depth);
+        let mut no_intents = Vec::with_capacity(depth);
         append_leg_ladder(
-            &mut intents,
+            &mut yes_intents,
             market,
             LadderLeg::Yes,
             &snapshot.yes_quote,
@@ -179,7 +181,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             now_ms,
         );
         append_leg_ladder(
-            &mut intents,
+            &mut no_intents,
             market,
             LadderLeg::No,
             &snapshot.no_quote,
@@ -191,6 +193,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             config,
             now_ms,
         );
+        interleave_leg_ladders(&mut intents, yes_intents, no_intents);
     }
 
     let (intents, risk_rejects) = filter_entry_intents(inventory, intents, &config.caps);
@@ -424,6 +427,29 @@ fn append_leg_ladder<M: MarketDescriptor>(
     }
 }
 
+fn interleave_leg_ladders(
+    intents: &mut Vec<OrderIntent>,
+    yes_intents: Vec<OrderIntent>,
+    no_intents: Vec<OrderIntent>,
+) {
+    let mut yes_iter = yes_intents.into_iter();
+    let mut no_iter = no_intents.into_iter();
+    loop {
+        let mut pushed = false;
+        if let Some(intent) = yes_iter.next() {
+            intents.push(intent);
+            pushed = true;
+        }
+        if let Some(intent) = no_iter.next() {
+            intents.push(intent);
+            pushed = true;
+        }
+        if !pushed {
+            break;
+        }
+    }
+}
+
 fn align_down_to_tick(price: f64, tick_size: f64) -> f64 {
     if !price.is_finite() || tick_size <= 0.0 {
         return price;
@@ -436,7 +462,9 @@ mod tests {
     use super::*;
     use crate::markets::BinaryOutcomeMarket;
     use crate::signals::FairValueModel;
-    use crate::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot};
+    use crate::types::{
+        BookLevel, ClientOrderId, InstrumentId, IntentKind, MarketId, QuoteSnapshot, TradeSide,
+    };
 
     fn market() -> BinaryOutcomeMarket {
         let mut market = BinaryOutcomeMarket::btc_5m(
@@ -472,6 +500,47 @@ mod tests {
             },
             ..snapshot()
         }
+    }
+
+    fn tagged_intent(tag: &str) -> OrderIntent {
+        OrderIntent {
+            client_order_id: ClientOrderId::from(tag),
+            market_id: MarketId::from("m"),
+            instrument_id: InstrumentId::from(tag),
+            side: TradeSide::Buy,
+            limit_price: 0.5,
+            quantity: 1.0,
+            reduce_only: false,
+            reason: tag.to_string(),
+            quote_level_tag: Some(tag.to_string()),
+            created_at_ms: 0,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        }
+    }
+
+    #[test]
+    fn interleaves_yes_and_no_ladders_by_level_before_risk() {
+        let mut intents = Vec::new();
+
+        interleave_leg_ladders(
+            &mut intents,
+            vec![
+                tagged_intent("yes:l1"),
+                tagged_intent("yes:l2"),
+                tagged_intent("yes:l3"),
+            ],
+            vec![tagged_intent("no:l1"), tagged_intent("no:l2")],
+        );
+
+        let tags: Vec<&str> = intents
+            .iter()
+            .map(|intent| intent.quote_level_tag.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            tags,
+            vec!["yes:l1", "no:l1", "yes:l2", "no:l2", "yes:l3"]
+        );
     }
 
     #[test]
