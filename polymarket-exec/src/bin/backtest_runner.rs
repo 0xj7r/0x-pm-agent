@@ -26,7 +26,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use polymarket_exec::collector::schema::Event;
-use polymarket_exec::replay::fill_sim::{FillSimConfig, LatencyPreset};
+use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset};
 use polymarket_exec::replay::manifest::{
     canonicalize, compute_run_id, profile_hash, Manifest, WindowPlan, FILL_SIM_VERSION,
     SCHEMA_VERSION,
@@ -95,6 +95,11 @@ struct Cli {
     #[arg(long, default_value = "nominal")]
     fill_config: String,
 
+    /// Fill-quality regime: optimistic | base | conservative. Orthogonal
+    /// to `--fill-config`. Defaults to `base` (the realistic regime).
+    #[arg(long, default_value = "base")]
+    fill_quality: String,
+
     /// 64-bit seed (hex or decimal).
     #[arg(long, default_value = "0xC0FFEE")]
     seed: String,
@@ -135,6 +140,15 @@ fn parse_fill_config(s: &str) -> Result<LatencyPreset> {
     }
 }
 
+fn parse_fill_quality(s: &str) -> Result<FillQuality> {
+    match s.to_ascii_lowercase().as_str() {
+        "optimistic" => Ok(FillQuality::Optimistic),
+        "base" => Ok(FillQuality::Base),
+        "conservative" => Ok(FillQuality::Conservative),
+        other => anyhow::bail!("unknown fill-quality regime: {other}"),
+    }
+}
+
 fn parse_market_filter(s: &str) -> Vec<String> {
     s.split(',')
         .map(|t| t.trim().to_string())
@@ -150,6 +164,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         .with_context(|| format!("invalid --window-end: {}", cli.window_end))?;
 
     let preset = parse_fill_config(&cli.fill_config)?;
+    let fill_quality = parse_fill_quality(&cli.fill_quality)?;
     let seed = parse_seed(&cli.seed)?;
 
     // Load + canonicalize profile.
@@ -200,12 +215,15 @@ fn run_main(cli: Cli) -> Result<i32> {
         })
         .collect();
 
-    // Compute run-id.
+    // Compute run-id. We hash BOTH `fill_config` (latency preset) and
+    // `fill_quality` so two runs differing only on either knob produce
+    // distinct run-ids.
+    let combined_fill_config = format!("{}+{}", cli.fill_config, cli.fill_quality);
     let derived_run_id = compute_run_id(
         &canonical_profile,
         &window_plans,
         &cli.git_rev,
-        &cli.fill_config,
+        &combined_fill_config,
         seed,
     );
     let run_id = if cli.run_id == "auto" {
@@ -229,7 +247,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         fill_sim_version: FILL_SIM_VERSION.to_string(),
         profile_hash: p_hash,
         windows: window_plans,
-        fill_config: cli.fill_config.clone(),
+        fill_config: combined_fill_config.clone(),
         seed: format!("0x{:016x}", seed),
     };
 
@@ -251,6 +269,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         window_id: String::new(),
         fill_sim: FillSimConfig {
             latency: preset,
+            fill_quality,
             seed,
             cancel_credit_fraction: 0.5,
         },
@@ -290,7 +309,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         git_rev: cli.git_rev,
         schema_version: SCHEMA_VERSION,
         fill_sim_version: FILL_SIM_VERSION.to_string(),
-        fill_config: cli.fill_config,
+        fill_config: combined_fill_config,
         windows: summaries,
     };
     fs::write(

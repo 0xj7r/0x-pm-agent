@@ -26,7 +26,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::collector::schema::Event;
-use crate::replay::fill_sim::{FillSimConfig, FillSimulator, SimulatedFill, StrategyOrderIntent};
+use crate::replay::fill_sim::{
+    FillSimConfig, FillSimulator, SimulatedFill, SimulatedRejection, StrategyOrderIntent,
+};
+use crate::replay::risk_trace::RiskRejection;
 
 /// What a window outputs. Aggregated into the run summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +38,15 @@ pub struct WindowSummary {
     pub events_replayed: u64,
     pub intents_submitted: u64,
     pub fills: Vec<SimulatedFill>,
+    /// Post-only rejections produced by the fill simulator (intents that
+    /// would have crossed the live book at submit time).
+    #[serde(default)]
+    pub post_only_rejections: Vec<SimulatedRejection>,
+    /// Risk-engine rejections captured during replay. Emitted to
+    /// `runs/run_id=<id>/trace/strand=risk_rejections/...parquet` by the
+    /// downstream writer (Phase 3d wiring; the strand is captured here).
+    #[serde(default)]
+    pub risk_rejections: Vec<RiskRejection>,
     pub status: WindowStatus,
 }
 
@@ -51,6 +63,9 @@ pub enum WindowStatus {
 pub struct ReplayDecision {
     pub submits: Vec<StrategyOrderIntent>,
     pub cancels: Vec<String>,
+    /// Risk-engine rejections produced while filtering this decision.
+    /// Carried up to the runner for trace-strand emission.
+    pub risk_rejections: Vec<RiskRejection>,
 }
 
 /// Trait the runner depends on. Implemented by a thin adapter over
@@ -85,9 +100,11 @@ pub fn run_window<S: ReplayStrategy>(
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut sim = FillSimulator::new(cfg.fill_sim.clone());
         let mut intents_submitted: u64 = 0;
+        let mut risk_rejections: Vec<RiskRejection> = Vec::new();
         for event in events {
             // Strategy reacts to event first
-            let decision = strategy.on_event(event);
+            let mut decision = strategy.on_event(event);
+            risk_rejections.append(&mut decision.risk_rejections);
             for intent in decision.submits {
                 sim.submit(intent);
                 intents_submitted += 1;
@@ -105,7 +122,8 @@ pub fn run_window<S: ReplayStrategy>(
             #[allow(clippy::unnecessary_to_owned)]
             let new_fills = sim.fills()[fills_before..fills_after].to_vec();
             for fill in new_fills {
-                let decision = strategy.on_fill(&fill);
+                let mut decision = strategy.on_fill(&fill);
+                risk_rejections.append(&mut decision.risk_rejections);
                 for intent in decision.submits {
                     sim.submit(intent);
                     intents_submitted += 1;
@@ -115,15 +133,22 @@ pub fn run_window<S: ReplayStrategy>(
                 }
             }
         }
-        (sim.fills().to_vec(), intents_submitted)
+        (
+            sim.fills().to_vec(),
+            sim.rejections().to_vec(),
+            intents_submitted,
+            risk_rejections,
+        )
     }));
 
     match outcome {
-        Ok((fills, intents_submitted)) => WindowSummary {
+        Ok((fills, post_only_rejections, intents_submitted, risk_rejections)) => WindowSummary {
             window_id: cfg.window_id.clone(),
             events_replayed: events.len() as u64,
             intents_submitted,
             fills,
+            post_only_rejections,
+            risk_rejections,
             status: WindowStatus::Ok,
         },
         Err(_panic) => WindowSummary {
@@ -131,6 +156,8 @@ pub fn run_window<S: ReplayStrategy>(
             events_replayed: events.len() as u64,
             intents_submitted: 0,
             fills: Vec::new(),
+            post_only_rejections: Vec::new(),
+            risk_rejections: Vec::new(),
             status: WindowStatus::Panicked,
         },
     }
@@ -213,15 +240,16 @@ mod tests {
             if !self.placed {
                 self.placed = true;
                 return ReplayDecision {
-                    submits: vec![StrategyOrderIntent {
-                        client_order_id: "passive-1".into(),
-                        asset_id: event.asset_id.clone().unwrap_or_default(),
-                        side: Side::Sell,
-                        price: 0.55,
-                        size: 100.0,
-                        placed_ms: (event.received_ns / 1_000_000) as u64,
-                    }],
+                    submits: vec![StrategyOrderIntent::passive(
+                        "passive-1",
+                        event.asset_id.clone().unwrap_or_default(),
+                        Side::Sell,
+                        0.55,
+                        100.0,
+                        (event.received_ns / 1_000_000) as u64,
+                    )],
                     cancels: vec![],
+                    risk_rejections: vec![],
                 };
             }
             ReplayDecision::default()

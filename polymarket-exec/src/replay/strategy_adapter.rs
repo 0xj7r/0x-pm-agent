@@ -24,11 +24,14 @@ use crate::core::types::{
     BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, IntentKind, MarketId,
     OrderIntent, QuoteSnapshot, StrategyDecision, TradeSide,
 };
+use crate::inventory::InventoryState as RuntimeInventoryState;
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketRegistry, UnderlyingAsset};
 use crate::replay::fill_sim::{Side, SimulatedFill, StrategyOrderIntent};
+use crate::replay::risk_trace::RiskRejection;
 use crate::replay::runner::{ReplayDecision, ReplayStrategy};
+use crate::risk::{RiskContext, RiskEngine};
 use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate, FairValueModel};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput};
@@ -352,9 +355,30 @@ pub struct ReplayStrategyAdapter {
     books: BookAggregator,
     btc_regime: BtcRegimeAggregator,
     inventories: BTreeMap<MarketId, InventoryState>,
+    /// Live runtime inventory mirror per market. Mirrors the live trader's
+    /// `core::inventory::InventoryState` so the `RiskEngine` evaluates
+    /// against the same shapes the live trader sees.
+    runtime_inventories: BTreeMap<MarketId, RuntimeInventoryState>,
+    risk: RiskEngine,
+    /// Per-market open-intent counters, updated as the simulator accepts
+    /// intents and decremented on fills. Feeds `RiskContext` so the
+    /// `max_open_orders_*` caps fire correctly.
+    open_orders_total: usize,
+    open_orders_per_market: BTreeMap<MarketId, usize>,
+    /// Whether risk-engine evaluation runs in-band on every intent. The
+    /// live trader does cancel/replace through a venue adapter; the replay
+    /// adapter does not yet model that, so leaving risk evaluation on by
+    /// default would over-trip `TooManyOpenOrders*` caps. Scenarios that
+    /// explicitly want to validate the risk strand turn this on.
+    risk_evaluation_enabled: bool,
     /// Track open intents so we can map `SimulatedFill.client_order_id` back
     /// to the originating `OrderIntent`'s leg, side, and market.
     open_intents: BTreeMap<String, IntentRecord>,
+    /// Map from the STRATEGY's stable client_order_id → the adapter's
+    /// last-issued unique simulator coid for that slot. Re-submits of
+    /// the same strategy slot emit an implicit cancel of the prior
+    /// adapter coid, mirroring the live runtime's replace semantics.
+    coid_by_strategy_slot: BTreeMap<String, String>,
     starting_cash_usd: f64,
     /// Last on_tick time per market, used to throttle on_tick calls. Without
     /// throttling we would call the strategy on every event which is the
@@ -379,6 +403,7 @@ impl ReplayStrategyAdapter {
     /// the live runtime's per-market binding via `register_paired_mm` /
     /// `register_pair_cost_arb`.
     pub fn from_profile(profile: StrategyProfile) -> Self {
+        let limits = profile.risk_limits();
         Self {
             profile,
             registry: StrategyRegistry::new(),
@@ -386,10 +411,23 @@ impl ReplayStrategyAdapter {
             books: BookAggregator::default(),
             btc_regime: BtcRegimeAggregator::default(),
             inventories: BTreeMap::new(),
+            runtime_inventories: BTreeMap::new(),
+            risk: RiskEngine::new(limits),
+            open_orders_total: 0,
+            open_orders_per_market: BTreeMap::new(),
+            risk_evaluation_enabled: false,
             open_intents: BTreeMap::new(),
+            coid_by_strategy_slot: BTreeMap::new(),
             starting_cash_usd: DEFAULT_STARTING_CASH_USD,
             sequence: 0,
         }
+    }
+
+    /// Enable in-band `RiskEngine` evaluation of every intent. Disabled
+    /// by default; see `risk_evaluation_enabled` field docs for why.
+    pub fn with_risk_evaluation(mut self, enabled: bool) -> Self {
+        self.risk_evaluation_enabled = enabled;
+        self
     }
 
     /// Test/inspection accessor.
@@ -605,6 +643,15 @@ impl ReplayStrategyAdapter {
             } else {
                 now_ms
             },
+            // Live trader's `OrderIntent` does not yet expose a typed
+            // aggressive/post-only flag, so the adapter defaults to the
+            // resting maker semantics. Hedge-rescue (Close) intents are
+            // FAK-style aggressive lifts; mark them as taker so the fill
+            // simulator crosses the book immediately. This preserves the
+            // "rescue completes the pair" invariant exercised by scenario
+            // fixture #4.
+            aggressive: matches!(intent.kind, IntentKind::Close),
+            post_only: false,
         })
     }
 
@@ -640,14 +687,121 @@ impl ReplayStrategyAdapter {
                             continue;
                         }
                     }
-                    if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
-                        out.submits.push(sim_intent);
-                    }
+                    self.evaluate_and_emit(intent, market, now_ms, out);
                 }
             }
             StrategyDecision::Merge { .. }
             | StrategyDecision::Suppress { .. }
             | StrategyDecision::Noop { .. } => {}
+        }
+    }
+
+    /// Route a single intent through the live `RiskEngine`. Accepted
+    /// intents are converted into `StrategyOrderIntent`s and pushed onto
+    /// `out.submits`; rejected intents append a typed `RiskRejection`
+    /// onto `out.risk_rejections` and DO NOT submit.
+    fn evaluate_and_emit(
+        &mut self,
+        intent: OrderIntent,
+        market: &BinaryOutcomeMarket,
+        now_ms: u64,
+        out: &mut ReplayDecision,
+    ) {
+        if !self.risk_evaluation_enabled {
+            // Bypass: convert and submit without risk evaluation. Mirrors
+            // the prior Phase 3a behaviour. Scenarios that need the risk
+            // strand opt in via `with_risk_evaluation(true)`.
+            let strategy_slot = intent.client_order_id.as_str().to_string();
+            if let Some(prior) = self.coid_by_strategy_slot.get(&strategy_slot).cloned() {
+                out.cancels.push(prior.clone());
+                self.open_intents.remove(&prior);
+            }
+            if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
+                self.coid_by_strategy_slot
+                    .insert(strategy_slot, sim_intent.client_order_id.clone());
+                out.submits.push(sim_intent);
+            }
+            return;
+        }
+        let runtime_inv = self
+            .runtime_inventories
+            .entry(market.market_id.clone())
+            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
+        // Replay open-order counters mirror submit/fill events. Without a
+        // cancel path the counter would grow unbounded; the adapter does
+        // not emit cancels today (the live trader manages cancel/replace
+        // through the venue, not exposed here), so we synthesise a count
+        // from the live `open_intents` map instead. This is the same set
+        // the simulator considers "resting" and matches the live engine's
+        // book-of-record.
+        let live_total = self.open_intents.len();
+        let live_for_market = self
+            .open_intents
+            .values()
+            .filter(|r| r.market_id == market.market_id)
+            .count();
+        let ctx = RiskContext {
+            open_orders_total: live_total,
+            open_orders_for_market: live_for_market,
+            starting_cash_usd: self.starting_cash_usd,
+            now_ms,
+        };
+        let decision = self.risk.evaluate(runtime_inv, &intent, &ctx);
+        if !decision.accepted {
+            let reason = decision
+                .reject_reason
+                .expect("rejected decisions carry a typed reason");
+            let caps = serde_json::json!({
+                "max_order_notional_usd": self.risk.limits().max_order_notional_usd,
+                "max_gross_notional_usd": self.risk.limits().max_gross_notional_usd,
+                "max_net_notional_per_market_usd": self.risk.limits().max_net_notional_per_market_usd,
+                "max_open_orders_total": self.risk.limits().max_open_orders_total,
+                "max_open_orders_per_market": self.risk.limits().max_open_orders_per_market,
+                "projected_free_cash_usd": decision.projected_free_cash_usd,
+                "projected_gross_notional_usd": decision.projected_gross_notional_usd,
+                "projected_market_net_notional_usd": decision.projected_market_net_notional_usd,
+            });
+            let side_str = match intent.side {
+                TradeSide::Buy => "buy",
+                TradeSide::Sell => "sell",
+            };
+            let intent_kind_str = match intent.kind {
+                IntentKind::Entry => "place",
+                IntentKind::Close => "place_close",
+            };
+            out.risk_rejections.push(RiskRejection::new(
+                (now_ms as i64).saturating_mul(1_000_000),
+                intent.client_order_id.as_str().to_string(),
+                market.market_id.as_str().to_string(),
+                intent.instrument_id.as_str().to_string(),
+                intent_kind_str,
+                side_str,
+                intent.limit_price,
+                intent.quantity,
+                reason,
+                decision.message.clone(),
+                caps,
+            ));
+            return;
+        }
+        let strategy_slot = intent.client_order_id.as_str().to_string();
+        // If the strategy is re-submitting the same logical slot, the live
+        // runtime would cancel the prior order before placing the new one.
+        // Emit an explicit cancel so the simulator drops the prior resting
+        // order and our open_intents map stays in sync.
+        if let Some(prior) = self.coid_by_strategy_slot.get(&strategy_slot).cloned() {
+            out.cancels.push(prior.clone());
+            self.open_intents.remove(&prior);
+        }
+        if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
+            self.coid_by_strategy_slot
+                .insert(strategy_slot, sim_intent.client_order_id.clone());
+            self.open_orders_total = self.open_orders_total.saturating_add(1);
+            *self
+                .open_orders_per_market
+                .entry(market.market_id.clone())
+                .or_insert(0) += 1;
+            out.submits.push(sim_intent);
         }
     }
 }
@@ -708,6 +862,15 @@ impl ReplayStrategy for ReplayStrategyAdapter {
             .or_insert_with(|| InventoryState::new(self.starting_cash_usd));
         inventory.apply_fill(record.leg, record.side, fill.price, fill.size);
 
+        // Decrement open-orders counters; the order has filled. Remove
+        // from the open-intent map so subsequent risk evaluations see the
+        // correct live count.
+        self.open_orders_total = self.open_orders_total.saturating_sub(1);
+        if let Some(c) = self.open_orders_per_market.get_mut(&record.market_id) {
+            *c = c.saturating_sub(1);
+        }
+        self.open_intents.remove(&fill.client_order_id);
+
         // Build StrategyFillInput and notify the strategy.
         let Some(market) = self.markets.get(&record.market_id).cloned() else {
             return ReplayDecision::default();
@@ -715,6 +878,10 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         let now_ms = fill.fill_ms;
         let Some(input) = self.build_input_for_market(&market, now_ms) else {
             return ReplayDecision::default();
+        };
+        let liquidity = match fill.maker_or_taker {
+            crate::replay::fill_sim::MakerOrTaker::Maker => FillLiquidity::Maker,
+            crate::replay::fill_sim::MakerOrTaker::Taker => FillLiquidity::Taker,
         };
         let fill_report = FillReport {
             order_id: None,
@@ -725,10 +892,15 @@ impl ReplayStrategy for ReplayStrategyAdapter {
             price: fill.price,
             quantity: fill.size,
             fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
+            liquidity,
             close_method: None,
             observed_at_ms: now_ms,
         };
+        // Mirror the fill onto the runtime inventory used by the risk
+        // engine so subsequent intents see post-fill exposure.
+        if let Some(runtime_inv) = self.runtime_inventories.get_mut(&record.market_id) {
+            let _ = runtime_inv.apply_fill(&fill_report);
+        }
         let fill_input = StrategyFillInput {
             market: market.clone(),
             snapshot: input.snapshot,
