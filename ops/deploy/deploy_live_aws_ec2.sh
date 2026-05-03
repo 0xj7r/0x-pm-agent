@@ -7,9 +7,14 @@ REMOTE_HOST="${AWS_LIVE_HOST:-${1:-}}"
 REMOTE_USER="${AWS_LIVE_USER:-ubuntu}"
 REMOTE_PORT="${AWS_LIVE_PORT:-22}"
 REMOTE_KEY="${AWS_LIVE_KEY_PATH:-$HOME/.ssh/polymarket_aws_live}"
-REMOTE_ROOT="${AWS_LIVE_REMOTE_ROOT:-/home/$REMOTE_USER/go/polymarket-agent}"
+REMOTE_RELEASE_ROOT="${AWS_LIVE_RELEASE_ROOT:-/home/$REMOTE_USER/go/polymarket-agent-releases}"
 REMOTE_CARGO_TARGET_DIR="${AWS_LIVE_CARGO_TARGET_DIR:-/home/$REMOTE_USER/.cache/polymarket-agent-cargo-target}"
 AWS_REGION="${AWS_REGION:-eu-west-1}"
+DEPLOY_REF="${AWS_LIVE_REF:-origin/main}"
+SKIP_FETCH="${AWS_LIVE_SKIP_FETCH:-0}"
+SKIP_BUILD="${AWS_LIVE_SKIP_BUILD:-0}"
+SKIP_RESTART="${AWS_LIVE_SKIP_RESTART:-1}"
+RESTART_CMD="${AWS_LIVE_RESTART_CMD:-}"
 
 log() {
   echo "[deploy-live-aws-ec2] $1"
@@ -37,32 +42,48 @@ ssh_base() {
 }
 
 rsync_base() {
-  rsync -az --delete \
+  rsync -az \
     -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p $REMOTE_PORT -i $REMOTE_KEY" \
     "$@"
 }
 
 require_remote
 
+cd "$ROOT_DIR"
+if [[ "$SKIP_FETCH" != "1" && "$DEPLOY_REF" == origin/* ]]; then
+  log "fetching origin before resolving $DEPLOY_REF"
+  git fetch origin
+fi
+
+git rev-parse --verify "$DEPLOY_REF^{commit}" >/dev/null ||
+  fail "deploy ref does not resolve to a commit: $DEPLOY_REF"
+DEPLOY_COMMIT="$(git rev-parse "$DEPLOY_REF^{commit}")"
+DEPLOY_SHORT="${DEPLOY_COMMIT:0:7}"
+ARCHIVE_PATH="$(mktemp "/tmp/polymarket-agent-${DEPLOY_SHORT}.XXXXXX.tar")"
+trap 'rm -f "$ARCHIVE_PATH"' EXIT
+
+log "deploy ref: $DEPLOY_REF ($DEPLOY_COMMIT)"
+log "creating clean git archive; local dirty worktree is intentionally ignored"
+git archive --format=tar --prefix="polymarket-agent-${DEPLOY_SHORT}/" "$DEPLOY_COMMIT" -o "$ARCHIVE_PATH"
+
 log "target region hint: $AWS_REGION"
 log "probing ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
 ssh_base 'hostname && whoami && uname -a'
 
-log "creating remote checkout root: $REMOTE_ROOT"
-ssh_base "mkdir -p '$REMOTE_ROOT'"
+log "creating remote release root: $REMOTE_RELEASE_ROOT"
+ssh_base "mkdir -p '$REMOTE_RELEASE_ROOT' '$REMOTE_CARGO_TARGET_DIR' \"\$HOME/.local/bin\""
 
-log "syncing repo without local artifacts or secrets"
-rsync_base \
-  --exclude '.git/' \
-  --exclude '.venv/' \
-  --exclude 'target/' \
-  --exclude 'reports/' \
-  --exclude 'data/' \
-  --exclude 'polymarket-exec/data/' \
-  --exclude 'polymarket-exec/.env' \
-  --exclude '*.sqlite-shm' \
-  --exclude '*.sqlite-wal' \
-  "$ROOT_DIR/" "${REMOTE_USER}@${REMOTE_HOST}:$REMOTE_ROOT/"
+log "uploading clean source archive"
+rsync_base "$ARCHIVE_PATH" "${REMOTE_USER}@${REMOTE_HOST}:/tmp/polymarket-agent-${DEPLOY_SHORT}.tar"
+
+log "extracting release $DEPLOY_SHORT"
+ssh_base "
+  set -euo pipefail
+  rm -rf '$REMOTE_RELEASE_ROOT/polymarket-agent-${DEPLOY_SHORT}'
+  tar -xf '/tmp/polymarket-agent-${DEPLOY_SHORT}.tar' -C '$REMOTE_RELEASE_ROOT'
+"
+
+REMOTE_RELEASE_DIR="$REMOTE_RELEASE_ROOT/polymarket-agent-${DEPLOY_SHORT}"
 
 log "verifying remote toolchain"
 ssh_base "
@@ -73,10 +94,22 @@ ssh_base "
 "
 
 log "installing user service templates"
-ssh_base "cd '$REMOTE_ROOT' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
+ssh_base "cd '$REMOTE_RELEASE_DIR' && polymarket-exec/ops/systemd/install_user_paper_services.sh"
 
-log "building single release binary"
-ssh_base "cd '$REMOTE_ROOT' && CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\") && mkdir -p '$REMOTE_CARGO_TARGET_DIR' \"\$HOME/.local/bin\" && CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec && install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/polymarket-exec\" && test -x \"\$HOME/.local/bin/polymarket-exec\""
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  log "skipping build (AWS_LIVE_SKIP_BUILD=1)"
+else
+  log "building release binary with persistent Cargo target cache"
+  ssh_base "
+    set -euo pipefail
+    cd '$REMOTE_RELEASE_DIR'
+    CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\")
+    CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec
+    install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
+    ln -sfn \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\" \"\$HOME/.local/bin/polymarket-exec\"
+    test -x \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
+  "
+fi
 
 log "reloading user systemd"
 ssh_base "systemctl --user daemon-reload"
@@ -87,12 +120,11 @@ ssh_base "sudo loginctl enable-linger '${REMOTE_USER}' || true"
 log "installed but did not start live smoke"
 ssh_base "systemctl --user status polymarket-exec-live-smoke.service --no-pager || true"
 
-# Safe-restart of running tinylive sleeve. Drains in-flight merges via the
-# kill switch + journal-quiet polling before issuing systemctl restart.
-# Set AWS_LIVE_SKIP_RESTART=1 to skip (e.g., for env-only or smoke deploys
-# that don't need the running process to swap binaries).
-if [[ "${AWS_LIVE_SKIP_RESTART:-0}" == "1" ]]; then
+if [[ "$SKIP_RESTART" == "1" ]]; then
   log "skipping safe-restart (AWS_LIVE_SKIP_RESTART=1)"
+elif [[ -n "$RESTART_CMD" ]]; then
+  log "running custom restart command"
+  ssh_base "$RESTART_CMD"
 elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
   log "running poly-safe-restart for ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
   ssh_base "\$HOME/.local/bin/poly-safe-restart.sh ${AWS_LIVE_SLEEVE:-btc_5m_mm_tinylive}"
@@ -105,13 +137,16 @@ cat <<EOF
 Deploy complete.
 
 Remote root:
-  $REMOTE_ROOT
+  $REMOTE_RELEASE_DIR
+
+Deployed ref:
+  $DEPLOY_REF ($DEPLOY_COMMIT)
 
 Persistent remote Cargo target dir:
   $REMOTE_CARGO_TARGET_DIR
 
 Tinylive env to edit on the AWS host:
-  ~/.config/polymarket-exec/btc_5m_mm_tinylive.env
+  ~/.config/polymarket-exec/btc_5m_hybrid_tinylive.env
 
 Operator kill switch:
   touch ~/.config/polymarket-exec/live.kill
