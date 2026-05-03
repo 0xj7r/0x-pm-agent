@@ -1227,6 +1227,19 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    pub fn remove_active_order_if_durable_terminal(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> (bool, RuntimeOutcome) {
+        let Some(record) = self.durable_terminal_order(client_order_id) else {
+            return (false, RuntimeOutcome::default());
+        };
+        let outcome = self.remove_active_order_after_durable_terminal(record, now_ms, reason);
+        (true, outcome)
+    }
+
     pub fn checkpoint_snapshot(
         &self,
         observed_at_ms: EpochMillis,

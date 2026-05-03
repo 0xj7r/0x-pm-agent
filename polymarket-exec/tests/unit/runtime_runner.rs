@@ -1155,6 +1155,101 @@ async fn matched_cancel_reject_does_not_replay_cancel_next_cycle() {
 }
 
 #[tokio::test]
+async fn missing_live_order_with_durable_fill_does_not_trigger_risk_off() {
+    static SQLITE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let suffix = SQLITE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "polymarket-exec-live-missing-filled-{ts}-{suffix}.sqlite"
+    ));
+    let client_order_id = ClientOrderId::from("client-missing-filled");
+    let mut store = SqliteOrderStore::open(&path).expect("store");
+    let mut record = OrderRecord::from_intent(
+        "run-test",
+        &OrderIntent {
+            client_order_id: client_order_id.clone(),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("token-1"),
+            side: TradeSide::Buy,
+            limit_price: 0.40,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "test recovered live order".to_string(),
+            quote_level_tag: None,
+            created_at_ms: 1,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        },
+        "noop",
+    );
+    record.status = ManagedOrderStatus::Working;
+    record.last_update_ms = 1;
+    store.insert(record).expect("insert order");
+
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Starting,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        StrategyMode::Noop(NoopStrategy),
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-test".to_string(),
+    );
+    runtime.recover_from_store(10_000, 100);
+    assert_eq!(runtime.open_order_snapshots().len(), 1);
+
+    let mut external_store = SqliteOrderStore::open(&path).expect("external store");
+    external_store
+        .update_status(&client_order_id, ManagedOrderStatus::Filled, 10_001)
+        .expect("durable fill");
+    drop(external_store);
+
+    let adapter = Arc::new(RecordingAdapter::default());
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets = vec!["token-1".to_string()];
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map =
+        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = live_test_policy();
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        RuntimeOutcome::default(),
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter,
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("execute");
+
+    assert!(runtime.open_order_snapshots().is_empty());
+    assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions() {
     let mut runtime = Runtime::new(
         RuntimeConfig {

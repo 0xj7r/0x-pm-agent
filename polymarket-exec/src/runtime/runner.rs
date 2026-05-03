@@ -3035,7 +3035,20 @@ async fn apply_sync_report(
     if execution_policy.paper_mode {
         return outcome;
     }
-    if report.errors > 0 || !report.missing_local_orders.is_empty() {
+    let mut unresolved_missing_local_orders = Vec::new();
+    for client_order_id in &report.missing_local_orders {
+        let (removed, terminal_outcome) = runtime.remove_active_order_if_durable_terminal(
+            client_order_id,
+            now_ms,
+            "venue sync missing locally tracked order already terminal in durable store",
+        );
+        outcome.extend(terminal_outcome);
+        if !removed {
+            unresolved_missing_local_orders.push(client_order_id.clone());
+        }
+    }
+
+    if report.errors > 0 || !unresolved_missing_local_orders.is_empty() {
         live_safety.consecutive_reconcile_mismatches = live_safety
             .consecutive_reconcile_mismatches
             .saturating_add(1);
@@ -3239,7 +3252,7 @@ async fn apply_sync_report(
         );
     }
 
-    for client_order_id in report.missing_local_orders {
+    for client_order_id in unresolved_missing_local_orders {
         outcome.extend(runtime.mark_order_needs_reconcile(
             &client_order_id,
             now_ms,
