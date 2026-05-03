@@ -10,7 +10,7 @@ strategy: pair_cost_arb
 pair_cost:
   threshold: 0.99                    # Buy only if projected pair_cost stays below this
   high_vol_threshold: 0.97           # Tighter threshold in high-vol / whipsaw regimes
-  min_merge_usd: 50.0                # Minimum balanced pair size before auto-merging
+  min_merge_usd: 0.10                # Merge any meaningful balanced pair; POL fees are negligible
   min_edge_bps: 100                  # Minimum edge required to buy a cheap leg
 
 # ── Clip Sizing (fractional Kelly) ───────────────────────────────────────────
@@ -46,13 +46,13 @@ signals:
 
 # ── Optional Hybrid Light MM Overlay (for liquidity rewards) ────────────────
 hybrid_mm:
-  enabled: true
-  capital_pct: 0.15                  # % of capital used for two-sided ladders
+  enabled: false                     # Live incident mode: pure pair-cost BUY+MERGE only
+  capital_pct: 0.0                   # Keep paired-MM overlay out of live until replay validates it
   base_spread_bps: 80
 
 # ── Rescue / EV Hold Logic ───────────────────────────────────────────────────
 rescue:
-  enabled: true
+  enabled: false                     # Canonical Gabagool path is BUY+MERGE; no live sell rescue yet
   late_window_sec: 90
   min_excess_usd: 5.0
   hold_threshold: 0.0

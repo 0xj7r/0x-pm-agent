@@ -220,8 +220,8 @@ impl AppConfig {
 
         let service_name = env_value("PM_BTC_5M_EXEC_SERVICE_NAME")
             .unwrap_or_else(|| "polymarket-exec".to_string());
-        let strategy_name = env_value("PM_BTC_5M_STRATEGY")
-            .unwrap_or_else(|| "pair_cost_arb,paired_mm".to_string());
+        let strategy_name =
+            env_value("PM_BTC_5M_STRATEGY").unwrap_or_else(|| "pair_cost_arb".to_string());
         let strategy_profile_paths = parse_strategy_profile_paths();
         let strategy_profile_path = strategy_profile_paths.first().cloned();
         let strategy_profile = if strategy_profile_paths.is_empty() {
