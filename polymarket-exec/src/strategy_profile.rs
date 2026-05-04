@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::risk::RiskLimits;
 use crate::market_making::paired_mm::{
-    CapitalRecycleConfig, HardPolicyConfig, LadderConfig, MergePolicyConfig, RescueConfig,
-    RunningInventoryCaps,
+    CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig, LadderConfig,
+    MergePolicyConfig, RescueConfig, RunningInventoryCaps,
 };
 use crate::quote_engine::QuoteEngineConfig;
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
@@ -33,6 +33,7 @@ pub struct StrategyProfile {
     pub pair_cost: PairCostSection,
     pub clip_sizing: ClipSizingSection,
     pub convexity: ConvexitySection,
+    pub convexity_overlay: ConvexityOverlaySection,
     pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
     pub hybrid_mm: HybridMmSection,
@@ -276,6 +277,37 @@ impl StrategyProfile {
             max_realized_vol_5m_bps: config.hard_policy.max_realized_vol_5m_bps,
             max_abs_return_60s_bps: config.hard_policy.max_abs_return_60s_bps,
         };
+        config.convexity_overlay = ConvexityOverlayConfig {
+            enabled: self
+                .convexity_overlay
+                .enabled
+                .unwrap_or(config.convexity_overlay.enabled),
+            late_window_sec: self
+                .convexity_overlay
+                .late_window_sec
+                .or(self.convexity.late_window_sec)
+                .unwrap_or(config.convexity_overlay.late_window_sec),
+            convex_p_threshold: self
+                .convexity_overlay
+                .convex_p_threshold
+                .or(self.convexity.convex_p_threshold)
+                .unwrap_or(config.convexity_overlay.convex_p_threshold),
+            max_excess_usd: self
+                .convexity_overlay
+                .max_excess_usd
+                .or(self.convexity.max_excess_usd)
+                .unwrap_or(config.convexity_overlay.max_excess_usd),
+            clip_usd: self
+                .convexity_overlay
+                .clip_usd
+                .or(self.quote.base_clip_usd)
+                .unwrap_or(config.convexity_overlay.clip_usd),
+            maker_safety_ticks: self
+                .convexity_overlay
+                .maker_safety_ticks
+                .or(self.quote.maker_safety_ticks)
+                .unwrap_or(config.convexity_overlay.maker_safety_ticks),
+        };
         config
     }
 
@@ -501,6 +533,19 @@ pub struct ConvexitySection {
     pub max_excess_usd: Option<f64>,
     pub avoid_rehedging_when_convex: Option<bool>,
     pub allow_extra_clip_on_winner: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConvexityOverlaySection {
+    pub enabled: Option<bool>,
+    pub capital_pct: Option<f64>,
+    pub late_window_sec: Option<u64>,
+    pub convex_p_threshold: Option<f64>,
+    pub max_excess_usd: Option<f64>,
+    pub clip_usd: Option<f64>,
+    pub allow_extra_clip_on_winner: Option<bool>,
+    pub maker_safety_ticks: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

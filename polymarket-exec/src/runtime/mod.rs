@@ -2843,7 +2843,13 @@ impl<S: Strategy> Runtime<S> {
             .quote_level_tag
             .as_deref()
             .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
-            .is_some_and(|kind| kind == crate::types::MmQuoteKind::PairedEntry);
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    crate::types::MmQuoteKind::PairedEntry
+                        | crate::types::MmQuoteKind::ConvexAccumulation
+                )
+            });
         (legacy_btc_mm || paired_entry_tag)
             && intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
@@ -2871,6 +2877,7 @@ impl<S: Strategy> Runtime<S> {
             market_ledger_state,
             market_context,
             btc_regime: self.btc_signals.snapshot(now_ms),
+            momentum: self.btc_signals.momentum_signal(now_ms),
             venue_rules,
         }
     }

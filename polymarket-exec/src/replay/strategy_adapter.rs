@@ -550,6 +550,8 @@ impl ReplayStrategyAdapter {
         let pair_cost = PairCostTracker::from_inventory(&inventory);
         let btc_regime = self.btc_regime.snapshot();
         let fair_value = self.fair_value_for(market, &btc_regime, now_ms);
+        let order_book_pressure =
+            crate::signals::OrderBookPressureEngine::default().compute(&snapshot);
         Some(StrategyInput {
             market: market.clone(),
             snapshot,
@@ -557,6 +559,8 @@ impl ReplayStrategyAdapter {
             pair_cost,
             fair_value,
             btc_regime,
+            momentum: crate::signals::MomentumSignal::default(),
+            order_book_pressure,
             now_ms,
         })
     }
@@ -974,7 +978,7 @@ mod tests {
     use super::*;
     use crate::collector::schema::Source;
     use crate::replay::fill_sim::{FillSimConfig, LatencyPreset};
-    use crate::replay::runner::{RunnerConfig, WindowStatus, run_window};
+    use crate::replay::runner::{run_window, RunnerConfig, WindowStatus};
     use serde_json::json;
 
     fn evt(received_ns: i64, event_type: EventType) -> Event {

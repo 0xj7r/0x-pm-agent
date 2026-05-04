@@ -56,15 +56,6 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
     let remaining_ms = market
         .time_remaining_ms(now_ms)
         .unwrap_or(market.window_ms());
-    if remaining_ms < config.min_time_remaining_ms {
-        return CapitalRecycleDecision::Wait {
-            reason: format!(
-                "capital recycle wait: remaining_ms={remaining_ms} below min {}",
-                config.min_time_remaining_ms
-            ),
-        };
-    }
-
     let imbalance_qty = inventory.side_imbalance_qty();
     if imbalance_qty < config.min_imbalance_qty {
         return CapitalRecycleDecision::Wait {
@@ -131,8 +122,7 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         .clamp(tick_size, 1.0 - tick_size);
 
     let venue_min_qty = market.min_order_size().max(0.0);
-    let min_buy_notional_usd =
-        (venue_min_qty * limit_price).max(MIN_MARKETABLE_BUY_NOTIONAL_USD);
+    let min_buy_notional_usd = (venue_min_qty * limit_price).max(MIN_MARKETABLE_BUY_NOTIONAL_USD);
     let min_buy_qty = venue_min_qty.max(min_buy_notional_usd / limit_price.max(tick_size));
     if min_buy_qty > config.max_buy_qty + 1e-9 {
         return CapitalRecycleDecision::Wait {
@@ -178,6 +168,7 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
             ),
         };
     }
+    let late_recycle = remaining_ms < config.min_time_remaining_ms;
 
     let leg_tag = match light_leg {
         LadderLeg::Yes => "yes",
@@ -197,7 +188,12 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         quantity,
         reduce_only: false,
         reason: format!(
-            "capital recycle buy light side {leg_tag} projected_pair_cost={projected_pair_cost:.4}"
+            "capital recycle buy light side {leg_tag} projected_pair_cost={projected_pair_cost:.4}{}",
+            if late_recycle {
+                " late_pair_cost_ok=true"
+            } else {
+                ""
+            }
         ),
         quote_level_tag: Some(format!(
             "mm-capital-recycle:{leg_tag}:{:?}",
@@ -213,7 +209,12 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         leg: light_leg,
         projected_pair_cost,
         reason: format!(
-            "capital recycle buy light side leg={light_leg:?} qty={quantity:.4} price={limit_price:.4} projected_pair_cost={projected_pair_cost:.4}"
+            "capital recycle buy light side leg={light_leg:?} qty={quantity:.4} price={limit_price:.4} projected_pair_cost={projected_pair_cost:.4}{}",
+            if late_recycle {
+                " late_pair_cost_ok=true"
+            } else {
+                ""
+            }
         ),
     }
 }
@@ -422,5 +423,69 @@ mod tests {
         };
 
         assert_eq!(intent.quantity, 5.0);
+    }
+
+    #[test]
+    fn late_recycle_is_allowed_when_projected_pair_cost_is_favorable() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.45,
+                no_avg_cost: 0.42,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.90,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            250_000,
+        );
+
+        let CapitalRecycleDecision::BuyLightSide { reason, .. } = decision else {
+            panic!("expected late buy-light-side decision");
+        };
+
+        assert!(reason.contains("late_pair_cost_ok=true"));
+    }
+
+    #[test]
+    fn late_recycle_still_refuses_expensive_rehedge() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.70,
+                no_avg_cost: 0.42,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.99,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+            },
+            250_000,
+        );
+
+        let CapitalRecycleDecision::Wait { reason } = decision else {
+            panic!("expected expensive late rehedge to wait");
+        };
+
+        assert!(reason.contains("projected_pair_cost"));
     }
 }

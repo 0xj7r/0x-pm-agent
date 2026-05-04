@@ -1,8 +1,9 @@
 //! Strategy adapter that applies the reusable paired-MM algorithm to a market.
 
 use crate::market_making::paired_mm::{
-    AutoFillSuggestion, CapitalRecycleConfig, HardPolicyConfig, LadderConfig, MergePolicyConfig,
-    PairedMmEngine, PairedMmEngineConfig, PairedMmInput, RescueConfig,
+    AutoFillSuggestion, CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig,
+    LadderConfig, MergePolicyConfig, PairedMmEngine, PairedMmEngineConfig, PairedMmInput,
+    RescueConfig,
 };
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
@@ -15,6 +16,7 @@ pub struct PairedMmStrategyConfig {
     pub merge: MergePolicyConfig,
     pub capital_recycle: CapitalRecycleConfig,
     pub hard_policy: HardPolicyConfig,
+    pub convexity_overlay: ConvexityOverlayConfig,
 }
 
 impl Default for PairedMmStrategyConfig {
@@ -25,6 +27,7 @@ impl Default for PairedMmStrategyConfig {
             merge: MergePolicyConfig::default(),
             capital_recycle: CapitalRecycleConfig::default(),
             hard_policy: HardPolicyConfig::default(),
+            convexity_overlay: ConvexityOverlayConfig::default(),
         }
     }
 }
@@ -44,6 +47,7 @@ impl PairedMmStrategy {
                 capital_recycle: config.capital_recycle,
                 hard_policy: config.hard_policy,
                 auto_fill: Default::default(),
+                convexity_overlay: config.convexity_overlay,
             }),
         }
     }
@@ -88,11 +92,16 @@ where
         let mut notes = decision.notes.clone();
         notes.extend(decision.ladder.diagnostics.notes.clone());
         notes.push(format!(
-            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4}",
+            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4}",
             decision.ladder.diagnostics.regime,
             btc_regime,
             vol_5m_bps,
             ret180_bps,
+            input.momentum.direction,
+            input.momentum.score,
+            input.order_book_pressure.direction,
+            input.order_book_pressure.imbalance,
+            input.order_book_pressure.thin_book,
             decision.ladder.diagnostics.depth,
             decision.ladder.diagnostics.spacing_ticks,
             decision.ladder.diagnostics.yes_reservation,
@@ -100,7 +109,7 @@ where
         ));
 
         if let Some(intent) = decision.capital_recycle_intent().cloned() {
-            notes.push("paired-mm capital recycle emitted".to_string());
+            notes.push("paired-mm decision_label=cheap_leg_recycle mode=cheap_leg_mode capital recycle emitted".to_string());
             return StrategyDecision::capital_recycle(vec![intent], notes);
         }
 
@@ -115,7 +124,15 @@ where
             return StrategyDecision::suppress(reason, false, notes);
         }
 
-        StrategyDecision::quote_set(decision.ladder.intents, notes)
+        let mut intents = decision.ladder.intents;
+        if !intents.is_empty() {
+            notes.push("paired-mm decision_label=paired_entry mode=paired_entry_mode paired ladder emitted".to_string());
+        }
+        if let Some(intent) = decision.convex_overlay {
+            intents.push(intent);
+        }
+
+        StrategyDecision::quote_set(intents, notes)
     }
 
     fn on_fill(&mut self, input: StrategyFillInput<M>) -> StrategyDecision {

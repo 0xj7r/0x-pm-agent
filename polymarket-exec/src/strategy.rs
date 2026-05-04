@@ -162,6 +162,7 @@ pub struct StrategyContext {
     pub market_ledger_state: MarketLedgerState,
     pub market_context: Option<MarketContextRecord>,
     pub btc_regime: crate::signals::BtcRegimeSnapshot,
+    pub momentum: crate::signals::MomentumSignal,
     pub venue_rules: Option<VenueMarketRules>,
 }
 
@@ -405,6 +406,8 @@ impl HybridStrategy {
             paired_inventory_from_context(&context.inventory, market_id, &yes_id, &no_id);
         let pair_cost = PairCostTracker::from_inventory(&inventory);
         let fair_value = fair_value_from_context(context, &market, self.momentum_weight);
+        let order_book_pressure =
+            crate::signals::OrderBookPressureEngine::default().compute(&snapshot);
         Some(StrategyInput {
             market,
             snapshot,
@@ -412,6 +415,8 @@ impl HybridStrategy {
             pair_cost,
             fair_value,
             btc_regime: context.btc_regime.clone(),
+            momentum: context.momentum.clone(),
+            order_book_pressure,
             now_ms: context.now_ms,
         })
     }

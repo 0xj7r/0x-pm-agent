@@ -15,7 +15,9 @@ mod scenario_builder;
 use std::path::Path;
 
 use polymarket_exec::collector::schema::{Event, EventType, Source};
-use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset, Side, SimulatedFill};
+use polymarket_exec::replay::fill_sim::{
+    FillQuality, FillSimConfig, LatencyPreset, Side, SimulatedFill,
+};
 use polymarket_exec::replay::runner::{
     run_window, ReplayDecision, ReplayStrategy, RunnerConfig, WindowStatus, WindowSummary,
 };
@@ -309,9 +311,7 @@ fn synthesizer_injects_price_to_beat_into_stream() {
     let synth_events: Vec<_> = recorder
         .seen
         .iter()
-        .filter(|(et, src, _, _)| {
-            *et == EventType::PriceToBeat && *src == Source::Synthesizer
-        })
+        .filter(|(et, src, _, _)| *et == EventType::PriceToBeat && *src == Source::Synthesizer)
         .collect();
     assert_eq!(
         synth_events.len(),
