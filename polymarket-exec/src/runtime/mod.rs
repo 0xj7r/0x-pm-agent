@@ -2494,7 +2494,7 @@ impl<S: Strategy> Runtime<S> {
                 .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
     }
 
-    fn accept_intent(&mut self, intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
+    fn accept_intent(&mut self, mut intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
         // TODO(2026-04-23): integrate execution acknowledgements/fill events from a downstream
         // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
@@ -2566,6 +2566,48 @@ impl<S: Strategy> Runtime<S> {
                 ),
             );
             return outcome;
+        }
+        if intent.side == TradeSide::Sell && intent.reduce_only {
+            let held_qty = self.inventory.position_qty(&intent.instrument_id).max(0.0);
+            let open_sell_qty =
+                self.open_reduce_only_sell_qty_for_instrument(&intent.instrument_id);
+            let available_qty = (held_qty - open_sell_qty).max(0.0);
+            let min_qty = self.actionable_order_qty_for_market(&intent.market_id);
+            if available_qty + ACCOUNTING_QTY_EPSILON < min_qty {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "reduce-only sell suppressed: no unreserved token inventory held={held_qty:.6} open_sell={open_sell_qty:.6} available={available_qty:.6} min_qty={min_qty:.6}"
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+            if intent.quantity > available_qty {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "reduce-only sell quantity clipped to unreserved token inventory requested={:.6} held={held_qty:.6} open_sell={open_sell_qty:.6} available={available_qty:.6}",
+                                intent.quantity
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                intent.quantity = available_qty;
+            }
         }
         if is_rescue_intent && self.has_equivalent_close_order_in_flight(&intent) {
             outcome.push_event(
@@ -3016,6 +3058,22 @@ impl<S: Strategy> Runtime<S> {
                 !managed.status.is_terminal() && &managed.intent.instrument_id == instrument_id
             })
             .map(|managed| managed.remaining_qty() * managed.intent.side.sign())
+            .sum()
+    }
+
+    fn open_reduce_only_sell_qty_for_instrument(
+        &self,
+        instrument_id: &crate::types::InstrumentId,
+    ) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal()
+                    && &managed.intent.instrument_id == instrument_id
+                    && managed.intent.side == TradeSide::Sell
+                    && managed.intent.reduce_only
+            })
+            .map(ManagedOrder::remaining_qty)
             .sum()
     }
 
