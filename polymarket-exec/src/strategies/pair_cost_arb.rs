@@ -465,8 +465,15 @@ where
         let convex_winner = self.active_convex_winner(&input);
         let book_cheapest_leg = self.book_cheapest_leg(&input);
         let mut notes = vec![format!(
-            "pair-cost arb fair p_up={:.4} p_down={:.4} target={:.4}",
-            input.fair_value.p_up, input.fair_value.p_down, target
+            "pair-cost arb fair p_up={:.4} p_down={:.4} target={:.4} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={}",
+            input.fair_value.p_up,
+            input.fair_value.p_down,
+            target,
+            input.momentum.direction,
+            input.momentum.score,
+            input.order_book_pressure.direction,
+            input.order_book_pressure.imbalance,
+            input.order_book_pressure.thin_book
         )];
         if let (Some(yes_mid), Some(no_mid)) = (
             input.snapshot.yes_quote.mid_price(),
@@ -475,6 +482,36 @@ where
             notes.push(format!(
                 "pair-cost arb book_mid yes={yes_mid:.4} no={no_mid:.4} fresh_entry_leg={book_cheapest_leg:?}"
             ));
+            let yes_projected = self.projected_pair_cost(
+                &input.pair_cost,
+                &input.snapshot,
+                Leg::Yes,
+                self.config.min_clip_usd.max(input.market.min_order_size()),
+                yes_mid,
+            );
+            let no_projected = self.projected_pair_cost(
+                &input.pair_cost,
+                &input.snapshot,
+                Leg::No,
+                self.config.min_clip_usd.max(input.market.min_order_size()),
+                no_mid,
+            );
+            let cheap_leg_signal =
+                crate::signals::CheapLegSignalEngine::new(crate::signals::CheapLegConfig {
+                    min_edge_bps: self.config.min_edge_bps,
+                    max_pair_cost: target,
+                    ..Default::default()
+                })
+                .decide(
+                    &input.fair_value,
+                    &input.momentum,
+                    &input.order_book_pressure,
+                    yes_projected,
+                    Some(yes_mid),
+                    no_projected,
+                    Some(no_mid),
+                );
+            notes.push(cheap_leg_signal.reason().to_string());
         }
 
         if let Some(intent) = self.merge_intent(&input) {
@@ -659,6 +696,8 @@ mod tests {
                 realized_vol_5m_bps: Some(10.0),
                 ..Default::default()
             },
+            momentum: crate::signals::MomentumSignal::default(),
+            order_book_pressure: crate::signals::OrderBookPressureSignal::default(),
             now_ms: 10,
         }
     }

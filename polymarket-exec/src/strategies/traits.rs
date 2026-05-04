@@ -2,7 +2,9 @@
 
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
-use crate::signals::{BtcRegimeSnapshot, FairValueEstimate};
+use crate::signals::{
+    BtcRegimeSnapshot, FairValueEstimate, MomentumSignal, OrderBookPressureSignal,
+};
 use crate::types::{EpochMillis, FillReport, StrategyDecision};
 
 #[derive(Clone, Debug)]
@@ -13,6 +15,8 @@ pub struct StrategyInput<M> {
     pub pair_cost: PairCostTracker,
     pub fair_value: FairValueEstimate,
     pub btc_regime: BtcRegimeSnapshot,
+    pub momentum: MomentumSignal,
+    pub order_book_pressure: OrderBookPressureSignal,
     pub now_ms: EpochMillis,
 }
 

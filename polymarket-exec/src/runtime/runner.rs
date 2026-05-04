@@ -3054,6 +3054,50 @@ async fn apply_sync_report(
         }
     }
 
+    let balance_observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
+    let authoritative_empty_balance_after_order =
+        |managed: &crate::runtime::types::ManagedOrder| {
+            report.balance_synced
+                && report.venue_positions_authoritative
+                && balance_observed_at_ms >= managed.last_update_ms
+                && !report.venue_positions.iter().any(|position| {
+                    position.market_id == managed.intent.market_id
+                        && position.instrument_id == managed.intent.instrument_id
+                        && position.quantity.abs() > 1e-9
+                })
+        };
+
+    let mut still_unresolved_missing_local_orders = Vec::new();
+    let open_order_by_client = runtime
+        .open_order_snapshots()
+        .into_iter()
+        .map(|managed| (managed.intent.client_order_id.clone(), managed))
+        .collect::<HashMap<_, _>>();
+    for client_order_id in unresolved_missing_local_orders {
+        let Some(managed) = open_order_by_client.get(&client_order_id) else {
+            continue;
+        };
+        if authoritative_empty_balance_after_order(managed) {
+            info!(
+                mode = "live",
+                client_order_id = %client_order_id,
+                market_id = %managed.intent.market_id,
+                instrument_id = %managed.intent.instrument_id,
+                balance_observed_at_ms,
+                order_last_update_ms = managed.last_update_ms,
+                "clearing missing live order as cancelled after authoritative empty balance sync"
+            );
+            outcome.extend(runtime.on_order_cancelled(
+                &client_order_id,
+                "venue open-order and authoritative balance sync show no active order or fill",
+                now_ms,
+            ));
+        } else {
+            still_unresolved_missing_local_orders.push(client_order_id);
+        }
+    }
+    let unresolved_missing_local_orders = still_unresolved_missing_local_orders;
+
     if report.errors > 0 || !unresolved_missing_local_orders.is_empty() {
         live_safety.consecutive_reconcile_mismatches = live_safety
             .consecutive_reconcile_mismatches

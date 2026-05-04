@@ -1250,6 +1250,61 @@ async fn missing_live_order_with_durable_fill_does_not_trigger_risk_off() {
 }
 
 #[tokio::test]
+async fn missing_live_order_with_authoritative_empty_balance_clears_as_cancelled() {
+    let client_order_id = ClientOrderId::from("client-missing-empty-balance");
+    let mut runtime = runtime_with_recovered_order(
+        client_order_id.clone(),
+        ManagedOrderStatus::Working,
+        1,
+        "polymarket-exec-live-missing-empty-balance",
+    );
+    assert_eq!(runtime.open_order_snapshots().len(), 1);
+
+    let adapter = Arc::new(RecordingAdapter {
+        balances: Some(VenueBalances {
+            cash_usd: 100.0,
+            positions: Vec::new(),
+            positions_authoritative: true,
+            observed_at_ms: 10_000,
+        }),
+        ..RecordingAdapter::default()
+    });
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets = vec!["token-1".to_string()];
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map =
+        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = live_test_policy();
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        RuntimeOutcome::default(),
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter,
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("execute");
+
+    assert!(runtime.open_order_snapshots().is_empty());
+    assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+}
+
+#[tokio::test]
 async fn live_sync_clears_local_inventory_on_authoritative_empty_venue_positions() {
     let mut runtime = Runtime::new(
         RuntimeConfig {

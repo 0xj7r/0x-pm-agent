@@ -8,16 +8,16 @@ strategy: paired_mm
 
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
-  levels_per_side: 2
-  base_clip_usd: 1.50
+  levels_per_side: 3
+  base_clip_usd: 3.00
   min_clip_usd: 0.50
-  max_clip_usd: 5.0
+  max_clip_usd: 8.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
-  min_top_depth_notional_usd: 2.0
+  min_top_depth_notional_usd: 3.0
   min_order_notional_usd: 0.50
-  entry_ladder_levels: 2
+  entry_ladder_levels: 3
   entry_ladder_spacing_ticks: 1.0
   maker_safety_ticks: 2.0
   venue_min_order_quantity: 5.0
@@ -33,16 +33,29 @@ fair_value:
 
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
-  max_gross_notional_usd: 30.0
-  max_net_notional_per_market_usd: 12.0
-  max_order_notional_usd: 5.0
+  max_gross_notional_usd: 45.0
+  max_net_notional_per_market_usd: 20.0
+  max_order_notional_usd: 8.0
   max_position_quantity_per_instrument: 75.0
-  max_open_orders_total: 12
-  max_open_orders_per_market: 6
-  max_stranded_leg_usd: 12.0
-  max_gross_cost_usd: 30.0
-  max_leg_cost_usd: 12.0
+  max_open_orders_total: 18
+  max_open_orders_per_market: 8
+  max_stranded_leg_usd: 20.0
+  max_gross_cost_usd: 45.0
+  max_leg_cost_usd: 20.0
   max_side_imbalance_qty: 20.0
+
+# ── Convexity Overlay ───────────────────────────────────────────
+# Late-window winner-side tilt is a separate, labelled path from paired entry.
+# It is intentionally small while live attribution is still being validated.
+convexity_overlay:
+  enabled: true
+  capital_pct: 0.10
+  late_window_sec: 120
+  convex_p_threshold: 0.72
+  max_excess_usd: 40.0
+  clip_usd: 3.0
+  allow_extra_clip_on_winner: true
+  maker_safety_ticks: 2.0
 
 # ── Pair / Merge Recycling ─────────────────────────────────────
 # Polygon merge fees are negligible for our setup; keep this low so tiny-live
@@ -93,8 +106,8 @@ operational:
 
 # ── Tiny-Live / Deployment Scaling ──────────────────────────────
 scaling:
-  capital_scale_factor: 0.5       # 0.5 = tiny-live ($50), 1.0 = full live
+  capital_scale_factor: 1.0       # $1k live sleeve; caps above remain the hard limit
 
-version: "1.0"
-last_updated: "2026-05-01"
-description: "Paired two-sided BTC 5m market-making profile with merge-first inventory recycling"
+version: "1.1"
+last_updated: "2026-05-04"
+description: "Paired two-sided BTC 5m market-making profile with labelled merge/recycle decisions and small late-window convex overlay"

@@ -68,6 +68,7 @@ pub struct PolymarketL1Credentials {
 pub enum PolymarketSignatureType {
     Eoa,
     Proxy,
+    Poly1271,
     #[default]
     GnosisSafe,
 }
@@ -84,18 +85,27 @@ impl PolymarketSignatureType {
             "0" | "eoa" => Ok(Self::Eoa),
             "1" | "proxy" | "poly_proxy" | "poly-proxy" => Ok(Self::Proxy),
             "2" | "safe" | "gnosis" | "gnosis_safe" | "gnosis-safe" => Ok(Self::GnosisSafe),
+            "3" | "poly_1271" | "poly-1271" | "poly1271" | "deposit_wallet" | "deposit-wallet" => {
+                Ok(Self::Poly1271)
+            }
             other => Err(ExecutionError::BadRequest(format!(
                 "unsupported POLYMARKET_SIGNATURE_TYPE `{other}`"
             ))),
         }
     }
 
-    fn as_sdk(self) -> SdkSignatureType {
-        match self {
+    fn as_legacy_sdk(self) -> Result<SdkSignatureType, ExecutionError> {
+        Ok(match self {
             Self::Eoa => SdkSignatureType::Eoa,
             Self::Proxy => SdkSignatureType::Proxy,
             Self::GnosisSafe => SdkSignatureType::GnosisSafe,
-        }
+            Self::Poly1271 => {
+                return Err(ExecutionError::BadRequest(
+                    "POLYMARKET_SIGNATURE_TYPE=poly_1271 requires the CLOB V2 client path"
+                        .to_string(),
+                ))
+            }
+        })
     }
 
     pub fn as_polymarket_code(self) -> u8 {
@@ -103,6 +113,7 @@ impl PolymarketSignatureType {
             Self::Eoa => 0,
             Self::Proxy => 1,
             Self::GnosisSafe => 2,
+            Self::Poly1271 => 3,
         }
     }
 }
@@ -349,7 +360,7 @@ impl PolymarketExecutionAdapter {
         )
         .map_err(map_sdk_error)?
         .authentication_builder(&signer)
-        .signature_type(credentials.signature_type.as_sdk());
+        .signature_type(credentials.signature_type.as_legacy_sdk()?);
 
         let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
@@ -425,7 +436,7 @@ impl PolymarketExecutionAdapter {
         .map_err(map_sdk_error)?
         .authentication_builder(&signer)
         .credentials(sdk_credentials)
-        .signature_type(credentials.signature_type.as_sdk());
+        .signature_type(credentials.signature_type.as_legacy_sdk()?);
 
         let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
@@ -560,6 +571,7 @@ impl PolymarketExecutionAdapter {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
             PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
             PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+            PolymarketSignatureType::Poly1271 => SdkV2SigType::Poly1271,
         };
         let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
             ExecutionError::AuthFailure(
@@ -606,6 +618,7 @@ impl PolymarketExecutionAdapter {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
             PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
             PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+            PolymarketSignatureType::Poly1271 => SdkV2SigType::Poly1271,
         };
         let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
             ExecutionError::AuthFailure(
@@ -676,6 +689,7 @@ impl PolymarketExecutionAdapter {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
             PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
             PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
+            PolymarketSignatureType::Poly1271 => SdkV2SigType::Poly1271,
         };
 
         // Re-derive a LocalSigner from the stored private key. Alloy's

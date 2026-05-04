@@ -112,6 +112,7 @@ fn context(
             return_180s_bps: Some(20.0),
             observed_at_ms: now_ms,
         },
+        momentum: polymarket_exec::signals::MomentumSignal::default(),
         venue_rules: Some(VenueMarketRules {
             minimum_order_size: 5.0,
             minimum_tick_size: 0.01,
@@ -394,7 +395,7 @@ fn paired_mm_emits_capital_recycle_when_inventory_is_one_sided() {
     assert!(decision
         .notes()
         .iter()
-        .any(|note| note.contains("paired-mm capital recycle emitted")));
+        .any(|note| note.contains("capital recycle emitted")));
 }
 
 #[test]
@@ -478,9 +479,9 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     let pair_cost_config = pair_cost_profile.pair_cost_arb_config();
     assert_eq!(pair_cost_config.pair_cost_threshold, 0.99);
     assert_eq!(pair_cost_config.high_vol_pair_cost_threshold, 0.97);
-    assert_eq!(pair_cost_config.base_clip_usd, 1.5);
+    assert_eq!(pair_cost_config.base_clip_usd, 6.0);
     assert_eq!(pair_cost_config.max_clip_usd, 5.0);
-    assert_eq!(pair_cost_config.rescue_enabled, true);
+    assert_eq!(pair_cost_config.rescue_enabled, false);
     assert_eq!(pair_cost_config.rescue_late_window_sec, 90);
     assert_eq!(pair_cost_config.rescue_rehedge_pair_cost_threshold, 1.03);
     assert_eq!(pair_cost_config.recycle_min_imbalance_qty, 5.0);
@@ -492,8 +493,8 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     .expect("paired-mm profile");
     let paired_mm_config = paired_mm_profile.paired_mm_config();
     assert_eq!(paired_mm_config.ladder.max_depth, 3);
-    assert_eq!(paired_mm_config.ladder.base_clip_usd, 1.10);
-    assert_eq!(paired_mm_config.ladder.max_clip_usd, 5.0);
+    assert_eq!(paired_mm_config.ladder.base_clip_usd, 3.00);
+    assert_eq!(paired_mm_config.ladder.max_clip_usd, 8.0);
     assert_eq!(
         paired_mm_config
             .ladder
@@ -510,8 +511,8 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     );
     assert_eq!(paired_mm_config.capital_recycle.pair_cost_target, 0.99);
     assert_eq!(paired_mm_config.capital_recycle.min_imbalance_qty, 5.0);
-    assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 25.0);
-    assert_eq!(paired_mm_config.capital_recycle.max_buy_notional_usd, 2.50);
+    assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 10.0);
+    assert_eq!(paired_mm_config.capital_recycle.max_buy_notional_usd, 1.00);
     assert_eq!(
         paired_mm_config.capital_recycle.min_time_remaining_ms,
         90_000

@@ -17,6 +17,7 @@ fn signature_type_label(sig: PolymarketSignatureType) -> &'static str {
     match sig {
         PolymarketSignatureType::Eoa => "eoa",
         PolymarketSignatureType::Proxy => "proxy",
+        PolymarketSignatureType::Poly1271 => "poly_1271",
         PolymarketSignatureType::GnosisSafe => "gnosis_safe",
     }
 }
@@ -67,7 +68,7 @@ fn live_signature_type_from_env(auth: Option<&UserWsAuth>) -> Result<PolymarketS
         .or_else(|| std::env::var("POLYMARKET_SIGNATURE_TYPE").ok());
     let raw = raw.ok_or_else(|| {
         anyhow::anyhow!(
-            "POLYMARKET_SIGNATURE_TYPE must be set explicitly (eoa, proxy, or gnosis_safe)"
+            "POLYMARKET_SIGNATURE_TYPE must be set explicitly (eoa, proxy, gnosis_safe, or poly_1271)"
         )
     })?;
     PolymarketSignatureType::parse(raw.as_str()).map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -116,18 +117,20 @@ fn resolve_funder_for_signature(
                     anyhow::bail!(
                         "invalid live auth config: POLYMARKET_SIGNATURE_TYPE=0 (EOA) requires \
                          funder/holder to equal signer {signer_address}, but {name} is {configured}. \
-                         Use signature_type=proxy/gnosis_safe for proxy-held funds, or remove the \
+                         Use signature_type=proxy/gnosis_safe/poly_1271 for smart-wallet-held funds, or remove the \
                          proxy/funder env vars for true EOA trading."
                     );
                 }
             }
             Ok(None)
         }
-        PolymarketSignatureType::Proxy | PolymarketSignatureType::GnosisSafe => {
+        PolymarketSignatureType::Proxy
+        | PolymarketSignatureType::GnosisSafe
+        | PolymarketSignatureType::Poly1271 => {
             let resolved = funder_address.or(proxy_wallet_address);
             let Some(resolved) = resolved else {
                 anyhow::bail!(
-                    "invalid live auth config: proxy/safe signature types require \
+                    "invalid live auth config: proxy/safe/poly_1271 signature types require \
                      POLYMARKET_FUNDER_ADDRESS or POLYMARKET_PROXY_WALLET_ADDRESS"
                 );
             };
@@ -243,6 +246,7 @@ pub(super) async fn connect_live_session(config: &AppConfig) -> Result<LiveConne
                     |_| match signature_type {
                         PolymarketSignatureType::Eoa => "eoa".to_string(),
                         PolymarketSignatureType::Proxy => "proxy".to_string(),
+                        PolymarketSignatureType::Poly1271 => "poly_1271".to_string(),
                         PolymarketSignatureType::GnosisSafe => "gnosis_safe".to_string(),
                     },
                 )),
