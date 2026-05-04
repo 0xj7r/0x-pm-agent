@@ -399,6 +399,47 @@ fn paired_mm_emits_capital_recycle_when_inventory_is_one_sided() {
 }
 
 #[test]
+fn paired_mm_emits_sell_rescue_when_recycle_is_bad_and_hold_ev_is_worse() {
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![position(&market_id, &yes_id, 30.0, 0.45, 120_000)]),
+        99.0,
+    );
+
+    let decision = drive_two_books(
+        "paired_mm",
+        &ctx,
+        quote(0.30, 0.31, 120_000),
+        quote(0.74, 0.75, 120_000),
+    );
+
+    assert!(
+        matches!(decision, StrategyDecision::Reactive { .. }),
+        "{decision:?}"
+    );
+    let intents = decision.intents();
+    assert_eq!(intents.len(), 1, "{decision:?}");
+    assert_eq!(intents[0].instrument_id, yes_id);
+    assert_eq!(intents[0].side, polymarket_exec::types::TradeSide::Sell);
+    assert_eq!(intents[0].kind, polymarket_exec::types::IntentKind::Close);
+    assert!(intents[0].reduce_only);
+    assert!(intents[0]
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("mm-rescue-sell:yes")));
+    assert!(decision
+        .notes()
+        .iter()
+        .any(|note| note.contains("sell_rescue")));
+}
+
+#[test]
 fn hybrid_mode_combines_pair_cost_and_paired_mm_outputs() {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
