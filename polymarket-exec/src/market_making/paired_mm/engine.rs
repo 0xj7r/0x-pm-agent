@@ -101,6 +101,7 @@ pub struct PairedMmDecision {
     pub merge: MergePolicyDecision,
     pub capital_recycle: CapitalRecycleDecision,
     pub rescue: Option<RescueDecision>,
+    pub rescue_intent: Option<OrderIntent>,
     pub convex_overlay: Option<OrderIntent>,
     pub notes: Vec<String>,
 }
@@ -118,9 +119,11 @@ impl PairedMmDecision {
     }
 
     pub fn should_emit_rescue(&self) -> bool {
-        self.rescue
-            .as_ref()
-            .is_some_and(|decision| decision.qty > 1e-9 && decision.action != RescueAction::Hold)
+        self.rescue_intent.is_some()
+    }
+
+    pub fn rescue_intent(&self) -> Option<&OrderIntent> {
+        self.rescue_intent.as_ref()
     }
 
     pub fn paired_entry_allowed(&self) -> bool {
@@ -183,9 +186,23 @@ impl PairedMmEngine {
             input.now_ms,
         );
 
-        let rescue = input
-            .rescue
-            .map(|rescue_inputs| choose_rescue(rescue_inputs, self.config.rescue));
+        let rescue_inputs = input.rescue.or_else(|| {
+            derive_tick_rescue_inputs(
+                &input.snapshot,
+                &input.inventory,
+                &input.fair_value,
+                self.config.capital_recycle.min_imbalance_qty,
+            )
+        });
+        let rescue =
+            rescue_inputs.map(|rescue_inputs| choose_rescue(rescue_inputs, self.config.rescue));
+        let rescue_intent =
+            rescue
+                .as_ref()
+                .zip(rescue_inputs)
+                .and_then(|(decision, rescue_inputs)| {
+                    build_rescue_sell_intent(&input.market, decision, rescue_inputs, input.now_ms)
+                });
 
         let ladder = match &hard_policy.action {
             HardPolicyAction::Allow => build_ladder(
@@ -243,6 +260,15 @@ impl PairedMmEngine {
                 rescue.action, rescue.qty, rescue.reason
             ));
         }
+        if let Some(intent) = &rescue_intent {
+            notes.push(format!(
+                "paired-mm decision_label=sell_rescue mode=ev_rescue intent={} price={:.4} qty={:.4} notional={:.4}",
+                intent.client_order_id,
+                intent.limit_price,
+                intent.quantity,
+                intent.notional_usd()
+            ));
+        }
         if let Some(intent) = &convex_overlay {
             notes.push(format!(
                 "paired-mm decision_label=winner_side_tilt mode=convex_tilt intent={} price={:.4} qty={:.4} notional={:.4}",
@@ -269,6 +295,7 @@ impl PairedMmEngine {
             merge,
             capital_recycle,
             rescue,
+            rescue_intent,
             convex_overlay,
             notes,
         }
@@ -281,6 +308,101 @@ impl PairedMmEngine {
             | HardPolicyAction::ForceFlatten { reason } => Some(reason.clone()),
         }
     }
+}
+
+fn derive_tick_rescue_inputs(
+    snapshot: &PairedMarketSnapshot,
+    inventory: &PairedInventorySnapshot,
+    fair_value: &FairValueEstimate,
+    min_imbalance_qty: f64,
+) -> Option<RescueInputs> {
+    let stranded_qty = inventory.side_imbalance_qty();
+    if stranded_qty < min_imbalance_qty.max(0.0).max(1e-9) {
+        return None;
+    }
+
+    if inventory.yes_qty > inventory.no_qty {
+        Some(RescueInputs {
+            leg: crate::market_making::pairing::types::LadderLeg::Yes,
+            stranded_qty,
+            avg_cost: inventory.yes_avg_cost,
+            fair_win_prob: fair_value.p_up,
+            best_exit_bid: snapshot
+                .yes_quote
+                .best_bid
+                .as_ref()
+                .map(|level| level.price),
+            opposite_best_ask: snapshot.no_quote.best_ask.as_ref().map(|level| level.price),
+        })
+    } else if inventory.no_qty > inventory.yes_qty {
+        Some(RescueInputs {
+            leg: crate::market_making::pairing::types::LadderLeg::No,
+            stranded_qty,
+            avg_cost: inventory.no_avg_cost,
+            fair_win_prob: fair_value.p_down,
+            best_exit_bid: snapshot.no_quote.best_bid.as_ref().map(|level| level.price),
+            opposite_best_ask: snapshot
+                .yes_quote
+                .best_ask
+                .as_ref()
+                .map(|level| level.price),
+        })
+    } else {
+        None
+    }
+}
+
+fn build_rescue_sell_intent<M: MarketDescriptor>(
+    market: &M,
+    decision: &RescueDecision,
+    inputs: RescueInputs,
+    now_ms: EpochMillis,
+) -> Option<OrderIntent> {
+    if decision.action != RescueAction::SellStrandedLeg || decision.qty <= 1e-9 {
+        return None;
+    }
+    let tick_size = market.tick_size().max(0.0001);
+    let limit_price = inputs
+        .best_exit_bid
+        .filter(|bid| bid.is_finite() && *bid > tick_size && *bid < 1.0)
+        .map(|bid| bid.clamp(tick_size, 1.0 - tick_size))?;
+    let quantity = decision.qty.min(inputs.stranded_qty);
+    if quantity + 1e-9 < market.min_order_size() {
+        return None;
+    }
+
+    let (leg_tag, instrument_id) = match inputs.leg {
+        crate::market_making::pairing::types::LadderLeg::Yes => {
+            ("yes", market.yes_instrument_id().clone())
+        }
+        crate::market_making::pairing::types::LadderLeg::No => {
+            ("no", market.no_instrument_id().clone())
+        }
+    };
+    let mut intent = OrderIntent::new_sell(
+        ClientOrderId::from(format!(
+            "paired-mm-rescue-sell:{}:{}:{}",
+            market.market_id(),
+            leg_tag,
+            now_ms
+        )),
+        market.market_id().clone(),
+        instrument_id,
+        limit_price,
+        quantity,
+        format!(
+            "paired-mm sell rescue leg={leg_tag} hold={:.4} exit={:.4} delta={:.4}",
+            decision.hold_value_per_share,
+            decision.rescue_value_per_share.unwrap_or(limit_price),
+            decision.delta_vs_hold_per_share.unwrap_or(0.0)
+        ),
+        now_ms,
+    );
+    intent.quote_level_tag = Some(format!(
+        "mm-rescue-sell:{leg_tag}:{:?}",
+        RescueAction::SellStrandedLeg
+    ));
+    Some(intent)
 }
 
 fn choose_convex_overlay<M: MarketDescriptor>(
