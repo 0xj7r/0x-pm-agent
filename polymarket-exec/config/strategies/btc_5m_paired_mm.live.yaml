@@ -69,7 +69,7 @@ rescue:
   hedge_rescue_max_qty: 10.0
   hedge_rescue_edge_bps: 25
   hedge_rescue_race_buffer_ticks: 3.0
-  sell_unwind_enabled: true
+  sell_unwind_enabled: false
   merge_gas_cost_usd: 0.30
 
 # ── Signal & Momentum Tilt ──────────────────────────────────────
