@@ -113,14 +113,6 @@ where
             return StrategyDecision::capital_recycle(vec![intent], notes);
         }
 
-        if let Some(intent) = decision.rescue_intent().cloned() {
-            notes.push(
-                "paired-mm decision_label=sell_rescue mode=ev_rescue close intent emitted"
-                    .to_string(),
-            );
-            return StrategyDecision::rescue(vec![intent], notes);
-        }
-
         if recycle_only {
             notes.push(format!(
                 "paired-mm recycle-only: suppressing fresh paired-entry ladder imbalance_qty={imbalance_qty:.4} threshold={recycle_only_threshold:.4}"
