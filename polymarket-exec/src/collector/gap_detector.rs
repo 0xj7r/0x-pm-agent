@@ -110,11 +110,7 @@ mod tests {
     fn under_threshold_emits_no_gap() {
         let mut detector = GapDetector::new();
         detector.observe(&ev(Some("a"), EventType::BookDelta, 0));
-        let out = detector.observe(&ev(
-            Some("a"),
-            EventType::BookDelta,
-            10 * 1_000_000_000,
-        ));
+        let out = detector.observe(&ev(Some("a"), EventType::BookDelta, 10 * 1_000_000_000));
         assert!(out.is_none());
     }
 
@@ -123,11 +119,7 @@ mod tests {
         let mut detector = GapDetector::new();
         detector.observe(&ev(Some("a"), EventType::BookDelta, 0));
         let out = detector
-            .observe(&ev(
-                Some("a"),
-                EventType::BookDelta,
-                16 * 1_000_000_000,
-            ))
+            .observe(&ev(Some("a"), EventType::BookDelta, 16 * 1_000_000_000))
             .expect("gap");
         assert_eq!(out.event_type, EventType::Gap);
         assert_eq!(out.source, Source::Collector);
@@ -141,11 +133,7 @@ mod tests {
         detector.observe(&ev(Some("a"), EventType::BookDelta, 0));
         // A trade arriving 16s later on the SAME asset should not be
         // judged against the book_delta key.
-        let out = detector.observe(&ev(
-            Some("a"),
-            EventType::Trade,
-            16 * 1_000_000_000,
-        ));
+        let out = detector.observe(&ev(Some("a"), EventType::Trade, 16 * 1_000_000_000));
         assert!(out.is_none());
     }
 

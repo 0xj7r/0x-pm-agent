@@ -82,7 +82,10 @@ mod tests {
         };
         let payload = build_emf(&snap, 1_700_000_000_000);
         assert_eq!(payload["_aws"]["Timestamp"], json!(1_700_000_000_000i64));
-        assert_eq!(payload["_aws"]["CloudWatchMetrics"][0]["Namespace"], json!(NAMESPACE));
+        assert_eq!(
+            payload["_aws"]["CloudWatchMetrics"][0]["Namespace"],
+            json!(NAMESPACE)
+        );
 
         let metrics = payload["_aws"]["CloudWatchMetrics"][0]["Metrics"]
             .as_array()
