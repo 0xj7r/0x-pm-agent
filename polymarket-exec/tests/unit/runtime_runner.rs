@@ -66,6 +66,7 @@ fn runner_test_config() -> AppConfig {
         market_context_path: None,
         journal_path: None,
         journal_rotate_bytes: None,
+        journal_firehose_stream: None,
         starting_cash_usd: 100.0,
         event_log_capacity: 128,
         market_id_by_asset: HashMap::new(),

@@ -399,6 +399,42 @@ fn paired_mm_emits_capital_recycle_when_inventory_is_one_sided() {
 }
 
 #[test]
+fn paired_mm_repair_mode_does_not_add_to_heavy_leg_when_recycle_waits() {
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![position(&market_id, &yes_id, 10.0, 0.55, 120_000)]),
+        100.0,
+    );
+
+    let decision = drive_two_books(
+        "paired_mm",
+        &ctx,
+        quote(0.49, 0.51, 120_000),
+        quote(0.49, 0.50, 120_000),
+    );
+
+    let intents = decision.intents();
+    assert!(!intents.is_empty(), "{decision:?}");
+    assert!(
+        intents.iter().all(|intent| intent.instrument_id == no_id),
+        "{decision:?}"
+    );
+    assert!(intents
+        .iter()
+        .all(|intent| intent.side == polymarket_exec::types::TradeSide::Buy));
+    assert!(decision
+        .notes()
+        .iter()
+        .any(|note| note.contains("mode=repair_first")));
+}
+
+#[test]
 fn hybrid_mode_combines_pair_cost_and_paired_mm_outputs() {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");

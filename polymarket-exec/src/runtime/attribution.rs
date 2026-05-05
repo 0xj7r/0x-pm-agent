@@ -1,13 +1,13 @@
 use anyhow::Result;
 
 use crate::event_log::{EventLog, EventRecord};
-use crate::journal::JournalWriter;
+use crate::journal::JournalFanout;
 use crate::metrics::AppMetrics;
 use crate::runtime::RuntimeOutcome;
 use crate::types::RuntimeCommand;
 
 pub(super) fn persist_runtime_outcome(
-    journal: &mut Option<JournalWriter>,
+    journal: &mut JournalFanout,
     metrics: &AppMetrics,
     event_log: &EventLog,
     paper_report: Option<&mut crate::paper::report::PaperReportWriter>,
@@ -33,15 +33,13 @@ pub(super) fn persist_runtime_outcome(
         report.record_runtime_outcome(&records, &outcome.commands, super::runner::now_unix_ms());
     }
 
-    if let Some(writer) = journal.as_mut() {
-        for record in &records {
-            writer.append_event(record)?;
-        }
-        for command in &outcome.commands {
-            writer.append_command(command)?;
-        }
-        writer.flush()?;
+    for record in &records {
+        journal.append_event(record)?;
     }
+    for command in &outcome.commands {
+        journal.append_command(command)?;
+    }
+    journal.flush()?;
 
     Ok(())
 }
@@ -87,6 +85,12 @@ fn classify_runtime_event(message: &str) -> Option<&'static str> {
     if message.contains("rescue stranded leg") {
         return Some("rescue_ev_selected");
     }
+    if message.contains("mode=repair_first") {
+        return Some("paired_mm_repair_first");
+    }
+    if message.contains("repair-first: no viable light-side quote") {
+        return Some("paired_mm_repair_suppressed");
+    }
     if message.contains("on-fill IOC rescue emitted") {
         return Some("on_fill_rescue");
     }
@@ -118,6 +122,7 @@ fn classify_runtime_command(command: &RuntimeCommand) -> Option<&'static str> {
     match intent.quote_level_tag.as_deref().unwrap_or_default() {
         tag if tag.starts_with("mm-paired-bid") => Some("paired_ladder"),
         tag if tag.starts_with("mm-convex-accum") => Some("convex_accum"),
+        tag if tag.starts_with("mm-capital-recycle") => Some("capital_recycle"),
         tag if tag.starts_with("mm-hedge-rescue") => Some("hedge_rescue"),
         tag if tag.starts_with("mm-reduce") => Some("reduce_cleanup"),
         "" => Some("untagged_submit"),

@@ -46,7 +46,6 @@ use crate::types::{RuntimeCommand, RuntimeStatus};
 pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
 use tracing::{info, warn};
 
-const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
 
 pub struct Runtime<S: Strategy> {
@@ -668,28 +667,53 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(stranded.market_id.clone()),
             );
         }
-        self.clear_accepted_merges_after_venue_reconcile(observed_at_ms);
+        self.clear_accepted_merges_after_venue_reconcile(&report, observed_at_ms);
         self.initial_reconcile_complete = true;
         Ok(report)
     }
 
-    fn clear_accepted_merges_after_venue_reconcile(&mut self, observed_at_ms: EpochMillis) {
+    fn clear_accepted_merges_after_venue_reconcile(
+        &mut self,
+        report: &InventoryReconciliationReport,
+        observed_at_ms: EpochMillis,
+    ) {
+        let reconciled_markets = report
+            .deltas
+            .iter()
+            .map(|delta| delta.market_id.clone())
+            .chain(
+                report
+                    .stranded_markets
+                    .iter()
+                    .map(|stranded| stranded.market_id.clone()),
+            )
+            .collect::<HashSet<_>>();
         let accepted_markets = self
             .accepted_merge_by_market
             .iter()
             .filter_map(|(market_id, accepted)| {
-                (observed_at_ms >= accepted.accepted_at_ms).then(|| market_id.clone())
+                (observed_at_ms >= accepted.accepted_at_ms
+                    && reconciled_markets.contains(market_id))
+                .then(|| market_id.clone())
             })
             .collect::<Vec<_>>();
 
         for market_id in accepted_markets {
+            let paired_quantity = report
+                .stranded_markets
+                .iter()
+                .find(|stranded| stranded.market_id == market_id)
+                .map(|stranded| stranded.paired_quantity)
+                .unwrap_or_default();
             if self.accepted_merge_by_market.remove(&market_id).is_some() {
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         observed_at_ms,
-                        "accepted merge latch cleared after venue position reconciliation; \
-                         remaining paired inventory may plan a fresh merge",
+                        format!(
+                            "accepted merge latch cleared after venue position reconciliation; \
+                             remaining paired_qty={paired_quantity:.8} may plan a fresh merge"
+                        ),
                     )
                     .with_market(market_id),
                 );
@@ -935,34 +959,31 @@ impl<S: Strategy> Runtime<S> {
                     .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
             })
         {
-            let blocked_for_ms = now_ms.saturating_sub(blocked_at_ms);
-            if blocked_for_ms < BLOCKED_MERGE_RETRY_AFTER_MS {
-                outcome.push_event(
-                    self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Execution,
-                            now_ms,
-                            format!(
-                                "merge intent suppressed: matching CTF recycle is blocked \
-                                 since {} reason={}",
-                                blocked_at_ms, blocked_reason
-                            ),
-                        )
-                        .with_market(market_id.clone()),
-                    ),
-                );
-                return outcome;
-            }
-            self.blocked_merge_by_market.remove(market_id);
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         now_ms,
                         format!(
-                            "blocked merge retry backoff elapsed after {blocked_for_ms}ms; \
-                             retrying CTF recycle reason={blocked_reason}"
+                            "merge intent suppressed: matching CTF recycle is blocked \
+                             since {blocked_at_ms} reason={blocked_reason}; waiting for \
+                             inventory-changing venue reconciliation before retry"
                         ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if self.blocked_merge_by_market.contains_key(market_id) {
+            self.blocked_merge_by_market.remove(market_id);
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        "blocked merge signature changed after inventory reconciliation; \
+                         allowing fresh CTF recycle",
                     )
                     .with_market(market_id.clone()),
                 ),
