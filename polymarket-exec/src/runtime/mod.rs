@@ -918,9 +918,11 @@ impl<S: Strategy> Runtime<S> {
                         ) {
                             Ok(adjustment) => {
                                 outcome.push_event(
-                                    self.event_log.push(adjustment.to_event(
-                                        "inventory updated from paper settlement close",
-                                    )),
+                                    self.event_log.push(
+                                        adjustment.to_event(
+                                            "inventory updated from paper settlement close",
+                                        ),
+                                    ),
                                 );
                             }
                             Err(error) => {
