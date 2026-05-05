@@ -808,8 +808,14 @@ fn apply_resolution_settlement(
     winner_asset_id: &str,
     redeem_events: &[ReplaySettlementFeeEvent],
 ) -> AppliedResolutionSummary {
-    let fee_usd: f64 = redeem_events.iter().map(|event| event.fee_usd.max(0.0)).sum();
-    let gas_usd: f64 = redeem_events.iter().map(|event| event.gas_usd.max(0.0)).sum();
+    let fee_usd: f64 = redeem_events
+        .iter()
+        .map(|event| event.fee_usd.max(0.0))
+        .sum();
+    let gas_usd: f64 = redeem_events
+        .iter()
+        .map(|event| event.gas_usd.max(0.0))
+        .sum();
     let mut out = AppliedResolutionSummary {
         fee_usd,
         gas_usd,
@@ -837,8 +843,7 @@ fn apply_resolution_settlement(
     }
     positions.retain(|_, pos| pos.qty > f64::EPSILON);
     out.credit_usd = out.gross_credit_usd - out.fee_usd - out.gas_usd;
-    out.realized_pnl_usd =
-        out.credit_usd - out.winning_cost_usd - out.losing_cost_usd;
+    out.realized_pnl_usd = out.credit_usd - out.winning_cost_usd - out.losing_cost_usd;
     out
 }
 
@@ -868,12 +873,8 @@ fn compute_settlement_summary(
         }
         let cost_basis = pos.qty * pos.avg_cost;
         let role = match winner_asset_id {
-            Some(winner) if winner == asset_id => {
-                "winner"
-            }
-            Some(_) => {
-                "loser"
-            }
+            Some(winner) if winner == asset_id => "winner",
+            Some(_) => "loser",
             None => "unresolved",
         };
         stranded_qty_total += pos.qty;
@@ -1137,7 +1138,10 @@ fn replay_marks(events: &[Event]) -> (BTreeMap<String, f64>, Option<String>) {
     (marks, winner_asset_id)
 }
 
-fn resolve_winner_asset_id(raw_winner: Option<&str>, pair_asset_ids: Option<&[String]>) -> Option<String> {
+fn resolve_winner_asset_id(
+    raw_winner: Option<&str>,
+    pair_asset_ids: Option<&[String]>,
+) -> Option<String> {
     let raw_winner = raw_winner?.trim();
     if raw_winner.is_empty() {
         return None;
