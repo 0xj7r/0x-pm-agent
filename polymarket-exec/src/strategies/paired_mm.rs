@@ -90,9 +90,12 @@ where
             market: input.market,
             snapshot: input.snapshot,
             inventory: input.inventory,
+            open_convex_order_exposure: input.open_convex_order_exposure,
             pair_cost: input.pair_cost,
             fair_value: input.fair_value,
             btc_regime: input.btc_regime,
+            momentum: input.momentum.clone(),
+            order_book_pressure: input.order_book_pressure.clone(),
             merge_candidate: None,
             rescue: None,
             now_ms: input.now_ms,
@@ -101,7 +104,7 @@ where
         let mut notes = decision.notes.clone();
         notes.extend(decision.ladder.diagnostics.notes.clone());
         notes.push(format!(
-            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4}",
+            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4} yes_signal_scale={:.3} no_signal_scale={:.3}",
             decision.ladder.diagnostics.regime,
             btc_regime,
             vol_5m_bps,
@@ -114,7 +117,9 @@ where
             decision.ladder.diagnostics.depth,
             decision.ladder.diagnostics.spacing_ticks,
             decision.ladder.diagnostics.yes_reservation,
-            decision.ladder.diagnostics.no_reservation
+            decision.ladder.diagnostics.no_reservation,
+            decision.ladder.diagnostics.yes_signal_scale,
+            decision.ladder.diagnostics.no_signal_scale
         ));
 
         if let Some(intent) = decision.capital_recycle_intent().cloned() {
@@ -147,7 +152,7 @@ where
                 notes.push("paired-mm decision_label=paired_entry mode=paired_entry_mode paired ladder emitted".to_string());
             }
         }
-        if let Some(intent) = decision.convex_overlay {
+        for intent in decision.convex_overlay {
             if repair_mode
                 .as_ref()
                 .is_none_or(|mode| intent.instrument_id != mode.heavy_instrument_id)

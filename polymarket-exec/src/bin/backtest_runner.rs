@@ -1,7 +1,7 @@
 //! backtest_runner: deterministic replay of captured Phase 1 events through
 //! the live strategy engine.
 //!
-//! Phase 3a slice: implements the CLI surface, content-addressed run-id
+//! Implements the CLI surface, content-addressed run-id
 //! derivation, and a local-filesystem replay path. S3 reads/writes and the
 //! RDS upsert are deferred to Phase 3b (Terraform + Batch); this binary
 //! supports `--input-prefix file://...` and `--output-prefix file://...`
@@ -94,6 +94,18 @@ struct Cli {
     /// Named latency preset.
     #[arg(long, default_value = "nominal")]
     fill_config: String,
+
+    /// Optional explicit submit latency override in milliseconds. This
+    /// lets replay mirror vendor static latency models such as
+    /// base_latency_ms + insert_latency_ms without adding another preset.
+    #[arg(long)]
+    submit_latency_ms: Option<u64>,
+
+    /// Optional explicit cancel latency override in milliseconds. This
+    /// lets replay mirror vendor static latency models such as
+    /// base_latency_ms + cancel_latency_ms without adding another preset.
+    #[arg(long)]
+    cancel_latency_ms: Option<u64>,
 
     /// Fill-quality regime: optimistic | base | conservative. Orthogonal
     /// to `--fill-config`. Defaults to `base` (the realistic regime).
@@ -240,7 +252,10 @@ fn run_main(cli: Cli) -> Result<i32> {
     // Compute run-id. We hash BOTH `fill_config` (latency preset) and
     // `fill_quality` so two runs differing only on either knob produce
     // distinct run-ids.
-    let combined_fill_config = format!("{}+{}", cli.fill_config, cli.fill_quality);
+    let combined_fill_config = format!(
+        "{}+{}+submit_ms={:?}+cancel_ms={:?}",
+        cli.fill_config, cli.fill_quality, cli.submit_latency_ms, cli.cancel_latency_ms
+    );
     let derived_run_id = compute_run_id(
         &canonical_profile,
         &window_plans,
@@ -293,6 +308,8 @@ fn run_main(cli: Cli) -> Result<i32> {
             latency: preset,
             fill_quality,
             seed,
+            submit_latency_ms: cli.submit_latency_ms,
+            cancel_latency_ms: cli.cancel_latency_ms,
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: cli.max_window_failures,

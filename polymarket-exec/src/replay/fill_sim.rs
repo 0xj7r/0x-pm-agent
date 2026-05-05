@@ -78,6 +78,14 @@ pub struct FillSimConfig {
     pub latency: LatencyPreset,
     pub fill_quality: FillQuality,
     pub seed: u64,
+    /// Optional explicit submit latency override. Use this for vendor-style
+    /// static latency configs such as Telonex/Nautilus
+    /// `base_latency_ms + insert_latency_ms`.
+    pub submit_latency_ms: Option<u64>,
+    /// Optional explicit cancel latency override. Use this for vendor-style
+    /// static latency configs such as Telonex/Nautilus
+    /// `base_latency_ms + cancel_latency_ms`.
+    pub cancel_latency_ms: Option<u64>,
     /// 0.0 = no queue progress from same-side cancels (conservative).
     /// 1.0 = full queue progress on every level shrink (optimistic).
     pub cancel_credit_fraction: f64,
@@ -89,8 +97,22 @@ impl Default for FillSimConfig {
             latency: LatencyPreset::Nominal,
             fill_quality: FillQuality::Base,
             seed: 0xC0FF_EE00_C0FF_EE00,
+            submit_latency_ms: None,
+            cancel_latency_ms: None,
             cancel_credit_fraction: 0.5,
         }
+    }
+}
+
+impl FillSimConfig {
+    pub fn submit_latency_ms(&self) -> u64 {
+        self.submit_latency_ms
+            .unwrap_or_else(|| self.latency.submit_latency_ms())
+    }
+
+    pub fn cancel_latency_ms(&self) -> u64 {
+        self.cancel_latency_ms
+            .unwrap_or_else(|| self.latency.cancel_latency_ms())
     }
 }
 
@@ -165,6 +187,24 @@ pub struct SimulatedFill {
     pub maker_or_taker: MakerOrTaker,
 }
 
+/// Records a strategy order submission after simulator-level normalization.
+/// This is the calibration hook for queue/fill modeling: it captures the
+/// visible same-side depth at rest and the submit-arrival timestamp the
+/// simulator actually used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimulatedOrderSubmission {
+    pub client_order_id: String,
+    pub asset_id: String,
+    pub side: Side,
+    pub price: f64,
+    pub size: f64,
+    pub placed_ms: u64,
+    pub arrival_ms: u64,
+    pub aggressive: bool,
+    pub post_only: bool,
+    pub book_depth_at_rest: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MakerOrTaker {
@@ -198,10 +238,10 @@ struct RestingOrder {
     arrival_ms: u64,
     remaining: f64,
     queue_ahead: f64,
-    /// Snapshot of visible book depth at-or-better than `intent.price` on
-    /// the SAME side, captured the moment the order rested. Used by the
-    /// `Base` and `Conservative` regimes to gate fills until the
-    /// cumulative aggressor flow has eaten through this depth.
+    /// Snapshot of visible book depth at `intent.price` on the SAME side,
+    /// captured the moment the order rested. Used by the `Base` and
+    /// `Conservative` regimes to gate fills until cumulative aggressor
+    /// flow has eaten through this same-price queue estimate.
     book_depth_at_rest: f64,
     /// Cumulative public trade volume at-or-better than `intent.price`
     /// SINCE this order rested. Compared against `book_depth_at_rest`.
@@ -233,22 +273,16 @@ impl LiveBook {
             .find_map(|(p, sz)| if *sz > 0.0 { Some(*p) } else { None })
     }
 
-    /// Total visible size on `side` at-or-better than `price_ticks`. "Better"
-    /// means lower for asks (a resting ask at 0.60 has the asks at 0.55-0.59
-    /// in front of it) and higher for bids (resting bid at 0.40 sits behind
-    /// any bid at 0.41+).
-    fn depth_at_or_better_ticks(&self, side: Side, price_ticks: i64) -> f64 {
+    /// Total visible size on `side` at exactly `price_ticks`.
+    ///
+    /// This mirrors L2 MBP queue-position modeling: on acceptance, a passive
+    /// order snapshots same-side displayed quantity at its own price level as
+    /// queue ahead. Better prices are handled separately by price priority
+    /// during sweep matching; including them here double-counts queue depth.
+    fn depth_at_price_ticks(&self, side: Side, price_ticks: i64) -> f64 {
         match side {
-            Side::Sell => self
-                .asks
-                .range(..=price_ticks)
-                .map(|(_, sz)| *sz)
-                .sum::<f64>(),
-            Side::Buy => self
-                .bids
-                .range(price_ticks..)
-                .map(|(_, sz)| *sz)
-                .sum::<f64>(),
+            Side::Sell => self.asks.get(&price_ticks).copied().unwrap_or(0.0),
+            Side::Buy => self.bids.get(&price_ticks).copied().unwrap_or(0.0),
         }
     }
 
@@ -280,6 +314,7 @@ pub struct FillSimulator {
     /// Per-asset live book mirror used to snapshot resting depth and to
     /// detect post-only crosses.
     books: BTreeMap<String, LiveBook>,
+    submissions: Vec<SimulatedOrderSubmission>,
     fills: Vec<SimulatedFill>,
     rejections: Vec<SimulatedRejection>,
 }
@@ -291,6 +326,7 @@ impl FillSimulator {
             resting: BTreeMap::new(),
             pending_cancels: BTreeMap::new(),
             books: BTreeMap::new(),
+            submissions: Vec::new(),
             fills: Vec::new(),
             rejections: Vec::new(),
         }
@@ -310,6 +346,10 @@ impl FillSimulator {
 
     pub fn rejections(&self) -> &[SimulatedRejection] {
         &self.rejections
+    }
+
+    pub fn submissions(&self) -> &[SimulatedOrderSubmission] {
+        &self.submissions
     }
 
     /// Crossing test for a post-only intent against the current live book.
@@ -335,9 +375,30 @@ impl FillSimulator {
     /// Post-only intents that would cross the live book are rejected and
     /// recorded in `rejections()`.
     pub fn submit(&mut self, intent: StrategyOrderIntent) {
+        // Treat a repeated client_order_id as a replace, not as an
+        // additional independent resting order. Live venue clients use
+        // client IDs as the quote lifecycle handle; replay must preserve
+        // that invariant or a high-frequency quote refresh loop accumulates
+        // stale simulated orders that never existed as simultaneously live
+        // venue orders.
+        self.pending_cancels.remove(&intent.client_order_id);
+        self.remove_resting_client_order_id(&intent.client_order_id);
+
         // Post-only crossing check happens before any resting state mutation
         // so rejected intents leave no trace in the resting book.
         if intent.post_only && self.would_cross_now(&intent) {
+            self.submissions.push(SimulatedOrderSubmission {
+                client_order_id: intent.client_order_id.clone(),
+                asset_id: intent.asset_id.clone(),
+                side: intent.side,
+                price: intent.price,
+                size: intent.size,
+                placed_ms: intent.placed_ms,
+                arrival_ms: intent.placed_ms,
+                aggressive: intent.aggressive,
+                post_only: intent.post_only,
+                book_depth_at_rest: 0.0,
+            });
             self.rejections.push(SimulatedRejection {
                 client_order_id: intent.client_order_id,
                 asset_id: intent.asset_id,
@@ -351,17 +412,41 @@ impl FillSimulator {
         }
 
         if intent.aggressive {
+            self.submissions.push(SimulatedOrderSubmission {
+                client_order_id: intent.client_order_id.clone(),
+                asset_id: intent.asset_id.clone(),
+                side: intent.side,
+                price: intent.price,
+                size: intent.size,
+                placed_ms: intent.placed_ms,
+                arrival_ms: intent.placed_ms + self.cfg.submit_latency_ms(),
+                aggressive: intent.aggressive,
+                post_only: intent.post_only,
+                book_depth_at_rest: 0.0,
+            });
             self.execute_taker(intent);
             return;
         }
 
-        let arrival_ms = intent.placed_ms + self.cfg.latency.submit_latency_ms();
+        let arrival_ms = intent.placed_ms + self.cfg.submit_latency_ms();
         let price_ticks = price_to_ticks(intent.price);
         let book_depth_at_rest = self
             .books
             .get(&intent.asset_id)
-            .map(|b| b.depth_at_or_better_ticks(intent.side, price_ticks))
+            .map(|b| b.depth_at_price_ticks(intent.side, price_ticks))
             .unwrap_or(0.0);
+        self.submissions.push(SimulatedOrderSubmission {
+            client_order_id: intent.client_order_id.clone(),
+            asset_id: intent.asset_id.clone(),
+            side: intent.side,
+            price: intent.price,
+            size: intent.size,
+            placed_ms: intent.placed_ms,
+            arrival_ms,
+            aggressive: intent.aggressive,
+            post_only: intent.post_only,
+            book_depth_at_rest,
+        });
         let key = (intent.asset_id.clone(), intent.side, price_ticks);
         let entry = self.resting.entry(key).or_default();
         entry.push(RestingOrder {
@@ -372,6 +457,13 @@ impl FillSimulator {
             cumulative_trade_through: 0.0,
             intent,
         });
+    }
+
+    fn remove_resting_client_order_id(&mut self, client_order_id: &str) {
+        for orders in self.resting.values_mut() {
+            orders.retain(|order| order.intent.client_order_id != client_order_id);
+        }
+        self.resting.retain(|_, orders| !orders.is_empty());
     }
 
     /// Cross an aggressive (FAK) order against the visible opposing book at
@@ -414,7 +506,7 @@ impl FillSimulator {
                 side: intent.side,
                 price: fill_price,
                 size: take,
-                fill_ms: intent.placed_ms + self.cfg.latency.submit_latency_ms(),
+                fill_ms: intent.placed_ms + self.cfg.submit_latency_ms(),
                 maker_or_taker: MakerOrTaker::Taker,
             });
             remaining -= take;
@@ -437,7 +529,7 @@ impl FillSimulator {
     /// `cancel_arrival_ms`. Recorded as a pending cancel; the actual
     /// removal happens during `on_event` once virtual time has advanced.
     pub fn cancel(&mut self, client_order_id: &str, requested_ms: u64) {
-        let cancel_ms = requested_ms + self.cfg.latency.cancel_latency_ms();
+        let cancel_ms = requested_ms + self.cfg.cancel_latency_ms();
         // Earliest-wins if multiple cancels are issued for the same order.
         self.pending_cancels
             .entry(client_order_id.to_string())
@@ -454,25 +546,25 @@ impl FillSimulator {
     /// keep the live book mirror in sync.
     pub fn on_event(&mut self, event: &Event) {
         let event_ms = (event.received_ns / 1_000_000) as u64;
+        self.reap_arrived_cancels(event_ms);
         match event.event_type {
             EventType::Trade => self.match_trade(event),
             EventType::BookDelta | EventType::BookSnapshot => self.apply_book_event(event),
             _ => {}
         }
-        // Reap cancels that have arrived strictly before this event.
+    }
+
+    fn reap_arrived_cancels(&mut self, event_ms: u64) {
         if !self.pending_cancels.is_empty() {
             let arrived: Vec<String> = self
                 .pending_cancels
                 .iter()
-                .filter(|(_, &t)| t < event_ms)
+                .filter(|(_, &t)| t <= event_ms)
                 .map(|(k, _)| k.clone())
                 .collect();
             for coid in arrived {
                 self.pending_cancels.remove(&coid);
-                for orders in self.resting.values_mut() {
-                    orders.retain(|o| o.intent.client_order_id != coid);
-                }
-                self.resting.retain(|_, v| !v.is_empty());
+                self.remove_resting_client_order_id(&coid);
             }
         }
     }
@@ -527,12 +619,13 @@ impl FillSimulator {
                 if order_asset != asset_id || *order_side != resting_side {
                     continue;
                 }
-                // "At-or-better" relative to the trade price: a trade at
-                // 0.55 contributes to the asks at 0.55+ (the order at 0.55
-                // sits behind the asks at 0.50..0.55 we just consumed).
+                // "At-or-through" relative to the resting order: a public
+                // sell at 0.42 sweeps bids down to 0.42, so our bid at 0.43
+                // was in the path. A public buy at 0.58 sweeps asks up to
+                // 0.58, so our ask at 0.57 was in the path.
                 let counts_for_level = match resting_side {
-                    Side::Sell => trade_ticks <= *order_ticks,
-                    Side::Buy => trade_ticks >= *order_ticks,
+                    Side::Sell => trade_ticks >= *order_ticks,
+                    Side::Buy => trade_ticks <= *order_ticks,
                 };
                 if !counts_for_level {
                     continue;
@@ -545,13 +638,40 @@ impl FillSimulator {
             }
         }
 
-        // 2. Match resting orders at the exact trade price (a trade-through
-        //    farther away does not directly fill an order at this price; it
-        //    only contributes to the cumulative gauge above).
-        let key = (asset_id.to_string(), resting_side, trade_ticks);
+        // 2. Match resting orders swept by the public trade. Some historical
+        //    feeds emit aggregate trade prints at the terminal sweep price;
+        //    exact-price matching underfills passive orders that sat between
+        //    the top of book and that terminal price.
         let mut remaining_size = size;
         let mut new_fills: Vec<SimulatedFill> = Vec::new();
-        if let Some(orders) = self.resting.get_mut(&key) {
+        let mut matching_keys = self
+            .resting
+            .keys()
+            .filter(|(order_asset, order_side, order_ticks)| {
+                if order_asset != asset_id || *order_side != resting_side {
+                    return false;
+                }
+                match resting_side {
+                    Side::Sell => trade_ticks >= *order_ticks,
+                    Side::Buy => trade_ticks <= *order_ticks,
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matching_keys.sort_by(|left, right| match resting_side {
+            // Better bids fill first.
+            Side::Buy => right.2.cmp(&left.2),
+            // Better asks fill first.
+            Side::Sell => left.2.cmp(&right.2),
+        });
+
+        for key in matching_keys {
+            if remaining_size <= 0.0 {
+                break;
+            }
+            let Some(orders) = self.resting.get_mut(&key) else {
+                continue;
+            };
             let mut idx = 0;
             while idx < orders.len() && remaining_size > 0.0 {
                 let order = &mut orders[idx];
@@ -758,6 +878,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_latency_overrides_take_precedence_over_named_preset() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Conservative,
+            fill_quality: FillQuality::Optimistic,
+            submit_latency_ms: Some(7),
+            cancel_latency_ms: Some(11),
+            ..Default::default()
+        });
+        sim.submit(intent("o1", "asset-a", Side::Sell, 0.55, 100.0, 1_000));
+        assert_eq!(sim.submissions()[0].arrival_ms, 1_007);
+
+        sim.on_event(&trade_event(1_006_000_000, "asset-a", "buy", "0.55", "100"));
+        assert_eq!(sim.fills().len(), 0);
+        sim.on_event(&trade_event(1_007_000_000, "asset-a", "buy", "0.55", "40"));
+        assert_eq!(sim.fills().len(), 1);
+        assert_eq!(sim.fills()[0].size, 40.0);
+
+        sim.cancel("o1", 1_010);
+        sim.on_event(&trade_event(1_020_000_000, "asset-a", "buy", "0.55", "40"));
+        assert_eq!(sim.fills().len(), 2);
+        sim.on_event(&trade_event(1_021_000_000, "asset-a", "buy", "0.55", "40"));
+        assert_eq!(sim.pending_count(), 0);
+        assert_eq!(sim.fills().len(), 2);
+    }
+
+    #[test]
     fn fifo_priority_within_same_price_level() {
         let mut sim = FillSimulator::new(FillSimConfig {
             latency: LatencyPreset::Instant,
@@ -778,6 +924,59 @@ mod tests {
     }
 
     #[test]
+    fn public_sell_sweep_can_fill_resting_buy_above_terminal_trade_price() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
+            ..Default::default()
+        });
+        sim.submit(intent("bid", "asset-a", Side::Buy, 0.43, 10.0, 1_000));
+
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "sell", "0.42", "10"));
+
+        assert_eq!(sim.fills().len(), 1);
+        assert_eq!(sim.fills()[0].client_order_id, "bid");
+        assert_eq!(sim.fills()[0].price, 0.43);
+        assert_eq!(sim.pending_count(), 0);
+    }
+
+    #[test]
+    fn public_buy_sweep_can_fill_resting_ask_below_terminal_trade_price() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
+            ..Default::default()
+        });
+        sim.submit(intent("ask", "asset-a", Side::Sell, 0.57, 10.0, 1_000));
+
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "buy", "0.58", "10"));
+
+        assert_eq!(sim.fills().len(), 1);
+        assert_eq!(sim.fills()[0].client_order_id, "ask");
+        assert_eq!(sim.fills()[0].price, 0.57);
+        assert_eq!(sim.pending_count(), 0);
+    }
+
+    #[test]
+    fn sweep_matches_better_price_before_worse_price_for_resting_bids() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
+            ..Default::default()
+        });
+        sim.submit(intent("better", "asset-a", Side::Buy, 0.44, 10.0, 1_000));
+        sim.submit(intent("worse", "asset-a", Side::Buy, 0.43, 10.0, 1_000));
+
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "sell", "0.43", "15"));
+
+        assert_eq!(sim.fills().len(), 2);
+        assert_eq!(sim.fills()[0].client_order_id, "better");
+        assert_eq!(sim.fills()[0].size, 10.0);
+        assert_eq!(sim.fills()[1].client_order_id, "worse");
+        assert_eq!(sim.fills()[1].size, 5.0);
+    }
+
+    #[test]
     fn cancel_with_latency_keeps_order_open_until_cancel_arrival() {
         let mut sim = FillSimulator::new(FillSimConfig {
             latency: LatencyPreset::Nominal, // 50ms
@@ -789,6 +988,41 @@ mod tests {
                                  // Trade at 1_140 ms (before cancel arrival) still matches
         sim.on_event(&trade_event(1_140_000_000, "asset-a", "buy", "0.55", "100"));
         assert_eq!(sim.fills().len(), 1);
+    }
+
+    #[test]
+    fn repeated_client_order_id_replaces_previous_resting_order() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Optimistic,
+            ..Default::default()
+        });
+        sim.submit(intent("quote-1", "asset-a", Side::Sell, 0.55, 100.0, 1_000));
+        sim.submit(intent("quote-1", "asset-a", Side::Sell, 0.56, 100.0, 1_001));
+
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "buy", "0.55", "100"));
+        assert_eq!(sim.fills().len(), 0);
+        assert_eq!(sim.pending_count(), 1);
+
+        sim.on_event(&trade_event(3_000_000_000, "asset-a", "buy", "0.56", "100"));
+        assert_eq!(sim.fills().len(), 1);
+        assert_eq!(sim.fills()[0].client_order_id, "quote-1");
+        assert!((sim.fills()[0].price - 0.56).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cancel_arrival_reaps_before_same_timestamp_trade_matches() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Nominal,
+            fill_quality: FillQuality::Optimistic,
+            ..Default::default()
+        });
+        sim.submit(intent("o1", "asset-a", Side::Sell, 0.55, 100.0, 1_000));
+        sim.cancel("o1", 1_100);
+
+        sim.on_event(&trade_event(1_150_000_000, "asset-a", "buy", "0.55", "100"));
+        assert_eq!(sim.fills().len(), 0);
+        assert_eq!(sim.pending_count(), 0);
     }
 
     #[test]
@@ -862,6 +1096,46 @@ mod tests {
         assert!(sim.fills().len() >= 1);
         let total: f64 = sim.fills().iter().map(|f| f.size).sum();
         assert!((total - 10.0).abs() < 1e-6, "expected ~10, got {total}");
+    }
+
+    #[test]
+    fn base_regime_queue_depth_uses_same_price_displayed_depth_only() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Base,
+            ..Default::default()
+        });
+        sim.on_event(&book_event(500_000_000, "asset-a", "sell", "0.54", "100"));
+        sim.on_event(&book_event(500_000_001, "asset-a", "sell", "0.55", "30"));
+        sim.submit(intent("o1", "asset-a", Side::Sell, 0.55, 10.0, 1_000));
+
+        assert_eq!(sim.submissions()[0].book_depth_at_rest, 30.0);
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "buy", "0.55", "35"));
+
+        let total: f64 = sim.fills().iter().map(|f| f.size).sum();
+        assert!((total - 5.0).abs() < 1e-6, "expected same-price residual fill, got {total}");
+    }
+
+    #[test]
+    fn zero_size_snapshot_level_deletes_visible_depth_for_cross_and_queue() {
+        let mut sim = FillSimulator::new(FillSimConfig {
+            latency: LatencyPreset::Instant,
+            fill_quality: FillQuality::Base,
+            ..Default::default()
+        });
+        sim.on_event(&book_event(500_000_000, "asset-a", "sell", "0.55", "100"));
+        sim.on_event(&book_event(500_000_001, "asset-a", "sell", "0.55", "0"));
+
+        let mut post_only =
+            StrategyOrderIntent::passive("po-1", "asset-a", Side::Buy, 0.55, 5.0, 1_000);
+        post_only.post_only = true;
+        sim.submit(post_only);
+
+        assert_eq!(sim.rejections().len(), 0);
+        assert_eq!(sim.submissions()[0].book_depth_at_rest, 0.0);
+        sim.on_event(&trade_event(2_000_000_000, "asset-a", "sell", "0.55", "5"));
+        assert_eq!(sim.fills().len(), 1);
+        assert_eq!(sim.fills()[0].client_order_id, "po-1");
     }
 
     #[test]

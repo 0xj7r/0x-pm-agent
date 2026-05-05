@@ -15,7 +15,7 @@
 //! adapter calls, journal/checkpoint side effects. The replay path applies
 //! the strategy decisions directly to the simulator.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use serde_yaml::Value as YamlValue;
 
@@ -27,11 +27,15 @@ use crate::core::types::{
 use crate::inventory::InventoryState as RuntimeInventoryState;
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::market_making::quote_reconciler::{QuoteAction, QuoteReconciler};
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketRegistry, UnderlyingAsset};
+use crate::quote_engine::{DesiredQuote, DesiredQuoteSet};
 use crate::replay::fill_sim::{Side, SimulatedFill, StrategyOrderIntent};
 use crate::replay::risk_trace::RiskRejection;
 use crate::replay::runner::{ReplayDecision, ReplayStrategy};
 use crate::risk::{RiskContext, RiskEngine};
+use crate::runtime::state_store::{InMemoryRuntimeStateStore, RuntimeStateStore};
+use crate::runtime::types::ManagedOrder;
 use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate, FairValueModel};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput};
@@ -156,10 +160,115 @@ impl BookAggregator {
 /// Lightweight BTC regime tracker built from `btc_tick` events. Mirrors the
 /// shape live runtime fills out (last_price plus realized vol approximation
 /// over a 5m window).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct BtcRegimeAggregator {
-    samples: Vec<(u64, f64)>,
+    last_price: Option<f64>,
     observed_at_ms: u64,
+    window_30s: BtcRollingWindow,
+    window_60s: BtcRollingWindow,
+    window_120s: BtcRollingWindow,
+    window_180s: BtcRollingWindow,
+    window_5m: BtcRollingWindow,
+    window_15m: BtcRollingWindow,
+    cached_snapshot: Option<BtcRegimeSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct BtcRollingWindow {
+    window_ms: u64,
+    prices: VecDeque<(u64, f64)>,
+    returns: VecDeque<(u64, f64)>,
+    sum_return: f64,
+    sum_sq_return: f64,
+}
+
+impl BtcRollingWindow {
+    fn new(window_ms: u64) -> Self {
+        Self {
+            window_ms,
+            prices: VecDeque::new(),
+            returns: VecDeque::new(),
+            sum_return: 0.0,
+            sum_sq_return: 0.0,
+        }
+    }
+
+    fn push(&mut self, now_ms: u64, price: f64, previous_price: Option<f64>) {
+        self.prices.push_back((now_ms, price));
+        if let Some(prev) = previous_price {
+            if prev > 0.0 && price > 0.0 {
+                let ret = (price / prev).ln();
+                if ret.is_finite() {
+                    self.returns.push_back((now_ms, ret));
+                    self.sum_return += ret;
+                    self.sum_sq_return += ret * ret;
+                }
+            }
+        }
+        self.evict(now_ms);
+    }
+
+    fn evict(&mut self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(self.window_ms);
+        while self
+            .prices
+            .front()
+            .map(|(ts, _)| *ts < cutoff)
+            .unwrap_or(false)
+        {
+            self.prices.pop_front();
+        }
+        while self
+            .returns
+            .front()
+            .map(|(ts, _)| *ts < cutoff)
+            .unwrap_or(false)
+        {
+            if let Some((_, ret)) = self.returns.pop_front() {
+                self.sum_return -= ret;
+                self.sum_sq_return -= ret * ret;
+            }
+        }
+    }
+
+    fn trade_count(&self) -> u64 {
+        self.prices.len() as u64
+    }
+
+    fn realized_vol_bps(&self) -> Option<f64> {
+        let count = self.returns.len();
+        if count == 0 {
+            return None;
+        }
+        let mean = self.sum_return / count as f64;
+        let variance = (self.sum_sq_return / count as f64 - mean * mean).max(0.0);
+        Some(variance.sqrt() * 10_000.0)
+    }
+
+    fn return_bps(&self) -> Option<f64> {
+        let earliest = self.prices.front()?.1;
+        let latest = self.prices.back()?.1;
+        if earliest <= 0.0 || latest <= 0.0 {
+            return None;
+        }
+        Some((latest / earliest).ln() * 10_000.0)
+    }
+}
+
+impl Default for BtcRegimeAggregator {
+    fn default() -> Self {
+        Self {
+            last_price: None,
+            observed_at_ms: 0,
+            window_30s: BtcRollingWindow::new(Self::WINDOW_MS_30S),
+            window_60s: BtcRollingWindow::new(Self::WINDOW_MS_60S),
+            window_120s: BtcRollingWindow::new(Self::WINDOW_MS_120S),
+            window_180s: BtcRollingWindow::new(Self::WINDOW_MS_180S),
+            window_5m: BtcRollingWindow::new(Self::WINDOW_MS_5M),
+            window_15m: BtcRollingWindow::new(Self::WINDOW_MS_15M),
+            cached_snapshot: None,
+        }
+    }
 }
 
 impl BtcRegimeAggregator {
@@ -169,7 +278,6 @@ impl BtcRegimeAggregator {
     const WINDOW_MS_60S: u64 = 60 * 1_000;
     const WINDOW_MS_120S: u64 = 120 * 1_000;
     const WINDOW_MS_180S: u64 = 180 * 1_000;
-    const MAX_SAMPLES: usize = 4_000;
 
     fn apply(&mut self, event: &Event) {
         if event.event_type != EventType::BtcTick {
@@ -179,80 +287,39 @@ impl BtcRegimeAggregator {
             return;
         };
         let now_ms = (event.received_ns / 1_000_000) as u64;
-        self.samples.push((now_ms, price));
+        let previous_price = self.last_price;
         self.observed_at_ms = now_ms;
-        let cutoff = now_ms.saturating_sub(Self::WINDOW_MS_15M + 60_000);
-        self.samples.retain(|(t, _)| *t >= cutoff);
-        if self.samples.len() > Self::MAX_SAMPLES {
-            let drop = self.samples.len() - Self::MAX_SAMPLES;
-            self.samples.drain(0..drop);
-        }
+        self.last_price = Some(price);
+        self.window_30s.push(now_ms, price, previous_price);
+        self.window_60s.push(now_ms, price, previous_price);
+        self.window_120s.push(now_ms, price, previous_price);
+        self.window_180s.push(now_ms, price, previous_price);
+        self.window_5m.push(now_ms, price, previous_price);
+        self.window_15m.push(now_ms, price, previous_price);
+        self.cached_snapshot = Some(self.compute_snapshot());
     }
 
     fn last_price(&self) -> Option<f64> {
-        self.samples.last().map(|(_, p)| *p)
-    }
-
-    fn realized_vol_bps(&self, window_ms: u64) -> Option<f64> {
-        let now = self.observed_at_ms;
-        let cutoff = now.saturating_sub(window_ms);
-        let prices: Vec<f64> = self
-            .samples
-            .iter()
-            .filter(|(t, _)| *t >= cutoff)
-            .map(|(_, p)| *p)
-            .collect();
-        if prices.len() < 2 {
-            return None;
-        }
-        let mut returns = Vec::with_capacity(prices.len() - 1);
-        for w in prices.windows(2) {
-            let prev = w[0];
-            let cur = w[1];
-            if prev > 0.0 && cur > 0.0 {
-                returns.push((cur / prev).ln());
-            }
-        }
-        if returns.is_empty() {
-            return None;
-        }
-        let mean = returns.iter().copied().sum::<f64>() / returns.len() as f64;
-        let var = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
-        Some(var.sqrt() * 10_000.0)
-    }
-
-    fn return_bps(&self, window_ms: u64) -> Option<f64> {
-        let now = self.observed_at_ms;
-        let cutoff = now.saturating_sub(window_ms);
-        let last = self.samples.last()?.1;
-        let earliest = self
-            .samples
-            .iter()
-            .find(|(t, _)| *t >= cutoff)
-            .map(|(_, p)| *p)?;
-        if earliest <= 0.0 {
-            return None;
-        }
-        Some(((last / earliest).ln()) * 10_000.0)
-    }
-
-    fn trade_count(&self, window_ms: u64) -> u64 {
-        let now = self.observed_at_ms;
-        let cutoff = now.saturating_sub(window_ms);
-        self.samples.iter().filter(|(t, _)| *t >= cutoff).count() as u64
+        self.last_price
     }
 
     fn snapshot(&self) -> BtcRegimeSnapshot {
+        self.cached_snapshot
+            .clone()
+            .unwrap_or_else(|| self.compute_snapshot())
+    }
+
+    fn compute_snapshot(&self) -> BtcRegimeSnapshot {
         BtcRegimeSnapshot {
             last_price: self.last_price(),
-            realized_vol_5m_bps: self.realized_vol_bps(Self::WINDOW_MS_5M),
-            realized_vol_15m_bps: self.realized_vol_bps(Self::WINDOW_MS_15M),
-            trade_count_5m: self.trade_count(Self::WINDOW_MS_5M),
-            trade_count_15m: self.trade_count(Self::WINDOW_MS_15M),
-            return_30s_bps: self.return_bps(Self::WINDOW_MS_30S),
-            return_60s_bps: self.return_bps(Self::WINDOW_MS_60S),
-            return_120s_bps: self.return_bps(Self::WINDOW_MS_120S),
-            return_180s_bps: self.return_bps(Self::WINDOW_MS_180S),
+            realized_vol_5m_bps: self.window_5m.realized_vol_bps(),
+            realized_vol_15m_bps: self.window_15m.realized_vol_bps(),
+            trade_count_5m: self.window_5m.trade_count(),
+            trade_count_15m: self.window_15m.trade_count(),
+            return_30s_bps: self.window_30s.return_bps(),
+            return_60s_bps: self.window_60s.return_bps(),
+            return_120s_bps: self.window_120s.return_bps(),
+            return_180s_bps: self.window_180s.return_bps(),
             observed_at_ms: self.observed_at_ms,
         }
     }
@@ -374,6 +441,8 @@ pub struct ReplayStrategyAdapter {
     /// Track open intents so we can map `SimulatedFill.client_order_id` back
     /// to the originating `OrderIntent`'s leg, side, and market.
     open_intents: BTreeMap<String, IntentRecord>,
+    runtime_state: InMemoryRuntimeStateStore,
+    quote_reconciler: QuoteReconciler,
     /// Map from the STRATEGY's stable client_order_id → the adapter's
     /// last-issued unique simulator coid for that slot. Re-submits of
     /// the same strategy slot emit an implicit cancel of the prior
@@ -395,7 +464,28 @@ struct IntentRecord {
     side: TradeSide,
     limit_price: f64,
     quantity: f64,
+    reduce_only: bool,
+    quote_level_tag: Option<String>,
+    pair_id: Option<String>,
+    kind: IntentKind,
     leg: Leg,
+}
+
+impl IntentRecord {
+    fn from_intent(intent: &OrderIntent, leg: Leg) -> Self {
+        Self {
+            market_id: intent.market_id.clone(),
+            instrument_id: intent.instrument_id.clone(),
+            side: intent.side,
+            limit_price: intent.limit_price,
+            quantity: intent.quantity,
+            reduce_only: intent.reduce_only,
+            quote_level_tag: intent.quote_level_tag.clone(),
+            pair_id: intent.pair_id.clone(),
+            kind: intent.kind,
+            leg,
+        }
+    }
 }
 
 impl ReplayStrategyAdapter {
@@ -419,6 +509,8 @@ impl ReplayStrategyAdapter {
             open_orders_per_market: BTreeMap::new(),
             risk_evaluation_enabled: false,
             open_intents: BTreeMap::new(),
+            runtime_state: InMemoryRuntimeStateStore::new(),
+            quote_reconciler: QuoteReconciler::default(),
             coid_by_strategy_slot: BTreeMap::new(),
             starting_cash_usd: DEFAULT_STARTING_CASH_USD,
             sequence: 0,
@@ -547,6 +639,32 @@ impl ReplayStrategyAdapter {
                 equity_usd: self.starting_cash_usd,
                 ..Default::default()
             });
+        let mut open_convex_order_exposure =
+            crate::strategies::traits::PairedOpenOrderExposure::default();
+        for managed in self.managed_open_orders().values().filter(|managed| {
+            managed.intent.market_id == market.market_id
+                && managed.intent.side == TradeSide::Buy
+                && !managed.intent.reduce_only
+                && managed.remaining_qty() > 1e-9
+                && managed
+                    .intent
+                    .quote_level_tag
+                    .as_deref()
+                    .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+                    == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+        }) {
+            let qty = managed.remaining_qty();
+            let notional = managed.intent.limit_price.max(0.0) * qty;
+            if managed.intent.instrument_id == market.yes_instrument_id {
+                open_convex_order_exposure.yes_qty += qty;
+                open_convex_order_exposure.yes_notional_usd += notional;
+                open_convex_order_exposure.yes_count += 1;
+            } else if managed.intent.instrument_id == market.no_instrument_id {
+                open_convex_order_exposure.no_qty += qty;
+                open_convex_order_exposure.no_notional_usd += notional;
+                open_convex_order_exposure.no_count += 1;
+            }
+        }
         let pair_cost = PairCostTracker::from_inventory(&inventory);
         let btc_regime = self.btc_regime.snapshot();
         let fair_value = self.fair_value_for(market, &btc_regime, now_ms);
@@ -556,6 +674,7 @@ impl ReplayStrategyAdapter {
             market: market.clone(),
             snapshot,
             inventory,
+            open_convex_order_exposure,
             pair_cost,
             fair_value,
             btc_regime,
@@ -629,16 +748,19 @@ impl ReplayStrategyAdapter {
             TradeSide::Sell => Side::Sell,
         };
         let asset_id = intent.instrument_id.as_str().to_string();
+        let mut runtime_intent = intent.clone();
+        runtime_intent.client_order_id = ClientOrderId::new(coid.clone());
+        runtime_intent.created_at_ms = if runtime_intent.created_at_ms > 0 {
+            runtime_intent.created_at_ms
+        } else {
+            now_ms
+        };
+        let _ = self
+            .runtime_state
+            .submit_order(runtime_intent.clone(), runtime_intent.created_at_ms);
         self.open_intents.insert(
             coid.clone(),
-            IntentRecord {
-                market_id: market.market_id.clone(),
-                instrument_id: intent.instrument_id.clone(),
-                side: intent.side,
-                limit_price: intent.limit_price,
-                quantity: intent.quantity,
-                leg,
-            },
+            IntentRecord::from_intent(&runtime_intent, leg),
         );
         Some(StrategyOrderIntent {
             client_order_id: coid,
@@ -671,8 +793,10 @@ impl ReplayStrategyAdapter {
         out: &mut ReplayDecision,
     ) {
         match decision {
-            StrategyDecision::QuoteSet { intents, .. }
-            | StrategyDecision::CapitalRecycle { intents, .. }
+            StrategyDecision::QuoteSet { intents, .. } => {
+                self.reconcile_and_emit_quote_set(intents, market, now_ms, out);
+            }
+            StrategyDecision::CapitalRecycle { intents, .. }
             | StrategyDecision::Rescue { intents, .. } => {
                 for intent in intents {
                     if matches!(intent.kind, IntentKind::Close) && intent.reduce_only {
@@ -704,6 +828,74 @@ impl ReplayStrategyAdapter {
         }
     }
 
+    fn reconcile_and_emit_quote_set(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        market: &BinaryOutcomeMarket,
+        now_ms: u64,
+        out: &mut ReplayDecision,
+    ) {
+        let desired = DesiredQuoteSet {
+            quotes: intents
+                .into_iter()
+                .enumerate()
+                .map(|(level, intent)| DesiredQuote {
+                    intent,
+                    level,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                })
+                .collect(),
+            stale_quote_max_age_ms: None,
+            quote_expiry_ms: None,
+        };
+        let open_orders = self.managed_open_orders();
+        let plan = self.quote_reconciler.plan(desired, &open_orders, now_ms);
+
+        for action in plan.actions {
+            match action {
+                QuoteAction::Keep(_) => {}
+                QuoteAction::Cancel {
+                    client_order_id,
+                    reason: _,
+                } => {
+                    out.cancels.push(client_order_id.as_str().to_string());
+                    self.cancel_runtime_order(&client_order_id, now_ms);
+                    self.remove_strategy_slot_for_sim_coid(client_order_id.as_str());
+                }
+                QuoteAction::Replace {
+                    existing_client_order_id,
+                    replacement,
+                    cancel_reason: _,
+                } => {
+                    out.cancels
+                        .push(existing_client_order_id.as_str().to_string());
+                    self.cancel_runtime_order(&existing_client_order_id, now_ms);
+                    self.remove_strategy_slot_for_sim_coid(existing_client_order_id.as_str());
+                    self.evaluate_and_emit(replacement, market, now_ms, out);
+                }
+                QuoteAction::Submit(intent) => {
+                    self.evaluate_and_emit(intent, market, now_ms, out);
+                }
+            }
+        }
+    }
+
+    fn managed_open_orders(&self) -> HashMap<ClientOrderId, ManagedOrder> {
+        self.runtime_state.open_orders()
+    }
+
+    fn remove_strategy_slot_for_sim_coid(&mut self, sim_coid: &str) {
+        self.coid_by_strategy_slot
+            .retain(|_, coid| coid.as_str() != sim_coid);
+    }
+
+    fn cancel_runtime_order(&mut self, client_order_id: &ClientOrderId, now_ms: u64) {
+        let _ = self.runtime_state.cancel_order(client_order_id, now_ms);
+        self.open_intents.remove(client_order_id.as_str());
+    }
+
     /// Route a single intent through the live `RiskEngine`. Accepted
     /// intents are converted into `StrategyOrderIntent`s and pushed onto
     /// `out.submits`; rejected intents append a typed `RiskRejection`
@@ -721,8 +913,15 @@ impl ReplayStrategyAdapter {
             // strand opt in via `with_risk_evaluation(true)`.
             let strategy_slot = intent.client_order_id.as_str().to_string();
             if let Some(prior) = self.coid_by_strategy_slot.get(&strategy_slot).cloned() {
+                if self
+                    .open_intents
+                    .get(&prior)
+                    .is_some_and(|record| record_matches_intent(record, &intent))
+                {
+                    return;
+                }
                 out.cancels.push(prior.clone());
-                self.open_intents.remove(&prior);
+                self.cancel_runtime_order(&ClientOrderId::new(prior), now_ms);
             }
             if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
                 self.coid_by_strategy_slot
@@ -731,40 +930,31 @@ impl ReplayStrategyAdapter {
             }
             return;
         }
-        let runtime_inv = self
-            .runtime_inventories
-            .entry(market.market_id.clone())
-            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
-        // Replay open-order counters mirror submit/fill events. Without a
-        // cancel path the counter would grow unbounded; the adapter does
-        // not emit cancels today (the live trader manages cancel/replace
-        // through the venue, not exposed here), so we synthesise a count
-        // from the live `open_intents` map instead. This is the same set
-        // the simulator considers "resting" and matches the live engine's
-        // book-of-record.
-        let live_total = self.open_intents.len();
-        let live_for_market = self
-            .open_intents
+        // Replay open-order counters come from the shared runtime state
+        // store. This is the same state shape consumed by the live quote
+        // reconciler, not a reconstructed replay-only view.
+        let managed_open_orders = self.runtime_state.open_orders();
+        let live_total = managed_open_orders.len();
+        let live_for_market = managed_open_orders
             .values()
-            .filter(|r| r.market_id == market.market_id)
+            .filter(|managed| managed.intent.market_id == market.market_id)
             .count();
-        let open_buy_notional_total_usd = self
-            .open_intents
+        let open_buy_notional_total_usd = managed_open_orders
             .values()
-            .filter(|record| matches!(record.side, TradeSide::Buy))
-            .map(|record| record.limit_price * record.quantity)
+            .filter(|managed| matches!(managed.intent.side, TradeSide::Buy))
+            .map(|managed| managed.intent.limit_price * managed.remaining_qty())
             .sum();
-        let open_signed_notional_for_market_usd = self
-            .open_intents
+        let open_signed_notional_for_market_usd = managed_open_orders
             .values()
-            .filter(|record| record.market_id == market.market_id)
-            .map(|record| record.limit_price * record.quantity * record.side.sign())
+            .filter(|managed| managed.intent.market_id == market.market_id)
+            .map(|managed| {
+                managed.intent.limit_price * managed.remaining_qty() * managed.intent.side.sign()
+            })
             .sum();
-        let open_position_qty_for_instrument = self
-            .open_intents
+        let open_position_qty_for_instrument = managed_open_orders
             .values()
-            .filter(|record| record.instrument_id == intent.instrument_id)
-            .map(|record| record.quantity * record.side.sign())
+            .filter(|managed| managed.intent.instrument_id == intent.instrument_id)
+            .map(|managed| managed.remaining_qty() * managed.intent.side.sign())
             .sum();
         let ctx = RiskContext {
             open_orders_total: live_total,
@@ -775,6 +965,10 @@ impl ReplayStrategyAdapter {
             starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
+        let runtime_inv = self
+            .runtime_inventories
+            .entry(market.market_id.clone())
+            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
         let decision = self.risk.evaluate(runtime_inv, &intent, &ctx);
         if !decision.accepted {
             let reason = decision
@@ -815,12 +1009,20 @@ impl ReplayStrategyAdapter {
         }
         let strategy_slot = intent.client_order_id.as_str().to_string();
         // If the strategy is re-submitting the same logical slot, the live
-        // runtime would cancel the prior order before placing the new one.
-        // Emit an explicit cancel so the simulator drops the prior resting
-        // order and our open_intents map stays in sync.
+        // runtime would keep an unchanged working order, or cancel/replace a
+        // materially changed order. Preserve that invariant here; otherwise
+        // replay turns every tick into a synthetic cancel/submit even when
+        // the live quote reconciler would have emitted Keep.
         if let Some(prior) = self.coid_by_strategy_slot.get(&strategy_slot).cloned() {
+            if self
+                .open_intents
+                .get(&prior)
+                .is_some_and(|record| record_matches_intent(record, &intent))
+            {
+                return;
+            }
             out.cancels.push(prior.clone());
-            self.open_intents.remove(&prior);
+            self.cancel_runtime_order(&ClientOrderId::new(prior), now_ms);
         }
         if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
             self.coid_by_strategy_slot
@@ -885,6 +1087,7 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         let Some(record) = self.open_intents.get(&fill.client_order_id).cloned() else {
             return ReplayDecision::default();
         };
+        let now_ms = fill.fill_ms;
         let inventory = self
             .inventories
             .entry(record.market_id.clone())
@@ -898,13 +1101,18 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         if let Some(c) = self.open_orders_per_market.get_mut(&record.market_id) {
             *c = c.saturating_sub(1);
         }
+        let fill_client_order_id = ClientOrderId::new(fill.client_order_id.clone());
+        let _ = self
+            .runtime_state
+            .apply_fill(&fill_client_order_id, fill.size, now_ms);
         self.open_intents.remove(&fill.client_order_id);
+        self.coid_by_strategy_slot
+            .retain(|_, coid| coid != &fill.client_order_id);
 
         // Build StrategyFillInput and notify the strategy.
         let Some(market) = self.markets.get(&record.market_id).cloned() else {
             return ReplayDecision::default();
         };
-        let now_ms = fill.fill_ms;
         let Some(input) = self.build_input_for_market(&market, now_ms) else {
             return ReplayDecision::default();
         };
@@ -943,6 +1151,17 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         }
         decision
     }
+}
+
+fn record_matches_intent(record: &IntentRecord, intent: &OrderIntent) -> bool {
+    record.instrument_id == intent.instrument_id
+        && record.side == intent.side
+        && record.reduce_only == intent.reduce_only
+        && record.quote_level_tag == intent.quote_level_tag
+        && record.pair_id == intent.pair_id
+        && record.kind == intent.kind
+        && (record.limit_price - intent.limit_price).abs() <= 1e-9
+        && (record.quantity - intent.quantity).abs() <= 1e-9
 }
 
 fn parse_f64(s: Option<&str>) -> Option<f64> {
@@ -1021,6 +1240,59 @@ mod tests {
                 "end_time_ms": (received_ns / 1_000_000) + 300_000,
             }),
         }
+    }
+
+    fn replay_intent(client_order_id: &str, price: f64) -> OrderIntent {
+        OrderIntent {
+            client_order_id: ClientOrderId::from(client_order_id),
+            market_id: MarketId::from("market-1"),
+            instrument_id: InstrumentId::from("yes-1"),
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: 10.0,
+            reduce_only: false,
+            reason: "test".to_string(),
+            quote_level_tag: Some("lvl-1".to_string()),
+            created_at_ms: 1_000,
+            pair_id: None,
+            kind: IntentKind::Entry,
+        }
+    }
+
+    #[test]
+    fn replay_quote_set_uses_live_reconciler_keep_for_unchanged_quote() {
+        let mut adapter = ReplayStrategyAdapter::from_profile(StrategyProfile::default());
+        let intent = replay_intent("slot-1", 0.42);
+        adapter.open_intents.insert(
+            "slot-1:1".to_string(),
+            IntentRecord {
+                market_id: intent.market_id.clone(),
+                instrument_id: intent.instrument_id.clone(),
+                side: intent.side,
+                limit_price: intent.limit_price,
+                quantity: intent.quantity,
+                reduce_only: intent.reduce_only,
+                quote_level_tag: intent.quote_level_tag.clone(),
+                pair_id: intent.pair_id.clone(),
+                kind: intent.kind,
+                leg: Leg::Yes,
+            },
+        );
+        adapter
+            .coid_by_strategy_slot
+            .insert("slot-1".to_string(), "slot-1:1".to_string());
+        let market = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-1"),
+            InstrumentId::from("yes-1"),
+            InstrumentId::from("no-1"),
+        );
+        let mut decision = ReplayDecision::default();
+
+        adapter.reconcile_and_emit_quote_set(vec![intent], &market, 2_000, &mut decision);
+
+        assert!(decision.submits.is_empty());
+        assert!(decision.cancels.is_empty());
+        assert_eq!(adapter.open_intents.len(), 1);
     }
 
     #[test]
