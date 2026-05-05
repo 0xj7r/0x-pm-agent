@@ -217,7 +217,7 @@ impl MarketSnapshot {
 /// string checks across runtime/mod.rs, core/risk.rs, market_making/quote_reconciler.rs,
 /// strategy.rs, and accept_intent's drift block. Promoted to a typed
 /// enum so any future gate someone adds doesn't silently re-trap rescues.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum IntentKind {
     /// Adds exposure: paired-bid maker entries, single-leg accumulations.
     /// Subject to all entry-time caps.

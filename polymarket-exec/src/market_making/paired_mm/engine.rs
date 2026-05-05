@@ -31,6 +31,7 @@ use crate::markets::MarketDescriptor;
 use crate::signals::{
     BtcRegime, BtcRegimeSnapshot, FairValueEstimate, MomentumSignal, OrderBookPressureSignal,
 };
+use crate::strategies::traits::PairedOpenOrderExposure;
 use crate::types::{
     ClientOrderId, CoolingReason, EpochMillis, FillReport, IntentKind, MmQuoteKind, OrderIntent,
 };
@@ -39,33 +40,21 @@ use crate::types::{
 pub struct ConvexityOverlayConfig {
     pub enabled: bool,
     pub suppress_ladder_when_package_fires: bool,
+    pub start_frac: f64,
+    pub capital_pct: f64,
+    pub fractional_kelly: f64,
+    pub max_loss_usd: f64,
+    pub max_book_take_pct: f64,
+    pub min_order_usd: f64,
+    pub max_active_orders_per_leg: usize,
     pub late_window_sec: u64,
     pub convex_p_threshold: f64,
-    pub max_excess_usd: f64,
-    pub clip_usd: f64,
     pub maker_safety_ticks: f64,
     pub min_favorite_edge_bps: f64,
     pub tail_enabled: bool,
-    pub tail_max_price: f64,
-    pub tail_clip_usd: f64,
-    pub min_combo_ev_usd: f64,
-    pub ev_gate_enabled: bool,
-    pub package_budget_usd: f64,
-    pub favorite_notional_min_pct: f64,
-    pub favorite_notional_max_pct: f64,
-    pub whipsaw_favorite_notional_min_pct: f64,
-    pub whipsaw_favorite_notional_max_pct: f64,
-    pub loser_stranded_favorite_notional_min_pct: f64,
-    pub loser_stranded_favorite_notional_max_pct: f64,
-    pub winner_stranded_favorite_notional_min_pct: f64,
-    pub winner_stranded_favorite_notional_max_pct: f64,
     pub max_favorite_win_loss_usd: f64,
     pub min_tail_win_profit_usd: f64,
     pub min_tail_payoff_multiple: f64,
-    pub ev_delta_weight: f64,
-    pub favorite_loss_reduction_weight: f64,
-    pub tail_convexity_weight: f64,
-    pub imbalance_penalty_weight: f64,
 }
 
 impl Default for ConvexityOverlayConfig {
@@ -73,33 +62,21 @@ impl Default for ConvexityOverlayConfig {
         Self {
             enabled: false,
             suppress_ladder_when_package_fires: true,
+            start_frac: 0.60,
+            capital_pct: 0.10,
+            fractional_kelly: 0.15,
+            max_loss_usd: 40.0,
+            max_book_take_pct: 0.20,
+            min_order_usd: 0.25,
+            max_active_orders_per_leg: 3,
             late_window_sec: 120,
             convex_p_threshold: 0.72,
-            max_excess_usd: 40.0,
-            clip_usd: 4.0,
             maker_safety_ticks: 2.0,
             min_favorite_edge_bps: 25.0,
             tail_enabled: true,
-            tail_max_price: 0.02,
-            tail_clip_usd: 2.0,
-            min_combo_ev_usd: 0.0,
-            ev_gate_enabled: false,
-            package_budget_usd: 15.0,
-            favorite_notional_min_pct: 0.80,
-            favorite_notional_max_pct: 0.97,
-            whipsaw_favorite_notional_min_pct: 0.50,
-            whipsaw_favorite_notional_max_pct: 0.70,
-            loser_stranded_favorite_notional_min_pct: 0.75,
-            loser_stranded_favorite_notional_max_pct: 0.90,
-            winner_stranded_favorite_notional_min_pct: 0.45,
-            winner_stranded_favorite_notional_max_pct: 0.65,
             max_favorite_win_loss_usd: 8.0,
             min_tail_win_profit_usd: 10.0,
-            min_tail_payoff_multiple: 4.0,
-            ev_delta_weight: 0.0,
-            favorite_loss_reduction_weight: 0.0,
-            tail_convexity_weight: 1.0,
-            imbalance_penalty_weight: 0.0,
+            min_tail_payoff_multiple: 20.0,
         }
     }
 }
@@ -134,6 +111,7 @@ pub struct PairedMmInput<M> {
     pub market: M,
     pub snapshot: PairedMarketSnapshot,
     pub inventory: PairedInventorySnapshot,
+    pub open_convex_order_exposure: PairedOpenOrderExposure,
     pub pair_cost: PairCostTracker,
     pub fair_value: FairValueEstimate,
     pub btc_regime: BtcRegimeSnapshot,
@@ -279,15 +257,18 @@ impl PairedMmEngine {
                 &input.market,
                 &input.snapshot,
                 &input.inventory,
+                &input.open_convex_order_exposure,
                 &input.fair_value,
                 &input.btc_regime,
+                &input.order_book_pressure,
                 self.config.convexity_overlay,
                 input.now_ms,
             )
         } else {
             Vec::new()
         };
-        if self.config
+        if self
+            .config
             .convexity_overlay
             .suppress_ladder_when_package_fires
             && !convex_overlay.is_empty()
@@ -403,8 +384,10 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     market: &M,
     snapshot: &PairedMarketSnapshot,
     inventory: &PairedInventorySnapshot,
+    open_convex_order_exposure: &PairedOpenOrderExposure,
     fair_value: &FairValueEstimate,
     btc_regime: &BtcRegimeSnapshot,
+    order_book_pressure: &OrderBookPressureSignal,
     config: ConvexityOverlayConfig,
     now_ms: EpochMillis,
 ) -> Vec<OrderIntent> {
@@ -414,7 +397,15 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     let remaining_ms = market
         .time_remaining_ms(now_ms)
         .unwrap_or(market.window_ms());
-    if remaining_ms > config.late_window_sec.saturating_mul(1_000) {
+    let start_frac_late_ms = ((1.0 - config.start_frac.clamp(0.0, 0.99))
+        * market.window_ms() as f64)
+        .round()
+        .max(0.0) as u64;
+    let late_threshold_ms = config
+        .late_window_sec
+        .saturating_mul(1_000)
+        .max(start_frac_late_ms);
+    if remaining_ms > late_threshold_ms {
         return Vec::new();
     }
 
@@ -424,6 +415,9 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         favorite_quote,
         favorite_prob,
         favorite_current_qty,
+        favorite_open_qty,
+        favorite_open_notional,
+        favorite_open_count,
         _opposite_qty,
         favorite_avg_cost,
         tail_tag,
@@ -431,43 +425,63 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         tail_quote,
         tail_prob,
         tail_current_qty,
+        tail_open_qty,
+        tail_open_notional,
+        tail_open_count,
         tail_avg_cost,
-    ) =
-        if fair_value.p_up >= config.convex_p_threshold {
-            (
-                "yes",
-                market.yes_instrument_id().clone(),
-                &snapshot.yes_quote,
-                fair_value.p_up,
-                inventory.yes_qty,
-                inventory.no_qty,
-                inventory.yes_avg_cost,
-                "no",
-                market.no_instrument_id().clone(),
-                &snapshot.no_quote,
-                fair_value.p_down,
-                inventory.no_qty,
-                inventory.no_avg_cost,
-            )
-        } else if fair_value.p_down >= config.convex_p_threshold {
-            (
-                "no",
-                market.no_instrument_id().clone(),
-                &snapshot.no_quote,
-                fair_value.p_down,
-                inventory.no_qty,
-                inventory.yes_qty,
-                inventory.no_avg_cost,
-                "yes",
-                market.yes_instrument_id().clone(),
-                &snapshot.yes_quote,
-                fair_value.p_up,
-                inventory.yes_qty,
-                inventory.yes_avg_cost,
-            )
-        } else {
-            return Vec::new();
-        };
+    ) = if fair_value.p_up >= config.convex_p_threshold {
+        (
+            "yes",
+            market.yes_instrument_id().clone(),
+            &snapshot.yes_quote,
+            fair_value.p_up,
+            inventory.yes_qty,
+            open_convex_order_exposure.yes_qty,
+            open_convex_order_exposure.yes_notional_usd,
+            open_convex_order_exposure.yes_count,
+            inventory.no_qty,
+            inventory.yes_avg_cost,
+            "no",
+            market.no_instrument_id().clone(),
+            &snapshot.no_quote,
+            fair_value.p_down,
+            inventory.no_qty,
+            open_convex_order_exposure.no_qty,
+            open_convex_order_exposure.no_notional_usd,
+            open_convex_order_exposure.no_count,
+            inventory.no_avg_cost,
+        )
+    } else if fair_value.p_down >= config.convex_p_threshold {
+        (
+            "no",
+            market.no_instrument_id().clone(),
+            &snapshot.no_quote,
+            fair_value.p_down,
+            inventory.no_qty,
+            open_convex_order_exposure.no_qty,
+            open_convex_order_exposure.no_notional_usd,
+            open_convex_order_exposure.no_count,
+            inventory.yes_qty,
+            inventory.no_avg_cost,
+            "yes",
+            market.yes_instrument_id().clone(),
+            &snapshot.yes_quote,
+            fair_value.p_up,
+            inventory.yes_qty,
+            open_convex_order_exposure.yes_qty,
+            open_convex_order_exposure.yes_notional_usd,
+            open_convex_order_exposure.yes_count,
+            inventory.yes_avg_cost,
+        )
+    } else {
+        return Vec::new();
+    };
+
+    let max_active_per_leg = config.max_active_orders_per_leg.max(1);
+    if favorite_open_count >= max_active_per_leg {
+        return Vec::new();
+    }
+    let pressure_bias = convex_pressure_bias(favorite_tag, order_book_pressure);
 
     let tick_size = market.tick_size().max(0.0001);
     let Some((favorite_limit_price, favorite_best_ask)) =
@@ -480,48 +494,149 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         return Vec::new();
     }
 
-    if !config.tail_enabled {
-        return Vec::new();
-    }
-    let Some((tail_limit_price, tail_best_ask)) =
-        passive_buy_price(tail_quote, tick_size, config.maker_safety_ticks)
-    else {
-        return Vec::new();
-    };
-    if tail_best_ask > config.tail_max_price.max(tick_size) {
-        return Vec::new();
-    }
-
-    let existing_favorite_cost = favorite_current_qty.max(0.0) * favorite_avg_cost.max(0.0);
-    let existing_tail_cost = tail_current_qty.max(0.0) * tail_avg_cost.max(0.0);
+    let effective_favorite_qty = favorite_current_qty.max(0.0) + favorite_open_qty.max(0.0);
+    let effective_tail_qty = tail_current_qty.max(0.0) + tail_open_qty.max(0.0);
+    let existing_favorite_cost = favorite_current_qty.max(0.0) * favorite_avg_cost.max(0.0)
+        + favorite_open_notional.max(0.0);
+    let existing_tail_cost =
+        tail_current_qty.max(0.0) * tail_avg_cost.max(0.0) + tail_open_notional.max(0.0);
     let existing_cost = existing_favorite_cost + existing_tail_cost;
-    let existing_ev = favorite_prob * favorite_current_qty.max(0.0)
-        + tail_prob * tail_current_qty.max(0.0)
-        - existing_cost;
-    let remaining_excess_budget = config.max_excess_usd - existing_cost;
+    let existing_ev =
+        favorite_prob * effective_favorite_qty + tail_prob * effective_tail_qty - existing_cost;
+    let total_budget = config.max_loss_usd.max(0.0);
+    let remaining_excess_budget = total_budget - existing_cost;
     if remaining_excess_budget <= 0.0 {
         return Vec::new();
     }
 
-    let budget = config.package_budget_usd.min(remaining_excess_budget).max(0.0);
-    let Some(plan) = choose_late_asymmetric_package(
+    let favorite_depth_usd = favorite_quote
+        .best_ask
+        .as_ref()
+        .map(|level| level.price * level.quantity)
+        .unwrap_or(config.min_order_usd);
+    let tail_depth_usd = tail_quote
+        .best_ask
+        .as_ref()
+        .map(|level| level.price * level.quantity)
+        .unwrap_or(config.min_order_usd);
+
+    let maybe_tail_quote = if config.tail_enabled && tail_open_count < max_active_per_leg {
+        passive_buy_price(tail_quote, tick_size, config.maker_safety_ticks)
+    } else {
+        None
+    };
+    let tail_price_cap = (1.0 / config.min_tail_payoff_multiple.max(1.0)).max(tick_size);
+    let maybe_package_plan =
+        maybe_tail_quote.and_then(|(tail_limit_price, tail_best_ask)| {
+            if tail_best_ask > tail_price_cap {
+                return None;
+            }
+            choose_late_asymmetric_package(
+                favorite_prob,
+                tail_prob,
+                favorite_limit_price,
+                tail_limit_price,
+                effective_favorite_qty,
+                effective_tail_qty,
+                existing_cost,
+                existing_ev,
+                remaining_excess_budget,
+                favorite_depth_usd,
+                tail_depth_usd,
+                market.min_order_size(),
+                btc_regime.regime(),
+                pressure_bias,
+                config,
+            )
+            .map(|plan| (plan, tail_limit_price, tail_best_ask))
+        });
+
+    if let Some((plan, tail_limit_price, tail_best_ask)) = maybe_package_plan {
+        let mut intents = Vec::with_capacity(2);
+        let mut favorite_intent = OrderIntent::new_buy(
+            ClientOrderId::from(format!(
+                "paired-mm-convex:{}:{}:{}",
+                market.market_id(),
+                favorite_tag,
+                now_ms
+            )),
+            market.market_id().clone(),
+            favorite_instrument_id,
+            favorite_limit_price,
+            plan.favorite_qty,
+            format!(
+                "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} regime={}",
+                favorite_edge * 10_000.0,
+                plan.ev_delta,
+                plan.pnl_if_favorite,
+                plan.pnl_if_tail,
+                plan.favorite_notional,
+                plan.tail_notional,
+                plan.tail_payoff_multiple,
+                pressure_bias.label,
+                plan.regime_label
+            ),
+            now_ms,
+        );
+        favorite_intent.quote_level_tag = Some(format!(
+            "mm-convex-accum:late-favorite:{favorite_tag}:{:?}",
+            MmQuoteKind::ConvexAccumulation
+        ));
+        favorite_intent.kind = IntentKind::Entry;
+        intents.push(favorite_intent);
+
+        let mut tail_intent = OrderIntent::new_buy(
+            ClientOrderId::from(format!(
+                "paired-mm-tail:{}:{}:{}",
+                market.market_id(),
+                tail_tag,
+                now_ms
+            )),
+            market.market_id().clone(),
+            tail_instrument_id,
+            tail_limit_price,
+            plan.tail_qty,
+            format!(
+                "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} regime={}",
+                plan.ev_delta,
+                plan.pnl_if_favorite,
+                plan.pnl_if_tail,
+                plan.favorite_notional,
+                plan.tail_notional,
+                plan.tail_payoff_multiple,
+                pressure_bias.label,
+                plan.regime_label
+            ),
+            now_ms,
+        );
+        tail_intent.quote_level_tag = Some(format!(
+            "mm-convex-accum:ultra-cheap-tail:{tail_tag}:{:?}",
+            MmQuoteKind::ConvexAccumulation
+        ));
+        tail_intent.kind = IntentKind::Entry;
+        intents.push(tail_intent);
+
+        return intents;
+    }
+
+    let Some(favorite_plan) = choose_late_favorite_only(
         favorite_prob,
         tail_prob,
         favorite_limit_price,
-        tail_limit_price,
-        favorite_current_qty.max(0.0),
-        tail_current_qty.max(0.0),
+        effective_favorite_qty,
+        effective_tail_qty,
         existing_cost,
         existing_ev,
-        budget,
+        remaining_excess_budget,
+        favorite_depth_usd,
         market.min_order_size(),
         btc_regime.regime(),
+        pressure_bias,
         config,
     ) else {
         return Vec::new();
     };
 
-    let mut intents = Vec::with_capacity(2);
     let mut favorite_intent = OrderIntent::new_buy(
         ClientOrderId::from(format!(
             "paired-mm-convex:{}:{}:{}",
@@ -532,58 +647,155 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         market.market_id().clone(),
         favorite_instrument_id,
         favorite_limit_price,
-        plan.favorite_qty,
+        favorite_plan.qty,
         format!(
-            "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} regime={}",
+            "paired-mm late favorite-only load leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_other={:.4} notional={:.4} pressure={} regime={}",
             favorite_edge * 10_000.0,
-            plan.ev_delta,
-            plan.pnl_if_favorite,
-            plan.pnl_if_tail,
-            plan.favorite_notional,
-            plan.tail_notional,
-            plan.tail_payoff_multiple,
-            plan.regime_label
+            favorite_plan.ev_delta,
+            favorite_plan.pnl_if_favorite,
+            favorite_plan.pnl_if_other,
+            favorite_plan.notional,
+            pressure_bias.label,
+            favorite_plan.regime_label
         ),
         now_ms,
     );
     favorite_intent.quote_level_tag = Some(format!(
-        "mm-convex-accum:late-favorite:{favorite_tag}:{:?}",
+        "mm-convex-accum:late-favorite-only:{favorite_tag}:{:?}",
         MmQuoteKind::ConvexAccumulation
     ));
     favorite_intent.kind = IntentKind::Entry;
-    intents.push(favorite_intent);
+    vec![favorite_intent]
+}
 
-    let mut tail_intent = OrderIntent::new_buy(
-        ClientOrderId::from(format!(
-            "paired-mm-tail:{}:{}:{}",
-            market.market_id(),
-            tail_tag,
-            now_ms
-        )),
-        market.market_id().clone(),
-        tail_instrument_id,
-        tail_limit_price,
-        plan.tail_qty,
-        format!(
-            "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} regime={}",
-            plan.ev_delta,
-            plan.pnl_if_favorite,
-            plan.pnl_if_tail,
-            plan.favorite_notional,
-            plan.tail_notional,
-            plan.tail_payoff_multiple,
-            plan.regime_label
-        ),
-        now_ms,
-    );
-    tail_intent.quote_level_tag = Some(format!(
-        "mm-convex-accum:ultra-cheap-tail:{tail_tag}:{:?}",
-        MmQuoteKind::ConvexAccumulation
-    ));
-    tail_intent.kind = IntentKind::Entry;
-    intents.push(tail_intent);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LateFavoriteOnlyPlan {
+    qty: f64,
+    notional: f64,
+    pnl_if_favorite: f64,
+    pnl_if_other: f64,
+    ev_delta: f64,
+    regime_label: &'static str,
+}
 
-    intents
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ConvexPressureBias {
+    favorite_scale: f64,
+    tail_scale: f64,
+    label: &'static str,
+}
+
+fn convex_pressure_bias(
+    favorite_tag: &str,
+    pressure: &OrderBookPressureSignal,
+) -> ConvexPressureBias {
+    let strength = pressure.imbalance.abs().clamp(0.0, 1.0);
+    let pressure_favorite_tag = match pressure.direction {
+        crate::signals::SignalDirection::Up => Some("yes"),
+        crate::signals::SignalDirection::Down => Some("no"),
+        crate::signals::SignalDirection::Neutral => None,
+    };
+    let mut bias = match pressure_favorite_tag {
+        Some(tag) if tag == favorite_tag => ConvexPressureBias {
+            favorite_scale: 1.0 + 0.50 * strength,
+            tail_scale: 1.0 - 0.20 * strength,
+            label: "supports_favorite",
+        },
+        Some(_) => ConvexPressureBias {
+            favorite_scale: 1.0 - 0.50 * strength,
+            tail_scale: 1.0 + 0.20 * strength,
+            label: "opposes_favorite",
+        },
+        None => ConvexPressureBias {
+            favorite_scale: 1.0,
+            tail_scale: 1.0,
+            label: "neutral",
+        },
+    };
+    if pressure.thin_book {
+        bias.favorite_scale *= 0.75;
+        bias.tail_scale *= 0.75;
+        bias.label = "thin_book";
+    }
+    bias.favorite_scale = bias.favorite_scale.clamp(0.50, 1.50);
+    bias.tail_scale = bias.tail_scale.clamp(0.60, 1.25);
+    bias
+}
+
+#[allow(clippy::too_many_arguments)]
+fn choose_late_favorite_only(
+    favorite_prob: f64,
+    tail_prob: f64,
+    favorite_price: f64,
+    existing_favorite_qty: f64,
+    existing_tail_qty: f64,
+    existing_cost: f64,
+    existing_ev: f64,
+    remaining_budget_usd: f64,
+    favorite_depth_usd: f64,
+    min_order_size: f64,
+    regime: Option<BtcRegime>,
+    pressure_bias: ConvexPressureBias,
+    config: ConvexityOverlayConfig,
+) -> Option<LateFavoriteOnlyPlan> {
+    if remaining_budget_usd <= 0.0 || favorite_price <= 0.0 || favorite_price >= 1.0 {
+        return None;
+    }
+
+    let regime_label = regime
+        .map(|regime| regime_label(regime))
+        .unwrap_or("unknown");
+    let book_take = config.max_book_take_pct.clamp(0.01, 1.0);
+    let depth_cap = (favorite_depth_usd * book_take).max(config.min_order_usd);
+    let risk_cap = config
+        .max_favorite_win_loss_usd
+        .max(config.min_order_usd)
+        .min(config.max_loss_usd.max(0.0))
+        .min(remaining_budget_usd);
+    let terminal_confidence = ((favorite_prob - config.convex_p_threshold)
+        / (1.0 - config.convex_p_threshold).max(1e-9))
+    .clamp(0.0, 1.0);
+    let edge = (favorite_prob - favorite_price).max(0.0);
+    let kelly = edge / (1.0 - favorite_price).max(1e-9);
+    let capital_budget = (config.max_loss_usd.max(0.0) * config.capital_pct.max(0.0))
+        .max(config.min_order_usd);
+    let mut notional = (capital_budget * config.fractional_kelly.clamp(0.0, 1.0))
+        .max(config.min_order_usd)
+        .max(capital_budget * terminal_confidence * config.fractional_kelly.clamp(0.0, 1.0))
+        .max(capital_budget * kelly * config.fractional_kelly.clamp(0.0, 1.0))
+        * pressure_bias.favorite_scale;
+    notional = notional
+        .min(depth_cap)
+        .min(risk_cap);
+    if matches!(regime, Some(BtcRegime::Whipsaw)) {
+        notional *= 0.75;
+    }
+    if notional + 1e-9 < config.min_order_usd {
+        return None;
+    }
+    let qty = (notional / favorite_price).max(min_order_size);
+    notional = qty * favorite_price;
+    if notional > risk_cap + 1e-9 {
+        return None;
+    }
+    let total_favorite_qty = existing_favorite_qty + qty;
+    let total_cost = existing_cost + notional;
+    let pnl_if_favorite = total_favorite_qty - total_cost;
+    let pnl_if_other = existing_tail_qty - total_cost;
+    let total_ev = favorite_prob * total_favorite_qty + tail_prob * existing_tail_qty - total_cost;
+    let ev_delta = total_ev - existing_ev;
+    if pnl_if_other + config.max_favorite_win_loss_usd < -1e-9 {
+        return None;
+    }
+
+    Some(LateFavoriteOnlyPlan {
+        qty,
+        notional,
+        pnl_if_favorite,
+        pnl_if_other,
+        ev_delta,
+        regime_label,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -609,128 +821,158 @@ fn choose_late_asymmetric_package(
     existing_tail_qty: f64,
     existing_cost: f64,
     existing_ev: f64,
-    budget_usd: f64,
+    remaining_budget_usd: f64,
+    favorite_depth_usd: f64,
+    tail_depth_usd: f64,
     min_order_size: f64,
     regime: Option<BtcRegime>,
+    pressure_bias: ConvexPressureBias,
     config: ConvexityOverlayConfig,
 ) -> Option<LateAsymmetricPackagePlan> {
-    if budget_usd <= 0.0 || favorite_price <= 0.0 || tail_price <= 0.0 {
+    if remaining_budget_usd <= 0.0 || favorite_price <= 0.0 || tail_price <= 0.0 {
         return None;
     }
 
-    let regime_label = regime.map(|regime| regime_label(regime)).unwrap_or("unknown");
-    let (mut configured_min_pct, mut configured_max_pct) = match regime {
-        Some(BtcRegime::Whipsaw) => (
-            config.whipsaw_favorite_notional_min_pct,
-            config.whipsaw_favorite_notional_max_pct,
-        ),
-        _ => (
-            config.favorite_notional_min_pct,
-            config.favorite_notional_max_pct,
-        ),
-    };
+    let regime_label = regime
+        .map(|regime| regime_label(regime))
+        .unwrap_or("unknown");
     let tail_stranded = existing_tail_qty > existing_favorite_qty + min_order_size.max(1e-9);
     let favorite_stranded = existing_favorite_qty > existing_tail_qty + min_order_size.max(1e-9);
+    let risk_budget = config.max_loss_usd.max(0.0);
+    let remaining_budget_usd = remaining_budget_usd.min(risk_budget).max(0.0);
+    let fractional_kelly = config.fractional_kelly.clamp(0.0, 1.0);
+    let capital_budget = (risk_budget * config.capital_pct.max(0.0)).max(config.min_order_usd);
+    let favorite_edge = (favorite_prob - favorite_price).max(0.0);
+    let favorite_kelly = if favorite_price < 1.0 {
+        favorite_edge / (1.0 - favorite_price).max(1e-9)
+    } else {
+        0.0
+    };
+    let tail_edge = (tail_prob - tail_price).max(0.0);
+    let tail_kelly = if tail_price < 1.0 {
+        tail_edge / (1.0 - tail_price).max(1e-9)
+    } else {
+        0.0
+    };
+    let tail_payoff_at_price = 1.0 / tail_price.max(1e-9);
+    if tail_payoff_at_price + 1e-9 < config.min_tail_payoff_multiple {
+        return None;
+    }
+
+    let book_take = config.max_book_take_pct.clamp(0.01, 1.0);
+    let favorite_depth_cap = (favorite_depth_usd * book_take).max(config.min_order_usd);
+    let tail_depth_cap = (tail_depth_usd * book_take).max(config.min_order_usd);
+
+    let structural_tail_notional =
+        (risk_budget / config.min_tail_payoff_multiple.max(1.0)).max(config.min_order_usd);
+    let per_leg_floor = config
+        .min_order_usd
+        .max(min_order_size * favorite_price)
+        .max(min_order_size * tail_price)
+        .min(remaining_budget_usd * 0.5);
+    let terminal_confidence = ((favorite_prob - config.convex_p_threshold)
+        / (1.0 - config.convex_p_threshold).max(1e-9))
+    .clamp(0.0, 1.0);
+    let favorite_edge_budget = capital_budget * fractional_kelly * favorite_kelly.max(0.0);
+    let favorite_confidence_budget = capital_budget * fractional_kelly * terminal_confidence;
+    let mut favorite_notional = favorite_edge_budget
+        .max(favorite_confidence_budget)
+        .max(per_leg_floor)
+        * pressure_bias.favorite_scale;
+    favorite_notional = favorite_notional
+        .min(favorite_depth_cap)
+        .min((remaining_budget_usd - per_leg_floor).max(0.0));
+
+    if matches!(regime, Some(BtcRegime::Whipsaw)) {
+        favorite_notional *= 0.90;
+    }
+
     if tail_stranded {
-        configured_min_pct = configured_min_pct.max(config.loser_stranded_favorite_notional_min_pct);
-        configured_max_pct = configured_max_pct.max(config.loser_stranded_favorite_notional_max_pct);
+        let share_deficit_cost =
+            (existing_tail_qty - existing_favorite_qty).max(0.0) * favorite_price;
+        favorite_notional = favorite_notional
+            .max(share_deficit_cost.min(remaining_budget_usd - per_leg_floor))
+            .min(favorite_depth_cap);
     } else if favorite_stranded {
-        configured_min_pct = configured_min_pct.min(config.winner_stranded_favorite_notional_min_pct);
-        configured_max_pct = configured_max_pct.min(config.winner_stranded_favorite_notional_max_pct);
-    }
-    let min_pct = configured_min_pct.clamp(0.01, 0.99);
-    let max_pct = configured_max_pct.clamp(min_pct, 0.995);
-    let steps = 8;
-    let mut best: Option<LateAsymmetricPackagePlan> = None;
-
-    for step in 0..=steps {
-        let pct = min_pct + (max_pct - min_pct) * (step as f64 / steps as f64);
-        let favorite_target_notional = budget_usd * pct;
-        let tail_target_notional = budget_usd - favorite_target_notional;
-        if favorite_target_notional <= 0.0 || tail_target_notional <= 0.0 {
-            continue;
-        }
-
-        let favorite_qty = (favorite_target_notional / favorite_price).max(min_order_size);
-        let tail_qty = (tail_target_notional / tail_price).max(min_order_size);
-        let favorite_notional = favorite_qty * favorite_price;
-        let tail_notional = tail_qty * tail_price;
-        let new_cost = favorite_notional + tail_notional;
-        if new_cost > budget_usd + 1e-9 {
-            continue;
-        }
-
-        let total_favorite_qty = existing_favorite_qty + favorite_qty;
-        let total_tail_qty = existing_tail_qty + tail_qty;
-        let total_cost = existing_cost + new_cost;
-        let pnl_if_favorite = total_favorite_qty - total_cost;
-        let pnl_if_tail = total_tail_qty - total_cost;
-        let total_ev = favorite_prob * total_favorite_qty + tail_prob * total_tail_qty - total_cost;
-        let ev_delta = total_ev - existing_ev;
-        if config.ev_gate_enabled && ev_delta + 1e-9 < config.min_combo_ev_usd {
-            continue;
-        }
-        if pnl_if_favorite + config.max_favorite_win_loss_usd < -1e-9 {
-            continue;
-        }
-        if pnl_if_tail + 1e-9 < config.min_tail_win_profit_usd {
-            continue;
-        }
-        let tail_payoff_multiple = total_tail_qty / total_cost.max(1e-9);
-        if tail_payoff_multiple + 1e-9 < config.min_tail_payoff_multiple {
-            continue;
-        }
-
-        let candidate = LateAsymmetricPackagePlan {
-            favorite_qty,
-            tail_qty,
-            favorite_notional,
-            tail_notional,
-            pnl_if_favorite,
-            pnl_if_tail,
-            ev_delta,
-            tail_payoff_multiple,
-            regime_label,
-        };
-    if best
-            .as_ref()
-            .is_none_or(|best| {
-                let candidate_imbalance_delta = (candidate.favorite_notional - candidate.tail_notional).abs();
-                let best_imbalance_delta = (best.favorite_notional - best.tail_notional).abs();
-                let stranded_score = |candidate: &LateAsymmetricPackagePlan| -> f64 {
-                    if tail_stranded {
-                        candidate.pnl_if_favorite
-                    } else if favorite_stranded {
-                        candidate.pnl_if_tail
-                    } else {
-                        candidate.tail_payoff_multiple
-                    }
-                };
-                let candidate_score = stranded_score(&candidate)
-                    + config.ev_delta_weight * candidate.ev_delta
-                    + config.favorite_loss_reduction_weight * candidate.pnl_if_favorite
-                    + config.tail_convexity_weight * candidate.tail_payoff_multiple
-                    - config.imbalance_penalty_weight * candidate_imbalance_delta;
-                let best_score = stranded_score(best)
-                    + config.ev_delta_weight * best.ev_delta
-                    + config.favorite_loss_reduction_weight * best.pnl_if_favorite
-                    + config.tail_convexity_weight * best.tail_payoff_multiple
-                    - config.imbalance_penalty_weight * best_imbalance_delta;
-
-                if tail_stranded {
-                    candidate_score > best_score
-                } else if favorite_stranded {
-                    candidate_score > best_score
-                } else {
-                    candidate_score > best_score
-                }
-            })
-        {
-            best = Some(candidate);
-        }
+        favorite_notional = favorite_notional.min(per_leg_floor.max(config.min_order_usd));
     }
 
-    best
+    let projected_favorite_qty = existing_favorite_qty + favorite_notional / favorite_price;
+    let coverage =
+        ((tail_payoff_at_price / config.min_tail_payoff_multiple.max(1.0)) - 1.0).clamp(0.25, 1.0);
+    let target_tail_qty = if tail_stranded {
+        existing_tail_qty + per_leg_floor / tail_price
+    } else {
+        projected_favorite_qty * coverage
+    };
+    let coverage_tail_qty = (target_tail_qty - existing_tail_qty).max(0.0);
+    let tail_profit_qty = (existing_cost + favorite_notional + config.min_tail_win_profit_usd
+        - existing_tail_qty)
+        .max(0.0)
+        / (1.0 - tail_price).max(1e-9);
+    let tail_edge_notional = capital_budget * fractional_kelly * tail_kelly.max(0.0);
+    let desired_tail_notional = structural_tail_notional
+        .max(coverage_tail_qty * tail_price)
+        .max(tail_profit_qty * tail_price)
+        .max(tail_edge_notional)
+        .max(per_leg_floor)
+        * pressure_bias.tail_scale;
+    let tail_notional = desired_tail_notional
+        .min(tail_depth_cap)
+        .min((remaining_budget_usd - favorite_notional).max(0.0));
+    if favorite_notional < config.min_order_usd && tail_notional < config.min_order_usd {
+        return None;
+    }
+
+    let favorite_qty = if favorite_notional + 1e-9 >= config.min_order_usd {
+        (favorite_notional / favorite_price).max(min_order_size)
+    } else {
+        0.0
+    };
+    let tail_qty = if tail_notional + 1e-9 >= config.min_order_usd {
+        (tail_notional / tail_price).max(min_order_size)
+    } else {
+        0.0
+    };
+    if favorite_qty <= 0.0 || tail_qty <= 0.0 {
+        return None;
+    }
+
+    let favorite_notional = favorite_qty * favorite_price;
+    let tail_notional = tail_qty * tail_price;
+    let new_cost = favorite_notional + tail_notional;
+    if new_cost > remaining_budget_usd + 1e-9 {
+        return None;
+    }
+    let total_favorite_qty = existing_favorite_qty + favorite_qty;
+    let total_tail_qty = existing_tail_qty + tail_qty;
+    let total_cost = existing_cost + new_cost;
+    let pnl_if_favorite = total_favorite_qty - total_cost;
+    let pnl_if_tail = total_tail_qty - total_cost;
+    let total_ev = favorite_prob * total_favorite_qty + tail_prob * total_tail_qty - total_cost;
+    let ev_delta = total_ev - existing_ev;
+    if pnl_if_favorite + config.max_favorite_win_loss_usd < -1e-9 {
+        return None;
+    }
+    if pnl_if_tail + 1e-9 < config.min_tail_win_profit_usd {
+        return None;
+    }
+    let tail_payoff_multiple = total_tail_qty / total_cost.max(1e-9);
+    if tail_payoff_multiple + 1e-9 < config.min_tail_payoff_multiple {
+        return None;
+    }
+
+    Some(LateAsymmetricPackagePlan {
+        favorite_qty,
+        tail_qty,
+        favorite_notional,
+        tail_notional,
+        pnl_if_favorite,
+        pnl_if_tail,
+        ev_delta,
+        tail_payoff_multiple,
+        regime_label,
+    })
 }
 
 fn regime_label(regime: BtcRegime) -> &'static str {
@@ -745,20 +987,200 @@ fn regime_label(regime: BtcRegime) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markets::BinaryOutcomeMarket;
+    use crate::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot};
 
     fn package_config() -> ConvexityOverlayConfig {
         ConvexityOverlayConfig {
-            ev_gate_enabled: false,
-            package_budget_usd: 10.0,
-            favorite_notional_min_pct: 0.60,
-            favorite_notional_max_pct: 0.80,
-            whipsaw_favorite_notional_min_pct: 0.45,
-            whipsaw_favorite_notional_max_pct: 0.65,
+            max_loss_usd: 40.0,
+            capital_pct: 1.0,
+            fractional_kelly: 0.25,
+            min_order_usd: 0.10,
+            max_book_take_pct: 1.0,
             max_favorite_win_loss_usd: 100.0,
             min_tail_win_profit_usd: 0.0,
             min_tail_payoff_multiple: 1.0,
             ..ConvexityOverlayConfig::default()
         }
+    }
+
+    fn quote(bid: f64, ask: f64, ask_qty: f64) -> QuoteSnapshot {
+        QuoteSnapshot {
+            best_bid: Some(BookLevel::new(bid, ask_qty)),
+            best_ask: Some(BookLevel::new(ask, ask_qty)),
+            bid_levels: vec![BookLevel::new(bid, ask_qty)],
+            ask_levels: vec![BookLevel::new(ask, ask_qty)],
+            depth_observed_at_ms: Some(250_000),
+            last_trade_price: Some(ask),
+            taker_buy_qty_60s: 0.0,
+            taker_sell_qty_60s: 0.0,
+            observed_at_ms: 250_000,
+        }
+    }
+
+    fn late_market() -> BinaryOutcomeMarket {
+        let mut market = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            InstrumentId::from("no"),
+        );
+        market.min_order_size = 0.1;
+        market.event_start_ms = Some(0);
+        market.event_end_ms = Some(300_000);
+        market
+    }
+
+    fn late_snapshot() -> PairedMarketSnapshot {
+        PairedMarketSnapshot {
+            market_id: MarketId::from("market"),
+            yes_instrument_id: InstrumentId::from("yes"),
+            no_instrument_id: InstrumentId::from("no"),
+            yes_quote: quote(0.98, 0.99, 10_000.0),
+            no_quote: quote(0.01, 0.02, 10_000.0),
+        }
+    }
+
+    fn neutral_pressure_bias() -> ConvexPressureBias {
+        ConvexPressureBias {
+            favorite_scale: 1.0,
+            tail_scale: 1.0,
+            label: "neutral",
+        }
+    }
+
+    #[test]
+    fn late_package_loads_99c_favorite_and_buys_1c_tail_shares() {
+        let mut config = package_config();
+        config.fractional_kelly = 0.06;
+        config.min_tail_payoff_multiple = 20.0;
+        config.min_tail_win_profit_usd = 10.0;
+
+        let plan = choose_late_asymmetric_package(
+            0.985,
+            0.015,
+            0.99,
+            0.01,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            40.0,
+            10_000.0,
+            10_000.0,
+            0.1,
+            Some(BtcRegime::DirectionalSmooth),
+            neutral_pressure_bias(),
+            config,
+        )
+        .expect("99c/1c late package should be viable");
+
+        assert!(
+            plan.favorite_notional > plan.tail_notional,
+            "favorite should get the dollar allocation, got favorite=${:.4} tail=${:.4}",
+            plan.favorite_notional,
+            plan.tail_notional
+        );
+        assert!(
+            plan.tail_qty > plan.favorite_qty,
+            "cheap tail should dominate share count, got favorite_qty={:.4} tail_qty={:.4}",
+            plan.favorite_qty,
+            plan.tail_qty
+        );
+        assert!(plan.tail_payoff_multiple >= 20.0);
+        assert!(plan.pnl_if_tail >= 10.0);
+    }
+
+    #[test]
+    fn late_convex_overlay_counts_open_convex_orders_against_rebuy_budget() {
+        let mut config = package_config();
+        config.enabled = true;
+        config.fractional_kelly = 0.06;
+        config.max_loss_usd = 40.0;
+        config.min_tail_payoff_multiple = 20.0;
+        config.min_tail_win_profit_usd = 10.0;
+
+        let market = late_market();
+        let snapshot = late_snapshot();
+        let fair_value = FairValueEstimate {
+            p_up: 0.985,
+            p_down: 0.015,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.0,
+            time_remaining_s: 50.0,
+            model: crate::signals::FairValueModel::NoSignal(
+                crate::signals::fair_value::NoSignalReason::SpotInvalid,
+            ),
+        };
+        let without_open_orders = choose_convex_overlay(
+            &market,
+            &snapshot,
+            &PairedInventorySnapshot::default(),
+            &PairedOpenOrderExposure::default(),
+            &fair_value,
+            &BtcRegimeSnapshot::default(),
+            &OrderBookPressureSignal::default(),
+            config,
+            250_000,
+        );
+        assert!(
+            !without_open_orders.is_empty(),
+            "baseline late convex package should fire with unused budget"
+        );
+
+        let saturated_open_orders = PairedOpenOrderExposure {
+            yes_qty: 20.0 / 0.98,
+            yes_notional_usd: 20.0,
+            yes_count: 3,
+            no_qty: 20.0 / 0.01,
+            no_notional_usd: 20.0,
+            no_count: 3,
+        };
+        let with_open_orders = choose_convex_overlay(
+            &market,
+            &snapshot,
+            &PairedInventorySnapshot::default(),
+            &saturated_open_orders,
+            &fair_value,
+            &BtcRegimeSnapshot::default(),
+            &OrderBookPressureSignal::default(),
+            config,
+            250_000,
+        );
+        assert!(
+            with_open_orders.is_empty(),
+            "active open convex orders should consume package budget before rebuying"
+        );
+    }
+
+    #[test]
+    fn late_package_keeps_tail_share_coverage_at_96c_2c() {
+        let mut config = package_config();
+        config.fractional_kelly = 0.06;
+        config.min_tail_payoff_multiple = 20.0;
+        config.min_tail_win_profit_usd = 10.0;
+
+        let plan = choose_late_asymmetric_package(
+            0.96,
+            0.04,
+            0.96,
+            0.02,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            40.0,
+            10_000.0,
+            10_000.0,
+            0.1,
+            Some(BtcRegime::DirectionalSmooth),
+            neutral_pressure_bias(),
+            config,
+        )
+        .expect("96c/2c late package should be viable");
+
+        assert!(plan.favorite_notional > plan.tail_notional);
+        assert!(plan.tail_qty > plan.favorite_qty);
+        assert!(plan.tail_payoff_multiple >= 20.0);
     }
 
     #[test]
@@ -773,8 +1195,11 @@ mod tests {
             50.0,
             -40.0,
             10.0,
+            100.0,
+            100.0,
             0.1,
             Some(BtcRegime::Whipsaw),
+            neutral_pressure_bias(),
             package_config(),
         )
         .expect("tail-stranded package should be viable");
@@ -802,8 +1227,11 @@ mod tests {
             50.0,
             40.0,
             10.0,
+            100.0,
+            100.0,
             0.1,
             Some(BtcRegime::Whipsaw),
+            neutral_pressure_bias(),
             package_config(),
         )
         .expect("favorite-stranded package should be viable");
@@ -836,8 +1264,11 @@ mod tests {
             0.0,
             0.0,
             10.0,
+            100.0,
+            100.0,
             0.1,
             Some(BtcRegime::DirectionalSmooth),
+            neutral_pressure_bias(),
             config,
         )
         .expect("structurally convex package should not require positive model EV");

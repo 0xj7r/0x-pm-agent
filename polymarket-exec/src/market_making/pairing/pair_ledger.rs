@@ -12,6 +12,21 @@ enum PairLeg {
     No,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedWinningLeg {
+    Yes,
+    No,
+}
+
+impl From<ResolvedWinningLeg> for PairLeg {
+    fn from(value: ResolvedWinningLeg) -> Self {
+        match value {
+            ResolvedWinningLeg::Yes => PairLeg::Yes,
+            ResolvedWinningLeg::No => PairLeg::No,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairLot {
     pub quantity: f64,
@@ -65,6 +80,24 @@ pub struct MarketPairState {
     pub expected_merge_gain_usd: f64,
     pub last_merge_at_ms: Option<EpochMillis>,
     pub last_update_ms: EpochMillis,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedRedeemCandidate {
+    pub market_id: MarketId,
+    pub winning_leg: ResolvedWinningLeg,
+    pub winning_instrument_id: Option<InstrumentId>,
+    pub losing_instrument_id: Option<InstrumentId>,
+    pub winning_qty: f64,
+    pub losing_qty: f64,
+    pub winning_cost_usd: f64,
+    pub losing_cost_usd: f64,
+    pub expected_cash_usd: f64,
+    pub expected_net_gain_usd: f64,
+    pub paired_qty_before_resolution: f64,
+    pub stranded_winning_qty_before_resolution: f64,
+    pub stranded_losing_qty_before_resolution: f64,
+    pub observed_at_ms: EpochMillis,
 }
 
 impl MarketPairState {
@@ -297,10 +330,72 @@ impl MarketPairState {
             observed_at_ms: self.last_update_ms,
         })
     }
+
+    pub fn resolved_redeem_candidate(
+        &self,
+        winning_leg: ResolvedWinningLeg,
+    ) -> Option<ResolvedRedeemCandidate> {
+        let winning_leg_pair = PairLeg::from(winning_leg);
+        let (winning_lots, losing_lots, winning_instrument_id, losing_instrument_id) =
+            match winning_leg_pair {
+                PairLeg::Yes => (
+                    &self.yes_lots,
+                    &self.no_lots,
+                    self.yes_instrument_id.clone(),
+                    self.no_instrument_id.clone(),
+                ),
+                PairLeg::No => (
+                    &self.no_lots,
+                    &self.yes_lots,
+                    self.no_instrument_id.clone(),
+                    self.yes_instrument_id.clone(),
+                ),
+            };
+        let winning_qty = total_quantity(winning_lots);
+        let losing_qty = total_quantity(losing_lots);
+        if winning_qty <= EPSILON_QTY && losing_qty <= EPSILON_QTY {
+            return None;
+        }
+
+        let winning_cost_usd = total_cost(winning_lots);
+        let losing_cost_usd = total_cost(losing_lots);
+        let expected_cash_usd = winning_qty;
+        let expected_net_gain_usd = expected_cash_usd - winning_cost_usd - losing_cost_usd;
+        let (
+            stranded_winning_qty_before_resolution,
+            stranded_losing_qty_before_resolution,
+        ) = match winning_leg_pair {
+            PairLeg::Yes => (self.stranded_yes_qty, self.stranded_no_qty),
+            PairLeg::No => (self.stranded_no_qty, self.stranded_yes_qty),
+        };
+
+        Some(ResolvedRedeemCandidate {
+            market_id: self.market_id.clone(),
+            winning_leg,
+            winning_instrument_id,
+            losing_instrument_id,
+            winning_qty,
+            losing_qty,
+            winning_cost_usd,
+            losing_cost_usd,
+            expected_cash_usd,
+            expected_net_gain_usd,
+            paired_qty_before_resolution: self.paired_qty,
+            stranded_winning_qty_before_resolution,
+            stranded_losing_qty_before_resolution,
+            observed_at_ms: self.last_update_ms,
+        })
+    }
 }
 
 fn total_quantity(lots: &[PairLot]) -> f64 {
     lots.iter().map(|lot| lot.quantity.max(0.0)).sum()
+}
+
+fn total_cost(lots: &[PairLot]) -> f64 {
+    lots.iter()
+        .map(|lot| lot.quantity.max(0.0) * lot.avg_price.max(0.0))
+        .sum()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -553,11 +648,21 @@ impl MarketPairLedger {
             .get_mut(market_id)
             .and_then(|state| state.apply_merge(requested_qty, observed_at_ms))
     }
+
+    pub fn resolved_redeem_candidate(
+        &self,
+        market_id: &MarketId,
+        winning_leg: ResolvedWinningLeg,
+    ) -> Option<ResolvedRedeemCandidate> {
+        self.states
+            .get(market_id)
+            .and_then(|state| state.resolved_redeem_candidate(winning_leg))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MarketPairLedger, MergeCandidate, MergePlan};
+    use super::{MarketPairLedger, MergeCandidate, MergePlan, ResolvedWinningLeg};
     use crate::types::{FillReport, InstrumentId, MarketId, TradeSide};
 
     fn mk_fill(instrument: &str, side: TradeSide, qty: f64, price: f64) -> FillReport {
@@ -677,5 +782,27 @@ mod tests {
             legs_to_close: 2,
         };
         assert!(plan.expected_gain_usd >= 0.0);
+    }
+
+    #[test]
+    fn resolved_redeem_candidate_values_winning_inventory_and_expires_loser() {
+        let mut ledger = MarketPairLedger::new();
+        ledger.ingest_fill(&mk_fill("yes-a-up", TradeSide::Buy, 10.0, 0.40));
+        ledger.ingest_fill(&mk_fill("no-a-down", TradeSide::Buy, 6.0, 0.55));
+        ledger.ingest_fill(&mk_fill("yes-a-up", TradeSide::Buy, 2.0, 0.25));
+
+        let candidate = ledger
+            .resolved_redeem_candidate(&MarketId::from("market-1"), ResolvedWinningLeg::Yes)
+            .expect("redeem candidate");
+
+        assert!((candidate.winning_qty - 12.0).abs() < 1e-9);
+        assert!((candidate.losing_qty - 6.0).abs() < 1e-9);
+        assert!((candidate.expected_cash_usd - 12.0).abs() < 1e-9);
+        assert!((candidate.winning_cost_usd - 4.5).abs() < 1e-9);
+        assert!((candidate.losing_cost_usd - 3.3).abs() < 1e-9);
+        assert!((candidate.expected_net_gain_usd - 4.2).abs() < 1e-9);
+        assert!((candidate.paired_qty_before_resolution - 6.0).abs() < 1e-9);
+        assert!((candidate.stranded_winning_qty_before_resolution - 6.0).abs() < 1e-9);
+        assert!((candidate.stranded_losing_qty_before_resolution - 0.0).abs() < 1e-9);
     }
 }

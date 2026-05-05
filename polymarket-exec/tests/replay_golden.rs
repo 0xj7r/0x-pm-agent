@@ -1,4 +1,4 @@
-//! Deterministic golden-fixture replay test (Phase 3a).
+//! Deterministic golden-fixture replay test 
 //!
 //! Generates a 50-event canonical fixture, writes it to a temp directory as
 //! Parquet + JSONL, reads both back through the replay reader, runs the
@@ -125,6 +125,8 @@ fn replay_with(events: &[Event]) -> Vec<SimulatedFill> {
             latency: LatencyPreset::Instant,
             fill_quality: FillQuality::Optimistic,
             seed: 0xC0FFEE,
+            submit_latency_ms: None,
+            cancel_latency_ms: None,
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
@@ -186,7 +188,11 @@ fn golden_fixture_replay_jsonl_roundtrip_matches_in_memory() {
     write_jsonl_file(&path, &fixture).unwrap();
     let read = read_jsonl_file(&path).unwrap();
     // dedupe_and_sort applies the same discipline read_local would.
-    let sorted_in_memory = dedupe_and_sort(fixture.clone());
+    let mut normalized_fixture = fixture.clone();
+    for event in &mut normalized_fixture {
+        event.raw = serde_json::Value::Null;
+    }
+    let sorted_in_memory = dedupe_and_sort(normalized_fixture);
     let sorted_from_disk = dedupe_and_sort(read);
     assert_eq!(sorted_in_memory, sorted_from_disk);
 
@@ -370,6 +376,8 @@ fn run_paired_mm_window(events: &[Event]) -> polymarket_exec::replay::runner::Wi
             latency: LatencyPreset::Instant,
             fill_quality: FillQuality::Optimistic,
             seed: 0xC0FFEE,
+            submit_latency_ms: None,
+            cancel_latency_ms: None,
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
@@ -416,16 +424,12 @@ fn golden_paired_mm_one_bar_replay_is_deterministic() {
     assert_eq!(s1.events_replayed, 100);
 
     // Locked-in PnL value: this is the deterministic cash flow of running
-    // the current paired_mm strategy + fill-sim against the 100-event
-    // fixture above. The strategy posts paired entry bids; public buy
-    // trades that hit those bids fill the maker side, generating cash
-    // outflows (negative PnL). If you change the strategy, the fill
-    // simulator, or the fixture, this constant will move and the assert
-    // will catch the regression so reviewers notice. To re-baseline, run
-    // the test, copy the printed value, and update the constant below in
-    // the same commit that explains why.
-    const GOLDEN_FILLS_COUNT: usize = 18;
-    const GOLDEN_PNL_USD: f64 = -40.25;
+    // the current paired_mm strategy + queue-aware fill-sim against the
+    // 100-event fixture above. The same-price queue model is intentionally
+    // stricter than the old optimistic golden, so this fixture now fills
+    // only the residual after displayed same-price depth is consumed.
+    const GOLDEN_FILLS_COUNT: usize = 1;
+    const GOLDEN_PNL_USD: f64 = -2.5;
     let fills_count = s1.fills.len();
     let pnl = realized_pnl_usd(&s1.fills);
 

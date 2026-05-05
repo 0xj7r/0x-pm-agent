@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::collector::schema::{Event, EventType};
 use crate::replay::fill_sim::{
-    FillSimConfig, FillSimulator, Side, SimulatedFill, SimulatedRejection, StrategyOrderIntent,
+    FillSimConfig, FillSimulator, Side, SimulatedFill, SimulatedOrderSubmission,
+    SimulatedRejection, StrategyOrderIntent,
 };
 use crate::replay::risk_trace::RiskRejection;
 use crate::replay::synthesizer::EventSynthesizer;
@@ -38,6 +39,16 @@ pub struct WindowSummary {
     pub window_id: String,
     pub events_replayed: u64,
     pub intents_submitted: u64,
+    /// Compact simulator-derived queue/fill calibration summary. Full
+    /// per-order traces are intentionally not embedded here because a single
+    /// window can emit hundreds of thousands of quote replacements.
+    #[serde(default)]
+    pub queue_calibration: ReplayQueueCalibrationSummary,
+    /// Bounded sample of simulator-normalized submissions for inspection.
+    /// This keeps large replay reports compact while still answering "what
+    /// did the strategy actually try to rest?" for smoke/debug windows.
+    #[serde(default)]
+    pub submitted_order_samples: Vec<SimulatedOrderSubmission>,
     pub fills: Vec<SimulatedFill>,
     /// Deterministic accounting from the replayed fill stream plus the
     /// replayed market marks. This is the canonical source for backtest
@@ -152,6 +163,73 @@ mod replay_accounting_tests {
         );
         assert_eq!(accounting.mark_source, "resolution");
     }
+
+    #[test]
+    fn accounting_reports_unmerged_pairable_inventory() {
+        let events = vec![market_meta_event("UP", "DOWN")];
+        let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 7.0)];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+
+        assert_eq!(accounting.settlement.pair_asset_ids, vec!["UP", "DOWN"]);
+        assert_eq!(accounting.settlement.pairable_qty_before_resolution, 7.0);
+        assert_eq!(accounting.settlement.merged_pair_qty, 0.0);
+        assert_eq!(accounting.settlement.unmerged_pairable_qty, 7.0);
+        assert_eq!(accounting.settlement.stranded_qty_total, 17.0);
+        assert_eq!(accounting.settlement.status, "merge_opportunity_unexecuted");
+    }
+
+    #[test]
+    fn accounting_applies_successful_merge_events_once() {
+        let events = vec![
+            market_meta_event("UP", "DOWN"),
+            merge_event("5", "confirmed"),
+        ];
+        let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 7.0)];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+
+        assert!((accounting.ending_cash_usd - 997.15).abs() < 1e-9);
+        assert!((accounting.realized_pnl_usd - 0.25).abs() < 1e-9);
+        assert_eq!(accounting.settlement.merge_attempted_count, 1);
+        assert_eq!(accounting.settlement.merge_success_count, 1);
+        assert_eq!(accounting.settlement.merged_pair_qty, 5.0);
+        assert_eq!(accounting.settlement.unmerged_pairable_qty, 2.0);
+    }
+
+    fn market_meta_event(up: &str, down: &str) -> Event {
+        Event {
+            v: 1,
+            ts_ns: 0,
+            received_ns: 0,
+            event_type: EventType::MarketMeta,
+            market_type: "btc_5m".to_string(),
+            market_slug: Some("btc-up-or-down".to_string()),
+            asset_id: None,
+            side: None,
+            price: None,
+            size: None,
+            sequence: Some(0),
+            source: Source::PolymarketDataApi,
+            raw: json!({ "asset_ids": [up, down] }),
+        }
+    }
+
+    fn merge_event(size: &str, status: &str) -> Event {
+        Event {
+            v: 1,
+            ts_ns: 3,
+            received_ns: 3,
+            event_type: EventType::UserOrder,
+            market_type: "btc_5m".to_string(),
+            market_slug: Some("btc-up-or-down".to_string()),
+            asset_id: None,
+            side: None,
+            price: None,
+            size: Some(size.to_string()),
+            sequence: Some(3),
+            source: Source::PolymarketUserWs,
+            raw: json!({ "type": "merge", "status": status, "size": size }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -171,6 +249,8 @@ pub struct ReplayAccountingSummary {
     pub resolution_winner_asset_id: Option<String>,
     pub mark_source: String,
     pub unmarked_open_positions: u64,
+    #[serde(default)]
+    pub settlement: ReplaySettlementSummary,
     pub open_positions: Vec<ReplayPositionSummary>,
 }
 
@@ -183,6 +263,43 @@ pub struct ReplayPositionSummary {
     pub mark_price_usd: Option<f64>,
     pub market_value_usd: f64,
     pub unrealized_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplaySettlementSummary {
+    pub pair_asset_ids: Vec<String>,
+    pub merge_attempted_count: u64,
+    pub merge_success_count: u64,
+    pub merge_reverted_count: u64,
+    pub merged_pair_qty: f64,
+    pub merge_credit_usd: f64,
+    pub pairable_qty_before_resolution: f64,
+    pub unmerged_pairable_qty: f64,
+    pub redeemed_winning_qty: f64,
+    pub expired_losing_qty: f64,
+    pub stranded_qty_total: f64,
+    pub stranded_cost_usd: f64,
+    pub stranded_inventory: Vec<ReplaySettlementAssetInventory>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplaySettlementAssetInventory {
+    pub asset_id: String,
+    pub qty: f64,
+    pub cost_basis_usd: f64,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayQueueCalibrationSummary {
+    pub sample_size: u64,
+    pub filled_orders: u64,
+    pub fill_rate: f64,
+    pub partial_fill_rate: f64,
+    pub median_seconds_to_first_fill: Option<f64>,
+    pub median_same_side_depth_at_entry: Option<f64>,
+    pub median_estimated_queue_position_fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -298,6 +415,12 @@ pub fn run_window<S: ReplayStrategy>(
         }
         (
             sim.fills().to_vec(),
+            compute_queue_calibration(sim.submissions(), sim.fills()),
+            sim.submissions()
+                .iter()
+                .take(64)
+                .cloned()
+                .collect::<Vec<_>>(),
             sim.rejections().to_vec(),
             intents_submitted,
             risk_rejections,
@@ -306,22 +429,32 @@ pub fn run_window<S: ReplayStrategy>(
     }));
 
     match outcome {
-        Ok((fills, post_only_rejections, intents_submitted, risk_rejections, accounting)) => {
-            WindowSummary {
-                window_id: cfg.window_id.clone(),
-                events_replayed: events.len() as u64,
-                intents_submitted,
-                fills,
-                accounting,
-                post_only_rejections,
-                risk_rejections,
-                status: WindowStatus::Ok,
-            }
-        }
+        Ok((
+            fills,
+            queue_calibration,
+            submitted_order_samples,
+            post_only_rejections,
+            intents_submitted,
+            risk_rejections,
+            accounting,
+        )) => WindowSummary {
+            window_id: cfg.window_id.clone(),
+            events_replayed: events.len() as u64,
+            intents_submitted,
+            queue_calibration,
+            submitted_order_samples,
+            fills,
+            accounting,
+            post_only_rejections,
+            risk_rejections,
+            status: WindowStatus::Ok,
+        },
         Err(_panic) => WindowSummary {
             window_id: cfg.window_id.clone(),
             events_replayed: events.len() as u64,
             intents_submitted: 0,
+            queue_calibration: ReplayQueueCalibrationSummary::default(),
+            submitted_order_samples: Vec::new(),
             fills: Vec::new(),
             accounting: ReplayAccountingSummary {
                 starting_cash_usd: cfg.starting_cash_usd,
@@ -368,11 +501,32 @@ fn compute_accounting(
     }
 
     let (marks, winner_asset_id) = replay_marks(events);
+    let pair_asset_ids = binary_asset_ids(events, &positions);
+    let merge_events = replay_merge_events(events);
+    let pairable_qty_before_resolution = pair_asset_ids
+        .as_ref()
+        .map(|pair| pairable_qty(&positions, pair))
+        .unwrap_or(0.0);
+    let merge_apply = pair_asset_ids
+        .as_ref()
+        .map(|pair| apply_successful_merges(&mut positions, pair, &merge_events))
+        .unwrap_or_default();
+    cash += merge_apply.credit_usd;
+    realized_pnl += merge_apply.realized_pnl_usd;
+
     let mut market_value = 0.0;
     let mut open_cost_basis = 0.0;
     let mut redeemable_value = 0.0;
     let mut unmarked_open_positions = 0u64;
     let mut open_positions = Vec::new();
+    let settlement = compute_settlement_summary(
+        pair_asset_ids.unwrap_or_default(),
+        &merge_events,
+        merge_apply.applied_qty,
+        pairable_qty_before_resolution,
+        &positions,
+        winner_asset_id.as_deref(),
+    );
 
     for (asset_id, pos) in positions {
         if pos.qty <= f64::EPSILON {
@@ -426,7 +580,334 @@ fn compute_accounting(
             "last_replayed_market_price".to_string()
         },
         unmarked_open_positions,
+        settlement,
         open_positions,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReplayMergeEvent {
+    size: f64,
+    status: ReplayMergeStatus,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ReplayMergeStatus {
+    Success,
+    Reverted,
+    #[default]
+    PendingOrUnknown,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AppliedMergeSummary {
+    applied_qty: f64,
+    credit_usd: f64,
+    realized_pnl_usd: f64,
+}
+
+fn binary_asset_ids(
+    events: &[Event],
+    positions: &BTreeMap<String, ReplayPositionAccounting>,
+) -> Option<Vec<String>> {
+    for event in events {
+        let Some(values) = event.raw.get("asset_ids").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let ids: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if ids.len() == 2 {
+            return Some(ids);
+        }
+    }
+    let ids: Vec<String> = positions
+        .iter()
+        .filter_map(|(asset_id, pos)| (pos.qty > f64::EPSILON).then_some(asset_id.clone()))
+        .collect();
+    (ids.len() == 2).then_some(ids)
+}
+
+fn pairable_qty(
+    positions: &BTreeMap<String, ReplayPositionAccounting>,
+    pair_asset_ids: &[String],
+) -> f64 {
+    if pair_asset_ids.len() != 2 {
+        return 0.0;
+    }
+    let a = positions
+        .get(&pair_asset_ids[0])
+        .map(|p| p.qty.max(0.0))
+        .unwrap_or(0.0);
+    let b = positions
+        .get(&pair_asset_ids[1])
+        .map(|p| p.qty.max(0.0))
+        .unwrap_or(0.0);
+    a.min(b)
+}
+
+fn apply_successful_merges(
+    positions: &mut BTreeMap<String, ReplayPositionAccounting>,
+    pair_asset_ids: &[String],
+    merge_events: &[ReplayMergeEvent],
+) -> AppliedMergeSummary {
+    if pair_asset_ids.len() != 2 {
+        return AppliedMergeSummary::default();
+    }
+    let requested_qty: f64 = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Success)
+        .map(|event| event.size)
+        .sum();
+    if requested_qty <= f64::EPSILON {
+        return AppliedMergeSummary::default();
+    }
+    let applied_qty = requested_qty.min(pairable_qty(positions, pair_asset_ids));
+    if applied_qty <= f64::EPSILON {
+        return AppliedMergeSummary::default();
+    }
+    let avg_a = positions
+        .get(&pair_asset_ids[0])
+        .map(|p| p.avg_cost)
+        .unwrap_or(0.0);
+    let avg_b = positions
+        .get(&pair_asset_ids[1])
+        .map(|p| p.avg_cost)
+        .unwrap_or(0.0);
+    for asset_id in pair_asset_ids {
+        if let Some(pos) = positions.get_mut(asset_id) {
+            pos.sell(applied_qty);
+        }
+    }
+    AppliedMergeSummary {
+        applied_qty,
+        credit_usd: applied_qty,
+        realized_pnl_usd: applied_qty * (1.0 - avg_a - avg_b),
+    }
+}
+
+fn compute_settlement_summary(
+    pair_asset_ids: Vec<String>,
+    merge_events: &[ReplayMergeEvent],
+    merged_pair_qty: f64,
+    pairable_qty_before_resolution: f64,
+    positions: &BTreeMap<String, ReplayPositionAccounting>,
+    winner_asset_id: Option<&str>,
+) -> ReplaySettlementSummary {
+    let unmerged_pairable_qty = if pair_asset_ids.len() == 2 {
+        pairable_qty(positions, &pair_asset_ids)
+    } else {
+        0.0
+    };
+    let mut stranded_inventory = Vec::new();
+    let mut stranded_qty_total = 0.0;
+    let mut stranded_cost_usd = 0.0;
+    let mut redeemed_winning_qty = 0.0;
+    let mut expired_losing_qty = 0.0;
+
+    for (asset_id, pos) in positions {
+        if pos.qty <= f64::EPSILON {
+            continue;
+        }
+        let cost_basis = pos.qty * pos.avg_cost;
+        let role = match winner_asset_id {
+            Some(winner) if winner == asset_id => {
+                redeemed_winning_qty += pos.qty;
+                "winner"
+            }
+            Some(_) => {
+                expired_losing_qty += pos.qty;
+                "loser"
+            }
+            None => "unresolved",
+        };
+        stranded_qty_total += pos.qty;
+        stranded_cost_usd += cost_basis;
+        stranded_inventory.push(ReplaySettlementAssetInventory {
+            asset_id: asset_id.clone(),
+            qty: pos.qty,
+            cost_basis_usd: cost_basis,
+            role: role.to_string(),
+        });
+    }
+
+    let merge_attempted_count = merge_events.len() as u64;
+    let merge_success_count = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Success)
+        .count() as u64;
+    let merge_reverted_count = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Reverted)
+        .count() as u64;
+    let status = if pair_asset_ids.len() != 2 {
+        "no_binary_pair_detected"
+    } else if pairable_qty_before_resolution <= f64::EPSILON && stranded_qty_total <= f64::EPSILON {
+        "flat"
+    } else if merge_reverted_count > 0 {
+        "merge_reverted"
+    } else if pairable_qty_before_resolution > f64::EPSILON && merged_pair_qty <= f64::EPSILON {
+        "merge_opportunity_unexecuted"
+    } else if unmerged_pairable_qty > f64::EPSILON {
+        "partially_merged"
+    } else if merged_pair_qty > f64::EPSILON {
+        "merged"
+    } else {
+        "unpaired_inventory"
+    };
+
+    ReplaySettlementSummary {
+        pair_asset_ids,
+        merge_attempted_count,
+        merge_success_count,
+        merge_reverted_count,
+        merged_pair_qty,
+        merge_credit_usd: merged_pair_qty,
+        pairable_qty_before_resolution,
+        unmerged_pairable_qty,
+        redeemed_winning_qty,
+        expired_losing_qty,
+        stranded_qty_total,
+        stranded_cost_usd,
+        stranded_inventory,
+        status: status.to_string(),
+    }
+}
+
+fn replay_merge_events(events: &[Event]) -> Vec<ReplayMergeEvent> {
+    events
+        .iter()
+        .filter(|event| raw_kind_is(event, "merge"))
+        .map(|event| ReplayMergeEvent {
+            size: parse_event_size(event).unwrap_or(0.0),
+            status: parse_merge_status(event),
+        })
+        .collect()
+}
+
+fn raw_kind_is(event: &Event, expected: &str) -> bool {
+    ["type", "event_type", "action", "kind"]
+        .iter()
+        .filter_map(|key| event.raw.get(*key).and_then(|v| v.as_str()))
+        .any(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn parse_event_size(event: &Event) -> Option<f64> {
+    event
+        .size
+        .as_deref()
+        .and_then(|value| parse_price(Some(value)))
+        .or_else(|| parse_raw_f64(&event.raw, &["size", "amount", "qty", "shares"]))
+}
+
+fn parse_raw_f64(raw: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        let Some(value) = raw.get(*key) else {
+            continue;
+        };
+        if let Some(number) = value.as_f64() {
+            if number.is_finite() {
+                return Some(number);
+            }
+        }
+        if let Some(text) = value.as_str().and_then(|value| parse_price(Some(value))) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn parse_merge_status(event: &Event) -> ReplayMergeStatus {
+    let status = ["status", "state", "tx_status"]
+        .iter()
+        .filter_map(|key| event.raw.get(*key).and_then(|v| v.as_str()))
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "confirmed" | "mined" | "success" | "succeeded" | "settled" => ReplayMergeStatus::Success,
+        "reverted" | "failed" | "failure" | "error" => ReplayMergeStatus::Reverted,
+        _ => ReplayMergeStatus::PendingOrUnknown,
+    }
+}
+
+fn compute_queue_calibration(
+    submissions: &[SimulatedOrderSubmission],
+    fills: &[SimulatedFill],
+) -> ReplayQueueCalibrationSummary {
+    let mut filled_by_order: BTreeMap<String, (f64, u64)> = BTreeMap::new();
+    for fill in fills {
+        let entry = filled_by_order
+            .entry(fill.client_order_id.clone())
+            .or_insert((0.0, fill.fill_ms));
+        entry.0 += fill.size;
+        if fill.fill_ms < entry.1 {
+            entry.1 = fill.fill_ms;
+        }
+    }
+
+    let mut seconds_to_first_fill = Vec::new();
+    let mut same_side_depth = Vec::new();
+    let mut queue_position_fraction = Vec::new();
+    let mut filled_orders = 0u64;
+    let mut partial_fills = 0u64;
+
+    for submission in submissions {
+        same_side_depth.push(submission.book_depth_at_rest);
+        if submission.size > 0.0 {
+            queue_position_fraction
+                .push((submission.book_depth_at_rest / submission.size).clamp(0.0, 1.0));
+        }
+        let (filled_size, first_fill_ms) = filled_by_order
+            .get(&submission.client_order_id)
+            .copied()
+            .unwrap_or((0.0, 0));
+        if filled_size > 0.0 {
+            filled_orders += 1;
+            if filled_size + f64::EPSILON < submission.size {
+                partial_fills += 1;
+            }
+            if first_fill_ms >= submission.arrival_ms {
+                seconds_to_first_fill
+                    .push((first_fill_ms - submission.arrival_ms) as f64 / 1_000.0);
+            }
+        }
+    }
+
+    let sample_size = submissions.len() as u64;
+    ReplayQueueCalibrationSummary {
+        sample_size,
+        filled_orders,
+        fill_rate: if sample_size > 0 {
+            filled_orders as f64 / sample_size as f64
+        } else {
+            0.0
+        },
+        partial_fill_rate: if filled_orders > 0 {
+            partial_fills as f64 / filled_orders as f64
+        } else {
+            0.0
+        },
+        median_seconds_to_first_fill: median_f64(seconds_to_first_fill),
+        median_same_side_depth_at_entry: median_f64(same_side_depth),
+        median_estimated_queue_position_fraction: median_f64(queue_position_fraction),
+    }
+}
+
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|v| v.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
     }
 }
 
@@ -549,7 +1030,7 @@ mod tests {
     use serde_json::json;
 
     use crate::collector::schema::{EventType, Source};
-    use crate::replay::fill_sim::{LatencyPreset, Side};
+    use crate::replay::fill_sim::{FillQuality, LatencyPreset, Side};
 
     fn evt(
         received_ns: i64,
@@ -677,6 +1158,35 @@ mod tests {
         }
     }
 
+    struct DelayedPassiveAskStrategy {
+        seen_events: u32,
+    }
+
+    impl ReplayStrategy for DelayedPassiveAskStrategy {
+        fn on_event(&mut self, event: &Event) -> ReplayDecision {
+            self.seen_events += 1;
+            if self.seen_events == 2 {
+                return ReplayDecision {
+                    submits: vec![StrategyOrderIntent::passive(
+                        "delayed-ask-1",
+                        "asset-a",
+                        Side::Sell,
+                        0.55,
+                        10.0,
+                        (event.received_ns / 1_000_000) as u64,
+                    )],
+                    cancels: vec![],
+                    risk_rejections: vec![],
+                };
+            }
+            ReplayDecision::default()
+        }
+
+        fn on_fill(&mut self, _fill: &SimulatedFill) -> ReplayDecision {
+            ReplayDecision::default()
+        }
+    }
+
     #[test]
     fn run_window_executes_event_loop_and_collects_fills() {
         let events = vec![
@@ -726,6 +1236,84 @@ mod tests {
         assert_eq!(strategy.on_fill_count, 2);
         assert_eq!(summary.events_replayed, 3);
         assert_eq!(summary.intents_submitted, 1);
+        assert_eq!(summary.queue_calibration.sample_size, 1);
+        assert_eq!(summary.queue_calibration.filled_orders, 1);
+        assert_eq!(summary.queue_calibration.fill_rate, 1.0);
+        assert_eq!(
+            summary.queue_calibration.median_same_side_depth_at_entry,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn run_window_reports_submission_samples_and_queue_calibration() {
+        let events = vec![
+            evt(
+                1_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "sell",
+                "0.55",
+                "20",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::BookDelta,
+                "asset-a",
+                "sell",
+                "0.55",
+                "20",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "25",
+            ),
+        ];
+        let cfg = RunnerConfig {
+            window_id: "w-queue".into(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                fill_quality: FillQuality::Base,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+        let mut strategy = DelayedPassiveAskStrategy { seen_events: 0 };
+
+        let summary = run_window(&mut strategy, &events, &cfg);
+
+        assert_eq!(summary.status, WindowStatus::Ok);
+        assert_eq!(summary.submitted_order_samples.len(), 1);
+        assert_eq!(
+            summary.submitted_order_samples[0].client_order_id,
+            "delayed-ask-1"
+        );
+        assert_eq!(summary.submitted_order_samples[0].book_depth_at_rest, 20.0);
+        assert_eq!(summary.queue_calibration.sample_size, 1);
+        assert_eq!(summary.queue_calibration.filled_orders, 1);
+        assert_eq!(summary.queue_calibration.fill_rate, 1.0);
+        assert_eq!(summary.queue_calibration.partial_fill_rate, 1.0);
+        assert_eq!(
+            summary.queue_calibration.median_seconds_to_first_fill,
+            Some(1.0)
+        );
+        assert_eq!(
+            summary.queue_calibration.median_same_side_depth_at_entry,
+            Some(20.0)
+        );
+        assert_eq!(
+            summary
+                .queue_calibration
+                .median_estimated_queue_position_fraction,
+            Some(1.0)
+        );
+        assert_eq!(summary.fills.len(), 1);
+        assert_eq!(summary.fills[0].size, 5.0);
     }
 
     #[test]

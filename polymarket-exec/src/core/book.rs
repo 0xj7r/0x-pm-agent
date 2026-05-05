@@ -600,8 +600,6 @@ mod tests {
         assert_eq!(s.classify_trade(f64::NAN), None);
     }
 
-    // ---- prune correctness ----
-
     #[test]
     fn record_trade_drops_silently_when_book_unset() {
         let mut s = LegFlowState::default();
