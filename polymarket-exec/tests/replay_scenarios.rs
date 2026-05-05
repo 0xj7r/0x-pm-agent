@@ -51,9 +51,12 @@ fn run(events: &[Event], profile: StrategyProfile, fill_quality: FillQuality) ->
             latency: LatencyPreset::Nominal,
             fill_quality,
             seed: 0xC0FFEE,
+            submit_latency_ms: None,
+            cancel_latency_ms: None,
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
+        starting_cash_usd: 1_000.0,
     };
     let mut adapter = ReplayStrategyAdapter::from_profile(profile);
     run_window(&mut adapter, events, &cfg)
@@ -300,9 +303,12 @@ fn synthesizer_injects_price_to_beat_into_stream() {
             latency: LatencyPreset::Nominal,
             fill_quality: FillQuality::Base,
             seed: 0xC0FFEE,
+            submit_latency_ms: None,
+            cancel_latency_ms: None,
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
+        starting_cash_usd: 1_000.0,
     };
     let mut recorder = EventRecorder { seen: Vec::new() };
     let summary = run_window(&mut recorder, &events, &cfg);

@@ -16,7 +16,10 @@ use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel};
 use crate::strategies::pair_cost_arb::PairCostArbStrategy;
 use crate::strategies::paired_mm::PairedMmStrategy;
-use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
+use crate::strategies::traits::{
+    PairedOpenOrderExposure, StrategyFillInput, StrategyInput, StrategyOpenOrderSnapshot,
+    TradingStrategy,
+};
 pub use crate::strategy_profile::*;
 use crate::types::{
     EpochMillis, FillReport, InstrumentId, IntentKind, MarketId, MarketLedgerState, MarketSnapshot,
@@ -157,6 +160,7 @@ pub struct StrategyContext {
     pub now_ms: EpochMillis,
     pub runtime_status: RuntimeStatus,
     pub inventory: InventorySnapshot,
+    pub open_orders: Vec<StrategyOpenOrderSnapshot>,
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
     pub market_ledger_state: MarketLedgerState,
@@ -404,6 +408,8 @@ impl HybridStrategy {
         };
         let inventory =
             paired_inventory_from_context(&context.inventory, market_id, &yes_id, &no_id);
+        let open_convex_order_exposure =
+            paired_convex_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id);
         let pair_cost = PairCostTracker::from_inventory(&inventory);
         let fair_value = fair_value_from_context(context, &market, self.momentum_weight);
         let order_book_pressure =
@@ -412,6 +418,7 @@ impl HybridStrategy {
             market,
             snapshot,
             inventory,
+            open_convex_order_exposure,
             pair_cost,
             fair_value,
             btc_regime: context.btc_regime.clone(),
@@ -763,6 +770,38 @@ fn paired_inventory_from_context(
         }
     }
     paired
+}
+
+fn paired_convex_open_order_exposure(
+    open_orders: &[StrategyOpenOrderSnapshot],
+    market_id: &MarketId,
+    yes_id: &InstrumentId,
+    no_id: &InstrumentId,
+) -> PairedOpenOrderExposure {
+    let mut exposure = PairedOpenOrderExposure::default();
+    for order in open_orders.iter().filter(|order| {
+        &order.market_id == market_id
+            && order.side == crate::types::TradeSide::Buy
+            && !order.reduce_only
+            && order.remaining_qty > 1e-9
+            && order
+                .quote_level_tag
+                .as_deref()
+                .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+                == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+    }) {
+        let notional = order.limit_price.max(0.0) * order.remaining_qty.max(0.0);
+        if &order.instrument_id == yes_id {
+            exposure.yes_qty += order.remaining_qty.max(0.0);
+            exposure.yes_notional_usd += notional;
+            exposure.yes_count += 1;
+        } else if &order.instrument_id == no_id {
+            exposure.no_qty += order.remaining_qty.max(0.0);
+            exposure.no_notional_usd += notional;
+            exposure.no_count += 1;
+        }
+    }
+    exposure
 }
 
 fn fair_value_from_context(

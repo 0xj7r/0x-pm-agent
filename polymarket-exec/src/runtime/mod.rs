@@ -13,6 +13,7 @@ pub mod order_store;
 mod paper_fill;
 pub mod reconcile;
 pub mod runner;
+pub mod state_store;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
@@ -64,6 +65,9 @@ pub struct Runtime<S: Strategy> {
     quote_engine_config: QuoteEngineConfig,
     quote_stale_ms: u64,
     min_merge_notional_usd: f64,
+    merge_free_cash_pressure_ratio: f64,
+    merge_gross_exposure_pressure_ratio: f64,
+    merge_market_exposure_pressure_usd: f64,
     btc_signals: BtcSignalStore,
     market_activity: HashMap<InstrumentId, GateMarketActivitySignal>,
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
@@ -162,6 +166,11 @@ impl<S: Strategy> Runtime<S> {
             quote_engine_config: config.quote_engine_config,
             quote_stale_ms: config.quote_stale_ms,
             min_merge_notional_usd: config.min_merge_notional_usd.max(0.0),
+            merge_free_cash_pressure_ratio: config.merge_free_cash_pressure_ratio.max(0.0),
+            merge_gross_exposure_pressure_ratio: config
+                .merge_gross_exposure_pressure_ratio
+                .max(0.0),
+            merge_market_exposure_pressure_usd: config.merge_market_exposure_pressure_usd.max(0.0),
             btc_signals: BtcSignalStore::default(),
             market_activity: HashMap::new(),
             first_fill_by_market: HashMap::new(),
@@ -930,24 +939,59 @@ impl<S: Strategy> Runtime<S> {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
 
-        // Dust/noise gate: keep this profile-driven. Polygon merge fees are
-        // negligible for us, so tiny-live and paper should be able to recycle
-        // very small paired inventory while production can still avoid dust.
+        let merge_pressure_reason = self.merge_pressure_reason(market_id);
+
+        // Batch tiny completed pairs unless recycling pressure is real. This
+        // keeps paired-MM closer to the observed whale shape: broad laddering
+        // plus batched merge/redeem, with immediate merge reserved for capital
+        // pressure or inventory pressure.
         if intent.expected_cash_usd + 1e-9 < self.min_merge_notional_usd {
+            if let Some(pressure_reason) = merge_pressure_reason.as_ref() {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge batching bypassed: paired notional ${:.4} below batch threshold ${:.4}; pressure={pressure_reason}",
+                                intent.expected_cash_usd, self.min_merge_notional_usd
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+            } else {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge batched: paired notional ${:.4} below batch threshold ${:.4}; no capital/inventory pressure",
+                                intent.expected_cash_usd, self.min_merge_notional_usd
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+        }
+
+        if intent.expected_cash_usd + 1e-9 >= self.min_merge_notional_usd {
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         now_ms,
                         format!(
-                            "merge skipped: paired notional ${:.4} below min merge notional ${:.4}",
+                            "merge batch threshold met: paired notional ${:.4} threshold ${:.4}",
                             intent.expected_cash_usd, self.min_merge_notional_usd
                         ),
                     )
                     .with_market(market_id.clone()),
                 ),
             );
-            return outcome;
         }
 
         let signature = MergeSignature::from_intent(&intent);
@@ -1033,6 +1077,47 @@ impl<S: Strategy> Runtime<S> {
         );
         outcome.push_command(RuntimeCommand::Merge(intent));
         outcome
+    }
+
+    fn merge_pressure_reason(&self, market_id: &MarketId) -> Option<String> {
+        let starting_cash = self.starting_cash_usd.max(0.0);
+        let free_cash_pressure_ratio = self.merge_free_cash_pressure_ratio;
+        let free_cash = self.inventory.free_cash_usd();
+        if starting_cash > 0.0
+            && free_cash_pressure_ratio > 0.0
+            && free_cash <= starting_cash * free_cash_pressure_ratio
+        {
+            let threshold = starting_cash * free_cash_pressure_ratio;
+            return Some(format!(
+                "free_cash_low free_cash={free_cash:.4} threshold={:.4}",
+                threshold
+            ));
+        }
+
+        let gross_exposure = self.inventory.gross_exposure_usd();
+        let gross_exposure_pressure_ratio = self.merge_gross_exposure_pressure_ratio;
+        if starting_cash > 0.0
+            && gross_exposure_pressure_ratio > 0.0
+            && gross_exposure >= starting_cash * gross_exposure_pressure_ratio
+        {
+            let threshold = starting_cash * gross_exposure_pressure_ratio;
+            return Some(format!(
+                "gross_inventory_high gross_exposure={gross_exposure:.4} threshold={:.4}",
+                threshold
+            ));
+        }
+
+        let net_market_exposure = self.inventory.net_exposure_for_market_usd(market_id).abs();
+        let market_exposure_pressure_usd = self.merge_market_exposure_pressure_usd;
+        if market_exposure_pressure_usd > 0.0 && net_market_exposure >= market_exposure_pressure_usd
+        {
+            return Some(format!(
+                "market_imbalance_high net_market_exposure={net_market_exposure:.4} threshold={:.4}",
+                market_exposure_pressure_usd
+            ));
+        }
+
+        None
     }
 
     fn inventory_merge_intent(
@@ -2933,6 +3018,25 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             runtime_status: self.status,
             inventory: self.inventory.snapshot(),
+            open_orders: self
+                .open_orders
+                .values()
+                .filter(|managed| {
+                    !managed.status.is_terminal()
+                        && market_id.is_none_or(|id| &managed.intent.market_id == id)
+                })
+                .map(
+                    |managed| crate::strategies::traits::StrategyOpenOrderSnapshot {
+                        market_id: managed.intent.market_id.clone(),
+                        instrument_id: managed.intent.instrument_id.clone(),
+                        side: managed.intent.side,
+                        limit_price: managed.intent.limit_price,
+                        remaining_qty: managed.remaining_qty(),
+                        reduce_only: managed.intent.reduce_only,
+                        quote_level_tag: managed.intent.quote_level_tag.clone(),
+                    },
+                )
+                .collect(),
             open_orders_total: self.open_orders.len(),
             open_orders_for_market: market_id
                 .map(|id| self.open_orders_for_market(id))

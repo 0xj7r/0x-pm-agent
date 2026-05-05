@@ -13,6 +13,7 @@ use crate::market_making::pairing::types::{
 use crate::markets::MarketDescriptor;
 use crate::signals::{
     BtcRegime, BtcRegimeSnapshot, FairValueEstimate, FairValueModel, IncentiveSignal,
+    MomentumSignal, OrderBookPressureSignal, SignalDirection,
 };
 use crate::types::{ClientOrderId, EpochMillis, IntentKind, MmQuoteKind, OrderIntent, TradeSide};
 
@@ -51,6 +52,9 @@ pub struct LadderConfig {
     pub caps: RunningInventoryCaps,
     pub incentives: IncentiveSignal,
     pub fair_value_anchoring: FairValueAnchoringConfig,
+    pub aligned_signal_clip_boost: f64,
+    pub adverse_signal_clip_cut: f64,
+    pub max_signal_clip_scale: f64,
 }
 
 impl Default for LadderConfig {
@@ -74,6 +78,9 @@ impl Default for LadderConfig {
             caps: RunningInventoryCaps::default(),
             incentives: IncentiveSignal::default(),
             fair_value_anchoring: FairValueAnchoringConfig::default(),
+            aligned_signal_clip_boost: 0.35,
+            adverse_signal_clip_cut: 0.25,
+            max_signal_clip_scale: 1.60,
         }
     }
 }
@@ -88,6 +95,8 @@ pub struct LadderDiagnostics {
     pub base_clip_usd: f64,
     pub suppressed_yes: bool,
     pub suppressed_no: bool,
+    pub yes_signal_scale: f64,
+    pub no_signal_scale: f64,
     pub notes: Vec<String>,
 }
 
@@ -103,6 +112,8 @@ pub fn build_ladder<M: MarketDescriptor>(
     inventory: &PairedInventorySnapshot,
     fair_value: &FairValueEstimate,
     btc_regime: &BtcRegimeSnapshot,
+    momentum: &MomentumSignal,
+    order_book_pressure: &OrderBookPressureSignal,
     pair_cost: &PairCostTracker,
     config: &LadderConfig,
     now_ms: EpochMillis,
@@ -160,6 +171,9 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
+    let yes_signal_scale =
+        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
+    let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
@@ -175,7 +189,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             yes_reservation,
             depth,
             spacing_ticks,
-            base_clip_usd,
+            base_clip_usd * yes_signal_scale,
             suppress_yes,
             config,
             now_ms,
@@ -188,7 +202,7 @@ pub fn build_ladder<M: MarketDescriptor>(
             no_reservation,
             depth,
             spacing_ticks,
-            base_clip_usd,
+            base_clip_usd * no_signal_scale,
             suppress_no,
             config,
             now_ms,
@@ -201,6 +215,7 @@ pub fn build_ladder<M: MarketDescriptor>(
         interleave_leg_ladders(&mut intents, yes_intents, no_intents);
     }
 
+    let intents = aggregate_collapsed_ladder_levels(intents, market.min_order_size());
     let (intents, risk_rejects) = filter_entry_intents(inventory, intents, &config.caps);
     for reject in risk_rejects {
         notes.push(reject.note);
@@ -217,8 +232,61 @@ pub fn build_ladder<M: MarketDescriptor>(
             base_clip_usd,
             suppressed_yes: suppress_yes,
             suppressed_no: suppress_no,
+            yes_signal_scale,
+            no_signal_scale,
             notes,
         },
+    }
+}
+
+fn signal_clip_scale(
+    leg: LadderLeg,
+    momentum: &MomentumSignal,
+    pressure: &OrderBookPressureSignal,
+    config: &LadderConfig,
+) -> f64 {
+    let mut scale = 1.0;
+
+    match signal_direction_for_leg(leg) {
+        direction if direction == momentum.direction => {
+            scale += config.aligned_signal_clip_boost * momentum.strength.clamp(0.0, 1.0);
+        }
+        _ if momentum.direction != SignalDirection::Neutral => {
+            scale -= config.adverse_signal_clip_cut * momentum.strength.clamp(0.0, 1.0);
+        }
+        _ => {}
+    }
+
+    match pressure.pressure_leg() {
+        Some(pressure_leg) if pressure_leg == leg => {
+            scale += config.aligned_signal_clip_boost * pressure.imbalance.abs().clamp(0.0, 1.0);
+        }
+        Some(_) => {
+            scale -= config.adverse_signal_clip_cut * pressure.imbalance.abs().clamp(0.0, 1.0);
+        }
+        None => {}
+    }
+
+    if let Some(acceleration_bps) = momentum.acceleration_bps {
+        let acceleration_strength = (acceleration_bps.abs() / 10.0).clamp(0.0, 1.0);
+        match signal_direction_for_leg(leg) {
+            direction if direction == SignalDirection::from_signed(acceleration_bps, 0.5) => {
+                scale += 0.15 * acceleration_strength;
+            }
+            _ if acceleration_strength > 0.0 => {
+                scale -= 0.10 * acceleration_strength;
+            }
+            _ => {}
+        }
+    }
+
+    scale.clamp(0.35, config.max_signal_clip_scale.max(0.35))
+}
+
+fn signal_direction_for_leg(leg: LadderLeg) -> SignalDirection {
+    match leg {
+        LadderLeg::Yes => SignalDirection::Up,
+        LadderLeg::No => SignalDirection::Down,
     }
 }
 
@@ -455,6 +523,45 @@ fn interleave_leg_ladders(
     }
 }
 
+fn aggregate_collapsed_ladder_levels(
+    intents: Vec<OrderIntent>,
+    min_order_size: f64,
+) -> Vec<OrderIntent> {
+    let mut aggregated: Vec<OrderIntent> = Vec::with_capacity(intents.len());
+    for intent in intents {
+        if let Some(existing) = aggregated.iter_mut().find(|existing| {
+            existing.instrument_id == intent.instrument_id
+                && existing.side == intent.side
+                && (existing.limit_price - intent.limit_price).abs() < 1e-9
+                && existing.kind == intent.kind
+                && existing.reduce_only == intent.reduce_only
+        }) {
+            let old_tag = existing.quote_level_tag.clone().unwrap_or_default();
+            let new_tag = intent.quote_level_tag.clone().unwrap_or_default();
+            existing.quantity += intent.quantity;
+            existing.reason = format!(
+                "{}; aggregated collapsed ladder level: {}",
+                existing.reason, intent.reason
+            );
+            existing.quote_level_tag = Some(if old_tag.is_empty() {
+                new_tag
+            } else if new_tag.is_empty() {
+                old_tag
+            } else {
+                format!("{old_tag}+{new_tag}")
+            });
+            existing.pair_id = None;
+        } else {
+            aggregated.push(intent);
+        }
+    }
+
+    aggregated
+        .into_iter()
+        .filter(|intent| intent.quantity + 1e-9 >= min_order_size.max(0.0))
+        .collect()
+}
+
 fn normalize_paired_entry_quantities(
     yes_intents: &mut Vec<OrderIntent>,
     no_intents: &mut Vec<OrderIntent>,
@@ -610,6 +717,8 @@ mod tests {
                 return_180s_bps: Some(1.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::from_inventory(&inventory),
             &config,
             0,
@@ -644,6 +753,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -681,6 +792,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 max_depth: 2,
@@ -740,6 +853,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -771,6 +886,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -813,6 +930,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -857,6 +976,8 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 stoikov: StoikovParams {

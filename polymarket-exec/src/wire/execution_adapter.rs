@@ -229,6 +229,18 @@ impl ExecutionAdapter for PaperExecutionAdapter {
         })
     }
 
+    async fn redeem_positions(
+        &self,
+        req: RedeemPositionsRequest,
+    ) -> Result<RedeemPositionsAck, ExecutionError> {
+        Ok(RedeemPositionsAck {
+            command_id: req.command_id,
+            accepted: true,
+            accepted_at_ms: req.submitted_at_ms,
+            venue_message: Some("paper adapter redeem accepted".to_string()),
+        })
+    }
+
     async fn sync_open_orders(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
         Ok(Vec::new())
     }

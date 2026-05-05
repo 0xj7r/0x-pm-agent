@@ -27,6 +27,7 @@ use arrow::array::{
     UInt32Array,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde::Deserialize;
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -43,6 +44,53 @@ type DedupKey = (
     Option<i64>,
     i64,
 );
+
+#[derive(Debug, Deserialize)]
+struct EventHeader {
+    v: u32,
+    ts_ns: i64,
+    received_ns: i64,
+    event_type: EventType,
+    market_type: String,
+    market_slug: Option<String>,
+    asset_id: Option<String>,
+    side: Option<String>,
+    price: Option<String>,
+    size: Option<String>,
+    sequence: Option<i64>,
+    source: Source,
+}
+
+impl EventHeader {
+    fn into_event(self, raw: Value) -> Event {
+        Event {
+            v: self.v,
+            ts_ns: self.ts_ns,
+            received_ns: self.received_ns,
+            event_type: self.event_type,
+            market_type: self.market_type,
+            market_slug: self.market_slug,
+            asset_id: self.asset_id,
+            side: self.side,
+            price: self.price,
+            size: self.size,
+            sequence: self.sequence,
+            source: self.source,
+            raw,
+        }
+    }
+}
+
+fn replay_requires_raw(event_type: EventType) -> bool {
+    matches!(
+        event_type,
+        EventType::MarketMeta
+            | EventType::PriceToBeat
+            | EventType::Resolution
+            | EventType::UserFill
+            | EventType::UserOrder
+    )
+}
 
 fn dedup_key(e: &Event) -> DedupKey {
     (
@@ -169,6 +217,7 @@ fn record_batch_to_events(batch: &arrow::record_batch::RecordBatch) -> Result<Ve
             .context("received_ns column required")?;
         let event_type_str =
             string_at(batch, event_type_col, row).context("event_type value required")?;
+        let event_type = parse_event_type(&event_type_str)?;
         let market_type =
             string_at(batch, market_type_col, row).context("market_type value required")?;
         let market_slug = market_slug_col.and_then(|i| string_at(batch, i, row));
@@ -186,22 +235,26 @@ fn record_batch_to_events(batch: &arrow::record_batch::RecordBatch) -> Result<Ve
                 }
             });
         let source_str = string_at(batch, source_col, row).context("source value required")?;
-        let raw = raw_col
-            .and_then(|i| {
-                if let Some(s) = string_at(batch, i, row) {
-                    Some(s)
-                } else {
-                    bytes_at(batch, i, row).map(|b| String::from_utf8_lossy(&b).into_owned())
-                }
-            })
-            .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))
-            .unwrap_or(Value::Null);
+        let raw = if replay_requires_raw(event_type) {
+            raw_col
+                .and_then(|i| {
+                    if let Some(s) = string_at(batch, i, row) {
+                        Some(s)
+                    } else {
+                        bytes_at(batch, i, row).map(|b| String::from_utf8_lossy(&b).into_owned())
+                    }
+                })
+                .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        };
 
         events.push(Event {
             v,
             ts_ns,
             received_ns,
-            event_type: parse_event_type(&event_type_str)?,
+            event_type,
             market_type,
             market_slug,
             asset_id,
@@ -293,10 +346,21 @@ pub fn read_jsonl_file(path: &Path) -> Result<Vec<Event>> {
         if trimmed.is_empty() {
             continue;
         }
-        let event: Event = serde_json::from_str(trimmed).with_context(|| {
+        let header: EventHeader = serde_json::from_str(trimmed).with_context(|| {
             format!("failed to parse jsonl {} line {}", path.display(), idx + 1)
         })?;
-        events.push(event);
+        if replay_requires_raw(header.event_type) {
+            let event: Event = serde_json::from_str(trimmed).with_context(|| {
+                format!(
+                    "failed to parse raw jsonl {} line {}",
+                    path.display(),
+                    idx + 1
+                )
+            })?;
+            events.push(event);
+        } else {
+            events.push(header.into_event(Value::Null));
+        }
     }
     Ok(events)
 }
@@ -495,6 +559,70 @@ mod tests {
         let read = read_jsonl_file(&path).unwrap();
         assert_eq!(read.len(), 2);
         assert_eq!(read[0].sequence, Some(1));
+    }
+
+    #[test]
+    fn jsonl_reader_skips_raw_for_high_volume_replay_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.jsonl");
+        let mut event = make_event(100, "x", 1, EventType::BookSnapshot);
+        event.raw = json!({
+            "book": {
+                "bids": [{"price": "0.50", "size": "100"}],
+                "asks": [{"price": "0.51", "size": "100"}]
+            }
+        });
+        write_jsonl_file(&path, &[event]).unwrap();
+
+        let read = read_jsonl_file(&path).unwrap();
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].event_type, EventType::BookSnapshot);
+        assert_eq!(read[0].raw, Value::Null);
+    }
+
+    #[test]
+    fn jsonl_reader_preserves_raw_for_market_meta() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("meta.jsonl");
+        let mut event = make_event(100, "x", 1, EventType::MarketMeta);
+        event.raw = json!({
+            "asset_ids": ["up-token", "down-token"],
+            "strike": 100000.0,
+            "end_time_ms": 1_777_788_300_000i64
+        });
+        write_jsonl_file(&path, &[event]).unwrap();
+
+        let read = read_jsonl_file(&path).unwrap();
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0]
+                .raw
+                .get("asset_ids")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            read[0].raw.get("end_time_ms").and_then(|v| v.as_i64()),
+            Some(1_777_788_300_000i64)
+        );
+    }
+
+    #[test]
+    fn parquet_reader_skips_raw_for_high_volume_replay_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("evts.parquet");
+        let mut event = make_event(100, "x", 1, EventType::Trade);
+        event.raw = json!({"large_raw_payload": [{"n": 1}, {"n": 2}]});
+        write_parquet_file(&path, &[event]).unwrap();
+
+        let read = read_parquet_file(&path).unwrap();
+
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].event_type, EventType::Trade);
+        assert_eq!(read[0].raw, Value::Null);
     }
 
     #[test]

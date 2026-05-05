@@ -907,6 +907,199 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
 }
 
 #[test]
+fn plan_merge_bypasses_tiny_threshold_under_free_cash_pressure() {
+    let market_id = MarketId::from("market-mm");
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 5.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 2.0,
+            merge_free_cash_pressure_ratio: 0.95,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            price: 0.10,
+            quantity: 1.50,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 10,
+        })
+        .expect("up leg");
+    let second_outcome = runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            price: 0.10,
+            quantity: 1.50,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 11,
+        })
+        .expect("down leg");
+
+    assert_eq!(
+        second_outcome.commands.len(),
+        1,
+        "free-cash-pressure should trigger immediate merge planning on fill path"
+    );
+
+    assert!(
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("merge batching bypassed")),
+        "expected pressure bypass logging when free cash is low"
+    );
+}
+
+#[test]
+fn plan_merge_bypasses_tiny_threshold_under_gross_exposure_pressure() {
+    let market_id = MarketId::from("market-mm");
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 50.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 6.0,
+            merge_free_cash_pressure_ratio: 0.0,
+            merge_gross_exposure_pressure_ratio: 0.02,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            price: 1.0,
+            quantity: 2.75,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 10,
+        })
+        .expect("up leg");
+    let second_outcome = runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            price: 1.0,
+            quantity: 2.75,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 11,
+        })
+        .expect("down leg");
+
+    assert_eq!(
+        second_outcome.commands.len(),
+        1,
+        "gross exposure pressure should trigger immediate merge planning on fill path"
+    );
+
+    assert!(
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("gross_inventory_high")),
+        "expected gross exposure pressure logging"
+    );
+}
+
+#[test]
+fn plan_merge_bypasses_tiny_threshold_under_market_imbalance_pressure() {
+    let market_id = MarketId::from("market-mm");
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 6.0,
+            merge_free_cash_pressure_ratio: 0.0,
+            merge_gross_exposure_pressure_ratio: 0.0,
+            merge_market_exposure_pressure_usd: 1.5,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("up"),
+            side: TradeSide::Buy,
+            price: 1.0,
+            quantity: 3.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 10,
+        })
+        .expect("up leg");
+    let second_outcome = runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: None,
+            market_id: market_id.clone(),
+            instrument_id: InstrumentId::from("down"),
+            side: TradeSide::Buy,
+            price: 1.0,
+            quantity: 1.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 11,
+        })
+        .expect("down leg");
+
+    assert_eq!(
+        second_outcome.commands.len(),
+        1,
+        "market imbalance pressure should trigger immediate merge planning on fill path"
+    );
+
+    assert!(
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("market_imbalance_high")),
+        "expected market imbalance pressure logging"
+    );
+}
+
+#[test]
 fn blocked_merge_waits_for_inventory_change_not_timer_backoff() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(

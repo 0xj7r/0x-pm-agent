@@ -106,6 +106,39 @@ impl QuoteMatchKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CollapsedQuoteKey {
+    market_id: crate::types::MarketId,
+    instrument_id: crate::types::InstrumentId,
+    side: crate::types::TradeSide,
+    reduce_only: bool,
+    price_ticks: i64,
+    pair_id: Option<String>,
+    kind: crate::types::IntentKind,
+}
+
+impl CollapsedQuoteKey {
+    fn from_intent(intent: &OrderIntent) -> Self {
+        Self {
+            market_id: intent.market_id.clone(),
+            instrument_id: intent.instrument_id.clone(),
+            side: intent.side,
+            reduce_only: intent.reduce_only,
+            price_ticks: price_to_ticks(intent.limit_price),
+            pair_id: intent.pair_id.clone(),
+            kind: intent.kind,
+        }
+    }
+}
+
+fn price_to_ticks(price: f64) -> i64 {
+    (price * 1_000_000.0).round() as i64
+}
+
+fn ticks_to_price(ticks: i64) -> f64 {
+    ticks as f64 / 1_000_000.0
+}
+
 #[derive(Clone, Debug)]
 pub struct QuoteReconciler {
     config: ReconcilerConfig,
@@ -342,7 +375,67 @@ impl QuoteReconciler {
             value.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         }
 
-        let desired_quotes = desired.quotes;
+        let mut seen_desired_keys: HashSet<QuoteMatchKey> = HashSet::new();
+        let mut deduped_desired_quotes = Vec::with_capacity(desired.quotes.len());
+        let mut duplicate_desired_quotes = 0usize;
+        for desired_quote in desired.quotes {
+            let key = QuoteMatchKey::from_intent(&desired_quote.intent);
+            if seen_desired_keys.insert(key) {
+                deduped_desired_quotes.push(desired_quote);
+            } else {
+                duplicate_desired_quotes += 1;
+            }
+        }
+        if duplicate_desired_quotes > 0 {
+            plan.notes.push(format!(
+                "dropped {duplicate_desired_quotes} duplicate desired quote(s)"
+            ));
+        }
+
+        let mut collapsed_desired_quotes: Vec<crate::quote_engine::DesiredQuote> =
+            Vec::with_capacity(deduped_desired_quotes.len());
+        let mut collapsed_index: HashMap<CollapsedQuoteKey, usize> = HashMap::new();
+        let mut collapsed_desired_quote_count = 0usize;
+        for desired_quote in deduped_desired_quotes {
+            let key = CollapsedQuoteKey::from_intent(&desired_quote.intent);
+            if let Some(index) = collapsed_index.get(&key).copied() {
+                let existing = &mut collapsed_desired_quotes[index];
+                existing.intent.quantity += desired_quote.intent.quantity;
+                existing.intent.limit_price = ticks_to_price(key.price_ticks);
+                existing.intent.reason = format!(
+                    "{}; aggregated collapsed ladder level {}",
+                    existing.intent.reason,
+                    desired_quote
+                        .intent
+                        .quote_level_tag
+                        .as_deref()
+                        .unwrap_or("untagged")
+                );
+                let existing_tag = existing.intent.quote_level_tag.clone().unwrap_or_default();
+                if let Some(tag) = desired_quote.intent.quote_level_tag {
+                    existing.intent.quote_level_tag = if existing_tag.is_empty() {
+                        Some(tag)
+                    } else if existing_tag.split('+').any(|part| part == tag) {
+                        Some(existing_tag)
+                    } else {
+                        Some(format!("{existing_tag}+{tag}"))
+                    };
+                }
+                collapsed_desired_quote_count += 1;
+            } else {
+                let mut desired_quote = desired_quote;
+                desired_quote.intent.limit_price = ticks_to_price(key.price_ticks);
+                collapsed_index.insert(key, collapsed_desired_quotes.len());
+                collapsed_desired_quotes.push(desired_quote);
+            }
+        }
+        if collapsed_desired_quote_count > 0 {
+            plan.notes.push(format!(
+                "aggregated {collapsed_desired_quote_count} collapsed same-price ladder quote(s)"
+            ));
+        }
+        let desired_quotes = collapsed_desired_quotes;
+
         let mut desired_pair_counts: HashMap<String, usize> = HashMap::new();
         let mut missing_pair_submit_counts: HashMap<String, usize> = HashMap::new();
         for desired_quote in &desired_quotes {
@@ -729,6 +822,115 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("submit rate cap reached")));
+    }
+
+    #[test]
+    fn quote_reconciler_dedupes_duplicate_desired_quote_slots() {
+        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
+            min_order_age_ms: 0,
+            max_churn_per_window: 16,
+            churn_window_ms: 10_000,
+            hard_pull_ms: 5_000,
+            max_submit_per_window: 6,
+            max_replace_per_window: 4,
+            max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
+        });
+        let mut duplicate = intent("duplicate", 0.22);
+        duplicate.quote_level_tag = Some("lvl-1".to_string());
+        let desired = crate::quote_engine::DesiredQuoteSet {
+            quotes: vec![
+                crate::quote_engine::DesiredQuote {
+                    intent: intent("new", 0.22),
+                    level: 0,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                },
+                crate::quote_engine::DesiredQuote {
+                    intent: duplicate,
+                    level: 0,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                },
+            ],
+            stale_quote_max_age_ms: None,
+            quote_expiry_ms: None,
+        };
+
+        let plan = reconciler.plan(desired, &HashMap::new(), 2);
+
+        assert_eq!(plan.actions.len(), 1);
+        assert!(matches!(plan.actions[0], QuoteAction::Submit(_)));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("dropped 1 duplicate desired quote")));
+    }
+
+    #[test]
+    fn quote_reconciler_aggregates_ladder_children_collapsed_to_same_price() {
+        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
+            min_order_age_ms: 0,
+            max_churn_per_window: 16,
+            churn_window_ms: 10_000,
+            hard_pull_ms: 5_000,
+            max_submit_per_window: 6,
+            max_replace_per_window: 4,
+            max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
+        });
+        let mut l1 = intent("l1", 0.43);
+        l1.quantity = 18.18;
+        l1.quote_level_tag = Some("l1".to_string());
+        let mut l2 = intent("l2", 0.43);
+        l2.quantity = 18.60;
+        l2.quote_level_tag = Some("l2".to_string());
+        let mut l3 = intent("l3", 0.43);
+        l3.quantity = 18.60;
+        l3.quote_level_tag = Some("l3".to_string());
+        let desired = crate::quote_engine::DesiredQuoteSet {
+            quotes: vec![
+                crate::quote_engine::DesiredQuote {
+                    intent: l1,
+                    level: 0,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                },
+                crate::quote_engine::DesiredQuote {
+                    intent: l2,
+                    level: 1,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                },
+                crate::quote_engine::DesiredQuote {
+                    intent: l3,
+                    level: 2,
+                    is_cleanup: false,
+                    suppress_if_stale: false,
+                    expires_at_ms: None,
+                },
+            ],
+            stale_quote_max_age_ms: None,
+            quote_expiry_ms: None,
+        };
+
+        let plan = reconciler.plan(desired, &HashMap::new(), 2);
+
+        assert_eq!(plan.actions.len(), 1);
+        let QuoteAction::Submit(intent) = &plan.actions[0] else {
+            panic!("expected one aggregated submit");
+        };
+        assert_eq!(intent.limit_price, 0.43);
+        assert!((intent.quantity - 55.38).abs() < 1e-9);
+        assert_eq!(intent.quote_level_tag.as_deref(), Some("l1+l2+l3"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("aggregated 2 collapsed same-price ladder quote")));
     }
 
     #[test]

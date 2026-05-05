@@ -470,6 +470,8 @@ pub async fn replay_runtime_from_snapshots(
     )
     .map_err(anyhow::Error::msg)?;
     let replay_taker_fee_coeff = strategy.taker_fee_coeff();
+    let pair_profile = config.strategy_profile.as_ref().map(|profile| &profile.pair);
+    let runtime_defaults = crate::runtime::types::RuntimeConfig::default();
     let mut runtime = crate::runtime::Runtime::new(
         crate::runtime::types::RuntimeConfig {
             starting_cash_usd: config.starting_cash_usd,
@@ -482,7 +484,16 @@ pub async fn replay_runtime_from_snapshots(
                 .strategy_profile
                 .as_ref()
                 .and_then(|profile| profile.pair.min_merge_notional_usd)
-                .unwrap_or_default(),
+                .unwrap_or(runtime_defaults.min_merge_notional_usd),
+            merge_free_cash_pressure_ratio: pair_profile
+                .and_then(|pair| pair.merge_pressure_free_cash_ratio)
+                .unwrap_or(runtime_defaults.merge_free_cash_pressure_ratio),
+            merge_gross_exposure_pressure_ratio: pair_profile
+                .and_then(|pair| pair.merge_pressure_gross_exposure_ratio)
+                .unwrap_or(runtime_defaults.merge_gross_exposure_pressure_ratio),
+            merge_market_exposure_pressure_usd: pair_profile
+                .and_then(|pair| pair.merge_market_exposure_pressure_usd)
+                .unwrap_or(runtime_defaults.merge_market_exposure_pressure_usd),
         },
         config.risk_limits.clone(),
         strategy,

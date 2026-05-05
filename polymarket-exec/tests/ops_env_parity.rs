@@ -39,7 +39,7 @@ fn btc_5m_hybrid_env_example_matches_active_strategy_contract() {
     let values = parse_env_example(&raw);
     assert_eq!(
         values.get("PM_BTC_5M_STRATEGY").map(String::as_str),
-        Some("pair_cost_arb,paired_mm")
+        Some("paired_mm")
     );
     assert_eq!(
         values.get("PM_BTC_5M_PAPER_MODE").map(String::as_str),
@@ -90,7 +90,7 @@ fn btc_5m_tinylive_env_example_has_live_safety_and_no_secrets() {
     let values = parse_env_example(&raw);
     assert_eq!(
         values.get("PM_BTC_5M_STRATEGY").map(String::as_str),
-        Some("pair_cost_arb,paired_mm")
+        Some("paired_mm")
     );
     assert_eq!(
         values.get("PM_BTC_5M_PAPER_MODE").map(String::as_str),
