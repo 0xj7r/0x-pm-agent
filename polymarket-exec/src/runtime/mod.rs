@@ -2652,12 +2652,18 @@ impl<S: Strategy> Runtime<S> {
             .collect()
     }
 
+    /// An entry intent that belongs to an atomic multi-leg group.
+    ///
+    /// Membership is signalled by `pair_id`: producers (paired-MM ladder,
+    /// late-convex package) set the same `pair_id` on every leg of the group
+    /// so the runtime can suppress submission of an incomplete group and
+    /// cancel the mate when one leg is rejected.
+    ///
+    /// This deliberately does NOT inspect `quote_level_tag` — the tag is for
+    /// reporting/attribution; atomicity is a structural property of the
+    /// intent, not a string convention.
     fn is_paired_entry_intent(intent: &OrderIntent) -> bool {
-        intent.kind == crate::types::IntentKind::Entry
-            && intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
+        intent.kind == crate::types::IntentKind::Entry && intent.pair_id.is_some()
     }
 
     fn accept_intent(&mut self, mut intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {

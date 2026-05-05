@@ -552,6 +552,11 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         });
 
     if let Some((plan, tail_limit_price, tail_best_ask)) = maybe_package_plan {
+        // Bind both legs to the same pair_id so the runtime treats the package
+        // as atomic. If one side fails or partially fills, the mate-cancel
+        // path at runtime/mod.rs:1991 unwinds the other leg before it can
+        // strand inventory.
+        let package_pair_id = format!("convex-package:{}:{}", market.market_id(), now_ms);
         let mut intents = Vec::with_capacity(2);
         let mut favorite_intent = OrderIntent::new_buy(
             ClientOrderId::from(format!(
@@ -583,6 +588,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             MmQuoteKind::ConvexAccumulation
         ));
         favorite_intent.kind = IntentKind::Entry;
+        favorite_intent.pair_id = Some(package_pair_id.clone());
         intents.push(favorite_intent);
 
         let mut tail_intent = OrderIntent::new_buy(
@@ -614,6 +620,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             MmQuoteKind::ConvexAccumulation
         ));
         tail_intent.kind = IntentKind::Entry;
+        tail_intent.pair_id = Some(package_pair_id);
         intents.push(tail_intent);
 
         return intents;
@@ -1088,6 +1095,57 @@ mod tests {
         );
         assert!(plan.tail_payoff_multiple >= 20.0);
         assert!(plan.pnl_if_tail >= 10.0);
+    }
+
+    #[test]
+    fn late_convex_package_legs_share_pair_id() {
+        let mut config = package_config();
+        config.enabled = true;
+        config.fractional_kelly = 0.06;
+        config.max_loss_usd = 40.0;
+        config.min_tail_payoff_multiple = 20.0;
+        config.min_tail_win_profit_usd = 10.0;
+
+        let market = late_market();
+        let snapshot = late_snapshot();
+        let fair_value = FairValueEstimate {
+            p_up: 0.985,
+            p_down: 0.015,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.0,
+            time_remaining_s: 50.0,
+            model: crate::signals::FairValueModel::NoSignal(
+                crate::signals::fair_value::NoSignalReason::SpotInvalid,
+            ),
+        };
+        let intents = choose_convex_overlay(
+            &market,
+            &snapshot,
+            &PairedInventorySnapshot::default(),
+            &PairedOpenOrderExposure::default(),
+            &fair_value,
+            &BtcRegimeSnapshot::default(),
+            &OrderBookPressureSignal::default(),
+            config,
+            250_000,
+        );
+        assert_eq!(
+            intents.len(),
+            2,
+            "late asymmetric package fires both favorite and tail legs"
+        );
+        let favorite_pair_id = intents[0]
+            .pair_id
+            .as_ref()
+            .expect("favorite leg must carry a pair_id so the runtime atomicity guard fires");
+        let tail_pair_id = intents[1]
+            .pair_id
+            .as_ref()
+            .expect("tail leg must carry a pair_id so the runtime atomicity guard fires");
+        assert_eq!(
+            favorite_pair_id, tail_pair_id,
+            "both legs share the same pair_id so they are treated as one atomic group"
+        );
     }
 
     #[test]
