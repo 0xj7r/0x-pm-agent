@@ -4,6 +4,8 @@
 //! with regime, visible book depth, time-to-bar-end, and inventory imbalance.
 //! It is pure: no venue calls, no state mutation, no runtime side effects.
 
+use std::collections::HashSet;
+
 use crate::market_making::paired_mm::risk_boundary::filter_entry_intents;
 use crate::market_making::paired_mm::stoikov::{stoikov_reservation_price, StoikovParams};
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
@@ -171,8 +173,7 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
-    let yes_signal_scale =
-        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
+    let yes_signal_scale = signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
     let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
@@ -442,6 +443,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
         LadderLeg::No => "no",
     };
 
+    let mut last_emitted_price: Option<f64> = None;
     for level in 0..depth {
         let multiplier = config
             .level_multipliers
@@ -459,6 +461,13 @@ fn append_leg_ladder<M: MarketDescriptor>(
         if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
             continue;
         }
+        // Levels collapse onto the previous price when reservation is on the
+        // far side of the maker_bid_cap. Stop emitting further levels — they
+        // would all land at the same price and submitting duplicates breaks
+        // the per-level pair_id atomicity contract with the cross-leg mate.
+        if last_emitted_price.is_some_and(|prev| (prev - limit_price).abs() < 1e-9) {
+            break;
+        }
         let clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
         let reward_qty = config.incentives.min_reward_quantity().unwrap_or(0.0);
         let quantity = (clip_usd / limit_price.max(tick_size))
@@ -468,6 +477,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
             continue;
         }
 
+        last_emitted_price = Some(limit_price);
         intents.push(OrderIntent {
             client_order_id: ClientOrderId::from(format!(
                 "paired-mm:{}:{}:l{}:{}",
@@ -523,11 +533,21 @@ fn interleave_leg_ladders(
     }
 }
 
+/// Aggregate intents that collapsed onto the same price tick within a single leg.
+///
+/// Used for ad-hoc / non-paired intents where merging duplicates is desirable.
+/// Paired-MM ladder intents are now deduplicated at append time
+/// (see `append_leg_ladder`) so their pair_id stays intact; this function is
+/// kept for code paths that produce same-price duplicates without pair_ids.
 fn aggregate_collapsed_ladder_levels(
     intents: Vec<OrderIntent>,
     min_order_size: f64,
 ) -> Vec<OrderIntent> {
     let mut aggregated: Vec<OrderIntent> = Vec::with_capacity(intents.len());
+    // pair_ids whose mate was aggregated away. The surviving aggregate
+    // carries pair_id = None and the cross-leg mate is left without an
+    // atomic counterpart, so we drop it.
+    let mut orphaned_pair_ids: HashSet<String> = HashSet::new();
     for intent in intents {
         if let Some(existing) = aggregated.iter_mut().find(|existing| {
             existing.instrument_id == intent.instrument_id
@@ -550,7 +570,12 @@ fn aggregate_collapsed_ladder_levels(
             } else {
                 format!("{old_tag}+{new_tag}")
             });
-            existing.pair_id = None;
+            if let Some(pair_id) = existing.pair_id.take() {
+                orphaned_pair_ids.insert(pair_id);
+            }
+            if let Some(pair_id) = intent.pair_id {
+                orphaned_pair_ids.insert(pair_id);
+            }
         } else {
             aggregated.push(intent);
         }
@@ -559,6 +584,12 @@ fn aggregate_collapsed_ladder_levels(
     aggregated
         .into_iter()
         .filter(|intent| intent.quantity + 1e-9 >= min_order_size.max(0.0))
+        .filter(|intent| {
+            intent
+                .pair_id
+                .as_ref()
+                .is_none_or(|pair_id| !orphaned_pair_ids.contains(pair_id))
+        })
         .collect()
 }
 

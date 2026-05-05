@@ -1,4 +1,4 @@
-//! Deterministic golden-fixture replay test 
+//! Deterministic golden-fixture replay test
 //!
 //! Generates a 50-event canonical fixture, writes it to a temp directory as
 //! Parquet + JSONL, reads both back through the replay reader, runs the
