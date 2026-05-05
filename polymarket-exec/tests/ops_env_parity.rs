@@ -73,9 +73,9 @@ fn btc_5m_hybrid_env_example_matches_active_strategy_contract() {
 }
 
 #[test]
-fn btc_5m_tinylive_env_example_has_live_safety_and_no_secrets() {
+fn btc_5m_mm_tinylive_env_example_has_live_safety_and_no_secrets() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let env_path = manifest_dir.join("ops/env/btc_5m_tinylive.env.example");
+    let env_path = manifest_dir.join("ops/env/btc_5m_mm_tinylive.env.example");
     let raw = std::fs::read_to_string(&env_path).expect("tiny-live env should be readable");
 
     assert!(
@@ -113,6 +113,22 @@ fn btc_5m_tinylive_env_example_has_live_safety_and_no_secrets() {
             .is_some_and(|value| value.contains("telonex")),
         "tiny-live example should document Telonex as the preferred Polygon RPC provider"
     );
+    for yaml_owned_cap in [
+        "PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD",
+        "PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD",
+        "PM_BTC_5M_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
+        "PM_BTC_5M_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
+        "PM_BTC_5M_EXEC_MIN_FREE_CASH_USD",
+        "PM_BTC_5M_EXEC_MIN_FREE_CASH_BPS",
+        "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_BPS",
+        "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL",
+        "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+    ] {
+        assert!(
+            !values.contains_key(yaml_owned_cap),
+            "{yaml_owned_cap} must stay YAML-owned in tinylive; leave env overrides commented"
+        );
+    }
 
     let profile_paths = values
         .get("PM_BTC_5M_STRATEGY_PROFILE_PATHS")
