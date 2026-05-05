@@ -1081,6 +1081,7 @@ mod tests {
                 ..Default::default()
             },
             max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
         };
         let summary = run_window(&mut adapter, &events, &cfg);
         assert_eq!(summary.status, WindowStatus::Ok);

@@ -128,6 +128,7 @@ fn replay_with(events: &[Event]) -> Vec<SimulatedFill> {
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
+        starting_cash_usd: 1_000.0,
     };
     let mut s = PassiveAsk { placed: false };
     let summary = run_window(&mut s, events, &cfg);
@@ -372,6 +373,7 @@ fn run_paired_mm_window(events: &[Event]) -> polymarket_exec::replay::runner::Wi
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: 0,
+        starting_cash_usd: 1_000.0,
     };
     let mut adapter = ReplayStrategyAdapter::from_profile(profile);
     run_window(&mut adapter, events, &cfg)

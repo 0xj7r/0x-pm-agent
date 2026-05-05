@@ -108,6 +108,10 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     max_window_failures: usize,
 
+    /// Starting cash used for replay accounting/equity output.
+    #[arg(long, default_value_t = 1_000.0)]
+    starting_cash_usd: f64,
+
     /// Plan + manifest only, skip replay.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -274,6 +278,7 @@ fn run_main(cli: Cli) -> Result<i32> {
             cancel_credit_fraction: 0.5,
         },
         max_window_failures: cli.max_window_failures,
+        starting_cash_usd: cli.starting_cash_usd,
     };
 
     // Load profile and instantiate the strategy adapter for each window.
