@@ -683,6 +683,7 @@ mod tests {
                 equity_usd: 50.0,
                 ..Default::default()
             },
+            open_convex_order_exposure: Default::default(),
             pair_cost: PairCostTracker::default(),
             fair_value: FairValueEstimate {
                 p_up: 0.92,

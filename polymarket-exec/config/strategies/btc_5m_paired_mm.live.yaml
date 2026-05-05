@@ -8,16 +8,16 @@ strategy: paired_mm
 
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
-  levels_per_side: 3
-  base_clip_usd: 3.00
+  levels_per_side: 12
+  base_clip_usd: 1.50
   min_clip_usd: 0.50
-  max_clip_usd: 8.0
+  max_clip_usd: 5.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
   min_top_depth_notional_usd: 3.0
   min_order_notional_usd: 0.50
-  entry_ladder_levels: 3
+  entry_ladder_levels: 12
   entry_ladder_spacing_ticks: 1.0
   maker_safety_ticks: 2.0
   venue_min_order_quantity: 5.0
@@ -33,35 +33,56 @@ fair_value:
 
 # ── Inventory & Risk Limits ─────────────────────────────────────
 inventory:
-  max_gross_notional_usd: 45.0
-  max_net_notional_per_market_usd: 20.0
+  # Inventory knobs are intentionally looser than legacy values to avoid
+  # artificial stranding pressure in fast close-out windows while retaining hard
+  # safety rails for 5m sleeves.
+  max_gross_notional_usd: 75.0
+  max_net_notional_per_market_usd: 35.0
   max_order_notional_usd: 8.0
-  max_position_quantity_per_instrument: 75.0
-  max_open_orders_total: 18
-  max_open_orders_per_market: 8
-  max_stranded_leg_usd: 20.0
-  max_gross_cost_usd: 45.0
-  max_leg_cost_usd: 20.0
-  max_side_imbalance_qty: 20.0
+  max_position_quantity_per_instrument: 150.0
+  max_open_orders_total: 40
+  max_open_orders_per_market: 24
+  max_stranded_leg_usd: 28.0
+  max_gross_cost_usd: 75.0
+  max_leg_cost_usd: 32.0
+  max_side_imbalance_qty: 45.0
 
 # ── Convexity Overlay ───────────────────────────────────────────
-# Late-window winner-side tilt is a separate, labelled path from paired entry.
-# It is intentionally small while live attribution is still being validated.
+# Late-window Bonereaper-style package: buy both sides, load more notional
+# into the model-favoured leg, and accumulate many cheap-tail shares when
+# the opposite leg collapses. EV is logged but not a hard gate because the
+# short-horizon model is weakest exactly where the convex payoff is largest.
 convexity_overlay:
   enabled: true
+  suppress_ladder_when_package_fires: true
+  start_frac: 0.60
   capital_pct: 0.10
+  fractional_kelly: 0.15
+  max_loss_usd: 40.0
+  max_book_take_pct: 0.20
+  min_order_usd: 0.25
+  max_active_orders_per_leg: 3
   late_window_sec: 120
   convex_p_threshold: 0.72
-  max_excess_usd: 40.0
-  clip_usd: 3.0
-  allow_extra_clip_on_winner: true
   maker_safety_ticks: 2.0
+  min_favorite_edge_bps: 25
+  tail_enabled: true
+  max_favorite_win_loss_usd: 10.00
+  min_tail_win_profit_usd: 10.00
+  min_tail_payoff_multiple: 20.00
 
 # ── Pair / Merge Recycling ─────────────────────────────────────
-# Polygon merge fees are negligible for our setup; keep this low so tiny-live
-# and paper validate the intended merge-first capital recycling path.
+# Batch tiny completed pairs by default; runtime bypasses this threshold and
+# merges immediately when free cash is low or gross/market inventory is high.
 pair:
-  min_merge_notional_usd: 0.10
+  # Batch noisy tiny pairs by default, but keep immediate-recycle as a safety valve.
+  min_merge_notional_usd: 12.00
+  # Immediate merge when free cash is scarce or gross exposure is high.
+  merge_pressure_free_cash_ratio: 0.15
+  merge_pressure_gross_exposure_ratio: 0.50
+  # Market-level imbalance pressure threshold before forcing immediate merge.
+  # Set to 1.0 here to require clear one-way inventory before bypassing batching.
+  merge_market_exposure_pressure_usd: 1.0
 
 # ── Rescue / Merge Logic ────────────────────────────────────────
 rescue:

@@ -36,7 +36,7 @@ pub struct StrategyProfile {
     pub convexity_overlay: ConvexityOverlaySection,
     pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
-    pub hybrid_mm: HybridMmSection,
+    pub hybrid_mm: HybridMmSection, 
     pub rescue: RescueSection,
     pub operational: OperationalSection,
     #[serde(flatten)]
@@ -282,6 +282,40 @@ impl StrategyProfile {
                 .convexity_overlay
                 .enabled
                 .unwrap_or(config.convexity_overlay.enabled),
+            suppress_ladder_when_package_fires: self
+                .convexity_overlay
+                .suppress_ladder_when_package_fires
+                .unwrap_or(config.convexity_overlay.suppress_ladder_when_package_fires),
+            start_frac: self
+                .convexity_overlay
+                .start_frac
+                .unwrap_or(config.convexity_overlay.start_frac),
+            capital_pct: self
+                .convexity_overlay
+                .capital_pct
+                .unwrap_or(config.convexity_overlay.capital_pct),
+            fractional_kelly: self
+                .convexity_overlay
+                .fractional_kelly
+                .unwrap_or(config.convexity_overlay.fractional_kelly),
+            max_loss_usd: self
+                .convexity_overlay
+                .max_loss_usd
+                .or(self.convexity_overlay.max_excess_usd)
+                .or(self.convexity.max_excess_usd)
+                .unwrap_or(config.convexity_overlay.max_loss_usd),
+            max_book_take_pct: self
+                .convexity_overlay
+                .max_book_take_pct
+                .unwrap_or(config.convexity_overlay.max_book_take_pct),
+            min_order_usd: self
+                .convexity_overlay
+                .min_order_usd
+                .unwrap_or(config.convexity_overlay.min_order_usd),
+            max_active_orders_per_leg: self
+                .convexity_overlay
+                .max_active_orders_per_leg
+                .unwrap_or(config.convexity_overlay.max_active_orders_per_leg),
             late_window_sec: self
                 .convexity_overlay
                 .late_window_sec
@@ -292,21 +326,31 @@ impl StrategyProfile {
                 .convex_p_threshold
                 .or(self.convexity.convex_p_threshold)
                 .unwrap_or(config.convexity_overlay.convex_p_threshold),
-            max_excess_usd: self
-                .convexity_overlay
-                .max_excess_usd
-                .or(self.convexity.max_excess_usd)
-                .unwrap_or(config.convexity_overlay.max_excess_usd),
-            clip_usd: self
-                .convexity_overlay
-                .clip_usd
-                .or(self.quote.base_clip_usd)
-                .unwrap_or(config.convexity_overlay.clip_usd),
             maker_safety_ticks: self
                 .convexity_overlay
                 .maker_safety_ticks
                 .or(self.quote.maker_safety_ticks)
                 .unwrap_or(config.convexity_overlay.maker_safety_ticks),
+            min_favorite_edge_bps: self
+                .convexity_overlay
+                .min_favorite_edge_bps
+                .unwrap_or(config.convexity_overlay.min_favorite_edge_bps),
+            tail_enabled: self
+                .convexity_overlay
+                .tail_enabled
+                .unwrap_or(config.convexity_overlay.tail_enabled),
+            max_favorite_win_loss_usd: self
+                .convexity_overlay
+                .max_favorite_win_loss_usd
+                .unwrap_or(config.convexity_overlay.max_favorite_win_loss_usd),
+            min_tail_win_profit_usd: self
+                .convexity_overlay
+                .min_tail_win_profit_usd
+                .unwrap_or(config.convexity_overlay.min_tail_win_profit_usd),
+            min_tail_payoff_multiple: self
+                .convexity_overlay
+                .min_tail_payoff_multiple
+                .unwrap_or(config.convexity_overlay.min_tail_payoff_multiple),
         };
         config
     }
@@ -320,6 +364,9 @@ impl StrategyProfile {
             .unwrap_or(config.max_depth)
             .max(1);
         config.min_depth = config.min_depth.min(config.max_depth);
+        config.low_vol_depth = config.max_depth;
+        config.high_vol_depth = config.high_vol_depth.min(config.max_depth);
+        config.late_bar_depth = config.late_bar_depth.min(config.max_depth);
         config.normal_spacing_ticks = self
             .quote
             .entry_ladder_spacing_ticks
@@ -491,6 +538,9 @@ pub struct ProfileRisk {
 #[serde(default)]
 pub struct ProfilePair {
     pub min_merge_notional_usd: Option<f64>,
+    pub merge_pressure_free_cash_ratio: Option<f64>,
+    pub merge_pressure_gross_exposure_ratio: Option<f64>,
+    pub merge_market_exposure_pressure_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -539,13 +589,24 @@ pub struct ConvexitySection {
 #[serde(default)]
 pub struct ConvexityOverlaySection {
     pub enabled: Option<bool>,
+    pub suppress_ladder_when_package_fires: Option<bool>,
+    pub start_frac: Option<f64>,
     pub capital_pct: Option<f64>,
+    pub fractional_kelly: Option<f64>,
+    pub max_loss_usd: Option<f64>,
+    pub max_book_take_pct: Option<f64>,
+    pub min_order_usd: Option<f64>,
+    pub max_active_orders_per_leg: Option<usize>,
     pub late_window_sec: Option<u64>,
     pub convex_p_threshold: Option<f64>,
     pub max_excess_usd: Option<f64>,
-    pub clip_usd: Option<f64>,
     pub allow_extra_clip_on_winner: Option<bool>,
     pub maker_safety_ticks: Option<f64>,
+    pub min_favorite_edge_bps: Option<f64>,
+    pub tail_enabled: Option<bool>,
+    pub max_favorite_win_loss_usd: Option<f64>,
+    pub min_tail_win_profit_usd: Option<f64>,
+    pub min_tail_payoff_multiple: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

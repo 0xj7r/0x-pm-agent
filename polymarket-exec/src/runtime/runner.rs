@@ -618,6 +618,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();
+    let pair_profile = config
+        .strategy_profile
+        .as_ref()
+        .map(|profile| &profile.pair);
+    let runtime_defaults = crate::runtime::types::RuntimeConfig::default();
     let order_store = config
         .order_store_path
         .as_ref()
@@ -647,7 +652,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .strategy_profile
                 .as_ref()
                 .and_then(|profile| profile.pair.min_merge_notional_usd)
-                .unwrap_or_default(),
+                .unwrap_or(runtime_defaults.min_merge_notional_usd),
+            merge_free_cash_pressure_ratio: pair_profile
+                .and_then(|pair| pair.merge_pressure_free_cash_ratio)
+                .unwrap_or(runtime_defaults.merge_free_cash_pressure_ratio),
+            merge_gross_exposure_pressure_ratio: pair_profile
+                .and_then(|pair| pair.merge_pressure_gross_exposure_ratio)
+                .unwrap_or(runtime_defaults.merge_gross_exposure_pressure_ratio),
+            merge_market_exposure_pressure_usd: pair_profile
+                .and_then(|pair| pair.merge_market_exposure_pressure_usd)
+                .unwrap_or(runtime_defaults.merge_market_exposure_pressure_usd),
         },
         config.risk_limits.clone(),
         strategy,
@@ -2741,12 +2755,75 @@ async fn execute_execution_adapter(
                 }
             }
             RuntimeCommand::Redeem(intent) => {
-                warn!(
-                    mode = if execution_policy.paper_mode { "paper" } else { "live" },
-                    market_id = %intent.market_id,
-                    command_id = %intent.command_id,
-                    "redeem command planned but relayer submission is not implemented"
-                );
+                let Some(condition_id) = intent.condition_id.clone() else {
+                    warn!(
+                        mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                        market_id = %intent.market_id,
+                        command_id = %intent.command_id,
+                        "redeem command skipped: missing condition_id"
+                    );
+                    continue;
+                };
+                let request = RedeemPositionsRequest {
+                    command_id: intent.command_id.clone(),
+                    market_id: intent.market_id.clone(),
+                    condition_id,
+                    collateral_token_address: None,
+                    index_sets: vec![1, 2],
+                    submitted_at_ms: observed_at_ms,
+                };
+                match execution_adapter.redeem_positions(request).await {
+                    Ok(ack) if ack.accepted => {
+                        info!(
+                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                            market_id = %intent.market_id,
+                            command_id = %intent.command_id,
+                            message = ?ack.venue_message,
+                            "redeem command accepted by execution adapter"
+                        );
+                        if !execution_policy.paper_mode {
+                            let report = sync_execution_state(
+                                execution_adapter.as_ref(),
+                                runtime,
+                                execution_venue_map,
+                                execution_policy,
+                                seen_venue_fill_keys,
+                                ack.accepted_at_ms,
+                            )
+                            .await;
+                            let sync_outcome = apply_sync_report(
+                                runtime,
+                                metrics,
+                                live_safety,
+                                execution_policy,
+                                market_assets,
+                                report,
+                                ack.accepted_at_ms,
+                                execution_adapter.as_ref(),
+                            )
+                            .await;
+                            stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
+                        }
+                    }
+                    Ok(ack) => {
+                        warn!(
+                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                            market_id = %intent.market_id,
+                            command_id = %intent.command_id,
+                            reason = ?ack.venue_message,
+                            "redeem command rejected by execution adapter"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                            market_id = %intent.market_id,
+                            command_id = %intent.command_id,
+                            error = %error,
+                            "redeem command failed"
+                        );
+                    }
+                }
             }
             RuntimeCommand::Noop => {}
         }

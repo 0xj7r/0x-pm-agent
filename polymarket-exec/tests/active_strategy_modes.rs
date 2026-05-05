@@ -96,6 +96,7 @@ fn context(
         now_ms,
         runtime_status: RuntimeStatus::Running,
         inventory,
+        open_orders: Vec::new(),
         open_orders_total: 0,
         open_orders_for_market: 0,
         market_ledger_state: MarketLedgerState::Flat,

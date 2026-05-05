@@ -16,6 +16,9 @@ pub struct RuntimeConfig {
     pub quote_stale_ms: u64,
     pub require_initial_reconcile_before_entry: bool,
     pub min_merge_notional_usd: f64,
+    pub merge_free_cash_pressure_ratio: f64,
+    pub merge_gross_exposure_pressure_ratio: f64,
+    pub merge_market_exposure_pressure_usd: f64,
 }
 
 impl Default for RuntimeConfig {
@@ -28,6 +31,9 @@ impl Default for RuntimeConfig {
             quote_stale_ms: 10_000,
             require_initial_reconcile_before_entry: false,
             min_merge_notional_usd: 0.0,
+            merge_free_cash_pressure_ratio: 0.15,
+            merge_gross_exposure_pressure_ratio: 0.50,
+            merge_market_exposure_pressure_usd: 1.0,
         }
     }
 }
