@@ -1,8 +1,10 @@
-//! Shared runtime state-store seam for order lifecycle state.
+//! Replay runtime state-store seam for order lifecycle state.
 //!
-//! Live trading and replay both need a source of truth for working orders.
-//! The durable `OrderStore` persists records; this module owns the in-memory
-//! runtime shape consumed by quote reconciliation, risk context, and replay.
+//! Live trading currently owns working orders in `Runtime::open_orders` and
+//! persists them through the durable `OrderStore`; do not treat this module as
+//! the live source of truth until the runtime is explicitly migrated onto this
+//! trait. Replay uses this seam to share the same `ManagedOrder` shape with
+//! quote reconciliation and risk-context construction.
 
 use std::collections::HashMap;
 

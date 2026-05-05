@@ -40,6 +40,9 @@ inventory:
   max_net_notional_per_market_usd: 35.0
   max_order_notional_usd: 8.0
   max_position_quantity_per_instrument: 150.0
+  min_free_cash_usd: 5.0
+  min_free_cash_bps: 1000.0
+  max_session_loss_bps: 2500.0
   max_open_orders_total: 40
   max_open_orders_per_market: 24
   max_stranded_leg_usd: 28.0
