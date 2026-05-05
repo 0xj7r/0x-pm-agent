@@ -414,6 +414,32 @@ impl MmQuoteKind {
             None
         }
     }
+
+    /// Stable label used by attribution dashboards and reports. The strings
+    /// are part of the metrics contract — do not rename without updating
+    /// downstream tooling.
+    pub fn attribution_bucket(self) -> &'static str {
+        match self {
+            Self::PairedEntry => "paired_ladder",
+            Self::ConvexAccumulation => "convex_accum",
+            Self::CapitalRecycle => "capital_recycle",
+            Self::HedgeRescue => "hedge_rescue",
+            Self::ReduceOnlyExit => "reduce_cleanup",
+            Self::LateBarCore => "other_submit",
+        }
+    }
+}
+
+/// Classify a `quote_level_tag` into the attribution bucket label used
+/// by `runtime::attribution` and `paper::report`. Empty tags map to
+/// `untagged_submit`, unknown tags to `other_submit`.
+pub fn classify_quote_level_tag_for_attribution(tag: &str) -> &'static str {
+    if tag.is_empty() {
+        return "untagged_submit";
+    }
+    MmQuoteKind::from_quote_level_tag(tag)
+        .map(MmQuoteKind::attribution_bucket)
+        .unwrap_or("other_submit")
 }
 
 /// Scope of a strategy suppression.
