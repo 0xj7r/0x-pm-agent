@@ -160,6 +160,22 @@ fn parse_market_filter(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn event_matches_market_filter(event: &Event, market_filter: &[String]) -> bool {
+    market_filter.is_empty()
+        || market_filter.contains(&event.market_type)
+        || event.market_type == "btc_ref"
+        || event.market_type == "reference"
+}
+
+fn target_window_market_types(event: &Event, market_filter: &[String]) -> Vec<String> {
+    if (event.market_type == "btc_ref" || event.market_type == "reference")
+        && !market_filter.is_empty()
+    {
+        return market_filter.to_vec();
+    }
+    vec![event.market_type.clone()]
+}
+
 fn run_main(cli: Cli) -> Result<i32> {
     // Validate CLI inputs.
     let _start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
@@ -197,7 +213,7 @@ fn run_main(cli: Cli) -> Result<i32> {
     let market_filter = parse_market_filter(&cli.market_filter);
     let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
     for e in events {
-        if !market_filter.is_empty() && !market_filter.contains(&e.market_type) {
+        if !event_matches_market_filter(&e, &market_filter) {
             continue;
         }
         let dt = chrono::Utc
@@ -205,8 +221,10 @@ fn run_main(cli: Cli) -> Result<i32> {
             .single()
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "1970-01-01".to_string());
-        let window_id = format!("{}/{}", e.market_type, dt);
-        windows.entry(window_id).or_default().push(e);
+        for market_type in target_window_market_types(&e, &market_filter) {
+            let window_id = format!("{market_type}/{dt}");
+            windows.entry(window_id).or_default().push(e.clone());
+        }
     }
 
     // Build window plan in deterministic order.
@@ -347,5 +365,55 @@ fn main() -> ExitCode {
                 ExitCode::from(5)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use polymarket_exec::collector::schema::{EventType, Source};
+    use serde_json::json;
+
+    fn event(market_type: &str) -> Event {
+        Event {
+            v: 1,
+            ts_ns: 1,
+            received_ns: 1,
+            event_type: EventType::Heartbeat,
+            market_type: market_type.to_string(),
+            market_slug: None,
+            asset_id: None,
+            side: None,
+            price: None,
+            size: None,
+            sequence: Some(1),
+            source: Source::Collector,
+            raw: json!({}),
+        }
+    }
+
+    #[test]
+    fn market_filter_keeps_reference_ticks_for_selected_crypto_market() {
+        let filter = vec!["btc_5m".to_string()];
+
+        assert!(event_matches_market_filter(&event("btc_5m"), &filter));
+        assert!(event_matches_market_filter(&event("btc_ref"), &filter));
+        assert!(event_matches_market_filter(&event("reference"), &filter));
+        assert!(!event_matches_market_filter(&event("eth_5m"), &filter));
+    }
+
+    #[test]
+    fn reference_ticks_are_grouped_into_selected_market_windows() {
+        let filter = vec!["btc_5m".to_string()];
+
+        assert_eq!(
+            target_window_market_types(&event("btc_ref"), &filter),
+            vec!["btc_5m".to_string()]
+        );
+        assert_eq!(
+            target_window_market_types(&event("reference"), &filter),
+            vec!["btc_5m".to_string()]
+        );
     }
 }
