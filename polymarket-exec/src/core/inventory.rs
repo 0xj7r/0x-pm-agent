@@ -815,13 +815,14 @@ impl InventoryState {
         let mut remove_after = false;
         let cost_basis_usd;
         {
-            let entry = self.positions.get_mut(instrument_id).ok_or_else(|| {
-                InventoryError::Oversell {
-                    instrument_id: instrument_id.clone(),
-                    available_qty: 0.0,
-                    attempted_qty: settled_qty,
-                }
-            })?;
+            let entry =
+                self.positions
+                    .get_mut(instrument_id)
+                    .ok_or_else(|| InventoryError::Oversell {
+                        instrument_id: instrument_id.clone(),
+                        available_qty: 0.0,
+                        attempted_qty: settled_qty,
+                    })?;
             if entry.quantity + 1e-9 < settled_qty {
                 return Err(InventoryError::Oversell {
                     instrument_id: instrument_id.clone(),
@@ -992,7 +993,10 @@ mod tests {
         assert_eq!(inventory.position_qty(&instrument_id), 0.0);
         assert!((inventory.free_cash_usd() - 105.75).abs() < 1e-9);
         assert!((inventory.realized_pnl_usd() - 5.75).abs() < 1e-9);
-        assert_eq!(adjustment.reason, InventoryAdjustmentReason::SettlementApplied);
+        assert_eq!(
+            adjustment.reason,
+            InventoryAdjustmentReason::SettlementApplied
+        );
         assert!((adjustment.cash_delta_usd - 9.75).abs() < 1e-9);
         assert!((adjustment.position_delta + 10.0).abs() < 1e-9);
     }
