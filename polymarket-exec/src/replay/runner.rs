@@ -112,6 +112,28 @@ mod replay_accounting_tests {
         }
     }
 
+    fn resolution_outcome_event(winning_outcome: &str, fee_usd: f64, gas_usd: f64) -> Event {
+        Event {
+            v: 1,
+            ts_ns: 2,
+            received_ns: 2,
+            event_type: EventType::Resolution,
+            market_type: "btc_5m".to_string(),
+            market_slug: Some("btc-up-or-down".to_string()),
+            asset_id: None,
+            side: None,
+            price: None,
+            size: None,
+            sequence: Some(2),
+            source: Source::Synthesizer,
+            raw: json!({
+                "winning_outcome": winning_outcome,
+                "redeem_fee_usd": fee_usd,
+                "redeem_gas_usd": gas_usd
+            }),
+        }
+    }
+
     fn buy_fill(asset_id: &str, price: f64, size: f64) -> SimulatedFill {
         SimulatedFill {
             client_order_id: format!("buy-{asset_id}"),
@@ -152,16 +174,49 @@ mod replay_accounting_tests {
         let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 10.0)];
         let accounting = compute_accounting(&events, &fills, 1_000.0);
 
-        assert_eq!(accounting.ending_cash_usd, 990.5);
+        assert_eq!(accounting.ending_cash_usd, 1_000.5);
         assert_eq!(accounting.redeemable_value_usd, 10.0);
-        assert_eq!(accounting.market_value_usd, 10.0);
+        assert_eq!(accounting.market_value_usd, 0.0);
         assert_eq!(accounting.ending_equity_usd, 1_000.5);
         assert_eq!(accounting.total_pnl_usd, 0.5);
+        assert_eq!(accounting.realized_pnl_usd, 0.5);
+        assert_eq!(accounting.unrealized_pnl_usd, 0.0);
         assert_eq!(
             accounting.resolution_winner_asset_id,
             Some("UP".to_string())
         );
         assert_eq!(accounting.mark_source, "resolution");
+        assert!(accounting.open_positions.is_empty());
+        assert_eq!(accounting.settlement.redeemed_winning_qty, 10.0);
+        assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+        assert_eq!(accounting.settlement.status, "resolved_settled");
+    }
+
+    #[test]
+    fn accounting_maps_winning_outcome_to_yes_no_asset_ids_and_deducts_redeem_fees() {
+        let events = vec![
+            market_meta_event("UP_TOKEN", "DOWN_TOKEN"),
+            resolution_outcome_event("Down", 0.10, 0.15),
+        ];
+        let fills = vec![
+            buy_fill("UP_TOKEN", 0.40, 10.0),
+            buy_fill("DOWN_TOKEN", 0.55, 10.0),
+        ];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+
+        assert_eq!(
+            accounting.resolution_winner_asset_id,
+            Some("DOWN_TOKEN".to_string())
+        );
+        assert!((accounting.ending_cash_usd - 1_000.25).abs() < 1e-9);
+        assert!((accounting.total_pnl_usd - 0.25).abs() < 1e-9);
+        assert!((accounting.fees_paid_usd - 0.25).abs() < 1e-9);
+        assert_eq!(accounting.settlement.redeemed_winning_qty, 10.0);
+        assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+        assert!((accounting.settlement.redeem_credit_usd - 10.0).abs() < 1e-9);
+        assert!((accounting.settlement.redeem_fee_usd - 0.10).abs() < 1e-9);
+        assert!((accounting.settlement.redeem_gas_usd - 0.15).abs() < 1e-9);
+        assert!(accounting.open_positions.is_empty());
     }
 
     #[test]
@@ -273,10 +328,20 @@ pub struct ReplaySettlementSummary {
     pub merge_reverted_count: u64,
     pub merged_pair_qty: f64,
     pub merge_credit_usd: f64,
+    #[serde(default)]
+    pub merge_fee_usd: f64,
+    #[serde(default)]
+    pub merge_gas_usd: f64,
     pub pairable_qty_before_resolution: f64,
     pub unmerged_pairable_qty: f64,
     pub redeemed_winning_qty: f64,
     pub expired_losing_qty: f64,
+    #[serde(default)]
+    pub redeem_credit_usd: f64,
+    #[serde(default)]
+    pub redeem_fee_usd: f64,
+    #[serde(default)]
+    pub redeem_gas_usd: f64,
     pub stranded_qty_total: f64,
     pub stranded_cost_usd: f64,
     pub stranded_inventory: Vec<ReplaySettlementAssetInventory>,
@@ -500,9 +565,12 @@ fn compute_accounting(
         }
     }
 
-    let (marks, winner_asset_id) = replay_marks(events);
+    let (marks, raw_winner_asset_id) = replay_marks(events);
     let pair_asset_ids = binary_asset_ids(events, &positions);
+    let winner_asset_id =
+        resolve_winner_asset_id(raw_winner_asset_id.as_deref(), pair_asset_ids.as_deref());
     let merge_events = replay_merge_events(events);
+    let redeem_events = replay_redeem_events(events);
     let pairable_qty_before_resolution = pair_asset_ids
         .as_ref()
         .map(|pair| pairable_qty(&positions, pair))
@@ -513,19 +581,28 @@ fn compute_accounting(
         .unwrap_or_default();
     cash += merge_apply.credit_usd;
     realized_pnl += merge_apply.realized_pnl_usd;
+    let positions_before_resolution = positions.clone();
+    let resolution_apply = winner_asset_id
+        .as_deref()
+        .map(|winner| apply_resolution_settlement(&mut positions, winner, &redeem_events))
+        .unwrap_or_default();
+    cash += resolution_apply.credit_usd;
+    realized_pnl += resolution_apply.realized_pnl_usd;
 
     let mut market_value = 0.0;
     let mut open_cost_basis = 0.0;
-    let mut redeemable_value = 0.0;
     let mut unmarked_open_positions = 0u64;
     let mut open_positions = Vec::new();
     let settlement = compute_settlement_summary(
         pair_asset_ids.unwrap_or_default(),
         &merge_events,
         merge_apply.applied_qty,
+        merge_apply.fee_usd,
+        merge_apply.gas_usd,
         pairable_qty_before_resolution,
-        &positions,
+        &positions_before_resolution,
         winner_asset_id.as_deref(),
+        &resolution_apply,
     );
 
     for (asset_id, pos) in positions {
@@ -541,9 +618,6 @@ fn compute_accounting(
         let value = mark.map(|p| p * pos.qty).unwrap_or(0.0);
         if mark.is_none() {
             unmarked_open_positions += 1;
-        }
-        if winner_asset_id.as_deref() == Some(asset_id.as_str()) {
-            redeemable_value += value;
         }
         market_value += value;
         open_cost_basis += cost_basis;
@@ -568,11 +642,14 @@ fn compute_accounting(
         total_pnl_usd: ending_equity - starting_cash_usd,
         realized_pnl_usd: realized_pnl,
         unrealized_pnl_usd: unrealized_pnl,
-        fees_paid_usd: 0.0,
+        fees_paid_usd: merge_apply.fee_usd
+            + merge_apply.gas_usd
+            + resolution_apply.fee_usd
+            + resolution_apply.gas_usd,
         gross_fill_notional_usd: buy_notional + sell_notional,
         buy_notional_usd: buy_notional,
         sell_notional_usd: sell_notional,
-        redeemable_value_usd: redeemable_value,
+        redeemable_value_usd: resolution_apply.gross_credit_usd,
         resolution_winner_asset_id: winner_asset_id.clone(),
         mark_source: if winner_asset_id.is_some() {
             "resolution".to_string()
@@ -589,6 +666,8 @@ fn compute_accounting(
 struct ReplayMergeEvent {
     size: f64,
     status: ReplayMergeStatus,
+    fee_usd: f64,
+    gas_usd: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -603,6 +682,27 @@ enum ReplayMergeStatus {
 struct AppliedMergeSummary {
     applied_qty: f64,
     credit_usd: f64,
+    fee_usd: f64,
+    gas_usd: f64,
+    realized_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplaySettlementFeeEvent {
+    fee_usd: f64,
+    gas_usd: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AppliedResolutionSummary {
+    winning_qty: f64,
+    losing_qty: f64,
+    winning_cost_usd: f64,
+    losing_cost_usd: f64,
+    gross_credit_usd: f64,
+    credit_usd: f64,
+    fee_usd: f64,
+    gas_usd: f64,
     realized_pnl_usd: f64,
 }
 
@@ -677,25 +777,81 @@ fn apply_successful_merges(
         .get(&pair_asset_ids[1])
         .map(|p| p.avg_cost)
         .unwrap_or(0.0);
+    let fee_usd: f64 = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Success)
+        .map(|event| event.fee_usd.max(0.0))
+        .sum();
+    let gas_usd: f64 = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Success)
+        .map(|event| event.gas_usd.max(0.0))
+        .sum();
     for asset_id in pair_asset_ids {
         if let Some(pos) = positions.get_mut(asset_id) {
             pos.sell(applied_qty);
         }
     }
+    let gross_credit_usd = applied_qty;
+    let credit_usd = gross_credit_usd - fee_usd - gas_usd;
     AppliedMergeSummary {
         applied_qty,
-        credit_usd: applied_qty,
-        realized_pnl_usd: applied_qty * (1.0 - avg_a - avg_b),
+        credit_usd,
+        fee_usd,
+        gas_usd,
+        realized_pnl_usd: credit_usd - applied_qty * (avg_a + avg_b),
     }
+}
+
+fn apply_resolution_settlement(
+    positions: &mut BTreeMap<String, ReplayPositionAccounting>,
+    winner_asset_id: &str,
+    redeem_events: &[ReplaySettlementFeeEvent],
+) -> AppliedResolutionSummary {
+    let fee_usd: f64 = redeem_events.iter().map(|event| event.fee_usd.max(0.0)).sum();
+    let gas_usd: f64 = redeem_events.iter().map(|event| event.gas_usd.max(0.0)).sum();
+    let mut out = AppliedResolutionSummary {
+        fee_usd,
+        gas_usd,
+        ..AppliedResolutionSummary::default()
+    };
+    let mut asset_ids = positions.keys().cloned().collect::<Vec<_>>();
+    for asset_id in asset_ids.drain(..) {
+        let Some(pos) = positions.get_mut(&asset_id) else {
+            continue;
+        };
+        if pos.qty <= f64::EPSILON {
+            continue;
+        }
+        let qty = pos.qty;
+        let cost = pos.qty * pos.avg_cost;
+        if asset_id == winner_asset_id {
+            out.winning_qty += qty;
+            out.winning_cost_usd += cost;
+            out.gross_credit_usd += qty;
+        } else {
+            out.losing_qty += qty;
+            out.losing_cost_usd += cost;
+        }
+        pos.sell(qty);
+    }
+    positions.retain(|_, pos| pos.qty > f64::EPSILON);
+    out.credit_usd = out.gross_credit_usd - out.fee_usd - out.gas_usd;
+    out.realized_pnl_usd =
+        out.credit_usd - out.winning_cost_usd - out.losing_cost_usd;
+    out
 }
 
 fn compute_settlement_summary(
     pair_asset_ids: Vec<String>,
     merge_events: &[ReplayMergeEvent],
     merged_pair_qty: f64,
+    merge_fee_usd: f64,
+    merge_gas_usd: f64,
     pairable_qty_before_resolution: f64,
     positions: &BTreeMap<String, ReplayPositionAccounting>,
     winner_asset_id: Option<&str>,
+    resolution_apply: &AppliedResolutionSummary,
 ) -> ReplaySettlementSummary {
     let unmerged_pairable_qty = if pair_asset_ids.len() == 2 {
         pairable_qty(positions, &pair_asset_ids)
@@ -705,8 +861,6 @@ fn compute_settlement_summary(
     let mut stranded_inventory = Vec::new();
     let mut stranded_qty_total = 0.0;
     let mut stranded_cost_usd = 0.0;
-    let mut redeemed_winning_qty = 0.0;
-    let mut expired_losing_qty = 0.0;
 
     for (asset_id, pos) in positions {
         if pos.qty <= f64::EPSILON {
@@ -715,11 +869,9 @@ fn compute_settlement_summary(
         let cost_basis = pos.qty * pos.avg_cost;
         let role = match winner_asset_id {
             Some(winner) if winner == asset_id => {
-                redeemed_winning_qty += pos.qty;
                 "winner"
             }
             Some(_) => {
-                expired_losing_qty += pos.qty;
                 "loser"
             }
             None => "unresolved",
@@ -745,6 +897,8 @@ fn compute_settlement_summary(
         .count() as u64;
     let status = if pair_asset_ids.len() != 2 {
         "no_binary_pair_detected"
+    } else if winner_asset_id.is_some() {
+        "resolved_settled"
     } else if pairable_qty_before_resolution <= f64::EPSILON && stranded_qty_total <= f64::EPSILON {
         "flat"
     } else if merge_reverted_count > 0 {
@@ -766,10 +920,15 @@ fn compute_settlement_summary(
         merge_reverted_count,
         merged_pair_qty,
         merge_credit_usd: merged_pair_qty,
+        merge_fee_usd,
+        merge_gas_usd,
         pairable_qty_before_resolution,
         unmerged_pairable_qty,
-        redeemed_winning_qty,
-        expired_losing_qty,
+        redeemed_winning_qty: resolution_apply.winning_qty,
+        expired_losing_qty: resolution_apply.losing_qty,
+        redeem_credit_usd: resolution_apply.gross_credit_usd,
+        redeem_fee_usd: resolution_apply.fee_usd,
+        redeem_gas_usd: resolution_apply.gas_usd,
         stranded_qty_total,
         stranded_cost_usd,
         stranded_inventory,
@@ -784,7 +943,21 @@ fn replay_merge_events(events: &[Event]) -> Vec<ReplayMergeEvent> {
         .map(|event| ReplayMergeEvent {
             size: parse_event_size(event).unwrap_or(0.0),
             status: parse_merge_status(event),
+            fee_usd: parse_fee_usd(event),
+            gas_usd: parse_gas_usd(event),
         })
+        .collect()
+}
+
+fn replay_redeem_events(events: &[Event]) -> Vec<ReplaySettlementFeeEvent> {
+    events
+        .iter()
+        .filter(|event| event.event_type == EventType::Resolution || raw_kind_is(event, "redeem"))
+        .map(|event| ReplaySettlementFeeEvent {
+            fee_usd: parse_fee_usd(event),
+            gas_usd: parse_gas_usd(event),
+        })
+        .filter(|event| event.fee_usd > 0.0 || event.gas_usd > 0.0)
         .collect()
 }
 
@@ -818,6 +991,37 @@ fn parse_raw_f64(raw: &serde_json::Value, keys: &[&str]) -> Option<f64> {
         }
     }
     None
+}
+
+fn parse_fee_usd(event: &Event) -> f64 {
+    parse_raw_f64(
+        &event.raw,
+        &[
+            "fee_usd",
+            "fees_usd",
+            "merge_fee_usd",
+            "redeem_fee_usd",
+            "settlement_fee_usd",
+            "tx_fee_usd",
+        ],
+    )
+    .unwrap_or(0.0)
+    .max(0.0)
+}
+
+fn parse_gas_usd(event: &Event) -> f64 {
+    parse_raw_f64(
+        &event.raw,
+        &[
+            "gas_usd",
+            "gas_fee_usd",
+            "merge_gas_usd",
+            "redeem_gas_usd",
+            "settlement_gas_usd",
+        ],
+    )
+    .unwrap_or(0.0)
+    .max(0.0)
 }
 
 fn parse_merge_status(event: &Event) -> ReplayMergeStatus {
@@ -933,6 +1137,28 @@ fn replay_marks(events: &[Event]) -> (BTreeMap<String, f64>, Option<String>) {
     (marks, winner_asset_id)
 }
 
+fn resolve_winner_asset_id(raw_winner: Option<&str>, pair_asset_ids: Option<&[String]>) -> Option<String> {
+    let raw_winner = raw_winner?.trim();
+    if raw_winner.is_empty() {
+        return None;
+    }
+    if let Some(pair) = pair_asset_ids {
+        if pair.iter().any(|asset_id| asset_id == raw_winner) {
+            return Some(raw_winner.to_string());
+        }
+        if pair.len() == 2 {
+            let normalized = raw_winner.to_ascii_lowercase();
+            if matches!(normalized.as_str(), "yes" | "up" | "home" | "1") {
+                return Some(pair[0].clone());
+            }
+            if matches!(normalized.as_str(), "no" | "down" | "away" | "0") {
+                return Some(pair[1].clone());
+            }
+        }
+    }
+    Some(raw_winner.to_string())
+}
+
 fn parse_price(value: Option<&str>) -> Option<f64> {
     let parsed = value?.parse::<f64>().ok()?;
     parsed.is_finite().then_some(parsed)
@@ -944,6 +1170,9 @@ fn resolution_winner_asset_id(event: &Event) -> Option<String> {
         "winning_asset_id",
         "resolved_asset_id",
         "asset_id",
+        "winning_outcome",
+        "winner_outcome",
+        "outcome",
     ] {
         if let Some(value) = event.raw.get(key).and_then(|v| v.as_str()) {
             if !value.is_empty() {
