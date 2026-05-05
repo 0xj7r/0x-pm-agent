@@ -8,16 +8,16 @@ strategy: paired_mm
 
 # ── Quote & Ladder Controls ─────────────────────────────────────
 quote:
-  levels_per_side: 3
-  base_clip_usd: 3.00
+  levels_per_side: 12
+  base_clip_usd: 1.50
   min_clip_usd: 0.50
-  max_clip_usd: 8.0
+  max_clip_usd: 5.0
   min_edge_bps: 75
   inventory_skew_bps: 150
   max_spread: 0.08
   min_top_depth_notional_usd: 3.0
   min_order_notional_usd: 0.50
-  entry_ladder_levels: 3
+  entry_ladder_levels: 12
   entry_ladder_spacing_ticks: 1.0
   maker_safety_ticks: 2.0
   venue_min_order_quantity: 5.0
@@ -35,33 +35,62 @@ fair_value:
 inventory:
   max_gross_notional_usd: 45.0
   max_net_notional_per_market_usd: 20.0
-  max_order_notional_usd: 8.0
+  max_order_notional_usd: 5.0
   max_position_quantity_per_instrument: 75.0
-  max_open_orders_total: 18
-  max_open_orders_per_market: 8
+  max_open_orders_total: 48
+  max_open_orders_per_market: 28
   max_stranded_leg_usd: 20.0
   max_gross_cost_usd: 45.0
   max_leg_cost_usd: 20.0
   max_side_imbalance_qty: 20.0
 
 # ── Convexity Overlay ───────────────────────────────────────────
-# Late-window winner-side tilt is a separate, labelled path from paired entry.
-# It is intentionally small while live attribution is still being validated.
+# Late-window Bonereaper-style package: buy both sides, load more notional
+# into the model-favoured leg, and accumulate many cheap-tail shares when
+# the opposite leg collapses. EV is logged but not a hard gate because the
+# short-horizon model is weakest exactly where the convex payoff is largest.
 convexity_overlay:
   enabled: true
+  suppress_ladder_when_package_fires: true
   capital_pct: 0.10
   late_window_sec: 120
   convex_p_threshold: 0.72
   max_excess_usd: 40.0
-  clip_usd: 3.0
+  clip_usd: 5.0
   allow_extra_clip_on_winner: true
   maker_safety_ticks: 2.0
+  min_favorite_edge_bps: 25
+  tail_enabled: true
+  tail_max_price: 0.02
+  tail_clip_usd: 1.50
+  min_combo_ev_usd: 0.00
+  ev_gate_enabled: false
+  package_budget_usd: 6.00
+  favorite_notional_min_pct: 0.70
+  favorite_notional_max_pct: 0.83
+  whipsaw_favorite_notional_min_pct: 0.50
+  whipsaw_favorite_notional_max_pct: 0.70
+  # If late inventory is stranded on the likely-losing side, spend more
+  # notional on the favourite to offset the near-certain terminal loss.
+  loser_stranded_favorite_notional_min_pct: 0.75
+  loser_stranded_favorite_notional_max_pct: 0.90
+  # If late inventory is already on the likely-winning side, avoid doubling
+  # down; bias new package notional toward the cheap opposite tail/pair leg.
+  winner_stranded_favorite_notional_min_pct: 0.45
+  winner_stranded_favorite_notional_max_pct: 0.65
+  max_favorite_win_loss_usd: 8.00
+  min_tail_win_profit_usd: 10.00
+  min_tail_payoff_multiple: 4.00
+  ev_delta_weight: 0.00
+  favorite_loss_reduction_weight: 0.40
+  tail_convexity_weight: 1.20
+  imbalance_penalty_weight: 0.00
 
 # ── Pair / Merge Recycling ─────────────────────────────────────
-# Polygon merge fees are negligible for our setup; keep this low so tiny-live
-# and paper validate the intended merge-first capital recycling path.
+# Batch tiny completed pairs by default; runtime bypasses this threshold and
+# merges immediately when free cash is low or gross/market inventory is high.
 pair:
-  min_merge_notional_usd: 0.10
+  min_merge_notional_usd: 8.00
 
 # ── Rescue / Merge Logic ────────────────────────────────────────
 rescue:
