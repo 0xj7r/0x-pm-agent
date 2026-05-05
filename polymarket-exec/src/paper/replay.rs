@@ -612,8 +612,26 @@ pub async fn replay_runtime_from_snapshots(
                     paper_order_ctx.remove(&client_order_id);
                     runtime.on_order_cancelled(&client_order_id, reason, record.t);
                 }
-                RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
-                    // Replay is venue-free; relayer actions remain no-ops.
+                RuntimeCommand::Merge(intent) => {
+                    let fill = FillReport {
+                        order_id: None,
+                        client_order_id: Some(intent.command_id.clone()),
+                        market_id: intent.market_id.clone(),
+                        instrument_id: intent.yes_instrument_id.clone(),
+                        side: TradeSide::Buy,
+                        price: 1.0,
+                        quantity: intent.quantity,
+                        fee_usd: intent.expected_fee_usd + intent.expected_gas_usd,
+                        liquidity: FillLiquidity::Unknown,
+                        close_method: Some(crate::types::CloseMethod::Merge),
+                        observed_at_ms: record.t,
+                    };
+                    report.record_fill(&fill, None);
+                    runtime.on_fill(fill)?;
+                }
+                RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
+                    // Replay is venue-free; unresolved redeem commands need
+                    // winner-leg context before inventory can be closed.
                 }
             }
         }

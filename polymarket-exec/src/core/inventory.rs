@@ -48,6 +48,7 @@ pub enum InventoryAdjustmentReason {
     Released,
     FillApplied,
     MergeApplied,
+    SettlementApplied,
     MarkUpdated,
     CashReconciled,
 }
@@ -792,6 +793,77 @@ impl InventoryState {
         })
     }
 
+    pub fn apply_settlement(
+        &mut self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        settled_qty: f64,
+        payout_price: f64,
+        additional_fee_usd: f64,
+        observed_at_ms: EpochMillis,
+    ) -> Result<InventoryAdjustment, InventoryError> {
+        if settled_qty <= 0.0
+            || !settled_qty.is_finite()
+            || !payout_price.is_finite()
+            || payout_price < 0.0
+            || !additional_fee_usd.is_finite()
+            || additional_fee_usd < 0.0
+        {
+            return Err(InventoryError::InvalidFill("invalid settlement close"));
+        }
+
+        let mut remove_after = false;
+        let cost_basis_usd;
+        {
+            let entry = self.positions.get_mut(instrument_id).ok_or_else(|| {
+                InventoryError::Oversell {
+                    instrument_id: instrument_id.clone(),
+                    available_qty: 0.0,
+                    attempted_qty: settled_qty,
+                }
+            })?;
+            if entry.quantity + 1e-9 < settled_qty {
+                return Err(InventoryError::Oversell {
+                    instrument_id: instrument_id.clone(),
+                    available_qty: entry.quantity,
+                    attempted_qty: settled_qty,
+                });
+            }
+            cost_basis_usd = entry.avg_price * settled_qty;
+            entry.quantity -= settled_qty;
+            entry.mark_price = Some(payout_price);
+            entry.updated_at_ms = observed_at_ms;
+            if entry.quantity <= 1e-9 {
+                remove_after = true;
+            }
+        }
+
+        if remove_after {
+            self.positions.remove(instrument_id);
+        }
+
+        let gross_cash_usd = settled_qty * payout_price;
+        let net_cash_usd = gross_cash_usd - additional_fee_usd;
+        let realized_pnl_delta_usd = net_cash_usd - cost_basis_usd;
+        self.free_cash_usd += net_cash_usd;
+        self.realized_pnl_usd += realized_pnl_delta_usd;
+
+        Ok(InventoryAdjustment {
+            reason: InventoryAdjustmentReason::SettlementApplied,
+            observed_at_ms,
+            market_id: Some(market_id.clone()),
+            instrument_id: Some(instrument_id.clone()),
+            client_order_id: None,
+            cash_delta_usd: net_cash_usd,
+            reserved_cash_delta_usd: 0.0,
+            position_delta: -settled_qty,
+            realized_pnl_delta_usd,
+            free_cash_after_usd: self.free_cash_usd,
+            reserved_cash_after_usd: self.reserved_cash_usd,
+            gross_exposure_after_usd: self.gross_exposure_usd(),
+        })
+    }
+
     fn noop_adjustment(
         &self,
         reason: InventoryAdjustmentReason,
@@ -819,7 +891,7 @@ impl InventoryState {
 
 #[cfg(test)]
 mod tests {
-    use super::{InventoryState, VenuePositionSnapshot};
+    use super::{InventoryAdjustmentReason, InventoryState, VenuePositionSnapshot};
     use crate::types::{
         ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderIntent, TradeSide,
     };
@@ -889,6 +961,40 @@ mod tests {
         assert_eq!(inventory.position_qty(&instrument_id), 0.0);
         assert!((inventory.free_cash_usd() - 100.9).abs() < 1e-9);
         assert!((inventory.realized_pnl_usd() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settlement_close_credits_winner_and_removes_inventory() {
+        let market_id = MarketId::from("market-a");
+        let instrument_id = InstrumentId::from("token-up");
+        let mut inventory = InventoryState::new(100.0);
+
+        inventory
+            .apply_fill(&FillReport {
+                order_id: None,
+                client_order_id: None,
+                market_id: market_id.clone(),
+                instrument_id: instrument_id.clone(),
+                side: TradeSide::Buy,
+                price: 0.40,
+                quantity: 10.0,
+                fee_usd: 0.0,
+                liquidity: FillLiquidity::Maker,
+                close_method: None,
+                observed_at_ms: 1,
+            })
+            .expect("buy fill");
+
+        let adjustment = inventory
+            .apply_settlement(&market_id, &instrument_id, 10.0, 1.0, 0.25, 2)
+            .expect("settlement");
+
+        assert_eq!(inventory.position_qty(&instrument_id), 0.0);
+        assert!((inventory.free_cash_usd() - 105.75).abs() < 1e-9);
+        assert!((inventory.realized_pnl_usd() - 5.75).abs() < 1e-9);
+        assert_eq!(adjustment.reason, InventoryAdjustmentReason::SettlementApplied);
+        assert!((adjustment.cash_delta_usd - 9.75).abs() < 1e-9);
+        assert!((adjustment.position_delta + 10.0).abs() < 1e-9);
     }
 
     #[test]

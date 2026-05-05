@@ -425,11 +425,11 @@ fn golden_paired_mm_one_bar_replay_is_deterministic() {
 
     // Locked-in PnL value: this is the deterministic cash flow of running
     // the current paired_mm strategy + queue-aware fill-sim against the
-    // 100-event fixture above. The same-price queue model is intentionally
-    // stricter than the old optimistic golden, so this fixture now fills
-    // only the residual after displayed same-price depth is consumed.
-    const GOLDEN_FILLS_COUNT: usize = 1;
-    const GOLDEN_PNL_USD: f64 = -2.5;
+    // 100-event fixture above. The fixture now exercises repeated quote
+    // refreshes in the same bar: one NO bid and two refreshed YES bids fill
+    // as maker orders.
+    const GOLDEN_FILLS_COUNT: usize = 3;
+    const GOLDEN_PNL_USD: f64 = -7.7;
     let fills_count = s1.fills.len();
     let pnl = realized_pnl_usd(&s1.fills);
 

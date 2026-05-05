@@ -40,8 +40,8 @@ use crate::strategy::{
     Strategy, StrategyContext, StrategyDecision, StrategyDecisionSuppressionKind, VenueMarketRules,
 };
 use crate::types::{
-    ClientOrderId, CloseMethod, EpochMillis, FillLiquidity, FillReport, InstrumentId, MarketId,
-    MarketLedgerState, MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
+    ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketLedgerState,
+    MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
@@ -779,11 +779,12 @@ impl<S: Strategy> Runtime<S> {
     /// 1. `RuntimeCommand::Cancel` for every currently-open order.
     /// 2. `RuntimeCommand::Merge` for every market with paired inventory
     ///    (via `plan_merge_command_for_market`).
-    /// 3. Synthetic `FillReport`s with `CloseMethod::Redeem` applied for each
-    ///    stranded position at `resolution_price` (0.0 = "no" wins, 1.0 = "yes"
-    ///    wins, 0.5 = unknown). When `resolution_price` is None and stranded
-    ///    inventory exists, an Inventory event is logged but the inventory is
-    ///    NOT settled (operator must intervene).
+    /// 3. Synthetic settlement closes for each stranded position. The legacy
+    ///    `resolution_price` argument is used only to infer the winning YES/NO
+    ///    leg (1.0 = YES/Up, 0.0 = NO/Down). Each instrument then receives its
+    ///    own payout price: winning leg = 1.0, losing leg = 0.0. Ambiguous
+    ///    values (for example 0.5) leave inventory unsettled and emit an
+    ///    Inventory event for operator intervention.
     /// 4. A single Runtime event marking the close.
     ///
     /// Phase 1 of the paper environment design doc
@@ -794,6 +795,15 @@ impl<S: Strategy> Runtime<S> {
         resolution_price: Option<f64>,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        let resolved_winning_leg = resolution_price.and_then(|price| {
+            if price >= 1.0 - 1e-9 {
+                Some(crate::market_making::pairing::ResolvedWinningLeg::Yes)
+            } else if price <= 1e-9 {
+                Some(crate::market_making::pairing::ResolvedWinningLeg::No)
+            } else {
+                None
+            }
+        });
 
         let open_coids: Vec<(ClientOrderId, MarketId, InstrumentId)> = self
             .open_orders
@@ -844,27 +854,75 @@ impl<S: Strategy> Runtime<S> {
 
         let stranded = self.inventory.stranded_market_inventory();
         for strand in stranded {
+            let redeem_candidate = resolved_winning_leg.and_then(|winning_leg| {
+                self.merge_executor
+                    .resolved_redeem_candidate(&strand.market_id, winning_leg)
+            });
             for position in &strand.stranded_positions {
                 if position.quantity.abs() <= 1e-9 {
                     continue;
                 }
-                match resolution_price {
+                let payout_price = resolved_winning_leg.and_then(|winning_leg| {
+                    if let Some(candidate) = redeem_candidate.as_ref() {
+                        if candidate
+                            .winning_instrument_id
+                            .as_ref()
+                            .is_some_and(|id| id == &position.instrument_id)
+                        {
+                            return Some(1.0);
+                        }
+                        if candidate
+                            .losing_instrument_id
+                            .as_ref()
+                            .is_some_and(|id| id == &position.instrument_id)
+                        {
+                            return Some(0.0);
+                        }
+                    }
+
+                    let instrument = position.instrument_id.as_str().to_ascii_lowercase();
+                    match winning_leg {
+                        crate::market_making::pairing::ResolvedWinningLeg::Yes
+                            if instrument.contains("yes") || instrument.contains("up") =>
+                        {
+                            Some(1.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::Yes
+                            if instrument.contains("no") || instrument.contains("down") =>
+                        {
+                            Some(0.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::No
+                            if instrument.contains("no") || instrument.contains("down") =>
+                        {
+                            Some(1.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::No
+                            if instrument.contains("yes") || instrument.contains("up") =>
+                        {
+                            Some(0.0)
+                        }
+                        _ => None,
+                    }
+                });
+
+                match payout_price {
                     Some(price) => {
-                        let synthetic_fill = FillReport {
-                            order_id: None,
-                            client_order_id: None,
-                            market_id: strand.market_id.clone(),
-                            instrument_id: position.instrument_id.clone(),
-                            side: TradeSide::Sell,
+                        match self.inventory.apply_settlement(
+                            &strand.market_id,
+                            &position.instrument_id,
+                            position.quantity,
                             price,
-                            quantity: position.quantity,
-                            fee_usd: 0.0,
-                            liquidity: FillLiquidity::Unknown,
-                            close_method: Some(CloseMethod::Redeem),
-                            observed_at_ms: now_ms,
-                        };
-                        match self.on_fill(synthetic_fill) {
-                            Ok(fill_outcome) => outcome.extend(fill_outcome),
+                            0.0,
+                            now_ms,
+                        ) {
+                            Ok(adjustment) => {
+                                outcome.push_event(
+                                    self.event_log.push(adjustment.to_event(
+                                        "inventory updated from paper settlement close",
+                                    )),
+                                );
+                            }
                             Err(error) => {
                                 outcome.push_event(
                                     self.event_log.push(
@@ -890,7 +948,9 @@ impl<S: Strategy> Runtime<S> {
                                     now_ms,
                                     format!(
                                         "paper market close: stranded position requires \
-                                         resolution_price (qty={:.8}); operator must settle manually",
+                                         unambiguous winner-leg mapping \
+                                         (resolution_price={:?} qty={:.8}); operator must settle manually",
+                                        resolution_price,
                                         position.quantity
                                     ),
                                 )
