@@ -1,478 +1,447 @@
-# Polymarket `btc_5m_mm` — implementation and debugging guide
+# Polymarket `paired_mm` / `btc_5m_mm` implementation guide
 
-Last updated: 2026-04-29
+Last updated: 2026-05-05
 
-This doc describes how `polymarket-exec` SHOULD behave on `btc-updown-5m-*`
-markets, the correct invariants for each subsystem, and the bug patterns
-we have hit (and any future agent should look for first when something
-seems wrong).
+This doc describes how the active BTC 5m strategy should behave in
+`polymarket-exec`, what to check when it misbehaves, and which historical bug
+patterns have already cost us money.
 
----
+The current production intent is **not** pure pair-cost arbitrage and not pure
+directional momentum. It is:
 
-## 1. The strategy in one paragraph
-
-We are a **paired-bid market maker** on Polymarket binary markets.
-Every 5-minute BTC bar produces a market with two outcome tokens (the
-YES instrument and NO instrument). We post **resting limit buy orders
-on BOTH outcome tokens simultaneously**, at prices that sum to less
-than $1.00. When a taker hits one of our bids we earn a maker rebate;
-when the bar resolves we redeem the winning leg for $1 (or merge the
-paired leg pair for $1 collateral release). Edge is the gap between
-what we paid for the pair and the $1 we recover.
-
-This is real market making *in the binary-market sense*: bidding NO
-at $p$ is economically equivalent to asking YES at $1-p$, so a paired
-bid is the canonical two-sided quote on a binary market. Polymarket
-recognizes this and pays maker rebates for it.
-
-We are **NOT** a directional trader. We do not predict the BTC move.
-Our edge comes from spread capture and rebates over many fills.
-
----
-
-## 1.5 The four entry/exit paths
-
-The strategy has four code paths that emit OrderIntents. Each fires under
-different conditions, has a different TIF, and has a different intent
-kind. When debugging, identify which path is (or is not) firing first —
-the answer to "why isn't the bot quoting" depends on which path you
-expect.
-
-### Path 1 — Paired bid (`mm-paired-bid`) — primary MM, ~95% of edge
-
-**Function:** `build_paired_entry_ladder` (`strategy.rs:3433`).
-**Tag:** `mm-paired-bid:lN` where N is the level index + 1.
-**TIF:** GTD with `live_order_ttl_ms` TTL (default 20s), post_only=true.
-**Intent kind:** Entry.
-**Fires when:** market not in `ManagingInventory` (no stranded
-inventory). Emits up to `entry_ladder_levels × 2` intents per
-on_market_snapshot tick (8 levels × YES leg + NO leg = 16 intents).
-**Edge source:** maker rebates + (1 - sum_of_paired_bid_prices) gap.
-
-This is the rebate workhorse. If this isn't firing, the bot is dormant.
-
-### Path 2 — Convex accumulation (`mm-convex-accum`) — cheap-leg side bet, ~3.5% of whale notional
-
-**Function:** `build_convex_accumulation_intent` (`strategy.rs:3083`).
-**Tag:** `mm-convex-accum:l1`.
-**TIF:** GTD, post_only=true.
-**Intent kind:** Entry.
-**Fires when:** the cheap leg (price < `CONVEX_ACCUMULATION_MAX_BID = 0.45`)
-shows trend persistence in the OPPOSITE direction (`CONVEX_TREND_PERSISTENCE_BPS = 50`)
-within bar phase 60-240s. Emits ONE intent per tick, capped at
-`CONVEX_MAX_BIDS_PER_BAR = 4` per market per bar.
-**Edge source:** asymmetric payoff — pays $1 if the cheap leg wins
-(low probability, high payoff). Bankroll-bounded by
-`CONVEX_FRACTIONAL_KELLY = 0.25`.
-
-Single-intent emission by design — this is a lottery ticket, not a
-ladder. Whale data shows this is 3.5% of notional, mostly opportunistic.
-
-### Path 3 — Late-bar core (`mm-late-bar-core`) — favored-leg late accumulation
-
-**Function:** `build_late_bar_core_intent` (`strategy.rs:3007`).
-**Tag:** `mm-late-bar-core:l1`.
-**TIF:** GTD with `LATE_BAR_CORE_TTL_MS = 60s`, post_only=true.
-**Intent kind:** Entry.
-**Fires when:** all of:
-- Time remaining in bar ∈ [30s, 120s]
-- Expensive leg book ask ∈ [`LATE_BAR_CORE_PRICE_FLOOR = 0.85`,
-  `LATE_BAR_CORE_PRICE_CEILING = 0.98`]
-- `realized_vol_5m_bps >= LATE_BAR_CORE_MIN_VOL_BPS = 50`
-- BTC momentum confirms direction
-- < `LATE_BAR_CORE_MAX_BIDS_PER_BAR = 15` already filled this bar
-- < `LATE_BAR_CORE_BUDGET_USD = $5` already spent
-
-Emits ONE intent per tick (single-shot, queued to repeat on subsequent
-ticks until the budget or count is hit).
-**Edge source:** high-probability, low-margin late-bar convergence —
-buy at $0.93, win $1.00 = $0.07/share with ~93% confidence.
-
-This is the "expensive leg accumulation" path you remember. Spec is at
-`docs/strategy/asymmetric_core_hedge_spec.md`.
-
-### Path 4 — Hedge rescue (`mm-hedge-rescue`) — close-side, IOC
-
-**Function:** rescue branch at `strategy.rs:3360+`.
-**Tag:** `mm-hedge-rescue`.
-**TIF:** **IOC**, post_only=**false**.
-**Intent kind:** **Close** — bypasses entry-time caps.
-**Fires when:** stranded inventory detected on a market and
-`decide_stranded_exposure` chooses RESCUE over HOLD. Lifts the
-opposite leg's ask + `hedge_rescue_race_buffer_ticks` to manufacture
-paired inventory for a merge.
-**Edge source:** locks in $1 - avg_cost - rescue_cost - taker_fee - merge_gas
-when better than holding to resolution.
-
-This is a TAKER action — pays venue fee, doesn't earn rebate. Used
-sparingly. Most stranded positions are HELD (positive-asymmetry hold
-beats rescue when fair has moved in our favor).
-
-### Decision tree per tick
-
+```text
+paired market making early/mid window
+  + maker-rebate capture
+  + controlled stranded-inventory handling
+  + late-window convex favorite/tail accumulation
+  + batched merges when cash pressure allows
 ```
+
+Whale reference points:
+
+- Unlawful-shear: paired MM + convex/cheap-leg accumulation on BTC 5m.
+- Bonereaper: two-sided accumulation in most BTC 5m windows, maker-heavy by
+  notional, no visible SELL unwind, late favorite loading, and cheap-tail share
+  accumulation.
+
+When changing strategy behavior, check those reference datasets first. Do not
+tune in a vacuum.
+
+---
+
+## 1. Strategy in one paragraph
+
+We post resting limit **buy** orders on both outcome tokens in BTC 5m binary
+markets. Early and mid-window, the base engine tries to accumulate pairable
+inventory at a combined cost below $1 while earning maker rebates. If both legs
+fill, we can merge the paired quantity back into collateral. If only one leg
+fills, we either keep trying to pair it, hold it to resolution, or use late
+window convex logic to reshape the payoff.
+
+Late in the bar, the strategy may deliberately buy more of the favored side
+and a smaller amount of the cheap opposite tail. The goal is not a strict
+package-arb every tick. The goal is asymmetric payoff shaping: favorite
+notional captures high-probability convergence; cheap-tail shares preserve
+convex upside if the bar reverses. Existing stranded inventory changes the
+sizing: losing-side stranded inventory should bias more favorite loading;
+winning-side stranded inventory should reduce favorite loading and use tail
+only where it improves convex payoff.
+
+We do **not** use a SELL unwind in this strategy. If inventory is stranded, the
+default tools are continued pairing, late convex reshaping, merge batching, and
+resolution/redeem.
+
+---
+
+## 2. Active paths
+
+### Path 1: paired bid ladder
+
+Primary path. This is the maker/rebate workhorse.
+
+- Tags: `mm-paired-bid:lN`.
+- TIF: usually GTD, `post_only=true`.
+- Intent kind: `Entry`.
+- Emits: up to `entry_ladder_levels * 2` child intents.
+- Expected behavior: quote both Up and Down around fair/book levels, with
+  combined pair cost controlled by YAML risk and quote settings.
+- Important invariant: if multiple ladder children collapse to the same
+  `market + instrument + side + price`, aggregate them into one order and
+  preserve metadata such as `quote_level_tag=l1+l2+l3`.
+
+This path should operate early and mid-window unless hard risk/runtime gates
+are active.
+
+### Path 2: cheap-leg / convex accumulation
+
+Small asymmetric side-bet path.
+
+- Tags: typically convex/cheap-leg tags.
+- TIF: GTD or maker-style resting order unless explicitly configured otherwise.
+- Intent kind: `Entry`.
+- Purpose: buy cheap opposite-side exposure where the payoff multiple is high
+  and the loss budget is controlled.
+- Sizing: should be driven by marginal payoff, remaining loss budget, current
+  inventory, BTC momentum/regime, and order-book pressure, not hardcoded fixed
+  clips where avoidable.
+
+This is not a separate strategy. It is the convex arm of paired MM.
+
+### Path 3: late convex favorite/tail package
+
+Late-window asymmetric accumulation inspired by Bonereaper behavior.
+
+- Tags: late convex / favorite / tail package tags.
+- TIF: generally short-lived GTD; maker-first where possible.
+- Intent kind: `Entry`.
+- Fires late in the window when terminal timing, liquidity, BTC momentum, and
+  book-pressure sanity checks pass.
+- Favorite side: larger notional allocation when the model/regime supports the
+  favorite and when losing-side stranded inventory needs offsetting.
+- Cheap tail: smaller dollar notional, but meaningful share count where payoff
+  multiple and max-loss constraints are acceptable.
+
+The package does **not** require strict positive EV on every combined package.
+That would suppress too much of the behavior we are trying to capture. It
+should require:
+
+- terminal timing sanity,
+- liquidity sanity,
+- price/payoff sanity,
+- max-loss sanity,
+- inventory-aware sizing,
+- no SELL unwind.
+
+### Path 4: merge batching / redeem
+
+Exit/capital recycling path, not a trading alpha path.
+
+- Merge paired inventory when capital pressure is high or pairable notional is
+  above the configured batch threshold.
+- Otherwise allow small pairs to batch, because constant tiny merges create
+  noise and unnecessary operational churn.
+- At resolution, winning inventory redeems to $1 and losing inventory expires
+  to $0.
+
+Policy:
+
+```text
+if free_cash low or gross inventory high:
+  merge immediately
+else if pairable_notional < merge_batch_threshold:
+  wait / batch
+else:
+  merge
+```
+
+---
+
+## 3. Per-tick decision model
+
+```text
 on_market_snapshot:
-  ├─ has_inventory?
-  │    YES → ManagingInventory
-  │      └─ stranded leg detected?
-  │           ├─ rescue_ev > hold_ev → emit hedge_rescue (Path 4)
-  │           └─ otherwise → hold, no intent emitted
-  │    NO  → Ready
-  │      ├─ Path 1: build_paired_entry_ladder (always tries)
-  │      ├─ Path 2: build_convex_accumulation_intent (if cheap-leg gates pass)
-  │      └─ Path 3: build_late_bar_core_intent (if late-bar gates pass)
+  refresh book, BTC, fair value, inventory, open-order state
+
+  if runtime degraded or hard risk gate active:
+    suppress all entry
+
+  if paired-MM allowed:
+    build paired bid ladder
+    aggregate collapsed ladder levels
+
+  if late-window convex overlay allowed:
+    compute favorite/tail package
+    size using inventory + momentum + book pressure + loss budget
+    optionally suppress normal ladder when package fires
+
+  if pairable inventory exists:
+    apply merge batching policy
+
+  never emit SELL unwind for paired_mm
 ```
 
-Path 1 and Paths 2/3 can fire on the SAME tick (they're not exclusive).
-Path 4 only fires when there's existing stranded inventory.
+Hard gates should be rare and obvious: runtime degraded, asymmetric fill
+cooldown if explicitly enabled, insufficient cash, max gross inventory, or
+venue/auth failure. Soft conditions should resize or switch paths rather than
+silence the strategy.
 
 ---
 
-## 2. Lifecycle of a single paired bid
+## 4. Required invariants
 
+### Strategy config
+
+- Strategy behavior belongs in `polymarket-exec/config/strategies/*.yaml`.
+- Rust defaults are safety fallbacks only. Live behavior should be explicit in
+  the YAML profile.
+- Do not bury strategy knobs in launch scripts.
+- Tinylive env must not silently override YAML risk caps unless the override is
+  deliberate and documented.
+
+### Paired ladder
+
+- Each ladder level must carry a stable `quote_level_tag`.
+- Distinct levels at distinct prices remain distinct orders.
+- Collapsed levels at the same price must aggregate into one order, not submit
+  duplicates.
+- Prices must be tick-aligned at the strategy or wire boundary.
+- `post_only=true` must be preserved for maker-entry paths.
+
+### Runtime state
+
+- Live source of truth is runtime open-order state plus `OrderStore`.
+- Replay-only stores must be named/scoped as replay-only.
+- Reconciliation should be able to answer:
+  - what we intended,
+  - what was submitted,
+  - what is working,
+  - what filled,
+  - what was cancelled/rejected,
+  - what inventory exists,
+  - what is pairable,
+  - what has merged/redeemed.
+
+### Risk
+
+- Entry caps apply to new risk.
+- Close/recycle actions must not be blocked by entry-only caps.
+- Late convex sizing must respect:
+  - max gross notional,
+  - max leg cost,
+  - max loss per package/window,
+  - max order notional,
+  - max position quantity,
+  - open-order count caps.
+
+If late convex needs more room than tinylive caps allow, change the YAML risk
+profile explicitly rather than bypassing the risk engine.
+
+### No SELL path
+
+For active paired MM, SELL should not be emitted as an inventory-management
+habit. We previously observed buy/sell loops that likely amplified losses.
+Allowed exits are:
+
+- merge paired inventory,
+- redeem winning inventory,
+- let losing inventory expire,
+- optionally rescue/pair through buying the opposite leg if configured and EV
+  justified.
+
+---
+
+## 5. Configuration sources of truth
+
+| Concept | Source of truth |
+|---|---|
+| Paired ladder levels/spacings | Strategy YAML |
+| Convex overlay enablement | Strategy YAML |
+| Favorite/tail package sizing limits | Strategy YAML |
+| Inventory caps | Strategy YAML |
+| Merge batching threshold | Strategy YAML |
+| Live venue/auth/env secrets | Host env/secrets |
+| Runtime logging paths | Host env |
+| Deployment unit name | `polymarket-exec@btc_5m_mm_tinylive.service` |
+
+Current tracked tinylive template:
+
+```text
+polymarket-exec/ops/env/btc_5m_mm_tinylive.env.example
 ```
-strategy.on_market_snapshot()
-   └─ build_paired_entry_ladder(8 levels, 2 legs each → up to 16 OrderIntent)
-        ↓
-runtime.accept_strategy_decision(decision.intents)
-   └─ DesiredQuoteSet::from_intents (passes pre-laddered intents through)
-   └─ QuoteReconciler::plan vs open_orders → Submit / Replace / Keep / Cancel
-        ↓
-runtime.accept_intent(intent)
-   ├─ has_active_btc_mm_buy_for_instrument check (matches market+inst+level_tag)
-   ├─ duplicate client_order_id check
-   ├─ drift block (skipped for Close intents)
-   └─ RiskEngine::evaluate (max_open_orders, max_position_qty, max_leg_cost)
-        ↓
-execution_adapter.submit_order
-   └─ Polymarket V2 SDK → POST /order with TIF=GTD, post_only=true
-        ↓
-order acks Working → sits on the book at our limit price
-        ↓
-either:
-  (a) taker hits us → fill received as Maker → maker rebate
-  (b) book moves, our quote stale → reconciler Replace next tick
-  (c) TTL expires (20s) → venue auto-cancels → strategy reposts next tick
-        ↓
-both legs of pair fill → paired_inventory detected → MERGE planned
-   └─ CTF.merge tx → $1 collateral released (USDC.e) → auto-wrap to pUSD
-```
 
-Each numbered step has a known-correct contract. If you suspect a bug,
-work through this list top-to-bottom and check the contract at each
-boundary.
+Deprecated naming such as `btc_5m_tinylive` or `hybrid-tinylive` should not be
+used for the current paired-MM deployment unless intentionally running a
+different profile.
 
 ---
 
-## 3. Required invariants by subsystem
+## 6. Verification checklist before tinylive
 
-### Strategy (`polymarket-exec/src/strategy.rs`)
+Do not claim readiness until these pass or are explicitly waived.
 
-- `build_paired_entry_ladder` returns up to `entry_ladder_levels × 2`
-  intents per call. Each level has a unique `quote_level_tag` of the form
-  `mm-paired-bid:lN`. Prices are tick-aligned (multiples of $0.01) by
-  `floor_to_tick`.
-- The only HARD bid cap is `entry_premium_bid_cap` (default $0.97,
-  env-tunable). Any other suppression must be signal-derived per the
-  V2 signals spec, not a constant.
-- `compute_market_mode` returns either `ManagingInventory` (if we hold
-  inventory) or `Ready`. There are NO regime/cooling/cooldown gates —
-  these were removed in the 2026-04-29 cleanup because whale data showed
-  none of them.
-- Hedge rescue (`mm-hedge-rescue` tag) emits Close intents (`IntentKind::Close`)
-  with `TIF=IOC, post_only=false`. Everything else is Entry.
-
-### Quote engine (`polymarket-exec/src/market_making/quote_engine.rs`)
-
-- `DesiredQuoteSet::from_intents` MUST detect pre-laddered intents and
-  pass them through verbatim — no `take(N)` truncation, no `skew_for_side`
-  price mutation. The detection criterion is `bucket.len() > 1 ||
-  level_tag.contains(":l")`.
-- `max_levels_per_side` clamp must be ≥ `entry_ladder_levels`. Default 16.
-- For legacy single-intent emissions (no per-level tag), the legacy fan-out
-  with skew is preserved.
-
-### Reconciler (`polymarket-exec/src/market_making/quote_reconciler.rs`)
-
-- `QuoteMatchKey` includes `level_tag`. Distinct ladder levels are
-  distinct keys.
-- Submit/replace/cancel rate caps come from env (`PM_BTC_5M_QUOTE_*`).
-  Not in code defaults.
-- Close intents (hedge rescue) bypass the submit rate cap.
-
-### Runtime (`polymarket-exec/src/runtime/mod.rs`)
-
-- `has_active_btc_mm_buy_for_instrument` matches by
-  `(market, instrument, level_tag)`. Without `level_tag` the filter
-  collapses ladders to the first level — see Bug #6 below.
-- All entry-time caps (max_open_orders, max_leg_cost, drift block)
-  must check `intent.kind` and skip Close intents.
-- `submit_rejection_counts_against_live_budget` excludes benign reasons
-  ("post-only", "crosses book", "would cross", "would take liquidity")
-  in BOTH the Ok-ack and Err paths. Without this, a single transient
-  book cross trips the live kill switch.
-
-### Execution adapter (`polymarket-exec/src/wire/execution_adapter.rs`)
-
-- Round `quantity` to 2 decimal places at the wire boundary (V2 SDK
-  rejects 15-decimal precision).
-- Treat `400 "invalid post-only order: order crosses book"` as a benign
-  rejection.
-
-### Hedge rescue and merge
-
-- Stranded inventory is detected from venue position reconciliation
-  (`venue reconciliation found stranded inventory`).
-- `decide_stranded_exposure` chooses HOLD vs RESCUE by EV. Hold when
-  `hold_ev > rescue_ev + HOLD_EV_MARGIN`.
-- Rescue is IOC FAK at the opposite leg's ask + race buffer ticks.
-- After both legs paired, merge plan fires with `min_notional ≥ $2.00`
-  to amortize gas.
-
----
-
-## 4. Configuration sources of truth
-
-| Concept | Where it's defined | Override mechanism |
-|---|---|---|
-| Ladder depth | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
-| Ladder spacing | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
-| Per-leg bid cap | `polymarket-exec/config/strategies/btc_5m_paired_mm.live.yaml` | YAML profile |
-| Capital caps | Strategy YAML + runtime risk caps | YAML / `PM_BTC_5M_EXEC_*` |
-| Risk caps | `PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_*` env | env |
-| TTL | `PM_BTC_5M_LIVE_ORDER_TTL_MS` env | env, default 20s |
-| Reconciler rate caps | `PM_BTC_5M_QUOTE_MAX_*` env | env |
-| Maker rebate behavior | venue-side; we just maintain `post_only=true` | n/a |
-| Suppression / cooling gates | **REMOVED** (2026-04-29) | n/a — should be signal-derived |
-
-Live env file lives at `~/.config/polymarket-exec/btc_5m_mm_tinylive.env`
-on the AWS host. Repo `polymarket-exec/env/btc_5m_mm_tinylive.env` is a
-template; the deployed version may diverge.
-
-**Single rule:** if a tunable doesn't appear in the env file, the code's
-default applies. There should be NO third source (no JSON profile gets
-wired for `btc_5m_mm` — see Bug #2 below).
-
----
-
-## 5. Verification checklist (before claiming the bot works)
-
-Run these in order. If any fails, do not claim "deployed and working":
-
-1. **Service alive:** `systemctl --user status polymarket-exec@btc_5m_mm_tinylive`
-   should show `Active: active (running)`.
-
-2. **No suppression gates firing:**
-   `journalctl ... | grep -E 'cooling|suppressed' | tail -20` should be
-   empty (post-2026-04-29 cleanup). If you see "cooling" entries, a gate
-   has been re-introduced — find and remove.
-
-3. **Ladder reaches the venue at all 8 levels:**
-   `journalctl ... | grep -oE 'mm-paired-bid:l[0-9]+' | sort | uniq -c`
-   should show non-zero counts for `l1` through `l8` (assuming env
-   `LEVELS=8`). If only `l1` appears, suspect:
-   - `from_intents` `clamp(1, 3)` — bug #4
-   - `has_active_btc_mm_buy_for_instrument` not matching by level_tag — bug #6
-   - `skew_for_side` pushing l2+ off-tick — bug #5
-
-4. **Maker fill ratio:** `python3 scripts/order_audit.py` should show
-   the vast majority of paired-bid fills tagged Maker. Taker fills on
-   `mm-paired-bid` indicate the post_only flag is broken or being
-   stripped at the SDK boundary.
-
-5. **Rebate inflow:** check `data-api.polymarket.com/rebates/current`
-   for the wallet — it should show non-zero earned rebates if we are
-   maker-quoting actively. Yesterday's measurement: ~$5.90/day on $50
-   starting capital.
-
-6. **Stranded inventory rescue path is hot but not fired needlessly:**
-   `journalctl ... | grep 'hedge rescue branch entered'` should show
-   logs only when `paired_quantity=0 stranded_legs > 0`. If it's
-   firing while `paired_quantity > 0`, the inventory detection is
-   broken.
-
-7. **Merges happen on paired inventory:** look for
-   `merge intent planned` events. If you see paired inventory sitting
-   for > 30s without a merge, the merge gate is broken or gas-cost
-   penalty has gone wrong.
-
----
-
-## 6. Known bug patterns and how to recognize them
-
-### Bug 1 — Live kill switch trips on benign post-only rejection
-
-**Symptom:** logs show `live execution error budget exhausted
-submit_errors=1` after a single submit failure, then the bot starts
-cancelling orders and stops submitting. Often after an entry like
-`"invalid post-only order: order crosses book"`.
-
-**Root cause:** `submit_rejection_counts_against_live_budget` in
-`runner.rs` was only consulted on the Ok-ack path, not the Err path.
-A 400 from the SDK comes back as `Err(ExecutionError)` and was
-incrementing the counter unconditionally.
-
-**Fix:** classify the Err message through the same exclusion list before
-incrementing. Patched on 2026-04-29.
-
-### Historical Bug 2 — Profile JSON had no effect on old `btc_5m_mm`
-
-**Symptom:** operator sets `quote.levels_per_side: 8` in profile JSON,
-ladder still emits 3 levels.
-
-**Root cause:** the old `btc_5m_mm` selector ignored the profile and called
-env-only config. The current active selectors are `paired_mm`, `pair_cost_arb`,
-and `hybrid`, all driven by YAML strategy profiles.
-
-**Detection:** `grep -n 'StrategyMode::try_from_name\|btc_5m_mm.*profile'` —
-if no profile field flows into `Btc5mMmConfig`, none will take effect.
-
-**Fix path:** PR1 in the audit (`docs/strategy/audit_2026-04-29.md`) —
-add `Btc5mMmProfile` sub-struct and wire it.
-
-### Bug 3 — Quote engine clamps ladder to 3 levels (clamp(1, 3))
-
-**Symptom:** strategy emits 8 sized levels (verified in `strategy.sizing`
-logs), only top-3 priced ones reach the reconciler.
-
-**Root cause:** `DesiredQuoteSet::from_intents` had a hardcoded
-`max_levels.clamp(1, 3)`.
-
-**Fix:** clamped to 1..32 + pre-laddered detection, 2026-04-29.
-
-### Bug 4 — `skew_for_side` pushes ladder prices off-tick
-
-**Symptom:** strategy emits prices 0.43, 0.42, 0.41 (tick-aligned);
-venue rejects 67% of l2/l3 orders silently.
-
-**Root cause:** `from_intents` runs `skew_for_side(price, level)` which
-multiplies by `(1 - level × skew_bps/10000)` → 0.42 becomes 0.4196850
-which is not on the 1c tick grid. Polymarket V2 silently drops
-off-tick prices.
-
-**Fix:** skip skew for pre-laddered intents (detected by `bucket.len() > 1`
-or `level_tag.contains(":l")`). 2026-04-29.
-
-### Bug 5 — Duplicate-buy filter blocks ladder beyond level 0
-
-**Symptom:** ladder reaches venue but only `:l1:` ever sees `Working`.
-`l2`-`l8` rejected as "duplicate active btc buy intent". This was the
-2026-04-29 mid-day surprise — the fix to bug 4 made `intents_in=16` but
-plan size stayed at 1 because of THIS filter.
-
-**Root cause:** `has_active_btc_mm_buy_for_instrument` matched by
-`(market, instrument, side)`. Once `l1` was active, every later level
-on the same instrument was rejected.
-
-**Fix:** include `quote_level_tag` in the match. 2026-04-29.
-
-### Bug 6 — Cooling/suppression gates compound
-
-**Symptom:** bot looks dormant on volatile bars; `journalctl` is full
-of `state="cooling" reason="market mid moved 0.10"` etc. for every
-tick.
-
-**Root cause:** five separate gates stack:
-- post-fill cooldown
-- mid-trend movement
-- premium fair cap
-- asymmetric-fill cooldown
-- regime-trending suppression
-
-ALL were hardcoded constants. Any one firing → no paired entry.
-
-**Fix:** removed all of them in the 2026-04-29 cleanup. The signals
-spec describes the V2 signal-derived replacements (order flow imbalance,
-bar-phase pacing, vol-scaled thresholds).
-
-### Bug 7 — Order TTL too short or too long
-
-**Symptom:** if too short, you see lots of "order expired" + reposts
-(reconciler churn). If too long, stale quotes get filled at
-disadvantageous prices when the book moves.
-
-**Tunable:** `PM_BTC_5M_LIVE_ORDER_TTL_MS`. Current default 20s.
-Whale's empirical bid persistence appears similar — leave at 20s
-unless you see a specific symptom.
-
-### Bug 8 — Stranded inventory naked because rescue dropped
-
-**Symptom:** `hedge rescue branch entered ... intent_built=false` for
-many ticks while a stranded leg sits exposed.
-
-**Root cause history:** four separate places stripped Close-kind
-intents when they shouldn't have:
-1. Drift block in `accept_intent`
-2. Risk engine `max_open_orders`
-3. `enforce_unlawful_mode` cancel filter
-4. Submit rate cap in reconciler
-
-**Fix:** all four now check `intent.kind == IntentKind::Close` and
-bypass. If you add a fifth gate that touches order intents, do this too.
-
----
-
-## 7. Useful one-liners
+1. Service target is correct.
 
 ```bash
-# How many ladder levels are actually firing?
+systemctl --user status polymarket-exec@btc_5m_mm_tinylive
+```
+
+2. No accidental SELL path.
+
+```bash
+rg -n "TradeSide::Sell|Side::Sell|sell" polymarket-exec/src
+```
+
+Then inspect any matches and confirm they are not active paired-MM unwind
+submissions.
+
+3. YAML/env alignment.
+
+```bash
+rg -n "PM_BTC_5M|btc_5m_mm|btc_5m_paired_mm" polymarket-exec/src scripts polymarket-exec/ops/env polymarket-exec/config
+```
+
+Check launcher env names match `config/mod.rs`, and that tinylive does not
+override YAML risk caps accidentally.
+
+4. Ladder reaches venue.
+
+```bash
+journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service --since '15 minutes ago' --no-pager \
+  | grep -oE 'mm-paired-bid:l[0-9]+' | sort | uniq -c
+```
+
+5. Collapsed ladder aggregation is visible.
+
+Look for one submitted order where several intended levels collapsed to one
+instrument/side/price and metadata preserves the combined level tags.
+
+6. Maker ratio is sane.
+
+Paired ladder fills should mostly be maker fills. Taker-heavy paired entries
+mean `post_only` or quote placement is wrong.
+
+7. Stranded inventory is visible and explainable.
+
+The journal/dashboard should show:
+
+- stranded side,
+- stranded quantity,
+- cost basis,
+- current fair/book value,
+- pairable quantity,
+- mergeable notional,
+- late convex adjustment reason.
+
+8. Merge batching works.
+
+Tiny pairable inventory should not necessarily merge immediately. Pairable
+inventory should merge when batch threshold/cash pressure/gross inventory
+policy says so.
+
+9. Replay sanity.
+
+Run at least one real Telonex-backed replay window before tinylive. Check:
+
+- fills,
+- stranded inventory,
+- merge batching,
+- late convex orders,
+- settlement/redeem accounting,
+- no SELL path.
+
+---
+
+## 7. Known bug patterns
+
+### Bug 1: benign post-only rejection trips live kill switch
+
+Symptom: one `invalid post-only order: order crosses book` failure causes live
+execution budget exhaustion.
+
+Fix invariant: benign post-only/crossing rejections must not count as fatal
+live errors in either Ok-ack or Err paths.
+
+### Bug 2: config drift between YAML, env, and launcher
+
+Symptom: operator changes YAML but live behavior does not change, or env uses a
+name that `config/mod.rs` never parses.
+
+Fix invariant: strategy knobs live in YAML; launcher env only handles secrets,
+paths, venue mode, and explicit operational overrides.
+
+### Bug 3: ladder clamp or duplicate filter collapses orders
+
+Symptom: strategy builds multiple ladder levels, but venue only sees one level
+per instrument.
+
+Fix invariant:
+
+- quote engine passes pre-laddered intents through,
+- duplicate filter matches by `market + instrument + side + level_tag`,
+- collapsed same-price children are aggregated intentionally, not dropped.
+
+### Bug 4: off-tick prices
+
+Symptom: l2/l3+ orders silently reject or disappear.
+
+Fix invariant: all submitted prices are one-cent tick aligned after any skew or
+aggregation.
+
+### Bug 5: stale open-order source of truth
+
+Symptom: runtime thinks orders are working when venue has cancelled/expired
+them, or submits duplicates because local state missed a fill/cancel.
+
+Fix invariant: reconciliation should write and read the same `OrderStore`
+state, and unexpected venue state should be logged as reconciliation drift.
+
+### Bug 6: immediate tiny merge churn
+
+Symptom: many tiny merge attempts for trivial pairable quantities.
+
+Fix invariant: merge batching threshold applies unless free cash or gross
+inventory pressure requires immediate recycling.
+
+### Bug 7: buy/sell loop
+
+Symptom: activity alternates BUY then SELL in the same market, often locking in
+losses while still leaving inventory risk.
+
+Fix invariant: active paired MM has no SELL unwind path. If SELL appears,
+identify the exact code path before restart.
+
+### Bug 8: late convex starved by risk caps
+
+Symptom: late favorite/tail logic appears to fire in logs but submits nothing
+because `max_order_notional`, `max_leg_cost`, or `max_position_quantity` are
+too low.
+
+Fix invariant: either YAML caps are intentionally tiny for tinylive, or the
+profile is raised explicitly. Do not bypass risk in code.
+
+---
+
+## 8. Useful one-liners
+
+```bash
+# Live logs
+journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service -f
+
+# Ladder tags seen in logs
 journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service --since '15 minutes ago' --no-pager \
   | grep -oE 'mm-paired-bid:l[0-9]+' | sort | uniq -c
 
-# Audit submit→fill→reject lifecycle
-python3 scripts/order_audit.py --since 3600
+# Late convex / package decisions
+journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service --since '15 minutes ago' --no-pager \
+  | grep -E 'convex|favorite|tail|package|stranded'
 
-# What's the bot decision per tick?
-journalctl ... | grep 'ladder pipeline counts' | tail
+# Merge planning
+journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service --since '30 minutes ago' --no-pager \
+  | grep -E 'merge intent|pairable|merge batch|redeem'
 
-# Why was paired entry suppressed (should be empty post-2026-04-29)?
-journalctl ... | grep -E 'suppressed by market state|cooling|asymmetric'
+# Post-only / live budget failures
+journalctl --user -u polymarket-exec@btc_5m_mm_tinylive.service --since '30 minutes ago' --no-pager \
+  | grep -E 'post-only|crosses book|error budget exhausted'
 
-# Did our submit rejection trip the kill switch?
-journalctl ... | grep 'live execution error budget exhausted'
-
-# Maker vs taker fill mix
-journalctl ... | grep 'liquidity=' | grep -oE 'liquidity=\w+' | sort | uniq -c
-
-# Wallet rebate balance
+# Rebate balance
 curl -s "https://data-api.polymarket.com/rebates/current?user=$WALLET" | jq
-
-# Live env file (source of truth for the deployment)
-ssh ubuntu@$AWS_LIVE_HOST 'cat ~/.config/polymarket-exec/btc_5m_mm_tinylive.env'
 ```
 
 ---
 
-## 8. When to escalate vs when to fix yourself
+## 9. What winning should look like
 
-**Fix yourself:**
-- A constant in `strategy.rs` is gating behavior whale exhibits — promote
-  to env or remove (follow `docs/strategy/audit_2026-04-29.md` PR list).
-- Logs show a known bug pattern from §6 — apply the listed fix.
-- Reconciler churn is tight — bump `PM_BTC_5M_QUOTE_MAX_SUBMIT_PER_WINDOW`.
-- TTL too aggressive/loose — bump `PM_BTC_5M_LIVE_ORDER_TTL_MS`.
+Normal window:
 
-**Discuss with operator first:**
-- Touching `inventory.rs` (paired ledger) — a bug here causes
-  incorrect P&L attribution.
-- Touching `core/risk.rs` — gates can fire on legitimate intents.
-- Adding a new suppression gate — these have a strong pattern of
-  causing the bot to look dormant for hours; require signal grounding
-  per CLAUDE.md "Gate calibration".
-- Changing `IntentKind::{Entry, Close}` semantics — this is the typed
-  invariant that prevents the rescue-trapping bugs.
+- early/mid: both sides quoted passively,
+- fills arrive mostly as maker,
+- pairable inventory accumulates without excessive duplicate orders,
+- stranded inventory is visible and bounded,
+- late window: favorite/tail convex overlay may reshape payoff,
+- paired quantities merge when batch/cash policy says so,
+- no SELL unwind,
+- resolution accounting correctly redeems winner and expires loser.
 
----
-
-## 9. Quick mental model: what does "winning" look like?
-
-A normal day in the life:
-- Bot quotes both legs of every active 5m bar at $0.45 / $0.55 (or
-  wherever the book sits)
-- A taker hits one leg → we have one-sided inventory for ~10 seconds
-- The other leg fills via natural taker flow → paired inventory
-- Auto-merge releases $1 collateral → +$0.0X realized + maker rebate
-- 50-100x per day → compounds
-
-If the bot sits idle with 0 fills for 30+ minutes during active hours,
-something is gating entry. Start with §5 verification checklist.
+If the bot has no fills for active windows, start with quote suppression and
+venue submission. If it has many fills but loses money, start with stranded
+inventory, late convex sizing, merge batching, and settlement accounting.
