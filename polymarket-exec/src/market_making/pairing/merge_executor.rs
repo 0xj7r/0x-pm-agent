@@ -29,6 +29,12 @@ pub struct MergeExecutor {
     gas_fee_usd: f64,
 }
 
+impl Default for MergeExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MergeExecutor {
     pub fn new() -> Self {
         Self::with_fees(0.0, 0.0)

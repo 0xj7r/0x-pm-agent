@@ -139,7 +139,7 @@ fn ticks_to_price(ticks: i64) -> f64 {
     ticks as f64 / 1_000_000.0
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct QuoteReconciler {
     config: ReconcilerConfig,
     churn_events: VecDeque<EpochMillis>,
@@ -149,18 +149,6 @@ pub struct QuoteReconciler {
     hard_pull_until_ms: Option<EpochMillis>,
 }
 
-impl Default for QuoteReconciler {
-    fn default() -> Self {
-        Self {
-            config: ReconcilerConfig::default(),
-            churn_events: VecDeque::new(),
-            submit_events: VecDeque::new(),
-            replace_events: VecDeque::new(),
-            cancel_events: VecDeque::new(),
-            hard_pull_until_ms: None,
-        }
-    }
-}
 impl QuoteReconciler {
     pub fn new(config: ReconcilerConfig) -> Self {
         Self {
@@ -671,7 +659,7 @@ mod tests {
 
     fn intent(id: &str, price: f64) -> OrderIntent {
         OrderIntent {
-            client_order_id: ClientOrderId::from(format!("{id}")),
+            client_order_id: ClientOrderId::from(id.to_string()),
             market_id: MarketId::from("market-1"),
             instrument_id: InstrumentId::from("instrument-1"),
             side: TradeSide::Buy,

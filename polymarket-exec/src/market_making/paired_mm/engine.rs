@@ -81,7 +81,7 @@ impl Default for ConvexityOverlayConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct PairedMmEngineConfig {
     pub ladder: LadderConfig,
     pub rescue: RescueConfig,
@@ -90,20 +90,6 @@ pub struct PairedMmEngineConfig {
     pub hard_policy: HardPolicyConfig,
     pub auto_fill: AutoFillConfig,
     pub convexity_overlay: ConvexityOverlayConfig,
-}
-
-impl Default for PairedMmEngineConfig {
-    fn default() -> Self {
-        Self {
-            ladder: LadderConfig::default(),
-            rescue: RescueConfig::default(),
-            merge: MergePolicyConfig::default(),
-            capital_recycle: CapitalRecycleConfig::default(),
-            hard_policy: HardPolicyConfig::default(),
-            auto_fill: AutoFillConfig::default(),
-            convexity_overlay: ConvexityOverlayConfig::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -526,30 +512,29 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         None
     };
     let tail_price_cap = (1.0 / config.min_tail_payoff_multiple.max(1.0)).max(tick_size);
-    let maybe_package_plan =
-        maybe_tail_quote.and_then(|(tail_limit_price, tail_best_ask)| {
-            if tail_best_ask > tail_price_cap {
-                return None;
-            }
-            choose_late_asymmetric_package(
-                favorite_prob,
-                tail_prob,
-                favorite_limit_price,
-                tail_limit_price,
-                effective_favorite_qty,
-                effective_tail_qty,
-                existing_cost,
-                existing_ev,
-                remaining_excess_budget,
-                favorite_depth_usd,
-                tail_depth_usd,
-                market.min_order_size(),
-                btc_regime.regime(),
-                pressure_bias,
-                config,
-            )
-            .map(|plan| (plan, tail_limit_price, tail_best_ask))
-        });
+    let maybe_package_plan = maybe_tail_quote.and_then(|(tail_limit_price, tail_best_ask)| {
+        if tail_best_ask > tail_price_cap {
+            return None;
+        }
+        choose_late_asymmetric_package(
+            favorite_prob,
+            tail_prob,
+            favorite_limit_price,
+            tail_limit_price,
+            effective_favorite_qty,
+            effective_tail_qty,
+            existing_cost,
+            existing_ev,
+            remaining_excess_budget,
+            favorite_depth_usd,
+            tail_depth_usd,
+            market.min_order_size(),
+            btc_regime.regime(),
+            pressure_bias,
+            config,
+        )
+        .map(|plan| (plan, tail_limit_price, tail_best_ask))
+    });
 
     if let Some((plan, tail_limit_price, tail_best_ask)) = maybe_package_plan {
         let mut intents = Vec::with_capacity(2);
@@ -742,9 +727,7 @@ fn choose_late_favorite_only(
         return None;
     }
 
-    let regime_label = regime
-        .map(|regime| regime_label(regime))
-        .unwrap_or("unknown");
+    let regime_label = regime.map(regime_label).unwrap_or("unknown");
     let book_take = config.max_book_take_pct.clamp(0.01, 1.0);
     let depth_cap = (favorite_depth_usd * book_take).max(config.min_order_usd);
     let risk_cap = config
@@ -757,16 +740,14 @@ fn choose_late_favorite_only(
     .clamp(0.0, 1.0);
     let edge = (favorite_prob - favorite_price).max(0.0);
     let kelly = edge / (1.0 - favorite_price).max(1e-9);
-    let capital_budget = (config.max_loss_usd.max(0.0) * config.capital_pct.max(0.0))
-        .max(config.min_order_usd);
+    let capital_budget =
+        (config.max_loss_usd.max(0.0) * config.capital_pct.max(0.0)).max(config.min_order_usd);
     let mut notional = (capital_budget * config.fractional_kelly.clamp(0.0, 1.0))
         .max(config.min_order_usd)
         .max(capital_budget * terminal_confidence * config.fractional_kelly.clamp(0.0, 1.0))
         .max(capital_budget * kelly * config.fractional_kelly.clamp(0.0, 1.0))
         * pressure_bias.favorite_scale;
-    notional = notional
-        .min(depth_cap)
-        .min(risk_cap);
+    notional = notional.min(depth_cap).min(risk_cap);
     if matches!(regime, Some(BtcRegime::Whipsaw)) {
         notional *= 0.75;
     }
@@ -833,9 +814,7 @@ fn choose_late_asymmetric_package(
         return None;
     }
 
-    let regime_label = regime
-        .map(|regime| regime_label(regime))
-        .unwrap_or("unknown");
+    let regime_label = regime.map(regime_label).unwrap_or("unknown");
     let tail_stranded = existing_tail_qty > existing_favorite_qty + min_order_size.max(1e-9);
     let favorite_stranded = existing_favorite_qty > existing_tail_qty + min_order_size.max(1e-9);
     let risk_budget = config.max_loss_usd.max(0.0);
@@ -982,6 +961,31 @@ fn regime_label(regime: BtcRegime) -> &'static str {
         BtcRegime::DirectionalSmooth => "directional_smooth",
         BtcRegime::TrendingVolatile => "trending_volatile",
     }
+}
+
+fn passive_buy_price(
+    quote: &crate::types::QuoteSnapshot,
+    tick_size: f64,
+    maker_safety_ticks: f64,
+) -> Option<(f64, f64)> {
+    let best_ask = quote.best_ask.as_ref()?.price;
+    let best_bid = quote
+        .best_bid
+        .as_ref()
+        .map(|level| level.price)
+        .unwrap_or(tick_size);
+    if !best_ask.is_finite() || best_ask <= tick_size || best_ask >= 1.0 {
+        return None;
+    }
+
+    let maker_cap = best_ask - tick_size * maker_safety_ticks.max(1.0);
+    let limit_price = (best_bid + tick_size)
+        .min(maker_cap)
+        .clamp(tick_size, 1.0 - tick_size);
+    if !limit_price.is_finite() || limit_price >= best_ask {
+        return None;
+    }
+    Some((limit_price, best_ask))
 }
 
 #[cfg(test)]
@@ -1281,29 +1285,4 @@ mod tests {
         assert!(plan.tail_payoff_multiple >= 4.0);
         assert!(plan.pnl_if_tail >= 10.0);
     }
-}
-
-fn passive_buy_price(
-    quote: &crate::types::QuoteSnapshot,
-    tick_size: f64,
-    maker_safety_ticks: f64,
-) -> Option<(f64, f64)> {
-    let best_ask = quote.best_ask.as_ref()?.price;
-    let best_bid = quote
-        .best_bid
-        .as_ref()
-        .map(|level| level.price)
-        .unwrap_or(tick_size);
-    if !best_ask.is_finite() || best_ask <= tick_size || best_ask >= 1.0 {
-        return None;
-    }
-
-    let maker_cap = best_ask - tick_size * maker_safety_ticks.max(1.0);
-    let limit_price = (best_bid + tick_size)
-        .min(maker_cap)
-        .clamp(tick_size, 1.0 - tick_size);
-    if !limit_price.is_finite() || limit_price >= best_ask {
-        return None;
-    }
-    Some((limit_price, best_ask))
 }

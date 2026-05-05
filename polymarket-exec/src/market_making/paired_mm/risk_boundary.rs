@@ -97,6 +97,53 @@ pub fn evaluate_entry_intent(
     PairedMmRiskDecision::accept()
 }
 
+pub fn filter_entry_intents(
+    inventory: &PairedInventorySnapshot,
+    intents: Vec<OrderIntent>,
+    caps: &RunningInventoryCaps,
+) -> (Vec<OrderIntent>, Vec<PairedMmRiskDecision>) {
+    let mut rejected_pair_ids: HashSet<String> = HashSet::new();
+    let mut accepted = Vec::with_capacity(intents.len());
+    let mut decisions = Vec::new();
+    let mut evaluated = Vec::with_capacity(intents.len());
+
+    for intent in intents {
+        let decision = evaluate_entry_intent(inventory, &intent, caps);
+        if !decision.accepted {
+            if let Some(pair_id) = intent.pair_id.as_ref() {
+                rejected_pair_ids.insert(pair_id.clone());
+            }
+            decisions.push(decision.clone());
+        }
+        evaluated.push((intent, decision));
+    }
+
+    for (intent, decision) in evaluated {
+        if !decision.accepted {
+            continue;
+        }
+        if intent
+            .pair_id
+            .as_ref()
+            .is_some_and(|pair_id| rejected_pair_ids.contains(pair_id))
+        {
+            decisions.push(PairedMmRiskDecision::reject(
+                PairedMmRiskReject::EntryNotionalCap {
+                    notional_usd: intent.notional_usd(),
+                    cap_usd: caps.max_entry_notional_usd,
+                },
+                format!(
+                    "paired-mm paired entry mate rejected; suppressing pair_id={}",
+                    intent.pair_id.as_deref().unwrap_or_default()
+                ),
+            ));
+            continue;
+        }
+        accepted.push(intent);
+    }
+    (accepted, decisions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,51 +197,4 @@ mod tests {
             Some(PairedMmRiskReject::EntryQuantityCap { .. })
         ));
     }
-}
-
-pub fn filter_entry_intents(
-    inventory: &PairedInventorySnapshot,
-    intents: Vec<OrderIntent>,
-    caps: &RunningInventoryCaps,
-) -> (Vec<OrderIntent>, Vec<PairedMmRiskDecision>) {
-    let mut rejected_pair_ids: HashSet<String> = HashSet::new();
-    let mut accepted = Vec::with_capacity(intents.len());
-    let mut decisions = Vec::new();
-    let mut evaluated = Vec::with_capacity(intents.len());
-
-    for intent in intents {
-        let decision = evaluate_entry_intent(inventory, &intent, caps);
-        if !decision.accepted {
-            if let Some(pair_id) = intent.pair_id.as_ref() {
-                rejected_pair_ids.insert(pair_id.clone());
-            }
-            decisions.push(decision.clone());
-        }
-        evaluated.push((intent, decision));
-    }
-
-    for (intent, decision) in evaluated {
-        if !decision.accepted {
-            continue;
-        }
-        if intent
-            .pair_id
-            .as_ref()
-            .is_some_and(|pair_id| rejected_pair_ids.contains(pair_id))
-        {
-            decisions.push(PairedMmRiskDecision::reject(
-                PairedMmRiskReject::EntryNotionalCap {
-                    notional_usd: intent.notional_usd(),
-                    cap_usd: caps.max_entry_notional_usd,
-                },
-                format!(
-                    "paired-mm paired entry mate rejected; suppressing pair_id={}",
-                    intent.pair_id.as_deref().unwrap_or_default()
-                ),
-            ));
-            continue;
-        }
-        accepted.push(intent);
-    }
-    (accepted, decisions)
 }

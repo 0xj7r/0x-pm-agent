@@ -189,6 +189,12 @@ struct AdapterState {
 
 pub struct PaperExecutionAdapter;
 
+impl Default for PaperExecutionAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PaperExecutionAdapter {
     pub fn new() -> Self {
         Self

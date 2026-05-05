@@ -361,13 +361,11 @@ impl MarketPairState {
         let losing_cost_usd = total_cost(losing_lots);
         let expected_cash_usd = winning_qty;
         let expected_net_gain_usd = expected_cash_usd - winning_cost_usd - losing_cost_usd;
-        let (
-            stranded_winning_qty_before_resolution,
-            stranded_losing_qty_before_resolution,
-        ) = match winning_leg_pair {
-            PairLeg::Yes => (self.stranded_yes_qty, self.stranded_no_qty),
-            PairLeg::No => (self.stranded_no_qty, self.stranded_yes_qty),
-        };
+        let (stranded_winning_qty_before_resolution, stranded_losing_qty_before_resolution) =
+            match winning_leg_pair {
+                PairLeg::Yes => (self.stranded_yes_qty, self.stranded_no_qty),
+                PairLeg::No => (self.stranded_no_qty, self.stranded_yes_qty),
+            };
 
         Some(ResolvedRedeemCandidate {
             market_id: self.market_id.clone(),

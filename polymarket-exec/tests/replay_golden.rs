@@ -1,4 +1,4 @@
-//! Deterministic golden-fixture replay test 
+//! Deterministic golden-fixture replay test
 //!
 //! Generates a 50-event canonical fixture, writes it to a temp directory as
 //! Parquet + JSONL, reads both back through the replay reader, runs the
@@ -209,7 +209,7 @@ fn golden_fixture_total_fill_size_equals_strategy_quote_size() {
     // volume in the fixture (sum of sizes is >= 100).
     let total: f64 = fills.iter().map(|f| f.size).sum();
     assert!(
-        total >= 99.999 && total <= 100.001,
+        (99.999..=100.001).contains(&total),
         "expected ~100, got {total}"
     );
 }
