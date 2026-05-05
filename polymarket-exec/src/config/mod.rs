@@ -106,6 +106,7 @@ pub struct AppConfig {
     pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
     pub journal_rotate_bytes: Option<u64>,
+    pub journal_firehose_stream: Option<String>,
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
@@ -374,6 +375,8 @@ impl AppConfig {
                 })
             })
             .transpose()?;
+        let journal_firehose_stream = env_value("PM_BTC_5M_EXEC_JOURNAL_FIREHOSE_STREAM")
+            .filter(|value| !value.trim().is_empty());
         let starting_cash_usd = parse_f64("PM_BTC_5M_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity = parse_usize("PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
@@ -584,6 +587,7 @@ impl AppConfig {
             market_context_path,
             journal_path,
             journal_rotate_bytes,
+            journal_firehose_stream,
             starting_cash_usd,
             event_log_capacity,
             market_id_by_asset,

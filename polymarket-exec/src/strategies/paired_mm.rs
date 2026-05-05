@@ -7,7 +7,7 @@ use crate::market_making::paired_mm::{
 };
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{CoolingReason, StrategyDecision};
+use crate::types::{CoolingReason, InstrumentId, StrategyDecision};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairedMmStrategyConfig {
@@ -70,6 +70,15 @@ where
         let vol_5m_bps = input.btc_regime.realized_vol_5m_bps;
         let ret180_bps = input.btc_regime.return_180s_bps;
         let imbalance_qty = input.inventory.side_imbalance_qty();
+        let yes_instrument_id = input.market.yes_instrument_id().clone();
+        let no_instrument_id = input.market.no_instrument_id().clone();
+        let repair_mode = RepairMode::from_inventory(
+            input.inventory.yes_qty,
+            input.inventory.no_qty,
+            input.market.min_order_size().max(1.0),
+            &yes_instrument_id,
+            &no_instrument_id,
+        );
         let recycle_only_threshold = self
             .engine
             .config()
@@ -113,23 +122,57 @@ where
             return StrategyDecision::capital_recycle(vec![intent], notes);
         }
 
-        if recycle_only {
-            notes.push(format!(
-                "paired-mm recycle-only: suppressing fresh paired-entry ladder imbalance_qty={imbalance_qty:.4} threshold={recycle_only_threshold:.4}"
-            ));
-            return StrategyDecision::suppress(CoolingReason::SideImbalanceCap, false, notes);
-        }
-
         if let Some(reason) = PairedMmEngine::suppression_reason(&decision) {
             return StrategyDecision::suppress(reason, false, notes);
         }
 
         let mut intents = decision.ladder.intents;
+        if let Some(repair_mode) = &repair_mode {
+            let before = intents.len();
+            intents.retain(|intent| intent.instrument_id == repair_mode.light_instrument_id);
+            let removed = before.saturating_sub(intents.len());
+            notes.push(format!(
+                "paired-mm decision_label=light_side_repair mode=repair_first heavy_leg={} light_leg={} imbalance_qty={imbalance_qty:.4} recycle_threshold={recycle_only_threshold:.4} removed_heavy_leg_quotes={removed}",
+                repair_mode.heavy_leg,
+                repair_mode.light_leg
+            ));
+        }
         if !intents.is_empty() {
-            notes.push("paired-mm decision_label=paired_entry mode=paired_entry_mode paired ladder emitted".to_string());
+            if repair_mode.is_some() {
+                notes.push(
+                    "paired-mm decision_label=light_side_repair mode=repair_first light-side repair ladder emitted"
+                        .to_string(),
+                );
+            } else {
+                notes.push("paired-mm decision_label=paired_entry mode=paired_entry_mode paired ladder emitted".to_string());
+            }
         }
         if let Some(intent) = decision.convex_overlay {
-            intents.push(intent);
+            if repair_mode
+                .as_ref()
+                .is_none_or(|mode| intent.instrument_id != mode.heavy_instrument_id)
+            {
+                intents.push(intent);
+            } else {
+                notes.push(
+                    "paired-mm convex overlay suppressed: would add to heavy leg during repair-first mode"
+                        .to_string(),
+                );
+            }
+        }
+
+        if intents.is_empty() && repair_mode.is_some() {
+            notes.push(format!(
+                "paired-mm repair-first: no viable light-side quote; suppressing fresh entry imbalance_qty={imbalance_qty:.4} threshold={recycle_only_threshold:.4}"
+            ));
+            return StrategyDecision::suppress(CoolingReason::SideImbalanceCap, false, notes);
+        }
+
+        if recycle_only && repair_mode.is_none() {
+            notes.push(format!(
+                "paired-mm recycle-only: suppressing fresh paired-entry ladder imbalance_qty={imbalance_qty:.4} threshold={recycle_only_threshold:.4}"
+            ));
+            return StrategyDecision::suppress(CoolingReason::SideImbalanceCap, false, notes);
         }
 
         StrategyDecision::quote_set(intents, notes)
@@ -161,6 +204,46 @@ where
                 ));
                 StrategyDecision::rescue(Vec::new(), notes)
             }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RepairMode {
+    heavy_leg: &'static str,
+    light_leg: &'static str,
+    heavy_instrument_id: InstrumentId,
+    light_instrument_id: InstrumentId,
+}
+
+impl RepairMode {
+    fn from_inventory(
+        yes_qty: f64,
+        no_qty: f64,
+        min_meaningful_qty: f64,
+        yes_instrument_id: &InstrumentId,
+        no_instrument_id: &InstrumentId,
+    ) -> Option<Self> {
+        let imbalance_qty = (yes_qty - no_qty).abs();
+        if imbalance_qty < min_meaningful_qty.max(1e-9) {
+            return None;
+        }
+        if yes_qty > no_qty {
+            Some(Self {
+                heavy_leg: "yes",
+                light_leg: "no",
+                heavy_instrument_id: yes_instrument_id.clone(),
+                light_instrument_id: no_instrument_id.clone(),
+            })
+        } else if no_qty > yes_qty {
+            Some(Self {
+                heavy_leg: "no",
+                light_leg: "yes",
+                heavy_instrument_id: no_instrument_id.clone(),
+                light_instrument_id: yes_instrument_id.clone(),
+            })
+        } else {
+            None
         }
     }
 }

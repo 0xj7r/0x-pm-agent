@@ -3,10 +3,13 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use aws_sdk_firehose::{primitives::Blob, types::Record, Client as FirehoseClient};
 use serde::Serialize;
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 use crate::event_log::EventRecord;
 use crate::runtime::RuntimeCheckpoint;
@@ -39,6 +42,107 @@ pub struct JournalWriter {
     writer: BufWriter<File>,
     rotate_bytes: Option<u64>,
     current_size_bytes: u64,
+}
+
+pub struct JournalFanout {
+    local: Option<JournalWriter>,
+    firehose: Option<JournalFirehoseSink>,
+}
+
+impl JournalFanout {
+    pub async fn open(
+        path: Option<PathBuf>,
+        rotate_bytes: Option<u64>,
+        firehose_stream: Option<String>,
+    ) -> Result<Self> {
+        let local = path
+            .map(|path| JournalWriter::open_with_rotation(path, rotate_bytes))
+            .transpose()?;
+        let firehose = match firehose_stream {
+            Some(stream) if !stream.trim().is_empty() => {
+                Some(JournalFirehoseSink::spawn(stream).await)
+            }
+            _ => None,
+        };
+        Ok(Self { local, firehose })
+    }
+
+    pub fn append_event(&mut self, record: &EventRecord) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeEvent { record })
+    }
+
+    pub fn append_command(&mut self, command: &RuntimeCommand) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeCommand { command })
+    }
+
+    pub fn append_checkpoint(
+        &mut self,
+        observed_at_ms: u64,
+        run_id: &str,
+        name: &str,
+        open_orders: usize,
+        needs_reconcile_orders: usize,
+        event_seq_checkpoint: u64,
+    ) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeCheckpoint {
+            observed_at_ms,
+            run_id,
+            name,
+            open_orders,
+            needs_reconcile_orders,
+            event_seq_checkpoint,
+        })
+    }
+
+    pub fn append_runtime_checkpoint(&mut self, checkpoint: &RuntimeCheckpoint) -> Result<()> {
+        self.append_line(&JournalLine::RuntimeReplayCheckpoint { checkpoint })
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(local) = self.local.as_mut() {
+            local.flush()?;
+        }
+        Ok(())
+    }
+
+    fn append_line(&mut self, line: &JournalLine<'_>) -> Result<()> {
+        let payload = serde_json::to_vec(line).context("failed to serialize journal line")?;
+        if let Some(local) = self.local.as_mut() {
+            local.append_serialized_line(&payload)?;
+        }
+        if let Some(firehose) = self.firehose.as_ref() {
+            let mut payload = payload;
+            payload.push(b'\n');
+            firehose.enqueue(payload);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct JournalFirehoseSink {
+    sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl JournalFirehoseSink {
+    async fn spawn(delivery_stream: String) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let config = aws_config::load_from_env().await;
+        let client = FirehoseClient::new(&config);
+        tokio::spawn(run_firehose_journal_sink(
+            client,
+            delivery_stream.clone(),
+            receiver,
+        ));
+        tracing::info!(delivery_stream, "runtime journal Firehose sink enabled");
+        Self { sender }
+    }
+
+    fn enqueue(&self, payload: Vec<u8>) {
+        if self.sender.send(payload).is_err() {
+            warn!("runtime journal Firehose sink is closed; dropping journal line");
+        }
+    }
 }
 
 impl JournalWriter {
@@ -112,17 +216,27 @@ impl JournalWriter {
     }
 
     fn append_line(&mut self, line: &JournalLine<'_>) -> Result<()> {
-        self.rotate_if_needed()?;
-        serde_json::to_writer(&mut self.writer, line).with_context(|| {
+        let payload = serde_json::to_vec(line).with_context(|| {
             format!(
                 "failed to serialize journal line to {}",
                 self.path.display()
             )
         })?;
+        self.append_serialized_line(&payload)
+    }
+
+    fn append_serialized_line(&mut self, payload: &[u8]) -> Result<()> {
+        self.rotate_if_needed()?;
+        self.writer
+            .write_all(payload)
+            .with_context(|| format!("failed to append journal line to {}", self.path.display()))?;
         self.writer
             .write_all(b"\n")
             .with_context(|| format!("failed to append newline to {}", self.path.display()))?;
-        self.current_size_bytes = self.current_size_bytes.saturating_add(1);
+        self.current_size_bytes = self
+            .current_size_bytes
+            .saturating_add(payload.len() as u64)
+            .saturating_add(1);
         Ok(())
     }
 
@@ -174,6 +288,99 @@ fn rotated_journal_path(path: &Path) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("jsonl");
     parent.join(format!("{stem}.{ts}.{ext}"))
+}
+
+const JOURNAL_FIREHOSE_MAX_RECORDS: usize = 500;
+const JOURNAL_FIREHOSE_MAX_BYTES: usize = 1024 * 1024;
+const JOURNAL_FIREHOSE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+async fn run_firehose_journal_sink(
+    client: FirehoseClient,
+    delivery_stream: String,
+    mut receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    let mut interval = tokio::time::interval(JOURNAL_FIREHOSE_FLUSH_INTERVAL);
+    let mut batch = Vec::with_capacity(JOURNAL_FIREHOSE_MAX_RECORDS);
+    let mut batch_bytes = 0usize;
+    loop {
+        tokio::select! {
+            maybe_payload = receiver.recv() => {
+                let Some(payload) = maybe_payload else {
+                    flush_firehose_journal_batch(&client, &delivery_stream, &mut batch, &mut batch_bytes).await;
+                    break;
+                };
+                batch_bytes = batch_bytes.saturating_add(payload.len());
+                batch.push(payload);
+                if batch.len() >= JOURNAL_FIREHOSE_MAX_RECORDS || batch_bytes >= JOURNAL_FIREHOSE_MAX_BYTES {
+                    flush_firehose_journal_batch(&client, &delivery_stream, &mut batch, &mut batch_bytes).await;
+                }
+            }
+            _ = interval.tick() => {
+                flush_firehose_journal_batch(&client, &delivery_stream, &mut batch, &mut batch_bytes).await;
+            }
+        }
+    }
+}
+
+async fn flush_firehose_journal_batch(
+    client: &FirehoseClient,
+    delivery_stream: &str,
+    batch: &mut Vec<Vec<u8>>,
+    batch_bytes: &mut usize,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let payloads = std::mem::take(batch);
+    *batch_bytes = 0;
+    let record_count = payloads.len();
+    let records = payloads
+        .into_iter()
+        .filter_map(|payload| {
+            Record::builder()
+                .data(Blob::new(payload))
+                .build()
+                .map_err(|err| {
+                    warn!(error = %err, "failed to build runtime journal Firehose record; dropping");
+                    err
+                })
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return;
+    }
+    match client
+        .put_record_batch()
+        .delivery_stream_name(delivery_stream)
+        .set_records(Some(records))
+        .send()
+        .await
+    {
+        Ok(output) if output.failed_put_count() == 0 => {
+            debug!(
+                delivery_stream,
+                records = record_count,
+                "runtime journal Firehose flush ok"
+            );
+        }
+        Ok(output) => {
+            warn!(
+                delivery_stream,
+                failed_put_count = output.failed_put_count(),
+                records = record_count,
+                "runtime journal Firehose accepted partial batch"
+            );
+        }
+        Err(err) => {
+            warn!(
+                delivery_stream,
+                error = %err,
+                records_dropped = record_count,
+                "runtime journal Firehose flush failed; dropping batch"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

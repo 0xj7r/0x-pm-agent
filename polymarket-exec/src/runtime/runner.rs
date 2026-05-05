@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
 use crate::inventory::VenuePositionSnapshot;
-use crate::journal::JournalWriter;
+use crate::journal::JournalFanout;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::quote_reconciler::ReconcilerConfig;
@@ -36,8 +36,9 @@ use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
     deterministic_hash_0_95, paper_fill_from_book_snapshot, paper_post_only_should_reject,
 };
-use crate::runtime::types::ManagedOrderStatus;
+use crate::runtime::types::{ManagedOrder, ManagedOrderStatus};
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
+use crate::signals::BtcRegimeSnapshot;
 use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
@@ -667,11 +668,12 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         max_cancel_per_window: config.quote_max_cancel_per_window,
         ..ReconcilerConfig::default()
     });
-    let mut journal = config
-        .journal_path
-        .clone()
-        .map(|path| JournalWriter::open_with_rotation(path, config.journal_rotate_bytes))
-        .transpose()?;
+    let mut journal = JournalFanout::open(
+        config.journal_path.clone(),
+        config.journal_rotate_bytes,
+        config.journal_firehose_stream.clone(),
+    )
+    .await?;
     let mut audit = config
         .audit_path
         .as_deref()
@@ -1103,7 +1105,7 @@ async fn run_runtime_loop(
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
     runtime: &mut Runtime<StrategyMode>,
-    journal: &mut Option<JournalWriter>,
+    journal: &mut JournalFanout,
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
@@ -1990,30 +1992,28 @@ fn persist_audit_outcome(
 }
 
 fn persist_runtime_checkpoint(
-    journal: &mut Option<JournalWriter>,
+    journal: &mut JournalFanout,
     runtime: &mut Runtime<StrategyMode>,
     observed_at_ms: u64,
     name: &str,
 ) -> Result<()> {
     runtime.persist_strategy_state(observed_at_ms);
     runtime.persist_runtime_status(observed_at_ms);
-    if let Some(writer) = journal.as_mut() {
-        let open_orders = runtime.open_order_snapshots();
-        let open_orders_count = open_orders.len();
-        let needs_reconcile_orders = open_orders
-            .iter()
-            .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
-            .count();
-        writer.append_checkpoint(
-            observed_at_ms,
-            runtime.run_id(),
-            name,
-            open_orders_count,
-            needs_reconcile_orders,
-            runtime.event_log().latest_seq(),
-        )?;
-        writer.flush()?;
-    }
+    let open_orders = runtime.open_order_snapshots();
+    let open_orders_count = open_orders.len();
+    let needs_reconcile_orders = open_orders
+        .iter()
+        .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+        .count();
+    journal.append_checkpoint(
+        observed_at_ms,
+        runtime.run_id(),
+        name,
+        open_orders_count,
+        needs_reconcile_orders,
+        runtime.event_log().latest_seq(),
+    )?;
+    journal.flush()?;
     Ok(())
 }
 
@@ -2091,9 +2091,11 @@ async fn execute_execution_adapter(
         stage_outcome_commands(&mut combined, &mut queue, quarantine_outcome);
         let stale_cancel_outcome = cancel_stale_live_orders(
             runtime,
+            books,
             observed_at_ms,
             execution_policy.live_order_max_age_ms,
-        );
+        )
+        .await;
         stage_outcome_commands(&mut combined, &mut queue, stale_cancel_outcome);
         let mut queued_cancel_ids: HashSet<ClientOrderId> = queue
             .iter()
@@ -3374,8 +3376,9 @@ fn enforce_live_error_budget(
     }
 }
 
-fn cancel_stale_live_orders(
+async fn cancel_stale_live_orders(
     runtime: &mut Runtime<StrategyMode>,
+    books: &Arc<BookStore>,
     now_ms: u64,
     max_age_ms: u64,
 ) -> RuntimeOutcome {
@@ -3383,7 +3386,8 @@ fn cancel_stale_live_orders(
     if max_age_ms == 0 {
         return outcome;
     }
-    let stale_ids = runtime
+    let btc_regime = runtime.btc_regime_snapshot(now_ms);
+    let stale_orders = runtime
         .open_order_snapshots()
         .into_iter()
         .filter(|managed| {
@@ -3392,16 +3396,153 @@ fn cancel_stale_live_orders(
                 ManagedOrderStatus::Submitted | ManagedOrderStatus::Working
             ) && now_ms.saturating_sub(managed.intent.created_at_ms) >= max_age_ms
         })
-        .map(|managed| managed.intent.client_order_id)
         .collect::<Vec<_>>();
-    for client_order_id in stale_ids {
-        outcome.extend(runtime.request_cancel_order(
-            &client_order_id,
-            now_ms,
-            format!("live order max age exceeded {max_age_ms}ms"),
-        ));
+    for managed in stale_orders {
+        let client_order_id = managed.intent.client_order_id.clone();
+        let Some(book) = books.snapshot(managed.intent.instrument_id.as_str()).await else {
+            outcome.extend(runtime.request_cancel_order(
+                &client_order_id,
+                now_ms,
+                format!("live order max age exceeded {max_age_ms}ms; no current book snapshot"),
+            ));
+            continue;
+        };
+
+        match stale_live_order_action(&managed, &book, &btc_regime) {
+            StaleLiveOrderAction::Preserve { reason } => {
+                tracing::info!(
+                    client_order_id = %client_order_id,
+                    instrument_id = %managed.intent.instrument_id,
+                    limit_price = managed.intent.limit_price,
+                    best_bid = book.best_bid,
+                    best_ask = book.best_ask,
+                    btc_return_30s_bps = ?btc_regime.return_30s_bps,
+                    btc_return_60s_bps = ?btc_regime.return_60s_bps,
+                    age_ms = now_ms.saturating_sub(managed.intent.created_at_ms),
+                    reason,
+                    "preserving aged live order because current book still supports maker quote"
+                );
+            }
+            StaleLiveOrderAction::Cancel { reason } => {
+                outcome.extend(runtime.request_cancel_order(
+                    &client_order_id,
+                    now_ms,
+                    format!("live order max age exceeded {max_age_ms}ms; {reason}"),
+                ));
+            }
+        }
     }
     outcome
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleLiveOrderAction {
+    Preserve { reason: &'static str },
+    Cancel { reason: &'static str },
+}
+
+fn stale_live_order_action(
+    order: &ManagedOrder,
+    book: &BookState,
+    btc_regime: &BtcRegimeSnapshot,
+) -> StaleLiveOrderAction {
+    let best_bid = book.best_bid;
+    let best_ask = book.best_ask;
+    if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask <= 0.0 {
+        return StaleLiveOrderAction::Cancel {
+            reason: "invalid current book",
+        };
+    }
+
+    let spread = (best_ask - best_bid).max(0.0);
+    let tolerance = spread.clamp(0.01, 0.03);
+    if last_trade_invalidates_order(order, book, tolerance) {
+        return StaleLiveOrderAction::Cancel {
+            reason: "last-trade drift invalidates aged quote price",
+        };
+    }
+    if btc_drift_invalidates_order(order, btc_regime) {
+        return StaleLiveOrderAction::Cancel {
+            reason: "btc drift invalidates aged quote side",
+        };
+    }
+    match order.intent.side {
+        TradeSide::Buy => {
+            if order.intent.limit_price >= best_ask {
+                return StaleLiveOrderAction::Cancel {
+                    reason: "buy quote would cross current ask",
+                };
+            }
+            if order.intent.limit_price > best_bid + tolerance {
+                return StaleLiveOrderAction::Cancel {
+                    reason: "buy quote is stale above current best bid",
+                };
+            }
+            StaleLiveOrderAction::Preserve {
+                reason: "buy quote remains behind current ask and near best bid",
+            }
+        }
+        TradeSide::Sell => {
+            if order.intent.limit_price <= best_bid {
+                return StaleLiveOrderAction::Cancel {
+                    reason: "sell quote would cross current bid",
+                };
+            }
+            if order.intent.limit_price < best_ask - tolerance {
+                return StaleLiveOrderAction::Cancel {
+                    reason: "sell quote is stale below current best ask",
+                };
+            }
+            StaleLiveOrderAction::Preserve {
+                reason: "sell quote remains above current bid and near best ask",
+            }
+        }
+    }
+}
+
+fn last_trade_invalidates_order(order: &ManagedOrder, book: &BookState, tolerance: f64) -> bool {
+    let last_trade_price = book.last_trade_price;
+    if !last_trade_price.is_finite() || last_trade_price <= 0.0 {
+        return false;
+    }
+    match order.intent.side {
+        TradeSide::Buy => order.intent.limit_price > last_trade_price + tolerance,
+        TradeSide::Sell => order.intent.limit_price < last_trade_price - tolerance,
+    }
+}
+
+fn btc_drift_invalidates_order(order: &ManagedOrder, btc_regime: &BtcRegimeSnapshot) -> bool {
+    let Some(tag) = order.intent.quote_level_tag.as_deref() else {
+        return false;
+    };
+    if !matches!(order.intent.side, TradeSide::Buy) {
+        return false;
+    }
+    let leg = if tag.contains(":yes:") {
+        Some(TradeSide::Buy)
+    } else if tag.contains(":no:") {
+        Some(TradeSide::Sell)
+    } else {
+        None
+    };
+    let Some(return_30s_bps) = btc_regime.return_30s_bps else {
+        return false;
+    };
+    let return_60s_bps = btc_regime.return_60s_bps.unwrap_or(return_30s_bps);
+    if return_30s_bps.signum() != return_60s_bps.signum() {
+        return false;
+    }
+    let vol_floor_bps = btc_regime
+        .realized_vol_5m_bps
+        .filter(|vol| vol.is_finite())
+        .unwrap_or(6.0)
+        .max(6.0);
+    let threshold_bps = (vol_floor_bps * 0.75).clamp(4.0, 25.0);
+    match leg {
+        Some(TradeSide::Buy) => return_30s_bps < -threshold_bps && return_60s_bps < -threshold_bps,
+        Some(TradeSide::Sell) => return_30s_bps > threshold_bps && return_60s_bps > threshold_bps,
+        _ => false,
+    }
 }
 
 fn venue_fill_key(fill: &VenueFill) -> String {

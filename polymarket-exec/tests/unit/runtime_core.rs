@@ -1,4 +1,4 @@
-use super::{ManagedOrderStatus, Runtime, RuntimeConfig, BLOCKED_MERGE_RETRY_AFTER_MS};
+use super::{ManagedOrderStatus, Runtime, RuntimeConfig};
 use crate::inventory::VenuePositionSnapshot;
 use crate::market_context::{MarketContextRecord, MarketContextStore};
 use crate::risk::RiskLimits;
@@ -907,7 +907,7 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
 }
 
 #[test]
-fn blocked_merge_retries_after_backoff_instead_of_permanent_suppression() {
+fn blocked_merge_waits_for_inventory_change_not_timer_backoff() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(
         RuntimeConfig {
@@ -959,11 +959,39 @@ fn blocked_merge_retries_after_backoff_instead_of_permanent_suppression() {
         "identical merge should still be suppressed during short backoff"
     );
 
-    let retry = runtime.plan_merge_command_for_market(
-        &market_id,
-        12 + BLOCKED_MERGE_RETRY_AFTER_MS + 1,
-        "retry after reconcile",
+    let still_blocked = runtime.plan_merge_command_for_market(&market_id, 30_000, "timer retry");
+    assert!(
+        still_blocked.commands.is_empty(),
+        "identical reverted merge should not retry just because time passed"
     );
+
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("up"),
+                    quantity: 5.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 31_000,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 5.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 31_000,
+                },
+            ],
+            31_000,
+        )
+        .expect("inventory-changing reconcile");
+
+    let retry = runtime.plan_merge_command_for_market(&market_id, 31_001, "retry after reconcile");
     assert!(
         retry
             .commands
