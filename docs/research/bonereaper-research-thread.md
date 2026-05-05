@@ -56,6 +56,11 @@ This is a clean MM-style activity fingerprint:
 - short-duration
 - no obvious directional one-leg bias in the top market mix
 
+Important limitation: `/activity` does not identify maker vs taker directly.
+It is strong evidence for public trade shape (buy-only, high turnover,
+two-sided across many short-duration markets), but maker/taker attribution
+requires CLOB order/fill context or rebate-endpoint correlation.
+
 ## Market Mix
 
 Recent dominant markets:

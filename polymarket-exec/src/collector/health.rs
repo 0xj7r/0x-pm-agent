@@ -84,12 +84,7 @@ mod tests {
 
     fn build_state() -> (HealthState, Arc<FirehoseSink>) {
         let sink = Arc::new(FirehoseSink::new(Arc::new(StubBackend)));
-        (
-            HealthState {
-                sink: sink.clone(),
-            },
-            sink,
-        )
+        (HealthState { sink: sink.clone() }, sink)
     }
 
     #[tokio::test]
@@ -97,7 +92,12 @@ mod tests {
         let (state, _sink) = build_state();
         let app = router(state);
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -134,7 +134,12 @@ mod tests {
 
         let app = router(state);
         let response = app
-            .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
