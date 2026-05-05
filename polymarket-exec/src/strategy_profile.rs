@@ -282,6 +282,10 @@ impl StrategyProfile {
                 .convexity_overlay
                 .enabled
                 .unwrap_or(config.convexity_overlay.enabled),
+            suppress_ladder_when_package_fires: self
+                .convexity_overlay
+                .suppress_ladder_when_package_fires
+                .unwrap_or(config.convexity_overlay.suppress_ladder_when_package_fires),
             late_window_sec: self
                 .convexity_overlay
                 .late_window_sec
@@ -307,6 +311,94 @@ impl StrategyProfile {
                 .maker_safety_ticks
                 .or(self.quote.maker_safety_ticks)
                 .unwrap_or(config.convexity_overlay.maker_safety_ticks),
+            min_favorite_edge_bps: self
+                .convexity_overlay
+                .min_favorite_edge_bps
+                .unwrap_or(config.convexity_overlay.min_favorite_edge_bps),
+            tail_enabled: self
+                .convexity_overlay
+                .tail_enabled
+                .unwrap_or(config.convexity_overlay.tail_enabled),
+            tail_max_price: self
+                .convexity_overlay
+                .tail_max_price
+                .unwrap_or(config.convexity_overlay.tail_max_price),
+            tail_clip_usd: self
+                .convexity_overlay
+                .tail_clip_usd
+                .unwrap_or(config.convexity_overlay.tail_clip_usd),
+            min_combo_ev_usd: self
+                .convexity_overlay
+                .min_combo_ev_usd
+                .unwrap_or(config.convexity_overlay.min_combo_ev_usd),
+            ev_gate_enabled: self
+                .convexity_overlay
+                .ev_gate_enabled
+                .unwrap_or(config.convexity_overlay.ev_gate_enabled),
+            package_budget_usd: self
+                .convexity_overlay
+                .package_budget_usd
+                .unwrap_or(config.convexity_overlay.package_budget_usd),
+            favorite_notional_min_pct: self
+                .convexity_overlay
+                .favorite_notional_min_pct
+                .unwrap_or(config.convexity_overlay.favorite_notional_min_pct),
+            favorite_notional_max_pct: self
+                .convexity_overlay
+                .favorite_notional_max_pct
+                .unwrap_or(config.convexity_overlay.favorite_notional_max_pct),
+            whipsaw_favorite_notional_min_pct: self
+                .convexity_overlay
+                .whipsaw_favorite_notional_min_pct
+                .unwrap_or(config.convexity_overlay.whipsaw_favorite_notional_min_pct),
+            whipsaw_favorite_notional_max_pct: self
+                .convexity_overlay
+                .whipsaw_favorite_notional_max_pct
+                .unwrap_or(config.convexity_overlay.whipsaw_favorite_notional_max_pct),
+            loser_stranded_favorite_notional_min_pct: self
+                .convexity_overlay
+                .loser_stranded_favorite_notional_min_pct
+                .unwrap_or(config.convexity_overlay.loser_stranded_favorite_notional_min_pct),
+            loser_stranded_favorite_notional_max_pct: self
+                .convexity_overlay
+                .loser_stranded_favorite_notional_max_pct
+                .unwrap_or(config.convexity_overlay.loser_stranded_favorite_notional_max_pct),
+            winner_stranded_favorite_notional_min_pct: self
+                .convexity_overlay
+                .winner_stranded_favorite_notional_min_pct
+                .unwrap_or(config.convexity_overlay.winner_stranded_favorite_notional_min_pct),
+            winner_stranded_favorite_notional_max_pct: self
+                .convexity_overlay
+                .winner_stranded_favorite_notional_max_pct
+                .unwrap_or(config.convexity_overlay.winner_stranded_favorite_notional_max_pct),
+            max_favorite_win_loss_usd: self
+                .convexity_overlay
+                .max_favorite_win_loss_usd
+                .unwrap_or(config.convexity_overlay.max_favorite_win_loss_usd),
+            min_tail_win_profit_usd: self
+                .convexity_overlay
+                .min_tail_win_profit_usd
+                .unwrap_or(config.convexity_overlay.min_tail_win_profit_usd),
+            min_tail_payoff_multiple: self
+                .convexity_overlay
+                .min_tail_payoff_multiple
+                .unwrap_or(config.convexity_overlay.min_tail_payoff_multiple),
+            ev_delta_weight: self
+                .convexity_overlay
+                .ev_delta_weight
+                .unwrap_or(config.convexity_overlay.ev_delta_weight),
+            favorite_loss_reduction_weight: self
+                .convexity_overlay
+                .favorite_loss_reduction_weight
+                .unwrap_or(config.convexity_overlay.favorite_loss_reduction_weight),
+            tail_convexity_weight: self
+                .convexity_overlay
+                .tail_convexity_weight
+                .unwrap_or(config.convexity_overlay.tail_convexity_weight),
+            imbalance_penalty_weight: self
+                .convexity_overlay
+                .imbalance_penalty_weight
+                .unwrap_or(config.convexity_overlay.imbalance_penalty_weight),
         };
         config
     }
@@ -320,6 +412,9 @@ impl StrategyProfile {
             .unwrap_or(config.max_depth)
             .max(1);
         config.min_depth = config.min_depth.min(config.max_depth);
+        config.low_vol_depth = config.max_depth;
+        config.high_vol_depth = config.high_vol_depth.min(config.max_depth);
+        config.late_bar_depth = config.late_bar_depth.min(config.max_depth);
         config.normal_spacing_ticks = self
             .quote
             .entry_ladder_spacing_ticks
@@ -539,6 +634,7 @@ pub struct ConvexitySection {
 #[serde(default)]
 pub struct ConvexityOverlaySection {
     pub enabled: Option<bool>,
+    pub suppress_ladder_when_package_fires: Option<bool>,
     pub capital_pct: Option<f64>,
     pub late_window_sec: Option<u64>,
     pub convex_p_threshold: Option<f64>,
@@ -546,6 +642,28 @@ pub struct ConvexityOverlaySection {
     pub clip_usd: Option<f64>,
     pub allow_extra_clip_on_winner: Option<bool>,
     pub maker_safety_ticks: Option<f64>,
+    pub min_favorite_edge_bps: Option<f64>,
+    pub tail_enabled: Option<bool>,
+    pub tail_max_price: Option<f64>,
+    pub tail_clip_usd: Option<f64>,
+    pub min_combo_ev_usd: Option<f64>,
+    pub ev_gate_enabled: Option<bool>,
+    pub package_budget_usd: Option<f64>,
+    pub favorite_notional_min_pct: Option<f64>,
+    pub favorite_notional_max_pct: Option<f64>,
+    pub whipsaw_favorite_notional_min_pct: Option<f64>,
+    pub whipsaw_favorite_notional_max_pct: Option<f64>,
+    pub loser_stranded_favorite_notional_min_pct: Option<f64>,
+    pub loser_stranded_favorite_notional_max_pct: Option<f64>,
+    pub winner_stranded_favorite_notional_min_pct: Option<f64>,
+    pub winner_stranded_favorite_notional_max_pct: Option<f64>,
+    pub max_favorite_win_loss_usd: Option<f64>,
+    pub min_tail_win_profit_usd: Option<f64>,
+    pub min_tail_payoff_multiple: Option<f64>,
+    pub ev_delta_weight: Option<f64>,
+    pub favorite_loss_reduction_weight: Option<f64>,
+    pub tail_convexity_weight: Option<f64>,
+    pub imbalance_penalty_weight: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
