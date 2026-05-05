@@ -1093,7 +1093,7 @@ mod tests {
         // Another 30-unit trade — total trade-through 110 > book_depth 100, so
         // 10 units bleed into our order.
         sim.on_event(&trade_event(3_000_000_000, "asset-a", "buy", "0.55", "30"));
-        assert!(sim.fills().len() >= 1);
+        assert!(!sim.fills().is_empty());
         let total: f64 = sim.fills().iter().map(|f| f.size).sum();
         assert!((total - 10.0).abs() < 1e-6, "expected ~10, got {total}");
     }
@@ -1113,7 +1113,10 @@ mod tests {
         sim.on_event(&trade_event(2_000_000_000, "asset-a", "buy", "0.55", "35"));
 
         let total: f64 = sim.fills().iter().map(|f| f.size).sum();
-        assert!((total - 5.0).abs() < 1e-6, "expected same-price residual fill, got {total}");
+        assert!(
+            (total - 5.0).abs() < 1e-6,
+            "expected same-price residual fill, got {total}"
+        );
     }
 
     #[test]

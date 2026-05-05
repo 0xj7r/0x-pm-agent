@@ -700,11 +700,10 @@ impl<S: Strategy> Runtime<S> {
         let accepted_markets = self
             .accepted_merge_by_market
             .iter()
-            .filter_map(|(market_id, accepted)| {
-                (observed_at_ms >= accepted.accepted_at_ms
-                    && reconciled_markets.contains(market_id))
-                .then(|| market_id.clone())
+            .filter(|&(market_id, accepted)| {
+                observed_at_ms >= accepted.accepted_at_ms && reconciled_markets.contains(market_id)
             })
+            .map(|(market_id, _accepted)| market_id.clone())
             .collect::<Vec<_>>();
 
         for market_id in accepted_markets {
@@ -918,9 +917,11 @@ impl<S: Strategy> Runtime<S> {
                         ) {
                             Ok(adjustment) => {
                                 outcome.push_event(
-                                    self.event_log.push(adjustment.to_event(
-                                        "inventory updated from paper settlement close",
-                                    )),
+                                    self.event_log.push(
+                                        adjustment.to_event(
+                                            "inventory updated from paper settlement close",
+                                        ),
+                                    ),
                                 );
                             }
                             Err(error) => {
@@ -1339,8 +1340,8 @@ impl<S: Strategy> Runtime<S> {
         let missing_from_store = self
             .open_orders
             .keys()
+            .filter(|&client_order_id| !seen.contains(client_order_id))
             .cloned()
-            .filter(|client_order_id| !seen.contains(client_order_id))
             .collect::<Vec<_>>();
         for client_order_id in missing_from_store {
             if let Some(record) = self.durable_terminal_order(&client_order_id) {

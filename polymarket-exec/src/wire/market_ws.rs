@@ -127,7 +127,7 @@ impl MarketWsClient {
             "custom_feature_enabled": true,
         });
         write
-            .send(Message::Text(subscribe.to_string().into()))
+            .send(Message::Text(subscribe.to_string()))
             .await
             .context("failed to subscribe market websocket")?;
 
@@ -160,7 +160,7 @@ impl MarketWsClient {
                         );
                     }
                     write
-                        .send(Message::Text("PING".to_string().into()))
+                        .send(Message::Text("PING".to_string()))
                         .await
                         .context("failed to send market websocket ping")?;
                 }
@@ -361,6 +361,58 @@ impl MarketWsClient {
     }
 }
 
+fn parse_levels(value: Option<&Value>) -> Vec<Level> {
+    value
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| {
+                    let price = level.get("price").and_then(value_as_f64_opt)?;
+                    let size = level
+                        .get("size")
+                        .or_else(|| level.get("s"))
+                        .and_then(value_as_f64_opt)
+                        .unwrap_or_default();
+                    Some(Level { price, size })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn value_as_str(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn raw_frame_asset_id(value: &Value) -> Option<String> {
+    value
+        .get("asset_id")
+        .or_else(|| value.get("a"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn value_as_f64_opt(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(raw) => raw.parse().ok(),
+        _ => None,
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,56 +468,4 @@ mod tests {
         );
         assert!(rx.try_recv().is_err());
     }
-}
-
-fn parse_levels(value: Option<&Value>) -> Vec<Level> {
-    value
-        .and_then(Value::as_array)
-        .map(|levels| {
-            levels
-                .iter()
-                .filter_map(|level| {
-                    let price = level.get("price").and_then(value_as_f64_opt)?;
-                    let size = level
-                        .get("size")
-                        .or_else(|| level.get("s"))
-                        .and_then(value_as_f64_opt)
-                        .unwrap_or_default();
-                    Some(Level { price, size })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn value_as_str(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn raw_frame_asset_id(value: &Value) -> Option<String> {
-    value
-        .get("asset_id")
-        .or_else(|| value.get("a"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-}
-
-fn value_as_f64_opt(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(number) => number.as_f64(),
-        Value::String(raw) => raw.parse().ok(),
-        _ => None,
-    }
-}
-
-fn now_unix_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }

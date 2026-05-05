@@ -36,7 +36,7 @@ pub struct StrategyProfile {
     pub convexity_overlay: ConvexityOverlaySection,
     pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
-    pub hybrid_mm: HybridMmSection, 
+    pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
     pub operational: OperationalSection,
     #[serde(flatten)]
@@ -373,6 +373,11 @@ impl StrategyProfile {
             .unwrap_or(config.normal_spacing_ticks);
         config.base_clip_usd = self.quote.base_clip_usd.unwrap_or(config.base_clip_usd);
         config.max_clip_usd = self.quote.max_clip_usd.unwrap_or(config.max_clip_usd);
+        config.min_projected_pair_edge_bps = self
+            .quote
+            .min_edge_bps
+            .unwrap_or(config.min_projected_pair_edge_bps)
+            .max(0.0);
         config.fractional_kelly = self
             .clip_sizing
             .fractional_kelly

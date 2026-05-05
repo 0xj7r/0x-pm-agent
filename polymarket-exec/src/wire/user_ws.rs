@@ -173,7 +173,7 @@ impl UserWsClient {
         let (mut write, mut read) = stream.split();
         let subscribe = build_subscribe_payload(&self.auth, &markets);
         write
-            .send(Message::Text(subscribe.to_string().into()))
+            .send(Message::Text(subscribe.to_string()))
             .await
             .context("failed to subscribe user websocket")?;
 
@@ -213,7 +213,7 @@ impl UserWsClient {
                         );
                     }
                     write
-                        .send(Message::Text("PING".to_string().into()))
+                        .send(Message::Text("PING".to_string()))
                         .await
                         .context("failed to send user websocket ping")?;
                 }
@@ -443,49 +443,43 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         ) && qty > 0.0
             && status_low.contains("fill"));
 
-    if is_merge_signal {
-        if qty > 0.0 {
-            return Some(UserOrderEvent::OrderMerged {
-                order_id,
-                client_order_id,
-                market_id,
-                asset_id,
-                price,
-                quantity: qty,
-                observed_at_ms,
-            });
-        }
+    if is_merge_signal && qty > 0.0 {
+        return Some(UserOrderEvent::OrderMerged {
+            order_id,
+            client_order_id,
+            market_id,
+            asset_id,
+            price,
+            quantity: qty,
+            observed_at_ms,
+        });
     }
 
-    if is_redeem_signal {
-        if qty > 0.0 {
-            return Some(UserOrderEvent::OrderRedeemed {
-                order_id,
-                client_order_id,
-                market_id,
-                asset_id,
-                price,
-                quantity: qty,
-                observed_at_ms,
-            });
-        }
+    if is_redeem_signal && qty > 0.0 {
+        return Some(UserOrderEvent::OrderRedeemed {
+            order_id,
+            client_order_id,
+            market_id,
+            asset_id,
+            price,
+            quantity: qty,
+            observed_at_ms,
+        });
     }
 
-    if is_fill_signal {
-        if qty > 0.0 {
-            return Some(UserOrderEvent::OrderFilled {
-                order_id,
-                client_order_id,
-                close_method,
-                market_id,
-                asset_id,
-                side,
-                price,
-                quantity: qty,
-                liquidity,
-                observed_at_ms,
-            });
-        }
+    if is_fill_signal && qty > 0.0 {
+        return Some(UserOrderEvent::OrderFilled {
+            order_id,
+            client_order_id,
+            close_method,
+            market_id,
+            asset_id,
+            side,
+            price,
+            quantity: qty,
+            liquidity,
+            observed_at_ms,
+        });
     }
 
     if status_low.contains("rejected") {
@@ -521,7 +515,7 @@ fn classify_user_event(event: &Value) -> Option<UserOrderEvent> {
         event_type_low.as_str(),
         "order" | "orderbook" | "order_update"
     ) && qty > 0.0
-        && !client_order_id.is_none()
+        && client_order_id.is_some()
         && (status_low.contains("closed")
             || status_low.contains("done")
             || status_low.contains("fill"))

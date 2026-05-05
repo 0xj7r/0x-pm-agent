@@ -52,6 +52,7 @@ pub struct LadderConfig {
     pub caps: RunningInventoryCaps,
     pub incentives: IncentiveSignal,
     pub fair_value_anchoring: FairValueAnchoringConfig,
+    pub min_projected_pair_edge_bps: f64,
     pub aligned_signal_clip_boost: f64,
     pub adverse_signal_clip_cut: f64,
     pub max_signal_clip_scale: f64,
@@ -78,6 +79,7 @@ impl Default for LadderConfig {
             caps: RunningInventoryCaps::default(),
             incentives: IncentiveSignal::default(),
             fair_value_anchoring: FairValueAnchoringConfig::default(),
+            min_projected_pair_edge_bps: 75.0,
             aligned_signal_clip_boost: 0.35,
             adverse_signal_clip_cut: 0.25,
             max_signal_clip_scale: 1.60,
@@ -97,6 +99,8 @@ pub struct LadderDiagnostics {
     pub suppressed_no: bool,
     pub yes_signal_scale: f64,
     pub no_signal_scale: f64,
+    pub yes_pair_cost_skipped: usize,
+    pub no_pair_cost_skipped: usize,
     pub notes: Vec<String>,
 }
 
@@ -171,21 +175,23 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
-    let yes_signal_scale =
-        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
+    let yes_signal_scale = signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
     let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
     let mut intents = Vec::with_capacity(depth * 2);
+    let mut yes_pair_cost_skipped = 0usize;
+    let mut no_pair_cost_skipped = 0usize;
     if inventory.gross_cost_usd() < config.caps.max_gross_cost_usd {
         let mut yes_intents = Vec::with_capacity(depth);
         let mut no_intents = Vec::with_capacity(depth);
-        append_leg_ladder(
+        let yes_stats = append_leg_ladder(
             &mut yes_intents,
             market,
             LadderLeg::Yes,
             &snapshot.yes_quote,
+            &snapshot.no_quote,
             yes_reservation,
             depth,
             spacing_ticks,
@@ -194,11 +200,13 @@ pub fn build_ladder<M: MarketDescriptor>(
             config,
             now_ms,
         );
-        append_leg_ladder(
+        yes_pair_cost_skipped = yes_stats.pair_cost_skipped;
+        let no_stats = append_leg_ladder(
             &mut no_intents,
             market,
             LadderLeg::No,
             &snapshot.no_quote,
+            &snapshot.yes_quote,
             no_reservation,
             depth,
             spacing_ticks,
@@ -207,6 +215,23 @@ pub fn build_ladder<M: MarketDescriptor>(
             config,
             now_ms,
         );
+        no_pair_cost_skipped = no_stats.pair_cost_skipped;
+        if yes_pair_cost_skipped > 0 {
+            notes.push(format!(
+                "yes ladder pair-cost gated levels={} opposite_ask={:?} min_edge_bps={:.1}",
+                yes_pair_cost_skipped,
+                snapshot.no_quote.best_ask.as_ref().map(|ask| ask.price),
+                config.min_projected_pair_edge_bps
+            ));
+        }
+        if no_pair_cost_skipped > 0 {
+            notes.push(format!(
+                "no ladder pair-cost gated levels={} opposite_ask={:?} min_edge_bps={:.1}",
+                no_pair_cost_skipped,
+                snapshot.yes_quote.best_ask.as_ref().map(|ask| ask.price),
+                config.min_projected_pair_edge_bps
+            ));
+        }
         normalize_paired_entry_quantities(
             &mut yes_intents,
             &mut no_intents,
@@ -234,6 +259,8 @@ pub fn build_ladder<M: MarketDescriptor>(
             suppressed_no: suppress_no,
             yes_signal_scale,
             no_signal_scale,
+            yes_pair_cost_skipped,
+            no_pair_cost_skipped,
             notes,
         },
     }
@@ -415,11 +442,17 @@ fn should_suppress_leg(
     }
 }
 
+#[derive(Default)]
+struct LegLadderStats {
+    pair_cost_skipped: usize,
+}
+
 fn append_leg_ladder<M: MarketDescriptor>(
     intents: &mut Vec<OrderIntent>,
     market: &M,
     leg: LadderLeg,
     quote: &crate::types::QuoteSnapshot,
+    opposite_quote: &crate::types::QuoteSnapshot,
     reservation: f64,
     depth: usize,
     spacing_ticks: f64,
@@ -427,12 +460,19 @@ fn append_leg_ladder<M: MarketDescriptor>(
     suppress: bool,
     config: &LadderConfig,
     now_ms: EpochMillis,
-) {
+) -> LegLadderStats {
+    let mut stats = LegLadderStats::default();
     if suppress {
-        return;
+        return stats;
     }
 
     let tick_size = market.tick_size().max(0.0001);
+    let min_pair_edge = (config.min_projected_pair_edge_bps.max(0.0) / 10_000.0).clamp(0.0, 0.99);
+    let max_projected_pair_cost = 1.0 - min_pair_edge;
+    let pairability_bid_cap = opposite_quote
+        .best_ask
+        .as_ref()
+        .map(|ask| max_projected_pair_cost - ask.price);
     let instrument_id = match leg {
         LadderLeg::Yes => market.yes_instrument_id().clone(),
         LadderLeg::No => market.no_instrument_id().clone(),
@@ -447,17 +487,30 @@ fn append_leg_ladder<M: MarketDescriptor>(
             .level_multipliers
             .get(level)
             .copied()
-            .unwrap_or_else(|| 1.0 + level as f64);
+            .unwrap_or(1.0 + level as f64);
         let raw_price = reservation - (level as f64 * spacing_ticks * tick_size);
         let maker_bid_cap = quote
             .best_ask
             .as_ref()
             .map(|ask| ask.price - tick_size)
             .unwrap_or(1.0 - tick_size);
-        let limit_price = align_down_to_tick(raw_price.min(maker_bid_cap), tick_size)
-            .clamp(tick_size, 1.0 - tick_size);
+        let bid_cap = pairability_bid_cap
+            .map(|cap| cap.min(maker_bid_cap))
+            .unwrap_or(maker_bid_cap);
+        if bid_cap < tick_size {
+            stats.pair_cost_skipped += 1;
+            continue;
+        }
+        let limit_price =
+            align_down_to_tick(raw_price.min(bid_cap), tick_size).clamp(tick_size, 1.0 - tick_size);
         if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
             continue;
+        }
+        if let Some(opposite_ask) = opposite_quote.best_ask.as_ref() {
+            if limit_price + opposite_ask.price > max_projected_pair_cost + 1e-9 {
+                stats.pair_cost_skipped += 1;
+                continue;
+            }
         }
         let clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
         let reward_qty = config.incentives.min_reward_quantity().unwrap_or(0.0);
@@ -498,6 +551,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
             kind: IntentKind::Entry,
         });
     }
+    stats
 }
 
 fn interleave_leg_ladders(
@@ -577,7 +631,7 @@ fn normalize_paired_entry_quantities(
 
     for (mut yes, mut no) in std::mem::take(yes_intents)
         .into_iter()
-        .zip(std::mem::take(no_intents).into_iter())
+        .zip(std::mem::take(no_intents))
     {
         let paired_quantity = yes.quantity.min(no.quantity);
         if !paired_quantity.is_finite() || paired_quantity < min_order_size {
@@ -768,6 +822,91 @@ mod tests {
                 assert!(intent.limit_price < 0.21);
             }
         }
+    }
+
+    #[test]
+    fn paired_entry_quotes_are_capped_by_opposite_ask_pair_cost() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.90, 0.55),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.99,
+                p_down: 0.01,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
+            &PairCostTracker::default(),
+            &LadderConfig {
+                min_projected_pair_edge_bps: 100.0,
+                stoikov: StoikovParams {
+                    gamma: 0.0,
+                    k: 1.0,
+                    max_skew: 0.20,
+                },
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!(!result.intents.is_empty());
+        for intent in result.intents {
+            if intent.instrument_id.as_str() == "yes" {
+                assert!(intent.limit_price + 0.55 <= 0.99 + 1e-9);
+            }
+            if intent.instrument_id.as_str() == "no" {
+                assert!(intent.limit_price + 0.90 <= 0.99 + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn paired_entry_skips_levels_when_opposite_ask_removes_required_edge() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.995, 0.995),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
+            &PairCostTracker::default(),
+            &LadderConfig {
+                min_projected_pair_edge_bps: 100.0,
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!(result.intents.is_empty());
+        assert!(result.diagnostics.yes_pair_cost_skipped > 0);
+        assert!(result.diagnostics.no_pair_cost_skipped > 0);
     }
 
     #[test]

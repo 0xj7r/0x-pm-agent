@@ -470,7 +470,10 @@ pub async fn replay_runtime_from_snapshots(
     )
     .map_err(anyhow::Error::msg)?;
     let replay_taker_fee_coeff = strategy.taker_fee_coeff();
-    let pair_profile = config.strategy_profile.as_ref().map(|profile| &profile.pair);
+    let pair_profile = config
+        .strategy_profile
+        .as_ref()
+        .map(|profile| &profile.pair);
     let runtime_defaults = crate::runtime::types::RuntimeConfig::default();
     let mut runtime = crate::runtime::Runtime::new(
         crate::runtime::types::RuntimeConfig {
@@ -660,7 +663,7 @@ pub fn replay_into_report(cfg: ReplayConfig) -> Result<ReplayOutcome> {
         assets.insert(record.asset.clone());
     }
     report.record_reject(
-        &ClientOrderId::from(format!("replay-input")),
+        &ClientOrderId::from("replay-input".to_string()),
         &MarketId::from(
             cfg.market_id_by_asset
                 .values()

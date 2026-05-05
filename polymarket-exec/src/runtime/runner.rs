@@ -1224,9 +1224,9 @@ async fn run_runtime_loop(
                         let assets = market_universe.read().await.market_assets.clone();
                         refresh_dashboard_state(
                             runtime,
-                            &books,
+                            books,
                             metrics.as_ref(),
-                            &config,
+                            config,
                             dashboard.clone(),
                             &assets,
                             strategy_name,
@@ -1280,9 +1280,9 @@ async fn run_runtime_loop(
                         persist_audit_outcome(audit, "market-discovery", runtime, &combined)?;
                         refresh_dashboard_state(
                             runtime,
-                            &books,
+                            books,
                             metrics.as_ref(),
-                            &config,
+                            config,
                             dashboard.clone(),
                             &assets,
                             strategy_name,
@@ -1351,7 +1351,7 @@ async fn run_runtime_loop(
                                 runtime,
                                 books,
                                 metrics.as_ref(),
-                                &config,
+                                config,
                                 dashboard.clone(),
                                 &current_assets,
                                 strategy_name,
@@ -1547,7 +1547,7 @@ async fn run_runtime_loop(
                                 runtime,
                                 books,
                                 metrics.as_ref(),
-                                &config,
+                                config,
                                 dashboard.clone(),
                                 &current_assets,
                                 strategy_name,
@@ -1687,7 +1687,7 @@ async fn run_runtime_loop(
                                         "auto-redeem: submitted"
                                     );
                                     maybe_auto_wrap_pusd_after_redeem(
-                                        &config,
+                                        config,
                                         execution_adapter.as_ref(),
                                     )
                                     .await;

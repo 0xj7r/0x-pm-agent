@@ -319,7 +319,7 @@ impl SpotWsClient {
                         );
                     }
                     write
-                        .send(Message::Ping(Vec::new().into()))
+                        .send(Message::Ping(Vec::new()))
                         .await
                         .context("failed to send spot websocket ping")?;
                 }
@@ -372,7 +372,7 @@ impl SpotWsClient {
             "channel": "market_trades",
         });
         write
-            .send(Message::Text(subscribe.to_string().into()))
+            .send(Message::Text(subscribe.to_string()))
             .await
             .context("failed to subscribe coinbase market trades")?;
         // Coinbase Advanced Trade docs: channels can close after 60-90s
@@ -382,7 +382,7 @@ impl SpotWsClient {
             "channel": "heartbeats",
         });
         write
-            .send(Message::Text(heartbeat_subscribe.to_string().into()))
+            .send(Message::Text(heartbeat_subscribe.to_string()))
             .await
             .context("failed to subscribe coinbase heartbeats")?;
 
@@ -416,7 +416,7 @@ impl SpotWsClient {
                         );
                     }
                     write
-                        .send(Message::Ping(Vec::new().into()))
+                        .send(Message::Ping(Vec::new()))
                         .await
                         .context("failed to send coinbase websocket ping")?;
                 }
@@ -619,7 +619,7 @@ fn normalize_binance_rest_events(
         .filter(|event| {
             event
                 .source_trade_id
-                .map_or(true, |trade_id| trade_id > last_seen_id)
+                .is_none_or(|trade_id| trade_id > last_seen_id)
         })
         .collect::<Vec<_>>();
     let max_event_ms = events

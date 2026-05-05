@@ -623,7 +623,7 @@ impl OrderStore for SqliteOrderStore {
             .query_row(
                 "SELECT * FROM orders WHERE client_order_id = ?1",
                 params![client_order_id.as_str()],
-                |row| Self::row_to_record(row),
+                Self::row_to_record,
             )
             .optional()
             .map_err(|error| OrderStoreError::Sqlite(format!("failed to load order: {error}")))
@@ -636,7 +636,7 @@ impl OrderStore for SqliteOrderStore {
         })?;
 
         let rows = statement
-            .query_map(params![], |row| Self::row_to_record(row))
+            .query_map(params![], Self::row_to_record)
             .map_err(|error| {
                 OrderStoreError::Sqlite(format!("failed to execute list open query: {error}"))
             })?;
@@ -660,7 +660,7 @@ impl OrderStore for SqliteOrderStore {
         })?;
 
         let rows = statement
-            .query_map(params![market_id.as_str()], |row| Self::row_to_record(row))
+            .query_map(params![market_id.as_str()], Self::row_to_record)
             .map_err(|error| {
                 OrderStoreError::Sqlite(format!("failed to execute market list query: {error}"))
             })?;

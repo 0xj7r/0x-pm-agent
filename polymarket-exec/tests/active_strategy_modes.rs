@@ -518,7 +518,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(pair_cost_config.high_vol_pair_cost_threshold, 0.97);
     assert_eq!(pair_cost_config.base_clip_usd, 6.0);
     assert_eq!(pair_cost_config.max_clip_usd, 5.0);
-    assert_eq!(pair_cost_config.rescue_enabled, false);
+    assert!(!pair_cost_config.rescue_enabled);
     assert_eq!(pair_cost_config.rescue_late_window_sec, 90);
     assert_eq!(pair_cost_config.rescue_rehedge_pair_cost_threshold, 1.03);
     assert_eq!(pair_cost_config.recycle_min_imbalance_qty, 5.0);

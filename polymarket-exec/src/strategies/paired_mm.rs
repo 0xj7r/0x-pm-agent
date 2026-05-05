@@ -9,7 +9,7 @@ use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, InstrumentId, StrategyDecision};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct PairedMmStrategyConfig {
     pub ladder: LadderConfig,
     pub rescue: RescueConfig,
@@ -17,19 +17,6 @@ pub struct PairedMmStrategyConfig {
     pub capital_recycle: CapitalRecycleConfig,
     pub hard_policy: HardPolicyConfig,
     pub convexity_overlay: ConvexityOverlayConfig,
-}
-
-impl Default for PairedMmStrategyConfig {
-    fn default() -> Self {
-        Self {
-            ladder: LadderConfig::default(),
-            rescue: RescueConfig::default(),
-            merge: MergePolicyConfig::default(),
-            capital_recycle: CapitalRecycleConfig::default(),
-            hard_policy: HardPolicyConfig::default(),
-            convexity_overlay: ConvexityOverlayConfig::default(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
