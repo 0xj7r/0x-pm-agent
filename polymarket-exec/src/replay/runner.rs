@@ -268,6 +268,7 @@ pub fn run_window<S: ReplayStrategy>(
         let mut synthesizer = EventSynthesizer::new();
         let mut intents_submitted: u64 = 0;
         let mut risk_rejections: Vec<RiskRejection> = Vec::new();
+        let mut accounting_events: Vec<Event> = Vec::with_capacity(events.len());
         for event in events {
             // Synthesize any window-open / window-close markers triggered
             // by this event and dispatch them through the strategy and
@@ -284,6 +285,7 @@ pub fn run_window<S: ReplayStrategy>(
                     &mut intents_submitted,
                     &mut risk_rejections,
                 );
+                accounting_events.push(synth.clone());
             }
             dispatch_event(
                 strategy,
@@ -292,13 +294,14 @@ pub fn run_window<S: ReplayStrategy>(
                 &mut intents_submitted,
                 &mut risk_rejections,
             );
+            accounting_events.push(event.clone());
         }
         (
             sim.fills().to_vec(),
             sim.rejections().to_vec(),
             intents_submitted,
             risk_rejections,
-            compute_accounting(events, sim.fills(), cfg.starting_cash_usd),
+            compute_accounting(&accounting_events, sim.fills(), cfg.starting_cash_usd),
         )
     }));
 
@@ -573,6 +576,46 @@ mod tests {
         }
     }
 
+    fn market_meta(received_ns: i64, end_time_ms: i64) -> Event {
+        Event {
+            v: 1,
+            ts_ns: received_ns - 1,
+            received_ns,
+            event_type: EventType::MarketMeta,
+            market_type: "btc_5m".into(),
+            market_slug: Some("btc-up-or-down".into()),
+            asset_id: None,
+            side: None,
+            price: None,
+            size: None,
+            sequence: Some(received_ns),
+            source: Source::PolymarketDataApi,
+            raw: json!({
+                "asset_ids": ["asset-a", "asset-b"],
+                "strike": 100.0,
+                "end_time_ms": end_time_ms
+            }),
+        }
+    }
+
+    fn btc_tick(received_ns: i64, price: &str) -> Event {
+        Event {
+            v: 1,
+            ts_ns: received_ns - 1,
+            received_ns,
+            event_type: EventType::BtcTick,
+            market_type: "btc_ref".into(),
+            market_slug: Some("btcusdt".into()),
+            asset_id: Some("BTC".into()),
+            side: None,
+            price: Some(price.into()),
+            size: Some("0.01".into()),
+            sequence: Some(received_ns),
+            source: Source::BinanceAggtrade,
+            raw: json!({}),
+        }
+    }
+
     /// Test fake: places one resting sell order on the first event, then
     /// passively counts fills. Used to verify the runner end-to-end.
     struct PassiveAskStrategy {
@@ -601,6 +644,35 @@ mod tests {
         }
         fn on_fill(&mut self, _fill: &SimulatedFill) -> ReplayDecision {
             self.on_fill_count += 1;
+            ReplayDecision::default()
+        }
+    }
+
+    struct PassiveBidStrategy {
+        placed: bool,
+    }
+
+    impl ReplayStrategy for PassiveBidStrategy {
+        fn on_event(&mut self, event: &Event) -> ReplayDecision {
+            if !self.placed && event.asset_id.as_deref() == Some("asset-a") {
+                self.placed = true;
+                return ReplayDecision {
+                    submits: vec![StrategyOrderIntent::passive(
+                        "passive-bid-1",
+                        "asset-a",
+                        Side::Buy,
+                        0.55,
+                        10.0,
+                        (event.received_ns / 1_000_000) as u64,
+                    )],
+                    cancels: vec![],
+                    risk_rejections: vec![],
+                };
+            }
+            ReplayDecision::default()
+        }
+
+        fn on_fill(&mut self, _fill: &SimulatedFill) -> ReplayDecision {
             ReplayDecision::default()
         }
     }
@@ -654,6 +726,52 @@ mod tests {
         assert_eq!(strategy.on_fill_count, 2);
         assert_eq!(summary.events_replayed, 3);
         assert_eq!(summary.intents_submitted, 1);
+    }
+
+    #[test]
+    fn run_window_accounting_uses_synthesized_resolution_events() {
+        let events = vec![
+            market_meta(1_000_000_000, 300_000),
+            evt(
+                2_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "sell",
+                "0.55",
+                "100",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "sell",
+                "0.55",
+                "10",
+            ),
+            btc_tick(301_000_000_000, "101.0"),
+        ];
+        let cfg = RunnerConfig {
+            window_id: "w-resolved".into(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+        let mut strategy = PassiveBidStrategy { placed: false };
+
+        let summary = run_window(&mut strategy, &events, &cfg);
+
+        assert_eq!(summary.status, WindowStatus::Ok);
+        assert_eq!(summary.fills.len(), 1);
+        assert_eq!(
+            summary.accounting.resolution_winner_asset_id,
+            Some("asset-a".to_string())
+        );
+        assert_eq!(summary.accounting.mark_source, "resolution");
+        assert_eq!(summary.accounting.redeemable_value_usd, 10.0);
+        assert_eq!(summary.accounting.ending_equity_usd, 1_004.5);
     }
 
     /// Strategy that panics on second event. Used to verify panic isolation.
