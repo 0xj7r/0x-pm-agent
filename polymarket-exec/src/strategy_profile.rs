@@ -450,11 +450,6 @@ impl StrategyProfile {
                 .side_score
                 .book_sanity_weight
                 .unwrap_or(config.side_score.book_sanity_weight),
-            max_ladder_tilt: self
-                .signals
-                .side_score
-                .max_ladder_tilt
-                .unwrap_or(config.side_score.max_ladder_tilt),
             max_late_convex_tilt: self
                 .signals
                 .side_score
@@ -803,7 +798,6 @@ pub struct SideScoreSection {
     pub terminal_timing_weight: Option<f64>,
     pub reversal_risk_weight: Option<f64>,
     pub book_sanity_weight: Option<f64>,
-    pub max_ladder_tilt: Option<f64>,
     pub max_late_convex_tilt: Option<f64>,
     pub min_favorite_confidence: Option<f64>,
 }
