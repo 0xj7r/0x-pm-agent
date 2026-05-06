@@ -15,6 +15,7 @@
 //! - Run-id is `sha256(canonical_profile || window_plan || git_rev ||
 //!   schema_version || fill_sim_version)[..16]`.
 
+pub mod checkpoint;
 pub mod fill_sim;
 pub mod journal;
 pub mod latency;
