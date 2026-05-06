@@ -30,47 +30,6 @@ When proposing any strategy change, the first question to answer is
 "what does the whale data say?" If the answer is "we haven't measured,"
 go measure first.
 
-## Strategy intent: paired MM + convex asymmetric payoff
-
-The `btc_5m_mm` strategy runs TWO complementary entry paths, not one.
-Future agents have repeatedly over-suppressed one to "fix" the other.
-Don't do that.
-
-**Path 1 — Paired bidding (the rebate workhorse).**
-Quote both legs (Up + Down) at fair − edge, capture maker rebates on
-fills, merge paired inventory back to $1 collateral. Works in flat /
-mid-priced markets where both legs are near 50/50. This is where most
-of our day-to-day revenue comes from.
-
-**Path 2 — Convex accumulation (the asymmetric payoff side bet).**
-When paired entry is suppressed because one leg is at premium prices
-(e.g., Up=$0.95, Down=$0.05), the strategy buys the cheap leg at
-≤ $0.45 in small size, betting on rare reversal. Pays off ~5-15% of
-the time but pays 5-20× when it does. This is NOT a separate strategy —
-it's the second arm of the same one. The asymmetric payoff is a core
-design intent.
-
-**What this strategy is NOT.**
-- NOT directional momentum chasing. We do not buy the winning side
-  at $0.95 expecting $1 payout. That's a different strategy
-  (latency-arb-against-spot) we don't currently run.
-- NOT pure paired-only. Suppressing convex_accum because "one side is
-  too expensive" kills the asymmetric payoff. Cooling state should
-  pause paired bidding while still attempting convex_accum where the
-  reason permits (premium fair cap, market mid moved, btc trending).
-
-**Hard suppression triggers** (skip ALL entry paths, including convex):
-asymmetric entry-fill cooldown, post-fill cooldown, btc regime
-inactive, runtime degraded.
-
-**Soft suppression triggers** (skip paired, allow convex):
-premium fair cap, market mid moved, btc regime trending.
-
-When introducing a new gate, ASK yourself: does this gate hurt paired
-behavior, convex behavior, or both? Encode the answer in the gate's
-return type (e.g., `GateOutcome::{Allow, SuppressPaired, SuppressAll}`)
-rather than a string-prefix classifier downstream.
-
 ## Gate calibration: prefer signals over hardcoded constants
 
 When adding a threshold (timing, magnitude, count), the V1 implementation
