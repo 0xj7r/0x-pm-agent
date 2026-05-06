@@ -26,10 +26,12 @@ use crate::market_making::pairing::rescue_engine::{
 use crate::market_making::pairing::risk_policy::{
     evaluate_hard_policy, HardPolicyAction, HardPolicyConfig, HardPolicyDecision,
 };
-use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::market_making::pairing::types::{LadderLeg, PairedInventorySnapshot, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::{
-    BtcRegime, BtcRegimeSnapshot, FairValueEstimate, MomentumSignal, OrderBookPressureSignal,
+    BookSanityConfig, BookSanitySignal, BtcRegime, BtcRegimeSnapshot, FairValueEstimate,
+    MomentumSignal, OrderBookPressureSignal, ReversalConfig, ReversalSignal, SideScoreConfig,
+    SideScoreSignal,
 };
 use crate::strategies::traits::PairedOpenOrderExposure;
 use crate::types::{
@@ -90,6 +92,9 @@ pub struct PairedMmEngineConfig {
     pub hard_policy: HardPolicyConfig,
     pub auto_fill: AutoFillConfig,
     pub convexity_overlay: ConvexityOverlayConfig,
+    pub reversal: ReversalConfig,
+    pub book_sanity: BookSanityConfig,
+    pub side_score: SideScoreConfig,
 }
 
 impl Default for PairedMmEngineConfig {
@@ -102,6 +107,9 @@ impl Default for PairedMmEngineConfig {
             hard_policy: HardPolicyConfig::default(),
             auto_fill: AutoFillConfig::default(),
             convexity_overlay: ConvexityOverlayConfig::default(),
+            reversal: ReversalConfig::default(),
+            book_sanity: BookSanityConfig::default(),
+            side_score: SideScoreConfig::default(),
         }
     }
 }
@@ -130,6 +138,9 @@ pub struct PairedMmDecision {
     pub capital_recycle: CapitalRecycleDecision,
     pub rescue: Option<RescueDecision>,
     pub convex_overlay: Vec<OrderIntent>,
+    pub reversal: ReversalSignal,
+    pub book_sanity: BookSanitySignal,
+    pub side_score: SideScoreSignal,
     pub notes: Vec<String>,
 }
 
@@ -221,6 +232,29 @@ impl PairedMmEngine {
         });
         let rescue =
             rescue_inputs.map(|rescue_inputs| choose_rescue(rescue_inputs, self.config.rescue));
+        let reversal = ReversalSignal::compute(
+            &input.fair_value,
+            &input.momentum,
+            &input.order_book_pressure,
+            self.config.reversal,
+        );
+        let book_sanity =
+            BookSanitySignal::compute(&input.snapshot, input.now_ms, self.config.book_sanity);
+        let remaining_ms = input
+            .market
+            .time_remaining_ms(input.now_ms)
+            .unwrap_or(input.market.window_ms());
+        let side_score = SideScoreSignal::compute(
+            &input.fair_value,
+            &input.snapshot,
+            &input.momentum,
+            &input.order_book_pressure,
+            &reversal,
+            &book_sanity,
+            remaining_ms,
+            input.market.window_ms(),
+            self.config.side_score,
+        );
 
         let mut ladder = match &hard_policy.action {
             HardPolicyAction::Allow => build_ladder(
@@ -231,6 +265,7 @@ impl PairedMmEngine {
                 &input.btc_regime,
                 &input.momentum,
                 &input.order_book_pressure,
+                &side_score,
                 &input.pair_cost,
                 &self.config.ladder,
                 input.now_ms,
@@ -244,6 +279,7 @@ impl PairedMmEngine {
                     &input.btc_regime,
                     &input.momentum,
                     &input.order_book_pressure,
+                    &side_score,
                     &input.pair_cost,
                     &self.config.ladder,
                     input.now_ms,
@@ -261,6 +297,7 @@ impl PairedMmEngine {
                 &input.fair_value,
                 &input.btc_regime,
                 &input.order_book_pressure,
+                &side_score,
                 self.config.convexity_overlay,
                 input.now_ms,
             )
@@ -325,6 +362,9 @@ impl PairedMmEngine {
             capital_recycle,
             rescue,
             convex_overlay,
+            reversal,
+            book_sanity,
+            side_score,
             notes,
         }
     }
@@ -388,6 +428,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     fair_value: &FairValueEstimate,
     btc_regime: &BtcRegimeSnapshot,
     order_book_pressure: &OrderBookPressureSignal,
+    side_score: &SideScoreSignal,
     config: ConvexityOverlayConfig,
     now_ms: EpochMillis,
 ) -> Vec<OrderIntent> {
@@ -481,7 +522,13 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     if favorite_open_count >= max_active_per_leg {
         return Vec::new();
     }
-    let pressure_bias = convex_pressure_bias(favorite_tag, order_book_pressure);
+    let favorite_leg = leg_from_tag(favorite_tag);
+    let tail_leg = leg_from_tag(tail_tag);
+    let mut pressure_bias = convex_pressure_bias(favorite_tag, order_book_pressure);
+    pressure_bias.favorite_scale *= side_score.leg(favorite_leg).late_convex_scale;
+    pressure_bias.tail_scale *= side_score.leg(tail_leg).late_convex_scale;
+    pressure_bias.favorite_scale = pressure_bias.favorite_scale.clamp(0.10, 2.50);
+    pressure_bias.tail_scale = pressure_bias.tail_scale.clamp(0.10, 2.50);
 
     let tick_size = market.tick_size().max(0.0001);
     let Some((favorite_limit_price, favorite_best_ask)) =
@@ -565,7 +612,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             favorite_limit_price,
             plan.favorite_qty,
             format!(
-                "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} regime={}",
+                "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_favorite={:.4} regime={}",
                 favorite_edge * 10_000.0,
                 plan.ev_delta,
                 plan.pnl_if_favorite,
@@ -574,6 +621,10 @@ fn choose_convex_overlay<M: MarketDescriptor>(
                 plan.tail_notional,
                 plan.tail_payoff_multiple,
                 pressure_bias.label,
+                side_score.leg(favorite_leg).score,
+                side_score.leg(tail_leg).score,
+                side_score.leg(favorite_leg).reversal_component.abs(),
+                side_score.leg(favorite_leg).book_sanity_penalty,
                 plan.regime_label
             ),
             now_ms,
@@ -597,7 +648,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             tail_limit_price,
             plan.tail_qty,
             format!(
-                "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} regime={}",
+                "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_tail={:.4} regime={}",
                 plan.ev_delta,
                 plan.pnl_if_favorite,
                 plan.pnl_if_tail,
@@ -605,6 +656,10 @@ fn choose_convex_overlay<M: MarketDescriptor>(
                 plan.tail_notional,
                 plan.tail_payoff_multiple,
                 pressure_bias.label,
+                side_score.leg(favorite_leg).score,
+                side_score.leg(tail_leg).score,
+                side_score.leg(favorite_leg).reversal_component.abs(),
+                side_score.leg(tail_leg).book_sanity_penalty,
                 plan.regime_label
             ),
             now_ms,
@@ -649,13 +704,16 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         favorite_limit_price,
         favorite_plan.qty,
         format!(
-            "paired-mm late favorite-only load leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_other={:.4} notional={:.4} pressure={} regime={}",
+            "paired-mm late favorite-only load leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_other={:.4} notional={:.4} pressure={} side_score={:.4} reversal_prob={:.4} book_penalty={:.4} regime={}",
             favorite_edge * 10_000.0,
             favorite_plan.ev_delta,
             favorite_plan.pnl_if_favorite,
             favorite_plan.pnl_if_other,
             favorite_plan.notional,
             pressure_bias.label,
+            side_score.leg(favorite_leg).score,
+            side_score.leg(favorite_leg).reversal_component.abs(),
+            side_score.leg(favorite_leg).book_sanity_penalty,
             favorite_plan.regime_label
         ),
         now_ms,
@@ -666,6 +724,14 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     ));
     favorite_intent.kind = IntentKind::Entry;
     vec![favorite_intent]
+}
+
+fn leg_from_tag(tag: &str) -> LadderLeg {
+    if tag == "yes" {
+        LadderLeg::Yes
+    } else {
+        LadderLeg::No
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

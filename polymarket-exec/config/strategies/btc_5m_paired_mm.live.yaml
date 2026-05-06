@@ -102,6 +102,30 @@ signals:
   momentum_max_tilt: 0.02
   order_flow_imbalance_threshold: 0.0
   asymmetric_fill_max_penalty: 0.02
+  reversal:
+    enabled: true
+    deceleration_weight: 0.35
+    momentum_flip_weight: 0.25
+    distance_weight: 0.20
+    orderflow_weight: 0.20
+    strong_momentum_bps: 8.0
+    flip_deadband_bps: 1.0
+  book_sanity:
+    max_spread: 0.08
+    min_top_depth_notional_usd: 3.0
+    max_staleness_ms: 1500
+    max_queue_depth_usd: 200.0
+    max_projected_pair_cost: 0.995
+  side_score:
+    fair_value_weight: 0.35
+    momentum_weight: 0.25
+    orderflow_weight: 0.20
+    terminal_timing_weight: 0.15
+    reversal_risk_weight: 0.15
+    book_sanity_weight: 0.10
+    max_ladder_tilt: 0.35
+    max_late_convex_tilt: 0.80
+    min_favorite_confidence: 0.05
 
 # ── Time / Bar Phase Scaling ────────────────────────────────────
 bar_phase:

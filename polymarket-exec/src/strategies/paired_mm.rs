@@ -6,6 +6,7 @@ use crate::market_making::paired_mm::{
     RescueConfig,
 };
 use crate::markets::MarketDescriptor;
+use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, InstrumentId, StrategyDecision};
 
@@ -17,6 +18,9 @@ pub struct PairedMmStrategyConfig {
     pub capital_recycle: CapitalRecycleConfig,
     pub hard_policy: HardPolicyConfig,
     pub convexity_overlay: ConvexityOverlayConfig,
+    pub reversal: ReversalConfig,
+    pub book_sanity: BookSanityConfig,
+    pub side_score: SideScoreConfig,
 }
 
 impl Default for PairedMmStrategyConfig {
@@ -28,6 +32,9 @@ impl Default for PairedMmStrategyConfig {
             capital_recycle: CapitalRecycleConfig::default(),
             hard_policy: HardPolicyConfig::default(),
             convexity_overlay: ConvexityOverlayConfig::default(),
+            reversal: ReversalConfig::default(),
+            book_sanity: BookSanityConfig::default(),
+            side_score: SideScoreConfig::default(),
         }
     }
 }
@@ -48,6 +55,9 @@ impl PairedMmStrategy {
                 hard_policy: config.hard_policy,
                 auto_fill: Default::default(),
                 convexity_overlay: config.convexity_overlay,
+                reversal: config.reversal,
+                book_sanity: config.book_sanity,
+                side_score: config.side_score,
             }),
         }
     }
@@ -104,7 +114,7 @@ where
         let mut notes = decision.notes.clone();
         notes.extend(decision.ladder.diagnostics.notes.clone());
         notes.push(format!(
-            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4} yes_signal_scale={:.3} no_signal_scale={:.3}",
+            "paired-mm ladder regime={:?} btc_regime={:?} vol_5m_bps={:?} ret180_bps={:?} momentum_dir={:?} momentum_score={:.4} pressure_dir={:?} pressure_imbalance={:.4} thin_book={} depth={} spacing_ticks={:.2} yes_res={:.4} no_res={:.4} yes_signal_scale={:.3} no_signal_scale={:.3} side_favorite={:?} side_confidence={:.4} yes_side_score={:.4} no_side_score={:.4} reversal_prob={:.4} book_penalty_yes={:.4} book_penalty_no={:.4}",
             decision.ladder.diagnostics.regime,
             btc_regime,
             vol_5m_bps,
@@ -119,7 +129,14 @@ where
             decision.ladder.diagnostics.yes_reservation,
             decision.ladder.diagnostics.no_reservation,
             decision.ladder.diagnostics.yes_signal_scale,
-            decision.ladder.diagnostics.no_signal_scale
+            decision.ladder.diagnostics.no_signal_scale,
+            decision.side_score.favorite_leg,
+            decision.side_score.confidence,
+            decision.ladder.diagnostics.yes_side_score,
+            decision.ladder.diagnostics.no_side_score,
+            decision.reversal.probability,
+            decision.book_sanity.yes.penalty,
+            decision.book_sanity.no.penalty
         ));
 
         if let Some(intent) = decision.capital_recycle_intent().cloned() {

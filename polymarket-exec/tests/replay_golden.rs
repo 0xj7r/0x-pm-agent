@@ -109,6 +109,7 @@ impl ReplayStrategy for PassiveAsk {
                 )],
                 cancels: vec![],
                 risk_rejections: vec![],
+                journal_events: vec![],
             };
         }
         ReplayDecision::default()
