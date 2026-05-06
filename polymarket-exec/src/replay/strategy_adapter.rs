@@ -31,6 +31,7 @@ use crate::market_making::quote_reconciler::{QuoteAction, QuoteReconciler};
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketRegistry, UnderlyingAsset};
 use crate::quote_engine::{DesiredQuote, DesiredQuoteSet};
 use crate::replay::fill_sim::{Side, SimulatedFill, StrategyOrderIntent};
+use crate::replay::journal::JournalEvent;
 use crate::replay::risk_trace::RiskRejection;
 use crate::replay::runner::{ReplayDecision, ReplayStrategy};
 use crate::risk::{RiskContext, RiskEngine};
@@ -762,6 +763,18 @@ impl ReplayStrategyAdapter {
             coid.clone(),
             IntentRecord::from_intent(&runtime_intent, leg),
         );
+        // Live/replay parity: `OrderIntent` does not carry a typed
+        // post_only flag yet, so the adapter derives it from
+        // `IntentKind`. Entry intents (paired-mm bids/asks, capital
+        // recycle, convex accumulation) are resting maker quotes and the
+        // live trader sets `post_only=true` on the venue request to keep
+        // the maker rebate. Close intents (hedge rescue, reduce-only
+        // sells) are FAK-style aggressive lifts and must NOT be
+        // post-only. This mirrors the live runtime's path through the
+        // execution adapter, where the same IntentKind drives the same
+        // venue-side flags.
+        let aggressive = matches!(intent.kind, IntentKind::Close);
+        let post_only = matches!(intent.kind, IntentKind::Entry);
         Some(StrategyOrderIntent {
             client_order_id: coid,
             asset_id,
@@ -773,15 +786,8 @@ impl ReplayStrategyAdapter {
             } else {
                 now_ms
             },
-            // Live trader's `OrderIntent` does not yet expose a typed
-            // aggressive/post-only flag, so the adapter defaults to the
-            // resting maker semantics. Hedge-rescue (Close) intents are
-            // FAK-style aggressive lifts; mark them as taker so the fill
-            // simulator crosses the book immediately. This preserves the
-            // "rescue completes the pair" invariant exercised by scenario
-            // fixture #4.
-            aggressive: matches!(intent.kind, IntentKind::Close),
-            post_only: false,
+            aggressive,
+            post_only,
         })
     }
 
@@ -792,6 +798,19 @@ impl ReplayStrategyAdapter {
         now_ms: u64,
         out: &mut ReplayDecision,
     ) {
+        let now_ns = (now_ms as i64).saturating_mul(1_000_000);
+        let market_slug = market.market_id.as_str().to_string();
+        let decision_label = strategy_decision_label(&decision);
+        let reason_tag = strategy_decision_reason_tag(&decision);
+        let inputs_hash = self.build_input_hash(market, now_ms);
+        out.journal_events.push(JournalEvent::StrategyDecision {
+            ts_ns: now_ns,
+            market_slug,
+            asset_id: None,
+            decision_type: decision_label,
+            raw_inputs_hash: inputs_hash,
+            reason_tag,
+        });
         match decision {
             StrategyDecision::QuoteSet { intents, .. } => {
                 self.reconcile_and_emit_quote_set(intents, market, now_ms, out);
@@ -828,6 +847,59 @@ impl ReplayStrategyAdapter {
         }
     }
 
+    /// Stable, content-addressed hash of the `(market, snapshot, fair_value,
+    /// btc_regime, inventory)` inputs handed to the strategy on this tick.
+    /// Lets downstream audit consumers verify that two replays of the same
+    /// stream saw byte-identical strategy inputs without persisting the
+    /// full input payload.
+    fn build_input_hash(&self, market: &BinaryOutcomeMarket, now_ms: u64) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        let yes_q = self
+            .books
+            .snapshot(market.yes_instrument_id.as_str())
+            .map(|q| {
+                (
+                    q.best_bid.as_ref().map(|l| (l.price, l.quantity)),
+                    q.best_ask.as_ref().map(|l| (l.price, l.quantity)),
+                    q.last_trade_price,
+                )
+            });
+        let no_q = self
+            .books
+            .snapshot(market.no_instrument_id.as_str())
+            .map(|q| {
+                (
+                    q.best_bid.as_ref().map(|l| (l.price, l.quantity)),
+                    q.best_ask.as_ref().map(|l| (l.price, l.quantity)),
+                    q.last_trade_price,
+                )
+            });
+        let inv = self
+            .inventories
+            .get(&market.market_id)
+            .map(|s| (s.yes_qty, s.no_qty, s.free_cash_usd));
+        let regime = self.btc_regime.snapshot();
+        let payload = format!(
+            "{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            market.market_id.as_str(),
+            now_ms,
+            yes_q,
+            no_q,
+            inv,
+            regime.last_price,
+            regime.realized_vol_5m_bps,
+            regime.return_180s_bps,
+        );
+        hasher.update(payload.as_bytes());
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(16);
+        for b in digest.iter().take(8) {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        hex
+    }
+
     fn reconcile_and_emit_quote_set(
         &mut self,
         intents: Vec<OrderIntent>,
@@ -853,13 +925,19 @@ impl ReplayStrategyAdapter {
         let open_orders = self.managed_open_orders();
         let plan = self.quote_reconciler.plan(desired, &open_orders, now_ms);
 
+        let now_ns = (now_ms as i64).saturating_mul(1_000_000);
         for action in plan.actions {
             match action {
                 QuoteAction::Keep(_) => {}
                 QuoteAction::Cancel {
                     client_order_id,
-                    reason: _,
+                    reason,
                 } => {
+                    out.journal_events.push(JournalEvent::IntentCancel {
+                        ts_ns: now_ns,
+                        intent_id: client_order_id.as_str().to_string(),
+                        reason: format!("{:?}", reason),
+                    });
                     out.cancels.push(client_order_id.as_str().to_string());
                     self.cancel_runtime_order(&client_order_id, now_ms);
                     self.remove_strategy_slot_for_sim_coid(client_order_id.as_str());
@@ -869,11 +947,26 @@ impl ReplayStrategyAdapter {
                     replacement,
                     cancel_reason: _,
                 } => {
-                    out.cancels
-                        .push(existing_client_order_id.as_str().to_string());
+                    let old_id = existing_client_order_id.as_str().to_string();
+                    out.cancels.push(old_id.clone());
                     self.cancel_runtime_order(&existing_client_order_id, now_ms);
                     self.remove_strategy_slot_for_sim_coid(existing_client_order_id.as_str());
+                    let pre_submit_len = out.submits.len();
                     self.evaluate_and_emit(replacement, market, now_ms, out);
+                    if let Some(new_intent) = out.submits.get(pre_submit_len) {
+                        out.journal_events.push(JournalEvent::IntentReplace {
+                            ts_ns: now_ns,
+                            old_intent_id: old_id,
+                            new_intent_id: new_intent.client_order_id.clone(),
+                        });
+                    } else {
+                        // Replacement was rejected by risk; record a cancel.
+                        out.journal_events.push(JournalEvent::IntentCancel {
+                            ts_ns: now_ns,
+                            intent_id: old_id,
+                            reason: "replace_rejected".to_string(),
+                        });
+                    }
                 }
                 QuoteAction::Submit(intent) => {
                     self.evaluate_and_emit(intent, market, now_ms, out);
@@ -923,9 +1016,35 @@ impl ReplayStrategyAdapter {
                 out.cancels.push(prior.clone());
                 self.cancel_runtime_order(&ClientOrderId::new(prior), now_ms);
             }
+            let market_slug = market.market_id.as_str().to_string();
+            let reason_tag = reason_tag_for_intent(&intent);
+            let ladder_position = intent
+                .quote_level_tag
+                .as_deref()
+                .and_then(ladder_position_for_tag);
+            let side_str = match intent.side {
+                TradeSide::Buy => "buy",
+                TradeSide::Sell => "sell",
+            }
+            .to_string();
+            let limit_price = intent.limit_price;
+            let quantity = intent.quantity;
+            let intent_kind = intent.kind;
             if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
                 self.coid_by_strategy_slot
                     .insert(strategy_slot, sim_intent.client_order_id.clone());
+                out.journal_events.push(JournalEvent::IntentSubmit {
+                    ts_ns: (now_ms as i64).saturating_mul(1_000_000),
+                    market_slug,
+                    asset_id: sim_intent.asset_id.clone(),
+                    intent_id: sim_intent.client_order_id.clone(),
+                    side: side_str,
+                    price: limit_price,
+                    size: quantity,
+                    post_only: matches!(intent_kind, IntentKind::Entry),
+                    ladder_position,
+                    reason_tag,
+                });
                 out.submits.push(sim_intent);
             }
             return;
@@ -1024,6 +1143,20 @@ impl ReplayStrategyAdapter {
             out.cancels.push(prior.clone());
             self.cancel_runtime_order(&ClientOrderId::new(prior), now_ms);
         }
+        let market_slug = market.market_id.as_str().to_string();
+        let reason_tag = reason_tag_for_intent(&intent);
+        let ladder_position = intent
+            .quote_level_tag
+            .as_deref()
+            .and_then(ladder_position_for_tag);
+        let side_str = match intent.side {
+            TradeSide::Buy => "buy",
+            TradeSide::Sell => "sell",
+        }
+        .to_string();
+        let limit_price = intent.limit_price;
+        let quantity = intent.quantity;
+        let intent_kind = intent.kind;
         if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
             self.coid_by_strategy_slot
                 .insert(strategy_slot, sim_intent.client_order_id.clone());
@@ -1032,6 +1165,18 @@ impl ReplayStrategyAdapter {
                 .open_orders_per_market
                 .entry(market.market_id.clone())
                 .or_insert(0) += 1;
+            out.journal_events.push(JournalEvent::IntentSubmit {
+                ts_ns: (now_ms as i64).saturating_mul(1_000_000),
+                market_slug,
+                asset_id: sim_intent.asset_id.clone(),
+                intent_id: sim_intent.client_order_id.clone(),
+                side: side_str,
+                price: limit_price,
+                size: quantity,
+                post_only: matches!(intent_kind, IntentKind::Entry),
+                ladder_position,
+                reason_tag,
+            });
             out.submits.push(sim_intent);
         }
     }
@@ -1093,6 +1238,10 @@ impl ReplayStrategy for ReplayStrategyAdapter {
             .entry(record.market_id.clone())
             .or_insert_with(|| InventoryState::new(self.starting_cash_usd));
         inventory.apply_fill(record.leg, record.side, fill.price, fill.size);
+        let post_fill_yes_qty = inventory.yes_qty;
+        let post_fill_yes_avg = inventory.yes_avg_cost;
+        let post_fill_no_qty = inventory.no_qty;
+        let post_fill_no_avg = inventory.no_avg_cost;
 
         // Decrement open-orders counters; the order has filled. Remove
         // from the open-intent map so subsequent risk evaluations see the
@@ -1145,12 +1294,109 @@ impl ReplayStrategy for ReplayStrategyAdapter {
             fill: fill_report,
         };
         let mut decision = ReplayDecision::default();
+        let now_ns = (now_ms as i64).saturating_mul(1_000_000);
+        let market_slug = market.market_id.as_str().to_string();
+        decision
+            .journal_events
+            .push(JournalEvent::InventorySnapshot {
+                ts_ns: now_ns,
+                market_slug: market_slug.clone(),
+                asset_id: market.yes_instrument_id.as_str().to_string(),
+                qty: post_fill_yes_qty,
+                avg_cost: post_fill_yes_avg,
+            });
+        decision
+            .journal_events
+            .push(JournalEvent::InventorySnapshot {
+                ts_ns: now_ns,
+                market_slug,
+                asset_id: market.no_instrument_id.as_str().to_string(),
+                qty: post_fill_no_qty,
+                avg_cost: post_fill_no_avg,
+            });
         let decisions = self.registry.on_fill(market.market_id.as_str(), fill_input);
         for d in decisions {
             self.handle_decision(d, &market, now_ms, &mut decision);
         }
         decision
     }
+}
+
+/// Map a `StrategyDecision` variant to its journal `decision_type` label.
+fn strategy_decision_label(decision: &StrategyDecision) -> String {
+    match decision {
+        StrategyDecision::QuoteSet { .. } => "quote_set".to_string(),
+        StrategyDecision::CapitalRecycle { .. } => "capital_recycle".to_string(),
+        StrategyDecision::Rescue { .. } => "rescue".to_string(),
+        StrategyDecision::Merge { .. } => "merge".to_string(),
+        StrategyDecision::Suppress { reason, .. } => format!("suppress:{:?}", reason),
+        StrategyDecision::Noop { .. } => "noop".to_string(),
+    }
+}
+
+/// Pull the most descriptive reason tag the live strategy emitted out of
+/// the decision's notes. The strategy already encodes mode/decision_label
+/// strings on its notes (see paired_mm.rs and engine.rs); we surface the
+/// first decision_label hit so downstream audit can pivot on the same
+/// label that live operators see in logs.
+fn strategy_decision_reason_tag(decision: &StrategyDecision) -> String {
+    let notes: &[String] = match decision {
+        StrategyDecision::QuoteSet { notes, .. }
+        | StrategyDecision::CapitalRecycle { notes, .. }
+        | StrategyDecision::Rescue { notes, .. }
+        | StrategyDecision::Merge { notes, .. }
+        | StrategyDecision::Suppress { notes, .. }
+        | StrategyDecision::Noop { notes } => notes,
+    };
+    for note in notes {
+        if let Some(label) = extract_decision_label(note) {
+            return label;
+        }
+    }
+    // Fallback: first note is the strategy's headline diagnostic.
+    notes
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "unlabeled".to_string())
+}
+
+fn extract_decision_label(note: &str) -> Option<String> {
+    let key = "decision_label=";
+    let idx = note.find(key)?;
+    let rest = &note[idx + key.len()..];
+    let end = rest.find(|c: char| c == ' ' || c == ',').unwrap_or(rest.len());
+    let label = rest[..end].trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Resolve the `reason_tag` field for an `intent_submit` journal row from
+/// the originating `OrderIntent`. The strategy already populates either
+/// `quote_level_tag` (e.g. `mm-paired-bid:yes:l1:PairedEntry`) or `reason`
+/// (e.g. `paired-mm ladder yes level 1`); we prefer the structured tag.
+fn reason_tag_for_intent(intent: &OrderIntent) -> String {
+    intent
+        .quote_level_tag
+        .clone()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| intent.reason.clone())
+}
+
+fn ladder_position_for_tag(tag: &str) -> Option<i32> {
+    // Existing tags carry `:l<N>:` (e.g. `mm-paired-bid:yes:l1:PairedEntry`).
+    let lower = tag.to_ascii_lowercase();
+    let mut iter = lower.split(':');
+    while let Some(seg) = iter.next() {
+        if let Some(stripped) = seg.strip_prefix('l') {
+            if let Ok(n) = stripped.parse::<i32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 fn record_matches_intent(record: &IntentRecord, intent: &OrderIntent) -> bool {

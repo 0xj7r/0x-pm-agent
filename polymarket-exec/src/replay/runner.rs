@@ -30,6 +30,7 @@ use crate::replay::fill_sim::{
     FillSimConfig, FillSimulator, Side, SimulatedFill, SimulatedOrderSubmission,
     SimulatedRejection, StrategyOrderIntent,
 };
+use crate::replay::journal::JournalEvent;
 use crate::replay::risk_trace::RiskRejection;
 use crate::replay::synthesizer::EventSynthesizer;
 
@@ -65,6 +66,13 @@ pub struct WindowSummary {
     /// downstream writer (Phase 3d wiring; the strand is captured here).
     #[serde(default)]
     pub risk_rejections: Vec<RiskRejection>,
+    /// Append-only audit-trail journal events captured per window. Each
+    /// row maps to one of the discriminated event_kinds documented in
+    /// `replay::journal`. The runner does not write Parquet here; the
+    /// CLI binary aggregates summaries across windows and writes a
+    /// single `journal.parquet` per run.
+    #[serde(default, skip_serializing)]
+    pub journal_events: Vec<JournalEvent>,
     pub status: WindowStatus,
 }
 
@@ -410,6 +418,12 @@ pub struct ReplayDecision {
     /// Risk-engine rejections produced while filtering this decision.
     /// Carried up to the runner for trace-strand emission.
     pub risk_rejections: Vec<RiskRejection>,
+    /// Journal events emitted by the strategy/adapter for the replay
+    /// audit trail. Strategy-decision rows, intent-submit rows, replace
+    /// rows, and inventory snapshots are all populated here; fills are
+    /// synthesized by the runner from the simulator output, not by the
+    /// adapter.
+    pub journal_events: Vec<JournalEvent>,
 }
 
 /// Trait the runner depends on. Implemented by a thin adapter over
@@ -450,6 +464,9 @@ pub fn run_window<S: ReplayStrategy>(
         let mut synthesizer = EventSynthesizer::new();
         let mut intents_submitted: u64 = 0;
         let mut risk_rejections: Vec<RiskRejection> = Vec::new();
+        let mut journal_events: Vec<JournalEvent> = Vec::new();
+        let mut intent_remaining: BTreeMap<String, f64> = BTreeMap::new();
+        let queue_assumption = format!("{:?}", cfg.fill_sim.fill_quality);
         let mut accounting_events: Vec<Event> = Vec::with_capacity(events.len());
         for event in events {
             // Synthesize any window-open / window-close markers triggered
@@ -466,7 +483,11 @@ pub fn run_window<S: ReplayStrategy>(
                     synth,
                     &mut intents_submitted,
                     &mut risk_rejections,
+                    &mut journal_events,
+                    &mut intent_remaining,
+                    &queue_assumption,
                 );
+                emit_market_event_journal_rows(synth, &mut journal_events);
                 accounting_events.push(synth.clone());
             }
             dispatch_event(
@@ -475,7 +496,11 @@ pub fn run_window<S: ReplayStrategy>(
                 event,
                 &mut intents_submitted,
                 &mut risk_rejections,
+                &mut journal_events,
+                &mut intent_remaining,
+                &queue_assumption,
             );
+            emit_market_event_journal_rows(event, &mut journal_events);
             accounting_events.push(event.clone());
         }
         (
@@ -489,6 +514,7 @@ pub fn run_window<S: ReplayStrategy>(
             sim.rejections().to_vec(),
             intents_submitted,
             risk_rejections,
+            journal_events,
             compute_accounting(&accounting_events, sim.fills(), cfg.starting_cash_usd),
         )
     }));
@@ -501,6 +527,7 @@ pub fn run_window<S: ReplayStrategy>(
             post_only_rejections,
             intents_submitted,
             risk_rejections,
+            journal_events,
             accounting,
         )) => WindowSummary {
             window_id: cfg.window_id.clone(),
@@ -512,6 +539,7 @@ pub fn run_window<S: ReplayStrategy>(
             accounting,
             post_only_rejections,
             risk_rejections,
+            journal_events,
             status: WindowStatus::Ok,
         },
         Err(_panic) => WindowSummary {
@@ -530,6 +558,7 @@ pub fn run_window<S: ReplayStrategy>(
             },
             post_only_rejections: Vec::new(),
             risk_rejections: Vec::new(),
+            journal_events: Vec::new(),
             status: WindowStatus::Panicked,
         },
     }
@@ -1192,10 +1221,15 @@ fn dispatch_event<S: ReplayStrategy>(
     event: &Event,
     intents_submitted: &mut u64,
     risk_rejections: &mut Vec<RiskRejection>,
+    journal_events: &mut Vec<JournalEvent>,
+    intent_remaining: &mut BTreeMap<String, f64>,
+    queue_assumption: &str,
 ) {
     let mut decision = strategy.on_event(event);
     risk_rejections.append(&mut decision.risk_rejections);
+    journal_events.append(&mut decision.journal_events);
     for intent in decision.submits {
+        intent_remaining.insert(intent.client_order_id.clone(), intent.size);
         sim.submit(intent);
         *intents_submitted += 1;
     }
@@ -1208,15 +1242,129 @@ fn dispatch_event<S: ReplayStrategy>(
     let fills_after = sim.fills().len();
     #[allow(clippy::unnecessary_to_owned)]
     let new_fills = sim.fills()[fills_before..fills_after].to_vec();
+    for fill in &new_fills {
+        emit_fill_journal_row(fill, intent_remaining, queue_assumption, journal_events);
+    }
     for fill in new_fills {
         let mut decision = strategy.on_fill(&fill);
         risk_rejections.append(&mut decision.risk_rejections);
+        journal_events.append(&mut decision.journal_events);
         for intent in decision.submits {
+            intent_remaining.insert(intent.client_order_id.clone(), intent.size);
             sim.submit(intent);
             *intents_submitted += 1;
         }
         for coid in decision.cancels {
             sim.cancel(&coid, event_ms);
+        }
+    }
+}
+
+fn emit_fill_journal_row(
+    fill: &SimulatedFill,
+    intent_remaining: &mut BTreeMap<String, f64>,
+    queue_assumption: &str,
+    journal_events: &mut Vec<JournalEvent>,
+) {
+    let ts_ns = (fill.fill_ms as i64).saturating_mul(1_000_000);
+    let prior = intent_remaining
+        .get(&fill.client_order_id)
+        .copied()
+        .unwrap_or(fill.size);
+    let remaining = (prior - fill.size).max(0.0);
+    if remaining > f64::EPSILON {
+        intent_remaining.insert(fill.client_order_id.clone(), remaining);
+        journal_events.push(JournalEvent::PartialFill {
+            ts_ns,
+            intent_id: fill.client_order_id.clone(),
+            fill_qty: fill.size,
+            fill_price: fill.price,
+            remaining_qty: remaining,
+        });
+    } else {
+        intent_remaining.remove(&fill.client_order_id);
+        journal_events.push(JournalEvent::Fill {
+            ts_ns,
+            intent_id: fill.client_order_id.clone(),
+            fill_qty: fill.size,
+            fill_price: fill.price,
+            queue_assumption: queue_assumption.to_string(),
+            was_simulated_fill: true,
+        });
+    }
+}
+
+/// Inspect a raw `Event` and emit `merge_event` / `redeem_event` /
+/// `accounting_event` journal rows where applicable. The Polymarket user
+/// websocket emits merge/redeem actions inside `EventType::UserOrder` /
+/// `Resolution`; the schema mirrors what the live runtime sees.
+fn emit_market_event_journal_rows(event: &Event, journal_events: &mut Vec<JournalEvent>) {
+    let market_slug = match event.market_slug.as_deref() {
+        Some(slug) => slug.to_string(),
+        None => return,
+    };
+    if raw_kind_is(event, "merge") {
+        let size = parse_event_size(event).unwrap_or(0.0);
+        let fee = parse_fee_usd(event);
+        let gas = parse_gas_usd(event);
+        let credit = (size - fee - gas).max(0.0);
+        journal_events.push(JournalEvent::MergeEvent {
+            ts_ns: event.received_ns,
+            market_slug: market_slug.clone(),
+            qty_yes_burned: size,
+            qty_no_burned: size,
+            usd_credited: credit,
+        });
+        if fee > 0.0 {
+            journal_events.push(JournalEvent::AccountingEvent {
+                ts_ns: event.received_ns,
+                kind: "fee".to_string(),
+                market_slug: Some(market_slug.clone()),
+                asset_id: None,
+                usd_amount: fee,
+            });
+        }
+        if gas > 0.0 {
+            journal_events.push(JournalEvent::AccountingEvent {
+                ts_ns: event.received_ns,
+                kind: "gas".to_string(),
+                market_slug: Some(market_slug),
+                asset_id: None,
+                usd_amount: gas,
+            });
+        }
+        return;
+    }
+    if event.event_type == EventType::Resolution || raw_kind_is(event, "redeem") {
+        let asset_id = event.asset_id.clone().unwrap_or_default();
+        let qty = parse_event_size(event).unwrap_or(0.0);
+        let credit = qty;
+        journal_events.push(JournalEvent::RedeemEvent {
+            ts_ns: event.received_ns,
+            market_slug: market_slug.clone(),
+            asset_id,
+            qty_redeemed: qty,
+            usd_credited: credit,
+        });
+        let fee = parse_fee_usd(event);
+        let gas = parse_gas_usd(event);
+        if fee > 0.0 {
+            journal_events.push(JournalEvent::AccountingEvent {
+                ts_ns: event.received_ns,
+                kind: "fee".to_string(),
+                market_slug: Some(market_slug.clone()),
+                asset_id: None,
+                usd_amount: fee,
+            });
+        }
+        if gas > 0.0 {
+            journal_events.push(JournalEvent::AccountingEvent {
+                ts_ns: event.received_ns,
+                kind: "gas".to_string(),
+                market_slug: Some(market_slug),
+                asset_id: None,
+                usd_amount: gas,
+            });
         }
     }
 }
@@ -1348,6 +1496,7 @@ mod tests {
                     )],
                     cancels: vec![],
                     risk_rejections: vec![],
+                    journal_events: vec![],
                 };
             }
             ReplayDecision::default()
@@ -1377,6 +1526,7 @@ mod tests {
                     )],
                     cancels: vec![],
                     risk_rejections: vec![],
+                    journal_events: vec![],
                 };
             }
             ReplayDecision::default()
@@ -1406,6 +1556,7 @@ mod tests {
                     )],
                     cancels: vec![],
                     risk_rejections: vec![],
+                    journal_events: vec![],
                 };
             }
             ReplayDecision::default()
@@ -1721,5 +1872,62 @@ mod tests {
         let r1 = run_window(&mut s1, &events, &cfg);
         let r2 = run_window(&mut s2, &events, &cfg);
         assert_eq!(r1, r2);
+    }
+
+    /// Journal-flow guard: every successful intent submission produces an
+    /// `intent_submit` row and every fill produces a `fill` row. This is
+    /// the minimum invariant downstream audit relies on.
+    #[test]
+    fn run_window_emits_journal_rows_for_submits_and_fills() {
+        use crate::replay::journal::JournalEvent;
+        let events = vec![
+            evt(
+                1_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+        ];
+        let cfg = RunnerConfig {
+            window_id: "w-journal".into(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+
+        // The PassiveAskStrategy here populates only `submits`; the runner
+        // should still synthesize a `Fill` journal row for the simulator
+        // match. Strategy-side journal rows (StrategyDecision, IntentSubmit
+        // etc.) are exercised by the strategy_adapter tests; this case
+        // exercises the runner-owned synthesis path.
+        let mut strategy = PassiveAskStrategy {
+            placed: false,
+            on_fill_count: 0,
+        };
+        let summary = run_window(&mut strategy, &events, &cfg);
+        assert_eq!(summary.status, WindowStatus::Ok);
+        let fill_count = summary
+            .journal_events
+            .iter()
+            .filter(|e| matches!(e, JournalEvent::Fill { .. }))
+            .count();
+        assert!(
+            fill_count >= 1,
+            "expected at least one Fill journal row, got {fill_count} of {} total",
+            summary.journal_events.len()
+        );
     }
 }

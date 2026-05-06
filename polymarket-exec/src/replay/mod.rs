@@ -16,6 +16,7 @@
 //!   schema_version || fill_sim_version)[..16]`.
 
 pub mod fill_sim;
+pub mod journal;
 pub mod manifest;
 pub mod reader;
 pub mod risk_trace;
