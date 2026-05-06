@@ -4,7 +4,7 @@ use crate::event_log::{EventLog, EventRecord};
 use crate::journal::JournalFanout;
 use crate::metrics::AppMetrics;
 use crate::runtime::RuntimeOutcome;
-use crate::types::RuntimeCommand;
+use crate::types::{classify_quote_level_tag_for_attribution, RuntimeCommand};
 
 pub(super) fn persist_runtime_outcome(
     journal: &mut JournalFanout,
@@ -119,13 +119,7 @@ fn classify_runtime_command(command: &RuntimeCommand) -> Option<&'static str> {
     let RuntimeCommand::Submit(intent) = command else {
         return None;
     };
-    match intent.quote_level_tag.as_deref().unwrap_or_default() {
-        tag if tag.starts_with("mm-paired-bid") => Some("paired_ladder"),
-        tag if tag.starts_with("mm-convex-accum") => Some("convex_accum"),
-        tag if tag.starts_with("mm-capital-recycle") => Some("capital_recycle"),
-        tag if tag.starts_with("mm-hedge-rescue") => Some("hedge_rescue"),
-        tag if tag.starts_with("mm-reduce") => Some("reduce_cleanup"),
-        "" => Some("untagged_submit"),
-        _ => Some("other_submit"),
-    }
+    Some(classify_quote_level_tag_for_attribution(
+        intent.quote_level_tag.as_deref().unwrap_or_default(),
+    ))
 }
