@@ -2652,12 +2652,13 @@ impl<S: Strategy> Runtime<S> {
             .collect()
     }
 
+    /// Entry intent that belongs to an atomic multi-leg group.
+    ///
+    /// `pair_id` is the structural contract. Paired ladders and late-convex
+    /// packages both set it on every mate, while attribution tags are only
+    /// reporting strings and should not decide runtime atomicity.
     fn is_paired_entry_intent(intent: &OrderIntent) -> bool {
-        intent.kind == crate::types::IntentKind::Entry
-            && intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
+        intent.kind == crate::types::IntentKind::Entry && intent.pair_id.is_some()
     }
 
     fn accept_intent(&mut self, mut intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
