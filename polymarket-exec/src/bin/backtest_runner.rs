@@ -8,6 +8,31 @@
 //! today which is sufficient to validate determinism end-to-end before the
 //! infrastructure lands.
 //!
+//! # Live/replay parity
+//!
+//! Verified-correct (May 2026):
+//! - The runner consumes the same YAML the live trader does
+//!   (`StrategyProfile::load` is the single loader; the live runtime calls
+//!   it from `config/mod.rs` and we call it from `run_main`). There is no
+//!   bespoke replay-only profile schema.
+//! - `ReplayStrategyAdapter::register_market_if_needed` calls
+//!   `StrategyRegistry::register_paired_mm` with `profile.paired_mm_config()`,
+//!   the same entry point the live trader uses. There is no replay-only
+//!   strategy fork.
+//! - The strategy crate has no `cfg!(test)` or `if replay {}` divergence
+//!   branches; all `#[cfg(test)]` blocks are isolated test modules at the
+//!   bottom of each file.
+//! - Replay clocks advance using `event.received_ns / 1_000_000`, which is
+//!   the local-collector receipt time. Per `polymarket-research/docs/
+//!   telonex-reference.md`, this is the only timestamp that lives in a
+//!   single clock domain (the collector hosts) and therefore the only one
+//!   safe for cross-exchange ordering. The Polymarket exchange-emit
+//!   `timestamp_us` (mapped to `event.ts_ns`) and the Binance matching-
+//!   engine clock would otherwise drift independently.
+//! - `OrderIntent.kind` (Entry vs Close) drives both `aggressive` and
+//!   `post_only` flags on the simulator submission, mirroring the venue
+//!   request the live trader sends.
+//!
 //! Exit codes (per spec):
 //!   0 ok
 //!   2 config error
@@ -27,6 +52,7 @@ use serde::{Deserialize, Serialize};
 
 use polymarket_exec::collector::schema::Event;
 use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset};
+use polymarket_exec::replay::journal::{write_journal_parquet, JournalEvent};
 use polymarket_exec::replay::manifest::{
     canonicalize, compute_run_id, profile_hash, Manifest, WindowPlan, FILL_SIM_VERSION,
     SCHEMA_VERSION,
@@ -319,7 +345,7 @@ fn run_main(cli: Cli) -> Result<i32> {
     // Load profile and instantiate the strategy adapter for each window.
     let profile = StrategyProfile::load(&cli.strategy_profile)
         .with_context(|| format!("load strategy profile {}", cli.strategy_profile.display()))?;
-    let summaries = match run_run(windows, &runner_cfg, |_| {
+    let mut summaries = match run_run(windows, &runner_cfg, |_| {
         ReplayStrategyAdapter::from_profile(profile.clone())
     }) {
         Ok(s) => s,
@@ -335,7 +361,8 @@ fn run_main(cli: Cli) -> Result<i32> {
     let windows_root = run_root.join("windows");
     fs::create_dir_all(&windows_root)?;
     let mut had_failure = false;
-    for s in &summaries {
+    let mut journal_events: Vec<JournalEvent> = Vec::new();
+    for s in summaries.iter_mut() {
         if s.status != WindowStatus::Ok {
             had_failure = true;
         }
@@ -343,7 +370,17 @@ fn run_main(cli: Cli) -> Result<i32> {
         let path = windows_root.join(format!("{safe_id}.json"));
         fs::write(&path, serde_json::to_string_pretty(&s)?)
             .with_context(|| format!("write window summary {}", path.display()))?;
+        // Drain the journal events into the run-level vector so each
+        // window's contribution lands in `journal.parquet` exactly once.
+        // The summary's `journal_events` is `skip_serializing` so the
+        // JSON file does not double-record them.
+        journal_events.append(&mut std::mem::take(&mut s.journal_events));
     }
+    let journal_path = run_root.join("journal.parquet");
+    write_journal_parquet(&journal_path, &journal_events)
+        .with_context(|| format!("write journal {}", journal_path.display()))?;
+    let journal_event_count = journal_events.len();
+
     let summary = RunSummary {
         run_id: run_id.clone(),
         git_rev: cli.git_rev,
@@ -357,7 +394,12 @@ fn run_main(cli: Cli) -> Result<i32> {
         serde_json::to_string_pretty(&summary)?,
     )?;
 
-    println!("run_id={} windows={}", run_id, summary.windows.len());
+    println!(
+        "run_id={} windows={} journal_events={}",
+        run_id,
+        summary.windows.len(),
+        journal_event_count
+    );
     Ok(if had_failure { 4 } else { 0 })
 }
 
@@ -432,5 +474,25 @@ mod tests {
             target_window_market_types(&event("reference"), &filter),
             vec!["btc_5m".to_string()]
         );
+    }
+
+    #[test]
+    fn live_paired_mm_yaml_loads_through_runner_path() {
+        // Live/replay parity guard: the runner MUST be able to load the
+        // same YAML the live trader uses, and the resulting profile must
+        // declare `paired_mm` as the active strategy with non-empty
+        // ladder/risk knobs. Any drift between the YAML schema and what
+        // `StrategyProfile::load` understands fails this test.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config/strategies/btc_5m_paired_mm.live.yaml");
+        let profile = StrategyProfile::load(&path).expect("load live YAML");
+        assert_eq!(profile.strategy.as_deref(), Some("paired_mm"));
+        let cfg = profile.paired_mm_config();
+        assert!(
+            cfg.ladder.max_depth >= 1,
+            "ladder.max_depth must be >= 1; got {}",
+            cfg.ladder.max_depth
+        );
+        assert!(cfg.ladder.base_clip_usd > 0.0);
     }
 }
