@@ -524,11 +524,12 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     }
     let favorite_leg = leg_from_tag(favorite_tag);
     let tail_leg = leg_from_tag(tail_tag);
-    let mut pressure_bias = convex_pressure_bias(favorite_tag, order_book_pressure);
-    pressure_bias.favorite_scale *= side_score.leg(favorite_leg).late_convex_scale;
-    pressure_bias.tail_scale *= side_score.leg(tail_leg).late_convex_scale;
-    pressure_bias.favorite_scale = pressure_bias.favorite_scale.clamp(0.10, 2.50);
-    pressure_bias.tail_scale = pressure_bias.tail_scale.clamp(0.10, 2.50);
+    let pressure_bias = apply_side_score_to_pressure_bias(
+        convex_pressure_bias(favorite_tag, order_book_pressure),
+        favorite_leg,
+        tail_leg,
+        side_score,
+    );
 
     let tick_size = market.tick_size().max(0.0001);
     let Some((favorite_limit_price, favorite_best_ask)) =
@@ -600,6 +601,13 @@ fn choose_convex_overlay<M: MarketDescriptor>(
 
     if let Some((plan, tail_limit_price, tail_best_ask)) = maybe_package_plan {
         let mut intents = Vec::with_capacity(2);
+        let package_pair_id = format!(
+            "paired-mm-convex-package:{}:{}:{}:{}",
+            market.market_id(),
+            favorite_tag,
+            tail_tag,
+            now_ms
+        );
         let mut favorite_intent = OrderIntent::new_buy(
             ClientOrderId::from(format!(
                 "paired-mm-convex:{}:{}:{}",
@@ -634,6 +642,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             MmQuoteKind::ConvexAccumulation
         ));
         favorite_intent.kind = IntentKind::Entry;
+        favorite_intent.pair_id = Some(package_pair_id.clone());
         intents.push(favorite_intent);
 
         let mut tail_intent = OrderIntent::new_buy(
@@ -669,6 +678,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             MmQuoteKind::ConvexAccumulation
         ));
         tail_intent.kind = IntentKind::Entry;
+        tail_intent.pair_id = Some(package_pair_id);
         intents.push(tail_intent);
 
         return intents;
@@ -751,6 +761,11 @@ struct ConvexPressureBias {
     label: &'static str,
 }
 
+const FAVORITE_SCALE_MIN: f64 = 0.50;
+const FAVORITE_SCALE_MAX: f64 = 1.50;
+const TAIL_SCALE_MIN: f64 = 0.60;
+const TAIL_SCALE_MAX: f64 = 1.25;
+
 fn convex_pressure_bias(
     favorite_tag: &str,
     pressure: &OrderBookPressureSignal,
@@ -783,9 +798,24 @@ fn convex_pressure_bias(
         bias.tail_scale *= 0.75;
         bias.label = "thin_book";
     }
-    bias.favorite_scale = bias.favorite_scale.clamp(0.50, 1.50);
-    bias.tail_scale = bias.tail_scale.clamp(0.60, 1.25);
+    bias.favorite_scale = bias.favorite_scale.clamp(FAVORITE_SCALE_MIN, FAVORITE_SCALE_MAX);
+    bias.tail_scale = bias.tail_scale.clamp(TAIL_SCALE_MIN, TAIL_SCALE_MAX);
     bias
+}
+
+fn apply_side_score_to_pressure_bias(
+    mut pressure_bias: ConvexPressureBias,
+    favorite_leg: LadderLeg,
+    tail_leg: LadderLeg,
+    side_score: &SideScoreSignal,
+) -> ConvexPressureBias {
+    pressure_bias.favorite_scale = (pressure_bias.favorite_scale
+        * side_score.leg(favorite_leg).late_convex_scale)
+        .clamp(FAVORITE_SCALE_MIN, FAVORITE_SCALE_MAX);
+    pressure_bias.tail_scale = (pressure_bias.tail_scale
+        * side_score.leg(tail_leg).late_convex_scale)
+        .clamp(TAIL_SCALE_MIN, TAIL_SCALE_MAX);
+    pressure_bias
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1185,12 +1215,23 @@ mod tests {
             &fair_value,
             &BtcRegimeSnapshot::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             config,
             250_000,
         );
         assert!(
             !without_open_orders.is_empty(),
             "baseline late convex package should fire with unused budget"
+        );
+        assert_eq!(without_open_orders.len(), 2);
+        let package_pair_id = without_open_orders[0]
+            .pair_id
+            .as_ref()
+            .expect("favorite package leg should carry pair_id");
+        assert_eq!(
+            without_open_orders[1].pair_id.as_ref(),
+            Some(package_pair_id),
+            "late asymmetric package legs must share pair_id"
         );
 
         let saturated_open_orders = PairedOpenOrderExposure {
@@ -1209,6 +1250,7 @@ mod tests {
             &fair_value,
             &BtcRegimeSnapshot::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             config,
             250_000,
         );
@@ -1247,6 +1289,36 @@ mod tests {
         assert!(plan.favorite_notional > plan.tail_notional);
         assert!(plan.tail_qty > plan.favorite_qty);
         assert!(plan.tail_payoff_multiple >= 20.0);
+    }
+
+    #[test]
+    fn side_score_adjusted_convex_pressure_bias_stays_inside_pressure_bounds() {
+        let side_score = SideScoreSignal {
+            yes: crate::signals::SideScoreLeg {
+                late_convex_scale: 2.50,
+                ..Default::default()
+            },
+            no: crate::signals::SideScoreLeg {
+                late_convex_scale: 0.10,
+                ..Default::default()
+            },
+            favorite_leg: Some(LadderLeg::Yes),
+            confidence: 1.0,
+        };
+        let pressure_bias = ConvexPressureBias {
+            favorite_scale: FAVORITE_SCALE_MAX,
+            tail_scale: TAIL_SCALE_MIN,
+            label: "test",
+        };
+        let adjusted = apply_side_score_to_pressure_bias(
+            pressure_bias,
+            LadderLeg::Yes,
+            LadderLeg::No,
+            &side_score,
+        );
+
+        assert_eq!(adjusted.favorite_scale, FAVORITE_SCALE_MAX);
+        assert_eq!(adjusted.tail_scale, TAIL_SCALE_MIN);
     }
 
     #[test]
