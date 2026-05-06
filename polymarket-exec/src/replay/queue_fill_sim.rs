@@ -20,6 +20,10 @@
 
 use std::collections::HashMap;
 
+type PriceTicks = i64;
+
+const PRICE_TICK_SCALE: f64 = 100.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
@@ -80,13 +84,16 @@ pub enum FillEvent {
 #[derive(Debug, Clone)]
 struct Tracked {
     order: OurOrder,
+    price_ticks: PriceTicks,
     queue_ahead: f64,
     remaining: f64,
+    sequence: u64,
 }
 
 pub struct QueuePositionFillSim {
     assumption: QueueAssumption,
     orders: HashMap<OrderId, Tracked>,
+    next_sequence: u64,
 }
 
 impl QueuePositionFillSim {
@@ -94,20 +101,26 @@ impl QueuePositionFillSim {
         Self {
             assumption,
             orders: HashMap::new(),
+            next_sequence: 0,
         }
     }
 
     pub fn on_place(&mut self, order: OurOrder, book_levels_same_side: &[BookLevel]) {
-        let queue_raw = sum_queue_ahead(order.side, order.price, book_levels_same_side);
+        let price_ticks = price_ticks(order.price);
+        let queue_raw = sum_queue_ahead(order.side, price_ticks, book_levels_same_side);
         let queue_ahead = queue_raw * self.assumption.multiplier();
         let remaining = order.size;
         let id = order.id;
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
         self.orders.insert(
             id,
             Tracked {
                 order,
+                price_ticks,
                 queue_ahead,
                 remaining,
+                sequence,
             },
         );
     }
@@ -141,26 +154,31 @@ impl QueuePositionFillSim {
         if qty <= 0.0 {
             return Vec::new();
         }
-        // Stable iteration order: by ascending OrderId. Avoids HashMap-iteration
-        // nondeterminism so identical inputs produce identical fill ordering.
-        let mut ids: Vec<OrderId> = self
+        let trade_price_ticks = price_ticks(price);
+        // Stable venue-priority order: price priority, then placement sequence,
+        // then id as a deterministic tiebreaker.
+        let mut candidates: Vec<(OrderId, PriceTicks, u64)> = self
             .orders
             .iter()
-            .filter(|(_, t)| {
-                t.order.market == market
-                    && t.order.asset_id == asset_id
-                    && t.order.side == side
-                    && trade_reaches_price(side, price, t.order.price)
+            .filter_map(|(id, tracked)| {
+                if tracked.order.market == market
+                    && tracked.order.asset_id == asset_id
+                    && tracked.order.side == side
+                    && trade_reaches_price(side, trade_price_ticks, tracked.price_ticks)
+                {
+                    Some((*id, tracked.price_ticks, tracked.sequence))
+                } else {
+                    None
+                }
             })
-            .map(|(id, _)| *id)
             .collect();
-        ids.sort_by_key(|id| id.0);
+        candidates.sort_by(|left, right| venue_priority(left, right, side));
 
         let mut remaining_qty = qty;
         let mut fills: Vec<FillEvent> = Vec::new();
         let mut to_remove: Vec<OrderId> = Vec::new();
 
-        for id in ids {
+        for (id, _, _) in candidates {
             if remaining_qty <= 0.0 {
                 break;
             }
@@ -215,12 +233,16 @@ impl QueuePositionFillSim {
 /// "better" means a lower ask. Equal-price levels also count as "ahead":
 /// without per-order timestamps in a snapshot we conservatively assume the
 /// existing queue at our price arrived before us.
-fn sum_queue_ahead(side: Side, our_price: f64, levels: &[BookLevel]) -> f64 {
+fn price_ticks(price: f64) -> PriceTicks {
+    (price * PRICE_TICK_SCALE).round() as PriceTicks
+}
+
+fn sum_queue_ahead(side: Side, our_price_ticks: PriceTicks, levels: &[BookLevel]) -> f64 {
     levels
         .iter()
         .filter(|lvl| match side {
-            Side::Buy => lvl.price >= our_price,
-            Side::Sell => lvl.price <= our_price,
+            Side::Buy => price_ticks(lvl.price) >= our_price_ticks,
+            Side::Sell => price_ticks(lvl.price) <= our_price_ticks,
         })
         .map(|lvl| lvl.size)
         .sum()
@@ -229,11 +251,29 @@ fn sum_queue_ahead(side: Side, our_price: f64, levels: &[BookLevel]) -> f64 {
 /// Does a trade at `trade_price` reach a resting order at `order_price`?
 /// Buys rest below the touch; an aggressor sell at-or-below our bid hits us.
 /// Sells rest above the touch; an aggressor buy at-or-above our ask hits us.
-fn trade_reaches_price(side: Side, trade_price: f64, order_price: f64) -> bool {
+fn trade_reaches_price(
+    side: Side,
+    trade_price_ticks: PriceTicks,
+    order_price_ticks: PriceTicks,
+) -> bool {
     match side {
-        Side::Buy => trade_price <= order_price,
-        Side::Sell => trade_price >= order_price,
+        Side::Buy => trade_price_ticks <= order_price_ticks,
+        Side::Sell => trade_price_ticks >= order_price_ticks,
     }
+}
+
+fn venue_priority(
+    left: &(OrderId, PriceTicks, u64),
+    right: &(OrderId, PriceTicks, u64),
+    side: Side,
+) -> std::cmp::Ordering {
+    let price_order = match side {
+        Side::Buy => right.1.cmp(&left.1),
+        Side::Sell => left.1.cmp(&right.1),
+    };
+    price_order
+        .then_with(|| left.2.cmp(&right.2))
+        .then_with(|| left.0.0.cmp(&right.0.0))
 }
 
 #[cfg(test)]
@@ -409,6 +449,45 @@ mod tests {
         assert!(fills.is_empty());
         // Correct (market, asset) fills.
         let fills = sim.on_trade("market-a", "asset-1", Side::Sell, 0.55, 10.0);
+        assert_eq!(fills.len(), 1);
+    }
+
+    #[test]
+    fn multiple_orders_fill_by_price_priority_before_id_order() {
+        let mut sim = QueuePositionFillSim::new(QueueAssumption::Base);
+        sim.on_place(order(1, "m1", "a1", Side::Buy, 0.42, 5.0), &[]);
+        sim.on_place(order(2, "m1", "a1", Side::Buy, 0.43, 5.0), &[]);
+
+        let fills = sim.on_trade("m1", "a1", Side::Buy, 0.42, 8.0);
+        assert_eq!(fills.len(), 2);
+        match &fills[0] {
+            FillEvent::Filled { id, qty, .. } => {
+                assert_eq!(*id, OrderId(2));
+                assert!((qty - 5.0).abs() < 1e-9);
+            }
+            other => panic!("expected better bid to fill first, got {:?}", other),
+        }
+        match &fills[1] {
+            FillEvent::PartialFill {
+                id,
+                qty,
+                remaining,
+                ..
+            } => {
+                assert_eq!(*id, OrderId(1));
+                assert!((qty - 3.0).abs() < 1e-9);
+                assert!((remaining - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected lower bid partial after better bid, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tick_equivalent_prices_match_despite_float_noise() {
+        let mut sim = QueuePositionFillSim::new(QueueAssumption::Base);
+        sim.on_place(order(1, "m1", "a1", Side::Sell, 0.55, 10.0), &[]);
+
+        let fills = sim.on_trade("m1", "a1", Side::Sell, 0.549_999_999_999, 10.0);
         assert_eq!(fills.len(), 1);
     }
 
