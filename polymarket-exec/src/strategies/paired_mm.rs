@@ -2,13 +2,14 @@
 
 use crate::market_making::paired_mm::{
     AutoFillSuggestion, CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig,
-    LadderConfig, MergePolicyConfig, PairedMmEngine, PairedMmEngineConfig, PairedMmInput,
-    RescueConfig,
+    LadderConfig, MergePolicyConfig, MergePolicyDecision, PairedMmEngine, PairedMmEngineConfig,
+    PairedMmInput, RescueConfig,
 };
+use crate::market_making::pairing::pair_ledger::MergeCandidate;
 use crate::markets::MarketDescriptor;
 use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{CoolingReason, InstrumentId, StrategyDecision};
+use crate::types::{ClientOrderId, CoolingReason, InstrumentId, MergeIntent, StrategyDecision};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairedMmStrategyConfig {
@@ -76,6 +77,7 @@ where
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
+        let now_ms = input.now_ms;
         let btc_regime = input.btc_regime.regime();
         let vol_5m_bps = input.btc_regime.realized_vol_5m_bps;
         let ret180_bps = input.btc_regime.return_180s_bps;
@@ -96,6 +98,7 @@ where
             .min_imbalance_qty
             .max(input.market.min_order_size());
         let recycle_only = imbalance_qty >= recycle_only_threshold;
+        let merge_candidate = merge_candidate_from_input(&input);
         let decision = self.engine.decide(&PairedMmInput {
             market: input.market,
             snapshot: input.snapshot,
@@ -106,7 +109,7 @@ where
             btc_regime: input.btc_regime,
             momentum: input.momentum.clone(),
             order_book_pressure: input.order_book_pressure.clone(),
-            merge_candidate: None,
+            merge_candidate: merge_candidate.clone(),
             rescue: None,
             now_ms: input.now_ms,
         });
@@ -138,6 +141,38 @@ where
             decision.book_sanity.yes.penalty,
             decision.book_sanity.no.penalty
         ));
+
+        if let (Some(candidate), MergePolicyDecision::MergeNow { quantity, reason }) =
+            (merge_candidate, decision.merge.clone())
+        {
+            notes.push(format!(
+                "paired-mm decision_label=merge mode=merge_first quantity={quantity:.4} reason={reason}"
+            ));
+            return StrategyDecision::Merge {
+                intent: MergeIntent {
+                    command_id: ClientOrderId::new(format!(
+                        "paired-mm-merge:{}:{}",
+                        candidate.market_id, now_ms
+                    )),
+                    market_id: candidate.market_id,
+                    condition_id: None,
+                    yes_instrument_id: candidate
+                        .yes_instrument_id
+                        .expect("merge candidate carries YES instrument"),
+                    no_instrument_id: candidate
+                        .no_instrument_id
+                        .expect("merge candidate carries NO instrument"),
+                    quantity,
+                    expected_cash_usd: quantity,
+                    expected_cost_usd: candidate.expected_cost_usd,
+                    expected_fee_usd: candidate.expected_fee_usd,
+                    expected_gas_usd: candidate.expected_gas_usd,
+                    reason,
+                    created_at_ms: now_ms,
+                },
+                notes,
+            };
+        }
 
         if let Some(intent) = decision.capital_recycle_intent().cloned() {
             notes.push("paired-mm decision_label=cheap_leg_recycle mode=cheap_leg_mode capital recycle emitted".to_string());
@@ -228,6 +263,44 @@ where
             }
         }
     }
+}
+
+fn merge_candidate_from_input<M>(input: &StrategyInput<M>) -> Option<MergeCandidate>
+where
+    M: MarketDescriptor,
+{
+    let paired_qty = input.inventory.yes_qty.min(input.inventory.no_qty);
+    if paired_qty <= 1e-9 {
+        return None;
+    }
+    let yes_avg_cost = input.inventory.yes_avg_cost.max(0.0);
+    let no_avg_cost = input.inventory.no_avg_cost.max(0.0);
+    let expected_cost_usd = paired_qty * yes_avg_cost + paired_qty * no_avg_cost;
+    let expected_cash_usd = paired_qty;
+    let expected_fee_usd = 0.0;
+    let expected_gas_usd = 0.0;
+    let stranded_yes_qty = (input.inventory.yes_qty - paired_qty).max(0.0);
+    let stranded_no_qty = (input.inventory.no_qty - paired_qty).max(0.0);
+    Some(MergeCandidate {
+        market_id: input.market.market_id().clone(),
+        yes_instrument_id: Some(input.market.yes_instrument_id().clone()),
+        no_instrument_id: Some(input.market.no_instrument_id().clone()),
+        paired_qty,
+        stranded_yes_qty,
+        stranded_no_qty,
+        stranded_yes_cost_usd: stranded_yes_qty * yes_avg_cost,
+        stranded_no_cost_usd: stranded_no_qty * no_avg_cost,
+        expected_cash_usd,
+        expected_cost_usd,
+        expected_gas_usd,
+        expected_fee_usd,
+        expected_net_gain_usd: expected_cash_usd
+            - expected_cost_usd
+            - expected_fee_usd
+            - expected_gas_usd,
+        last_merge_at_ms: None,
+        observed_at_ms: input.now_ms,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]

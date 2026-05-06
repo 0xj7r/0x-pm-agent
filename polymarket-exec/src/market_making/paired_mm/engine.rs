@@ -1185,6 +1185,7 @@ mod tests {
             &fair_value,
             &BtcRegimeSnapshot::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             config,
             250_000,
         );
@@ -1209,6 +1210,7 @@ mod tests {
             &fair_value,
             &BtcRegimeSnapshot::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             config,
             250_000,
         );
