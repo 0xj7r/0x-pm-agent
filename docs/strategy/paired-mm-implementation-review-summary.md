@@ -302,24 +302,22 @@ The ladder is anchored by:
 - BTC regime and visible-depth-driven ladder shape
 - inventory imbalance
 - signal clip scaling
-- side-score clip scaling
 
 Signal scaling currently includes:
 
 - momentum alignment/adversity
 - order-book pressure alignment/adversity
 - acceleration alignment/adversity
-- side-score bounded ladder tilt
 
 The normal ladder is still intentionally paired and two-sided. The side score
-should tilt notional/clip sizes, not convert the workhorse MM path into a pure
-directional strategy.
+is logged for diagnostics but does not independently resize YES/NO ladder legs;
+late-convex overlay owns asymmetric favourite/tail sizing.
 
 Review points:
 
-- Confirm quantity normalization does not erase too much useful side-score tilt.
-- Confirm side-score tilt remains bounded by `max_signal_clip_scale`.
 - Confirm risk filtering still enforces inventory caps after sizing.
+- Confirm quote-level knobs (`min_clip_usd`, `entry_min_size_multiplier`,
+  `max_spread`, `max_quote_per_side_usd`) remain wired to the paired ladder.
 
 ## 5. Late convex overlay implementation
 
@@ -344,6 +342,14 @@ effective_favorite_scale = pressure_favorite_scale * side_score.favorite.late_co
 effective_tail_scale = pressure_tail_scale * side_score.tail.late_convex_scale
 ```
 
+Design note:
+
+- The convex overlay's structural favourite is still the fair-value favourite.
+  `SideScoreSignal::favorite_leg` is diagnostic and can diverge when momentum,
+  reversal risk, orderflow, or book sanity disagree with fair value. That
+  divergence should be reviewed before making side-score the source of truth
+  for late-convex leg selection.
+
 Intent reason strings now include:
 
 - side score for favourite
@@ -359,6 +365,8 @@ Review points:
 - Verify tail share count matches intended Bonereaper-style convexity.
 - Verify caps do not suppress all meaningful favorite/tail orders.
 - Verify whipsaw/reversal behavior is sane.
+- Decide whether late-convex favourite selection should remain fair-value-led
+  or move to composite side-score-led selection.
 
 ## 6. Configuration and tuning surfaces
 
@@ -377,9 +385,11 @@ Important sections:
 Controls:
 
 - ladder depth
-- base/max clip
+- base/min/max clip
 - min edge
-- max spread
+- max spread hard guard for paired ladder quoting
+- max quote per side
+- entry minimum size multiplier
 - min top depth
 - maker safety ticks
 - venue minimum order quantity
@@ -448,9 +458,7 @@ Controls:
 - terminal timing weight
 - reversal risk weight
 - book sanity weight
-- max ladder tilt
 - max late convex tilt
-- minimum favourite confidence
 
 ## 7. What needs systematic review
 
