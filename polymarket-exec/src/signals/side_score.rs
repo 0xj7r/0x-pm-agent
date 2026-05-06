@@ -20,7 +20,6 @@ pub struct SideScoreConfig {
     pub reversal_risk_weight: f64,
     pub book_sanity_weight: f64,
     pub max_late_convex_tilt: f64,
-    pub min_favorite_confidence: f64,
 }
 
 impl Default for SideScoreConfig {
@@ -33,7 +32,6 @@ impl Default for SideScoreConfig {
             reversal_risk_weight: 0.15,
             book_sanity_weight: 0.10,
             max_late_convex_tilt: 0.80,
-            min_favorite_confidence: 0.05,
         }
     }
 }
@@ -122,12 +120,10 @@ impl SideScoreSignal {
             config,
         );
         let confidence = (yes.score - no.score).abs().clamp(0.0, 1.0);
-        let favorite_leg = if confidence >= config.min_favorite_confidence.max(0.0) {
-            if yes.score > no.score {
-                Some(LadderLeg::Yes)
-            } else {
-                Some(LadderLeg::No)
-            }
+        let favorite_leg = if yes.score > no.score {
+            Some(LadderLeg::Yes)
+        } else if no.score > yes.score {
+            Some(LadderLeg::No)
         } else {
             None
         };
