@@ -127,7 +127,9 @@ struct JournalFirehoseSink {
 impl JournalFirehoseSink {
     async fn spawn(delivery_stream: String) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
-        let config = aws_config::load_from_env().await;
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .load()
+            .await;
         let client = FirehoseClient::new(&config);
         tokio::spawn(run_firehose_journal_sink(
             client,
