@@ -20,12 +20,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"PMCK";
 const HEADER_LEN: usize = 4 + 4 + 8;
+const MAX_CHECKPOINT_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 
@@ -37,6 +37,7 @@ pub enum CheckpointError {
     BadMagic,
     SchemaMismatch { expected: u32, found: u32 },
     InvalidFilename(String),
+    PayloadTooLarge { max: u64, found: u64 },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -51,6 +52,10 @@ impl std::fmt::Display for CheckpointError {
                 "checkpoint schema mismatch: expected v{expected}, found v{found}"
             ),
             CheckpointError::InvalidFilename(s) => write!(f, "checkpoint invalid filename: {s}"),
+            CheckpointError::PayloadTooLarge { max, found } => write!(
+                f,
+                "checkpoint payload too large: max {max} bytes, found {found} bytes"
+            ),
         }
     }
 }
@@ -101,6 +106,9 @@ pub struct AccountingState {
 pub struct ReplayCheckpoint {
     pub at_event_ts_ns: u64,
     pub schema_version: u32,
+    pub strategy_id: String,
+    pub strategy_config_hash: String,
+    pub strategy_state_schema_version: u32,
     pub positions: Vec<Position>,
     pub open_orders: Vec<OpenOrder>,
     pub book_state: Vec<BookSnapshot>,
@@ -113,6 +121,9 @@ impl ReplayCheckpoint {
         Self {
             at_event_ts_ns,
             schema_version: CHECKPOINT_SCHEMA_VERSION,
+            strategy_id: String::new(),
+            strategy_config_hash: String::new(),
+            strategy_state_schema_version: 0,
             positions: Vec::new(),
             open_orders: Vec::new(),
             book_state: Vec::new(),
@@ -133,13 +144,15 @@ pub trait Checkpointable {
 
 pub struct CheckpointWriter {
     out_dir: PathBuf,
+    next_sequence: AtomicU64,
 }
-
-static WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl CheckpointWriter {
     pub fn new(out_dir: PathBuf) -> Self {
-        Self { out_dir }
+        Self {
+            out_dir,
+            next_sequence: AtomicU64::new(0),
+        }
     }
 
     pub fn write(&self, ckpt: &ReplayCheckpoint) -> Result<PathBuf, CheckpointError> {
@@ -148,16 +161,11 @@ impl CheckpointWriter {
         let payload = bincode::serialize(ckpt)
             .map_err(|e| CheckpointError::Serialize(e.to_string()))?;
 
-        let nonce_seq = WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
-        let wall_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let nonce = wall_ns ^ nonce_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
 
         let filename = format!(
-            "ckpt-{:020}-{:016x}.bin",
-            ckpt.at_event_ts_ns, nonce,
+            "ckpt-{:020}-{:010}.bin",
+            ckpt.at_event_ts_ns, sequence,
         );
         let path = self.out_dir.join(filename);
 
@@ -222,7 +230,14 @@ impl CheckpointReader {
         let payload_len = u64::from_le_bytes([
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
             header[15],
-        ]) as usize;
+        ]);
+        if payload_len > MAX_CHECKPOINT_PAYLOAD_BYTES {
+            return Err(CheckpointError::PayloadTooLarge {
+                max: MAX_CHECKPOINT_PAYLOAD_BYTES,
+                found: payload_len,
+            });
+        }
+        let payload_len = payload_len as usize;
 
         let mut payload = vec![0u8; payload_len];
         f.read_exact(&mut payload)?;
@@ -259,7 +274,7 @@ impl CheckpointReader {
 }
 
 fn parse_ts_from_filename(name: &str) -> Result<u64, CheckpointError> {
-    // expected: ckpt-<20-digit ts>-<hex>.bin
+    // expected: ckpt-<20-digit ts>-<10-digit sequence>.bin
     let stripped = name
         .strip_prefix("ckpt-")
         .ok_or_else(|| CheckpointError::InvalidFilename(name.to_string()))?;
@@ -281,6 +296,9 @@ mod tests {
         ReplayCheckpoint {
             at_event_ts_ns: ts,
             schema_version: CHECKPOINT_SCHEMA_VERSION,
+            strategy_id: "paired_mm".into(),
+            strategy_config_hash: "profile_hash_fixture".into(),
+            strategy_state_schema_version: 1,
             positions: vec![Position {
                 market: "m1".into(),
                 asset_id: "a1".into(),
@@ -352,7 +370,7 @@ mod tests {
     #[test]
     fn schema_mismatch_returns_typed_error() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("ckpt-00000000000000000001-deadbeefdeadbeef.bin");
+        let path = dir.path().join("ckpt-00000000000000000001-0000000000.bin");
 
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(MAGIC).unwrap();
@@ -429,7 +447,7 @@ mod tests {
     #[test]
     fn bad_magic_returns_typed_error() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("ckpt-00000000000000000001-cafef00dcafef00d.bin");
+        let path = dir.path().join("ckpt-00000000000000000001-0000000000.bin");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"XXXX").unwrap();
         f.write_all(&CHECKPOINT_SCHEMA_VERSION.to_le_bytes()).unwrap();
@@ -439,6 +457,19 @@ mod tests {
             CheckpointError::BadMagic => {}
             other => panic!("expected BadMagic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn strategy_identity_round_trips_with_state_blob() {
+        let dir = tempdir().unwrap();
+        let writer = CheckpointWriter::new(dir.path().to_path_buf());
+        let ckpt = sample_ckpt(123);
+        let path = writer.write(&ckpt).unwrap();
+        let loaded = CheckpointReader::load(&path).unwrap();
+        assert_eq!(loaded.strategy_id, "paired_mm");
+        assert_eq!(loaded.strategy_config_hash, "profile_hash_fixture");
+        assert_eq!(loaded.strategy_state_schema_version, 1);
+        assert_eq!(loaded.strategy_state, vec![1, 2, 3, 4, 5]);
     }
 
     struct DummyStrategy {
