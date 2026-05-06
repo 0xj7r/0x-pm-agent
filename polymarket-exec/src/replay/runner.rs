@@ -415,6 +415,10 @@ pub enum WindowStatus {
 pub struct ReplayDecision {
     pub submits: Vec<StrategyOrderIntent>,
     pub cancels: Vec<String>,
+    /// Simulator fills rejected by the strategy/runtime accounting layer.
+    /// Candidate fills are excluded from accepted replay fills, journal fill
+    /// rows, and PnL accounting when their client order id appears here.
+    pub rejected_fills: Vec<String>,
     /// Risk-engine rejections produced while filtering this decision.
     /// Carried up to the runner for trace-strand emission.
     pub risk_rejections: Vec<RiskRejection>,
@@ -424,6 +428,10 @@ pub struct ReplayDecision {
     /// synthesized by the runner from the simulator output, not by the
     /// adapter.
     pub journal_events: Vec<JournalEvent>,
+    /// Replay-generated lifecycle events accepted by the strategy/runtime
+    /// adapter. These are appended to the accounting event stream so
+    /// non-order actions such as simulated merges affect PnL/equity.
+    pub accounting_events: Vec<Event>,
 }
 
 /// Trait the runner depends on. Implemented by a thin adapter over
@@ -465,6 +473,7 @@ pub fn run_window<S: ReplayStrategy>(
         let mut intents_submitted: u64 = 0;
         let mut risk_rejections: Vec<RiskRejection> = Vec::new();
         let mut journal_events: Vec<JournalEvent> = Vec::new();
+        let mut accepted_fills: Vec<SimulatedFill> = Vec::new();
         let mut intent_remaining: BTreeMap<String, f64> = BTreeMap::new();
         let queue_assumption = format!("{:?}", cfg.fill_sim.fill_quality);
         let mut accounting_events: Vec<Event> = Vec::with_capacity(events.len());
@@ -484,7 +493,9 @@ pub fn run_window<S: ReplayStrategy>(
                     &mut intents_submitted,
                     &mut risk_rejections,
                     &mut journal_events,
+                    &mut accepted_fills,
                     &mut intent_remaining,
+                    &mut accounting_events,
                     &queue_assumption,
                 );
                 emit_market_event_journal_rows(synth, &mut journal_events);
@@ -497,15 +508,17 @@ pub fn run_window<S: ReplayStrategy>(
                 &mut intents_submitted,
                 &mut risk_rejections,
                 &mut journal_events,
+                &mut accepted_fills,
                 &mut intent_remaining,
+                &mut accounting_events,
                 &queue_assumption,
             );
             emit_market_event_journal_rows(event, &mut journal_events);
             accounting_events.push(event.clone());
         }
         (
-            sim.fills().to_vec(),
-            compute_queue_calibration(sim.submissions(), sim.fills()),
+            accepted_fills.clone(),
+            compute_queue_calibration(sim.submissions(), &accepted_fills),
             sim.submissions()
                 .iter()
                 .take(64)
@@ -515,7 +528,7 @@ pub fn run_window<S: ReplayStrategy>(
             intents_submitted,
             risk_rejections,
             journal_events,
-            compute_accounting(&accounting_events, sim.fills(), cfg.starting_cash_usd),
+            compute_accounting(&accounting_events, &accepted_fills, cfg.starting_cash_usd),
         )
     }));
 
@@ -837,8 +850,14 @@ fn apply_resolution_settlement(
     winner_asset_id: &str,
     redeem_events: &[ReplaySettlementFeeEvent],
 ) -> AppliedResolutionSummary {
-    let fee_usd: f64 = redeem_events.iter().map(|event| event.fee_usd.max(0.0)).sum();
-    let gas_usd: f64 = redeem_events.iter().map(|event| event.gas_usd.max(0.0)).sum();
+    let fee_usd: f64 = redeem_events
+        .iter()
+        .map(|event| event.fee_usd.max(0.0))
+        .sum();
+    let gas_usd: f64 = redeem_events
+        .iter()
+        .map(|event| event.gas_usd.max(0.0))
+        .sum();
     let mut out = AppliedResolutionSummary {
         fee_usd,
         gas_usd,
@@ -866,8 +885,7 @@ fn apply_resolution_settlement(
     }
     positions.retain(|_, pos| pos.qty > f64::EPSILON);
     out.credit_usd = out.gross_credit_usd - out.fee_usd - out.gas_usd;
-    out.realized_pnl_usd =
-        out.credit_usd - out.winning_cost_usd - out.losing_cost_usd;
+    out.realized_pnl_usd = out.credit_usd - out.winning_cost_usd - out.losing_cost_usd;
     out
 }
 
@@ -897,12 +915,8 @@ fn compute_settlement_summary(
         }
         let cost_basis = pos.qty * pos.avg_cost;
         let role = match winner_asset_id {
-            Some(winner) if winner == asset_id => {
-                "winner"
-            }
-            Some(_) => {
-                "loser"
-            }
+            Some(winner) if winner == asset_id => "winner",
+            Some(_) => "loser",
             None => "unresolved",
         };
         stranded_qty_total += pos.qty;
@@ -1166,7 +1180,10 @@ fn replay_marks(events: &[Event]) -> (BTreeMap<String, f64>, Option<String>) {
     (marks, winner_asset_id)
 }
 
-fn resolve_winner_asset_id(raw_winner: Option<&str>, pair_asset_ids: Option<&[String]>) -> Option<String> {
+fn resolve_winner_asset_id(
+    raw_winner: Option<&str>,
+    pair_asset_ids: Option<&[String]>,
+) -> Option<String> {
     let raw_winner = raw_winner?.trim();
     if raw_winner.is_empty() {
         return None;
@@ -1222,12 +1239,15 @@ fn dispatch_event<S: ReplayStrategy>(
     intents_submitted: &mut u64,
     risk_rejections: &mut Vec<RiskRejection>,
     journal_events: &mut Vec<JournalEvent>,
+    accepted_fills: &mut Vec<SimulatedFill>,
     intent_remaining: &mut BTreeMap<String, f64>,
+    accounting_events: &mut Vec<Event>,
     queue_assumption: &str,
 ) {
     let mut decision = strategy.on_event(event);
     risk_rejections.append(&mut decision.risk_rejections);
     journal_events.append(&mut decision.journal_events);
+    accounting_events.append(&mut decision.accounting_events);
     for intent in decision.submits {
         intent_remaining.insert(intent.client_order_id.clone(), intent.size);
         sim.submit(intent);
@@ -1242,13 +1262,19 @@ fn dispatch_event<S: ReplayStrategy>(
     let fills_after = sim.fills().len();
     #[allow(clippy::unnecessary_to_owned)]
     let new_fills = sim.fills()[fills_before..fills_after].to_vec();
-    for fill in &new_fills {
-        emit_fill_journal_row(fill, intent_remaining, queue_assumption, journal_events);
-    }
     for fill in new_fills {
         let mut decision = strategy.on_fill(&fill);
+        let rejected = decision
+            .rejected_fills
+            .iter()
+            .any(|client_order_id| client_order_id == &fill.client_order_id);
         risk_rejections.append(&mut decision.risk_rejections);
         journal_events.append(&mut decision.journal_events);
+        accounting_events.append(&mut decision.accounting_events);
+        if !rejected {
+            emit_fill_journal_row(&fill, intent_remaining, queue_assumption, journal_events);
+            accepted_fills.push(fill.clone());
+        }
         for intent in decision.submits {
             intent_remaining.insert(intent.client_order_id.clone(), intent.size);
             sim.submit(intent);
@@ -1495,8 +1521,10 @@ mod tests {
                         (event.received_ns / 1_000_000) as u64,
                     )],
                     cancels: vec![],
+                    rejected_fills: vec![],
                     risk_rejections: vec![],
                     journal_events: vec![],
+                    accounting_events: vec![],
                 };
             }
             ReplayDecision::default()
@@ -1525,8 +1553,10 @@ mod tests {
                         (event.received_ns / 1_000_000) as u64,
                     )],
                     cancels: vec![],
+                    rejected_fills: vec![],
                     risk_rejections: vec![],
                     journal_events: vec![],
+                    accounting_events: vec![],
                 };
             }
             ReplayDecision::default()
@@ -1555,8 +1585,10 @@ mod tests {
                         (event.received_ns / 1_000_000) as u64,
                     )],
                     cancels: vec![],
+                    rejected_fills: vec![],
                     risk_rejections: vec![],
                     journal_events: vec![],
+                    accounting_events: vec![],
                 };
             }
             ReplayDecision::default()
