@@ -18,6 +18,7 @@
 pub mod fill_sim;
 pub mod journal;
 pub mod manifest;
+pub mod raw_parquet;
 pub mod reader;
 pub mod risk_trace;
 pub mod runner;

@@ -57,6 +57,7 @@ use polymarket_exec::replay::manifest::{
     canonicalize, compute_run_id, profile_hash, Manifest, WindowPlan, FILL_SIM_VERSION,
     SCHEMA_VERSION,
 };
+use polymarket_exec::replay::raw_parquet::{read_raw_replay, RawReplayMarket, RawReplayOptions};
 use polymarket_exec::replay::reader::read_local_filtered;
 use polymarket_exec::replay::runner::{run_run, RunnerConfig, WindowStatus, WindowSummary};
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
@@ -90,6 +91,21 @@ struct Cli {
     /// supported in Phase 3a; use a local path.
     #[arg(long)]
     input_prefix: PathBuf,
+
+    /// Input format. `rust-event` reads canonical Event v1 Parquet/JSONL.
+    /// `telonex-raw` reads raw Telonex/Binance Parquet directly.
+    #[arg(long, default_value = "rust-event")]
+    input_format: String,
+
+    /// Raw replay market map: slug=up_asset,down_asset[,strike]. Required for
+    /// `--input-format telonex-raw` so market_meta can be emitted without
+    /// scanning the global markets dataset.
+    #[arg(long = "raw-market-asset-map")]
+    raw_market_asset_maps: Vec<String>,
+
+    /// Book levels per side to decode from raw Telonex book snapshots.
+    #[arg(long, default_value_t = 25)]
+    raw_max_book_levels: usize,
 
     /// Output prefix for manifest + per-window summaries.
     #[arg(long)]
@@ -198,6 +214,32 @@ fn parse_market_filter(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_raw_market_asset_maps(values: &[String]) -> Result<Vec<RawReplayMarket>> {
+    let mut markets = Vec::new();
+    for raw in values {
+        for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (slug, assets) = item.split_once('=').with_context(|| {
+                format!("invalid --raw-market-asset-map {item}; expected slug=up_asset,down_asset")
+            })?;
+            let asset_ids: Vec<String> = assets
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            if asset_ids.len() < 2 {
+                anyhow::bail!("invalid --raw-market-asset-map {item}; expected two asset IDs");
+            }
+            markets.push(RawReplayMarket {
+                slug: slug.trim().to_string(),
+                asset_ids: [asset_ids[0].clone(), asset_ids[1].clone()],
+                strike: asset_ids.get(2).cloned(),
+            });
+        }
+    }
+    Ok(markets)
+}
+
 fn event_matches_market_filter(event: &Event, market_filter: &[String]) -> bool {
     market_filter.is_empty()
         || market_filter.contains(&event.market_type)
@@ -216,9 +258,9 @@ fn target_window_market_types(event: &Event, market_filter: &[String]) -> Vec<St
 
 fn run_main(cli: Cli) -> Result<i32> {
     // Validate CLI inputs.
-    let _start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
+    let start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
         .with_context(|| format!("invalid --window-start: {}", cli.window_start))?;
-    let _end_dt = DateTime::parse_from_rfc3339(&cli.window_end)
+    let end_dt = DateTime::parse_from_rfc3339(&cli.window_end)
         .with_context(|| format!("invalid --window-end: {}", cli.window_end))?;
 
     let preset = parse_fill_config(&cli.fill_config)?;
@@ -243,8 +285,37 @@ fn run_main(cli: Cli) -> Result<i32> {
         eprintln!("input prefix not found: {}", cli.input_prefix.display());
         return Ok(3);
     }
-    let events: Vec<Event> = read_local_filtered(&cli.input_prefix, None)
-        .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?;
+    let events: Vec<Event> = match cli.input_format.as_str() {
+        "rust-event" => read_local_filtered(&cli.input_prefix, None)
+            .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?,
+        "telonex-raw" => {
+            let markets = parse_raw_market_asset_maps(&cli.raw_market_asset_maps)?;
+            if markets.is_empty() {
+                anyhow::bail!("--input-format telonex-raw requires at least one --raw-market-asset-map slug=up_asset,down_asset");
+            }
+            read_raw_replay(
+                &cli.input_prefix,
+                &RawReplayOptions {
+                    window_start_ns: start_dt
+                        .timestamp_nanos_opt()
+                        .context("invalid window_start nanoseconds")?,
+                    window_end_ns: end_dt
+                        .timestamp_nanos_opt()
+                        .context("invalid window_end nanoseconds")?,
+                    market_filter: cli.market_filter.clone(),
+                    max_book_levels: cli.raw_max_book_levels,
+                    markets,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "reading raw Telonex input from {}",
+                    cli.input_prefix.display()
+                )
+            })?
+        }
+        other => anyhow::bail!("unknown --input-format: {other}"),
+    };
 
     // Group into windows by (market_type, dt). Phase 3a uses one window
     // per market_type (broader windowing per the spec is Phase 3b/5).
@@ -474,6 +545,29 @@ mod tests {
             target_window_market_types(&event("reference"), &filter),
             vec!["btc_5m".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_raw_market_asset_maps() {
+        let markets = parse_raw_market_asset_maps(&[
+            "btc-updown-5m-1771178400=UP,DOWN".to_string(),
+            "btc-updown-5m-1771178700=UP2,DOWN2".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(markets.len(), 2);
+        assert_eq!(markets[0].slug, "btc-updown-5m-1771178400");
+        assert_eq!(markets[0].asset_ids, ["UP".to_string(), "DOWN".to_string()]);
+        assert_eq!(markets[0].strike, None);
+    }
+
+    #[test]
+    fn parses_raw_market_asset_maps_with_exact_strike() {
+        let markets =
+            parse_raw_market_asset_maps(&["btc-updown-5m-1771178400=UP,DOWN,79000.12".to_string()])
+                .unwrap();
+
+        assert_eq!(markets[0].strike.as_deref(), Some("79000.12"));
     }
 
     #[test]
