@@ -25,9 +25,11 @@ pub struct PairedMmStrategyConfig {
 
 impl Default for PairedMmStrategyConfig {
     fn default() -> Self {
+        let mut rescue = RescueConfig::default();
+        rescue.allow_sell_fallback = false;
         Self {
             ladder: LadderConfig::default(),
-            rescue: RescueConfig::default(),
+            rescue,
             merge: MergePolicyConfig::default(),
             capital_recycle: CapitalRecycleConfig::default(),
             hard_policy: HardPolicyConfig::default(),
