@@ -455,11 +455,6 @@ impl StrategyProfile {
                 .side_score
                 .max_late_convex_tilt
                 .unwrap_or(config.side_score.max_late_convex_tilt),
-            min_favorite_confidence: self
-                .signals
-                .side_score
-                .min_favorite_confidence
-                .unwrap_or(config.side_score.min_favorite_confidence),
         };
         config
     }
@@ -481,7 +476,21 @@ impl StrategyProfile {
             .entry_ladder_spacing_ticks
             .unwrap_or(config.normal_spacing_ticks);
         config.base_clip_usd = self.quote.base_clip_usd.unwrap_or(config.base_clip_usd);
+        config.min_clip_usd = self
+            .quote
+            .min_clip_usd
+            .or(self.clip_sizing.min_clip_usd)
+            .unwrap_or(config.min_clip_usd);
         config.max_clip_usd = self.quote.max_clip_usd.unwrap_or(config.max_clip_usd);
+        config.entry_min_size_multiplier = self
+            .quote
+            .entry_min_size_multiplier
+            .unwrap_or(config.entry_min_size_multiplier);
+        config.max_spread = self.quote.max_spread.or(config.max_spread);
+        config.max_quote_per_side_usd = self
+            .quote
+            .max_quote_per_side_usd
+            .or(config.max_quote_per_side_usd);
         config.fractional_kelly = self
             .clip_sizing
             .fractional_kelly
@@ -799,7 +808,6 @@ pub struct SideScoreSection {
     pub reversal_risk_weight: Option<f64>,
     pub book_sanity_weight: Option<f64>,
     pub max_late_convex_tilt: Option<f64>,
-    pub min_favorite_confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -873,6 +881,18 @@ mod tests {
             "live paired_mm profile must not permit sell unwind"
         );
         assert!(config.rescue.require_no_guaranteed_loss);
+    }
+
+    #[test]
+    fn live_paired_mm_profile_wires_quote_knobs_into_ladder() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config/strategies/btc_5m_paired_mm.live.yaml");
+        let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
+        let config = profile.paired_mm_config();
+
+        assert_eq!(config.ladder.min_clip_usd, 0.50);
+        assert_eq!(config.ladder.entry_min_size_multiplier, 1.0);
+        assert_eq!(config.ladder.max_spread, Some(0.08));
     }
 
     #[test]
