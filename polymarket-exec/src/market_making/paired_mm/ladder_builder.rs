@@ -45,8 +45,12 @@ pub struct LadderConfig {
     pub imbalanced_spacing_multiplier: f64,
     pub late_bar_cutoff_ms: u64,
     pub base_clip_usd: f64,
+    pub min_clip_usd: f64,
     pub fractional_kelly: f64,
     pub max_clip_usd: f64,
+    pub entry_min_size_multiplier: f64,
+    pub max_spread: Option<f64>,
+    pub max_quote_per_side_usd: Option<f64>,
     pub level_multipliers: Vec<f64>,
     pub stoikov: StoikovParams,
     pub caps: RunningInventoryCaps,
@@ -71,8 +75,12 @@ impl Default for LadderConfig {
             imbalanced_spacing_multiplier: 2.0,
             late_bar_cutoff_ms: 60_000,
             base_clip_usd: 10.0,
+            min_clip_usd: 0.0,
             fractional_kelly: 0.20,
             max_clip_usd: 25.0,
+            entry_min_size_multiplier: 1.0,
+            max_spread: None,
+            max_quote_per_side_usd: None,
             level_multipliers: vec![1.0, 1.8, 2.5, 3.5, 4.0, 4.5, 5.0, 5.5],
             stoikov: StoikovParams::default(),
             caps: RunningInventoryCaps::default(),
@@ -176,8 +184,26 @@ pub fn build_ladder<M: MarketDescriptor>(
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
     let yes_signal_scale = signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
     let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
-    let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
-    let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
+    let yes_spread_suppressed = spread_exceeds_limit(&snapshot.yes_quote, config.max_spread);
+    let no_spread_suppressed = spread_exceeds_limit(&snapshot.no_quote, config.max_spread);
+    if yes_spread_suppressed {
+        notes.push(format!(
+            "ladder yes suppressed: spread exceeds max_spread spread={:.4} max_spread={:.4}",
+            snapshot.yes_quote.spread().unwrap_or(f64::NAN),
+            config.max_spread.unwrap_or_default()
+        ));
+    }
+    if no_spread_suppressed {
+        notes.push(format!(
+            "ladder no suppressed: spread exceeds max_spread spread={:.4} max_spread={:.4}",
+            snapshot.no_quote.spread().unwrap_or(f64::NAN),
+            config.max_spread.unwrap_or_default()
+        ));
+    }
+    let suppress_yes =
+        should_suppress_leg(LadderLeg::Yes, inventory, config) || yes_spread_suppressed;
+    let suppress_no =
+        should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
 
     let mut intents = Vec::with_capacity(depth * 2);
     if inventory.gross_cost_usd() < config.caps.max_gross_cost_usd {
@@ -398,11 +424,20 @@ fn kelly_clip_size(
         LadderRegime::LateBar => 0.35,
         LadderRegime::InventoryImbalanced => 0.35,
     };
-    config
-        .base_clip_usd
-        .max(kelly_component)
-        .min(config.max_clip_usd)
-        * regime_scale
+    let min_clip = config.min_clip_usd.max(0.0).min(config.max_clip_usd.max(0.0));
+    let max_clip = config.max_clip_usd.max(min_clip);
+    (config.base_clip_usd.max(kelly_component).min(max_clip) * regime_scale)
+        .max(min_clip)
+        .min(max_clip)
+}
+
+fn spread_exceeds_limit(quote: &crate::types::QuoteSnapshot, max_spread: Option<f64>) -> bool {
+    let Some(max_spread) = max_spread.filter(|value| value.is_finite() && *value > 0.0) else {
+        return false;
+    };
+    quote
+        .spread()
+        .is_some_and(|spread| spread.is_finite() && spread > max_spread)
 }
 
 fn should_suppress_leg(
@@ -446,6 +481,9 @@ fn append_leg_ladder<M: MarketDescriptor>(
         LadderLeg::No => "no",
     };
 
+    let mut leg_notional_usd = 0.0;
+    let min_quantity = market.min_order_size()
+        * config.entry_min_size_multiplier.max(0.0).max(1.0);
     for level in 0..depth {
         let multiplier = config
             .level_multipliers
@@ -463,14 +501,34 @@ fn append_leg_ladder<M: MarketDescriptor>(
         if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
             continue;
         }
-        let clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
+        let mut clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
+        if let Some(max_quote_per_side_usd) = config
+            .max_quote_per_side_usd
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            let remaining = max_quote_per_side_usd - leg_notional_usd;
+            if remaining + 1e-9 < config.min_clip_usd.max(0.0) {
+                break;
+            }
+            clip_usd = clip_usd.min(remaining.max(0.0));
+        }
         let reward_qty = config.incentives.min_reward_quantity().unwrap_or(0.0);
         let quantity = (clip_usd / limit_price.max(tick_size))
-            .max(market.min_order_size())
+            .max(min_quantity)
             .max(reward_qty);
         if quantity <= 0.0 || !quantity.is_finite() {
             continue;
         }
+
+        let notional_usd = quantity * limit_price;
+        if config
+            .max_quote_per_side_usd
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .is_some_and(|cap| leg_notional_usd + notional_usd > cap + 1e-9)
+        {
+            break;
+        }
+        leg_notional_usd += notional_usd;
 
         intents.push(OrderIntent {
             client_order_id: ClientOrderId::from(format!(
@@ -643,6 +701,27 @@ mod tests {
             no_quote: QuoteSnapshot {
                 best_bid: Some(BookLevel::new((no_ask - 0.01).max(0.01), 10.0)),
                 best_ask: Some(BookLevel::new(no_ask, 10.0)),
+                ..QuoteSnapshot::default()
+            },
+            ..snapshot()
+        }
+    }
+
+    fn snapshot_with_spreads(
+        yes_bid: f64,
+        yes_ask: f64,
+        no_bid: f64,
+        no_ask: f64,
+    ) -> PairedMarketSnapshot {
+        PairedMarketSnapshot {
+            yes_quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(yes_bid, 100.0)),
+                best_ask: Some(BookLevel::new(yes_ask, 100.0)),
+                ..QuoteSnapshot::default()
+            },
+            no_quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(no_bid, 100.0)),
+                best_ask: Some(BookLevel::new(no_ask, 100.0)),
                 ..QuoteSnapshot::default()
             },
             ..snapshot()
@@ -836,6 +915,172 @@ mod tests {
                 "yes={yes:?} no={no:?}"
             );
         }
+    }
+
+    #[test]
+    fn min_clip_usd_sets_paired_mm_ladder_floor() {
+        let clip = kelly_clip_size(
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &LadderConfig {
+                base_clip_usd: 0.10,
+                min_clip_usd: 0.50,
+                max_clip_usd: 5.0,
+                ..LadderConfig::default()
+            },
+            LadderRegime::Normal,
+        );
+
+        assert_eq!(clip, 0.50);
+    }
+
+    #[test]
+    fn entry_min_size_multiplier_controls_ladder_quantity_floor() {
+        let mut test_market = market();
+        test_market.min_order_size = 5.0;
+        let result = build_ladder(
+            &test_market,
+            &snapshot_with_asks(0.56, 0.46),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
+            &PairCostTracker::default(),
+            &LadderConfig {
+                max_depth: 1,
+                low_vol_depth: 1,
+                base_clip_usd: 0.50,
+                max_clip_usd: 0.50,
+                entry_min_size_multiplier: 2.0,
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!(!result.intents.is_empty());
+        assert!(result
+            .intents
+            .iter()
+            .all(|intent| intent.quantity >= 10.0));
+    }
+
+    #[test]
+    fn max_spread_suppresses_wide_paired_ladder_leg() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_spreads(0.40, 0.56, 0.44, 0.45),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
+            &PairCostTracker::default(),
+            &LadderConfig {
+                max_spread: Some(0.08),
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!(result.diagnostics.suppressed_yes);
+        assert!(result.intents.is_empty());
+    }
+
+    #[test]
+    fn max_quote_per_side_usd_caps_paired_mm_ladder_notional() {
+        let result = build_ladder(
+            &market(),
+            &snapshot_with_asks(0.56, 0.46),
+            &PairedInventorySnapshot {
+                free_cash_usd: 1_000.0,
+                equity_usd: 1_000.0,
+                ..Default::default()
+            },
+            &FairValueEstimate {
+                p_up: 0.50,
+                p_down: 0.50,
+                log_moneyness: 0.0,
+                sigma_remaining: 0.0,
+                time_remaining_s: 100.0,
+                model: FairValueModel::BsmBinary,
+            },
+            &BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(2.0),
+                ..BtcRegimeSnapshot::default()
+            },
+            &MomentumSignal::default(),
+            &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
+            &PairCostTracker::default(),
+            &LadderConfig {
+                max_depth: 8,
+                low_vol_depth: 8,
+                base_clip_usd: 2.0,
+                max_clip_usd: 5.0,
+                max_quote_per_side_usd: Some(6.0),
+                ..LadderConfig::default()
+            },
+            0,
+        );
+
+        assert!(!result.intents.is_empty());
+        let yes_notional: f64 = result
+            .intents
+            .iter()
+            .filter(|intent| intent.instrument_id.as_str() == "yes")
+            .map(OrderIntent::notional_usd)
+            .sum();
+        let no_notional: f64 = result
+            .intents
+            .iter()
+            .filter(|intent| intent.instrument_id.as_str() == "no")
+            .map(OrderIntent::notional_usd)
+            .sum();
+
+        assert!(yes_notional <= 6.0 + 1e-9);
+        assert!(no_notional <= 6.0 + 1e-9);
     }
 
     #[test]

@@ -124,7 +124,6 @@ signals:
     reversal_risk_weight: 0.15
     book_sanity_weight: 0.10
     max_late_convex_tilt: 0.80
-    min_favorite_confidence: 0.05
 
 # ── Time / Bar Phase Scaling ────────────────────────────────────
 bar_phase:
