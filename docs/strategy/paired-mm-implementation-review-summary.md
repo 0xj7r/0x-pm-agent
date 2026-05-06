@@ -30,6 +30,9 @@ The strategy has two complementary entry modes:
 The strategy intentionally avoids SELL unwind by default. Existing stranded
 inventory should be handled through light-side repair, merge batching, redeem,
 or hold-to-resolution decisions rather than sell loops.
+This is enforced at the paired-MM strategy config boundary:
+`PairedMmStrategyConfig::default()` disables `allow_sell_fallback`, while YAML
+can still explicitly opt into sell unwind if we choose to test that separately.
 
 ## 2. Core runtime shape
 
@@ -258,14 +261,20 @@ Outputs per leg:
 
 - `score`
 - component diagnostics
-- `ladder_clip_scale`
 - `late_convex_scale`
 
-Neutral/default side-score output deliberately uses `1.0` sizing scales, not
-zero, so default/test call sites preserve prior behaviour unless real signal
-inputs are provided.
-- `ladder_clip_scale`
-- `late_convex_scale`
+Neutral/default side-score output deliberately uses a `1.0` late-convex scale,
+not zero, so default/test call sites preserve prior behaviour unless real
+signal inputs are provided.
+
+Implementation note:
+
+- The normal paired ladder does not apply side-score to per-leg quantities.
+  Paired entries are intentionally share-paired after construction; independent
+  YES/NO quantity tilts are erased by pair normalization and can accidentally
+  shrink the whole pair based on the binding leg. Side score is therefore used
+  for diagnostics and late-convex sizing, not independent paired-ladder leg
+  sizing.
 
 Usage:
 

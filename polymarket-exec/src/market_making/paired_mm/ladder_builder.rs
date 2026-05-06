@@ -174,10 +174,8 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
-    let yes_signal_scale =
-        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, side_score, config);
-    let no_signal_scale =
-        signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, side_score, config);
+    let yes_signal_scale = signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
+    let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
@@ -249,7 +247,6 @@ fn signal_clip_scale(
     leg: LadderLeg,
     momentum: &MomentumSignal,
     pressure: &OrderBookPressureSignal,
-    side_score: &SideScoreSignal,
     config: &LadderConfig,
 ) -> f64 {
     let mut scale = 1.0;
@@ -287,7 +284,6 @@ fn signal_clip_scale(
         }
     }
 
-    scale *= side_score.leg(leg).ladder_clip_scale;
     scale.clamp(0.35, config.max_signal_clip_scale.max(0.35))
 }
 
