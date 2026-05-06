@@ -13,7 +13,7 @@ use crate::market_making::pairing::types::{
 use crate::markets::MarketDescriptor;
 use crate::signals::{
     BtcRegime, BtcRegimeSnapshot, FairValueEstimate, FairValueModel, IncentiveSignal,
-    MomentumSignal, OrderBookPressureSignal, SignalDirection,
+    MomentumSignal, OrderBookPressureSignal, SideScoreSignal, SignalDirection,
 };
 use crate::types::{ClientOrderId, EpochMillis, IntentKind, MmQuoteKind, OrderIntent, TradeSide};
 
@@ -97,6 +97,8 @@ pub struct LadderDiagnostics {
     pub suppressed_no: bool,
     pub yes_signal_scale: f64,
     pub no_signal_scale: f64,
+    pub yes_side_score: f64,
+    pub no_side_score: f64,
     pub notes: Vec<String>,
 }
 
@@ -114,6 +116,7 @@ pub fn build_ladder<M: MarketDescriptor>(
     btc_regime: &BtcRegimeSnapshot,
     momentum: &MomentumSignal,
     order_book_pressure: &OrderBookPressureSignal,
+    side_score: &SideScoreSignal,
     pair_cost: &PairCostTracker,
     config: &LadderConfig,
     now_ms: EpochMillis,
@@ -172,8 +175,9 @@ pub fn build_ladder<M: MarketDescriptor>(
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
     let yes_signal_scale =
-        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
-    let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
+        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, side_score, config);
+    let no_signal_scale =
+        signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, side_score, config);
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
@@ -234,6 +238,8 @@ pub fn build_ladder<M: MarketDescriptor>(
             suppressed_no: suppress_no,
             yes_signal_scale,
             no_signal_scale,
+            yes_side_score: side_score.yes.score,
+            no_side_score: side_score.no.score,
             notes,
         },
     }
@@ -243,6 +249,7 @@ fn signal_clip_scale(
     leg: LadderLeg,
     momentum: &MomentumSignal,
     pressure: &OrderBookPressureSignal,
+    side_score: &SideScoreSignal,
     config: &LadderConfig,
 ) -> f64 {
     let mut scale = 1.0;
@@ -280,6 +287,7 @@ fn signal_clip_scale(
         }
     }
 
+    scale *= side_score.leg(leg).ladder_clip_scale;
     scale.clamp(0.35, config.max_signal_clip_scale.max(0.35))
 }
 
@@ -719,6 +727,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::from_inventory(&inventory),
             &config,
             0,
@@ -755,6 +764,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -794,6 +804,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 max_depth: 2,
@@ -855,6 +866,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -888,6 +900,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -932,6 +945,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -978,6 +992,7 @@ mod tests {
             },
             &MomentumSignal::default(),
             &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 stoikov: StoikovParams {

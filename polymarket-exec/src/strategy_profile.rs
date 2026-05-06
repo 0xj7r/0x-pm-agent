@@ -13,6 +13,7 @@ use crate::market_making::paired_mm::{
     MergePolicyConfig, RescueConfig, RunningInventoryCaps,
 };
 use crate::quote_engine::QuoteEngineConfig;
+use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
 
@@ -352,6 +353,119 @@ impl StrategyProfile {
                 .min_tail_payoff_multiple
                 .unwrap_or(config.convexity_overlay.min_tail_payoff_multiple),
         };
+        config.reversal = ReversalConfig {
+            enabled: self
+                .signals
+                .reversal
+                .enabled
+                .unwrap_or(config.reversal.enabled),
+            deceleration_weight: self
+                .signals
+                .reversal
+                .deceleration_weight
+                .unwrap_or(config.reversal.deceleration_weight),
+            momentum_flip_weight: self
+                .signals
+                .reversal
+                .momentum_flip_weight
+                .unwrap_or(config.reversal.momentum_flip_weight),
+            distance_weight: self
+                .signals
+                .reversal
+                .distance_weight
+                .unwrap_or(config.reversal.distance_weight),
+            orderflow_weight: self
+                .signals
+                .reversal
+                .orderflow_weight
+                .unwrap_or(config.reversal.orderflow_weight),
+            strong_momentum_bps: self
+                .signals
+                .reversal
+                .strong_momentum_bps
+                .unwrap_or(config.reversal.strong_momentum_bps),
+            flip_deadband_bps: self
+                .signals
+                .reversal
+                .flip_deadband_bps
+                .unwrap_or(config.reversal.flip_deadband_bps),
+        };
+        config.book_sanity = BookSanityConfig {
+            max_spread: self
+                .signals
+                .book_sanity
+                .max_spread
+                .or(self.quote.max_spread)
+                .unwrap_or(config.book_sanity.max_spread),
+            min_top_depth_notional_usd: self
+                .signals
+                .book_sanity
+                .min_top_depth_notional_usd
+                .or(self.quote.min_top_depth_notional_usd)
+                .unwrap_or(config.book_sanity.min_top_depth_notional_usd),
+            max_staleness_ms: self
+                .signals
+                .book_sanity
+                .max_staleness_ms
+                .unwrap_or(config.book_sanity.max_staleness_ms),
+            max_queue_depth_usd: self
+                .signals
+                .book_sanity
+                .max_queue_depth_usd
+                .unwrap_or(config.book_sanity.max_queue_depth_usd),
+            max_projected_pair_cost: self
+                .signals
+                .book_sanity
+                .max_projected_pair_cost
+                .unwrap_or(config.book_sanity.max_projected_pair_cost),
+        };
+        config.side_score = SideScoreConfig {
+            fair_value_weight: self
+                .signals
+                .side_score
+                .fair_value_weight
+                .unwrap_or(config.side_score.fair_value_weight),
+            momentum_weight: self
+                .signals
+                .side_score
+                .momentum_weight
+                .unwrap_or(config.side_score.momentum_weight),
+            orderflow_weight: self
+                .signals
+                .side_score
+                .orderflow_weight
+                .unwrap_or(config.side_score.orderflow_weight),
+            terminal_timing_weight: self
+                .signals
+                .side_score
+                .terminal_timing_weight
+                .unwrap_or(config.side_score.terminal_timing_weight),
+            reversal_risk_weight: self
+                .signals
+                .side_score
+                .reversal_risk_weight
+                .unwrap_or(config.side_score.reversal_risk_weight),
+            book_sanity_weight: self
+                .signals
+                .side_score
+                .book_sanity_weight
+                .unwrap_or(config.side_score.book_sanity_weight),
+            max_ladder_tilt: self
+                .signals
+                .side_score
+                .max_ladder_tilt
+                .unwrap_or(config.side_score.max_ladder_tilt),
+            max_late_convex_tilt: self
+                .signals
+                .side_score
+                .max_late_convex_tilt
+                .unwrap_or(config.side_score.max_late_convex_tilt),
+            min_favorite_confidence: self
+                .signals
+                .side_score
+                .min_favorite_confidence
+                .unwrap_or(config.side_score.min_favorite_confidence),
+        };
         config
     }
 
@@ -623,6 +737,9 @@ pub struct SignalsSection {
     pub cheap_leg: CheapLegSection,
     pub vol_regime: VolRegimeSection,
     pub late_window: LateWindowSection,
+    pub reversal: ReversalSection,
+    pub book_sanity: BookSanitySection,
+    pub side_score: SideScoreSection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -653,6 +770,42 @@ pub struct VolRegimeSection {
 pub struct LateWindowSection {
     pub enabled: Option<bool>,
     pub p_threshold: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReversalSection {
+    pub enabled: Option<bool>,
+    pub deceleration_weight: Option<f64>,
+    pub momentum_flip_weight: Option<f64>,
+    pub distance_weight: Option<f64>,
+    pub orderflow_weight: Option<f64>,
+    pub strong_momentum_bps: Option<f64>,
+    pub flip_deadband_bps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BookSanitySection {
+    pub max_spread: Option<f64>,
+    pub min_top_depth_notional_usd: Option<f64>,
+    pub max_staleness_ms: Option<u64>,
+    pub max_queue_depth_usd: Option<f64>,
+    pub max_projected_pair_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SideScoreSection {
+    pub fair_value_weight: Option<f64>,
+    pub momentum_weight: Option<f64>,
+    pub orderflow_weight: Option<f64>,
+    pub terminal_timing_weight: Option<f64>,
+    pub reversal_risk_weight: Option<f64>,
+    pub book_sanity_weight: Option<f64>,
+    pub max_ladder_tilt: Option<f64>,
+    pub max_late_convex_tilt: Option<f64>,
+    pub min_favorite_confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
