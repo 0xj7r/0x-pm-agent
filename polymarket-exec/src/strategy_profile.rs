@@ -844,3 +844,48 @@ pub struct OperationalSection {
     pub recycle_min_time_remaining_ms: Option<u64>,
     pub recycle_max_light_side_spread: Option<f64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_mm_default_disables_sell_unwind() {
+        let profile = StrategyProfile::default();
+        let config = profile.paired_mm_config();
+
+        assert!(
+            !config.rescue.allow_sell_fallback,
+            "paired_mm must be buy-only by default unless a profile explicitly opts into sell unwind"
+        );
+        assert!(config.rescue.require_no_guaranteed_loss);
+    }
+
+    #[test]
+    fn live_paired_mm_profile_disables_sell_unwind() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config/strategies/btc_5m_paired_mm.live.yaml");
+        let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
+        let config = profile.paired_mm_config();
+
+        assert!(
+            !config.rescue.allow_sell_fallback,
+            "live paired_mm profile must not permit sell unwind"
+        );
+        assert!(config.rescue.require_no_guaranteed_loss);
+    }
+
+    #[test]
+    fn paired_mm_profile_can_explicitly_opt_into_sell_unwind() {
+        let profile = StrategyProfile {
+            rescue: RescueSection {
+                sell_unwind_enabled: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = profile.paired_mm_config();
+
+        assert!(config.rescue.allow_sell_fallback);
+    }
+}

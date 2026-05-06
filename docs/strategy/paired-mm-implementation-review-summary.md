@@ -30,6 +30,9 @@ The strategy has two complementary entry modes:
 The strategy intentionally avoids SELL unwind by default. Existing stranded
 inventory should be handled through light-side repair, merge batching, redeem,
 or hold-to-resolution decisions rather than sell loops.
+This is enforced at the paired-MM strategy config boundary:
+`PairedMmStrategyConfig::default()` disables `allow_sell_fallback`, while YAML
+can still explicitly opt into sell unwind if we choose to test that separately.
 
 ## 2. Core runtime shape
 
