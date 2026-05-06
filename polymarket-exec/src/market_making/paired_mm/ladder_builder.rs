@@ -4,6 +4,8 @@
 //! with regime, visible book depth, time-to-bar-end, and inventory imbalance.
 //! It is pure: no venue calls, no state mutation, no runtime side effects.
 
+use std::collections::HashSet;
+
 use crate::market_making::paired_mm::risk_boundary::filter_entry_intents;
 use crate::market_making::paired_mm::stoikov::{stoikov_reservation_price, StoikovParams};
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
@@ -482,6 +484,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
     };
 
     let mut leg_notional_usd = 0.0;
+    let mut last_emitted_price: Option<f64> = None;
     let min_quantity = market.min_order_size()
         * config.entry_min_size_multiplier.max(0.0).max(1.0);
     for level in 0..depth {
@@ -500,6 +503,12 @@ fn append_leg_ladder<M: MarketDescriptor>(
             .clamp(tick_size, 1.0 - tick_size);
         if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
             continue;
+        }
+        // If deeper levels collapse onto the same tick, stop this leg. Keeping
+        // multiple same-price paired entries with distinct pair_ids causes the
+        // later aggregation pass to orphan the opposite-leg mate.
+        if last_emitted_price.is_some_and(|prev| (prev - limit_price).abs() < 1e-9) {
+            break;
         }
         let mut clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
         if let Some(max_quote_per_side_usd) = config
@@ -529,6 +538,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
             break;
         }
         leg_notional_usd += notional_usd;
+        last_emitted_price = Some(limit_price);
 
         intents.push(OrderIntent {
             client_order_id: ClientOrderId::from(format!(
@@ -590,6 +600,7 @@ fn aggregate_collapsed_ladder_levels(
     min_order_size: f64,
 ) -> Vec<OrderIntent> {
     let mut aggregated: Vec<OrderIntent> = Vec::with_capacity(intents.len());
+    let mut orphaned_pair_ids: HashSet<String> = HashSet::new();
     for intent in intents {
         if let Some(existing) = aggregated.iter_mut().find(|existing| {
             existing.instrument_id == intent.instrument_id
@@ -612,7 +623,12 @@ fn aggregate_collapsed_ladder_levels(
             } else {
                 format!("{old_tag}+{new_tag}")
             });
-            existing.pair_id = None;
+            if let Some(pair_id) = existing.pair_id.take() {
+                orphaned_pair_ids.insert(pair_id);
+            }
+            if let Some(pair_id) = intent.pair_id {
+                orphaned_pair_ids.insert(pair_id);
+            }
         } else {
             aggregated.push(intent);
         }
@@ -621,6 +637,10 @@ fn aggregate_collapsed_ladder_levels(
     aggregated
         .into_iter()
         .filter(|intent| intent.quantity + 1e-9 >= min_order_size.max(0.0))
+        .filter(|intent| match intent.pair_id.as_ref() {
+            Some(pair_id) => !orphaned_pair_ids.contains(pair_id),
+            None => true,
+        })
         .collect()
 }
 
