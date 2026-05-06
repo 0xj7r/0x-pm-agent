@@ -13,7 +13,8 @@ use serde::Serialize;
 use crate::book::BookState;
 use crate::event_log::EventRecord;
 use crate::types::{
-    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, RuntimeCommand, TradeSide,
+    classify_quote_level_tag_for_attribution, ClientOrderId, FillLiquidity, FillReport,
+    InstrumentId, MarketId, RuntimeCommand, TradeSide,
 };
 
 /// Per-fill record captured by `PaperReportWriter`.
@@ -851,19 +852,7 @@ fn classify_runtime_event(message: &str) -> Option<&'static str> {
 }
 
 fn classify_submit_intent(tag: &str) -> &'static str {
-    if tag.starts_with("mm-paired-bid") {
-        "paired_ladder"
-    } else if tag.starts_with("mm-convex-accum") {
-        "convex_accum"
-    } else if tag.starts_with("mm-hedge-rescue") {
-        "hedge_rescue"
-    } else if tag.starts_with("mm-reduce") {
-        "reduce_cleanup"
-    } else if tag.is_empty() {
-        "untagged_submit"
-    } else {
-        "other_submit"
-    }
+    classify_quote_level_tag_for_attribution(tag)
 }
 
 fn midpoint(best_bid: f64, best_ask: f64) -> Option<f64> {
