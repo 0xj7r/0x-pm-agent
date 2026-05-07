@@ -17,6 +17,7 @@ pub struct CapitalRecycleConfig {
     pub min_time_remaining_ms: u64,
     pub max_light_side_spread: f64,
     pub race_buffer_ticks: f64,
+    pub cooldown_ms: u64,
 }
 
 impl Default for CapitalRecycleConfig {
@@ -29,6 +30,7 @@ impl Default for CapitalRecycleConfig {
             min_time_remaining_ms: 120_000,
             max_light_side_spread: 0.10,
             race_buffer_ticks: 1.0,
+            cooldown_ms: 1_000,
         }
     }
 }
@@ -274,6 +276,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             0,
         );
@@ -307,6 +310,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             0,
         );
@@ -350,6 +354,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             0,
         );
@@ -382,6 +387,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             0,
         );
@@ -414,6 +420,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             0,
         );
@@ -446,6 +453,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             250_000,
         );
@@ -478,6 +486,7 @@ mod tests {
                 min_time_remaining_ms: 60_000,
                 max_light_side_spread: 0.10,
                 race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
             },
             250_000,
         );
