@@ -11,6 +11,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use arrow::array::{Array, Float64Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
+use chrono::{TimeZone, Utc};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
@@ -37,18 +38,107 @@ pub struct RawReplayMarket {
 pub fn read_raw_replay(path: &Path, options: &RawReplayOptions) -> Result<Vec<Event>> {
     let mut events = Vec::new();
     let mut book_state = BookDiffState::default();
+    let file_filter = RawFileFilter::new(options);
     for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
         }
         let p = entry.path();
-        if p.extension().and_then(|e| e.to_str()) != Some("parquet") {
+        if !file_filter.should_read(p) {
             continue;
         }
         events.extend(read_raw_parquet_file(p, options, &mut book_state)?);
     }
     events.extend(market_meta_events(options, first_btc_tick_price(&events))?);
     Ok(dedupe_and_sort(events))
+}
+
+struct RawFileFilter {
+    start_date: String,
+    end_date: String,
+    market_slugs: BTreeSet<String>,
+    asset_ids: BTreeSet<String>,
+    book_channel: &'static str,
+}
+
+impl RawFileFilter {
+    fn new(options: &RawReplayOptions) -> Self {
+        let start_date = date_partition(options.window_start_ns);
+        let end_date = date_partition(options.window_end_ns.saturating_sub(1));
+        let mut market_slugs = BTreeSet::new();
+        let mut asset_ids = BTreeSet::new();
+        for market in &options.markets {
+            market_slugs.insert(market.slug.clone());
+            asset_ids.extend(market.asset_ids.iter().cloned());
+        }
+        Self {
+            start_date,
+            end_date,
+            market_slugs,
+            asset_ids,
+            book_channel: selected_book_channel(options.max_book_levels),
+        }
+    }
+
+    fn should_read(&self, path: &Path) -> bool {
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            return false;
+        }
+
+        if let Some(date) = partition_value(path, "date").or_else(|| partition_value(path, "dt")) {
+            if date.as_str() < self.start_date.as_str() || date.as_str() > self.end_date.as_str() {
+                return false;
+            }
+        }
+
+        if let Some(slug) =
+            partition_value(path, "slug").or_else(|| partition_value(path, "market_slug"))
+        {
+            if !self.market_slugs.is_empty() && !self.market_slugs.contains(&slug) {
+                return false;
+            }
+        }
+
+        if let Some(asset_id) = partition_value(path, "asset_id")
+            .or_else(|| partition_value(path, "token_id"))
+            .or_else(|| partition_value(path, "asset"))
+        {
+            if !self.asset_ids.is_empty() && !self.asset_ids.contains(&asset_id) {
+                return false;
+            }
+        }
+
+        let exchange = partition_value(path, "exchange");
+        let channel = partition_value(path, "channel").or_else(|| partition_value(path, "dataset"));
+        matches!(
+            (exchange.as_deref(), channel.as_deref()),
+            (Some("polymarket"), Some("trades"))
+                | (Some("polymarket"), Some("quotes"))
+                | (Some("polymarket"), Some("onchain_fills"))
+                | (Some("binance"), Some("agg_trades"))
+                | (Some("binance"), Some("trades"))
+        ) || matches!(
+            (exchange.as_deref(), channel.as_deref()),
+            (Some("polymarket"), Some(channel)) if channel == self.book_channel
+        )
+    }
+}
+
+fn selected_book_channel(max_book_levels: usize) -> &'static str {
+    if max_book_levels <= 5 {
+        "book_snapshot_5"
+    } else if max_book_levels <= 25 {
+        "book_snapshot_25"
+    } else {
+        "book_snapshot_full"
+    }
+}
+
+fn date_partition(ts_ns: i64) -> String {
+    Utc.timestamp_opt(ts_ns / 1_000_000_000, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
 }
 
 fn read_raw_parquet_file(
@@ -626,6 +716,73 @@ mod tests {
                 && e.market_type == "btc_ref"
                 && e.price.as_deref() == Some("79000.12")
         }));
+    }
+
+    #[test]
+    fn raw_reader_uses_single_book_depth_channel_for_requested_depth() {
+        let dir = tempdir().unwrap();
+        let book_25 = dir
+            .path()
+            .join("exchange=polymarket/channel=book_snapshot_25/date=2026-02-15/asset_id=UP");
+        std::fs::create_dir_all(&book_25).unwrap();
+        write_book_fixture(&book_25.join("book.parquet"));
+
+        let book_full = dir
+            .path()
+            .join("exchange=polymarket/channel=book_snapshot_full/date=2026-02-15/asset_id=UP");
+        std::fs::create_dir_all(&book_full).unwrap();
+        write_book_fixture(&book_full.join("book.parquet"));
+
+        let events = read_raw_replay(
+            dir.path(),
+            &RawReplayOptions {
+                window_start_ns: 1_771_178_400_000_000_000,
+                window_end_ns: 1_771_178_700_000_000_000,
+                market_filter: "btc_5m".to_string(),
+                max_book_levels: 25,
+                markets: vec![RawReplayMarket {
+                    slug: "btc-updown-5m-1771178400".to_string(),
+                    asset_ids: ["UP".to_string(), "DOWN".to_string()],
+                    strike: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let book_deltas = events
+            .iter()
+            .filter(|event| event.event_type == EventType::BookDelta)
+            .count();
+        assert_eq!(book_deltas, 2);
+    }
+
+    #[test]
+    fn raw_file_filter_skips_dates_and_assets_outside_window_plan() {
+        let options = RawReplayOptions {
+            window_start_ns: 1_771_178_400_000_000_000,
+            window_end_ns: 1_771_178_700_000_000_000,
+            market_filter: "btc_5m".to_string(),
+            max_book_levels: 25,
+            markets: vec![RawReplayMarket {
+                slug: "btc-updown-5m-1771178400".to_string(),
+                asset_ids: ["UP".to_string(), "DOWN".to_string()],
+                strike: None,
+            }],
+        };
+        let filter = RawFileFilter::new(&options);
+
+        assert!(filter.should_read(Path::new(
+            "exchange=polymarket/channel=book_snapshot_25/date=2026-02-15/asset_id=UP/file.parquet"
+        )));
+        assert!(!filter.should_read(Path::new(
+            "exchange=polymarket/channel=book_snapshot_full/date=2026-02-15/asset_id=UP/file.parquet"
+        )));
+        assert!(!filter.should_read(Path::new(
+            "exchange=polymarket/channel=book_snapshot_25/date=2026-02-14/asset_id=UP/file.parquet"
+        )));
+        assert!(!filter.should_read(Path::new(
+            "exchange=polymarket/channel=book_snapshot_25/date=2026-02-15/asset_id=OTHER/file.parquet"
+        )));
     }
 
     fn write_book_fixture(path: &Path) {
