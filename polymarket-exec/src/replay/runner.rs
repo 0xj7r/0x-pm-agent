@@ -765,6 +765,9 @@ pub struct ReplayDecision {
 pub trait ReplayStrategy {
     fn on_event(&mut self, event: &Event) -> ReplayDecision;
     fn on_fill(&mut self, fill: &SimulatedFill) -> ReplayDecision;
+    fn on_ioc_expired(&mut self, _client_order_id: &str, _now_ms: u64) -> ReplayDecision {
+        ReplayDecision::default()
+    }
 }
 
 /// Configuration for the replay run.
@@ -2086,21 +2089,123 @@ fn dispatch_event<S: ReplayStrategy>(
     accounting_events: &mut Vec<Event>,
     queue_assumption: &str,
 ) {
+    let event_ms = (event.received_ns / 1_000_000) as u64;
+    let fills_before_event = sim.fills().len();
+    sim.on_event(event);
+    process_new_simulated_fills(
+        strategy,
+        sim,
+        fills_before_event,
+        event_ms,
+        intents_submitted,
+        risk_rejections,
+        journal_events,
+        accepted_fills,
+        intent_remaining,
+        accounting_events,
+        queue_assumption,
+    );
+
     let mut decision = strategy.on_event(event);
     risk_rejections.append(&mut decision.risk_rejections);
     journal_events.append(&mut decision.journal_events);
     accounting_events.append(&mut decision.accounting_events);
-    for intent in decision.submits {
+    for coid in decision.cancels {
+        sim.cancel(&coid, event_ms);
+    }
+    submit_replay_intents(
+        strategy,
+        sim,
+        decision.submits,
+        event_ms,
+        intents_submitted,
+        risk_rejections,
+        journal_events,
+        accepted_fills,
+        intent_remaining,
+        accounting_events,
+        queue_assumption,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_replay_intents<S: ReplayStrategy>(
+    strategy: &mut S,
+    sim: &mut FillSimulator,
+    submits: Vec<StrategyOrderIntent>,
+    event_ms: u64,
+    intents_submitted: &mut u64,
+    risk_rejections: &mut Vec<RiskRejection>,
+    journal_events: &mut Vec<JournalEvent>,
+    accepted_fills: &mut Vec<SimulatedFill>,
+    intent_remaining: &mut BTreeMap<String, f64>,
+    accounting_events: &mut Vec<Event>,
+    queue_assumption: &str,
+) {
+    if submits.is_empty() {
+        return;
+    }
+    let mut expire_ioc = Vec::new();
+    let fills_before_submit = sim.fills().len();
+    for intent in submits {
+        if intent.aggressive {
+            expire_ioc.push(intent.client_order_id.clone());
+        }
         intent_remaining.insert(intent.client_order_id.clone(), intent.size);
         sim.submit(intent);
         *intents_submitted += 1;
     }
-    let event_ms = (event.received_ns / 1_000_000) as u64;
-    for coid in decision.cancels {
-        sim.cancel(&coid, event_ms);
+    process_new_simulated_fills(
+        strategy,
+        sim,
+        fills_before_submit,
+        event_ms,
+        intents_submitted,
+        risk_rejections,
+        journal_events,
+        accepted_fills,
+        intent_remaining,
+        accounting_events,
+        queue_assumption,
+    );
+    for client_order_id in expire_ioc {
+        let mut decision = strategy.on_ioc_expired(&client_order_id, event_ms);
+        risk_rejections.append(&mut decision.risk_rejections);
+        journal_events.append(&mut decision.journal_events);
+        accounting_events.append(&mut decision.accounting_events);
+        for coid in decision.cancels {
+            sim.cancel(&coid, event_ms);
+        }
+        submit_replay_intents(
+            strategy,
+            sim,
+            decision.submits,
+            event_ms,
+            intents_submitted,
+            risk_rejections,
+            journal_events,
+            accepted_fills,
+            intent_remaining,
+            accounting_events,
+            queue_assumption,
+        );
     }
-    let fills_before = sim.fills().len();
-    sim.on_event(event);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_new_simulated_fills<S: ReplayStrategy>(
+    strategy: &mut S,
+    sim: &mut FillSimulator,
+    fills_before: usize,
+    event_ms: u64,
+    intents_submitted: &mut u64,
+    risk_rejections: &mut Vec<RiskRejection>,
+    journal_events: &mut Vec<JournalEvent>,
+    accepted_fills: &mut Vec<SimulatedFill>,
+    intent_remaining: &mut BTreeMap<String, f64>,
+    accounting_events: &mut Vec<Event>,
+    queue_assumption: &str,
+) {
     let fills_after = sim.fills().len();
     #[allow(clippy::unnecessary_to_owned)]
     let new_fills = sim.fills()[fills_before..fills_after].to_vec();
@@ -2117,14 +2222,22 @@ fn dispatch_event<S: ReplayStrategy>(
             emit_fill_journal_row(&fill, intent_remaining, queue_assumption, journal_events);
             accepted_fills.push(fill.clone());
         }
-        for intent in decision.submits {
-            intent_remaining.insert(intent.client_order_id.clone(), intent.size);
-            sim.submit(intent);
-            *intents_submitted += 1;
-        }
         for coid in decision.cancels {
             sim.cancel(&coid, event_ms);
         }
+        submit_replay_intents(
+            strategy,
+            sim,
+            decision.submits,
+            event_ms,
+            intents_submitted,
+            risk_rejections,
+            journal_events,
+            accepted_fills,
+            intent_remaining,
+            accounting_events,
+            queue_assumption,
+        );
     }
 }
 
@@ -2371,6 +2484,7 @@ mod tests {
                     risk_rejections: vec![],
                     journal_events: vec![],
                     accounting_events: vec![],
+                    ..ReplayDecision::default()
                 };
             }
             ReplayDecision::default()
@@ -2403,6 +2517,7 @@ mod tests {
                     risk_rejections: vec![],
                     journal_events: vec![],
                     accounting_events: vec![],
+                    ..ReplayDecision::default()
                 };
             }
             ReplayDecision::default()
@@ -2435,6 +2550,7 @@ mod tests {
                     risk_rejections: vec![],
                     journal_events: vec![],
                     accounting_events: vec![],
+                    ..ReplayDecision::default()
                 };
             }
             ReplayDecision::default()
