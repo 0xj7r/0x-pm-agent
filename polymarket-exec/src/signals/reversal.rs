@@ -60,8 +60,7 @@ impl ReversalSignal {
         let deceleration_score = deceleration_score(momentum, config);
         let momentum_flip_score = momentum_flip_score(momentum, config);
         let distance_to_strike_score = distance_to_strike_score(fair_value);
-        let orderflow_against_score =
-            orderflow_against_score(favorite_leg, order_book_pressure);
+        let orderflow_against_score = orderflow_against_score(favorite_leg, order_book_pressure);
         let weight_sum = config.deceleration_weight.max(0.0)
             + config.momentum_flip_weight.max(0.0)
             + config.distance_weight.max(0.0)
@@ -172,8 +171,9 @@ fn orderflow_against_score(
         return 0.0;
     };
     match pressure.pressure_leg() {
-        Some(pressure_leg) if pressure_leg != favorite_leg => pressure.imbalance.abs().clamp(0.0, 1.0),
+        Some(pressure_leg) if pressure_leg != favorite_leg => {
+            pressure.imbalance.abs().clamp(0.0, 1.0)
+        }
         _ => 0.0,
     }
 }
-
