@@ -337,7 +337,6 @@ struct InventoryState {
     no_qty: f64,
     no_avg_cost: f64,
     free_cash_usd: f64,
-    starting_cash_usd: f64,
 }
 
 impl InventoryState {
@@ -348,7 +347,6 @@ impl InventoryState {
             no_qty: 0.0,
             no_avg_cost: 0.0,
             free_cash_usd: starting_cash_usd,
-            starting_cash_usd,
         }
     }
 
@@ -359,7 +357,7 @@ impl InventoryState {
             yes_avg_cost: self.yes_avg_cost,
             no_avg_cost: self.no_avg_cost,
             free_cash_usd: self.free_cash_usd,
-            equity_usd: self.starting_cash_usd
+            equity_usd: self.free_cash_usd
                 + self.yes_qty * self.yes_avg_cost
                 + self.no_qty * self.no_avg_cost,
         }
@@ -425,7 +423,7 @@ impl InventoryState {
             self.no_qty = 0.0;
             self.no_avg_cost = 0.0;
         }
-        self.free_cash_usd += (cash_usd - fee_usd - gas_usd).max(0.0);
+        self.free_cash_usd += cash_usd - fee_usd - gas_usd;
         true
     }
 }
@@ -1802,6 +1800,31 @@ mod tests {
             .expect("runtime inventory exists from reservation");
         assert!((runtime_inventory.free_cash_usd() - 750.0).abs() < 1e-9);
         assert!((runtime_inventory.reserved_cash_usd() - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_snapshot_equity_uses_free_cash_plus_cost_basis() {
+        let mut inventory = InventoryState::new(1_000.0);
+
+        inventory.apply_fill(Leg::Yes, TradeSide::Buy, 0.40, 10.0);
+        inventory.apply_fill(Leg::No, TradeSide::Buy, 0.55, 10.0);
+        let snapshot = inventory.snapshot();
+
+        assert!((snapshot.free_cash_usd - 990.5).abs() < 1e-9);
+        assert!((snapshot.equity_usd - 1_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inventory_merge_can_reduce_cash_when_fees_exceed_credit() {
+        let mut inventory = InventoryState::new(1_000.0);
+        inventory.apply_fill(Leg::Yes, TradeSide::Buy, 0.40, 1.0);
+        inventory.apply_fill(Leg::No, TradeSide::Buy, 0.55, 1.0);
+
+        assert!(inventory.apply_merge(1.0, 1.0, 0.75, 0.50));
+
+        assert_eq!(inventory.yes_qty, 0.0);
+        assert_eq!(inventory.no_qty, 0.0);
+        assert!((inventory.free_cash_usd - 998.80).abs() < 1e-9);
     }
 
     #[test]
