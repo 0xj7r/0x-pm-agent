@@ -1,7 +1,7 @@
-//! Composite side score for paired-MM sizing.
+//! Composite side score for paired-MM diagnostics and overlay sizing.
 //!
 //! This combines fair value, BTC momentum, order-book pressure, terminal
-//! timing, reversal risk, and book sanity into bounded sizing multipliers.
+//! timing, reversal risk, and book sanity into a bounded side preference.
 //! It does not emit orders and should not become a hidden gate.
 
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
@@ -19,9 +19,7 @@ pub struct SideScoreConfig {
     pub terminal_timing_weight: f64,
     pub reversal_risk_weight: f64,
     pub book_sanity_weight: f64,
-    pub max_ladder_tilt: f64,
     pub max_late_convex_tilt: f64,
-    pub min_favorite_confidence: f64,
 }
 
 impl Default for SideScoreConfig {
@@ -33,9 +31,7 @@ impl Default for SideScoreConfig {
             terminal_timing_weight: 0.15,
             reversal_risk_weight: 0.15,
             book_sanity_weight: 0.10,
-            max_ladder_tilt: 0.35,
             max_late_convex_tilt: 0.80,
-            min_favorite_confidence: 0.05,
         }
     }
 }
@@ -49,7 +45,6 @@ pub struct SideScoreLeg {
     pub terminal_timing_component: f64,
     pub reversal_component: f64,
     pub book_sanity_penalty: f64,
-    pub ladder_clip_scale: f64,
     pub late_convex_scale: f64,
 }
 
@@ -63,7 +58,6 @@ impl Default for SideScoreLeg {
             terminal_timing_component: 0.0,
             reversal_component: 0.0,
             book_sanity_penalty: 0.0,
-            ladder_clip_scale: 1.0,
             late_convex_scale: 1.0,
         }
     }
@@ -126,12 +120,10 @@ impl SideScoreSignal {
             config,
         );
         let confidence = (yes.score - no.score).abs().clamp(0.0, 1.0);
-        let favorite_leg = if confidence >= config.min_favorite_confidence.max(0.0) {
-            if yes.score > no.score {
-                Some(LadderLeg::Yes)
-            } else {
-                Some(LadderLeg::No)
-            }
+        let favorite_leg = if yes.score > no.score {
+            Some(LadderLeg::Yes)
+        } else if no.score > yes.score {
+            Some(LadderLeg::No)
         } else {
             None
         };
@@ -193,7 +185,6 @@ fn leg_score(
         0.0
     };
     let score = raw_score.clamp(-1.0, 1.0);
-    let ladder_tilt = score.clamp(-config.max_ladder_tilt, config.max_ladder_tilt);
     let convex_tilt = score.clamp(-config.max_late_convex_tilt, config.max_late_convex_tilt);
 
     SideScoreLeg {
@@ -204,7 +195,6 @@ fn leg_score(
         terminal_timing_component,
         reversal_component,
         book_sanity_penalty,
-        ladder_clip_scale: (1.0 + ladder_tilt).clamp(0.25, 2.0),
         late_convex_scale: (1.0 + convex_tilt).clamp(0.10, 2.5),
     }
 }
