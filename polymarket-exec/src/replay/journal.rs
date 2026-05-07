@@ -427,9 +427,8 @@ impl ColumnBuilders {
 /// in causal order.
 pub fn write_journal_parquet(path: &Path, events: &[JournalEvent]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create journal parent dir {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create journal parent dir {}", parent.display()))?;
     }
     let schema = journal_schema();
 
@@ -447,8 +446,8 @@ pub fn write_journal_parquet(path: &Path, events: &[JournalEvent]) -> Result<()>
 
     let file = File::create(path)
         .with_context(|| format!("failed to create journal file {}", path.display()))?;
-    let mut writer = ArrowWriter::try_new(file, schema, None)
-        .context("failed to create journal ArrowWriter")?;
+    let mut writer =
+        ArrowWriter::try_new(file, schema, None).context("failed to create journal ArrowWriter")?;
     writer
         .write(&batch)
         .context("failed to write journal RecordBatch")?;

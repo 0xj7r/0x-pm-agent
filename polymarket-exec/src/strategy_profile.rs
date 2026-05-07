@@ -37,7 +37,7 @@ pub struct StrategyProfile {
     pub convexity_overlay: ConvexityOverlaySection,
     pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
-    pub hybrid_mm: HybridMmSection, 
+    pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
     pub operational: OperationalSection,
     #[serde(flatten)]

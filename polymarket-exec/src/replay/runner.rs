@@ -201,6 +201,21 @@ mod replay_accounting_tests {
     }
 
     #[test]
+    fn accounting_allows_negative_pnl_when_bought_leg_loses() {
+        let events = vec![resolution_event("DOWN")];
+        let fills = vec![buy_fill("UP", 0.90, 10.0)];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+
+        assert_eq!(accounting.ending_cash_usd, 991.0);
+        assert_eq!(accounting.market_value_usd, 0.0);
+        assert_eq!(accounting.ending_equity_usd, 991.0);
+        assert_eq!(accounting.total_pnl_usd, -9.0);
+        assert_eq!(accounting.realized_pnl_usd, -9.0);
+        assert_eq!(accounting.unrealized_pnl_usd, 0.0);
+        assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+    }
+
+    #[test]
     fn accounting_maps_winning_outcome_to_yes_no_asset_ids_and_deducts_redeem_fees() {
         let events = vec![
             market_meta_event("UP_TOKEN", "DOWN_TOKEN"),
@@ -238,7 +253,10 @@ mod replay_accounting_tests {
         assert_eq!(accounting.settlement.merged_pair_qty, 0.0);
         assert_eq!(accounting.settlement.unmerged_pairable_qty, 7.0);
         assert_eq!(accounting.settlement.stranded_qty_total, 17.0);
-        assert_eq!(accounting.settlement.status, "merge_opportunity_unexecuted");
+        assert_eq!(
+            accounting.settlement.status,
+            "profitable_merge_opportunity_unexecuted"
+        );
     }
 
     #[test]
@@ -342,6 +360,12 @@ pub struct ReplaySettlementSummary {
     pub merge_gas_usd: f64,
     pub pairable_qty_before_resolution: f64,
     pub unmerged_pairable_qty: f64,
+    #[serde(default)]
+    pub unmerged_pairable_cost_usd: f64,
+    #[serde(default)]
+    pub unmerged_pairable_merge_value_usd: f64,
+    #[serde(default)]
+    pub unmerged_pairable_net_gain_usd: f64,
     pub redeemed_winning_qty: f64,
     pub expired_losing_qty: f64,
     #[serde(default)]
@@ -354,6 +378,8 @@ pub struct ReplaySettlementSummary {
     pub stranded_cost_usd: f64,
     pub stranded_inventory: Vec<ReplaySettlementAssetInventory>,
     pub status: String,
+    #[serde(default)]
+    pub status_reason: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -449,9 +475,10 @@ pub trait ReplayStrategy {
 pub struct RunnerConfig {
     pub window_id: String,
     pub fill_sim: FillSimConfig,
-    /// Starting cash used only for replay accounting. Strategy behavior is
-    /// still driven by its own profile/runtime state; this field makes the
-    /// emitted equity line explicit and reproducible.
+    /// Starting cash for the current replay window. The run-level driver
+    /// carries prior-window ending cash into this field so accounting,
+    /// strategy input snapshots, and risk evaluation share the same
+    /// deployable-capital baseline.
     pub starting_cash_usd: f64,
     /// `--max-window-failures` from the CLI; used at the run level by
     /// `run_run`. A single window's `run_window` always returns whatever
@@ -905,6 +932,10 @@ fn compute_settlement_summary(
     } else {
         0.0
     };
+    let (unmerged_pairable_cost_usd, unmerged_pairable_merge_value_usd) =
+        pairable_cost_and_value(positions, &pair_asset_ids, unmerged_pairable_qty);
+    let unmerged_pairable_net_gain_usd =
+        unmerged_pairable_merge_value_usd - unmerged_pairable_cost_usd;
     let mut stranded_inventory = Vec::new();
     let mut stranded_qty_total = 0.0;
     let mut stranded_cost_usd = 0.0;
@@ -938,22 +969,63 @@ fn compute_settlement_summary(
         .iter()
         .filter(|event| event.status == ReplayMergeStatus::Reverted)
         .count() as u64;
-    let status = if pair_asset_ids.len() != 2 {
-        "no_binary_pair_detected"
+    let (status, status_reason) = if pair_asset_ids.len() != 2 {
+        (
+            "no_binary_pair_detected",
+            "no YES/NO pair asset ids found in market metadata or open positions".to_string(),
+        )
     } else if winner_asset_id.is_some() {
-        "resolved_settled"
+        (
+            "resolved_settled",
+            "resolution event present; open inventory settled by winning leg".to_string(),
+        )
     } else if pairable_qty_before_resolution <= f64::EPSILON && stranded_qty_total <= f64::EPSILON {
-        "flat"
+        (
+            "flat",
+            "no open inventory and no pairable inventory".to_string(),
+        )
     } else if merge_reverted_count > 0 {
-        "merge_reverted"
+        (
+            "merge_reverted",
+            format!("{merge_reverted_count} merge event(s) reverted"),
+        )
     } else if pairable_qty_before_resolution > f64::EPSILON && merged_pair_qty <= f64::EPSILON {
-        "merge_opportunity_unexecuted"
+        if unmerged_pairable_net_gain_usd < -1e-9 {
+            (
+                "merge_would_crystallize_loss",
+                format!(
+                    "unmerged pairable qty {:.4} would merge for {:.4} against cost {:.4}, net_gain {:.4}",
+                    unmerged_pairable_qty,
+                    unmerged_pairable_merge_value_usd,
+                    unmerged_pairable_cost_usd,
+                    unmerged_pairable_net_gain_usd
+                ),
+            )
+        } else {
+            (
+                "profitable_merge_opportunity_unexecuted",
+                format!(
+                    "unmerged pairable qty {:.4} has non-negative merge net_gain {:.4} but no merge event was observed",
+                    unmerged_pairable_qty,
+                    unmerged_pairable_net_gain_usd
+                ),
+            )
+        }
     } else if unmerged_pairable_qty > f64::EPSILON {
-        "partially_merged"
+        (
+            "partially_merged",
+            format!(
+                "merged {:.4} pair(s) but {:.4} pairable qty remains with net_gain {:.4}",
+                merged_pair_qty, unmerged_pairable_qty, unmerged_pairable_net_gain_usd
+            ),
+        )
     } else if merged_pair_qty > f64::EPSILON {
-        "merged"
+        ("merged", format!("merged {:.4} pair(s)", merged_pair_qty))
     } else {
-        "unpaired_inventory"
+        (
+            "unpaired_inventory",
+            "open inventory exists but no pairable quantity is available".to_string(),
+        )
     };
 
     ReplaySettlementSummary {
@@ -967,6 +1039,9 @@ fn compute_settlement_summary(
         merge_gas_usd,
         pairable_qty_before_resolution,
         unmerged_pairable_qty,
+        unmerged_pairable_cost_usd,
+        unmerged_pairable_merge_value_usd,
+        unmerged_pairable_net_gain_usd,
         redeemed_winning_qty: resolution_apply.winning_qty,
         expired_losing_qty: resolution_apply.losing_qty,
         redeem_credit_usd: resolution_apply.gross_credit_usd,
@@ -976,7 +1051,27 @@ fn compute_settlement_summary(
         stranded_cost_usd,
         stranded_inventory,
         status: status.to_string(),
+        status_reason,
     }
+}
+
+fn pairable_cost_and_value(
+    positions: &BTreeMap<String, ReplayPositionAccounting>,
+    pair_asset_ids: &[String],
+    pairable_qty: f64,
+) -> (f64, f64) {
+    if pair_asset_ids.len() != 2 || pairable_qty <= f64::EPSILON {
+        return (0.0, 0.0);
+    }
+    let avg_a = positions
+        .get(&pair_asset_ids[0])
+        .map(|p| p.avg_cost)
+        .unwrap_or(0.0);
+    let avg_b = positions
+        .get(&pair_asset_ids[1])
+        .map(|p| p.avg_cost)
+        .unwrap_or(0.0);
+    (pairable_qty * (avg_a + avg_b), pairable_qty)
 }
 
 fn replay_merge_events(events: &[Event]) -> Vec<ReplayMergeEvent> {
@@ -1404,14 +1499,16 @@ pub fn run_run<S, F>(
 ) -> Result<Vec<WindowSummary>>
 where
     S: ReplayStrategy,
-    F: FnMut(&str) -> S,
+    F: FnMut(&str, f64) -> S,
 {
     let mut out = Vec::with_capacity(windows.len());
     let mut failed = 0usize;
+    let mut carried_cash_usd = cfg.starting_cash_usd;
     for (window_id, events) in windows {
-        let mut strategy = strategy_factory(&window_id);
         let mut win_cfg = cfg.clone();
         win_cfg.window_id = window_id;
+        win_cfg.starting_cash_usd = carried_cash_usd;
+        let mut strategy = strategy_factory(&win_cfg.window_id, carried_cash_usd);
         let summary = run_window(&mut strategy, &events, &win_cfg);
         if summary.status != WindowStatus::Ok {
             failed += 1;
@@ -1421,6 +1518,8 @@ where
                     cfg.max_window_failures
                 );
             }
+        } else {
+            carried_cash_usd = summary.accounting.ending_cash_usd;
         }
         out.push(summary);
     }
@@ -1851,8 +1950,61 @@ mod tests {
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
         };
-        let result = run_run(windows, &cfg, |_| PanicAfter(1));
+        let result = run_run(windows, &cfg, |_, _| PanicAfter(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_run_carries_ending_cash_into_next_window() {
+        let losing_window = vec![
+            market_meta(1_000_000_000, 300_000),
+            evt(
+                2_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "sell",
+                "0.55",
+                "100",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "sell",
+                "0.55",
+                "10",
+            ),
+            btc_tick(301_000_000_000, "99.0"),
+        ];
+        let idle_window = vec![evt(
+            302_000_000_000,
+            EventType::BookSnapshot,
+            "asset-a",
+            "sell",
+            "0.55",
+            "100",
+        )];
+        let mut windows = BTreeMap::new();
+        windows.insert("a".to_string(), losing_window);
+        windows.insert("b".to_string(), idle_window);
+        let cfg = RunnerConfig {
+            window_id: String::new(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+
+        let summaries = run_run(windows, &cfg, |_, _| PassiveBidStrategy { placed: false })
+            .expect("run succeeds");
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].accounting.total_pnl_usd, -5.5);
+        assert_eq!(summaries[0].accounting.ending_cash_usd, 994.5);
+        assert_eq!(summaries[1].accounting.starting_cash_usd, 994.5);
+        assert_eq!(summaries[1].accounting.ending_cash_usd, 994.5);
     }
 
     #[test]

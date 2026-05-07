@@ -174,10 +174,20 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
-    let yes_signal_scale =
-        signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, side_score, config);
-    let no_signal_scale =
-        signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, side_score, config);
+    let yes_signal_scale = signal_clip_scale(
+        LadderLeg::Yes,
+        momentum,
+        order_book_pressure,
+        side_score,
+        config,
+    );
+    let no_signal_scale = signal_clip_scale(
+        LadderLeg::No,
+        momentum,
+        order_book_pressure,
+        side_score,
+        config,
+    );
     let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
     let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
