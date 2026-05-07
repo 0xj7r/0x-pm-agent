@@ -17,6 +17,7 @@ pub const SLUG_FLAT_5050: &str = "btc-5m-flat-5050";
 pub const SLUG_DISAGREEMENT: &str = "btc-5m-fv-book-disagreement";
 pub const SLUG_PAIR_COMPLETING: &str = "btc-5m-pair-completing";
 pub const SLUG_LATE_RESCUE: &str = "btc-5m-late-rescue";
+pub const SLUG_CAPITAL_RECYCLE_THIN_EDGE: &str = "btc-5m-capital-recycle-thin-edge";
 pub const SLUG_MISSING_PRICE_TO_BEAT: &str = "btc-5m-missing-strike";
 pub const SLUG_STALE_BTC: &str = "btc-5m-stale-btc";
 
@@ -191,6 +192,61 @@ pub fn flat_50_50_paired_mm() -> (Vec<Event>, ScenarioExpectations) {
     let exp = ScenarioExpectations {
         name: "flat_50_50_paired_mm".into(),
         intents_emitted_total_min: Some(2),
+        ..Default::default()
+    };
+    (events, exp)
+}
+
+/// Capital-recycle fixture: fills one side of the paired ladder, then
+/// offers the light side at a thin but positive pair cost. The same event
+/// tape is used with two profiles:
+///
+/// - normal cash profile: should wait because projected pair cost is above
+///   the routine recycle target.
+/// - cash-pressure profile: may recycle because the hard pair-cost target
+///   is still satisfied.
+pub fn capital_recycle_thin_edge() -> (Vec<Event>, ScenarioExpectations) {
+    let slug = SLUG_CAPITAL_RECYCLE_THIN_EDGE;
+    let mut events = Vec::new();
+    events.push(market_meta(slug, Some(60_000.0)));
+
+    for (asset, side, price, size) in [
+        (ASSET_UP, "buy", "0.56", "200"),
+        (ASSET_UP, "sell", "0.58", "200"),
+        (ASSET_DOWN, "buy", "0.40", "200"),
+        (ASSET_DOWN, "sell", "0.42", "200"),
+    ] {
+        events.push(book_seed(slug, asset, side, price, size, BAR_START_NS + 1));
+    }
+
+    for (i, p) in [60_001.0, 60_002.0, 60_001.5, 60_001.2, 60_001.8]
+        .iter()
+        .enumerate()
+    {
+        events.push(btc_tick(
+            slug,
+            BAR_START_NS + 5_000_000_000 * (i as i64 + 1),
+            *p,
+        ));
+    }
+
+    // Public sells hit our UP bids and leave a one-sided UP inventory.
+    let mut t = BAR_START_NS + 60_000_000_000;
+    for _ in 0..10 {
+        events.push(trade(slug, t, ASSET_UP, "sell", "0.56", "5"));
+        t += 2_000_000_000;
+    }
+
+    // Keep emitting book/tick updates after inventory exists so the
+    // replay adapter has ticks on which to consider recycle.
+    for i in 0..20 {
+        let ns = BAR_START_NS + 90_000_000_000 + i * 3_000_000_000;
+        events.push(book_seed(slug, ASSET_DOWN, "sell", "0.42", "200", ns));
+        events.push(btc_tick(slug, ns + 1, 60_001.0));
+    }
+
+    let exp = ScenarioExpectations {
+        name: "capital_recycle_thin_edge".into(),
         ..Default::default()
     };
     (events, exp)

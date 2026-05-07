@@ -18,6 +18,7 @@ use polymarket_exec::collector::schema::{Event, EventType, Source};
 use polymarket_exec::replay::fill_sim::{
     FillQuality, FillSimConfig, LatencyPreset, Side, SimulatedFill,
 };
+use polymarket_exec::replay::journal::JournalEvent;
 use polymarket_exec::replay::runner::{
     run_window, ReplayDecision, ReplayStrategy, RunnerConfig, WindowStatus, WindowSummary,
 };
@@ -25,9 +26,9 @@ use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
 use polymarket_exec::strategy_profile::StrategyProfile;
 
 use scenario_builder::{
-    flat_50_50_paired_mm, flat_model_book_disagreement, late_window_ev_rescue,
-    missing_price_to_beat_no_trade, pair_completing_buy_and_merge, stale_btc_feed_no_trade,
-    ScenarioExpectations, ASSET_DOWN, ASSET_UP,
+    capital_recycle_thin_edge, flat_50_50_paired_mm, flat_model_book_disagreement,
+    late_window_ev_rescue, missing_price_to_beat_no_trade, pair_completing_buy_and_merge,
+    stale_btc_feed_no_trade, ScenarioExpectations, ASSET_DOWN, ASSET_UP,
 };
 
 fn paired_mm_profile() -> StrategyProfile {
@@ -35,6 +36,13 @@ fn paired_mm_profile() -> StrategyProfile {
         "tests/fixtures/replay/profiles/paired_mm_test.yaml",
     ))
     .expect("load paired_mm test profile")
+}
+
+fn paired_mm_cash_pressure_profile() -> StrategyProfile {
+    StrategyProfile::load(Path::new(
+        "tests/fixtures/replay/profiles/paired_mm_cash_pressure_test.yaml",
+    ))
+    .expect("load paired_mm cash-pressure test profile")
 }
 
 fn pair_cost_arb_profile() -> StrategyProfile {
@@ -83,6 +91,21 @@ fn intents_emitted(s: &WindowSummary) -> u64 {
 
 fn risk_rejections_total(s: &WindowSummary) -> u64 {
     s.risk_rejections.len() as u64
+}
+
+fn strategy_decisions(s: &WindowSummary, decision_type: &str) -> usize {
+    s.journal_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                JournalEvent::StrategyDecision {
+                    decision_type: actual,
+                    ..
+                } if actual == decision_type
+            )
+        })
+        .count()
 }
 
 fn assert_invariants(s: &WindowSummary, exp: &ScenarioExpectations) {
@@ -262,6 +285,33 @@ fn scenario_6_stale_btc_feed_no_trade() {
     let (events, exp) = stale_btc_feed_no_trade();
     let s = run(&events, paired_mm_profile(), FillQuality::Base);
     assert_invariants(&s, &exp);
+}
+
+#[test]
+fn scenario_7_capital_recycle_waits_on_thin_edge_without_cash_pressure() {
+    let (events, exp) = capital_recycle_thin_edge();
+    let s = run(&events, paired_mm_profile(), FillQuality::Base);
+    assert_invariants(&s, &exp);
+    assert_eq!(
+        strategy_decisions(&s, "capital_recycle"),
+        0,
+        "thin-edge recycle must wait when cash is healthy"
+    );
+}
+
+#[test]
+fn scenario_8_capital_recycle_fires_under_cash_pressure() {
+    let (events, exp) = capital_recycle_thin_edge();
+    let s = run(
+        &events,
+        paired_mm_cash_pressure_profile(),
+        FillQuality::Base,
+    );
+    assert_invariants(&s, &exp);
+    assert!(
+        strategy_decisions(&s, "capital_recycle") > 0,
+        "cash pressure should allow thin-edge capital recycling"
+    );
 }
 
 /// Tracking strategy used by `synthesizer_injects_price_to_beat_into_stream`.
