@@ -13,7 +13,7 @@
 //! complicates audit (10 separate files per run, partial-write risk) without
 //! a query-time benefit at backtest cardinality.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -427,7 +427,7 @@ impl ColumnBuilders {
 /// in causal order.
 pub fn write_journal_parquet(path: &Path, events: &[JournalEvent]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        fs::create_dir_all(parent)
             .with_context(|| format!("failed to create journal parent dir {}", parent.display()))?;
     }
     let schema = journal_schema();
@@ -444,14 +444,27 @@ pub fn write_journal_parquet(path: &Path, events: &[JournalEvent]) -> Result<()>
     let batch = RecordBatch::try_new(schema.clone(), arrays)
         .context("failed to build journal RecordBatch")?;
 
-    let file = File::create(path)
-        .with_context(|| format!("failed to create journal file {}", path.display()))?;
+    let tmp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("parquet")
+    ));
+    let file = File::create(&tmp_path)
+        .with_context(|| format!("failed to create journal file {}", tmp_path.display()))?;
     let mut writer =
         ArrowWriter::try_new(file, schema, None).context("failed to create journal ArrowWriter")?;
     writer
         .write(&batch)
         .context("failed to write journal RecordBatch")?;
     writer.close().context("failed to close journal writer")?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "failed to atomically move journal {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

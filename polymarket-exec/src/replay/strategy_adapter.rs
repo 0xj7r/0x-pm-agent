@@ -1066,7 +1066,15 @@ impl ReplayStrategyAdapter {
             stale_quote_max_age_ms: None,
             quote_expiry_ms: None,
         };
-        let open_orders = self.managed_open_orders();
+        // `quote_reconciler::plan` expects `&HashMap<...>`. The reconciler
+        // sorts every output path explicitly (per-key vec on line 374 and
+        // unmatched_ids on line 572 of `quote_reconciler.rs`, plus a final
+        // `plan.actions.sort_by` near the end), so the input map's
+        // iteration order does not leak. The conversion here is the seam
+        // between the `BTreeMap`-only adapter world and the live live
+        // reconciler signature.
+        let open_orders: HashMap<ClientOrderId, ManagedOrder> =
+            self.managed_open_orders().into_iter().collect();
         let plan = self.quote_reconciler.plan(desired, &open_orders, now_ms);
 
         let now_ns = (now_ms as i64).saturating_mul(1_000_000);
@@ -1119,8 +1127,14 @@ impl ReplayStrategyAdapter {
         }
     }
 
-    fn managed_open_orders(&self) -> HashMap<ClientOrderId, ManagedOrder> {
-        self.runtime_state.open_orders()
+    /// Returns open orders in `BTreeMap` order so every downstream
+    /// iteration (floating-point sums, exposure accumulators) is fed
+    /// orders in a stable, key-sorted sequence. The runtime state store
+    /// internally keys by `ClientOrderId` in a `HashMap`; converting at
+    /// this seam keeps the determinism invariant local to the replay
+    /// adapter.
+    fn managed_open_orders(&self) -> BTreeMap<ClientOrderId, ManagedOrder> {
+        self.runtime_state.open_orders().into_iter().collect()
     }
 
     fn remove_strategy_slot_for_sim_coid(&mut self, sim_coid: &str) {
@@ -1200,8 +1214,12 @@ impl ReplayStrategyAdapter {
         }
         // Replay open-order counters come from the shared runtime state
         // store. This is the same state shape consumed by the live quote
-        // reconciler, not a reconstructed replay-only view.
-        let managed_open_orders = self.runtime_state.open_orders();
+        // reconciler, not a reconstructed replay-only view. Routed through
+        // `managed_open_orders` so the iteration order below feeding the
+        // floating-point sums is `BTreeMap`-stable rather than HashMap-
+        // randomised; otherwise rehash order can flip risk decisions for
+        // bit-identical input.
+        let managed_open_orders = self.managed_open_orders();
         let live_total = managed_open_orders.len();
         let live_for_market = managed_open_orders
             .values()
