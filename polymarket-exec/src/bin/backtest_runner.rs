@@ -727,6 +727,10 @@ fn fill_path(fill: &SimulatedFill) -> &'static str {
     let coid = fill.client_order_id.as_str();
     if coid.contains("convex") {
         "convex_overlay"
+    } else if coid.contains("capital-recycle") {
+        "capital_recycle"
+    } else if coid.contains("hedge-rescue") {
+        "hedge_rescue"
     } else if coid.contains("paired-mm") || coid.contains("paired-bid") {
         "paired_ladder"
     } else {
@@ -811,6 +815,7 @@ mod tests {
     use super::*;
 
     use polymarket_exec::collector::schema::{EventType, Source};
+    use polymarket_exec::replay::fill_sim::{MakerOrTaker, Side};
     use serde_json::json;
 
     fn event(market_type: &str) -> Event {
@@ -828,6 +833,18 @@ mod tests {
             sequence: Some(1),
             source: Source::Collector,
             raw: json!({}),
+        }
+    }
+
+    fn fill(client_order_id: &str) -> SimulatedFill {
+        SimulatedFill {
+            client_order_id: client_order_id.to_string(),
+            asset_id: "asset".to_string(),
+            side: Side::Buy,
+            price: 0.5,
+            size: 1.0,
+            fill_ms: 0,
+            maker_or_taker: MakerOrTaker::Maker,
         }
     }
 
@@ -852,6 +869,26 @@ mod tests {
         assert_eq!(
             target_window_market_types(&event("reference"), &filter),
             vec!["btc_5m".to_string()]
+        );
+    }
+
+    #[test]
+    fn fill_path_separates_close_and_overlay_paths() {
+        assert_eq!(
+            fill_path(&fill("paired-mm:btc-updown-5m-1:yes:l1:1:1")),
+            "paired_ladder"
+        );
+        assert_eq!(
+            fill_path(&fill("paired-mm-convex:btc-updown-5m-1:yes:1:1")),
+            "convex_overlay"
+        );
+        assert_eq!(
+            fill_path(&fill("capital-recycle:btc-updown-5m-1:no:1:1")),
+            "capital_recycle"
+        );
+        assert_eq!(
+            fill_path(&fill("hedge-rescue:btc-updown-5m-1:no:1:1")),
+            "hedge_rescue"
         );
     }
 
