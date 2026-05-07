@@ -1,0 +1,88 @@
+profile_name: paired_mm_cash_pressure_test
+strategy: paired_mm
+version: "1.0"
+description: |
+  Replay fixture profile that forces the capital-recycle cash-pressure
+  branch without changing the event tape. Used to verify that thin-edge
+  recycle is suppressed in normal cash conditions but allowed under
+  explicit cash pressure.
+
+quote:
+  levels_per_side: 2
+  base_clip_usd: 10.0
+  max_clip_usd: 20.0
+  inventory_skew_bps: 50.0
+  skew_cap_bps: 75.0
+  entry_ladder_levels: 2
+  entry_ladder_spacing_ticks: 1.0
+  refresh_interval_ms: 250
+
+inventory:
+  max_gross_cost_usd: 200.0
+  max_side_imbalance_qty: 100.0
+  max_order_notional_usd: 25.0
+
+risk:
+  book_stale_ms: 5000
+
+pair:
+  min_merge_notional_usd: 10.0
+  merge_pressure_free_cash_ratio: 1.0
+
+fill:
+  taker_fee_bps: 0.0
+
+pair_cost:
+  threshold: 0.99
+  high_vol_threshold: 0.94
+  min_merge_usd: 10.0
+  min_edge_bps: 25.0
+
+clip_sizing:
+  base_clip_usd: 10.0
+  min_clip_usd: 5.0
+  max_clip_usd: 20.0
+  fractional_kelly: 0.25
+  capital_scale_factor: 1.0
+
+convexity:
+  late_window_sec: 60
+  convex_p_threshold: 0.55
+  max_excess_usd: 30.0
+  avoid_rehedging_when_convex: true
+  allow_extra_clip_on_winner: false
+
+fair_value:
+  max_model_divergence: 0.15
+  model_influence_weight: 0.25
+
+signals:
+  fair_value:
+    momentum_weight: 0.5
+  cheap_leg:
+    price_deviation_bps: 25.0
+  vol_regime:
+    high_vol_atr_threshold: 50.0
+    extreme_vol_pause: false
+  late_window:
+    enabled: true
+    p_threshold: 0.55
+
+rescue:
+  enabled: false
+  late_window_sec: 30
+  min_excess_usd: 5.0
+  hold_threshold: 0.55
+  rescue_threshold: 0.6
+  max_rescue_fraction: 0.5
+  rehedge_pair_cost_threshold: 0.95
+  merge_gas_cost_usd: 0.05
+  end_of_bar_flatten_ms: 30000
+
+operational:
+  cooldown_ms: 0
+  enable_buy_light_side_rebalance: false
+  recycle_min_imbalance_qty: 25.0
+  recycle_min_time_remaining_ms: 60000
+  recycle_max_light_side_spread: 0.05
+  recycle_routine_pair_cost_target: 0.97
