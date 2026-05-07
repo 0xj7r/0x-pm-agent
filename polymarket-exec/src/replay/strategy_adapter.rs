@@ -1503,6 +1503,12 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         }
         decision
     }
+
+    fn on_ioc_expired(&mut self, client_order_id: &str, now_ms: u64) -> ReplayDecision {
+        let client_order_id = ClientOrderId::new(client_order_id.to_string());
+        self.cancel_runtime_order(&client_order_id, now_ms);
+        ReplayDecision::default()
+    }
 }
 
 /// Map a `StrategyDecision` variant to its journal `decision_type` label.
@@ -1800,6 +1806,50 @@ mod tests {
             .expect("runtime inventory exists from reservation");
         assert!((runtime_inventory.free_cash_usd() - 750.0).abs() < 1e-9);
         assert!((runtime_inventory.reserved_cash_usd() - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn replay_ioc_close_expiry_releases_unfilled_reservation() {
+        let mut profile = StrategyProfile::default();
+        profile.inventory.min_free_cash_usd = Some(0.0);
+        profile.inventory.min_free_cash_bps = Some(0.0);
+        profile.inventory.max_net_notional_per_market_usd = Some(2_000.0);
+        profile.inventory.max_gross_notional_usd = Some(2_000.0);
+        let mut adapter = ReplayStrategyAdapter::from_profile(profile);
+        let market = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-1"),
+            InstrumentId::from("yes-1"),
+            InstrumentId::from("no-1"),
+        );
+        adapter.handle_market_meta(&market_meta_event(1_000_000, "market-1", "yes-1", "no-1"));
+
+        let mut intent = replay_intent("close-buy", 0.50);
+        intent.kind = IntentKind::Close;
+        intent.quote_level_tag = Some("mm-capital-recycle:yes:CapitalRecycle".to_string());
+        let mut submit_decision = ReplayDecision::default();
+        adapter.evaluate_and_emit(intent, &market, 2_000, &mut submit_decision);
+        let submitted = submit_decision
+            .submits
+            .first()
+            .expect("close order accepted and reserved");
+
+        let runtime_inventory = adapter
+            .runtime_inventories
+            .get(&market.market_id)
+            .expect("runtime inventory exists from reservation");
+        assert!((runtime_inventory.free_cash_usd() - 995.0).abs() < 1e-9);
+        assert!((runtime_inventory.reserved_cash_usd() - 5.0).abs() < 1e-9);
+
+        adapter.on_ioc_expired(&submitted.client_order_id, 2_000);
+
+        let runtime_inventory = adapter
+            .runtime_inventories
+            .get(&market.market_id)
+            .expect("runtime inventory remains");
+        assert!((runtime_inventory.free_cash_usd() - 1_000.0).abs() < 1e-9);
+        assert!(runtime_inventory.reserved_cash_usd().abs() < 1e-9);
+        assert!(adapter.open_intents.is_empty());
+        assert_eq!(adapter.managed_open_orders().len(), 0);
     }
 
     #[test]
