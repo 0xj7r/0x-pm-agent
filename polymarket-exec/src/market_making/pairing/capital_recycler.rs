@@ -11,6 +11,8 @@ const MIN_MARKETABLE_BUY_NOTIONAL_USD: f64 = 1.0;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CapitalRecycleConfig {
     pub pair_cost_target: f64,
+    pub routine_pair_cost_target: f64,
+    pub cash_pressure_free_cash_ratio: f64,
     pub min_imbalance_qty: f64,
     pub max_buy_qty: f64,
     pub max_buy_notional_usd: f64,
@@ -24,6 +26,8 @@ impl Default for CapitalRecycleConfig {
     fn default() -> Self {
         Self {
             pair_cost_target: 0.99,
+            routine_pair_cost_target: 0.97,
+            cash_pressure_free_cash_ratio: 0.15,
             min_imbalance_qty: 1.0,
             max_buy_qty: 25.0,
             max_buy_notional_usd: 25.0,
@@ -171,6 +175,28 @@ pub fn choose_capital_recycle<M: MarketDescriptor>(
         };
     }
     let late_recycle = remaining_ms < config.min_time_remaining_ms;
+    let free_cash_ratio = if inventory.equity_usd.is_finite() && inventory.equity_usd > 0.0 {
+        (inventory.free_cash_usd / inventory.equity_usd).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let cash_pressured = free_cash_ratio <= config.cash_pressure_free_cash_ratio.max(0.0);
+    if late_recycle && !cash_pressured {
+        return CapitalRecycleDecision::Wait {
+            reason: format!(
+                "capital recycle wait: late window and free_cash_ratio={free_cash_ratio:.4} above pressure {:.4}",
+                config.cash_pressure_free_cash_ratio
+            ),
+        };
+    }
+    if !cash_pressured && projected_pair_cost > config.routine_pair_cost_target {
+        return CapitalRecycleDecision::Wait {
+            reason: format!(
+                "capital recycle wait: projected_pair_cost={projected_pair_cost:.4} above routine target {:.4} without cash pressure free_cash_ratio={free_cash_ratio:.4}",
+                config.routine_pair_cost_target
+            ),
+        };
+    }
 
     let leg_tag = match light_leg {
         LadderLeg::Yes => "yes",
@@ -433,7 +459,79 @@ mod tests {
     }
 
     #[test]
-    fn late_recycle_is_allowed_when_projected_pair_cost_is_favorable() {
+    fn routine_recycle_waits_without_cash_pressure_when_edge_is_thin() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.56,
+                no_avg_cost: 0.42,
+                free_cash_usd: 100.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.99,
+                routine_pair_cost_target: 0.97,
+                cash_pressure_free_cash_ratio: 0.15,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
+            },
+            0,
+        );
+
+        let CapitalRecycleDecision::Wait { reason } = decision else {
+            panic!("expected thin-edge routine recycle to wait");
+        };
+
+        assert!(reason.contains("routine target"));
+    }
+
+    #[test]
+    fn cash_pressure_allows_thin_edge_recycle_below_hard_pair_cost_target() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.56,
+                no_avg_cost: 0.42,
+                free_cash_usd: 10.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.99,
+                routine_pair_cost_target: 0.97,
+                cash_pressure_free_cash_ratio: 0.15,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
+            },
+            0,
+        );
+
+        assert!(matches!(
+            decision,
+            CapitalRecycleDecision::BuyLightSide {
+                leg: LadderLeg::No,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn late_recycle_waits_without_cash_pressure() {
         let decision = choose_capital_recycle(
             &market(),
             &snapshot(),
@@ -447,6 +545,40 @@ mod tests {
             },
             CapitalRecycleConfig {
                 pair_cost_target: 0.90,
+                min_imbalance_qty: 5.0,
+                max_buy_qty: 10.0,
+                max_buy_notional_usd: 10.0,
+                min_time_remaining_ms: 60_000,
+                max_light_side_spread: 0.10,
+                race_buffer_ticks: 0.0,
+                ..CapitalRecycleConfig::default()
+            },
+            250_000,
+        );
+
+        let CapitalRecycleDecision::Wait { reason } = decision else {
+            panic!("expected late recycle without cash pressure to wait");
+        };
+
+        assert!(reason.contains("late window"));
+    }
+
+    #[test]
+    fn late_recycle_is_allowed_when_cash_is_pressured_and_pair_cost_is_favorable() {
+        let decision = choose_capital_recycle(
+            &market(),
+            &snapshot(),
+            &PairedInventorySnapshot {
+                yes_qty: 20.0,
+                no_qty: 5.0,
+                yes_avg_cost: 0.45,
+                no_avg_cost: 0.42,
+                free_cash_usd: 10.0,
+                equity_usd: 100.0,
+            },
+            CapitalRecycleConfig {
+                pair_cost_target: 0.90,
+                cash_pressure_free_cash_ratio: 0.15,
                 min_imbalance_qty: 5.0,
                 max_buy_qty: 10.0,
                 max_buy_notional_usd: 10.0,

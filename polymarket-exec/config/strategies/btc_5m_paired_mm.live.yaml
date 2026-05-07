@@ -147,6 +147,7 @@ operational:
   max_rescue_free_cash_bps: 5000
   taker_fee_coeff: 0.072
   recycle_min_imbalance_qty: 5.0
+  recycle_routine_pair_cost_target: 0.97
   recycle_min_time_remaining_ms: 90000
   recycle_max_light_side_spread: 0.10
 
