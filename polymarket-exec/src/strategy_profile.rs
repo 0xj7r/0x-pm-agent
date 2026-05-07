@@ -259,6 +259,10 @@ impl StrategyProfile {
                 .rescue
                 .hedge_rescue_race_buffer_ticks
                 .unwrap_or(config.capital_recycle.race_buffer_ticks),
+            cooldown_ms: self
+                .operational
+                .cooldown_ms
+                .unwrap_or(config.capital_recycle.cooldown_ms),
         };
         config.hard_policy = HardPolicyConfig {
             max_gross_cost_usd: self

@@ -189,6 +189,7 @@ impl PairCostArbStrategy {
             min_time_remaining_ms: self.config.recycle_min_time_remaining_ms,
             max_light_side_spread: self.config.recycle_max_light_side_spread.max(0.0),
             race_buffer_ticks: self.config.maker_safety_ticks.max(0.0),
+            ..CapitalRecycleConfig::default()
         }
     }
 

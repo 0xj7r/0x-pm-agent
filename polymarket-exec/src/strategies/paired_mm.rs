@@ -1,5 +1,7 @@
 //! Strategy adapter that applies the reusable paired-MM algorithm to a market.
 
+use std::collections::BTreeMap;
+
 use crate::market_making::paired_mm::{
     AutoFillSuggestion, CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig,
     LadderConfig, MergePolicyConfig, MergePolicyDecision, PairedMmEngine, PairedMmEngineConfig,
@@ -45,6 +47,7 @@ impl Default for PairedMmStrategyConfig {
 #[derive(Clone, Debug)]
 pub struct PairedMmStrategy {
     engine: PairedMmEngine,
+    last_capital_recycle_at_ms: BTreeMap<String, u64>,
 }
 
 impl PairedMmStrategy {
@@ -62,6 +65,7 @@ impl PairedMmStrategy {
                 book_sanity: config.book_sanity,
                 side_score: config.side_score,
             }),
+            last_capital_recycle_at_ms: BTreeMap::new(),
         }
     }
 
@@ -177,8 +181,23 @@ where
         }
 
         if let Some(intent) = decision.capital_recycle_intent().cloned() {
-            notes.push("paired-mm decision_label=cheap_leg_recycle mode=cheap_leg_mode capital recycle emitted".to_string());
-            return StrategyDecision::capital_recycle(vec![intent], notes);
+            let recycle_key = format!("{}:{}", intent.market_id, intent.instrument_id);
+            let cooldown_ms = self.engine.config().capital_recycle.cooldown_ms;
+            let in_cooldown = cooldown_ms > 0
+                && self
+                    .last_capital_recycle_at_ms
+                    .get(&recycle_key)
+                    .is_some_and(|last| now_ms.saturating_sub(*last) < cooldown_ms);
+            if in_cooldown {
+                notes.push(format!(
+                    "paired-mm capital recycle cooldown active key={recycle_key} cooldown_ms={cooldown_ms}"
+                ));
+            } else {
+                self.last_capital_recycle_at_ms
+                    .insert(recycle_key, now_ms);
+                notes.push("paired-mm decision_label=cheap_leg_recycle mode=cheap_leg_mode capital recycle emitted".to_string());
+                return StrategyDecision::capital_recycle(vec![intent], notes);
+            }
         }
 
         if let Some(reason) = PairedMmEngine::suppression_reason(&decision) {
