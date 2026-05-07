@@ -370,6 +370,11 @@ mod replay_accounting_tests {
             },
             intent_submit("paired-up", "UP", "mm-paired-bid:yes:l1:PairedEntry"),
             intent_submit("late-down", "DOWN", "mm-late-bar-core:l1"),
+            intent_submit(
+                "late-hyphen",
+                "DOWN",
+                "mm-convex-accum:late-favorite-only:no:ConvexAccumulation",
+            ),
             intent_submit("tail-up", "UP", "mm-convex-accum:l1"),
         ];
         let accounting = compute_accounting(&events, &fills, 1_000.0);
@@ -388,7 +393,7 @@ mod replay_accounting_tests {
         );
         assert_eq!(attribution.paired_mm.decisions_count, 1);
         assert_eq!(attribution.paired_mm.submitted_orders, 1);
-        assert_eq!(attribution.late_favorite_loading.submitted_orders, 1);
+        assert_eq!(attribution.late_favorite_loading.submitted_orders, 2);
         assert_eq!(attribution.cheap_tail_convexity.submitted_orders, 1);
         assert!((attribution.paired_mm.total_pnl_usd - 5.5).abs() < 1e-9);
         assert!((attribution.late_favorite_loading.total_pnl_usd + 4.5).abs() < 1e-9);
@@ -1213,8 +1218,10 @@ fn classify_tag(tag: &str) -> AttributionPath {
         AttributionPath::PairedMm
     } else if tag.contains("late-bar-core")
         || tag.contains("late_favorite")
+        || tag.contains("late-favorite")
         || tag.contains("late favorite")
         || tag.contains("favorite_loading")
+        || tag.contains("favorite-loading")
     {
         AttributionPath::LateFavorite
     } else if tag.contains("convex")
