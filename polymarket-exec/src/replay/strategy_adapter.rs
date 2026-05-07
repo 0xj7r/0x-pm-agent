@@ -539,6 +539,17 @@ impl ReplayStrategyAdapter {
         }
     }
 
+    /// Override the replay cash baseline used by strategy input snapshots,
+    /// runtime inventory reservations, and risk evaluation.
+    pub fn with_starting_cash_usd(mut self, starting_cash_usd: f64) -> Self {
+        self.starting_cash_usd = if starting_cash_usd.is_finite() {
+            starting_cash_usd
+        } else {
+            DEFAULT_STARTING_CASH_USD
+        };
+        self
+    }
+
     /// Enable or disable in-band `RiskEngine` evaluation of every intent.
     pub fn with_risk_evaluation(mut self, enabled: bool) -> Self {
         self.risk_evaluation_enabled = enabled;
@@ -882,8 +893,7 @@ impl ReplayStrategyAdapter {
             StrategyDecision::Merge { intent, .. } => {
                 self.apply_merge_decision(intent, market, now_ms, out);
             }
-            StrategyDecision::Suppress { .. }
-            | StrategyDecision::Noop { .. } => {}
+            StrategyDecision::Suppress { .. } | StrategyDecision::Noop { .. } => {}
         }
     }
 
