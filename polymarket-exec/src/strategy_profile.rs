@@ -235,6 +235,14 @@ impl StrategyProfile {
                 .pair_cost
                 .threshold
                 .unwrap_or(config.capital_recycle.pair_cost_target),
+            routine_pair_cost_target: self
+                .operational
+                .recycle_routine_pair_cost_target
+                .unwrap_or(config.capital_recycle.routine_pair_cost_target),
+            cash_pressure_free_cash_ratio: self
+                .pair
+                .merge_pressure_free_cash_ratio
+                .unwrap_or(config.capital_recycle.cash_pressure_free_cash_ratio),
             min_imbalance_qty: self
                 .operational
                 .recycle_min_imbalance_qty
@@ -853,6 +861,7 @@ pub struct OperationalSection {
     pub max_session_loss_bps: Option<f64>,
     pub enable_buy_light_side_rebalance: Option<bool>,
     pub recycle_min_imbalance_qty: Option<f64>,
+    pub recycle_routine_pair_cost_target: Option<f64>,
     pub recycle_min_time_remaining_ms: Option<u64>,
     pub recycle_max_light_side_spread: Option<f64>,
 }
