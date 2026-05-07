@@ -398,12 +398,12 @@ pub enum MmQuoteKind {
 impl MmQuoteKind {
     pub fn from_quote_level_tag(tag: &str) -> Option<Self> {
         let tag = tag.to_ascii_lowercase();
-        if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
-            Some(Self::PairedEntry)
+        if tag.contains("convex") {
+            Some(Self::ConvexAccumulation)
         } else if tag.contains("capital-recycle") || tag.contains("buy-light") {
             Some(Self::CapitalRecycle)
-        } else if tag.contains("convex") {
-            Some(Self::ConvexAccumulation)
+        } else if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
+            Some(Self::PairedEntry)
         } else if tag.contains("hedge-rescue") || tag.contains("rescue") {
             Some(Self::HedgeRescue)
         } else if tag.contains("sell-unwind") || tag.contains("reduce") {
