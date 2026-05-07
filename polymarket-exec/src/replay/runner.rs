@@ -276,6 +276,46 @@ mod replay_accounting_tests {
         assert_eq!(accounting.settlement.unmerged_pairable_qty, 2.0);
     }
 
+    #[test]
+    fn accounting_does_not_credit_sell_fills_beyond_held_inventory() {
+        let fills = vec![SimulatedFill {
+            client_order_id: "phantom-sell".to_string(),
+            asset_id: "UP".to_string(),
+            side: Side::Sell,
+            price: 0.70,
+            size: 10.0,
+            fill_ms: 1,
+            maker_or_taker: MakerOrTaker::Maker,
+        }];
+
+        let accounting = compute_accounting(&[], &fills, 1_000.0);
+
+        assert_eq!(accounting.ending_cash_usd, 1_000.0);
+        assert_eq!(accounting.ending_equity_usd, 1_000.0);
+        assert_eq!(accounting.sell_notional_usd, 0.0);
+        assert_eq!(accounting.invalid_fill_count, 1);
+        assert!((accounting.invalid_fill_notional_usd - 7.0).abs() < 1e-9);
+        assert_eq!(accounting.total_pnl_usd, 0.0);
+    }
+
+    #[test]
+    fn accounting_allows_negative_pnl_when_bought_losing_leg_settles_to_zero() {
+        let events = vec![
+            market_meta_event("UP", "DOWN"),
+            resolution_outcome_event("Down", 0.0, 0.0),
+        ];
+        let fills = vec![buy_fill("UP", 0.40, 10.0)];
+
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+
+        assert_eq!(accounting.ending_cash_usd, 996.0);
+        assert_eq!(accounting.ending_equity_usd, 996.0);
+        assert_eq!(accounting.total_pnl_usd, -4.0);
+        assert_eq!(accounting.realized_pnl_usd, -4.0);
+        assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+        assert_eq!(accounting.settlement.redeemed_winning_qty, 0.0);
+    }
+
     fn market_meta_event(up: &str, down: &str) -> Event {
         Event {
             v: 1,
@@ -326,6 +366,10 @@ pub struct ReplayAccountingSummary {
     pub gross_fill_notional_usd: f64,
     pub buy_notional_usd: f64,
     pub sell_notional_usd: f64,
+    #[serde(default)]
+    pub invalid_fill_count: u64,
+    #[serde(default)]
+    pub invalid_fill_notional_usd: f64,
     pub redeemable_value_usd: f64,
     pub resolution_winner_asset_id: Option<String>,
     pub mark_source: String,
@@ -613,6 +657,8 @@ fn compute_accounting(
     let mut realized_pnl = 0.0;
     let mut buy_notional = 0.0;
     let mut sell_notional = 0.0;
+    let mut invalid_fill_count = 0u64;
+    let mut invalid_fill_notional = 0.0;
     let mut positions: BTreeMap<String, ReplayPositionAccounting> = BTreeMap::new();
 
     for fill in fills {
@@ -625,11 +671,17 @@ fn compute_accounting(
                 pos.buy(fill.price, fill.size);
             }
             Side::Sell => {
-                cash += notional;
-                sell_notional += notional;
                 let avg_cost = pos.avg_cost;
                 let closed = pos.sell(fill.size);
+                let credited_notional = fill.price * closed;
+                cash += credited_notional;
+                sell_notional += credited_notional;
                 realized_pnl += (fill.price - avg_cost) * closed;
+                let excess = (fill.size - closed).max(0.0);
+                if excess > f64::EPSILON {
+                    invalid_fill_count += 1;
+                    invalid_fill_notional += fill.price * excess;
+                }
             }
         }
     }
@@ -718,6 +770,8 @@ fn compute_accounting(
         gross_fill_notional_usd: buy_notional + sell_notional,
         buy_notional_usd: buy_notional,
         sell_notional_usd: sell_notional,
+        invalid_fill_count,
+        invalid_fill_notional_usd: invalid_fill_notional,
         redeemable_value_usd: resolution_apply.gross_credit_usd,
         resolution_winner_asset_id: winner_asset_id.clone(),
         mark_source: if winner_asset_id.is_some() {
@@ -1428,7 +1482,7 @@ fn emit_market_event_journal_rows(event: &Event, journal_events: &mut Vec<Journa
         let size = parse_event_size(event).unwrap_or(0.0);
         let fee = parse_fee_usd(event);
         let gas = parse_gas_usd(event);
-        let credit = (size - fee - gas).max(0.0);
+        let credit = size - fee - gas;
         journal_events.push(JournalEvent::MergeEvent {
             ts_ns: event.received_ns,
             market_slug: market_slug.clone(),
