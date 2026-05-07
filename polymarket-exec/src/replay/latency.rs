@@ -13,9 +13,19 @@ use std::collections::BinaryHeap;
 
 #[derive(Debug, Clone, Copy)]
 pub enum LatencyModel {
-    Constant { delay_ns: u64 },
-    Uniform { min_ns: u64, max_ns: u64, seed: u64 },
-    Normal { mean_ns: u64, stddev_ns: u64, seed: u64 },
+    Constant {
+        delay_ns: u64,
+    },
+    Uniform {
+        min_ns: u64,
+        max_ns: u64,
+        seed: u64,
+    },
+    Normal {
+        mean_ns: u64,
+        stddev_ns: u64,
+        seed: u64,
+    },
 }
 
 /// Tiny PCG-XSH-RR style 64-bit generator. Self-contained so we avoid
@@ -30,10 +40,7 @@ impl Pcg64 {
     fn new(seed: u64) -> Self {
         // Stream constant from the PCG reference; any odd 128-bit value works.
         let inc: u128 = 0xda3e_39cb_94b9_5bdb_5851_f42d_4c95_7f2du128 | 1;
-        let mut rng = Self {
-            state: 0,
-            inc,
-        };
+        let mut rng = Self { state: 0, inc };
         // Standard PCG init: step, add seed, step.
         rng.next_u64();
         rng.state = rng.state.wrapping_add(seed as u128);
@@ -180,9 +187,7 @@ impl<T> LatencyBuffer<T> {
                 min_ns + (u * (span as f64)) as u64
             }
             LatencyModel::Normal {
-                mean_ns,
-                stddev_ns,
-                ..
+                mean_ns, stddev_ns, ..
             } => {
                 let rng = self.rng.as_mut().expect("normal has rng");
                 let z = rng.next_standard_normal();
@@ -203,10 +208,9 @@ mod tests {
 
     #[test]
     fn constant_delay_holds_until_due() {
-        let mut buf: LatencyBuffer<&'static str> =
-            LatencyBuffer::new(LatencyModel::Constant {
-                delay_ns: 100_000_000,
-            });
+        let mut buf: LatencyBuffer<&'static str> = LatencyBuffer::new(LatencyModel::Constant {
+            delay_ns: 100_000_000,
+        });
         buf.submit(0, "order_a");
 
         assert_eq!(buf.pop_due(99_999_999).len(), 0);

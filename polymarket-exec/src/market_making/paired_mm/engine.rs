@@ -26,7 +26,9 @@ use crate::market_making::pairing::rescue_engine::{
 use crate::market_making::pairing::risk_policy::{
     evaluate_hard_policy, HardPolicyAction, HardPolicyConfig, HardPolicyDecision,
 };
-use crate::market_making::pairing::types::{LadderLeg, PairedInventorySnapshot, PairedMarketSnapshot};
+use crate::market_making::pairing::types::{
+    LadderLeg, PairedInventorySnapshot, PairedMarketSnapshot,
+};
 use crate::markets::MarketDescriptor;
 use crate::signals::{
     BookSanityConfig, BookSanitySignal, BtcRegime, BtcRegimeSnapshot, FairValueEstimate,
@@ -531,9 +533,8 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         None
     };
     let tail_price_cap = (1.0 / config.min_tail_payoff_multiple.max(1.0)).max(tick_size);
-    let maybe_package_plan =
-        maybe_tail_quote.and_then(|(tail_limit_price, tail_best_ask)| {
-            if tail_best_ask > tail_price_cap {
+    let maybe_package_plan = maybe_tail_quote.and_then(|(tail_limit_price, tail_best_ask)| {
+        if tail_best_ask > tail_price_cap {
             return None;
         }
         choose_late_asymmetric_package(
@@ -542,18 +543,18 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             favorite_limit_price,
             tail_limit_price,
             effective_favorite_qty,
-                effective_tail_qty,
-                existing_cost,
-                existing_ev,
-                remaining_excess_budget,
-                favorite_depth_usd,
-                tail_depth_usd,
-                market.min_order_size(),
-                btc_regime.regime(),
-                pressure_bias,
-                config,
-            )
-            .map(|plan| (plan, tail_limit_price, tail_best_ask))
+            effective_tail_qty,
+            existing_cost,
+            existing_ev,
+            remaining_excess_budget,
+            favorite_depth_usd,
+            tail_depth_usd,
+            market.min_order_size(),
+            btc_regime.regime(),
+            pressure_bias,
+            config,
+        )
+        .map(|plan| (plan, tail_limit_price, tail_best_ask))
     });
 
     if let Some((plan, tail_limit_price, tail_best_ask)) = maybe_package_plan {
@@ -829,7 +830,9 @@ fn convex_pressure_bias(
         bias.tail_scale *= 0.75;
         bias.label = "thin_book";
     }
-    bias.favorite_scale = bias.favorite_scale.clamp(FAVORITE_SCALE_MIN, FAVORITE_SCALE_MAX);
+    bias.favorite_scale = bias
+        .favorite_scale
+        .clamp(FAVORITE_SCALE_MIN, FAVORITE_SCALE_MAX);
     bias.tail_scale = bias.tail_scale.clamp(TAIL_SCALE_MIN, TAIL_SCALE_MAX);
     bias
 }
@@ -884,16 +887,14 @@ fn choose_late_favorite_only(
     .clamp(0.0, 1.0);
     let edge = (favorite_prob - favorite_price).max(0.0);
     let kelly = edge / (1.0 - favorite_price).max(1e-9);
-    let capital_budget = (config.max_loss_usd.max(0.0) * config.capital_pct.max(0.0))
-        .max(config.min_order_usd);
+    let capital_budget =
+        (config.max_loss_usd.max(0.0) * config.capital_pct.max(0.0)).max(config.min_order_usd);
     let mut notional = (capital_budget * config.fractional_kelly.clamp(0.0, 1.0))
         .max(config.min_order_usd)
         .max(capital_budget * terminal_confidence * config.fractional_kelly.clamp(0.0, 1.0))
         .max(capital_budget * kelly * config.fractional_kelly.clamp(0.0, 1.0))
         * pressure_bias.favorite_scale;
-    notional = notional
-        .min(depth_cap)
-        .min(risk_cap);
+    notional = notional.min(depth_cap).min(risk_cap);
     if matches!(regime, Some(BtcRegime::Whipsaw)) {
         notional *= 0.75;
     }

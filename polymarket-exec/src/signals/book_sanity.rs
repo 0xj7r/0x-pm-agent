@@ -52,18 +52,8 @@ impl BookSanitySignal {
         now_ms: EpochMillis,
         config: BookSanityConfig,
     ) -> Self {
-        let yes = leg_sanity(
-            &snapshot.yes_quote,
-            &snapshot.no_quote,
-            now_ms,
-            config,
-        );
-        let no = leg_sanity(
-            &snapshot.no_quote,
-            &snapshot.yes_quote,
-            now_ms,
-            config,
-        );
+        let yes = leg_sanity(&snapshot.yes_quote, &snapshot.no_quote, now_ms, config);
+        let no = leg_sanity(&snapshot.no_quote, &snapshot.yes_quote, now_ms, config);
         Self {
             yes,
             no,
@@ -108,10 +98,7 @@ fn leg_sanity(
     let queue_penalty =
         (same_side_queue_notional_usd / config.max_queue_depth_usd.max(1e-9)).clamp(0.0, 1.0);
     let pair_cost_penalty = projected_pair_cost
-        .map(|pair_cost| {
-            ((pair_cost - config.max_projected_pair_cost) / 0.02)
-                .clamp(0.0, 1.0)
-        })
+        .map(|pair_cost| ((pair_cost - config.max_projected_pair_cost) / 0.02).clamp(0.0, 1.0))
         .unwrap_or(0.5);
     let structural_penalty =
         bool_penalty(missing_bbo) + bool_penalty(crossed) + bool_penalty(stale);
@@ -138,9 +125,7 @@ fn is_stale(quote: &QuoteSnapshot, now_ms: EpochMillis, max_staleness_ms: u64) -
     if now_ms == 0 || max_staleness_ms == 0 {
         return false;
     }
-    let observed = quote
-        .depth_observed_at_ms
-        .unwrap_or(quote.observed_at_ms);
+    let observed = quote.depth_observed_at_ms.unwrap_or(quote.observed_at_ms);
     observed > 0 && now_ms.saturating_sub(observed) > max_staleness_ms
 }
 
@@ -154,5 +139,9 @@ fn level_notional(level: &BookLevel) -> f64 {
 }
 
 fn bool_penalty(value: bool) -> f64 {
-    if value { 1.0 } else { 0.0 }
+    if value {
+        1.0
+    } else {
+        0.0
+    }
 }

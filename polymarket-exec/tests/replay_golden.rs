@@ -1,4 +1,4 @@
-//! Deterministic golden-fixture replay test 
+//! Deterministic golden-fixture replay test
 //!
 //! Generates a 50-event canonical fixture, writes it to a temp directory as
 //! Parquet + JSONL, reads both back through the replay reader, runs the
@@ -108,8 +108,10 @@ impl ReplayStrategy for PassiveAsk {
                     (event.received_ns / 1_000_000) as u64,
                 )],
                 cancels: vec![],
+                rejected_fills: vec![],
                 risk_rejections: vec![],
                 journal_events: vec![],
+                accounting_events: vec![],
             };
         }
         ReplayDecision::default()

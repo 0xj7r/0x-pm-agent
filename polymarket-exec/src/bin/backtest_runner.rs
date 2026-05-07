@@ -51,12 +51,13 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use polymarket_exec::collector::schema::Event;
-use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset};
+use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset, SimulatedFill};
 use polymarket_exec::replay::journal::{write_journal_parquet, JournalEvent};
 use polymarket_exec::replay::manifest::{
     canonicalize, compute_run_id, profile_hash, Manifest, WindowPlan, FILL_SIM_VERSION,
     SCHEMA_VERSION,
 };
+use polymarket_exec::replay::raw_parquet::{read_raw_replay, RawReplayMarket, RawReplayOptions};
 use polymarket_exec::replay::reader::read_local_filtered;
 use polymarket_exec::replay::runner::{run_run, RunnerConfig, WindowStatus, WindowSummary};
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
@@ -90,6 +91,21 @@ struct Cli {
     /// supported in Phase 3a; use a local path.
     #[arg(long)]
     input_prefix: PathBuf,
+
+    /// Input format. `rust-event` reads canonical Event v1 Parquet/JSONL.
+    /// `telonex-raw` reads raw Telonex/Binance Parquet directly.
+    #[arg(long, default_value = "rust-event")]
+    input_format: String,
+
+    /// Raw replay market map: slug=up_asset,down_asset[,strike]. Required for
+    /// `--input-format telonex-raw` so market_meta can be emitted without
+    /// scanning the global markets dataset.
+    #[arg(long = "raw-market-asset-map")]
+    raw_market_asset_maps: Vec<String>,
+
+    /// Book levels per side to decode from raw Telonex book snapshots.
+    #[arg(long, default_value_t = 25)]
+    raw_max_book_levels: usize,
 
     /// Output prefix for manifest + per-window summaries.
     #[arg(long)]
@@ -165,6 +181,83 @@ struct RunSummary {
     windows: Vec<WindowSummary>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MetricsSummary {
+    run_id: String,
+    fill_config: String,
+    window_count: u64,
+    events_replayed: u64,
+    intents_submitted: u64,
+    accepted_fills: u64,
+    gross_fill_notional_usd: f64,
+    ending_equity_usd_sum: f64,
+    portfolio_starting_cash_usd: f64,
+    portfolio_ending_cash_usd: f64,
+    portfolio_ending_equity_usd: f64,
+    portfolio_total_pnl_usd: f64,
+    portfolio_max_drawdown_usd: f64,
+    total_pnl_usd: f64,
+    realized_pnl_usd: f64,
+    unrealized_pnl_usd: f64,
+    mean_pnl_per_window_usd: f64,
+    std_pnl_per_window_usd: f64,
+    sharpe_per_window: Option<f64>,
+    sortino_per_window: Option<f64>,
+    win_rate: f64,
+    profit_factor: Option<f64>,
+    max_drawdown_usd: f64,
+    worst_window_pnl_usd: f64,
+    best_window_pnl_usd: f64,
+    negative_cash_windows: u64,
+    risk_rejection_count: u64,
+    risk_rejection_reasons: BTreeMap<String, u64>,
+    post_only_rejection_count: u64,
+    merge_attempted_count: u64,
+    merge_success_count: u64,
+    merged_pair_qty: f64,
+    unmerged_pairable_qty: f64,
+    stranded_qty_total: f64,
+    stranded_cost_usd: f64,
+    settlement_status_counts: BTreeMap<String, u64>,
+    fill_path: BTreeMap<String, FillAttribution>,
+    fill_path_leg: BTreeMap<String, FillAttribution>,
+    fill_time_bucket: BTreeMap<String, FillAttribution>,
+    fill_price_bucket: BTreeMap<String, FillAttribution>,
+    windows: Vec<MetricsWindowSummary>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct FillAttribution {
+    fills: u64,
+    quantity: f64,
+    notional_usd: f64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct MetricsWindowSummary {
+    window_id: String,
+    events_replayed: u64,
+    intents_submitted: u64,
+    fills: u64,
+    gross_fill_notional_usd: f64,
+    total_pnl_usd: f64,
+    realized_pnl_usd: f64,
+    unrealized_pnl_usd: f64,
+    ending_cash_usd: f64,
+    ending_equity_usd: f64,
+    risk_rejections: u64,
+    settlement_status: String,
+    settlement_status_reason: String,
+    merge_attempted_count: u64,
+    merge_success_count: u64,
+    unmerged_pairable_qty: f64,
+    unmerged_pairable_net_gain_usd: f64,
+    stranded_qty_total: f64,
+    stranded_cost_usd: f64,
+    paired_ladder_notional_usd: f64,
+    convex_overlay_notional_usd: f64,
+}
+
 fn parse_seed(s: &str) -> Result<u64> {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(rest, 16).context("invalid hex seed")
@@ -198,6 +291,32 @@ fn parse_market_filter(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_raw_market_asset_maps(values: &[String]) -> Result<Vec<RawReplayMarket>> {
+    let mut markets = Vec::new();
+    for raw in values {
+        for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let (slug, assets) = item.split_once('=').with_context(|| {
+                format!("invalid --raw-market-asset-map {item}; expected slug=up_asset,down_asset")
+            })?;
+            let asset_ids: Vec<String> = assets
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            if asset_ids.len() < 2 {
+                anyhow::bail!("invalid --raw-market-asset-map {item}; expected two asset IDs");
+            }
+            markets.push(RawReplayMarket {
+                slug: slug.trim().to_string(),
+                asset_ids: [asset_ids[0].clone(), asset_ids[1].clone()],
+                strike: asset_ids.get(2).cloned(),
+            });
+        }
+    }
+    Ok(markets)
+}
+
 fn event_matches_market_filter(event: &Event, market_filter: &[String]) -> bool {
     market_filter.is_empty()
         || market_filter.contains(&event.market_type)
@@ -216,9 +335,9 @@ fn target_window_market_types(event: &Event, market_filter: &[String]) -> Vec<St
 
 fn run_main(cli: Cli) -> Result<i32> {
     // Validate CLI inputs.
-    let _start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
+    let start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
         .with_context(|| format!("invalid --window-start: {}", cli.window_start))?;
-    let _end_dt = DateTime::parse_from_rfc3339(&cli.window_end)
+    let end_dt = DateTime::parse_from_rfc3339(&cli.window_end)
         .with_context(|| format!("invalid --window-end: {}", cli.window_end))?;
 
     let preset = parse_fill_config(&cli.fill_config)?;
@@ -243,8 +362,37 @@ fn run_main(cli: Cli) -> Result<i32> {
         eprintln!("input prefix not found: {}", cli.input_prefix.display());
         return Ok(3);
     }
-    let events: Vec<Event> = read_local_filtered(&cli.input_prefix, None)
-        .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?;
+    let events: Vec<Event> = match cli.input_format.as_str() {
+        "rust-event" => read_local_filtered(&cli.input_prefix, None)
+            .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?,
+        "telonex-raw" => {
+            let markets = parse_raw_market_asset_maps(&cli.raw_market_asset_maps)?;
+            if markets.is_empty() {
+                anyhow::bail!("--input-format telonex-raw requires at least one --raw-market-asset-map slug=up_asset,down_asset");
+            }
+            read_raw_replay(
+                &cli.input_prefix,
+                &RawReplayOptions {
+                    window_start_ns: start_dt
+                        .timestamp_nanos_opt()
+                        .context("invalid window_start nanoseconds")?,
+                    window_end_ns: end_dt
+                        .timestamp_nanos_opt()
+                        .context("invalid window_end nanoseconds")?,
+                    market_filter: cli.market_filter.clone(),
+                    max_book_levels: cli.raw_max_book_levels,
+                    markets,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "reading raw Telonex input from {}",
+                    cli.input_prefix.display()
+                )
+            })?
+        }
+        other => anyhow::bail!("unknown --input-format: {other}"),
+    };
 
     // Group into windows by (market_type, dt). Phase 3a uses one window
     // per market_type (broader windowing per the spec is Phase 3b/5).
@@ -345,8 +493,9 @@ fn run_main(cli: Cli) -> Result<i32> {
     // Load profile and instantiate the strategy adapter for each window.
     let profile = StrategyProfile::load(&cli.strategy_profile)
         .with_context(|| format!("load strategy profile {}", cli.strategy_profile.display()))?;
-    let mut summaries = match run_run(windows, &runner_cfg, |_| {
+    let mut summaries = match run_run(windows, &runner_cfg, |_, starting_cash_usd| {
         ReplayStrategyAdapter::from_profile(profile.clone())
+            .with_starting_cash_usd(starting_cash_usd)
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -386,9 +535,14 @@ fn run_main(cli: Cli) -> Result<i32> {
         git_rev: cli.git_rev,
         schema_version: SCHEMA_VERSION,
         fill_sim_version: FILL_SIM_VERSION.to_string(),
-        fill_config: combined_fill_config,
+        fill_config: combined_fill_config.clone(),
         windows: summaries,
     };
+    let metrics = compute_metrics_summary(&run_id, &combined_fill_config, &summary.windows);
+    fs::write(
+        run_root.join("metrics_summary.json"),
+        serde_json::to_string_pretty(&metrics)?,
+    )?;
     fs::write(
         run_root.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
@@ -401,6 +555,231 @@ fn run_main(cli: Cli) -> Result<i32> {
         journal_event_count
     );
     Ok(if had_failure { 4 } else { 0 })
+}
+
+fn compute_metrics_summary(
+    run_id: &str,
+    fill_config: &str,
+    windows: &[WindowSummary],
+) -> MetricsSummary {
+    let mut out = MetricsSummary {
+        run_id: run_id.to_string(),
+        fill_config: fill_config.to_string(),
+        window_count: windows.len() as u64,
+        worst_window_pnl_usd: f64::INFINITY,
+        best_window_pnl_usd: f64::NEG_INFINITY,
+        ..MetricsSummary::default()
+    };
+    let mut pnls = Vec::new();
+    let mut cumulative_pnl = 0.0;
+    let mut peak_pnl = 0.0;
+    let mut gross_wins = 0.0;
+    let mut gross_losses = 0.0;
+
+    for window in windows {
+        let accounting = &window.accounting;
+        let settlement = &accounting.settlement;
+        let pnl = accounting.total_pnl_usd;
+        if pnls.is_empty() {
+            out.portfolio_starting_cash_usd = accounting.starting_cash_usd;
+        }
+        out.portfolio_ending_cash_usd = accounting.ending_cash_usd;
+        out.portfolio_ending_equity_usd = accounting.ending_equity_usd;
+        pnls.push(pnl);
+        cumulative_pnl += pnl;
+        if cumulative_pnl > peak_pnl {
+            peak_pnl = cumulative_pnl;
+        }
+        out.max_drawdown_usd = out.max_drawdown_usd.max(peak_pnl - cumulative_pnl);
+        out.portfolio_max_drawdown_usd = out.max_drawdown_usd;
+        if pnl > 0.0 {
+            gross_wins += pnl;
+        } else if pnl < 0.0 {
+            gross_losses += -pnl;
+        }
+        out.best_window_pnl_usd = out.best_window_pnl_usd.max(pnl);
+        out.worst_window_pnl_usd = out.worst_window_pnl_usd.min(pnl);
+        out.events_replayed += window.events_replayed;
+        out.intents_submitted += window.intents_submitted;
+        out.accepted_fills += window.fills.len() as u64;
+        out.gross_fill_notional_usd += accounting.gross_fill_notional_usd;
+        out.ending_equity_usd_sum += accounting.ending_equity_usd;
+        out.total_pnl_usd += pnl;
+        out.realized_pnl_usd += accounting.realized_pnl_usd;
+        out.unrealized_pnl_usd += accounting.unrealized_pnl_usd;
+        out.negative_cash_windows += (accounting.ending_cash_usd < -1e-9) as u64;
+        out.risk_rejection_count += window.risk_rejections.len() as u64;
+        for rejection in &window.risk_rejections {
+            *out.risk_rejection_reasons
+                .entry(risk_rejection_reason_key(rejection))
+                .or_insert(0) += 1;
+        }
+        out.post_only_rejection_count += window.post_only_rejections.len() as u64;
+        out.merge_attempted_count += settlement.merge_attempted_count;
+        out.merge_success_count += settlement.merge_success_count;
+        out.merged_pair_qty += settlement.merged_pair_qty;
+        out.unmerged_pairable_qty += settlement.unmerged_pairable_qty;
+        out.stranded_qty_total += settlement.stranded_qty_total;
+        out.stranded_cost_usd += settlement.stranded_cost_usd;
+        *out.settlement_status_counts
+            .entry(settlement.status.clone())
+            .or_insert(0) += 1;
+
+        let mut paired_ladder_notional = 0.0;
+        let mut convex_overlay_notional = 0.0;
+        for fill in &window.fills {
+            let path = fill_path(fill);
+            let leg = fill_leg(fill);
+            let notional = fill.price * fill.size;
+            if path == "paired_ladder" {
+                paired_ladder_notional += notional;
+            } else if path == "convex_overlay" {
+                convex_overlay_notional += notional;
+            }
+            add_fill_attr(&mut out.fill_path, path, fill);
+            add_fill_attr(&mut out.fill_path_leg, &format!("{path}:{leg}"), fill);
+            add_fill_attr(&mut out.fill_time_bucket, &fill_time_bucket(fill), fill);
+            add_fill_attr(&mut out.fill_price_bucket, &fill_price_bucket(fill), fill);
+        }
+        out.windows.push(MetricsWindowSummary {
+            window_id: window.window_id.clone(),
+            events_replayed: window.events_replayed,
+            intents_submitted: window.intents_submitted,
+            fills: window.fills.len() as u64,
+            gross_fill_notional_usd: accounting.gross_fill_notional_usd,
+            total_pnl_usd: pnl,
+            realized_pnl_usd: accounting.realized_pnl_usd,
+            unrealized_pnl_usd: accounting.unrealized_pnl_usd,
+            ending_cash_usd: accounting.ending_cash_usd,
+            ending_equity_usd: accounting.ending_equity_usd,
+            risk_rejections: window.risk_rejections.len() as u64,
+            settlement_status: settlement.status.clone(),
+            settlement_status_reason: settlement.status_reason.clone(),
+            merge_attempted_count: settlement.merge_attempted_count,
+            merge_success_count: settlement.merge_success_count,
+            unmerged_pairable_qty: settlement.unmerged_pairable_qty,
+            unmerged_pairable_net_gain_usd: settlement.unmerged_pairable_net_gain_usd,
+            stranded_qty_total: settlement.stranded_qty_total,
+            stranded_cost_usd: settlement.stranded_cost_usd,
+            paired_ladder_notional_usd: paired_ladder_notional,
+            convex_overlay_notional_usd: convex_overlay_notional,
+        });
+    }
+
+    if out.window_count == 0 {
+        out.worst_window_pnl_usd = 0.0;
+        out.best_window_pnl_usd = 0.0;
+        return out;
+    }
+    out.portfolio_total_pnl_usd = out.portfolio_ending_equity_usd - out.portfolio_starting_cash_usd;
+    let n = out.window_count as f64;
+    out.mean_pnl_per_window_usd = out.total_pnl_usd / n;
+    let variance = pnls
+        .iter()
+        .map(|pnl| {
+            let diff = pnl - out.mean_pnl_per_window_usd;
+            diff * diff
+        })
+        .sum::<f64>()
+        / n;
+    out.std_pnl_per_window_usd = variance.sqrt();
+    out.sharpe_per_window = (out.std_pnl_per_window_usd > 1e-12)
+        .then_some(out.mean_pnl_per_window_usd / out.std_pnl_per_window_usd);
+    let downside = pnls
+        .iter()
+        .filter(|pnl| **pnl < 0.0)
+        .map(|pnl| pnl * pnl)
+        .sum::<f64>();
+    let downside_count = pnls.iter().filter(|pnl| **pnl < 0.0).count() as f64;
+    out.sortino_per_window = (downside_count > 0.0)
+        .then(|| (downside / downside_count).sqrt())
+        .and_then(|downside_dev| {
+            (downside_dev > 1e-12).then_some(out.mean_pnl_per_window_usd / downside_dev)
+        });
+    out.win_rate = pnls.iter().filter(|pnl| **pnl > 0.0).count() as f64 / n;
+    out.profit_factor = if gross_losses > 1e-12 {
+        Some(gross_wins / gross_losses)
+    } else if gross_wins > 0.0 {
+        Some(f64::INFINITY)
+    } else {
+        None
+    };
+    out
+}
+
+fn risk_rejection_reason_key(
+    rejection: &polymarket_exec::replay::risk_trace::RiskRejection,
+) -> String {
+    serde_json::to_value(&rejection.reject_reason)
+        .ok()
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .unwrap_or_else(|| format!("{:?}", rejection.reject_reason))
+}
+
+fn add_fill_attr(map: &mut BTreeMap<String, FillAttribution>, key: &str, fill: &SimulatedFill) {
+    let entry = map.entry(key.to_string()).or_default();
+    entry.fills += 1;
+    entry.quantity += fill.size;
+    entry.notional_usd += fill.price * fill.size;
+}
+
+fn fill_path(fill: &SimulatedFill) -> &'static str {
+    let coid = fill.client_order_id.as_str();
+    if coid.contains("convex") {
+        "convex_overlay"
+    } else if coid.contains("paired-mm") || coid.contains("paired-bid") {
+        "paired_ladder"
+    } else {
+        "other"
+    }
+}
+
+fn fill_leg(fill: &SimulatedFill) -> &'static str {
+    let coid = fill.client_order_id.as_str();
+    if coid.contains(":yes:") {
+        "yes"
+    } else if coid.contains(":no:") {
+        "no"
+    } else {
+        "unknown"
+    }
+}
+
+fn fill_price_bucket(fill: &SimulatedFill) -> String {
+    let price = fill.price;
+    if price <= 0.02 {
+        "tail_0_2c".to_string()
+    } else if price <= 0.10 {
+        "tail_2_10c".to_string()
+    } else if price >= 0.95 {
+        "favorite_95_100c".to_string()
+    } else if price >= 0.85 {
+        "favorite_85_95c".to_string()
+    } else {
+        "middle".to_string()
+    }
+}
+
+fn fill_time_bucket(fill: &SimulatedFill) -> String {
+    let Some(start_s) = market_epoch_from_client_order_id(&fill.client_order_id) else {
+        return "unknown".to_string();
+    };
+    let phase_s = fill.fill_ms as i64 / 1_000 - start_s;
+    match phase_s {
+        i64::MIN..=-1 => "pre_window".to_string(),
+        0..=59 => "000_060s".to_string(),
+        60..=119 => "060_120s".to_string(),
+        120..=179 => "120_180s".to_string(),
+        180..=239 => "180_240s".to_string(),
+        240..=300 => "240_300s".to_string(),
+        _ => "post_window".to_string(),
+    }
+}
+
+fn market_epoch_from_client_order_id(coid: &str) -> Option<i64> {
+    coid.split(':')
+        .find_map(|part| part.strip_prefix("btc-updown-5m-"))
+        .and_then(|suffix| suffix.parse::<i64>().ok())
 }
 
 fn main() -> ExitCode {
@@ -477,6 +856,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_raw_market_asset_maps() {
+        let markets = parse_raw_market_asset_maps(&[
+            "btc-updown-5m-1771178400=UP,DOWN".to_string(),
+            "btc-updown-5m-1771178700=UP2,DOWN2".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(markets.len(), 2);
+        assert_eq!(markets[0].slug, "btc-updown-5m-1771178400");
+        assert_eq!(markets[0].asset_ids, ["UP".to_string(), "DOWN".to_string()]);
+        assert_eq!(markets[0].strike, None);
+    }
+
+    #[test]
+    fn parses_raw_market_asset_maps_with_exact_strike() {
+        let markets =
+            parse_raw_market_asset_maps(&["btc-updown-5m-1771178400=UP,DOWN,79000.12".to_string()])
+                .unwrap();
+
+        assert_eq!(markets[0].strike.as_deref(), Some("79000.12"));
+    }
+
+    #[test]
     fn live_paired_mm_yaml_loads_through_runner_path() {
         // Live/replay parity guard: the runner MUST be able to load the
         // same YAML the live trader uses, and the resulting profile must
@@ -494,5 +896,9 @@ mod tests {
             cfg.ladder.max_depth
         );
         assert!(cfg.ladder.base_clip_usd > 0.0);
+        let limits = profile.risk_limits();
+        assert!(limits.max_order_notional_usd > 0.0);
+        assert!(limits.max_gross_notional_usd > 0.0);
+        assert!(limits.max_open_orders_total > 0);
     }
 }

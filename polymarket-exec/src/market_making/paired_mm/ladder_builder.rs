@@ -204,8 +204,7 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
     let suppress_yes =
         should_suppress_leg(LadderLeg::Yes, inventory, config) || yes_spread_suppressed;
-    let suppress_no =
-        should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
+    let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
 
     let mut intents = Vec::with_capacity(depth * 2);
     if inventory.gross_cost_usd() < config.caps.max_gross_cost_usd {
@@ -426,7 +425,10 @@ fn kelly_clip_size(
         LadderRegime::LateBar => 0.35,
         LadderRegime::InventoryImbalanced => 0.35,
     };
-    let min_clip = config.min_clip_usd.max(0.0).min(config.max_clip_usd.max(0.0));
+    let min_clip = config
+        .min_clip_usd
+        .max(0.0)
+        .min(config.max_clip_usd.max(0.0));
     let max_clip = config.max_clip_usd.max(min_clip);
     (config.base_clip_usd.max(kelly_component).min(max_clip) * regime_scale)
         .max(min_clip)
@@ -485,8 +487,7 @@ fn append_leg_ladder<M: MarketDescriptor>(
 
     let mut leg_notional_usd = 0.0;
     let mut last_emitted_price: Option<f64> = None;
-    let min_quantity = market.min_order_size()
-        * config.entry_min_size_multiplier.max(0.0).max(1.0);
+    let min_quantity = market.min_order_size() * config.entry_min_size_multiplier.max(0.0).max(1.0);
     for level in 0..depth {
         let multiplier = config
             .level_multipliers
@@ -1005,10 +1006,7 @@ mod tests {
         );
 
         assert!(!result.intents.is_empty());
-        assert!(result
-            .intents
-            .iter()
-            .all(|intent| intent.quantity >= 10.0));
+        assert!(result.intents.iter().all(|intent| intent.quantity >= 10.0));
     }
 
     #[test]
