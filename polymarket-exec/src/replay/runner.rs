@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::collector::schema::{Event, EventType};
 use crate::replay::fill_sim::{
-    FillSimConfig, FillSimulator, Side, SimulatedFill, SimulatedOrderSubmission,
-    SimulatedRejection, StrategyOrderIntent,
+    FillQuality, FillSimConfig, FillSimulator, MakerOrTaker, Side, SimulatedFill,
+    SimulatedOrderSubmission, SimulatedRejection, StrategyOrderIntent,
 };
 use crate::replay::journal::JournalEvent;
 use crate::replay::risk_trace::RiskRejection;
@@ -151,6 +151,38 @@ mod replay_accounting_tests {
             size,
             fill_ms: 1,
             maker_or_taker: MakerOrTaker::Maker,
+        }
+    }
+
+    fn tagged_buy_fill(
+        client_order_id: &str,
+        asset_id: &str,
+        price: f64,
+        size: f64,
+    ) -> SimulatedFill {
+        SimulatedFill {
+            client_order_id: client_order_id.to_string(),
+            asset_id: asset_id.to_string(),
+            side: Side::Buy,
+            price,
+            size,
+            fill_ms: 1,
+            maker_or_taker: MakerOrTaker::Maker,
+        }
+    }
+
+    fn intent_submit(intent_id: &str, asset_id: &str, reason_tag: &str) -> JournalEvent {
+        JournalEvent::IntentSubmit {
+            ts_ns: 1,
+            market_slug: "btc-up-or-down".to_string(),
+            asset_id: asset_id.to_string(),
+            intent_id: intent_id.to_string(),
+            side: "buy".to_string(),
+            price: 0.5,
+            size: 1.0,
+            post_only: true,
+            ladder_position: Some(1),
+            reason_tag: reason_tag.to_string(),
         }
     }
 
@@ -316,6 +348,133 @@ mod replay_accounting_tests {
         assert_eq!(accounting.settlement.redeemed_winning_qty, 0.0);
     }
 
+    #[test]
+    fn attribution_breaks_terminal_pnl_into_strategy_paths() {
+        let events = vec![
+            market_meta_event("UP", "DOWN"),
+            resolution_outcome_event("Up", 0.0, 0.0),
+        ];
+        let fills = vec![
+            tagged_buy_fill("paired-up", "UP", 0.45, 10.0),
+            tagged_buy_fill("late-down", "DOWN", 0.90, 5.0),
+            tagged_buy_fill("tail-up", "UP", 0.02, 20.0),
+        ];
+        let journal_events = vec![
+            JournalEvent::StrategyDecision {
+                ts_ns: 1,
+                market_slug: "btc-up-or-down".to_string(),
+                asset_id: Some("UP".to_string()),
+                decision_type: "paired_entry".to_string(),
+                raw_inputs_hash: "h".to_string(),
+                reason_tag: "mm-paired-bid:yes:l1:PairedEntry".to_string(),
+            },
+            intent_submit("paired-up", "UP", "mm-paired-bid:yes:l1:PairedEntry"),
+            intent_submit("late-down", "DOWN", "mm-late-bar-core:l1"),
+            intent_submit("tail-up", "UP", "mm-convex-accum:l1"),
+        ];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let attribution = compute_pnl_attribution(
+            &events,
+            &fills,
+            &journal_events,
+            &accounting,
+            FillQuality::Base,
+        );
+
+        assert_eq!(attribution.fill_quality, "base");
+        assert_eq!(
+            attribution.strategy_validation_status,
+            "valid_strategy_replay"
+        );
+        assert_eq!(attribution.paired_mm.decisions_count, 1);
+        assert_eq!(attribution.paired_mm.submitted_orders, 1);
+        assert_eq!(attribution.late_favorite_loading.submitted_orders, 1);
+        assert_eq!(attribution.cheap_tail_convexity.submitted_orders, 1);
+        assert!((attribution.paired_mm.total_pnl_usd - 5.5).abs() < 1e-9);
+        assert!((attribution.late_favorite_loading.total_pnl_usd + 4.5).abs() < 1e-9);
+        assert!((attribution.cheap_tail_convexity.total_pnl_usd - 19.6).abs() < 1e-9);
+        assert!((attribution.attributed_path_pnl_usd - accounting.total_pnl_usd).abs() < 1e-9);
+        assert!(attribution.unattributed_pnl_usd.abs() < 1e-9);
+        assert!(
+            (attribution
+                .stranded_inventory_losses
+                .expired_losing_cost_usd
+                - 4.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn attribution_reports_merge_recycling_and_explicit_costs() {
+        let merge = Event {
+            raw: json!({
+                "type": "merge",
+                "status": "confirmed",
+                "size": "5",
+                "fee_usd": 0.10,
+                "gas_usd": 0.20
+            }),
+            ..merge_event("5", "confirmed")
+        };
+        let events = vec![market_meta_event("UP", "DOWN"), merge];
+        let fills = vec![
+            tagged_buy_fill("paired-up", "UP", 0.40, 5.0),
+            tagged_buy_fill("paired-down", "DOWN", 0.55, 5.0),
+        ];
+        let journal_events = vec![
+            intent_submit("paired-up", "UP", "mm-paired-bid:yes:l1:PairedEntry"),
+            intent_submit("paired-down", "DOWN", "mm-paired-bid:no:l1:PairedEntry"),
+        ];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let attribution = compute_pnl_attribution(
+            &events,
+            &fills,
+            &journal_events,
+            &accounting,
+            FillQuality::Conservative,
+        );
+
+        assert_eq!(attribution.fill_quality, "conservative");
+        assert_eq!(attribution.merge_redeem_recycling.merge_success_count, 1);
+        assert_eq!(attribution.merge_redeem_recycling.merged_pair_qty, 5.0);
+        assert!((attribution.merge_redeem_recycling.merge_realized_pnl_usd - 0.25).abs() < 1e-9);
+        assert!((attribution.costs.fees_paid_usd - 0.30).abs() < 1e-9);
+        assert!((attribution.costs.merge_fee_usd - 0.10).abs() < 1e-9);
+        assert!((attribution.costs.merge_gas_usd - 0.20).abs() < 1e-9);
+        assert!((attribution.paired_mm.total_pnl_usd - 0.25).abs() < 1e-9);
+        assert!((attribution.attributed_path_pnl_usd - accounting.total_pnl_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribution_flags_no_intent_no_pair_smoke_as_invalid_strategy_validation() {
+        let events = vec![mark_event("UP", "0.45")];
+        let fills = Vec::new();
+        let journal_events = Vec::new();
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let attribution = compute_pnl_attribution(
+            &events,
+            &fills,
+            &journal_events,
+            &accounting,
+            FillQuality::Base,
+        );
+
+        assert_eq!(
+            attribution.strategy_validation_status,
+            "invalid_non_strategy_validation"
+        );
+        assert!(attribution
+            .invalid_reasons
+            .contains(&"no_intents_submitted".to_string()));
+        assert!(attribution
+            .invalid_reasons
+            .contains(&"no_strategy_decisions_journaled".to_string()));
+        assert!(attribution
+            .invalid_reasons
+            .contains(&"no_binary_pair_detected".to_string()));
+    }
+
     fn market_meta_event(up: &str, down: &str) -> Event {
         Event {
             v: 1,
@@ -376,7 +535,96 @@ pub struct ReplayAccountingSummary {
     pub unmarked_open_positions: u64,
     #[serde(default)]
     pub settlement: ReplaySettlementSummary,
+    #[serde(default)]
+    pub attribution: ReplayPnlAttributionSummary,
     pub open_positions: Vec<ReplayPositionSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayPnlAttributionSummary {
+    pub fill_quality: String,
+    pub strategy_validation_status: String,
+    pub invalid_reasons: Vec<String>,
+    pub total_pnl_check_usd: f64,
+    pub attributed_path_pnl_usd: f64,
+    pub unattributed_pnl_usd: f64,
+    pub paired_mm: ReplayPnlAttributionBucket,
+    pub late_favorite_loading: ReplayPnlAttributionBucket,
+    pub cheap_tail_convexity: ReplayPnlAttributionBucket,
+    pub other: ReplayPnlAttributionBucket,
+    pub merge_redeem_recycling: ReplayMergeRedeemAttribution,
+    pub stranded_inventory_losses: ReplayStrandedInventoryAttribution,
+    pub costs: ReplayCostAttribution,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayPnlAttributionBucket {
+    pub decisions_count: u64,
+    pub submitted_orders: u64,
+    pub fill_count: u64,
+    pub maker_fills: u64,
+    pub taker_fills: u64,
+    pub buy_notional_usd: f64,
+    pub sell_notional_usd: f64,
+    pub gross_notional_usd: f64,
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub total_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayMergeRedeemAttribution {
+    pub merge_success_count: u64,
+    pub merged_pair_qty: f64,
+    pub merge_credit_usd: f64,
+    pub merge_realized_pnl_usd: f64,
+    pub redeemed_winning_qty: f64,
+    pub expired_losing_qty: f64,
+    pub redeem_credit_usd: f64,
+    pub redeem_resolution_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReplayStrandedInventoryAttribution {
+    pub stranded_qty_total: f64,
+    pub stranded_cost_usd: f64,
+    pub expired_losing_qty: f64,
+    pub expired_losing_cost_usd: f64,
+    pub unresolved_cost_usd: f64,
+    pub unrealized_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayCostAttribution {
+    pub fees_paid_usd: f64,
+    pub merge_fee_usd: f64,
+    pub merge_gas_usd: f64,
+    pub redeem_fee_usd: f64,
+    pub redeem_gas_usd: f64,
+    pub maker_rebate_assumption_bps: f64,
+    pub maker_rebate_estimate_usd: f64,
+    pub taker_fee_assumption_bps: f64,
+    pub taker_fee_estimate_usd: f64,
+    pub assumptions: String,
+}
+
+impl Default for ReplayCostAttribution {
+    fn default() -> Self {
+        Self {
+            fees_paid_usd: 0.0,
+            merge_fee_usd: 0.0,
+            merge_gas_usd: 0.0,
+            redeem_fee_usd: 0.0,
+            redeem_gas_usd: 0.0,
+            maker_rebate_assumption_bps: 0.0,
+            maker_rebate_estimate_usd: 0.0,
+            taker_fee_assumption_bps: 0.0,
+            taker_fee_estimate_usd: 0.0,
+            assumptions:
+                "replay includes explicit merge/redeem fees and gas from events; maker rebates and taker fees default to 0 until configured"
+                    .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -587,6 +835,15 @@ pub fn run_window<S: ReplayStrategy>(
             emit_market_event_journal_rows(event, &mut journal_events);
             accounting_events.push(event.clone());
         }
+        let mut accounting =
+            compute_accounting(&accounting_events, &accepted_fills, cfg.starting_cash_usd);
+        accounting.attribution = compute_pnl_attribution(
+            &accounting_events,
+            &accepted_fills,
+            &journal_events,
+            &accounting,
+            cfg.fill_sim.fill_quality,
+        );
         (
             accepted_fills.clone(),
             compute_queue_calibration(sim.submissions(), &accepted_fills),
@@ -599,7 +856,7 @@ pub fn run_window<S: ReplayStrategy>(
             intents_submitted,
             risk_rejections,
             journal_events,
-            compute_accounting(&accounting_events, &accepted_fills, cfg.starting_cash_usd),
+            accounting,
         )
     }));
 
@@ -781,8 +1038,437 @@ fn compute_accounting(
         },
         unmarked_open_positions,
         settlement,
+        attribution: ReplayPnlAttributionSummary::default(),
         open_positions,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AttributionPath {
+    PairedMm,
+    LateFavorite,
+    CheapTailConvexity,
+    Other,
+}
+
+impl AttributionPath {
+    fn bucket_mut<'a>(
+        self,
+        summary: &'a mut ReplayPnlAttributionSummary,
+    ) -> &'a mut ReplayPnlAttributionBucket {
+        match self {
+            Self::PairedMm => &mut summary.paired_mm,
+            Self::LateFavorite => &mut summary.late_favorite_loading,
+            Self::CheapTailConvexity => &mut summary.cheap_tail_convexity,
+            Self::Other => &mut summary.other,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttributionLot {
+    path: AttributionPath,
+    qty: f64,
+    avg_cost: f64,
+}
+
+fn compute_pnl_attribution(
+    events: &[Event],
+    fills: &[SimulatedFill],
+    journal_events: &[JournalEvent],
+    accounting: &ReplayAccountingSummary,
+    fill_quality: FillQuality,
+) -> ReplayPnlAttributionSummary {
+    let mut summary = ReplayPnlAttributionSummary {
+        fill_quality: fill_quality.as_str().to_string(),
+        total_pnl_check_usd: accounting.total_pnl_usd,
+        costs: ReplayCostAttribution {
+            fees_paid_usd: accounting.fees_paid_usd,
+            merge_fee_usd: accounting.settlement.merge_fee_usd,
+            merge_gas_usd: accounting.settlement.merge_gas_usd,
+            redeem_fee_usd: accounting.settlement.redeem_fee_usd,
+            redeem_gas_usd: accounting.settlement.redeem_gas_usd,
+            ..ReplayCostAttribution::default()
+        },
+        merge_redeem_recycling: ReplayMergeRedeemAttribution {
+            merge_success_count: accounting.settlement.merge_success_count,
+            merged_pair_qty: accounting.settlement.merged_pair_qty,
+            merge_credit_usd: accounting.settlement.merge_credit_usd,
+            redeemed_winning_qty: accounting.settlement.redeemed_winning_qty,
+            expired_losing_qty: accounting.settlement.expired_losing_qty,
+            redeem_credit_usd: accounting.settlement.redeem_credit_usd,
+            ..ReplayMergeRedeemAttribution::default()
+        },
+        stranded_inventory_losses: ReplayStrandedInventoryAttribution {
+            stranded_qty_total: accounting.settlement.stranded_qty_total,
+            stranded_cost_usd: accounting.settlement.stranded_cost_usd,
+            expired_losing_qty: accounting.settlement.expired_losing_qty,
+            ..ReplayStrandedInventoryAttribution::default()
+        },
+        ..ReplayPnlAttributionSummary::default()
+    };
+
+    let intent_paths = classify_journal_intents(journal_events, &mut summary);
+    let mut lots: BTreeMap<String, Vec<AttributionLot>> = BTreeMap::new();
+    for fill in fills {
+        let path = intent_paths
+            .get(&fill.client_order_id)
+            .copied()
+            .unwrap_or_else(|| classify_tag(&fill.client_order_id));
+        let bucket = path.bucket_mut(&mut summary);
+        bucket.fill_count += 1;
+        match fill.maker_or_taker {
+            MakerOrTaker::Maker => bucket.maker_fills += 1,
+            MakerOrTaker::Taker => bucket.taker_fills += 1,
+        }
+        let notional = fill.price * fill.size;
+        bucket.gross_notional_usd += notional;
+        match fill.side {
+            Side::Buy => {
+                bucket.buy_notional_usd += notional;
+                lots.entry(fill.asset_id.clone())
+                    .or_default()
+                    .push(AttributionLot {
+                        path,
+                        qty: fill.size,
+                        avg_cost: fill.price,
+                    });
+            }
+            Side::Sell => {
+                bucket.sell_notional_usd += notional;
+                realize_sell_against_lots(
+                    &mut lots,
+                    &fill.asset_id,
+                    fill.size,
+                    fill.price,
+                    &mut summary,
+                );
+            }
+        }
+    }
+
+    let pair_asset_ids = binary_asset_ids_from_events_or_lots(events, &lots);
+    let merge_events = replay_merge_events(events);
+    if let Some(pair) = pair_asset_ids.as_ref() {
+        let merge_pnl = attribute_successful_merges(&mut lots, pair, &merge_events, &mut summary);
+        summary.merge_redeem_recycling.merge_realized_pnl_usd = merge_pnl;
+    }
+
+    let (marks, raw_winner_asset_id) = replay_marks(events);
+    let winner_asset_id =
+        resolve_winner_asset_id(raw_winner_asset_id.as_deref(), pair_asset_ids.as_deref());
+    if let Some(winner) = winner_asset_id.as_deref() {
+        let resolution_pnl = attribute_resolution(&mut lots, winner, &mut summary);
+        summary.merge_redeem_recycling.redeem_resolution_pnl_usd = resolution_pnl;
+    }
+
+    attribute_unrealized_lots(&lots, winner_asset_id.as_deref(), &marks, &mut summary);
+    finalize_attribution_totals(&mut summary);
+    finalize_strategy_validation_status(&mut summary, accounting, journal_events);
+    summary
+}
+
+fn classify_journal_intents(
+    journal_events: &[JournalEvent],
+    summary: &mut ReplayPnlAttributionSummary,
+) -> BTreeMap<String, AttributionPath> {
+    let mut out = BTreeMap::new();
+    for event in journal_events {
+        match event {
+            JournalEvent::StrategyDecision {
+                decision_type,
+                reason_tag,
+                ..
+            } => {
+                let path = classify_tag_pair(decision_type, reason_tag);
+                path.bucket_mut(summary).decisions_count += 1;
+            }
+            JournalEvent::IntentSubmit {
+                intent_id,
+                reason_tag,
+                ..
+            } => {
+                let path = classify_tag(reason_tag);
+                path.bucket_mut(summary).submitted_orders += 1;
+                out.insert(intent_id.clone(), path);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn classify_tag_pair(a: &str, b: &str) -> AttributionPath {
+    let first = classify_tag(a);
+    if first != AttributionPath::Other {
+        return first;
+    }
+    classify_tag(b)
+}
+
+fn classify_tag(tag: &str) -> AttributionPath {
+    let tag = tag.to_ascii_lowercase();
+    if tag.contains("mm-paired-bid") || tag.contains("pairedentry") || tag.contains("paired_entry")
+    {
+        AttributionPath::PairedMm
+    } else if tag.contains("late-bar-core")
+        || tag.contains("late_favorite")
+        || tag.contains("late favorite")
+        || tag.contains("favorite_loading")
+    {
+        AttributionPath::LateFavorite
+    } else if tag.contains("convex")
+        || tag.contains("cheap-tail")
+        || tag.contains("cheap_tail")
+        || tag.contains("cheap-leg")
+    {
+        AttributionPath::CheapTailConvexity
+    } else {
+        AttributionPath::Other
+    }
+}
+
+fn realize_sell_against_lots(
+    lots: &mut BTreeMap<String, Vec<AttributionLot>>,
+    asset_id: &str,
+    mut qty: f64,
+    sell_price: f64,
+    summary: &mut ReplayPnlAttributionSummary,
+) {
+    let Some(asset_lots) = lots.get_mut(asset_id) else {
+        return;
+    };
+    for lot in asset_lots.iter_mut() {
+        if qty <= f64::EPSILON {
+            break;
+        }
+        if lot.qty <= f64::EPSILON {
+            continue;
+        }
+        let take = qty.min(lot.qty);
+        let pnl = (sell_price - lot.avg_cost) * take;
+        lot.path.bucket_mut(summary).realized_pnl_usd += pnl;
+        lot.qty -= take;
+        qty -= take;
+    }
+    asset_lots.retain(|lot| lot.qty > f64::EPSILON);
+}
+
+fn attribute_successful_merges(
+    lots: &mut BTreeMap<String, Vec<AttributionLot>>,
+    pair_asset_ids: &[String],
+    merge_events: &[ReplayMergeEvent],
+    summary: &mut ReplayPnlAttributionSummary,
+) -> f64 {
+    if pair_asset_ids.len() != 2 {
+        return 0.0;
+    }
+    let requested_qty: f64 = merge_events
+        .iter()
+        .filter(|event| event.status == ReplayMergeStatus::Success)
+        .map(|event| event.size)
+        .sum();
+    let applied_qty = requested_qty.min(pairable_qty_from_lots(lots, pair_asset_ids));
+    if applied_qty <= f64::EPSILON {
+        return 0.0;
+    }
+    let mut total_pnl = 0.0;
+    for asset_id in pair_asset_ids {
+        total_pnl += consume_lots_with_terminal_value(lots, asset_id, applied_qty, 0.5, summary);
+    }
+    total_pnl
+}
+
+fn attribute_resolution(
+    lots: &mut BTreeMap<String, Vec<AttributionLot>>,
+    winner_asset_id: &str,
+    summary: &mut ReplayPnlAttributionSummary,
+) -> f64 {
+    let mut total_pnl = 0.0;
+    let asset_ids = lots.keys().cloned().collect::<Vec<_>>();
+    for asset_id in asset_ids {
+        let terminal_value = if asset_id == winner_asset_id {
+            1.0
+        } else {
+            0.0
+        };
+        let qty = lots
+            .get(&asset_id)
+            .map(|asset_lots| asset_lots.iter().map(|lot| lot.qty.max(0.0)).sum())
+            .unwrap_or(0.0);
+        if terminal_value == 0.0 {
+            let losing_cost = lots
+                .get(&asset_id)
+                .map(|asset_lots| {
+                    asset_lots
+                        .iter()
+                        .map(|lot| lot.qty.max(0.0) * lot.avg_cost)
+                        .sum::<f64>()
+                })
+                .unwrap_or(0.0);
+            summary.stranded_inventory_losses.expired_losing_cost_usd += losing_cost;
+        }
+        total_pnl +=
+            consume_lots_with_terminal_value(lots, &asset_id, qty, terminal_value, summary);
+    }
+    total_pnl
+}
+
+fn consume_lots_with_terminal_value(
+    lots: &mut BTreeMap<String, Vec<AttributionLot>>,
+    asset_id: &str,
+    mut qty: f64,
+    terminal_value: f64,
+    summary: &mut ReplayPnlAttributionSummary,
+) -> f64 {
+    let Some(asset_lots) = lots.get_mut(asset_id) else {
+        return 0.0;
+    };
+    let mut total_pnl = 0.0;
+    for lot in asset_lots.iter_mut() {
+        if qty <= f64::EPSILON {
+            break;
+        }
+        if lot.qty <= f64::EPSILON {
+            continue;
+        }
+        let take = qty.min(lot.qty);
+        let pnl = (terminal_value - lot.avg_cost) * take;
+        lot.path.bucket_mut(summary).realized_pnl_usd += pnl;
+        total_pnl += pnl;
+        lot.qty -= take;
+        qty -= take;
+    }
+    asset_lots.retain(|lot| lot.qty > f64::EPSILON);
+    total_pnl
+}
+
+fn attribute_unrealized_lots(
+    lots: &BTreeMap<String, Vec<AttributionLot>>,
+    winner_asset_id: Option<&str>,
+    marks: &BTreeMap<String, f64>,
+    summary: &mut ReplayPnlAttributionSummary,
+) {
+    for (asset_id, asset_lots) in lots {
+        let mark = if let Some(winner) = winner_asset_id {
+            Some(if winner == asset_id { 1.0 } else { 0.0 })
+        } else {
+            marks.get(asset_id).copied()
+        };
+        for lot in asset_lots {
+            if lot.qty <= f64::EPSILON {
+                continue;
+            }
+            let cost = lot.qty * lot.avg_cost;
+            let value = mark.map(|price| price * lot.qty).unwrap_or(0.0);
+            let pnl = value - cost;
+            lot.path.bucket_mut(summary).unrealized_pnl_usd += pnl;
+            if mark.is_none() {
+                summary.stranded_inventory_losses.unresolved_cost_usd += cost;
+            }
+            summary.stranded_inventory_losses.unrealized_pnl_usd += pnl;
+        }
+    }
+}
+
+fn finalize_attribution_totals(summary: &mut ReplayPnlAttributionSummary) {
+    for bucket in [
+        &mut summary.paired_mm,
+        &mut summary.late_favorite_loading,
+        &mut summary.cheap_tail_convexity,
+        &mut summary.other,
+    ] {
+        bucket.total_pnl_usd = bucket.realized_pnl_usd + bucket.unrealized_pnl_usd;
+    }
+    summary.attributed_path_pnl_usd = summary.paired_mm.total_pnl_usd
+        + summary.late_favorite_loading.total_pnl_usd
+        + summary.cheap_tail_convexity.total_pnl_usd
+        + summary.other.total_pnl_usd
+        - summary.costs.fees_paid_usd;
+    summary.unattributed_pnl_usd = summary.total_pnl_check_usd - summary.attributed_path_pnl_usd;
+}
+
+fn finalize_strategy_validation_status(
+    summary: &mut ReplayPnlAttributionSummary,
+    accounting: &ReplayAccountingSummary,
+    journal_events: &[JournalEvent],
+) {
+    let submitted_orders = summary.paired_mm.submitted_orders
+        + summary.late_favorite_loading.submitted_orders
+        + summary.cheap_tail_convexity.submitted_orders
+        + summary.other.submitted_orders;
+    let decision_events = journal_events
+        .iter()
+        .filter(|event| matches!(event, JournalEvent::StrategyDecision { .. }))
+        .count() as u64;
+    let fill_count = summary.paired_mm.fill_count
+        + summary.late_favorite_loading.fill_count
+        + summary.cheap_tail_convexity.fill_count
+        + summary.other.fill_count;
+    let mut reasons = Vec::new();
+    if submitted_orders == 0 {
+        reasons.push("no_intents_submitted".to_string());
+    }
+    if decision_events == 0 {
+        reasons.push("no_strategy_decisions_journaled".to_string());
+    }
+    if fill_count == 0 {
+        reasons.push("no_accepted_fills".to_string());
+    }
+    if accounting.settlement.status == "no_binary_pair_detected" {
+        reasons.push("no_binary_pair_detected".to_string());
+    }
+    summary.strategy_validation_status = if reasons.is_empty() {
+        "valid_strategy_replay".to_string()
+    } else {
+        "invalid_non_strategy_validation".to_string()
+    };
+    summary.invalid_reasons = reasons;
+}
+
+fn pairable_qty_from_lots(
+    lots: &BTreeMap<String, Vec<AttributionLot>>,
+    pair_asset_ids: &[String],
+) -> f64 {
+    if pair_asset_ids.len() != 2 {
+        return 0.0;
+    }
+    pair_asset_ids
+        .iter()
+        .map(|asset_id| {
+            lots.get(asset_id)
+                .map(|asset_lots| asset_lots.iter().map(|lot| lot.qty.max(0.0)).sum::<f64>())
+                .unwrap_or(0.0)
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn binary_asset_ids_from_events_or_lots(
+    events: &[Event],
+    lots: &BTreeMap<String, Vec<AttributionLot>>,
+) -> Option<Vec<String>> {
+    for event in events {
+        let Some(values) = event.raw.get("asset_ids").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let ids: Vec<String> = values
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if ids.len() == 2 {
+            return Some(ids);
+        }
+    }
+    let ids = lots
+        .iter()
+        .filter_map(|(asset_id, asset_lots)| {
+            let qty: f64 = asset_lots.iter().map(|lot| lot.qty.max(0.0)).sum();
+            (qty > f64::EPSILON).then_some(asset_id.clone())
+        })
+        .collect::<Vec<_>>();
+    (ids.len() == 2).then_some(ids)
 }
 
 #[derive(Debug, Clone, Default)]
