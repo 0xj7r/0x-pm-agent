@@ -163,7 +163,8 @@ fn leg_score(
         order_book_pressure.direction,
         order_book_pressure.imbalance.abs().clamp(0.0, 1.0),
     );
-    let terminal_timing_component = terminal_timing_component(leg, fair_value, remaining_ms, window_ms);
+    let terminal_timing_component =
+        terminal_timing_component(leg, fair_value, remaining_ms, window_ms);
     let reversal_component = reversal.support_for_leg(leg);
     let book_sanity_penalty = book_sanity.penalty_for_leg(leg).clamp(0.0, 1.0);
     let weight_sum = config.fair_value_weight.max(0.0)
@@ -214,11 +215,7 @@ fn fair_value_component(
     ((prob - reference) / 0.25).clamp(-1.0, 1.0)
 }
 
-fn directional_component(
-    leg: LadderLeg,
-    direction: SignalDirection,
-    strength: f64,
-) -> f64 {
+fn directional_component(leg: LadderLeg, direction: SignalDirection, strength: f64) -> f64 {
     let strength = strength.clamp(0.0, 1.0);
     match (leg, direction) {
         (LadderLeg::Yes, SignalDirection::Up) | (LadderLeg::No, SignalDirection::Down) => strength,
@@ -240,7 +237,7 @@ fn terminal_timing_component(
     if !prob.is_finite() || window_ms == 0 {
         return 0.0;
     }
-    let late_frac = (1.0 - (remaining_ms as f64 / window_ms as f64).clamp(0.0, 1.0))
-        .clamp(0.0, 1.0);
+    let late_frac =
+        (1.0 - (remaining_ms as f64 / window_ms as f64).clamp(0.0, 1.0)).clamp(0.0, 1.0);
     ((prob - 0.5) * 2.0 * late_frac).clamp(-1.0, 1.0)
 }

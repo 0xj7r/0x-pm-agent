@@ -21,6 +21,7 @@ pub mod journal;
 pub mod latency;
 pub mod manifest;
 pub mod queue_fill_sim;
+pub mod raw_parquet;
 pub mod reader;
 pub mod risk_trace;
 pub mod runner;

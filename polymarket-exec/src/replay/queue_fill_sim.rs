@@ -273,7 +273,7 @@ fn venue_priority(
     };
     price_order
         .then_with(|| left.2.cmp(&right.2))
-        .then_with(|| left.0.0.cmp(&right.0.0))
+        .then_with(|| left.0 .0.cmp(&right.0 .0))
 }
 
 #[cfg(test)]
@@ -400,7 +400,11 @@ mod tests {
         sim.on_cancel(OrderId(1));
         // Even after enough trade flow to clear the queue and fill, no events.
         let fills = sim.on_trade("m1", "a1", Side::Sell, 0.55, 100.0);
-        assert!(fills.is_empty(), "canceled order should not fill: {:?}", fills);
+        assert!(
+            fills.is_empty(),
+            "canceled order should not fill: {:?}",
+            fills
+        );
     }
 
     #[test]
@@ -469,16 +473,16 @@ mod tests {
         }
         match &fills[1] {
             FillEvent::PartialFill {
-                id,
-                qty,
-                remaining,
-                ..
+                id, qty, remaining, ..
             } => {
                 assert_eq!(*id, OrderId(1));
                 assert!((qty - 3.0).abs() < 1e-9);
                 assert!((remaining - 2.0).abs() < 1e-9);
             }
-            other => panic!("expected lower bid partial after better bid, got {:?}", other),
+            other => panic!(
+                "expected lower bid partial after better bid, got {:?}",
+                other
+            ),
         }
     }
 

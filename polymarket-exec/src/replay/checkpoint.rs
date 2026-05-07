@@ -158,15 +158,12 @@ impl CheckpointWriter {
     pub fn write(&self, ckpt: &ReplayCheckpoint) -> Result<PathBuf, CheckpointError> {
         fs::create_dir_all(&self.out_dir)?;
 
-        let payload = bincode::serialize(ckpt)
-            .map_err(|e| CheckpointError::Serialize(e.to_string()))?;
+        let payload =
+            bincode::serialize(ckpt).map_err(|e| CheckpointError::Serialize(e.to_string()))?;
 
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
 
-        let filename = format!(
-            "ckpt-{:020}-{:010}.bin",
-            ckpt.at_event_ts_ns, sequence,
-        );
+        let filename = format!("ckpt-{:020}-{:010}.bin", ckpt.at_event_ts_ns, sequence,);
         let path = self.out_dir.join(filename);
 
         let tmp = path.with_extension("bin.tmp");
@@ -450,7 +447,8 @@ mod tests {
         let path = dir.path().join("ckpt-00000000000000000001-0000000000.bin");
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(b"XXXX").unwrap();
-        f.write_all(&CHECKPOINT_SCHEMA_VERSION.to_le_bytes()).unwrap();
+        f.write_all(&CHECKPOINT_SCHEMA_VERSION.to_le_bytes())
+            .unwrap();
         f.write_all(&0u64.to_le_bytes()).unwrap();
         drop(f);
         match CheckpointReader::load(&path).unwrap_err() {

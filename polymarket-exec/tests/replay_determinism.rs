@@ -171,8 +171,9 @@ fn run_once() -> Vec<JournalEvent> {
     let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
     windows.insert("btc_5m/det".into(), build_fixture());
 
-    let summaries = run_run(windows, &cfg, |_window_id| {
+    let summaries = run_run(windows, &cfg, |_window_id, starting_cash_usd| {
         ReplayStrategyAdapter::from_profile(profile.clone())
+            .with_starting_cash_usd(starting_cash_usd)
     })
     .expect("run_run should not abort");
 
