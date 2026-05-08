@@ -159,10 +159,26 @@ pub fn dedupe_and_sort(events: Vec<Event>) -> Vec<Event> {
     out
 }
 
+/// Parse a Hive-style partition value like `event_type=trade` from a path.
+/// Returns the value if any path component starts with `key=`, else `None`.
+fn partition_value(path: &Path, key: &str) -> Option<String> {
+    let needle = format!("{key}=");
+    for component in path.components() {
+        let s = component.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(&needle) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// Read a single Parquet file into `Vec<Event>`.
 /// Expects the canonical v=1 schema columns; missing optional columns are
 /// taken as null. The `raw` JSON column is read as either a UTF-8 string or a
-/// binary blob — whatever Glue produced.
+/// binary blob — whatever Glue produced. Hive-partitioned outputs (the
+/// `processed/v=1/dt=*/market_type=*/event_type=*/...` layout) typically omit
+/// `event_type` and `market_type` from the row data; in that case we fall
+/// back to parsing them out of the file path.
 pub fn read_parquet_file(path: &Path) -> Result<Vec<Event>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open parquet file {}", path.display()))?;
@@ -171,22 +187,38 @@ pub fn read_parquet_file(path: &Path) -> Result<Vec<Event>> {
     let reader = builder
         .build()
         .with_context(|| format!("failed to build parquet record reader {}", path.display()))?;
+    let event_type_partition = partition_value(path, "event_type");
+    let market_type_partition = partition_value(path, "market_type");
     let mut events = Vec::new();
     for batch in reader {
         let batch = batch.with_context(|| format!("parquet batch read {}", path.display()))?;
-        events.extend(record_batch_to_events(&batch)?);
+        events.extend(record_batch_to_events(
+            &batch,
+            event_type_partition.as_deref(),
+            market_type_partition.as_deref(),
+        )?);
     }
     Ok(events)
 }
 
-fn record_batch_to_events(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<Event>> {
+fn record_batch_to_events(
+    batch: &arrow::record_batch::RecordBatch,
+    event_type_partition: Option<&str>,
+    market_type_partition: Option<&str>,
+) -> Result<Vec<Event>> {
     let schema = batch.schema();
     let col = |name: &str| schema.index_of(name).ok();
     let v_col = col("v");
     let ts_ns_col = col("ts_ns");
     let received_ns_col = col("received_ns");
-    let event_type_col = col("event_type").context("event_type column missing")?;
-    let market_type_col = col("market_type").context("market_type column missing")?;
+    let event_type_col = col("event_type");
+    if event_type_col.is_none() && event_type_partition.is_none() {
+        return Err(anyhow::anyhow!("event_type column missing"));
+    }
+    let market_type_col = col("market_type");
+    if market_type_col.is_none() && market_type_partition.is_none() {
+        return Err(anyhow::anyhow!("market_type column missing"));
+    }
     let market_slug_col = col("market_slug");
     let asset_id_col = col("asset_id");
     let side_col = col("side");
@@ -215,11 +247,15 @@ fn record_batch_to_events(batch: &arrow::record_batch::RecordBatch) -> Result<Ve
             .and_then(|i| batch.column(i).as_any().downcast_ref::<Int64Array>())
             .map(|a| a.value(row))
             .context("received_ns column required")?;
-        let event_type_str =
-            string_at(batch, event_type_col, row).context("event_type value required")?;
+        let event_type_str = event_type_col
+            .and_then(|i| string_at(batch, i, row))
+            .or_else(|| event_type_partition.map(|s| s.to_string()))
+            .context("event_type value required")?;
         let event_type = parse_event_type(&event_type_str)?;
-        let market_type =
-            string_at(batch, market_type_col, row).context("market_type value required")?;
+        let market_type = market_type_col
+            .and_then(|i| string_at(batch, i, row))
+            .or_else(|| market_type_partition.map(|s| s.to_string()))
+            .context("market_type value required")?;
         let market_slug = market_slug_col.and_then(|i| string_at(batch, i, row));
         let asset_id = asset_id_col.and_then(|i| string_at(batch, i, row));
         let side = side_col.and_then(|i| string_at(batch, i, row));
