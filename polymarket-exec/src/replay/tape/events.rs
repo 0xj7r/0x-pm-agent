@@ -22,10 +22,14 @@ pub struct TapeReplayOptions {
 pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
     ensure!(!options.markets.is_empty(), "missing tape replay markets");
     let mut events = Vec::new();
-    events.extend(market_meta_events(options)?);
-    for market in &options.markets {
+    for (idx, market) in options.markets.iter().enumerate() {
         let market_prefix = tape_market_prefix(options, market);
-        events.extend(read_market_tape_events(options, market, &market_prefix)?);
+        events.extend(read_market_tape_events(
+            options,
+            market,
+            idx,
+            &market_prefix,
+        )?);
     }
 
     Ok(dedupe_and_sort(events))
@@ -34,6 +38,7 @@ pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
 fn read_market_tape_events(
     options: &TapeReplayOptions,
     market: &RawReplayMarket,
+    market_index: usize,
     market_prefix: &PathBuf,
 ) -> Result<Vec<Event>> {
     let book_path = market_prefix.join("book.bin");
@@ -47,9 +52,14 @@ fn read_market_tape_events(
     let btc = MappedTape::<BtcTickV1>::open(&btc_path)
         .with_context(|| format!("opening BTC tape {}", btc_path.display()))?;
 
-    let mut events = Vec::with_capacity(
-        book.records().len() + trades.records().len() + btc.records().len() + 1,
-    );
+    let mut events =
+        Vec::with_capacity(book.records().len() + trades.records().len() + btc.records().len() + 1);
+    events.push(market_meta_event(
+        options,
+        market,
+        market_index,
+        btc.records(),
+    ));
 
     for (idx, event) in book.records().iter().enumerate() {
         if !in_window(event.ts_ns, options) {
@@ -82,41 +92,66 @@ fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> 
     }
 }
 
-fn market_meta_events(options: &TapeReplayOptions) -> Result<Vec<Event>> {
-    let mut events = Vec::with_capacity(options.markets.len());
-    for (idx, market) in options.markets.iter().enumerate() {
-        let start_ms = market_start_ms(&market.slug).unwrap_or(options.window_start_ns / 1_000_000);
-        let end_ms = market_end_ms(&market.slug).unwrap_or(options.window_end_ns / 1_000_000);
-        let mut raw = json!({
-            "slug": market.slug,
-            "market_type": market_type_from_slug(&market.slug),
-            "asset_ids": market.asset_ids,
-            "outcomes": ["Up", "Down"],
-            "start_time_ms": start_ms,
-            "end_time_ms": end_ms,
-            "source": "packed_tape_replay_market_meta"
-        });
-        if let Some(strike) = market.strike.as_ref() {
-            raw["strike"] = json!(strike.parse::<f64>().unwrap_or(0.0));
-            raw["strike_source"] = json!("market_metadata");
-        }
-        events.push(Event {
-            v: 1,
-            ts_ns: options.window_start_ns,
-            received_ns: options.window_start_ns,
-            event_type: EventType::MarketMeta,
-            market_type: market_type_from_slug(&market.slug),
-            market_slug: Some(market.slug.clone()),
-            asset_id: None,
-            side: None,
-            price: None,
-            size: None,
-            sequence: Some(-10_000 + idx as i64),
-            source: Source::PolymarketDataApi,
-            raw,
-        });
+fn market_meta_event(
+    options: &TapeReplayOptions,
+    market: &RawReplayMarket,
+    market_index: usize,
+    btc_ticks: &[BtcTickV1],
+) -> Event {
+    let start_ms = market_start_ms(&market.slug).unwrap_or(options.window_start_ns / 1_000_000);
+    let end_ms = market_end_ms(&market.slug).unwrap_or(options.window_end_ns / 1_000_000);
+    let start_ns = start_ms.saturating_mul(1_000_000);
+    let mut raw = json!({
+        "slug": market.slug,
+        "market_type": market_type_from_slug(&market.slug),
+        "asset_ids": market.asset_ids,
+        "outcomes": ["Up", "Down"],
+        "start_time_ms": start_ms,
+        "end_time_ms": end_ms,
+        "source": "packed_tape_replay_market_meta"
+    });
+    if let Some((strike, source)) = market_strike(market, start_ns, btc_ticks) {
+        raw["strike"] = json!(strike);
+        raw["strike_source"] = json!(source);
     }
-    Ok(events)
+    Event {
+        v: 1,
+        ts_ns: start_ns,
+        received_ns: start_ns,
+        event_type: EventType::MarketMeta,
+        market_type: market_type_from_slug(&market.slug),
+        market_slug: Some(market.slug.clone()),
+        asset_id: None,
+        side: None,
+        price: None,
+        size: None,
+        sequence: Some(-10_000 + market_index as i64),
+        source: Source::PolymarketDataApi,
+        raw,
+    }
+}
+
+fn market_strike(
+    market: &RawReplayMarket,
+    market_start_ns: i64,
+    btc_ticks: &[BtcTickV1],
+) -> Option<(f64, &'static str)> {
+    if let Some(strike) = market
+        .strike
+        .as_deref()
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        return Some((strike, "open_price_asset_map"));
+    }
+
+    let start_ns = u64::try_from(market_start_ns).ok()?;
+    let index = btc_ticks.partition_point(|tick| tick.ts_ns < start_ns);
+    let tick = btc_ticks.get(index).or_else(|| btc_ticks.last())?;
+    Some((
+        tick.price_cents as f64 / 100.0,
+        "binance_first_tick_at_or_after_market_start",
+    ))
 }
 
 fn book_event(event: &BookEventV1, market: &RawReplayMarket, sequence: i64) -> Event {
@@ -276,6 +311,74 @@ mod tests {
             8,
         );
         assert_eq!(sell.side.as_deref(), Some("sell"));
+    }
+
+    #[test]
+    fn tape_market_meta_prefers_explicit_open_price() {
+        let options = TapeReplayOptions {
+            input_prefix: PathBuf::from("/tmp/unused"),
+            window_start_ns: 1_771_119_900_000_000_000,
+            window_end_ns: 1_771_120_200_000_000_000,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![market()],
+        };
+        let event = market_meta_event(&options, &market(), 0, &[]);
+
+        assert_eq!(event.received_ns, 1_771_119_900_000_000_000);
+        assert_eq!(
+            event.raw.get("strike").and_then(|value| value.as_f64()),
+            Some(70_000.0)
+        );
+        assert_eq!(
+            event
+                .raw
+                .get("strike_source")
+                .and_then(|value| value.as_str()),
+            Some("open_price_asset_map")
+        );
+    }
+
+    #[test]
+    fn tape_market_meta_derives_open_price_from_owning_btc_tape_when_missing() {
+        let options = TapeReplayOptions {
+            input_prefix: PathBuf::from("/tmp/unused"),
+            window_start_ns: 1_771_119_900_000_000_000,
+            window_end_ns: 1_771_120_200_000_000_000,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![RawReplayMarket {
+                slug: "btc-updown-5m-1771119900".to_string(),
+                asset_ids: ["UP".to_string(), "DOWN".to_string()],
+                strike: None,
+            }],
+        };
+        let btc_ticks = [
+            BtcTickV1 {
+                ts_ns: 1_771_119_899_999_000_000,
+                price_cents: 6_999_999,
+                qty_lots: 1,
+                _pad: [0; 4],
+            },
+            BtcTickV1 {
+                ts_ns: 1_771_119_900_001_000_000,
+                price_cents: 7_012_345,
+                qty_lots: 1,
+                _pad: [0; 4],
+            },
+        ];
+
+        let event = market_meta_event(&options, &options.markets[0], 0, &btc_ticks);
+
+        assert_eq!(
+            event.raw.get("strike").and_then(|value| value.as_f64()),
+            Some(70_123.45)
+        );
+        assert_eq!(
+            event
+                .raw
+                .get("strike_source")
+                .and_then(|value| value.as_str()),
+            Some("binance_first_tick_at_or_after_market_start")
+        );
     }
 
     #[test]
