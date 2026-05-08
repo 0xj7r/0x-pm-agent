@@ -60,7 +60,8 @@ use polymarket_exec::replay::manifest::{
 use polymarket_exec::replay::raw_parquet::{read_raw_replay, RawReplayMarket, RawReplayOptions};
 use polymarket_exec::replay::reader::read_local_filtered;
 use polymarket_exec::replay::runner::{
-    run_run_with_journal_mode, ReplayJournalMode, RunnerConfig, WindowStatus, WindowSummary,
+    fold_cash_carry, run_run_parallel_with_journal_mode, run_run_with_journal_mode,
+    ReplayJournalMode, RunnerConfig, WindowStatus, WindowSummary,
 };
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
 use polymarket_exec::replay::tape::events::{read_tape_replay_windows, TapeReplayOptions};
@@ -132,10 +133,13 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     force_run_id: bool,
 
-    /// Per-window parallelism. Phase 3a runs windows sequentially (the
-    /// flag is accepted for forward-compatibility).
+    /// Per-window parallelism. >1 runs windows in parallel.
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
+
+    /// Run each window independently without post-hoc cross-window cash carry.
+    #[arg(long, default_value_t = false)]
+    independent_windows: bool,
 
     /// Named latency preset.
     #[arg(long, default_value = "nominal")]
@@ -209,6 +213,7 @@ struct RunSummary {
 #[derive(Debug, Serialize, Deserialize)]
 struct CompactWindowSummary {
     window_id: String,
+    input_hash: String,
     events_replayed: u64,
     intents_submitted: u64,
     fill_count: usize,
@@ -222,6 +227,7 @@ impl From<&WindowSummary> for CompactWindowSummary {
     fn from(summary: &WindowSummary) -> Self {
         Self {
             window_id: summary.window_id.clone(),
+            input_hash: summary.input_hash.clone(),
             events_replayed: summary.events_replayed,
             intents_submitted: summary.intents_submitted,
             fill_count: summary.fills.len(),
@@ -555,7 +561,12 @@ fn run_main(cli: Cli) -> Result<i32> {
                 market_filter: cli.market_filter.clone(),
                 markets,
             })
-            .with_context(|| format!("reading packed tape input from {}", cli.input_prefix.display()))?
+            .with_context(|| {
+                format!(
+                    "reading packed tape input from {}",
+                    cli.input_prefix.display()
+                )
+            })?
         }
         other => anyhow::bail!("unknown --input-format: {other}"),
     };
@@ -644,19 +655,48 @@ fn run_main(cli: Cli) -> Result<i32> {
     // Load profile and instantiate the strategy adapter for each window.
     let profile = StrategyProfile::load(&cli.strategy_profile)
         .with_context(|| format!("load strategy profile {}", cli.strategy_profile.display()))?;
-    let mut summaries = match run_run_with_journal_mode(
-        windows,
-        &runner_cfg,
-        cli.journal_mode.into(),
-        |_, starting_cash_usd| {
-            ReplayStrategyAdapter::from_profile(profile.clone())
-                .with_starting_cash_usd(starting_cash_usd)
-        },
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("run aborted: {e}");
-            return Ok(4);
+    let mut summaries = if cli.concurrency <= 1 {
+        match run_run_with_journal_mode(
+            windows,
+            &runner_cfg,
+            cli.journal_mode.into(),
+            |_, starting_cash_usd| {
+                ReplayStrategyAdapter::from_profile(profile.clone())
+                    .with_starting_cash_usd(starting_cash_usd)
+            },
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("run aborted: {e}");
+                return Ok(4);
+            }
+        }
+    } else {
+        if !cli.independent_windows {
+            eprintln!(
+                "parallel mode is running with post-hoc carry-forward accounting; strategy internals still use a synthetic per-window starting cash baseline. For strict live-style dependency analysis, run with --independent-windows."
+            );
+        }
+        match run_run_parallel_with_journal_mode(
+            windows,
+            &runner_cfg,
+            cli.journal_mode.into(),
+            cli.concurrency,
+            |_, starting_cash_usd| {
+                ReplayStrategyAdapter::from_profile(profile.clone())
+                    .with_starting_cash_usd(starting_cash_usd)
+            },
+        ) {
+            Ok(mut s) => {
+                if !cli.independent_windows {
+                    fold_cash_carry(&mut s, cli.starting_cash_usd);
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("run aborted: {e}");
+                return Ok(4);
+            }
         }
     };
 
@@ -673,8 +713,11 @@ fn run_main(cli: Cli) -> Result<i32> {
         }
         let safe_id = s.window_id.replace('/', "_");
         let path = windows_root.join(format!("{safe_id}.json"));
-        fs::write(&path, serde_json::to_string_pretty(&CompactWindowSummary::from(&*s))?)
-            .with_context(|| format!("write window summary {}", path.display()))?;
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&CompactWindowSummary::from(&*s))?,
+        )
+        .with_context(|| format!("write window summary {}", path.display()))?;
         // Drain the journal events into the run-level vector so each
         // window's contribution lands in `journal.parquet` exactly once.
         // The summary's `journal_events` is `skip_serializing` so the

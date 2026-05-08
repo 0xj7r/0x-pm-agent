@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::panic::{self, AssertUnwindSafe};
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::collector::schema::{Event, EventType};
 use crate::replay::fill_sim::{
@@ -40,6 +42,10 @@ pub struct WindowSummary {
     pub window_id: String,
     pub events_replayed: u64,
     pub intents_submitted: u64,
+    /// Stable per-window fingerprint of the replay input that generated this
+    /// summary.
+    #[serde(default)]
+    pub input_hash: String,
     /// Compact simulator-derived queue/fill calibration summary. Full
     /// per-order traces are intentionally not embedded here because a single
     /// window can emit hundreds of thousands of quote replacements.
@@ -74,6 +80,53 @@ pub struct WindowSummary {
     #[serde(default, skip_serializing)]
     pub journal_events: Vec<JournalEvent>,
     pub status: WindowStatus,
+}
+
+#[derive(Debug, Clone)]
+struct WindowPlan {
+    window_id: String,
+    events: Vec<Event>,
+    index: usize,
+}
+
+/// Deterministic per-window input fingerprint used for replay reproducibility
+/// checks.
+pub fn compute_window_input_hash(window_id: &str, events: &[Event]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(window_id.as_bytes());
+    for event in events {
+        if let Ok(event_bytes) = serde_json::to_vec(event) {
+            hasher.update(&event_bytes);
+            hasher.update(b"\n");
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+/// Fold independent window summaries into sequential carry-forward cash/equity.
+///
+/// Input order is market-window order. This preserves total PnL while lifting
+/// each summary into the carry-forward cash baseline.
+pub fn fold_cash_carry(windows: &mut [WindowSummary], starting_cash_usd: f64) -> f64 {
+    let mut carried_cash_usd = starting_cash_usd;
+    for summary in windows.iter_mut() {
+        let delta_cash = summary.accounting.ending_cash_usd - summary.accounting.starting_cash_usd;
+        let cash_shift = carried_cash_usd - summary.accounting.starting_cash_usd;
+
+        summary.accounting.starting_cash_usd = carried_cash_usd;
+        summary.accounting.ending_cash_usd = carried_cash_usd + delta_cash;
+        summary.accounting.ending_equity_usd += cash_shift;
+
+        if summary.status == WindowStatus::Ok {
+            carried_cash_usd = summary.accounting.ending_cash_usd;
+        }
+    }
+
+    carried_cash_usd
 }
 
 #[cfg(test)]
@@ -820,6 +873,7 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
     cfg: &RunnerConfig,
     journal_mode: ReplayJournalMode,
 ) -> WindowSummary {
+    let input_hash = compute_window_input_hash(&cfg.window_id, events);
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut sim = FillSimulator::new(cfg.fill_sim.clone());
         let mut synthesizer = EventSynthesizer::new();
@@ -932,6 +986,7 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
             accounting,
         )) => WindowSummary {
             window_id: cfg.window_id.clone(),
+            input_hash: input_hash.clone(),
             events_replayed: events.len() as u64,
             intents_submitted,
             queue_calibration,
@@ -945,6 +1000,7 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
         },
         Err(_panic) => WindowSummary {
             window_id: cfg.window_id.clone(),
+            input_hash: input_hash.clone(),
             events_replayed: events.len() as u64,
             intents_submitted: 0,
             queue_calibration: ReplayQueueCalibrationSummary::default(),
@@ -2468,6 +2524,62 @@ where
     Ok(out)
 }
 
+/// Run windows in parallel, one strategy per window.
+///
+/// This is an intentionally independent-mode runner: each window starts from the
+/// same `cfg.starting_cash_usd`. Fold with `fold_cash_carry` to enforce
+/// carry-forward semantics if desired.
+pub fn run_run_parallel_with_journal_mode<S, F>(
+    windows: BTreeMap<String, Vec<Event>>,
+    cfg: &RunnerConfig,
+    journal_mode: ReplayJournalMode,
+    max_threads: usize,
+    strategy_factory: F,
+) -> Result<Vec<WindowSummary>>
+where
+    S: ReplayStrategy + Send,
+    F: Fn(&str, f64) -> S + Send + Sync,
+{
+    let mut plans = Vec::with_capacity(windows.len());
+    for (index, (window_id, events)) in windows.into_iter().enumerate() {
+        plans.push(WindowPlan {
+            window_id,
+            events,
+            index,
+        });
+    }
+
+    let cfg = cfg.clone();
+    let thread_count = max_threads.max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build thread pool: {err}"))?;
+
+    let mut out = pool.install(|| {
+        plans
+            .into_par_iter()
+            .map(|plan| {
+                let mut win_cfg = cfg.clone();
+                win_cfg.window_id = plan.window_id.clone();
+                win_cfg.starting_cash_usd = cfg.starting_cash_usd;
+                let mut strategy = strategy_factory(&plan.window_id, cfg.starting_cash_usd);
+                let summary = run_window_with_journal_mode(
+                    &mut strategy,
+                    &plan.events,
+                    &win_cfg,
+                    journal_mode,
+                );
+                (plan.index, summary)
+            })
+            .collect::<Vec<(usize, WindowSummary)>>()
+    });
+
+    out.sort_by_key(|(index, _)| *index);
+    let summaries = out.into_iter().map(|(_, s)| s).collect();
+    Ok(summaries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2996,6 +3108,129 @@ mod tests {
         assert_eq!(summaries[0].accounting.ending_cash_usd, 994.5);
         assert_eq!(summaries[1].accounting.starting_cash_usd, 994.5);
         assert_eq!(summaries[1].accounting.ending_cash_usd, 994.5);
+    }
+
+    #[test]
+    fn fold_cash_carry_rebases_window_starting_cash_and_equity() {
+        let mut windows = vec![
+            WindowSummary {
+                window_id: "w1".into(),
+                input_hash: "h1".into(),
+                events_replayed: 0,
+                intents_submitted: 0,
+                queue_calibration: ReplayQueueCalibrationSummary::default(),
+                submitted_order_samples: Vec::new(),
+                fills: Vec::new(),
+                accounting: ReplayAccountingSummary {
+                    starting_cash_usd: 1_000.0,
+                    ending_cash_usd: 900.0,
+                    ending_equity_usd: 900.0,
+                    ..ReplayAccountingSummary::default()
+                },
+                post_only_rejections: Vec::new(),
+                risk_rejections: Vec::new(),
+                journal_events: Vec::new(),
+                status: WindowStatus::Ok,
+            },
+            WindowSummary {
+                window_id: "w2".into(),
+                input_hash: "h2".into(),
+                events_replayed: 0,
+                intents_submitted: 0,
+                queue_calibration: ReplayQueueCalibrationSummary::default(),
+                submitted_order_samples: Vec::new(),
+                fills: Vec::new(),
+                accounting: ReplayAccountingSummary {
+                    starting_cash_usd: 1_000.0,
+                    ending_cash_usd: 1_025.0,
+                    ending_equity_usd: 1_025.0,
+                    ..ReplayAccountingSummary::default()
+                },
+                post_only_rejections: Vec::new(),
+                risk_rejections: Vec::new(),
+                journal_events: Vec::new(),
+                status: WindowStatus::Ok,
+            },
+        ];
+        let ending_cash = fold_cash_carry(&mut windows, 1_000.0);
+        assert_eq!(windows[0].accounting.starting_cash_usd, 1_000.0);
+        assert_eq!(windows[0].accounting.ending_cash_usd, 900.0);
+        assert_eq!(windows[1].accounting.starting_cash_usd, 900.0);
+        assert_eq!(windows[1].accounting.ending_cash_usd, 925.0);
+        assert_eq!(ending_cash, 925.0);
+    }
+
+    #[test]
+    fn run_run_parallel_window_order_is_stable_and_cash_seed_is_window_agnostic() {
+        let mut windows = BTreeMap::new();
+        windows.insert(
+            "b-window".to_string(),
+            vec![
+                evt(
+                    2_000_000_000,
+                    EventType::BookSnapshot,
+                    "asset-a",
+                    "buy",
+                    "0.55",
+                    "1",
+                ),
+                evt(
+                    2_500_000_000,
+                    EventType::Trade,
+                    "asset-a",
+                    "buy",
+                    "0.55",
+                    "1",
+                ),
+            ],
+        );
+        windows.insert(
+            "a-window".to_string(),
+            vec![
+                evt(
+                    1_000_000_000,
+                    EventType::MarketMeta,
+                    "asset-b",
+                    "sell",
+                    "0.55",
+                    "1",
+                ),
+                evt(
+                    1_500_000_000,
+                    EventType::Trade,
+                    "asset-b",
+                    "sell",
+                    "0.55",
+                    "1",
+                ),
+            ],
+        );
+        let cfg = RunnerConfig {
+            window_id: String::new(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+
+        let summaries = run_run_parallel_with_journal_mode(
+            windows,
+            &cfg,
+            ReplayJournalMode::None,
+            2,
+            |_window_id, starting_cash| {
+                assert_eq!(starting_cash, 1_000.0);
+                PassiveBidStrategy { placed: false }
+            },
+        )
+        .expect("parallel run succeeds");
+
+        assert_eq!(summaries[0].window_id, "a-window");
+        assert_eq!(summaries[1].window_id, "b-window");
+        assert_eq!(summaries[0].input_hash.len(), 64);
+        assert_eq!(summaries[1].input_hash.len(), 64);
     }
 
     #[test]
