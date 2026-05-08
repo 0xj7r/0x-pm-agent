@@ -95,10 +95,9 @@ pub fn compute_window_input_hash(window_id: &str, events: &[Event]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(window_id.as_bytes());
     for event in events {
-        if let Ok(event_bytes) = serde_json::to_vec(event) {
-            hasher.update(&event_bytes);
-            hasher.update(b"\n");
-        }
+        let event_bytes = serde_json::to_vec(event).expect("event must serialize for hash");
+        hasher.update(&event_bytes);
+        hasher.update(b"\n");
     }
     hasher
         .finalize()
