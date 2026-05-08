@@ -43,6 +43,7 @@ parquet = "54"
 clap = { version = "4", features = ["derive"] }
 walkdir = "2.5"
 flate2 = "1.0"
+libc = "0.2"
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -57,3 +58,11 @@ path = "src/bin/live_collector.rs"
 [[bin]]
 name = "backtest_runner"
 path = "src/bin/backtest_runner.rs"
+
+[[bin]]
+name = "tape_convert"
+path = "src/bin/tape_convert.rs"
+
+[[bin]]
+name = "tape_smoke"
+path = "src/bin/tape_smoke.rs"
