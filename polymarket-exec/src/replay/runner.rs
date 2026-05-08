@@ -229,6 +229,9 @@ mod replay_accounting_tests {
         assert!(accounting.open_positions.is_empty());
         assert_eq!(accounting.settlement.redeemed_winning_qty, 10.0);
         assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+        assert_eq!(accounting.settlement.stranded_qty_total, 0.0);
+        assert_eq!(accounting.settlement.stranded_cost_usd, 0.0);
+        assert!(accounting.settlement.stranded_inventory.is_empty());
         assert_eq!(accounting.settlement.status, "resolved_settled");
     }
 
@@ -245,6 +248,8 @@ mod replay_accounting_tests {
         assert_eq!(accounting.realized_pnl_usd, -9.0);
         assert_eq!(accounting.unrealized_pnl_usd, 0.0);
         assert_eq!(accounting.settlement.expired_losing_qty, 10.0);
+        assert_eq!(accounting.settlement.stranded_qty_total, 0.0);
+        assert_eq!(accounting.settlement.stranded_cost_usd, 0.0);
     }
 
     #[test]
@@ -271,6 +276,8 @@ mod replay_accounting_tests {
         assert!((accounting.settlement.redeem_credit_usd - 10.0).abs() < 1e-9);
         assert!((accounting.settlement.redeem_fee_usd - 0.10).abs() < 1e-9);
         assert!((accounting.settlement.redeem_gas_usd - 0.15).abs() < 1e-9);
+        assert_eq!(accounting.settlement.stranded_qty_total, 0.0);
+        assert_eq!(accounting.settlement.stranded_cost_usd, 0.0);
         assert!(accounting.open_positions.is_empty());
     }
 
@@ -1012,7 +1019,6 @@ fn compute_accounting(
         .unwrap_or_default();
     cash += merge_apply.credit_usd;
     realized_pnl += merge_apply.realized_pnl_usd;
-    let positions_before_resolution = positions.clone();
     let resolution_apply = winner_asset_id
         .as_deref()
         .map(|winner| apply_resolution_settlement(&mut positions, winner, &redeem_events))
@@ -1031,7 +1037,7 @@ fn compute_accounting(
         merge_apply.fee_usd,
         merge_apply.gas_usd,
         pairable_qty_before_resolution,
-        &positions_before_resolution,
+        &positions,
         winner_asset_id.as_deref(),
         &resolution_apply,
     );

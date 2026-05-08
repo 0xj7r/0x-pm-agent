@@ -63,7 +63,7 @@ use polymarket_exec::replay::runner::{
     run_run_with_journal_mode, ReplayJournalMode, RunnerConfig, WindowStatus, WindowSummary,
 };
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
-use polymarket_exec::replay::tape::events::{read_tape_replay, TapeReplayOptions};
+use polymarket_exec::replay::tape::events::{read_tape_replay_windows, TapeReplayOptions};
 use polymarket_exec::strategy_profile::StrategyProfile;
 
 /// Backtest CLI. Mirrors the spec's clap::Parser shape.
@@ -423,6 +423,29 @@ fn replay_window_id(event: &Event, market_type: &str, dt: &str) -> String {
         .unwrap_or_else(|| format!("{market_type}/{dt}"))
 }
 
+fn group_events_into_windows(events: Vec<Event>, cli: &Cli) -> BTreeMap<String, Vec<Event>> {
+    let market_filter = parse_market_filter(&cli.market_filter);
+    let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    let target_market_window_ids = tape_target_market_window_ids(cli);
+    for e in events {
+        if !event_matches_market_filter(&e, &market_filter) {
+            continue;
+        }
+        let dt = chrono::Utc
+            .timestamp_opt(e.received_ns / 1_000_000_000, 0)
+            .single()
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "1970-01-01".to_string());
+        for market_type in target_window_market_types(&e, &market_filter) {
+            let window_ids = replay_window_ids(&e, &market_type, &dt, &target_market_window_ids);
+            for window_id in window_ids {
+                windows.entry(window_id).or_default().push(e.clone());
+            }
+        }
+    }
+    windows
+}
+
 fn tape_target_market_window_ids(cli: &Cli) -> Vec<String> {
     if cli.input_format != "tape" {
         return Vec::new();
@@ -483,15 +506,18 @@ fn run_main(cli: Cli) -> Result<i32> {
         eprintln!("input prefix not found: {}", cli.input_prefix.display());
         return Ok(3);
     }
-    let events: Vec<Event> = match cli.input_format.as_str() {
-        "rust-event" => read_local_filtered(&cli.input_prefix, None)
-            .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?,
+    let windows: BTreeMap<String, Vec<Event>> = match cli.input_format.as_str() {
+        "rust-event" => {
+            let events = read_local_filtered(&cli.input_prefix, None)
+                .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?;
+            group_events_into_windows(events, &cli)
+        }
         "telonex-raw" => {
             let markets = parse_raw_market_asset_maps(&cli.raw_market_asset_maps)?;
             if markets.is_empty() {
                 anyhow::bail!("--input-format telonex-raw requires at least one --raw-market-asset-map slug=up_asset,down_asset");
             }
-            read_raw_replay(
+            let events = read_raw_replay(
                 &cli.input_prefix,
                 &RawReplayOptions {
                     window_start_ns: start_dt
@@ -510,14 +536,15 @@ fn run_main(cli: Cli) -> Result<i32> {
                     "reading raw Telonex input from {}",
                     cli.input_prefix.display()
                 )
-            })?
+            })?;
+            group_events_into_windows(events, &cli)
         }
         "tape" => {
             let markets = parse_raw_market_asset_maps(&cli.raw_market_asset_maps)?;
             if markets.is_empty() {
                 anyhow::bail!("--input-format tape requires --raw-market-asset-map slug=up_asset,down_asset[,strike]");
             }
-            read_tape_replay(&TapeReplayOptions {
+            read_tape_replay_windows(&TapeReplayOptions {
                 input_prefix: cli.input_prefix.clone(),
                 window_start_ns: start_dt
                     .timestamp_nanos_opt()
@@ -532,28 +559,6 @@ fn run_main(cli: Cli) -> Result<i32> {
         }
         other => anyhow::bail!("unknown --input-format: {other}"),
     };
-
-    // Group into windows by (market_type, dt). Phase 3a uses one window
-    // per market_type (broader windowing per the spec is Phase 3b/5).
-    let market_filter = parse_market_filter(&cli.market_filter);
-    let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
-    let target_market_window_ids = tape_target_market_window_ids(&cli);
-    for e in events {
-        if !event_matches_market_filter(&e, &market_filter) {
-            continue;
-        }
-        let dt = chrono::Utc
-            .timestamp_opt(e.received_ns / 1_000_000_000, 0)
-            .single()
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "1970-01-01".to_string());
-        for market_type in target_window_market_types(&e, &market_filter) {
-            let window_ids = replay_window_ids(&e, &market_type, &dt, &target_market_window_ids);
-            for window_id in window_ids {
-                windows.entry(window_id).or_default().push(e.clone());
-            }
-        }
-    }
 
     // Build window plan in deterministic order.
     let window_plans: Vec<WindowPlan> = windows
