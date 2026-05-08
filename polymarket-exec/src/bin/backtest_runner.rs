@@ -394,6 +394,19 @@ fn replay_window_ids(
     if (event.market_type == "btc_ref" || event.market_type == "reference")
         && !target_market_window_ids.is_empty()
     {
+        if let Some(slug) = event
+            .market_slug
+            .as_deref()
+            .filter(|slug| !slug.is_empty() && *slug != "btcusdt")
+        {
+            let owned_window = format!("{market_type}/{dt}/{slug}");
+            if target_market_window_ids
+                .iter()
+                .any(|window_id| window_id == &owned_window)
+            {
+                return vec![owned_window];
+            }
+        }
         return target_market_window_ids.to_vec();
     }
     vec![replay_window_id(event, market_type, dt)]
@@ -1042,6 +1055,20 @@ mod tests {
         assert_eq!(
             replay_window_ids(&btc_event, "btc_5m", "2026-02-15", &targets),
             targets
+        );
+    }
+
+    #[test]
+    fn owned_reference_ticks_route_to_their_market_window() {
+        let mut btc_event = event("btc_ref");
+        btc_event.market_slug = Some("btc-updown-5m-1".to_string());
+        let targets = vec![
+            "btc_5m/2026-02-15/btc-updown-5m-1".to_string(),
+            "btc_5m/2026-02-15/btc-updown-5m-2".to_string(),
+        ];
+        assert_eq!(
+            replay_window_ids(&btc_event, "btc_5m", "2026-02-15", &targets),
+            vec!["btc_5m/2026-02-15/btc-updown-5m-1".to_string()]
         );
     }
 

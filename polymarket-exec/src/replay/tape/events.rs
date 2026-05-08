@@ -67,7 +67,7 @@ fn read_market_tape_events(
         if !in_window(tick.ts_ns, options) {
             continue;
         }
-        events.push(btc_event(tick, idx as i64));
+        events.push(btc_event(tick, market, idx as i64));
     }
 
     Ok(events)
@@ -155,14 +155,14 @@ fn trade_event(event: &TradeEventV1, market: &RawReplayMarket, sequence: i64) ->
     }
 }
 
-fn btc_event(tick: &BtcTickV1, sequence: i64) -> Event {
+fn btc_event(tick: &BtcTickV1, market: &RawReplayMarket, sequence: i64) -> Event {
     Event {
         v: 1,
         ts_ns: tick.ts_ns as i64,
         received_ns: tick.ts_ns as i64,
         event_type: EventType::BtcTick,
         market_type: "btc_ref".to_string(),
-        market_slug: Some("btcusdt".to_string()),
+        market_slug: Some(market.slug.clone()),
         asset_id: Some("BTC".to_string()),
         side: None,
         price: Some((tick.price_cents as f64 / 100.0).to_string()),

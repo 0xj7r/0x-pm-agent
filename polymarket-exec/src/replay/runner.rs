@@ -869,6 +869,25 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
             }
             accounting_events.push(event.clone());
         }
+        for synth in synthesizer.flush_due(i64::MAX) {
+            dispatch_event(
+                strategy,
+                &mut sim,
+                &synth,
+                &mut intents_submitted,
+                &mut risk_rejections,
+                &mut journal_events,
+                capture_journal,
+                &mut accepted_fills,
+                &mut intent_remaining,
+                &mut accounting_events,
+                &queue_assumption,
+            );
+            if capture_journal {
+                emit_market_event_journal_rows(&synth, &mut journal_events);
+            }
+            accounting_events.push(synth);
+        }
         let mut accounting =
             compute_accounting(&accounting_events, &accepted_fills, cfg.starting_cash_usd);
         accounting.attribution = compute_pnl_attribution(
@@ -2791,6 +2810,52 @@ mod tests {
         assert_eq!(summary.accounting.mark_source, "resolution");
         assert_eq!(summary.accounting.redeemable_value_usd, 10.0);
         assert_eq!(summary.accounting.ending_equity_usd, 1_004.5);
+    }
+
+    #[test]
+    fn run_window_flushes_synthesized_resolution_without_post_close_event() {
+        let events = vec![
+            market_meta(1_000_000_000, 300_000),
+            evt(
+                2_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "sell",
+                "0.55",
+                "100",
+            ),
+            evt(
+                3_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "sell",
+                "0.55",
+                "10",
+            ),
+            btc_tick(299_999_000_000, "101.0"),
+        ];
+        let cfg = RunnerConfig {
+            window_id: "w-resolved-flush".into(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+        let mut strategy = PassiveBidStrategy { placed: false };
+
+        let summary = run_window(&mut strategy, &events, &cfg);
+
+        assert_eq!(summary.status, WindowStatus::Ok);
+        assert_eq!(summary.fills.len(), 1);
+        assert_eq!(
+            summary.accounting.resolution_winner_asset_id,
+            Some("asset-a".to_string())
+        );
+        assert_eq!(summary.accounting.mark_source, "resolution");
+        assert_eq!(summary.accounting.redeemable_value_usd, 10.0);
+        assert_eq!(summary.accounting.settlement.status, "resolved_settled");
     }
 
     /// Strategy that panics on second event. Used to verify panic isolation.
