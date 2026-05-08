@@ -67,7 +67,8 @@ impl<T: TapeRecord> MappedTape<T> {
     }
 
     pub fn seek_ts(&self, ts_ns: u64) -> usize {
-        self.records().partition_point(|record| record.ts_ns() < ts_ns)
+        self.records()
+            .partition_point(|record| record.ts_ns() < ts_ns)
     }
 }
 
@@ -164,4 +165,3 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
-

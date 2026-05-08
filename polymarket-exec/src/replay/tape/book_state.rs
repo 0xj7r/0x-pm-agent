@@ -128,7 +128,10 @@ fn apply_best_bid_level(
     }
 
     if top.bid_price_ticks == Some(price) {
-        if let Some(next_index) = levels[..index].iter().rposition(|level_size| *level_size > 0) {
+        if let Some(next_index) = levels[..index]
+            .iter()
+            .rposition(|level_size| *level_size > 0)
+        {
             top.bid_price_ticks = Some(next_index as u32);
             top.bid_size_lots = levels[next_index];
         } else {
