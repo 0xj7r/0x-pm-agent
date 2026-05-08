@@ -180,7 +180,34 @@ struct RunSummary {
     schema_version: u32,
     fill_sim_version: String,
     fill_config: String,
-    windows: Vec<WindowSummary>,
+    windows: Vec<CompactWindowSummary>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompactWindowSummary {
+    window_id: String,
+    events_replayed: u64,
+    intents_submitted: u64,
+    fill_count: usize,
+    post_only_rejection_count: usize,
+    risk_rejection_count: usize,
+    accounting: polymarket_exec::replay::runner::ReplayAccountingSummary,
+    status: WindowStatus,
+}
+
+impl From<&WindowSummary> for CompactWindowSummary {
+    fn from(summary: &WindowSummary) -> Self {
+        Self {
+            window_id: summary.window_id.clone(),
+            events_replayed: summary.events_replayed,
+            intents_submitted: summary.intents_submitted,
+            fill_count: summary.fills.len(),
+            post_only_rejection_count: summary.post_only_rejections.len(),
+            risk_rejection_count: summary.risk_rejections.len(),
+            accounting: summary.accounting.clone(),
+            status: summary.status.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -537,7 +564,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         }
         let safe_id = s.window_id.replace('/', "_");
         let path = windows_root.join(format!("{safe_id}.json"));
-        fs::write(&path, serde_json::to_string_pretty(&s)?)
+        fs::write(&path, serde_json::to_string_pretty(&CompactWindowSummary::from(&*s))?)
             .with_context(|| format!("write window summary {}", path.display()))?;
         // Drain the journal events into the run-level vector so each
         // window's contribution lands in `journal.parquet` exactly once.
@@ -556,9 +583,9 @@ fn run_main(cli: Cli) -> Result<i32> {
         schema_version: SCHEMA_VERSION,
         fill_sim_version: FILL_SIM_VERSION.to_string(),
         fill_config: combined_fill_config.clone(),
-        windows: summaries,
+        windows: summaries.iter().map(CompactWindowSummary::from).collect(),
     };
-    let metrics = compute_metrics_summary(&run_id, &combined_fill_config, &summary.windows);
+    let metrics = compute_metrics_summary(&run_id, &combined_fill_config, &summaries);
     fs::write(
         run_root.join("metrics_summary.json"),
         serde_json::to_string_pretty(&metrics)?,

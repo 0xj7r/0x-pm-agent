@@ -139,7 +139,7 @@ pub fn price_to_ticks(price: f64) -> Result<u32> {
 }
 
 pub fn size_to_lots(size: f64) -> Result<u32> {
-    finite_non_negative_to_scaled_u32(size, SIZE_SCALE, "size")
+    rounded_non_negative_to_scaled_u32(size, SIZE_SCALE, "size")
 }
 
 pub fn btc_price_to_cents(price: f64) -> Result<u64> {
@@ -245,6 +245,15 @@ fn finite_non_negative_to_scaled_u32(value: f64, scale: f64, label: &str) -> Res
     Ok(scaled as u32)
 }
 
+fn rounded_non_negative_to_scaled_u32(value: f64, scale: f64, label: &str) -> Result<u32> {
+    if !value.is_finite() || value < 0.0 {
+        bail!("{label} must be finite and non-negative");
+    }
+    let scaled = (value * scale).round();
+    ensure!(scaled <= u32::MAX as f64, "{label} overflows u32");
+    Ok(scaled as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,4 +269,3 @@ mod tests {
         assert!(price_to_ticks(0.12345).is_err());
     }
 }
-
