@@ -3,7 +3,7 @@ use crate::replay::raw_parquet::RawReplayMarket;
 use crate::replay::reader::dedupe_and_sort;
 use crate::replay::tape::format::{
     lots_to_size, ticks_to_price, BookEventV1, BtcTickV1, TradeEventV1, LEG_NO, LEG_YES, SIDE_ASK,
-    SIDE_BID,
+    SIDE_BID, TAKER_BUY, TAKER_SELL,
 };
 use crate::replay::tape::reader::MappedTape;
 use anyhow::{ensure, Context, Result};
@@ -20,17 +20,25 @@ pub struct TapeReplayOptions {
 }
 
 pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
-    ensure!(
-        options.markets.len() == 1,
-        "tape replay currently expects exactly one market per tape directory"
-    );
-    let market = options
-        .markets
-        .first()
-        .context("missing tape replay market")?;
-    let book_path = options.input_prefix.join("book.bin");
-    let trades_path = options.input_prefix.join("trades.bin");
-    let btc_path = options.input_prefix.join("btc.bin");
+    ensure!(!options.markets.is_empty(), "missing tape replay markets");
+    let mut events = Vec::new();
+    events.extend(market_meta_events(options)?);
+    for market in &options.markets {
+        let market_prefix = tape_market_prefix(options, market);
+        events.extend(read_market_tape_events(options, market, &market_prefix)?);
+    }
+
+    Ok(dedupe_and_sort(events))
+}
+
+fn read_market_tape_events(
+    options: &TapeReplayOptions,
+    market: &RawReplayMarket,
+    market_prefix: &PathBuf,
+) -> Result<Vec<Event>> {
+    let book_path = market_prefix.join("book.bin");
+    let trades_path = market_prefix.join("trades.bin");
+    let btc_path = market_prefix.join("btc.bin");
 
     let book = MappedTape::<BookEventV1>::open(&book_path)
         .with_context(|| format!("opening book tape {}", book_path.display()))?;
@@ -42,7 +50,6 @@ pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
     let mut events = Vec::with_capacity(
         book.records().len() + trades.records().len() + btc.records().len() + 1,
     );
-    events.extend(market_meta_events(options)?);
 
     for (idx, event) in book.records().iter().enumerate() {
         if !in_window(event.ts_ns, options) {
@@ -63,7 +70,16 @@ pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
         events.push(btc_event(tick, idx as i64));
     }
 
-    Ok(dedupe_and_sort(events))
+    Ok(events)
+}
+
+fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> PathBuf {
+    let direct_book = options.input_prefix.join("book.bin");
+    if options.markets.len() == 1 && direct_book.exists() {
+        options.input_prefix.clone()
+    } else {
+        options.input_prefix.join(&market.slug)
+    }
 }
 
 fn market_meta_events(options: &TapeReplayOptions) -> Result<Vec<Event>> {
@@ -130,7 +146,7 @@ fn trade_event(event: &TradeEventV1, market: &RawReplayMarket, sequence: i64) ->
         market_type: market_type_from_slug(&market.slug),
         market_slug: Some(market.slug.clone()),
         asset_id: asset_id_for_leg(event.leg, market),
-        side: None,
+        side: taker_side_name(event.taker_side).map(ToString::to_string),
         price: Some(ticks_to_price(event.price_ticks).to_string()),
         size: Some(lots_to_size(event.size_lots).to_string()),
         sequence: Some(sequence),
@@ -178,6 +194,14 @@ fn side_name(side: u8) -> Option<&'static str> {
     }
 }
 
+fn taker_side_name(side: u8) -> Option<&'static str> {
+    match side {
+        TAKER_BUY => Some("buy"),
+        TAKER_SELL => Some("sell"),
+        _ => None,
+    }
+}
+
 fn market_type_from_slug(slug: &str) -> String {
     let text = slug.to_ascii_lowercase();
     if text.contains("eth") {
@@ -210,3 +234,85 @@ fn market_end_ms(slug: &str) -> Option<i64> {
     market_start_ms(slug).map(|start| start + 5 * 60 * 1000)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::tape::format::{TAKER_BUY, TAKER_SELL};
+
+    fn market() -> RawReplayMarket {
+        RawReplayMarket {
+            slug: "btc-updown-5m-1771119900".to_string(),
+            asset_ids: ["UP".to_string(), "DOWN".to_string()],
+            strike: Some("70000.00".to_string()),
+        }
+    }
+
+    #[test]
+    fn tape_trade_preserves_taker_side_for_fill_sim() {
+        let buy = trade_event(
+            &TradeEventV1 {
+                ts_ns: 1,
+                price_ticks: 5_000,
+                size_lots: 100,
+                leg: LEG_YES,
+                taker_side: TAKER_BUY,
+                _pad: [0; 6],
+            },
+            &market(),
+            7,
+        );
+        assert_eq!(buy.side.as_deref(), Some("buy"));
+
+        let sell = trade_event(
+            &TradeEventV1 {
+                ts_ns: 2,
+                price_ticks: 4_900,
+                size_lots: 200,
+                leg: LEG_NO,
+                taker_side: TAKER_SELL,
+                _pad: [0; 6],
+            },
+            &market(),
+            8,
+        );
+        assert_eq!(sell.side.as_deref(), Some("sell"));
+    }
+
+    #[test]
+    fn tape_market_prefix_supports_single_and_market_root_layouts() {
+        let base = std::env::temp_dir().join(format!(
+            "tape-market-prefix-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("book.bin"), []).unwrap();
+        let single = TapeReplayOptions {
+            input_prefix: base.clone(),
+            window_start_ns: 0,
+            window_end_ns: 1,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![market()],
+        };
+        assert_eq!(tape_market_prefix(&single, &single.markets[0]), base);
+
+        let root = std::env::temp_dir().join(format!(
+            "tape-market-root-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let multi = TapeReplayOptions {
+            input_prefix: root.clone(),
+            window_start_ns: 0,
+            window_end_ns: 1,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![market(), market()],
+        };
+        assert_eq!(
+            tape_market_prefix(&multi, &multi.markets[0]),
+            root.join("btc-updown-5m-1771119900")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

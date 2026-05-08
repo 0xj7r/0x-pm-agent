@@ -362,6 +362,62 @@ fn target_window_market_types(event: &Event, market_filter: &[String]) -> Vec<St
     vec![event.market_type.clone()]
 }
 
+fn replay_window_ids(
+    event: &Event,
+    market_type: &str,
+    dt: &str,
+    target_market_window_ids: &[String],
+) -> Vec<String> {
+    if (event.market_type == "btc_ref" || event.market_type == "reference")
+        && !target_market_window_ids.is_empty()
+    {
+        return target_market_window_ids.to_vec();
+    }
+    vec![replay_window_id(event, market_type, dt)]
+}
+
+fn replay_window_id(event: &Event, market_type: &str, dt: &str) -> String {
+    event
+        .market_slug
+        .as_ref()
+        .filter(|slug| {
+            market_type != "btc_ref" && market_type != "reference" && slug.as_str() != "btcusdt"
+        })
+        .map(|slug| format!("{market_type}/{dt}/{slug}"))
+        .unwrap_or_else(|| format!("{market_type}/{dt}"))
+}
+
+fn tape_target_market_window_ids(cli: &Cli) -> Vec<String> {
+    if cli.input_format != "tape" {
+        return Vec::new();
+    }
+    let Ok(markets) = parse_raw_market_asset_maps(&cli.raw_market_asset_maps) else {
+        return Vec::new();
+    };
+    let market_type = if cli.market_filter.trim().is_empty() {
+        "btc_5m".to_string()
+    } else {
+        cli.market_filter
+            .split(',')
+            .next()
+            .unwrap_or("btc_5m")
+            .trim()
+            .to_string()
+    };
+    markets
+        .into_iter()
+        .filter_map(|market| {
+            let seconds = market.slug.rsplit('-').next()?.parse::<i64>().ok()?;
+            let dt = chrono::Utc
+                .timestamp_opt(seconds, 0)
+                .single()?
+                .format("%Y-%m-%d")
+                .to_string();
+            Some(format!("{market_type}/{dt}/{}", market.slug))
+        })
+        .collect()
+}
+
 fn run_main(cli: Cli) -> Result<i32> {
     // Validate CLI inputs.
     let start_dt = DateTime::parse_from_rfc3339(&cli.window_start)
@@ -445,6 +501,7 @@ fn run_main(cli: Cli) -> Result<i32> {
     // per market_type (broader windowing per the spec is Phase 3b/5).
     let market_filter = parse_market_filter(&cli.market_filter);
     let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
+    let target_market_window_ids = tape_target_market_window_ids(&cli);
     for e in events {
         if !event_matches_market_filter(&e, &market_filter) {
             continue;
@@ -455,8 +512,10 @@ fn run_main(cli: Cli) -> Result<i32> {
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "1970-01-01".to_string());
         for market_type in target_window_market_types(&e, &market_filter) {
-            let window_id = format!("{market_type}/{dt}");
-            windows.entry(window_id).or_default().push(e.clone());
+            let window_ids = replay_window_ids(&e, &market_type, &dt, &target_market_window_ids);
+            for window_id in window_ids {
+                windows.entry(window_id).or_default().push(e.clone());
+            }
         }
     }
 
@@ -916,6 +975,37 @@ mod tests {
         assert_eq!(
             target_window_market_types(&event("reference"), &filter),
             vec!["btc_5m".to_string()]
+        );
+    }
+
+    #[test]
+    fn market_events_are_grouped_by_slug_window() {
+        let mut market_event = event("btc_5m");
+        market_event.market_slug = Some("btc-updown-5m-1771119900".to_string());
+        assert_eq!(
+            replay_window_id(&market_event, "btc_5m", "2026-02-15"),
+            "btc_5m/2026-02-15/btc-updown-5m-1771119900"
+        );
+
+        let mut btc_event = event("btc_ref");
+        btc_event.market_slug = Some("btcusdt".to_string());
+        assert_eq!(
+            replay_window_id(&btc_event, "btc_5m", "2026-02-15"),
+            "btc_5m/2026-02-15"
+        );
+    }
+
+    #[test]
+    fn reference_ticks_are_fanned_out_to_tape_market_windows() {
+        let mut btc_event = event("btc_ref");
+        btc_event.market_slug = Some("btcusdt".to_string());
+        let targets = vec![
+            "btc_5m/2026-02-15/btc-updown-5m-1".to_string(),
+            "btc_5m/2026-02-15/btc-updown-5m-2".to_string(),
+        ];
+        assert_eq!(
+            replay_window_ids(&btc_event, "btc_5m", "2026-02-15", &targets),
+            targets
         );
     }
 
