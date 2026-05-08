@@ -1,6 +1,7 @@
 use crate::collector::schema::{Event, EventType, Source};
 use crate::replay::raw_parquet::RawReplayMarket;
 use crate::replay::reader::dedupe_and_sort;
+use crate::replay::tape::book_state::BookState;
 use crate::replay::tape::format::{
     lots_to_size, ticks_to_price, BookEventV1, BtcTickV1, TradeEventV1, LEG_NO, LEG_YES, SIDE_ASK,
     SIDE_BID, TAKER_BUY, TAKER_SELL,
@@ -61,12 +62,7 @@ fn read_market_tape_events(
         btc.records(),
     ));
 
-    for (idx, event) in book.records().iter().enumerate() {
-        if !in_window(event.ts_ns, options) {
-            continue;
-        }
-        events.push(book_event(event, market, idx as i64));
-    }
+    extend_top_book_events(&mut events, book.records(), options, market);
     for (idx, event) in trades.records().iter().enumerate() {
         if !in_window(event.ts_ns, options) {
             continue;
@@ -81,6 +77,27 @@ fn read_market_tape_events(
     }
 
     Ok(events)
+}
+
+fn extend_top_book_events(
+    events: &mut Vec<Event>,
+    book_events: &[BookEventV1],
+    options: &TapeReplayOptions,
+    market: &RawReplayMarket,
+) {
+    let mut book_state = BookState::new();
+    for (idx, event) in book_events.iter().enumerate() {
+        if event.ts_ns >= options.window_end_ns as u64 {
+            break;
+        }
+
+        let top_changed = book_state.apply(event);
+        if event.ts_ns < options.window_start_ns as u64 || !top_changed {
+            continue;
+        }
+
+        events.push(book_event(event, market, idx as i64));
+    }
 }
 
 fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> PathBuf {
@@ -272,13 +289,61 @@ fn market_end_ms(slug: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replay::tape::format::{TAKER_BUY, TAKER_SELL};
+    use crate::replay::tape::format::{EVENT_UPDATE, TAKER_BUY, TAKER_SELL};
+    use crate::replay::tape::writer::write_tape_file;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn market() -> RawReplayMarket {
         RawReplayMarket {
             slug: "btc-updown-5m-1771119900".to_string(),
             asset_ids: ["UP".to_string(), "DOWN".to_string()],
             strike: Some("70000.00".to_string()),
+        }
+    }
+
+    fn tape_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "packed-tape-reduction-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn write_tape_fixture(
+        dir: &PathBuf,
+        book: &[BookEventV1],
+        trades: &[TradeEventV1],
+        btc: &[BtcTickV1],
+    ) {
+        let market = market();
+        write_tape_file(dir.join("book.bin"), &market.slug, book).unwrap();
+        write_tape_file(dir.join("trades.bin"), &market.slug, trades).unwrap();
+        write_tape_file(dir.join("btc.bin"), &market.slug, btc).unwrap();
+    }
+
+    fn replay_tape(dir: PathBuf) -> Vec<Event> {
+        read_tape_replay(&TapeReplayOptions {
+            input_prefix: dir,
+            window_start_ns: 10,
+            window_end_ns: 20,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![market()],
+        })
+        .unwrap()
+    }
+
+    fn book_update(ts_ns: u64, price_ticks: u32, size_lots: u32) -> BookEventV1 {
+        BookEventV1 {
+            ts_ns,
+            price_ticks,
+            size_lots,
+            leg: LEG_YES,
+            side: SIDE_BID,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
         }
     }
 
@@ -311,6 +376,112 @@ mod tests {
             8,
         );
         assert_eq!(sell.side.as_deref(), Some("sell"));
+    }
+
+    #[test]
+    fn packed_tape_replay_suppresses_non_top_book_deltas() {
+        let dir = tape_dir("suppresses-non-top");
+        write_tape_fixture(
+            &dir,
+            &[
+                book_update(5, 5_000, 100),
+                book_update(11, 4_900, 75),
+                book_update(12, 5_000, 125),
+            ],
+            &[],
+            &[],
+        );
+
+        let events = replay_tape(dir.clone());
+        let book_prices: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == EventType::BookDelta)
+            .map(|event| event.price.as_deref().unwrap())
+            .collect();
+
+        assert_eq!(book_prices, vec!["0.5"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn packed_tape_replay_preserves_top_book_changes() {
+        let dir = tape_dir("preserves-top");
+        write_tape_fixture(
+            &dir,
+            &[book_update(10, 5_000, 100), book_update(11, 5_100, 50)],
+            &[],
+            &[],
+        );
+
+        let events = replay_tape(dir.clone());
+        let book_prices: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == EventType::BookDelta)
+            .map(|event| event.price.as_deref().unwrap())
+            .collect();
+
+        assert_eq!(book_prices, vec!["0.5", "0.51"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn packed_tape_replay_preserves_trades_btc_and_settlement_market_meta() {
+        let dir = tape_dir("preserves-non-book");
+        write_tape_fixture(
+            &dir,
+            &[book_update(5, 5_000, 100), book_update(11, 4_900, 75)],
+            &[TradeEventV1 {
+                ts_ns: 11,
+                price_ticks: 4_900,
+                size_lots: 200,
+                leg: LEG_NO,
+                taker_side: TAKER_SELL,
+                _pad: [0; 6],
+            }],
+            &[BtcTickV1 {
+                ts_ns: 12,
+                price_cents: 7_012_345,
+                qty_lots: 1,
+                _pad: [0; 4],
+            }],
+        );
+
+        let events = replay_tape(dir.clone());
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::BookDelta)
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::Trade)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::BtcTick)
+                .count(),
+            1
+        );
+        let meta = events
+            .iter()
+            .find(|event| event.event_type == EventType::MarketMeta)
+            .unwrap();
+        assert_eq!(
+            meta.raw.get("asset_ids").and_then(|value| value.as_array()).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            meta.raw.get("strike").and_then(|value| value.as_f64()),
+            Some(70_000.0)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
