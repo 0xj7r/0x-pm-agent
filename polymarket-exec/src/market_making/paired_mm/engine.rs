@@ -337,8 +337,21 @@ impl PairedMmEngine {
             ));
         }
         for intent in &convex_overlay {
+            let decision_label = intent
+                .quote_level_tag
+                .as_deref()
+                .map(|tag| {
+                    if tag.contains("ultra-cheap-tail") {
+                        "cheap_tail_convexity"
+                    } else if tag.contains("late-favorite") {
+                        "late_favorite_loading"
+                    } else {
+                        "late_asymmetric_convex"
+                    }
+                })
+                .unwrap_or("late_asymmetric_convex");
             notes.push(format!(
-                "paired-mm decision_label=late_asymmetric_convex mode=convex_tilt intent={} price={:.4} qty={:.4} notional={:.4} reason={}",
+                "paired-mm decision_label={decision_label} mode=convex_tilt intent={} price={:.4} qty={:.4} notional={:.4} reason={}",
                 intent.client_order_id,
                 intent.limit_price,
                 intent.quantity,
