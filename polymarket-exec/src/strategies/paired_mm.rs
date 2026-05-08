@@ -193,8 +193,7 @@ where
                     "paired-mm capital recycle cooldown active key={recycle_key} cooldown_ms={cooldown_ms}"
                 ));
             } else {
-                self.last_capital_recycle_at_ms
-                    .insert(recycle_key, now_ms);
+                self.last_capital_recycle_at_ms.insert(recycle_key, now_ms);
                 notes.push("paired-mm decision_label=cheap_leg_recycle mode=cheap_leg_mode capital recycle emitted".to_string());
                 return StrategyDecision::capital_recycle(vec![intent], notes);
             }

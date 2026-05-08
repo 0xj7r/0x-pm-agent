@@ -16,9 +16,8 @@ pub fn write_tape_file<T: TapeRecord>(
 
     let output_path = output_path.as_ref();
     if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating tape output directory {}", parent.display())
-        })?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating tape output directory {}", parent.display()))?;
     }
 
     let tmp_path = output_path.with_extension("bin.tmp");
@@ -84,4 +83,3 @@ mod tests {
         assert!(write_tape_file("/tmp/ignored-tape-test.bin", "m", &records).is_err());
     }
 }
-

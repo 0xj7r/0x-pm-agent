@@ -185,7 +185,10 @@ pub fn header_for<T: TapeRecord>(market_id: &str, records: &[T]) -> TapeHeaderV1
 pub fn validate_header<T: TapeRecord>(header: &TapeHeaderV1) -> Result<()> {
     ensure!(header.magic == TAPE_MAGIC, "invalid tape magic");
     ensure!(header.version == TAPE_VERSION, "unsupported tape version");
-    ensure!(header.header_size == TAPE_HEADER_SIZE, "invalid tape header size");
+    ensure!(
+        header.header_size == TAPE_HEADER_SIZE,
+        "invalid tape header size"
+    );
     ensure!(
         header.record_kind == T::RECORD_KIND,
         "unexpected tape record kind"

@@ -111,7 +111,11 @@ fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> 
     }
 }
 
-fn tape_window_id(options: &TapeReplayOptions, market: &RawReplayMarket, events: &[Event]) -> String {
+fn tape_window_id(
+    options: &TapeReplayOptions,
+    market: &RawReplayMarket,
+    events: &[Event],
+) -> String {
     let market_type = options
         .market_filter
         .split(',')
@@ -565,7 +569,11 @@ mod tests {
             .find(|event| event.event_type == EventType::MarketMeta)
             .unwrap();
         assert_eq!(
-            meta.raw.get("asset_ids").and_then(|value| value.as_array()).unwrap().len(),
+            meta.raw
+                .get("asset_ids")
+                .and_then(|value| value.as_array())
+                .unwrap()
+                .len(),
             2
         );
         assert_eq!(
@@ -645,10 +653,8 @@ mod tests {
 
     #[test]
     fn tape_market_prefix_supports_single_and_market_root_layouts() {
-        let base = std::env::temp_dir().join(format!(
-            "tape-market-prefix-test-{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("tape-market-prefix-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("book.bin"), []).unwrap();
@@ -661,10 +667,8 @@ mod tests {
         };
         assert_eq!(tape_market_prefix(&single, &single.markets[0]), base);
 
-        let root = std::env::temp_dir().join(format!(
-            "tape-market-root-test-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tape-market-root-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let multi = TapeReplayOptions {

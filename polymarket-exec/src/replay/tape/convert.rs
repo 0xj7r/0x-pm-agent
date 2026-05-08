@@ -147,7 +147,8 @@ fn read_raw_file(
         return Ok(());
     };
 
-    let file = File::open(path).with_context(|| format!("opening raw parquet {}", path.display()))?;
+    let file =
+        File::open(path).with_context(|| format!("opening raw parquet {}", path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading parquet metadata {}", path.display()))?
         .with_batch_size(65_536)
@@ -254,8 +255,8 @@ fn trade_event(
     let Some(leg) = row_leg(path, batch, row, options) else {
         return Ok(None);
     };
-    let Some(price) = value_f64(batch, "price", row)
-        .or_else(|| value_f64(batch, "last_trade_price", row))
+    let Some(price) =
+        value_f64(batch, "price", row).or_else(|| value_f64(batch, "last_trade_price", row))
     else {
         return Ok(None);
     };
@@ -280,7 +281,8 @@ fn trade_event(
 }
 
 fn btc_tick(batch: &RecordBatch, row: usize, ts_ns: i64) -> Result<Option<BtcTickV1>> {
-    let Some(price) = value_f64(batch, "price", row).or_else(|| value_f64(batch, "last_price", row))
+    let Some(price) =
+        value_f64(batch, "price", row).or_else(|| value_f64(batch, "last_price", row))
     else {
         return Ok(None);
     };

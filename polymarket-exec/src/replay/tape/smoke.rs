@@ -127,4 +127,3 @@ mod tests {
         assert_eq!(stats.total_events, 3);
     }
 }
-
