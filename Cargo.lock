@@ -4452,6 +4452,7 @@ dependencies = [
  "hmac 0.12.1",
  "hostname",
  "http-body-util",
+ "libc",
  "parquet",
  "polymarket-client-sdk",
  "polymarket_client_sdk_v2",
