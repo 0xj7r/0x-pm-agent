@@ -733,6 +733,14 @@ pub enum WindowStatus {
     Panicked,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayJournalMode {
+    #[default]
+    Full,
+    None,
+}
+
 /// Decision emitted by a strategy on each event.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ReplayDecision {
@@ -794,12 +802,24 @@ pub fn run_window<S: ReplayStrategy>(
     events: &[Event],
     cfg: &RunnerConfig,
 ) -> WindowSummary {
+    run_window_with_journal_mode(strategy, events, cfg, ReplayJournalMode::Full)
+}
+
+/// Run a single window with explicit journal capture mode. `run_window`
+/// remains audit-grade/full by default for existing callers.
+pub fn run_window_with_journal_mode<S: ReplayStrategy>(
+    strategy: &mut S,
+    events: &[Event],
+    cfg: &RunnerConfig,
+    journal_mode: ReplayJournalMode,
+) -> WindowSummary {
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut sim = FillSimulator::new(cfg.fill_sim.clone());
         let mut synthesizer = EventSynthesizer::new();
         let mut intents_submitted: u64 = 0;
         let mut risk_rejections: Vec<RiskRejection> = Vec::new();
         let mut journal_events: Vec<JournalEvent> = Vec::new();
+        let capture_journal = journal_mode == ReplayJournalMode::Full;
         let mut accepted_fills: Vec<SimulatedFill> = Vec::new();
         let mut intent_remaining: BTreeMap<String, f64> = BTreeMap::new();
         let queue_assumption = format!("{:?}", cfg.fill_sim.fill_quality);
@@ -820,12 +840,15 @@ pub fn run_window<S: ReplayStrategy>(
                     &mut intents_submitted,
                     &mut risk_rejections,
                     &mut journal_events,
+                    capture_journal,
                     &mut accepted_fills,
                     &mut intent_remaining,
                     &mut accounting_events,
                     &queue_assumption,
                 );
-                emit_market_event_journal_rows(synth, &mut journal_events);
+                if capture_journal {
+                    emit_market_event_journal_rows(synth, &mut journal_events);
+                }
                 accounting_events.push(synth.clone());
             }
             dispatch_event(
@@ -835,12 +858,15 @@ pub fn run_window<S: ReplayStrategy>(
                 &mut intents_submitted,
                 &mut risk_rejections,
                 &mut journal_events,
+                capture_journal,
                 &mut accepted_fills,
                 &mut intent_remaining,
                 &mut accounting_events,
                 &queue_assumption,
             );
-            emit_market_event_journal_rows(event, &mut journal_events);
+            if capture_journal {
+                emit_market_event_journal_rows(event, &mut journal_events);
+            }
             accounting_events.push(event.clone());
         }
         let mut accounting =
@@ -2084,6 +2110,7 @@ fn dispatch_event<S: ReplayStrategy>(
     intents_submitted: &mut u64,
     risk_rejections: &mut Vec<RiskRejection>,
     journal_events: &mut Vec<JournalEvent>,
+    capture_journal: bool,
     accepted_fills: &mut Vec<SimulatedFill>,
     intent_remaining: &mut BTreeMap<String, f64>,
     accounting_events: &mut Vec<Event>,
@@ -2100,6 +2127,7 @@ fn dispatch_event<S: ReplayStrategy>(
         intents_submitted,
         risk_rejections,
         journal_events,
+        capture_journal,
         accepted_fills,
         intent_remaining,
         accounting_events,
@@ -2108,7 +2136,9 @@ fn dispatch_event<S: ReplayStrategy>(
 
     let mut decision = strategy.on_event(event);
     risk_rejections.append(&mut decision.risk_rejections);
-    journal_events.append(&mut decision.journal_events);
+    if capture_journal {
+        journal_events.append(&mut decision.journal_events);
+    }
     accounting_events.append(&mut decision.accounting_events);
     for coid in decision.cancels {
         sim.cancel(&coid, event_ms);
@@ -2121,6 +2151,7 @@ fn dispatch_event<S: ReplayStrategy>(
         intents_submitted,
         risk_rejections,
         journal_events,
+        capture_journal,
         accepted_fills,
         intent_remaining,
         accounting_events,
@@ -2137,6 +2168,7 @@ fn submit_replay_intents<S: ReplayStrategy>(
     intents_submitted: &mut u64,
     risk_rejections: &mut Vec<RiskRejection>,
     journal_events: &mut Vec<JournalEvent>,
+    capture_journal: bool,
     accepted_fills: &mut Vec<SimulatedFill>,
     intent_remaining: &mut BTreeMap<String, f64>,
     accounting_events: &mut Vec<Event>,
@@ -2163,6 +2195,7 @@ fn submit_replay_intents<S: ReplayStrategy>(
         intents_submitted,
         risk_rejections,
         journal_events,
+        capture_journal,
         accepted_fills,
         intent_remaining,
         accounting_events,
@@ -2171,7 +2204,9 @@ fn submit_replay_intents<S: ReplayStrategy>(
     for client_order_id in expire_ioc {
         let mut decision = strategy.on_ioc_expired(&client_order_id, event_ms);
         risk_rejections.append(&mut decision.risk_rejections);
-        journal_events.append(&mut decision.journal_events);
+        if capture_journal {
+            journal_events.append(&mut decision.journal_events);
+        }
         accounting_events.append(&mut decision.accounting_events);
         for coid in decision.cancels {
             sim.cancel(&coid, event_ms);
@@ -2184,6 +2219,7 @@ fn submit_replay_intents<S: ReplayStrategy>(
             intents_submitted,
             risk_rejections,
             journal_events,
+            capture_journal,
             accepted_fills,
             intent_remaining,
             accounting_events,
@@ -2201,6 +2237,7 @@ fn process_new_simulated_fills<S: ReplayStrategy>(
     intents_submitted: &mut u64,
     risk_rejections: &mut Vec<RiskRejection>,
     journal_events: &mut Vec<JournalEvent>,
+    capture_journal: bool,
     accepted_fills: &mut Vec<SimulatedFill>,
     intent_remaining: &mut BTreeMap<String, f64>,
     accounting_events: &mut Vec<Event>,
@@ -2216,10 +2253,14 @@ fn process_new_simulated_fills<S: ReplayStrategy>(
             .iter()
             .any(|client_order_id| client_order_id == &fill.client_order_id);
         risk_rejections.append(&mut decision.risk_rejections);
-        journal_events.append(&mut decision.journal_events);
+        if capture_journal {
+            journal_events.append(&mut decision.journal_events);
+        }
         accounting_events.append(&mut decision.accounting_events);
         if !rejected {
-            emit_fill_journal_row(&fill, intent_remaining, queue_assumption, journal_events);
+            if capture_journal {
+                emit_fill_journal_row(&fill, intent_remaining, queue_assumption, journal_events);
+            }
             accepted_fills.push(fill.clone());
         }
         for coid in decision.cancels {
@@ -2233,6 +2274,7 @@ fn process_new_simulated_fills<S: ReplayStrategy>(
             intents_submitted,
             risk_rejections,
             journal_events,
+            capture_journal,
             accepted_fills,
             intent_remaining,
             accounting_events,
@@ -2355,6 +2397,21 @@ fn emit_market_event_journal_rows(event: &Event, journal_events: &mut Vec<Journa
 pub fn run_run<S, F>(
     windows: BTreeMap<String, Vec<Event>>,
     cfg: &RunnerConfig,
+    strategy_factory: F,
+) -> Result<Vec<WindowSummary>>
+where
+    S: ReplayStrategy,
+    F: FnMut(&str, f64) -> S,
+{
+    run_run_with_journal_mode(windows, cfg, ReplayJournalMode::Full, strategy_factory)
+}
+
+/// Run a set of windows in deterministic order with explicit journal mode.
+/// Existing `run_run` callers keep full audit-grade journal capture.
+pub fn run_run_with_journal_mode<S, F>(
+    windows: BTreeMap<String, Vec<Event>>,
+    cfg: &RunnerConfig,
+    journal_mode: ReplayJournalMode,
     mut strategy_factory: F,
 ) -> Result<Vec<WindowSummary>>
 where
@@ -2369,7 +2426,7 @@ where
         win_cfg.window_id = window_id;
         win_cfg.starting_cash_usd = carried_cash_usd;
         let mut strategy = strategy_factory(&win_cfg.window_id, carried_cash_usd);
-        let summary = run_window(&mut strategy, &events, &win_cfg);
+        let summary = run_window_with_journal_mode(&mut strategy, &events, &win_cfg, journal_mode);
         if summary.status != WindowStatus::Ok {
             failed += 1;
             if failed > cfg.max_window_failures {
@@ -2976,5 +3033,52 @@ mod tests {
             "expected at least one Fill journal row, got {fill_count} of {} total",
             summary.journal_events.len()
         );
+    }
+
+    #[test]
+    fn run_window_none_journal_mode_preserves_fills_and_accounting_without_rows() {
+        let events = vec![
+            evt(
+                1_000_000_000,
+                EventType::BookSnapshot,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+            evt(
+                2_000_000_000,
+                EventType::Trade,
+                "asset-a",
+                "buy",
+                "0.55",
+                "100",
+            ),
+        ];
+        let cfg = RunnerConfig {
+            window_id: "w-no-journal".into(),
+            fill_sim: FillSimConfig {
+                latency: LatencyPreset::Instant,
+                ..Default::default()
+            },
+            max_window_failures: 0,
+            starting_cash_usd: 1_000.0,
+        };
+        let mut strategy = PassiveAskStrategy {
+            placed: false,
+            on_fill_count: 0,
+        };
+
+        let summary =
+            run_window_with_journal_mode(&mut strategy, &events, &cfg, ReplayJournalMode::None);
+
+        assert_eq!(summary.status, WindowStatus::Ok);
+        assert_eq!(summary.journal_events.len(), 0);
+        assert_eq!(summary.fills.len(), 1);
+        assert_eq!(summary.intents_submitted, 1);
+        assert_eq!(strategy.on_fill_count, 1);
+        assert_eq!(summary.accounting.starting_cash_usd, 1_000.0);
+        assert_eq!(summary.accounting.ending_cash_usd, 1_000.0);
+        assert_eq!(summary.accounting.invalid_fill_count, 1);
     }
 }
