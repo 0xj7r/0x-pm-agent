@@ -8,6 +8,7 @@ use crate::replay::tape::format::{
 use crate::replay::tape::reader::MappedTape;
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,24 @@ pub fn read_tape_replay(options: &TapeReplayOptions) -> Result<Vec<Event>> {
     }
 
     Ok(dedupe_and_sort(events))
+}
+
+pub fn read_tape_replay_windows(
+    options: &TapeReplayOptions,
+) -> Result<BTreeMap<String, Vec<Event>>> {
+    ensure!(!options.markets.is_empty(), "missing tape replay markets");
+    let mut windows = BTreeMap::new();
+    for (idx, market) in options.markets.iter().enumerate() {
+        let market_prefix = tape_market_prefix(options, market);
+        let events = dedupe_and_sort(read_market_tape_events(
+            options,
+            market,
+            idx,
+            &market_prefix,
+        )?);
+        windows.insert(tape_window_id(options, market, &events), events);
+    }
+    Ok(windows)
 }
 
 fn read_market_tape_events(
@@ -90,6 +109,24 @@ fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> 
     } else {
         options.input_prefix.join(&market.slug)
     }
+}
+
+fn tape_window_id(options: &TapeReplayOptions, market: &RawReplayMarket, events: &[Event]) -> String {
+    let market_type = options
+        .market_filter
+        .split(',')
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| market_type_from_slug(&market.slug));
+    let start_ns = market_start_ms(&market.slug)
+        .map(|value| value.saturating_mul(1_000_000))
+        .or_else(|| events.first().map(|event| event.received_ns))
+        .unwrap_or(options.window_start_ns);
+    let dt = chrono::DateTime::from_timestamp(start_ns / 1_000_000_000, 0)
+        .map(|value| value.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    format!("{market_type}/{dt}/{}", market.slug)
 }
 
 fn market_meta_event(
@@ -318,6 +355,17 @@ mod tests {
         .unwrap()
     }
 
+    fn replay_tape_windows(dir: PathBuf) -> BTreeMap<String, Vec<Event>> {
+        read_tape_replay_windows(&TapeReplayOptions {
+            input_prefix: dir,
+            window_start_ns: 10,
+            window_end_ns: 20,
+            market_filter: "btc_5m".to_string(),
+            markets: vec![market()],
+        })
+        .unwrap()
+    }
+
     fn book_update(ts_ns: u64, price_ticks: u32, size_lots: u32) -> BookEventV1 {
         BookEventV1 {
             ts_ns,
@@ -414,6 +462,57 @@ mod tests {
             .iter()
             .filter(|event| event.event_type == EventType::BookDelta)
             .all(|event| event.raw == Value::Null));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn packed_tape_replay_windows_preserve_full_market_stream() {
+        let dir = tape_dir("windows-preserve-stream");
+        write_tape_fixture(
+            &dir,
+            &[book_update(10, 5_000, 100), book_update(11, 4_900, 75)],
+            &[TradeEventV1 {
+                ts_ns: 12,
+                price_ticks: 4_900,
+                size_lots: 200,
+                leg: LEG_NO,
+                taker_side: TAKER_SELL,
+                _pad: [0; 6],
+            }],
+            &[BtcTickV1 {
+                ts_ns: 13,
+                price_cents: 7_012_345,
+                qty_lots: 1,
+                _pad: [0; 4],
+            }],
+        );
+
+        let windows = replay_tape_windows(dir.clone());
+        let events = windows
+            .get("btc_5m/2026-02-15/btc-updown-5m-1771119900")
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::BookDelta)
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::Trade)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == EventType::BtcTick)
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
