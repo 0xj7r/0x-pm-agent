@@ -1253,10 +1253,10 @@ fn classify_tag(tag: &str) -> AttributionPath {
         || tag.contains("favorite-loading")
     {
         AttributionPath::LateFavorite
-    } else if tag.contains("convex")
-        || tag.contains("cheap-tail")
+    } else if tag.contains("cheap-tail")
         || tag.contains("cheap_tail")
         || tag.contains("cheap-leg")
+        || tag.contains("ultra-cheap-tail")
     {
         AttributionPath::CheapTailConvexity
     } else {
@@ -3080,5 +3080,21 @@ mod tests {
         assert_eq!(summary.accounting.starting_cash_usd, 1_000.0);
         assert_eq!(summary.accounting.ending_cash_usd, 1_000.0);
         assert_eq!(summary.accounting.invalid_fill_count, 1);
+    }
+
+    #[test]
+    fn generic_convex_decision_label_is_not_cheap_tail_attribution() {
+        assert_eq!(
+            classify_tag("paired-mm decision_label=late_asymmetric_convex mode=convex_tilt"),
+            AttributionPath::Other
+        );
+        assert_eq!(
+            classify_tag("paired-mm decision_label=late_favorite_loading mode=convex_tilt"),
+            AttributionPath::LateFavorite
+        );
+        assert_eq!(
+            classify_tag("mm-convex-accum:ultra-cheap-tail:no:convex_accum"),
+            AttributionPath::CheapTailConvexity
+        );
     }
 }
