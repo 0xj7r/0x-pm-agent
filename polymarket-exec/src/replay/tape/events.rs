@@ -1,7 +1,6 @@
 use crate::collector::schema::{Event, EventType, Source};
 use crate::replay::raw_parquet::RawReplayMarket;
 use crate::replay::reader::dedupe_and_sort;
-use crate::replay::tape::book_state::BookState;
 use crate::replay::tape::format::{
     lots_to_size, ticks_to_price, BookEventV1, BtcTickV1, TradeEventV1, LEG_NO, LEG_YES, SIDE_ASK,
     SIDE_BID, TAKER_BUY, TAKER_SELL,
@@ -62,7 +61,12 @@ fn read_market_tape_events(
         btc.records(),
     ));
 
-    extend_top_book_events(&mut events, book.records(), options, market);
+    for (idx, event) in book.records().iter().enumerate() {
+        if !in_window(event.ts_ns, options) {
+            continue;
+        }
+        events.push(book_event(event, market, idx as i64));
+    }
     for (idx, event) in trades.records().iter().enumerate() {
         if !in_window(event.ts_ns, options) {
             continue;
@@ -77,27 +81,6 @@ fn read_market_tape_events(
     }
 
     Ok(events)
-}
-
-fn extend_top_book_events(
-    events: &mut Vec<Event>,
-    book_events: &[BookEventV1],
-    options: &TapeReplayOptions,
-    market: &RawReplayMarket,
-) {
-    let mut book_state = BookState::new();
-    for (idx, event) in book_events.iter().enumerate() {
-        if event.ts_ns >= options.window_end_ns as u64 {
-            break;
-        }
-
-        let top_changed = book_state.apply(event);
-        if event.ts_ns < options.window_start_ns as u64 || !top_changed {
-            continue;
-        }
-
-        events.push(book_event(event, market, idx as i64));
-    }
 }
 
 fn tape_market_prefix(options: &TapeReplayOptions, market: &RawReplayMarket) -> PathBuf {
@@ -379,8 +362,8 @@ mod tests {
     }
 
     #[test]
-    fn packed_tape_replay_suppresses_non_top_book_deltas() {
-        let dir = tape_dir("suppresses-non-top");
+    fn packed_tape_replay_preserves_all_book_deltas() {
+        let dir = tape_dir("preserves-all");
         write_tape_fixture(
             &dir,
             &[
@@ -393,13 +376,19 @@ mod tests {
         );
 
         let events = replay_tape(dir.clone());
-        let book_prices: Vec<_> = events
+        let book_events: Vec<_> = events
             .iter()
             .filter(|event| event.event_type == EventType::BookDelta)
-            .map(|event| event.price.as_deref().unwrap())
             .collect();
 
-        assert_eq!(book_prices, vec!["0.5"]);
+        assert_eq!(
+            book_events
+                .iter()
+                .map(|event| event.price.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["0.49", "0.5"]
+        );
+        assert!(book_events.iter().all(|event| event.raw == Value::Null));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -421,6 +410,10 @@ mod tests {
             .collect();
 
         assert_eq!(book_prices, vec!["0.5", "0.51"]);
+        assert!(events
+            .iter()
+            .filter(|event| event.event_type == EventType::BookDelta)
+            .all(|event| event.raw == Value::Null));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -448,13 +441,12 @@ mod tests {
 
         let events = replay_tape(dir.clone());
 
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| event.event_type == EventType::BookDelta)
-                .count(),
-            0
-        );
+        let book_events = events
+            .iter()
+            .filter(|event| event.event_type == EventType::BookDelta)
+            .collect::<Vec<_>>();
+        assert_eq!(book_events.len(), 1);
+        assert_eq!(book_events[0].raw, Value::Null);
         assert_eq!(
             events
                 .iter()
