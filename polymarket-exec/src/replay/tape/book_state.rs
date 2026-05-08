@@ -50,7 +50,6 @@ impl BookState {
 
         let previous = self.top(event.leg);
         self.apply_level(event);
-        self.refresh_top(event.leg);
         previous != self.top(event.leg)
     }
 
@@ -75,21 +74,17 @@ impl BookState {
         };
 
         match (event.leg, event.side) {
-            (LEG_YES, SIDE_BID) => self.yes_bids[index] = size,
-            (LEG_YES, SIDE_ASK) => self.yes_asks[index] = size,
-            (LEG_NO, SIDE_BID) => self.no_bids[index] = size,
-            (LEG_NO, SIDE_ASK) => self.no_asks[index] = size,
-            _ => {}
-        }
-    }
-
-    fn refresh_top(&mut self, leg: u8) {
-        match leg {
-            LEG_YES => {
-                self.yes_top = top_from_levels(&self.yes_bids, &self.yes_asks);
+            (LEG_YES, SIDE_BID) => {
+                apply_side_level(&mut self.yes_bids, &mut self.yes_top, index, size, true);
             }
-            LEG_NO => {
-                self.no_top = top_from_levels(&self.no_bids, &self.no_asks);
+            (LEG_YES, SIDE_ASK) => {
+                apply_side_level(&mut self.yes_asks, &mut self.yes_top, index, size, false);
+            }
+            (LEG_NO, SIDE_BID) => {
+                apply_side_level(&mut self.no_bids, &mut self.no_top, index, size, true);
+            }
+            (LEG_NO, SIDE_ASK) => {
+                apply_side_level(&mut self.no_asks, &mut self.no_top, index, size, false);
             }
             _ => {}
         }
@@ -101,15 +96,75 @@ fn price_index(price_ticks: u32) -> Option<usize> {
     (index <= MAX_PRICE_TICKS).then_some(index)
 }
 
-fn top_from_levels(bids: &[u32; PRICE_LEVELS], asks: &[u32; PRICE_LEVELS]) -> TopOfBook {
-    let bid_price = bids.iter().rposition(|size| *size > 0).map(|idx| idx as u32);
-    let ask_price = asks.iter().position(|size| *size > 0).map(|idx| idx as u32);
+fn apply_side_level(
+    levels: &mut [u32; PRICE_LEVELS],
+    top: &mut TopOfBook,
+    index: usize,
+    size: u32,
+    is_bid: bool,
+) {
+    levels[index] = size;
 
-    TopOfBook {
-        bid_price_ticks: bid_price,
-        bid_size_lots: bid_price.map(|idx| bids[idx as usize]).unwrap_or(0),
-        ask_price_ticks: ask_price,
-        ask_size_lots: ask_price.map(|idx| asks[idx as usize]).unwrap_or(0),
+    if is_bid {
+        apply_best_bid_level(levels, top, index, size);
+    } else {
+        apply_best_ask_level(levels, top, index, size);
+    }
+}
+
+fn apply_best_bid_level(
+    levels: &[u32; PRICE_LEVELS],
+    top: &mut TopOfBook,
+    index: usize,
+    size: u32,
+) {
+    let price = index as u32;
+    if size > 0 {
+        if top.bid_price_ticks.map_or(true, |best| price >= best) {
+            top.bid_price_ticks = Some(price);
+            top.bid_size_lots = size;
+        }
+        return;
+    }
+
+    if top.bid_price_ticks == Some(price) {
+        if let Some(next_index) = levels[..index].iter().rposition(|level_size| *level_size > 0) {
+            top.bid_price_ticks = Some(next_index as u32);
+            top.bid_size_lots = levels[next_index];
+        } else {
+            top.bid_price_ticks = None;
+            top.bid_size_lots = 0;
+        }
+    }
+}
+
+fn apply_best_ask_level(
+    levels: &[u32; PRICE_LEVELS],
+    top: &mut TopOfBook,
+    index: usize,
+    size: u32,
+) {
+    let price = index as u32;
+    if size > 0 {
+        if top.ask_price_ticks.map_or(true, |best| price <= best) {
+            top.ask_price_ticks = Some(price);
+            top.ask_size_lots = size;
+        }
+        return;
+    }
+
+    if top.ask_price_ticks == Some(price) {
+        if let Some(offset) = levels[index + 1..]
+            .iter()
+            .position(|level_size| *level_size > 0)
+        {
+            let next_index = index + 1 + offset;
+            top.ask_price_ticks = Some(next_index as u32);
+            top.ask_size_lots = levels[next_index];
+        } else {
+            top.ask_price_ticks = None;
+            top.ask_size_lots = 0;
+        }
     }
 }
 
@@ -152,5 +207,92 @@ mod tests {
         }));
         assert_eq!(state.top(LEG_YES).bid_price_ticks, Some(5_000));
     }
-}
 
+    #[test]
+    fn updates_best_size_without_rescanning() {
+        let mut state = BookState::new();
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 1,
+            price_ticks: 5_000,
+            size_lots: 100,
+            leg: LEG_YES,
+            side: SIDE_BID,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
+        }));
+
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 2,
+            price_ticks: 5_000,
+            size_lots: 125,
+            leg: LEG_YES,
+            side: SIDE_BID,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
+        }));
+        assert_eq!(state.top(LEG_YES).bid_price_ticks, Some(5_000));
+        assert_eq!(state.top(LEG_YES).bid_size_lots, 125);
+    }
+
+    #[test]
+    fn delete_current_best_ask_promotes_next_best() {
+        let mut state = BookState::new();
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 1,
+            price_ticks: 5_100,
+            size_lots: 100,
+            leg: LEG_NO,
+            side: SIDE_ASK,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
+        }));
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 2,
+            price_ticks: 5_000,
+            size_lots: 50,
+            leg: LEG_NO,
+            side: SIDE_ASK,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
+        }));
+        assert_eq!(state.top(LEG_NO).ask_price_ticks, Some(5_000));
+        assert_eq!(state.top(LEG_NO).ask_size_lots, 50);
+
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 3,
+            price_ticks: 5_000,
+            size_lots: 0,
+            leg: LEG_NO,
+            side: SIDE_ASK,
+            event_type: EVENT_DELETE,
+            _pad: [0; 5],
+        }));
+        assert_eq!(state.top(LEG_NO).ask_price_ticks, Some(5_100));
+        assert_eq!(state.top(LEG_NO).ask_size_lots, 100);
+    }
+
+    #[test]
+    fn delete_non_best_level_does_not_change_top() {
+        let mut state = BookState::new();
+        assert!(state.apply(&BookEventV1 {
+            ts_ns: 1,
+            price_ticks: 5_000,
+            size_lots: 100,
+            leg: LEG_YES,
+            side: SIDE_BID,
+            event_type: EVENT_UPDATE,
+            _pad: [0; 5],
+        }));
+        assert!(!state.apply(&BookEventV1 {
+            ts_ns: 2,
+            price_ticks: 4_900,
+            size_lots: 0,
+            leg: LEG_YES,
+            side: SIDE_BID,
+            event_type: EVENT_DELETE,
+            _pad: [0; 5],
+        }));
+        assert_eq!(state.top(LEG_YES).bid_price_ticks, Some(5_000));
+        assert_eq!(state.top(LEG_YES).bid_size_lots, 100);
+    }
+}
