@@ -102,6 +102,21 @@ impl EventSynthesizer {
         out
     }
 
+    /// Emit any synthetic events due by the supplied replay timestamp.
+    /// The runner calls this at the end of a window so settlement does not
+    /// depend on an unrelated later market/reference event arriving after
+    /// the market close.
+    pub fn flush_due(&mut self, now_ns: i64) -> Vec<Event> {
+        let mut out = Vec::new();
+        self.emit_due_resolutions(now_ns, &mut out);
+        out.sort_by(|a, b| {
+            a.received_ns
+                .cmp(&b.received_ns)
+                .then_with(|| event_type_order(a.event_type).cmp(&event_type_order(b.event_type)))
+        });
+        out
+    }
+
     fn handle_market_meta(&mut self, event: &Event, out: &mut Vec<Event>) {
         let Some(slug) = event.market_slug.as_deref() else {
             return;
@@ -281,7 +296,7 @@ fn build_resolution_event(state: &MarketState, strike: f64, last_price: f64) -> 
         "winning_asset_id": winning_asset_id,
         "oracle_btc_price_at_close_usd": format!("{:.2}", last_price),
         "window_end_ts_ns": state.window_end_ns,
-        "resolution_source": "synthesizer_onchain_fills",
+        "resolution_source": "derived_from_market_strike_and_btc_close",
     });
     Event {
         v: 1,
@@ -457,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             r.raw.get("resolution_source").and_then(|v| v.as_str()),
-            Some("synthesizer_onchain_fills")
+            Some("derived_from_market_strike_and_btc_close")
         );
         assert_eq!(r.received_ns, WINDOW_END_NS);
     }
@@ -507,7 +522,7 @@ mod tests {
             .expect("resolution event present");
         assert_eq!(
             r.raw.get("resolution_source").and_then(|v| v.as_str()),
-            Some("synthesizer_onchain_fills")
+            Some("derived_from_market_strike_and_btc_close")
         );
         assert_eq!(
             r.raw.get("winning_outcome").and_then(|v| v.as_str()),
