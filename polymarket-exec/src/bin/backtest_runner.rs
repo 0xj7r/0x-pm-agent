@@ -47,7 +47,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use polymarket_exec::collector::schema::Event;
@@ -59,7 +59,9 @@ use polymarket_exec::replay::manifest::{
 };
 use polymarket_exec::replay::raw_parquet::{read_raw_replay, RawReplayMarket, RawReplayOptions};
 use polymarket_exec::replay::reader::read_local_filtered;
-use polymarket_exec::replay::runner::{run_run, RunnerConfig, WindowStatus, WindowSummary};
+use polymarket_exec::replay::runner::{
+    run_run_with_journal_mode, ReplayJournalMode, RunnerConfig, WindowStatus, WindowSummary,
+};
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
 use polymarket_exec::replay::tape::events::{read_tape_replay, TapeReplayOptions};
 use polymarket_exec::strategy_profile::StrategyProfile;
@@ -168,9 +170,30 @@ struct Cli {
     #[arg(long, default_value_t = 1_000.0)]
     starting_cash_usd: f64,
 
+    /// Replay journal persistence mode. `full` preserves audit-grade
+    /// per-event rows; `none` skips runner journal accumulation/writes for
+    /// faster large tape backtests.
+    #[arg(long, value_enum, default_value = "full")]
+    journal_mode: CliJournalMode,
+
     /// Plan + manifest only, skip replay.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliJournalMode {
+    Full,
+    None,
+}
+
+impl From<CliJournalMode> for ReplayJournalMode {
+    fn from(value: CliJournalMode) -> Self {
+        match value {
+            CliJournalMode::Full => ReplayJournalMode::Full,
+            CliJournalMode::None => ReplayJournalMode::None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -533,8 +556,12 @@ fn run_main(cli: Cli) -> Result<i32> {
     // `fill_quality` so two runs differing only on either knob produce
     // distinct run-ids.
     let combined_fill_config = format!(
-        "{}+{}+submit_ms={:?}+cancel_ms={:?}",
-        cli.fill_config, cli.fill_quality, cli.submit_latency_ms, cli.cancel_latency_ms
+        "{}+{}+submit_ms={:?}+cancel_ms={:?}+journal={:?}",
+        cli.fill_config,
+        cli.fill_quality,
+        cli.submit_latency_ms,
+        cli.cancel_latency_ms,
+        cli.journal_mode
     );
     let derived_run_id = compute_run_id(
         &canonical_profile,
@@ -599,10 +626,15 @@ fn run_main(cli: Cli) -> Result<i32> {
     // Load profile and instantiate the strategy adapter for each window.
     let profile = StrategyProfile::load(&cli.strategy_profile)
         .with_context(|| format!("load strategy profile {}", cli.strategy_profile.display()))?;
-    let mut summaries = match run_run(windows, &runner_cfg, |_, starting_cash_usd| {
-        ReplayStrategyAdapter::from_profile(profile.clone())
-            .with_starting_cash_usd(starting_cash_usd)
-    }) {
+    let mut summaries = match run_run_with_journal_mode(
+        windows,
+        &runner_cfg,
+        cli.journal_mode.into(),
+        |_, starting_cash_usd| {
+            ReplayStrategyAdapter::from_profile(profile.clone())
+                .with_starting_cash_usd(starting_cash_usd)
+        },
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("run aborted: {e}");
@@ -629,11 +661,15 @@ fn run_main(cli: Cli) -> Result<i32> {
         // window's contribution lands in `journal.parquet` exactly once.
         // The summary's `journal_events` is `skip_serializing` so the
         // JSON file does not double-record them.
-        journal_events.append(&mut std::mem::take(&mut s.journal_events));
+        if cli.journal_mode == CliJournalMode::Full {
+            journal_events.append(&mut std::mem::take(&mut s.journal_events));
+        }
     }
-    let journal_path = run_root.join("journal.parquet");
-    write_journal_parquet(&journal_path, &journal_events)
-        .with_context(|| format!("write journal {}", journal_path.display()))?;
+    if cli.journal_mode == CliJournalMode::Full {
+        let journal_path = run_root.join("journal.parquet");
+        write_journal_parquet(&journal_path, &journal_events)
+            .with_context(|| format!("write journal {}", journal_path.display()))?;
+    }
     let journal_event_count = journal_events.len();
 
     let summary = RunSummary {
