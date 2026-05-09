@@ -276,6 +276,21 @@ struct MetricsSummary {
     unmerged_pairable_qty: f64,
     stranded_qty_total: f64,
     stranded_cost_usd: f64,
+    /// Cost basis of stranded inventory bucketed by attribution path
+    /// (paired_mm / late_favorite_loading / cheap_tail_convexity / other).
+    /// Lets the caller separate "MM imbalance leak" from "intentional late
+    /// directional bet" instead of seeing only the totals.
+    #[serde(default)]
+    stranded_cost_by_path: BTreeMap<String, f64>,
+    #[serde(default)]
+    stranded_qty_by_path: BTreeMap<String, f64>,
+    /// Cost basis of inventory that resolved as the losing side, bucketed by
+    /// attribution path. Already counted negatively in realized_pnl_usd; this
+    /// surfaces the gross spend.
+    #[serde(default)]
+    expired_losing_cost_by_path: BTreeMap<String, f64>,
+    #[serde(default)]
+    expired_losing_qty_by_path: BTreeMap<String, f64>,
     settlement_status_counts: BTreeMap<String, u64>,
     fill_path: BTreeMap<String, FillAttribution>,
     fill_path_leg: BTreeMap<String, FillAttribution>,
@@ -824,6 +839,30 @@ fn compute_metrics_summary(
         out.unmerged_pairable_qty += settlement.unmerged_pairable_qty;
         out.stranded_qty_total += settlement.stranded_qty_total;
         out.stranded_cost_usd += settlement.stranded_cost_usd;
+        let attribution = &accounting.attribution;
+        for (label, bucket) in [
+            ("paired_mm", &attribution.paired_mm),
+            ("late_favorite_loading", &attribution.late_favorite_loading),
+            ("cheap_tail_convexity", &attribution.cheap_tail_convexity),
+            ("other", &attribution.other),
+        ] {
+            if bucket.stranded_cost_usd != 0.0 || bucket.stranded_qty != 0.0 {
+                *out.stranded_cost_by_path
+                    .entry(label.to_string())
+                    .or_insert(0.0) += bucket.stranded_cost_usd;
+                *out.stranded_qty_by_path
+                    .entry(label.to_string())
+                    .or_insert(0.0) += bucket.stranded_qty;
+            }
+            if bucket.expired_losing_cost_usd != 0.0 || bucket.expired_losing_qty != 0.0 {
+                *out.expired_losing_cost_by_path
+                    .entry(label.to_string())
+                    .or_insert(0.0) += bucket.expired_losing_cost_usd;
+                *out.expired_losing_qty_by_path
+                    .entry(label.to_string())
+                    .or_insert(0.0) += bucket.expired_losing_qty;
+            }
+        }
         *out.settlement_status_counts
             .entry(settlement.status.clone())
             .or_insert(0) += 1;

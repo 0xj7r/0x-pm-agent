@@ -574,6 +574,107 @@ mod replay_accounting_tests {
             raw: json!({ "type": "merge", "status": status, "size": size }),
         }
     }
+
+    #[test]
+    fn classify_tag_recognizes_production_client_order_id_prefixes() {
+        // Production strategy emits these exact prefixes; the classifier
+        // must work on raw client_order_ids when journal mode is `none` so
+        // attribution still buckets fills correctly without journal events.
+        assert_eq!(
+            classify_tag("paired-mm:btc-updown-5m-1777862100:yes:l1:1234"),
+            AttributionPath::PairedMm,
+        );
+        assert_eq!(
+            classify_tag("paired-mm-convex:btc-updown-5m-1777862100:yes:1234"),
+            AttributionPath::LateFavorite,
+        );
+        assert_eq!(
+            classify_tag("paired-mm-tail:btc-updown-5m-1777862100:no:1234"),
+            AttributionPath::CheapTailConvexity,
+        );
+        assert_eq!(
+            classify_tag("capital-recycle:btc-updown-5m-1777862100:1234"),
+            AttributionPath::PairedMm,
+        );
+        assert_eq!(
+            classify_tag("paired-mm-merge:btc-updown-5m-1777862100:1234"),
+            AttributionPath::PairedMm,
+        );
+    }
+
+    #[test]
+    fn unrealized_lots_bucket_stranded_cost_per_path() {
+        let events = vec![market_meta_event("UP", "DOWN")];
+        let fills = vec![
+            tagged_buy_fill(
+                "paired-mm:btc-updown-5m-1:yes:l1:1",
+                "UP",
+                0.40,
+                10.0,
+            ),
+            tagged_buy_fill(
+                "paired-mm-convex:btc-updown-5m-1:yes:1",
+                "UP",
+                0.55,
+                7.0,
+            ),
+        ];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let attribution = compute_pnl_attribution(
+            &events,
+            &fills,
+            &[],
+            &accounting,
+            FillQuality::Base,
+        );
+
+        assert!((attribution.paired_mm.stranded_cost_usd - 4.0).abs() < 1e-9);
+        assert!((attribution.paired_mm.stranded_qty - 10.0).abs() < 1e-9);
+        assert!(
+            (attribution.late_favorite_loading.stranded_cost_usd - 3.85).abs() < 1e-9,
+            "actual {}",
+            attribution.late_favorite_loading.stranded_cost_usd
+        );
+        assert!((attribution.late_favorite_loading.stranded_qty - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolution_buckets_expired_losing_cost_per_path() {
+        let events = vec![
+            market_meta_event("UP", "DOWN"),
+            resolution_outcome_event("Up", 0.0, 0.0),
+        ];
+        let fills = vec![
+            tagged_buy_fill(
+                "paired-mm:btc-updown-5m-1:no:l1:1",
+                "DOWN",
+                0.45,
+                10.0,
+            ),
+            tagged_buy_fill(
+                "paired-mm-convex:btc-updown-5m-1:no:1",
+                "DOWN",
+                0.60,
+                5.0,
+            ),
+        ];
+        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let attribution = compute_pnl_attribution(
+            &events,
+            &fills,
+            &[],
+            &accounting,
+            FillQuality::Base,
+        );
+
+        assert!((attribution.paired_mm.expired_losing_cost_usd - 4.5).abs() < 1e-9);
+        assert!((attribution.paired_mm.expired_losing_qty - 10.0).abs() < 1e-9);
+        assert!((attribution.late_favorite_loading.expired_losing_cost_usd - 3.0).abs() < 1e-9);
+        assert!((attribution.late_favorite_loading.expired_losing_qty - 5.0).abs() < 1e-9);
+        // Both losing buckets feed negative realized P&L.
+        assert!((attribution.paired_mm.realized_pnl_usd + 4.5).abs() < 1e-9);
+        assert!((attribution.late_favorite_loading.realized_pnl_usd + 3.0).abs() < 1e-9);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -634,6 +735,22 @@ pub struct ReplayPnlAttributionBucket {
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
     pub total_pnl_usd: f64,
+    /// Cost basis of inventory bought through this path that resolved as the
+    /// losing side. Already counted in `realized_pnl_usd` as a negative; this
+    /// surfaces the gross cost so callers can answer "how much did we *spend*
+    /// on losing late-convex bets" without subtracting from the P&L line.
+    #[serde(default)]
+    pub expired_losing_qty: f64,
+    #[serde(default)]
+    pub expired_losing_cost_usd: f64,
+    /// Inventory bought through this path that ended the window without a
+    /// resolution event observed. Marked-to-cost in `unrealized_pnl_usd`; this
+    /// pair lets callers separate "MM imbalance leak" from "intentional late
+    /// directional bet" by bucketing the cost basis per path.
+    #[serde(default)]
+    pub stranded_qty: f64,
+    #[serde(default)]
+    pub stranded_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1322,10 +1439,18 @@ fn classify_tag_pair(a: &str, b: &str) -> AttributionPath {
 
 fn classify_tag(tag: &str) -> AttributionPath {
     let tag = tag.to_ascii_lowercase();
-    if tag.contains("mm-paired-bid") || tag.contains("pairedentry") || tag.contains("paired_entry")
+    // Order matters: the convex / tail prefixes both start with `paired-mm-`,
+    // so check those first before falling through to the plain paired-mm
+    // ladder bucket.
+    if tag.contains("paired-mm-tail")
+        || tag.contains("ultra-cheap-tail")
+        || tag.contains("cheap-tail")
+        || tag.contains("cheap_tail")
+        || tag.contains("cheap-leg")
     {
-        AttributionPath::PairedMm
-    } else if tag.contains("late-bar-core")
+        AttributionPath::CheapTailConvexity
+    } else if tag.contains("paired-mm-convex")
+        || tag.contains("late-bar-core")
         || tag.contains("late_favorite")
         || tag.contains("late-favorite")
         || tag.contains("late favorite")
@@ -1333,12 +1458,14 @@ fn classify_tag(tag: &str) -> AttributionPath {
         || tag.contains("favorite-loading")
     {
         AttributionPath::LateFavorite
-    } else if tag.contains("cheap-tail")
-        || tag.contains("cheap_tail")
-        || tag.contains("cheap-leg")
-        || tag.contains("ultra-cheap-tail")
+    } else if tag.contains("mm-paired-bid")
+        || tag.contains("pairedentry")
+        || tag.contains("paired_entry")
+        || tag.contains("paired-mm:")
+        || tag.contains("paired-mm-merge")
+        || tag.contains("capital-recycle")
     {
-        AttributionPath::CheapTailConvexity
+        AttributionPath::PairedMm
     } else {
         AttributionPath::Other
     }
@@ -1423,6 +1550,24 @@ fn attribute_resolution(
                 })
                 .unwrap_or(0.0);
             summary.stranded_inventory_losses.expired_losing_cost_usd += losing_cost;
+            // Bucket the losing-side cost basis per path so callers can read
+            // "we spent $X on losing late-convex bets" directly.
+            if let Some(asset_lots) = lots.get(&asset_id) {
+                let mut per_path: BTreeMap<AttributionPath, (f64, f64)> = BTreeMap::new();
+                for lot in asset_lots {
+                    if lot.qty <= f64::EPSILON {
+                        continue;
+                    }
+                    let entry = per_path.entry(lot.path).or_insert((0.0, 0.0));
+                    entry.0 += lot.qty;
+                    entry.1 += lot.qty * lot.avg_cost;
+                }
+                for (path, (path_qty, path_cost)) in per_path {
+                    let bucket = path.bucket_mut(summary);
+                    bucket.expired_losing_qty += path_qty;
+                    bucket.expired_losing_cost_usd += path_cost;
+                }
+            }
         }
         total_pnl +=
             consume_lots_with_terminal_value(lots, &asset_id, qty, terminal_value, summary);
@@ -1478,7 +1623,13 @@ fn attribute_unrealized_lots(
             let cost = lot.qty * lot.avg_cost;
             let value = mark.map(|price| price * lot.qty).unwrap_or(0.0);
             let pnl = value - cost;
-            lot.path.bucket_mut(summary).unrealized_pnl_usd += pnl;
+            let bucket = lot.path.bucket_mut(summary);
+            bucket.unrealized_pnl_usd += pnl;
+            // Stranded = inventory still in lots after merges + resolution
+            // settled what they could. Bucket cost basis per path so callers
+            // can split MM imbalance from intentional directional bets.
+            bucket.stranded_qty += lot.qty;
+            bucket.stranded_cost_usd += cost;
             if mark.is_none() {
                 summary.stranded_inventory_losses.unresolved_cost_usd += cost;
             }
@@ -3402,4 +3553,5 @@ mod tests {
             AttributionPath::CheapTailConvexity
         );
     }
+
 }
