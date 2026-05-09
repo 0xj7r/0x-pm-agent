@@ -1002,13 +1002,31 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
         let queue_assumption = format!("{:?}", cfg.fill_sim.fill_quality);
         let mut accounting_events: Vec<Event> = Vec::with_capacity(events.len());
         for event in events {
-            // Synthesize any window-open / window-close markers triggered
-            // by this event and dispatch them through the strategy and
-            // simulator FIRST so the strategy sees, e.g., `price_to_beat`
-            // before the `market_meta` it derives from. The synthesizer
-            // is a pure function of prior events (no clock, no RNG) so
-            // determinism holds.
+            // Synthesise any window-open / window-close markers triggered
+            // by this event. Dispatch the input event FIRST and the synthetic
+            // events SECOND so causality matches: a `price_to_beat` derived
+            // from a fresh `market_meta` cannot reach the strategy before the
+            // `market_meta` itself, otherwise the adapter has no registered
+            // market to attach the strike to and `fair_value` never escapes
+            // NoSignal::StrikeInvalid (74352/74352 in the 2026-05-03 sweep).
             let synthetic_events = synthesizer.on_event(event);
+            dispatch_event(
+                strategy,
+                &mut sim,
+                event,
+                &mut intents_submitted,
+                &mut risk_rejections,
+                &mut journal_events,
+                capture_journal,
+                &mut accepted_fills,
+                &mut intent_remaining,
+                &mut accounting_events,
+                &queue_assumption,
+            );
+            if capture_journal {
+                emit_market_event_journal_rows(event, &mut journal_events);
+            }
+            accounting_events.push(event.clone());
             for synth in &synthetic_events {
                 dispatch_event(
                     strategy,
@@ -1028,23 +1046,6 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
                 }
                 accounting_events.push(synth.clone());
             }
-            dispatch_event(
-                strategy,
-                &mut sim,
-                event,
-                &mut intents_submitted,
-                &mut risk_rejections,
-                &mut journal_events,
-                capture_journal,
-                &mut accepted_fills,
-                &mut intent_remaining,
-                &mut accounting_events,
-                &queue_assumption,
-            );
-            if capture_journal {
-                emit_market_event_journal_rows(event, &mut journal_events);
-            }
-            accounting_events.push(event.clone());
         }
         for synth in synthesizer.flush_due(i64::MAX) {
             dispatch_event(

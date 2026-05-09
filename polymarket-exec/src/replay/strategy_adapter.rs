@@ -602,6 +602,44 @@ impl ReplayStrategyAdapter {
         }
     }
 
+    /// Apply a synthesised `price_to_beat` to the matching registered market
+    /// so the fair-value model has a finite strike to plug into the BSM
+    /// formula. Without this the late-asymmetric-convex overlay never fires
+    /// because every fair-value evaluation falls back to NoSignal::StrikeInvalid.
+    fn handle_price_to_beat(&mut self, event: &Event) {
+        let Some(market_slug) = event.market_slug.as_deref() else {
+            return;
+        };
+        let raw = &event.raw;
+        // Prefer an explicit `strike` (live data API path); fall back to the
+        // synthesizer's `btc_price_at_window_open_usd` because btc-updown-5m
+        // markets do not carry a fixed strike in the metadata - the strike IS
+        // the BTC price at window open.
+        let strike = raw
+            .get("strike")
+            .and_then(|v| v.as_f64())
+            .or_else(|| {
+                raw.get("btc_price_at_window_open_usd")
+                    .and_then(|v| match v {
+                        serde_json::Value::Number(n) => n.as_f64(),
+                        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                        _ => None,
+                    })
+            });
+        let Some(strike) = strike.filter(|p| p.is_finite() && *p > 0.0) else {
+            return;
+        };
+        let market_id = MarketId::new(market_slug);
+        if let Some(market) = self.markets.get_mut(&market_id) {
+            market.price_to_beat = Some(strike);
+            crate::market_making::paired_mm::engine::PRICE_TO_BEAT_DELIVERED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::market_making::paired_mm::engine::PRICE_TO_BEAT_NO_MARKET
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn handle_market_meta(&mut self, event: &Event) {
         let Some(market_slug) = event.market_slug.as_deref() else {
             return;
@@ -1359,6 +1397,10 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         match event.event_type {
             EventType::MarketMeta => {
                 self.handle_market_meta(event);
+                return ReplayDecision::default();
+            }
+            EventType::PriceToBeat => {
+                self.handle_price_to_beat(event);
                 return ReplayDecision::default();
             }
             EventType::BookSnapshot | EventType::BookDelta | EventType::Trade => {

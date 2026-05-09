@@ -25,6 +25,10 @@ impl MarketRegistry {
         self.markets.get(market_id)
     }
 
+    pub fn get_mut(&mut self, market_id: &MarketId) -> Option<&mut BinaryOutcomeMarket> {
+        self.markets.get_mut(market_id)
+    }
+
     pub fn active_at(&self, now_ms: u64) -> Vec<&BinaryOutcomeMarket> {
         self.markets
             .values()
