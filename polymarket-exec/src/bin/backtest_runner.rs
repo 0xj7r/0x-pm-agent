@@ -839,6 +839,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         summary.windows.len(),
         journal_event_count
     );
+    polymarket_exec::market_making::paired_mm::engine::print_convex_overlay_gate_counts();
     Ok(if had_failure { 4 } else { 0 })
 }
 

@@ -6,6 +6,8 @@
 //! 2. entry ladders are generated only when hard risk state permits,
 //! 3. all output remains proposed intents for the runtime hard risk boundary.
 
+use std::sync::atomic::AtomicU64;
+
 use crate::market_making::paired_mm::fill_automation::{
     AutoFillConfig, AutoFillDecision, AutoFillState,
 };
@@ -435,6 +437,117 @@ fn derive_tick_rescue_inputs(
     }
 }
 
+/// Diagnostic counters for late-asymmetric-convex gate rejections. These
+/// are global so the rayon-parallel replay can write into them without
+/// threading state through every strategy call. Dumped via
+/// `print_convex_overlay_gate_counts` at the end of a run so we can see
+/// which gate is dropping the late-favourite path on real data.
+static CONVEX_GATE_DISABLED: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_OUTSIDE_LATE_WINDOW: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_PROB_BELOW_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_FAVORITE_OPEN_FULL: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_BAD_PASSIVE_PRICE: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_EDGE_TOO_THIN: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_PLAN_REJECTED: AtomicU64 = AtomicU64::new(0);
+static CONVEX_GATE_PASSED: AtomicU64 = AtomicU64::new(0);
+/// Within-late-window p_max histogram (max(p_up, p_down) at decision time).
+/// Granularity: 0.05 buckets from 0.50 upward. Tells us whether fair-value
+/// is producing actionable directional signal in the convex eligibility
+/// window without flooding stderr with per-event prints.
+static CONVEX_PMAX_50_55: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_55_60: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_60_65: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_65_70: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_70_75: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_75_80: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_80_85: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_85_90: AtomicU64 = AtomicU64::new(0);
+static CONVEX_PMAX_90_PLUS: AtomicU64 = AtomicU64::new(0);
+/// Counts of fair-value model branches reached during late-window evaluation.
+static CONVEX_FAIR_NOSIGNAL: AtomicU64 = AtomicU64::new(0);
+static CONVEX_FAIR_BSM: AtomicU64 = AtomicU64::new(0);
+static CONVEX_FAIR_STEP: AtomicU64 = AtomicU64::new(0);
+/// NoSignal reason buckets: which input was missing/invalid when fair-value
+/// fell back. Spot = BTC last price; Strike = market.price_to_beat;
+/// Vol = regime.realized_vol_5m_bps; Time = remaining seconds.
+static CONVEX_NOSIGNAL_SPOT: AtomicU64 = AtomicU64::new(0);
+static CONVEX_NOSIGNAL_STRIKE: AtomicU64 = AtomicU64::new(0);
+static CONVEX_NOSIGNAL_VOL: AtomicU64 = AtomicU64::new(0);
+static CONVEX_NOSIGNAL_TIME: AtomicU64 = AtomicU64::new(0);
+
+/// PriceToBeat delivery counters: did the synthesised PriceToBeat events
+/// reach the registered market and update its strike?
+pub static PRICE_TO_BEAT_DELIVERED: AtomicU64 = AtomicU64::new(0);
+pub static PRICE_TO_BEAT_NO_MARKET: AtomicU64 = AtomicU64::new(0);
+
+pub fn print_convex_overlay_gate_counts() {
+    let load = |a: &AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "convex_overlay_gates disabled={} outside_late_window={} prob_below_threshold={} favorite_open_full={} bad_passive_price={} edge_too_thin={} plan_rejected={} passed={}",
+        load(&CONVEX_GATE_DISABLED),
+        load(&CONVEX_GATE_OUTSIDE_LATE_WINDOW),
+        load(&CONVEX_GATE_PROB_BELOW_THRESHOLD),
+        load(&CONVEX_GATE_FAVORITE_OPEN_FULL),
+        load(&CONVEX_GATE_BAD_PASSIVE_PRICE),
+        load(&CONVEX_GATE_EDGE_TOO_THIN),
+        load(&CONVEX_GATE_PLAN_REJECTED),
+        load(&CONVEX_GATE_PASSED),
+    );
+    eprintln!(
+        "convex_late_window_pmax_buckets 0.50-0.55={} 0.55-0.60={} 0.60-0.65={} 0.65-0.70={} 0.70-0.75={} 0.75-0.80={} 0.80-0.85={} 0.85-0.90={} 0.90+={}",
+        load(&CONVEX_PMAX_50_55),
+        load(&CONVEX_PMAX_55_60),
+        load(&CONVEX_PMAX_60_65),
+        load(&CONVEX_PMAX_65_70),
+        load(&CONVEX_PMAX_70_75),
+        load(&CONVEX_PMAX_75_80),
+        load(&CONVEX_PMAX_80_85),
+        load(&CONVEX_PMAX_85_90),
+        load(&CONVEX_PMAX_90_PLUS),
+    );
+    eprintln!(
+        "convex_late_window_fair_value_model nosignal={} bsm={} step={}",
+        load(&CONVEX_FAIR_NOSIGNAL),
+        load(&CONVEX_FAIR_BSM),
+        load(&CONVEX_FAIR_STEP),
+    );
+    eprintln!(
+        "convex_late_window_nosignal_reasons spot={} strike={} vol={} time={}",
+        load(&CONVEX_NOSIGNAL_SPOT),
+        load(&CONVEX_NOSIGNAL_STRIKE),
+        load(&CONVEX_NOSIGNAL_VOL),
+        load(&CONVEX_NOSIGNAL_TIME),
+    );
+    eprintln!(
+        "price_to_beat delivered={} no_market_match={}",
+        load(&PRICE_TO_BEAT_DELIVERED),
+        load(&PRICE_TO_BEAT_NO_MARKET),
+    );
+}
+
+fn record_convex_pmax(p_max: f64) {
+    let bucket = if p_max < 0.55 {
+        &CONVEX_PMAX_50_55
+    } else if p_max < 0.60 {
+        &CONVEX_PMAX_55_60
+    } else if p_max < 0.65 {
+        &CONVEX_PMAX_60_65
+    } else if p_max < 0.70 {
+        &CONVEX_PMAX_65_70
+    } else if p_max < 0.75 {
+        &CONVEX_PMAX_70_75
+    } else if p_max < 0.80 {
+        &CONVEX_PMAX_75_80
+    } else if p_max < 0.85 {
+        &CONVEX_PMAX_80_85
+    } else if p_max < 0.90 {
+        &CONVEX_PMAX_85_90
+    } else {
+        &CONVEX_PMAX_90_PLUS
+    };
+    bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn choose_convex_overlay<M: MarketDescriptor>(
     market: &M,
     snapshot: &PairedMarketSnapshot,
@@ -448,6 +561,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     now_ms: EpochMillis,
 ) -> Vec<OrderIntent> {
     if !config.enabled {
+        CONVEX_GATE_DISABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
     let remaining_ms = market
@@ -462,7 +576,29 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         .saturating_mul(1_000)
         .max(start_frac_late_ms);
     if remaining_ms > late_threshold_ms {
+        CONVEX_GATE_OUTSIDE_LATE_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
+    }
+
+    let p_max = fair_value.p_up.max(fair_value.p_down);
+    record_convex_pmax(p_max);
+    match fair_value.model {
+        crate::signals::FairValueModel::NoSignal(reason) => {
+            CONVEX_FAIR_NOSIGNAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let bucket = match reason {
+                crate::signals::fair_value::NoSignalReason::SpotInvalid => &CONVEX_NOSIGNAL_SPOT,
+                crate::signals::fair_value::NoSignalReason::StrikeInvalid => &CONVEX_NOSIGNAL_STRIKE,
+                crate::signals::fair_value::NoSignalReason::VolInvalid => &CONVEX_NOSIGNAL_VOL,
+                crate::signals::fair_value::NoSignalReason::TimeRemainingInvalid => &CONVEX_NOSIGNAL_TIME,
+            };
+            bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::signals::FairValueModel::BsmBinary => {
+            CONVEX_FAIR_BSM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        crate::signals::FairValueModel::StepFunctionDecided => {
+            CONVEX_FAIR_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     let (favorite, tail) = if fair_value.p_up >= config.convex_p_threshold {
@@ -500,11 +636,13 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             ),
         )
     } else {
+        CONVEX_GATE_PROB_BELOW_THRESHOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     };
 
     let max_active_per_leg = config.max_active_orders_per_leg.max(1);
     if favorite.open_count >= max_active_per_leg {
+        CONVEX_GATE_FAVORITE_OPEN_FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
     let pressure_bias = apply_side_score_to_pressure_bias(
@@ -518,10 +656,12 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     let Some((favorite_limit_price, favorite_best_ask)) =
         passive_buy_price(favorite.quote, tick_size, config.maker_safety_ticks)
     else {
+        CONVEX_GATE_BAD_PASSIVE_PRICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     };
     let favorite_edge = favorite.win_prob - favorite_limit_price;
     if favorite_edge * 10_000.0 < config.min_favorite_edge_bps.max(0.0) {
+        CONVEX_GATE_EDGE_TOO_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
 
@@ -534,6 +674,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     let total_budget = config.max_loss_usd.max(0.0);
     let remaining_excess_budget = total_budget - existing_cost;
     if remaining_excess_budget <= 0.0 {
+        CONVEX_GATE_PLAN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
 
