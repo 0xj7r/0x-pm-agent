@@ -174,6 +174,13 @@ struct Cli {
     #[arg(long, default_value_t = 1_000.0)]
     starting_cash_usd: f64,
 
+    /// Maker rebate in basis points credited per maker fill. Polymarket's
+    /// dynamic-taker-fee redistribution paid us measurable USDC in 2026-04;
+    /// /rebates/current shows ~10 bps blended on btc_5m_mm. Default 0
+    /// preserves prior accounting.
+    #[arg(long, default_value_t = 0.0)]
+    maker_rebate_bps: f64,
+
     /// Replay journal persistence mode. `full` preserves audit-grade
     /// per-event rows; `none` skips runner journal accumulation/writes for
     /// faster large tape backtests.
@@ -732,6 +739,7 @@ fn run_main(cli: Cli) -> Result<i32> {
         },
         max_window_failures: cli.max_window_failures,
         starting_cash_usd: cli.starting_cash_usd,
+        maker_rebate_bps: cli.maker_rebate_bps,
     };
 
     // Load profile and instantiate the strategy adapter for each window.
