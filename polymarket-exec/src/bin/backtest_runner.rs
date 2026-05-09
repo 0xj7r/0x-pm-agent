@@ -40,7 +40,7 @@
 //!   4 partial (>= 1 window failed but under threshold)
 //!   5 unrecoverable
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -447,7 +447,39 @@ fn replay_window_id(event: &Event, market_type: &str, dt: &str) -> String {
 fn group_events_into_windows(events: Vec<Event>, cli: &Cli) -> BTreeMap<String, Vec<Event>> {
     let market_filter = parse_market_filter(&cli.market_filter);
     let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();
-    let target_market_window_ids = tape_target_market_window_ids(cli);
+    let mut target_market_window_ids = tape_target_market_window_ids(cli);
+    // For rust-event input the caller does not supply an explicit market list,
+    // but btc_ref ticks still need to be fanned into every per-market window
+    // so the signal layer can compute realized vol per market. Discover the
+    // window ids from non-btc_ref events first, then use that set for the
+    // tick fan-out below.
+    if cli.input_format == "rust-event" && target_market_window_ids.is_empty() {
+        let mut discovered: BTreeSet<String> = BTreeSet::new();
+        for e in &events {
+            if !event_matches_market_filter(e, &market_filter) {
+                continue;
+            }
+            if matches!(e.market_type.as_str(), "btc_ref" | "reference") {
+                continue;
+            }
+            let Some(slug) = e
+                .market_slug
+                .as_deref()
+                .filter(|s| !s.is_empty() && *s != "btcusdt")
+            else {
+                continue;
+            };
+            let dt = chrono::Utc
+                .timestamp_opt(e.received_ns / 1_000_000_000, 0)
+                .single()
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "1970-01-01".to_string());
+            for market_type in target_window_market_types(e, &market_filter) {
+                discovered.insert(format!("{market_type}/{dt}/{slug}"));
+            }
+        }
+        target_market_window_ids = discovered.into_iter().collect();
+    }
     for e in events {
         if !event_matches_market_filter(&e, &market_filter) {
             continue;
