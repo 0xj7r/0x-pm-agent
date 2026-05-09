@@ -428,9 +428,44 @@ fn replay_window_ids(
                 return vec![owned_window];
             }
         }
-        return target_market_window_ids.to_vec();
+        // Restrict tick fan-out to windows whose strike-derived
+        // [start_ns, end_ns] interval covers the tick's received_ns.
+        // Without this gate every BTC tick lands in every market window
+        // (~400k ticks * ~300 markets = ~120M tick deliveries) which is
+        // a 100x over-replication of the data the strategy actually needs.
+        return target_market_window_ids
+            .iter()
+            .filter(|wid| btc5m_window_contains(wid, event.received_ns))
+            .cloned()
+            .collect();
     }
     vec![replay_window_id(event, market_type, dt)]
+}
+
+/// For a btc_5m window id of the form `btc_5m/<dt>/btc-updown-5m-<strike_epoch_s>`,
+/// derive the 5-minute strike interval and check whether `received_ns` falls
+/// inside an extended pre-strike window covering the strategy's vol/return
+/// lookback (45m max in `runtime::btc_signals`) plus the 5-minute trading
+/// interval itself. Returns true (default-allow) for any window id that does
+/// not follow the binary slug convention so non-btc_5m callers are not
+/// silently filtered.
+fn btc5m_window_contains(window_id: &str, received_ns: i64) -> bool {
+    let Some(slug) = window_id.rsplit('/').next() else {
+        return true;
+    };
+    let Some(strike_str) = slug.strip_prefix("btc-updown-5m-") else {
+        return true;
+    };
+    let Ok(strike_epoch_s) = strike_str.parse::<i64>() else {
+        return true;
+    };
+    let end_ns = strike_epoch_s.saturating_mul(1_000_000_000);
+    // Lookback = 45 min vol/return retention + 5 min trade interval.
+    // Without the 45 min warmup, realized_vol_5m / 15m read empty buffers
+    // for the first half of the window and fair-value falls back to the
+    // book-mid no-signal path.
+    let start_ns = end_ns.saturating_sub(50 * 60 * 1_000_000_000);
+    received_ns >= start_ns && received_ns < end_ns
 }
 
 fn replay_window_id(event: &Event, market_type: &str, dt: &str) -> String {
