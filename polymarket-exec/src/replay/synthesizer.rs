@@ -213,6 +213,16 @@ impl EventSynthesizer {
         // any tick at all, or (b) the tick predates window_start by some
         // amount (we accept it as the best available oracle sample).
         let emit_at_ns = state.window_start_ns.max(now_ns).max(tick_ns);
+        // Persist the BTC tick price as the de facto strike when the
+        // market metadata did not carry one. btc-updown-5m markets do
+        // not declare a fixed strike; the strike IS the BTC price at
+        // window open, and emit_due_resolutions later needs it to pick
+        // a winner. Without this state.strike stays None and every
+        // window resolves with no winner_asset_id, so stranded
+        // inventory cannot be marked to its realised outcome.
+        if state.strike.is_none() && tick_price.is_finite() && tick_price > 0.0 {
+            state.strike = Some(tick_price);
+        }
         let event = build_price_to_beat_event(state, tick_ns, tick_price, emit_at_ns);
         state.emitted_price_to_beat = true;
         state.price_to_beat_pending = false;
