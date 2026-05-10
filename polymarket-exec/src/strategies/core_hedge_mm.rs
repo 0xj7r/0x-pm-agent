@@ -20,7 +20,7 @@ use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::StrategyDecision;
+use crate::types::{MergeIntent, StrategyDecision};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
@@ -45,6 +45,10 @@ pub struct CoreHedgeMmConfig {
     pub maker_improve_ticks: f64,
     /// Floor on per-order USD notional.
     pub min_order_usd: f64,
+    /// Minimum paired inventory (min(yes_qty, no_qty)) that triggers a
+    /// merge intent on the next tick. Whale data (493 paired windows)
+    /// shows first merge ~30s after entry, so we want a low threshold.
+    pub merge_min_qty: f64,
 }
 
 impl Default for CoreHedgeMmConfig {
@@ -61,6 +65,7 @@ impl Default for CoreHedgeMmConfig {
             hedge_clip_usd: 5.0,
             maker_improve_ticks: 0.0,
             min_order_usd: 1.0,
+            merge_min_qty: 1.0,
         }
     }
 }
@@ -206,6 +211,48 @@ where
         if !cfg.enabled {
             return StrategyDecision::Noop {
                 notes: vec!["core_hedge disabled".to_string()],
+            };
+        }
+
+        // Merge planner: if paired inventory exists, recycle it BEFORE
+        // posting new entry intents. Whale pattern (unlawful) merges
+        // ~14x per window with first merge ~30s after entry. Without
+        // this the strategy accumulates paired inventory and bleeds
+        // when the favorite resolves (97% of bars at deep tier).
+        let paired_qty = input.inventory.yes_qty.min(input.inventory.no_qty);
+        if paired_qty >= cfg.merge_min_qty {
+            let yes_avg = input.inventory.yes_avg_cost.max(0.0);
+            let no_avg = input.inventory.no_avg_cost.max(0.0);
+            let expected_cost_usd = paired_qty * (yes_avg + no_avg);
+            let expected_cash_usd = paired_qty;
+            let merge_intent = MergeIntent {
+                command_id: ClientOrderId::new(format!(
+                    "core-hedge-merge:{}:{}",
+                    input.market.market_id(),
+                    input.now_ms,
+                )),
+                market_id: input.market.market_id().clone(),
+                condition_id: None,
+                yes_instrument_id: input.market.yes_instrument_id().clone(),
+                no_instrument_id: input.market.no_instrument_id().clone(),
+                quantity: paired_qty,
+                expected_cash_usd,
+                expected_cost_usd,
+                expected_fee_usd: 0.0,
+                expected_gas_usd: 0.0,
+                reason: format!(
+                    "core_hedge merge paired_qty={:.4} expected_net={:.4}",
+                    paired_qty,
+                    expected_cash_usd - expected_cost_usd
+                ),
+                created_at_ms: input.now_ms,
+            };
+            return StrategyDecision::Merge {
+                intent: merge_intent,
+                notes: vec![format!(
+                    "core_hedge merging paired_qty={:.4} cost={:.2} cash={:.2}",
+                    paired_qty, expected_cost_usd, expected_cash_usd
+                )],
             };
         }
 
