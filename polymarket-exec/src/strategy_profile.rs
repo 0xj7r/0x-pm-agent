@@ -96,6 +96,7 @@ pub struct CoreHedgeSection {
     pub hedge_clip_usd: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
+    pub merge_min_qty: Option<f64>,
 }
 
 impl StrategyProfile {
@@ -279,6 +280,7 @@ impl StrategyProfile {
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
                 min_order_usd: s.min_order_usd.unwrap_or(defaults.min_order_usd),
+                merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
             },
         }
     }
