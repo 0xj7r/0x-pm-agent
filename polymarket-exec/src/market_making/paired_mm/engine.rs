@@ -49,6 +49,11 @@ pub struct ConvexityOverlayConfig {
     pub start_frac: f64,
     pub capital_pct: f64,
     pub fractional_kelly: f64,
+    /// Total convex package budget (favorite + tail). Hard cap on total
+    /// convex-attributed open orders. Single shared pool: each leg sizes
+    /// from its own edge logic; package is fit-to-budget with priority
+    /// going to the leg that needs to rebalance (tail-stranded → favorite
+    /// priority; favorite-stranded → tail priority; otherwise proportional).
     pub max_loss_usd: f64,
     pub max_book_take_pct: f64,
     pub min_order_usd: f64,
@@ -671,17 +676,15 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     let existing_ev = favorite.win_prob * effective_favorite_qty
         + tail.win_prob * effective_tail_qty
         - existing_cost;
-    // Budget gate uses only convex-attributed open orders, not paired-MM
-    // inventory. Otherwise paired-MM accumulating favorite-side fills (which
-    // it does aggressively under whale-tuned configs) suppresses convex
-    // before it ever has a chance to fire. The `existing_cost` above (full
-    // position) is correct for the EV calculation; this gate just needs to
-    // know what convex itself has already spent.
+    // Budget gate is on the SHARED convex pool (max_loss_usd), counted only
+    // against convex-attributed open orders — paired-MM inventory is sunk
+    // cost and never enters the convex sizing decision (per-bar EV is
+    // independent of stranded losses).
     let convex_attributed_cost =
         favorite.convex_attributed_cost_usd() + tail.convex_attributed_cost_usd();
-    let total_budget = config.max_loss_usd.max(0.0);
-    let remaining_excess_budget = total_budget - convex_attributed_cost;
-    if remaining_excess_budget <= 0.0 {
+    let convex_remaining_budget =
+        (config.max_loss_usd.max(0.0) - convex_attributed_cost).max(0.0);
+    if convex_remaining_budget <= 0.0 {
         CONVEX_GATE_PLAN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
@@ -708,7 +711,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             effective_tail_qty,
             existing_cost,
             existing_ev,
-            remaining_excess_budget,
+            convex_remaining_budget,
             favorite_depth_usd,
             tail_depth_usd,
             market.min_order_size(),
@@ -818,7 +821,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         effective_tail_qty,
         existing_cost,
         existing_ev,
-        remaining_excess_budget,
+        convex_remaining_budget,
         favorite_depth_usd,
         market.min_order_size(),
         btc_regime.regime(),
@@ -1121,7 +1124,7 @@ fn choose_late_asymmetric_package(
     existing_tail_qty: f64,
     existing_cost: f64,
     existing_ev: f64,
-    remaining_budget_usd: f64,
+    convex_remaining_budget: f64,
     favorite_depth_usd: f64,
     tail_depth_usd: f64,
     min_order_size: f64,
@@ -1129,6 +1132,7 @@ fn choose_late_asymmetric_package(
     pressure_bias: ConvexPressureBias,
     config: ConvexityOverlayConfig,
 ) -> Option<LateAsymmetricPackagePlan> {
+    let remaining_budget_usd = convex_remaining_budget.max(0.0);
     if remaining_budget_usd <= 0.0 || favorite_price <= 0.0 || tail_price <= 0.0 {
         return None;
     }
@@ -1179,9 +1183,12 @@ fn choose_late_asymmetric_package(
         .max(favorite_confidence_budget)
         .max(per_leg_floor)
         * pressure_bias.favorite_scale;
-    favorite_notional = favorite_notional
-        .min(favorite_depth_cap)
-        .min((remaining_budget_usd - per_leg_floor).max(0.0));
+    // v4: each leg sizes from its own edge logic, capped only by book
+    // depth. Total package vs. shared convex pool is enforced via
+    // proportional scaling below — so the favorite (whale-style late
+    // accumulation) can fully consume the budget when tail can't fire,
+    // and vice versa, without sub-pool starvation.
+    favorite_notional = favorite_notional.min(favorite_depth_cap);
 
     if matches!(regime, Some(BtcRegime::Whipsaw)) {
         favorite_notional *= 0.90;
@@ -1191,7 +1198,7 @@ fn choose_late_asymmetric_package(
         let share_deficit_cost =
             (existing_tail_qty - existing_favorite_qty).max(0.0) * favorite_price;
         favorite_notional = favorite_notional
-            .max(share_deficit_cost.min(remaining_budget_usd - per_leg_floor))
+            .max(share_deficit_cost.min(remaining_budget_usd))
             .min(favorite_depth_cap);
     } else if favorite_stranded {
         favorite_notional = favorite_notional.min(per_leg_floor.max(config.min_order_usd));
@@ -1217,9 +1224,37 @@ fn choose_late_asymmetric_package(
         .max(tail_edge_notional)
         .max(per_leg_floor)
         * pressure_bias.tail_scale;
-    let tail_notional = desired_tail_notional
-        .min(tail_depth_cap)
-        .min((remaining_budget_usd - favorite_notional).max(0.0));
+    // v4: tail also sizes from its own logic, capped by book depth.
+    // Shared convex pool enforced via proportional scaling below.
+    let mut tail_notional = desired_tail_notional.min(tail_depth_cap);
+    // Fit the package to the shared convex pool. When one leg is stranded,
+    // the OTHER leg has the rebalancing intent (tail stranded → buy more
+    // favorite to balance shares; favorite stranded → buy more tail) so we
+    // give it pool priority. Otherwise scale both proportionally so neither
+    // is starved by the other's Kelly sizing.
+    let total_intent = favorite_notional + tail_notional;
+    if total_intent > remaining_budget_usd && total_intent > 0.0 {
+        // Reserve a per-leg floor for the non-priority leg so the package
+        // remains viable (both legs >= min_order_usd) — otherwise the
+        // priority leg consumes the whole pool and the package returns None.
+        if tail_stranded {
+            let tail_reserve = per_leg_floor.min(tail_notional);
+            let fav_cap = favorite_notional.min((remaining_budget_usd - tail_reserve).max(0.0));
+            let tail_cap = (remaining_budget_usd - fav_cap).max(0.0).min(tail_notional);
+            favorite_notional = fav_cap;
+            tail_notional = tail_cap;
+        } else if favorite_stranded {
+            let fav_reserve = per_leg_floor.min(favorite_notional);
+            let tail_cap = tail_notional.min((remaining_budget_usd - fav_reserve).max(0.0));
+            let fav_cap = (remaining_budget_usd - tail_cap).max(0.0).min(favorite_notional);
+            favorite_notional = fav_cap;
+            tail_notional = tail_cap;
+        } else {
+            let scale = remaining_budget_usd / total_intent;
+            favorite_notional *= scale;
+            tail_notional *= scale;
+        }
+    }
     if favorite_notional < config.min_order_usd && tail_notional < config.min_order_usd {
         return None;
     }
