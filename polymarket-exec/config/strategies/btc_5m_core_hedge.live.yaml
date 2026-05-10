@@ -22,3 +22,4 @@ core_hedge:
   hedge_clip_usd: 5.0
   maker_improve_ticks: 0.0
   min_order_usd: 1.0
+  merge_min_qty: 1.0
