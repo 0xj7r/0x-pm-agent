@@ -14,6 +14,7 @@ use crate::market_making::paired_mm::{
 };
 use crate::quote_engine::QuoteEngineConfig;
 use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
+use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
 
@@ -40,8 +41,25 @@ pub struct StrategyProfile {
     pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
     pub operational: OperationalSection,
+    pub core_hedge: CoreHedgeSection,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CoreHedgeSection {
+    pub enabled: Option<bool>,
+    pub cheap_leg_max_price: Option<f64>,
+    pub expensive_leg_min_price: Option<f64>,
+    pub expensive_leg_max_price: Option<f64>,
+    pub min_price_gap: Option<f64>,
+    pub bar_capital_usd: Option<f64>,
+    pub target_hedge_ratio: Option<f64>,
+    pub core_clip_usd: Option<f64>,
+    pub hedge_clip_usd: Option<f64>,
+    pub maker_improve_ticks: Option<f64>,
+    pub min_order_usd: Option<f64>,
 }
 
 impl StrategyProfile {
@@ -197,6 +215,36 @@ impl StrategyProfile {
             .rehedge_pair_cost_threshold
             .unwrap_or(config.rescue_rehedge_pair_cost_threshold);
         config
+    }
+
+    pub fn core_hedge_mm_config(&self) -> CoreHedgeMmStrategyConfig {
+        let defaults = CoreHedgeMmConfig::default();
+        let s = &self.core_hedge;
+        CoreHedgeMmStrategyConfig {
+            core_hedge: CoreHedgeMmConfig {
+                enabled: s.enabled.unwrap_or(defaults.enabled),
+                cheap_leg_max_price: s
+                    .cheap_leg_max_price
+                    .unwrap_or(defaults.cheap_leg_max_price),
+                expensive_leg_min_price: s
+                    .expensive_leg_min_price
+                    .unwrap_or(defaults.expensive_leg_min_price),
+                expensive_leg_max_price: s
+                    .expensive_leg_max_price
+                    .unwrap_or(defaults.expensive_leg_max_price),
+                min_price_gap: s.min_price_gap.unwrap_or(defaults.min_price_gap),
+                bar_capital_usd: s.bar_capital_usd.unwrap_or(defaults.bar_capital_usd),
+                target_hedge_ratio: s
+                    .target_hedge_ratio
+                    .unwrap_or(defaults.target_hedge_ratio),
+                core_clip_usd: s.core_clip_usd.unwrap_or(defaults.core_clip_usd),
+                hedge_clip_usd: s.hedge_clip_usd.unwrap_or(defaults.hedge_clip_usd),
+                maker_improve_ticks: s
+                    .maker_improve_ticks
+                    .unwrap_or(defaults.maker_improve_ticks),
+                min_order_usd: s.min_order_usd.unwrap_or(defaults.min_order_usd),
+            },
+        }
     }
 
     pub fn paired_mm_config(&self) -> PairedMmStrategyConfig {

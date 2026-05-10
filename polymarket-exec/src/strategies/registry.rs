@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::markets::MarketDescriptor;
+use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig};
 use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
 use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
@@ -27,6 +28,7 @@ impl StrategyKey {
 pub enum RegisteredStrategy {
     PairedMm(PairedMmStrategy),
     PairCostArb(PairCostArbStrategy),
+    CoreHedgeMm(CoreHedgeMmStrategy),
 }
 
 impl RegisteredStrategy {
@@ -36,6 +38,9 @@ impl RegisteredStrategy {
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
             Self::PairCostArb(strategy) => <PairCostArbStrategy as TradingStrategy<
+                crate::markets::BinaryOutcomeMarket,
+            >>::name(strategy),
+            Self::CoreHedgeMm(strategy) => <CoreHedgeMmStrategy as TradingStrategy<
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
         }
@@ -48,6 +53,7 @@ impl RegisteredStrategy {
         match self {
             Self::PairedMm(strategy) => strategy.on_tick(input),
             Self::PairCostArb(strategy) => strategy.on_tick(input),
+            Self::CoreHedgeMm(strategy) => strategy.on_tick(input),
         }
     }
 
@@ -58,6 +64,7 @@ impl RegisteredStrategy {
         match self {
             Self::PairedMm(strategy) => strategy.on_fill(input),
             Self::PairCostArb(strategy) => strategy.on_fill(input),
+            Self::CoreHedgeMm(strategy) => strategy.on_fill(input),
         }
     }
 }
@@ -96,12 +103,24 @@ impl StrategyRegistry {
         );
     }
 
+    pub fn register_core_hedge_mm(
+        &mut self,
+        market_id: impl Into<String>,
+        config: CoreHedgeMmStrategyConfig,
+    ) {
+        let key = StrategyKey::new(market_id, "core_hedge_mm");
+        self.strategies.insert(
+            key,
+            RegisteredStrategy::CoreHedgeMm(CoreHedgeMmStrategy::new(config)),
+        );
+    }
+
     pub fn paired_mm_mut(&mut self, market_id: &str) -> Option<&mut PairedMmStrategy> {
         self.strategies
             .get_mut(&StrategyKey::new(market_id, "paired_mm"))
             .and_then(|strategy| match strategy {
                 RegisteredStrategy::PairedMm(strategy) => Some(strategy),
-                RegisteredStrategy::PairCostArb(_) => None,
+                RegisteredStrategy::PairCostArb(_) | RegisteredStrategy::CoreHedgeMm(_) => None,
             })
     }
 
