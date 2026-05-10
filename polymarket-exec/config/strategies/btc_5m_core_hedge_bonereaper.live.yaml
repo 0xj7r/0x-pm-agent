@@ -1,0 +1,26 @@
+strategy: core_hedge_mm
+profile_name: btc_5m_core_hedge_bonereaper
+version: "0.1"
+last_updated: 2026-05-10
+description: |
+  Bonereaper-scale tuning of core_hedge_mm. Per v3 whale reanalysis
+  (7.7d full-window, ~395K trades), bonereaper is paired-MM symmetric
+  with skew +0.033, just at larger scale than unlawful: ~4x market
+  count, 5x max clip ($5,004 vs $993), $8.46M vs $2.29M throughput.
+  This profile boosts capital + clip caps to match. Same strategy code
+  as the unlawful-tuned default; only knobs differ.
+
+core_hedge:
+  enabled: true
+  cheap_leg_max_price: 0.50
+  expensive_leg_min_price: 0.50
+  expensive_leg_max_price: 0.99
+  min_price_gap: 0.10
+  # Bonereaper-scale: ~4x bar capital deployed, 4x clip caps.
+  bar_capital_usd: 200.0
+  target_hedge_ratio: 0.47
+  core_clip_usd: 50.0
+  hedge_clip_usd: 20.0
+  maker_improve_ticks: 0.0
+  min_order_usd: 1.0
+  merge_min_qty: 1.0
