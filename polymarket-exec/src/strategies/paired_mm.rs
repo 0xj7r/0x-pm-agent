@@ -391,15 +391,46 @@ where
                 decision: rescue, ..
             } => {
                 let mut notes = decision.notes;
+                let now_ms = input.fill.observed_at_ms;
+                // Phase 1 (early/mid bar): paired_mm + rescue actively unwind
+                // asymmetric fills to keep inventory neutral.
+                // Phase 2 (late bar): paired_mm hands off to the directional
+                // lanes (late-favorite + cheap-tail). Rescue must not fire in
+                // Phase 2 because it would unwind the directional positions
+                // those lanes are intentionally accumulating.
+                //
+                // Boundary uses the same `convexity_overlay.late_window_sec`
+                // that gates convex on_tick so both lanes share one truth.
+                let late_threshold_ms = self
+                    .engine
+                    .config()
+                    .convexity_overlay
+                    .late_window_sec
+                    .saturating_mul(1_000);
+                let remaining_ms = input
+                    .market
+                    .time_remaining_ms(now_ms)
+                    .unwrap_or(input.market.window_ms());
+                if remaining_ms <= late_threshold_ms {
+                    notes.push(format!(
+                        "hedge_rescue suppressed (Phase 2 directional): remaining_ms={} <= late_threshold_ms={} action={:?} qty={:.4} reason={}",
+                        remaining_ms,
+                        late_threshold_ms,
+                        rescue.action,
+                        rescue.qty,
+                        rescue.reason
+                    ));
+                    return StrategyDecision::Noop { notes };
+                }
                 let intents = build_rescue_intents(
                     &rescue,
                     &input.fill,
                     &input.snapshot,
                     &input.market,
-                    input.fill.observed_at_ms,
+                    now_ms,
                 );
                 notes.push(format!(
-                    "paired-mm hedge_rescue action={:?} qty={:.4} intents_built={} reason={}",
+                    "paired-mm hedge_rescue (Phase 1) action={:?} qty={:.4} intents_built={} reason={}",
                     rescue.action,
                     rescue.qty,
                     intents.len(),
