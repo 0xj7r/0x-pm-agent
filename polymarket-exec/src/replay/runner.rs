@@ -244,6 +244,7 @@ mod replay_accounting_tests {
             &[mark_event("UP", "0.45")],
             &[buy_fill("UP", 0.40, 10.0)],
             1_000.0,
+            0.0,
         );
 
         assert_eq!(accounting.starting_cash_usd, 1_000.0);
@@ -264,7 +265,7 @@ mod replay_accounting_tests {
             resolution_event("UP"),
         ];
         let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 10.0)];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert_eq!(accounting.ending_cash_usd, 1_000.5);
         assert_eq!(accounting.redeemable_value_usd, 10.0);
@@ -291,7 +292,7 @@ mod replay_accounting_tests {
     fn accounting_allows_negative_pnl_when_bought_leg_loses() {
         let events = vec![resolution_event("DOWN")];
         let fills = vec![buy_fill("UP", 0.90, 10.0)];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert_eq!(accounting.ending_cash_usd, 991.0);
         assert_eq!(accounting.market_value_usd, 0.0);
@@ -314,7 +315,7 @@ mod replay_accounting_tests {
             buy_fill("UP_TOKEN", 0.40, 10.0),
             buy_fill("DOWN_TOKEN", 0.55, 10.0),
         ];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert_eq!(
             accounting.resolution_winner_asset_id,
@@ -337,7 +338,7 @@ mod replay_accounting_tests {
     fn accounting_reports_unmerged_pairable_inventory() {
         let events = vec![market_meta_event("UP", "DOWN")];
         let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 7.0)];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert_eq!(accounting.settlement.pair_asset_ids, vec!["UP", "DOWN"]);
         assert_eq!(accounting.settlement.pairable_qty_before_resolution, 7.0);
@@ -357,7 +358,7 @@ mod replay_accounting_tests {
             merge_event("5", "confirmed"),
         ];
         let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.55, 7.0)];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert!((accounting.ending_cash_usd - 997.15).abs() < 1e-9);
         assert!((accounting.realized_pnl_usd - 0.25).abs() < 1e-9);
@@ -379,7 +380,7 @@ mod replay_accounting_tests {
             maker_or_taker: MakerOrTaker::Maker,
         }];
 
-        let accounting = compute_accounting(&[], &fills, 1_000.0);
+        let accounting = compute_accounting(&[], &fills, 1_000.0, 0.0);
 
         assert_eq!(accounting.ending_cash_usd, 1_000.0);
         assert_eq!(accounting.ending_equity_usd, 1_000.0);
@@ -397,7 +398,7 @@ mod replay_accounting_tests {
         ];
         let fills = vec![buy_fill("UP", 0.40, 10.0)];
 
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
 
         assert_eq!(accounting.ending_cash_usd, 996.0);
         assert_eq!(accounting.ending_equity_usd, 996.0);
@@ -436,7 +437,7 @@ mod replay_accounting_tests {
             ),
             intent_submit("tail-up", "UP", "mm-convex-accum:l1"),
         ];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
         let attribution = compute_pnl_attribution(
             &events,
             &fills,
@@ -490,7 +491,7 @@ mod replay_accounting_tests {
             intent_submit("paired-up", "UP", "mm-paired-bid:yes:l1:PairedEntry"),
             intent_submit("paired-down", "DOWN", "mm-paired-bid:no:l1:PairedEntry"),
         ];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
         let attribution = compute_pnl_attribution(
             &events,
             &fills,
@@ -515,7 +516,7 @@ mod replay_accounting_tests {
         let events = vec![mark_event("UP", "0.45")];
         let fills = Vec::new();
         let journal_events = Vec::new();
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
         let attribution = compute_pnl_attribution(
             &events,
             &fills,
@@ -576,6 +577,34 @@ mod replay_accounting_tests {
     }
 
     #[test]
+    fn maker_rebate_credits_cash_on_maker_fills_only() {
+        // Two maker BUYs at $0.40 size 10 each = $4 each, $8 total notional
+        // for buys. Rebate at 10 bps = $8 * 0.001 = $0.008. Cash should
+        // reflect notional outflow ($8) minus rebate credit ($0.008).
+        let events = vec![market_meta_event("UP", "DOWN")];
+        let fills = vec![buy_fill("UP", 0.40, 10.0), buy_fill("DOWN", 0.40, 10.0)];
+
+        let no_rebate = compute_accounting(&events, &fills, 1_000.0, 0.0);
+        let with_rebate = compute_accounting(&events, &fills, 1_000.0, 10.0);
+
+        assert!((no_rebate.maker_rebate_usd).abs() < 1e-9);
+        let expected_rebate = (0.40 * 10.0 + 0.40 * 10.0) * 10.0 / 10_000.0;
+        assert!(
+            (with_rebate.maker_rebate_usd - expected_rebate).abs() < 1e-9,
+            "expected {expected_rebate}, got {}",
+            with_rebate.maker_rebate_usd
+        );
+        assert!(
+            (with_rebate.ending_cash_usd - (no_rebate.ending_cash_usd + expected_rebate)).abs()
+                < 1e-9
+        );
+        assert!(
+            (with_rebate.realized_pnl_usd - (no_rebate.realized_pnl_usd + expected_rebate)).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn classify_tag_recognizes_production_client_order_id_prefixes() {
         // Production strategy emits these exact prefixes; the classifier
         // must work on raw client_order_ids when journal mode is `none` so
@@ -619,7 +648,7 @@ mod replay_accounting_tests {
                 7.0,
             ),
         ];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
         let attribution = compute_pnl_attribution(
             &events,
             &fills,
@@ -658,7 +687,7 @@ mod replay_accounting_tests {
                 5.0,
             ),
         ];
-        let accounting = compute_accounting(&events, &fills, 1_000.0);
+        let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
         let attribution = compute_pnl_attribution(
             &events,
             &fills,
@@ -687,6 +716,10 @@ pub struct ReplayAccountingSummary {
     pub realized_pnl_usd: f64,
     pub unrealized_pnl_usd: f64,
     pub fees_paid_usd: f64,
+    /// Total maker rebate credited to cash this window. Zero unless
+    /// RunnerConfig.maker_rebate_bps was set.
+    #[serde(default)]
+    pub maker_rebate_usd: f64,
     pub gross_fill_notional_usd: f64,
     pub buy_notional_usd: f64,
     pub sell_notional_usd: f64,
@@ -968,6 +1001,13 @@ pub struct RunnerConfig {
     /// `run_run`. A single window's `run_window` always returns whatever
     /// outcome it reaches.
     pub max_window_failures: usize,
+    /// Maker rebate in basis points credited per maker fill. Default 0
+    /// preserves prior accounting; set non-zero to model Polymarket's
+    /// dynamic-taker-fee redistribution. The credit is added to cash and
+    /// surfaced in `ReplayAccountingSummary.maker_rebate_usd` so callers
+    /// can break it out separately from realised P&L.
+    #[allow(dead_code)]
+    pub maker_rebate_bps: f64,
 }
 
 /// Run a single window. Bug-isolated by `panic::catch_unwind` around the
@@ -1066,8 +1106,12 @@ pub fn run_window_with_journal_mode<S: ReplayStrategy>(
             }
             accounting_events.push(synth);
         }
-        let mut accounting =
-            compute_accounting(&accounting_events, &accepted_fills, cfg.starting_cash_usd);
+        let mut accounting = compute_accounting(
+            &accounting_events,
+            &accepted_fills,
+            cfg.starting_cash_usd,
+            cfg.maker_rebate_bps,
+        );
         accounting.attribution = compute_pnl_attribution(
             &accounting_events,
             &accepted_fills,
@@ -1142,6 +1186,7 @@ fn compute_accounting(
     events: &[Event],
     fills: &[SimulatedFill],
     starting_cash_usd: f64,
+    maker_rebate_bps: f64,
 ) -> ReplayAccountingSummary {
     let mut cash = starting_cash_usd;
     let mut realized_pnl = 0.0;
@@ -1149,7 +1194,9 @@ fn compute_accounting(
     let mut sell_notional = 0.0;
     let mut invalid_fill_count = 0u64;
     let mut invalid_fill_notional = 0.0;
+    let mut maker_rebate_total = 0.0;
     let mut positions: BTreeMap<String, ReplayPositionAccounting> = BTreeMap::new();
+    let rebate_factor = (maker_rebate_bps / 10_000.0).max(0.0);
 
     for fill in fills {
         let notional = fill.price * fill.size;
@@ -1173,6 +1220,12 @@ fn compute_accounting(
                     invalid_fill_notional += fill.price * excess;
                 }
             }
+        }
+        if matches!(fill.maker_or_taker, MakerOrTaker::Maker) && rebate_factor > 0.0 {
+            let rebate = notional * rebate_factor;
+            cash += rebate;
+            realized_pnl += rebate;
+            maker_rebate_total += rebate;
         }
     }
 
@@ -1256,6 +1309,7 @@ fn compute_accounting(
             + merge_apply.gas_usd
             + resolution_apply.fee_usd
             + resolution_apply.gas_usd,
+        maker_rebate_usd: maker_rebate_total,
         gross_fill_notional_usd: buy_notional + sell_notional,
         buy_notional_usd: buy_notional,
         sell_notional_usd: sell_notional,
@@ -2942,6 +2996,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut strategy = PassiveAskStrategy {
             placed: false,
@@ -3001,6 +3056,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut strategy = DelayedPassiveAskStrategy { seen_events: 0 };
 
@@ -3065,6 +3121,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut strategy = PassiveBidStrategy { placed: false };
 
@@ -3111,6 +3168,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut strategy = PassiveBidStrategy { placed: false };
 
@@ -3167,6 +3225,7 @@ mod tests {
             fill_sim: FillSimConfig::default(),
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut s = PanicAfter(2);
         let summary = run_window(&mut s, &events, &cfg);
@@ -3203,6 +3262,7 @@ mod tests {
             fill_sim: FillSimConfig::default(),
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let result = run_run(windows, &cfg, |_, _| PanicAfter(1));
         assert!(result.is_err());
@@ -3249,6 +3309,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
 
         let summaries = run_run(windows, &cfg, |_, _| PassiveBidStrategy { placed: false })
@@ -3364,6 +3425,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
 
         let summaries = run_run_parallel_with_journal_mode(
@@ -3421,6 +3483,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut s1 = PassiveAskStrategy {
             placed: false,
@@ -3467,6 +3530,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
 
         // The PassiveAskStrategy here populates only `submits`; the runner
@@ -3520,6 +3584,7 @@ mod tests {
             },
             max_window_failures: 0,
             starting_cash_usd: 1_000.0,
+            maker_rebate_bps: 0.0,
         };
         let mut strategy = PassiveAskStrategy {
             placed: false,
