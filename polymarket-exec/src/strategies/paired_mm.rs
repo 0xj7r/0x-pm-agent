@@ -2,16 +2,132 @@
 
 use std::collections::BTreeMap;
 
+use crate::core::types::FillReport;
 use crate::market_making::paired_mm::{
     AutoFillSuggestion, CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig,
     LadderConfig, MergePolicyConfig, MergePolicyDecision, PairedMmEngine, PairedMmEngineConfig,
     PairedMmInput, RescueConfig,
 };
 use crate::market_making::pairing::pair_ledger::MergeCandidate;
+use crate::market_making::pairing::rescue_engine::{RescueAction, RescueDecision};
+use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{ClientOrderId, CoolingReason, InstrumentId, MergeIntent, StrategyDecision};
+use crate::types::{
+    ClientOrderId, CoolingReason, EpochMillis, InstrumentId, IntentKind, MergeIntent, OrderIntent,
+    StrategyDecision,
+};
+
+/// Race buffer in ticks used when crossing the touch on a hedge rescue.
+/// Matches the live profile's `rescue.hedge_rescue_race_buffer_ticks`
+/// default of 3.0. Hard-coded for now; the YAML knob is currently dead
+/// config in `strategy_profile.rs:843-846` and plumbing it through
+/// PairedMmStrategyConfig is a follow-up.
+const HEDGE_RESCUE_RACE_BUFFER_TICKS: f64 = 3.0;
+
+/// Translate a rescue brain decision into venue-ready aggressive Close
+/// intents. Returns an empty Vec if the decision is `Hold`, qty is below
+/// the float floor, or the snapshot lacks the side we need to lift/hit.
+///
+/// Without this builder the on-fill rescue path emits an empty intent
+/// vector and the simulator never sees the rescue, so stranded one-sided
+/// inventory just sits and resolves on the losing side. That accounts for
+/// the bulk of `expired_losing_cost_by_path[paired_mm]` we observed in
+/// the whale-v1 21-day backtest ($2,756 / 21d).
+fn build_rescue_intents<M: MarketDescriptor>(
+    rescue: &RescueDecision,
+    fill: &FillReport,
+    snapshot: &PairedMarketSnapshot,
+    market: &M,
+    now_ms: EpochMillis,
+) -> Vec<OrderIntent> {
+    let qty = rescue.qty.max(0.0);
+    if qty < 1e-9 {
+        return Vec::new();
+    }
+    let tick = market.tick_size().max(0.0001);
+
+    // The leg the fill just landed on is the "stranded" side because
+    // it has accumulated more inventory than the opposite leg.
+    let stranded_leg = if fill.instrument_id == *market.yes_instrument_id() {
+        LadderLeg::Yes
+    } else if fill.instrument_id == *market.no_instrument_id() {
+        LadderLeg::No
+    } else {
+        return Vec::new();
+    };
+
+    match rescue.action {
+        RescueAction::Hold => Vec::new(),
+        RescueAction::BuyOppositeForMerge => {
+            let (opposite_id, opposite_quote) = match stranded_leg {
+                LadderLeg::Yes => (market.no_instrument_id().clone(), &snapshot.no_quote),
+                LadderLeg::No => (market.yes_instrument_id().clone(), &snapshot.yes_quote),
+            };
+            let Some(best_ask) = opposite_quote.best_ask.as_ref() else {
+                return Vec::new();
+            };
+            // Cross the touch by `race_buffer_ticks` so the fill simulator
+            // walks opposing depth instead of resting passive.
+            let limit_price =
+                (best_ask.price + HEDGE_RESCUE_RACE_BUFFER_TICKS * tick).clamp(tick, 0.999);
+            let coid = ClientOrderId::from(format!(
+                "mm-hedge-rescue:merge:{}:{:?}:{}",
+                market.market_id(),
+                stranded_leg,
+                now_ms,
+            ));
+            let mut intent = OrderIntent::new_buy(
+                coid,
+                market.market_id().clone(),
+                opposite_id,
+                limit_price,
+                qty,
+                format!(
+                    "hedge_rescue buy_opposite_for_merge stranded_leg={:?} qty={:.4} ask={:.4} reason={}",
+                    stranded_leg, qty, best_ask.price, rescue.reason
+                ),
+                now_ms,
+            );
+            intent.kind = IntentKind::Close;
+            intent.quote_level_tag = Some(format!("mm-hedge-rescue:merge:{:?}", stranded_leg));
+            vec![intent]
+        }
+        RescueAction::SellStrandedLeg => {
+            let (stranded_id, stranded_quote) = match stranded_leg {
+                LadderLeg::Yes => (market.yes_instrument_id().clone(), &snapshot.yes_quote),
+                LadderLeg::No => (market.no_instrument_id().clone(), &snapshot.no_quote),
+            };
+            let Some(best_bid) = stranded_quote.best_bid.as_ref() else {
+                return Vec::new();
+            };
+            let limit_price =
+                (best_bid.price - HEDGE_RESCUE_RACE_BUFFER_TICKS * tick).clamp(tick, 0.999);
+            let coid = ClientOrderId::from(format!(
+                "mm-hedge-rescue:sell:{}:{:?}:{}",
+                market.market_id(),
+                stranded_leg,
+                now_ms,
+            ));
+            let mut intent = OrderIntent::new_sell(
+                coid,
+                market.market_id().clone(),
+                stranded_id,
+                limit_price,
+                qty,
+                format!(
+                    "hedge_rescue sell_stranded_leg leg={:?} qty={:.4} bid={:.4} reason={}",
+                    stranded_leg, qty, best_bid.price, rescue.reason
+                ),
+                now_ms,
+            );
+            intent.kind = IntentKind::Close;
+            intent.quote_level_tag = Some(format!("mm-hedge-rescue:sell:{:?}", stranded_leg));
+            vec![intent]
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairedMmStrategyConfig {
@@ -275,11 +391,21 @@ where
                 decision: rescue, ..
             } => {
                 let mut notes = decision.notes;
+                let intents = build_rescue_intents(
+                    &rescue,
+                    &input.fill,
+                    &input.snapshot,
+                    &input.market,
+                    input.fill.observed_at_ms,
+                );
                 notes.push(format!(
-                    "paired-mm on-fill rescue requires venue adapter action={:?} qty={:.4}",
-                    rescue.action, rescue.qty
+                    "paired-mm hedge_rescue action={:?} qty={:.4} intents_built={} reason={}",
+                    rescue.action,
+                    rescue.qty,
+                    intents.len(),
+                    rescue.reason
                 ));
-                StrategyDecision::rescue(Vec::new(), notes)
+                StrategyDecision::rescue(intents, notes)
             }
         }
     }
@@ -360,5 +486,149 @@ impl RepairMode {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod hedge_rescue_tests {
+    use super::*;
+    use crate::core::types::{BookLevel, FillLiquidity, QuoteSnapshot, TradeSide};
+    use crate::markets::descriptor::BinaryOutcomeMarket;
+    use crate::types::{InstrumentId, MarketId};
+
+    fn quote(bid: f64, ask: f64) -> QuoteSnapshot {
+        QuoteSnapshot {
+            best_bid: Some(BookLevel::new(bid, 100.0)),
+            best_ask: Some(BookLevel::new(ask, 100.0)),
+            bid_levels: vec![BookLevel::new(bid, 100.0)],
+            ask_levels: vec![BookLevel::new(ask, 100.0)],
+            depth_observed_at_ms: Some(0),
+            last_trade_price: None,
+            taker_buy_qty_60s: 0.0,
+            taker_sell_qty_60s: 0.0,
+            observed_at_ms: 0,
+        }
+    }
+
+    fn fixtures() -> (BinaryOutcomeMarket, PairedMarketSnapshot) {
+        let market = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("m"),
+            InstrumentId::from("yes"),
+            InstrumentId::from("no"),
+        );
+        let snapshot = PairedMarketSnapshot {
+            market_id: MarketId::from("m"),
+            yes_instrument_id: InstrumentId::from("yes"),
+            no_instrument_id: InstrumentId::from("no"),
+            yes_quote: quote(0.40, 0.45),
+            no_quote: quote(0.55, 0.60),
+        };
+        (market, snapshot)
+    }
+
+    fn fill(instrument: &str) -> FillReport {
+        FillReport {
+            order_id: None,
+            client_order_id: Some(ClientOrderId::from("paired-mm:m:yes:l1:1")),
+            market_id: MarketId::from("m"),
+            instrument_id: InstrumentId::from(instrument),
+            side: TradeSide::Buy,
+            price: 0.40,
+            quantity: 5.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn build_rescue_intents_empty_for_hold_action() {
+        let (market, snapshot) = fixtures();
+        let decision = RescueDecision {
+            action: RescueAction::Hold,
+            qty: 0.0,
+            hold_value_per_share: 0.5,
+            rescue_value_per_share: None,
+            delta_vs_hold_per_share: None,
+            reason: "no opposite arm".into(),
+        };
+        let intents = build_rescue_intents(&decision, &fill("yes"), &snapshot, &market, 1_000);
+        assert!(intents.is_empty());
+    }
+
+    #[test]
+    fn build_rescue_intents_buy_opposite_for_merge_yes_stranded() {
+        // Yes leg over-filled. Rescue brain says buy NO at the touch + race
+        // buffer to create a mergeable pair.
+        let (market, snapshot) = fixtures();
+        let decision = RescueDecision {
+            action: RescueAction::BuyOppositeForMerge,
+            qty: 5.0,
+            hold_value_per_share: 0.40,
+            rescue_value_per_share: Some(0.40),
+            delta_vs_hold_per_share: Some(0.05),
+            reason: "merge cheaper than holding".into(),
+        };
+        let intents = build_rescue_intents(&decision, &fill("yes"), &snapshot, &market, 1_000);
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.side, TradeSide::Buy);
+        assert_eq!(intent.kind, IntentKind::Close);
+        assert_eq!(intent.instrument_id, InstrumentId::from("no"));
+        let no_ask = 0.60;
+        let tick = market.tick_size();
+        let expected = (no_ask + 3.0 * tick).clamp(tick, 0.999);
+        assert!(
+            (intent.limit_price - expected).abs() < 1e-9,
+            "price should cross opposite ask + race_buffer"
+        );
+    }
+
+    #[test]
+    fn build_rescue_intents_sell_stranded_leg_no_stranded() {
+        // No leg over-filled. Sell NO at best_bid - race_buffer to take.
+        let (market, snapshot) = fixtures();
+        let decision = RescueDecision {
+            action: RescueAction::SellStrandedLeg,
+            qty: 7.0,
+            hold_value_per_share: 0.55,
+            rescue_value_per_share: Some(0.55),
+            delta_vs_hold_per_share: Some(0.0),
+            reason: "exit on bid".into(),
+        };
+        let intents = build_rescue_intents(&decision, &fill("no"), &snapshot, &market, 2_000);
+        assert_eq!(intents.len(), 1);
+        let intent = &intents[0];
+        assert_eq!(intent.side, TradeSide::Sell);
+        assert_eq!(intent.kind, IntentKind::Close);
+        assert!(intent.reduce_only);
+        assert_eq!(intent.instrument_id, InstrumentId::from("no"));
+        let no_bid = 0.55;
+        let tick = market.tick_size();
+        let expected = (no_bid - 3.0 * tick).clamp(tick, 0.999);
+        assert!(
+            (intent.limit_price - expected).abs() < 1e-9,
+            "price should hit own bid - race_buffer"
+        );
+    }
+
+    #[test]
+    fn build_rescue_intents_empty_when_opposite_book_empty() {
+        let (market, mut snapshot) = fixtures();
+        snapshot.no_quote.best_ask = None;
+        let decision = RescueDecision {
+            action: RescueAction::BuyOppositeForMerge,
+            qty: 5.0,
+            hold_value_per_share: 0.40,
+            rescue_value_per_share: None,
+            delta_vs_hold_per_share: None,
+            reason: "no liquidity".into(),
+        };
+        let intents = build_rescue_intents(&decision, &fill("yes"), &snapshot, &market, 1_000);
+        assert!(
+            intents.is_empty(),
+            "must skip rescue when opposite leg has no asks to lift"
+        );
     }
 }
