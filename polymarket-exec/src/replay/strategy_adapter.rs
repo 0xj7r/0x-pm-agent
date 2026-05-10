@@ -580,6 +580,7 @@ impl ReplayStrategyAdapter {
         match self.profile.strategy.as_deref() {
             Some("pair_cost_arb") => EnabledStrategy::PairCostArb,
             Some("core_hedge_mm") => EnabledStrategy::CoreHedgeMm,
+            Some("late_favorite_directional") => EnabledStrategy::LateFavorite,
             _ => EnabledStrategy::PairedMm,
         }
     }
@@ -604,6 +605,11 @@ impl ReplayStrategyAdapter {
                 let cfg = self.profile.core_hedge_mm_config();
                 self.registry
                     .register_core_hedge_mm(market_id.as_str(), cfg);
+            }
+            EnabledStrategy::LateFavorite => {
+                let cfg = self.profile.late_favorite_config();
+                self.registry
+                    .register_late_favorite(market_id.as_str(), cfg);
             }
         }
     }
@@ -1396,6 +1402,7 @@ enum EnabledStrategy {
     PairedMm,
     PairCostArb,
     CoreHedgeMm,
+    LateFavorite,
 }
 
 impl ReplayStrategy for ReplayStrategyAdapter {

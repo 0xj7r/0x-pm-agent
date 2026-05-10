@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 
 use crate::markets::MarketDescriptor;
 use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig};
+use crate::strategies::late_favorite_directional::{
+    LateFavoriteStrategy, LateFavoriteStrategyConfig,
+};
 use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
 use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
@@ -29,6 +32,7 @@ pub enum RegisteredStrategy {
     PairedMm(PairedMmStrategy),
     PairCostArb(PairCostArbStrategy),
     CoreHedgeMm(CoreHedgeMmStrategy),
+    LateFavorite(LateFavoriteStrategy),
 }
 
 impl RegisteredStrategy {
@@ -43,6 +47,9 @@ impl RegisteredStrategy {
             Self::CoreHedgeMm(strategy) => <CoreHedgeMmStrategy as TradingStrategy<
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
+            Self::LateFavorite(strategy) => <LateFavoriteStrategy as TradingStrategy<
+                crate::markets::BinaryOutcomeMarket,
+            >>::name(strategy),
         }
     }
 
@@ -54,6 +61,7 @@ impl RegisteredStrategy {
             Self::PairedMm(strategy) => strategy.on_tick(input),
             Self::PairCostArb(strategy) => strategy.on_tick(input),
             Self::CoreHedgeMm(strategy) => strategy.on_tick(input),
+            Self::LateFavorite(strategy) => strategy.on_tick(input),
         }
     }
 
@@ -65,6 +73,7 @@ impl RegisteredStrategy {
             Self::PairedMm(strategy) => strategy.on_fill(input),
             Self::PairCostArb(strategy) => strategy.on_fill(input),
             Self::CoreHedgeMm(strategy) => strategy.on_fill(input),
+            Self::LateFavorite(strategy) => strategy.on_fill(input),
         }
     }
 }
@@ -115,12 +124,26 @@ impl StrategyRegistry {
         );
     }
 
+    pub fn register_late_favorite(
+        &mut self,
+        market_id: impl Into<String>,
+        config: LateFavoriteStrategyConfig,
+    ) {
+        let key = StrategyKey::new(market_id, "late_favorite_directional");
+        self.strategies.insert(
+            key,
+            RegisteredStrategy::LateFavorite(LateFavoriteStrategy::new(config)),
+        );
+    }
+
     pub fn paired_mm_mut(&mut self, market_id: &str) -> Option<&mut PairedMmStrategy> {
         self.strategies
             .get_mut(&StrategyKey::new(market_id, "paired_mm"))
             .and_then(|strategy| match strategy {
                 RegisteredStrategy::PairedMm(strategy) => Some(strategy),
-                RegisteredStrategy::PairCostArb(_) | RegisteredStrategy::CoreHedgeMm(_) => None,
+                RegisteredStrategy::PairCostArb(_)
+                | RegisteredStrategy::CoreHedgeMm(_)
+                | RegisteredStrategy::LateFavorite(_) => None,
             })
     }
 
