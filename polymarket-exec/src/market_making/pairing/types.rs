@@ -2,7 +2,7 @@
 
 use crate::types::{InstrumentId, MarketId, QuoteSnapshot};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LadderLeg {
     Yes,
     No,

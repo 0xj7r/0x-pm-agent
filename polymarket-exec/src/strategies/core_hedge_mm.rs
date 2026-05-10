@@ -16,11 +16,13 @@
 //! P1 (this revision): leg classifier + core/hedge ladder pricing only.
 //! Merge planner integration and salvage are deferred.
 
+use std::collections::HashMap;
+
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{MergeIntent, StrategyDecision};
+use crate::types::{MergeIntent, MarketId, StrategyDecision};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
@@ -83,18 +85,49 @@ impl Default for CoreHedgeMmStrategyConfig {
     }
 }
 
+/// Tracks the last (price, qty) we emitted per (market, leg, tag) so we
+/// only re-emit when those change. Without this, the strategy fires a
+/// new intent every tick (~1 Hz), each with a fresh CoID. The replay
+/// fill simulator treats every replace as a fresh `cumulative_trade_
+/// through` counter — meaning we reset our queue-burn estimate every
+/// second instead of accumulating it over minutes like a real maker.
+/// That artifact lets the simulator fill us on tiny trade-through
+/// events that wouldn't reach a long-resting maker.
+type LastEmitKey = (MarketId, LadderLeg, &'static str);
+
 #[derive(Clone, Debug)]
 pub struct CoreHedgeMmStrategy {
     config: CoreHedgeMmStrategyConfig,
+    last_emit: HashMap<LastEmitKey, (f64, f64)>,
 }
 
 impl CoreHedgeMmStrategy {
     pub fn new(config: CoreHedgeMmStrategyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            last_emit: HashMap::new(),
+        }
     }
 
     pub fn config(&self) -> &CoreHedgeMmStrategyConfig {
         &self.config
+    }
+
+    /// Returns true (and records) if this leg+tag should re-emit at the
+    /// given price/qty. Returns false if the prior emission was identical
+    /// within tolerance — caller should skip the intent.
+    fn should_emit(&mut self, market_id: &MarketId, leg: LadderLeg, tag: &'static str, price: f64, qty: f64) -> bool {
+        let key = (market_id.clone(), leg, tag);
+        let changed = match self.last_emit.get(&key) {
+            Some(&(prev_px, prev_qty)) => {
+                (price - prev_px).abs() > 1e-6 || (qty - prev_qty).abs() > 1e-6
+            }
+            None => true,
+        };
+        if changed {
+            self.last_emit.insert(key, (price, qty));
+        }
+        changed
     }
 }
 
@@ -174,11 +207,13 @@ fn build_clip<M: MarketDescriptor>(
         LadderLeg::Yes => market.yes_instrument_id().clone(),
         LadderLeg::No => market.no_instrument_id().clone(),
     };
+    // Stable CoID per (market, leg, tag): same string across ticks. The
+    // strategy gates re-emits via `should_emit` so we only submit when
+    // (price, qty) actually change.
     let coid = ClientOrderId::from(format!(
-        "core-hedge:{}:{:?}:{}:{:?}",
+        "core-hedge:{}:{:?}:{}",
         market.market_id(),
         leg,
-        now_ms / 1000,
         tag,
     ));
     let mut intent = OrderIntent::new_buy(
@@ -308,8 +343,13 @@ where
             expensive_notional, expensive_target, cheap_notional, cheap_target,
         ));
 
-        if expensive_gap >= cfg.min_order_usd {
-            let clip = cfg.core_clip_usd.min(expensive_gap).max(cfg.min_order_usd);
+        let market_id = input.market.market_id().clone();
+        let cfg_min_order = cfg.min_order_usd;
+        let cfg_core_clip = cfg.core_clip_usd;
+        let cfg_hedge_clip = cfg.hedge_clip_usd;
+        let cfg_improve = cfg.maker_improve_ticks;
+        if expensive_gap >= cfg_min_order {
+            let clip = cfg_core_clip.min(expensive_gap).max(cfg_min_order);
             if let Some(intent) = build_clip(
                 &input.market,
                 geom.expensive_leg,
@@ -317,16 +357,18 @@ where
                 geom.expensive_ask,
                 clip,
                 "core",
-                cfg.maker_improve_ticks,
-                cfg.min_order_usd,
+                cfg_improve,
+                cfg_min_order,
                 input.now_ms,
             ) {
-                intents.push(intent);
+                if self.should_emit(&market_id, geom.expensive_leg, "core", intent.limit_price, intent.quantity) {
+                    intents.push(intent);
+                }
             }
         }
 
-        if cheap_gap >= cfg.min_order_usd {
-            let clip = cfg.hedge_clip_usd.min(cheap_gap).max(cfg.min_order_usd);
+        if cheap_gap >= cfg_min_order {
+            let clip = cfg_hedge_clip.min(cheap_gap).max(cfg_min_order);
             if let Some(intent) = build_clip(
                 &input.market,
                 geom.cheap_leg,
@@ -334,11 +376,13 @@ where
                 geom.cheap_ask,
                 clip,
                 "hedge",
-                cfg.maker_improve_ticks,
-                cfg.min_order_usd,
+                cfg_improve,
+                cfg_min_order,
                 input.now_ms,
             ) {
-                intents.push(intent);
+                if self.should_emit(&market_id, geom.cheap_leg, "hedge", intent.limit_price, intent.quantity) {
+                    intents.push(intent);
+                }
             }
         }
 
