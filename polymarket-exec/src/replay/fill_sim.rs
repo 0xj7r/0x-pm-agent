@@ -755,8 +755,27 @@ fn parse_side(s: &str) -> Option<Side> {
 /// estimated queue position (FIFO position represented by `queue_ahead` is
 /// already maintained; the haircut here is the depth-at-rest minus
 /// already-consumed depth).
+/// Real Polymarket maker queues at deep-tail prices (≤ 0.05 / ≥ 0.95)
+/// stack thousands of shares from other MMs harvesting rebates. Our
+/// fixed-size clip would sit at the back of that queue and rarely fill
+/// even on a sweep. Force Conservative regardless of configured regime
+/// when the order rests at this tier — otherwise the convex-tail
+/// strategies (e.g. late_favorite_directional buying cheap @ 0.01)
+/// blow out their backtest P&L on fills that wouldn't happen live.
+const DEEP_TAIL_PRICE: f64 = 0.05;
+
 fn eligible_fill_size(regime: FillQuality, order: &RestingOrder, remaining_size: f64) -> f64 {
-    match regime {
+    let effective_regime = if order.intent.price <= DEEP_TAIL_PRICE
+        || order.intent.price >= 1.0 - DEEP_TAIL_PRICE
+    {
+        match regime {
+            FillQuality::Optimistic | FillQuality::Base => FillQuality::Conservative,
+            FillQuality::Conservative => FillQuality::Conservative,
+        }
+    } else {
+        regime
+    };
+    match effective_regime {
         FillQuality::Optimistic => remaining_size,
         FillQuality::Base => {
             let already_consumed = order.cumulative_trade_through - remaining_size;
@@ -764,18 +783,15 @@ fn eligible_fill_size(regime: FillQuality, order: &RestingOrder, remaining_size:
             (remaining_size - depth_remaining).max(0.0)
         }
         FillQuality::Conservative => {
-            // Same gate as Base, then haircut by queue-ahead share of the
-            // remaining trade-through. queue_ahead is FIFO position within
-            // our own resting orders and is already applied by the caller;
-            // here we apply a depth-at-rest haircut that models the public
-            // queue ahead of us at this level.
             let already_consumed = order.cumulative_trade_through - remaining_size;
             let depth_remaining = (order.book_depth_at_rest - already_consumed).max(0.0);
             let after_book = (remaining_size - depth_remaining).max(0.0);
-            // Conservative haircut: split the residual between us and the
+            // Conservative haircut: residual is split between us and the
             // (assumed) other public makers at our level. With no per-level
-            // visibility into peer makers, halve the residual. This matches
-            // the spec's "queue-position haircut" and is calibratable later.
+            // visibility into peer makers, halve the residual. At deep-tail
+            // tiers this is still optimistic vs reality (queues of 1000s)
+            // but bounds the backtest P&L away from clearly-impossible
+            // fill rates.
             after_book * 0.5
         }
     }
