@@ -748,52 +748,49 @@ fn parse_side(s: &str) -> Option<Side> {
     }
 }
 
-/// How much of `remaining_size` is ELIGIBLE to fill `order` under `regime`.
-/// `Optimistic` returns the full amount unconditionally. `Base` returns the
-/// amount only after `cumulative_trade_through` has eaten through the
-/// `book_depth_at_rest`. `Conservative` additionally haircuts by the
-/// estimated queue position (FIFO position represented by `queue_ahead` is
-/// already maintained; the haircut here is the depth-at-rest minus
-/// already-consumed depth).
-/// Real Polymarket maker queues at deep-tail prices (≤ 0.05 / ≥ 0.95)
-/// stack thousands of shares from other MMs harvesting rebates. Our
-/// fixed-size clip would sit at the back of that queue and rarely fill
-/// even on a sweep. Force Conservative regardless of configured regime
-/// when the order rests at this tier — otherwise the convex-tail
-/// strategies (e.g. late_favorite_directional buying cheap @ 0.01)
-/// blow out their backtest P&L on fills that wouldn't happen live.
-const DEEP_TAIL_PRICE: f64 = 0.05;
-
-fn eligible_fill_size(regime: FillQuality, order: &RestingOrder, remaining_size: f64) -> f64 {
-    let effective_regime = if order.intent.price <= DEEP_TAIL_PRICE
-        || order.intent.price >= 1.0 - DEEP_TAIL_PRICE
-    {
-        match regime {
-            FillQuality::Optimistic | FillQuality::Base => FillQuality::Conservative,
-            FillQuality::Conservative => FillQuality::Conservative,
-        }
+/// Estimated peer-maker density at a given price. Real Polymarket queues
+/// stack other maker bots harvesting rebates; the peer density is what
+/// determines our actual share of incoming taker flow once the visible
+/// book at our level is eaten through.
+///
+/// Calibrated against whale fill rates (unlawful: ~265 fills/active market;
+/// our backtest at Conservative was ~36 fills/market BUT with extreme
+/// per-fill P&L because we only filled on full sweeps, suggesting our
+/// queue position was wildly under-modeled). Peer-density model bounds
+/// fill rate AND fill quality more realistically:
+///
+/// - Mid-band (0.15..0.85): peer_density 1.0 → 50% share (we're roughly
+///   half of all makers stacked at level)
+/// - Near-tail (0.05..0.15 / 0.85..0.95): peer_density 2.0 → 33% share
+///   (more rebate-harvesters concentrate near the tails)
+/// - Deep tail (≤ 0.05 / ≥ 0.95): peer_density 5.0 → 17% share (huge
+///   queues from passive insurance/lottery bidders)
+fn peer_density_for_price(price: f64) -> f64 {
+    if price <= 0.05 || price >= 0.95 {
+        5.0
+    } else if price <= 0.15 || price >= 0.85 {
+        2.0
     } else {
-        regime
-    };
-    match effective_regime {
-        FillQuality::Optimistic => remaining_size,
-        FillQuality::Base => {
-            let already_consumed = order.cumulative_trade_through - remaining_size;
-            let depth_remaining = (order.book_depth_at_rest - already_consumed).max(0.0);
-            (remaining_size - depth_remaining).max(0.0)
-        }
-        FillQuality::Conservative => {
-            let already_consumed = order.cumulative_trade_through - remaining_size;
-            let depth_remaining = (order.book_depth_at_rest - already_consumed).max(0.0);
-            let after_book = (remaining_size - depth_remaining).max(0.0);
-            // Conservative haircut: residual is split between us and the
-            // (assumed) other public makers at our level. With no per-level
-            // visibility into peer makers, halve the residual. At deep-tail
-            // tiers this is still optimistic vs reality (queues of 1000s)
-            // but bounds the backtest P&L away from clearly-impossible
-            // fill rates.
-            after_book * 0.5
-        }
+        1.0
+    }
+}
+
+/// How much of `remaining_size` is ELIGIBLE to fill `order` under `regime`.
+/// All non-Optimistic regimes apply the peer-density share. Conservative
+/// further halves the result.
+fn eligible_fill_size(regime: FillQuality, order: &RestingOrder, remaining_size: f64) -> f64 {
+    if matches!(regime, FillQuality::Optimistic) {
+        return remaining_size;
+    }
+    let already_consumed = order.cumulative_trade_through - remaining_size;
+    let depth_remaining = (order.book_depth_at_rest - already_consumed).max(0.0);
+    let after_book = (remaining_size - depth_remaining).max(0.0);
+    let our_share = 1.0 / (1.0 + peer_density_for_price(order.intent.price));
+    let after_peers = after_book * our_share;
+    match regime {
+        FillQuality::Base => after_peers,
+        FillQuality::Conservative => after_peers * 0.5,
+        FillQuality::Optimistic => unreachable!(),
     }
 }
 
