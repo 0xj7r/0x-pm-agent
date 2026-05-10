@@ -671,8 +671,16 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     let existing_ev = favorite.win_prob * effective_favorite_qty
         + tail.win_prob * effective_tail_qty
         - existing_cost;
+    // Budget gate uses only convex-attributed open orders, not paired-MM
+    // inventory. Otherwise paired-MM accumulating favorite-side fills (which
+    // it does aggressively under whale-tuned configs) suppresses convex
+    // before it ever has a chance to fire. The `existing_cost` above (full
+    // position) is correct for the EV calculation; this gate just needs to
+    // know what convex itself has already spent.
+    let convex_attributed_cost =
+        favorite.convex_attributed_cost_usd() + tail.convex_attributed_cost_usd();
     let total_budget = config.max_loss_usd.max(0.0);
-    let remaining_excess_budget = total_budget - existing_cost;
+    let remaining_excess_budget = total_budget - convex_attributed_cost;
     if remaining_excess_budget <= 0.0 {
         CONVEX_GATE_PLAN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
@@ -917,8 +925,18 @@ impl<'a> ConvexLeg<'a> {
         self.current_qty.max(0.0) + self.open_qty.max(0.0)
     }
 
+    /// Total cost basis on this leg: full inventory + open orders. Used for
+    /// EV calculation where existing position genuinely changes the expected
+    /// payoff of adding more.
     fn existing_cost_usd(&self) -> f64 {
         self.current_qty.max(0.0) * self.avg_cost.max(0.0) + self.open_notional.max(0.0)
+    }
+
+    /// Cost the convex overlay itself has consumed (open convex orders only).
+    /// Used for the convex budget gate so paired-MM inventory accumulated
+    /// independently does not crowd convex out of its dedicated budget.
+    fn convex_attributed_cost_usd(&self) -> f64 {
+        self.open_notional.max(0.0)
     }
 
     fn depth_usd_or(&self, fallback: f64) -> f64 {
@@ -1443,6 +1461,64 @@ mod tests {
         assert!(
             with_open_orders.is_empty(),
             "active open convex orders should consume package budget before rebuying"
+        );
+    }
+
+    #[test]
+    fn late_convex_overlay_ignores_paired_mm_inventory_in_budget_check() {
+        // Whale-v1 backtest finding: paired-MM accumulated favorite-side
+        // inventory aggressively, and the prior `existing_cost` formula
+        // included that full position cost. Convex saw remaining_excess_budget
+        // <= 0 and silently suppressed itself. This test pins the new
+        // behavior: paired-MM-attributed inventory does not eat the convex
+        // budget; only convex's own open orders do.
+        let mut config = package_config();
+        config.enabled = true;
+        config.fractional_kelly = 0.06;
+        config.max_loss_usd = 40.0;
+        config.min_tail_payoff_multiple = 20.0;
+        config.min_tail_win_profit_usd = 10.0;
+
+        let market = late_market();
+        let snapshot = late_snapshot();
+        let fair_value = FairValueEstimate {
+            p_up: 0.985,
+            p_down: 0.015,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.0,
+            time_remaining_s: 50.0,
+            model: crate::signals::FairValueModel::NoSignal(
+                crate::signals::fair_value::NoSignalReason::SpotInvalid,
+            ),
+        };
+        // Paired-MM has accumulated ~$50 of favorite-side inventory through
+        // its market making. Under the buggy formula this would consume the
+        // entire $40 convex budget and suppress every package. The new
+        // formula uses convex-attributed open orders only (zero here), so
+        // convex should fire.
+        let modest_paired_inventory = PairedInventorySnapshot {
+            yes_qty: 50.0 / 0.985,
+            yes_avg_cost: 0.985,
+            ..PairedInventorySnapshot::default()
+        };
+        let no_open_convex_orders = PairedOpenOrderExposure::default();
+
+        let intents = choose_convex_overlay(
+            &market,
+            &snapshot,
+            &modest_paired_inventory,
+            &no_open_convex_orders,
+            &fair_value,
+            &BtcRegimeSnapshot::default(),
+            &OrderBookPressureSignal::default(),
+            &SideScoreSignal::default(),
+            config,
+            250_000,
+        );
+        assert!(
+            !intents.is_empty(),
+            "paired-MM inventory must not consume convex budget; \
+             convex package should still fire when its own open orders are zero"
         );
     }
 
