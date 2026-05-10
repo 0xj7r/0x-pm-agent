@@ -15,6 +15,9 @@ use crate::market_making::paired_mm::{
 use crate::quote_engine::QuoteEngineConfig;
 use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
 use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
+use crate::strategies::late_favorite_directional::{
+    ConvexTailConfig, FavoriteClimbConfig, LateFavoriteStrategyConfig,
+};
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
 
@@ -42,8 +45,41 @@ pub struct StrategyProfile {
     pub rescue: RescueSection,
     pub operational: OperationalSection,
     pub core_hedge: CoreHedgeSection,
+    pub late_favorite: LateFavoriteSection,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LateFavoriteSection {
+    pub favorite_climb: FavoriteClimbSubsection,
+    pub convex_tail: ConvexTailSubsection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FavoriteClimbSubsection {
+    pub enabled: Option<bool>,
+    pub min_favorite_ask: Option<f64>,
+    pub max_favorite_ask: Option<f64>,
+    pub window_sec: Option<u64>,
+    pub clip_usd: Option<f64>,
+    pub max_load_usd: Option<f64>,
+    pub maker_improve_ticks: Option<f64>,
+    pub min_order_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConvexTailSubsection {
+    pub enabled: Option<bool>,
+    pub max_cheap_ask: Option<f64>,
+    pub window_sec: Option<u64>,
+    pub clip_usd: Option<f64>,
+    pub max_load_usd: Option<f64>,
+    pub maker_improve_ticks: Option<f64>,
+    pub min_order_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -243,6 +279,38 @@ impl StrategyProfile {
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
                 min_order_usd: s.min_order_usd.unwrap_or(defaults.min_order_usd),
+            },
+        }
+    }
+
+    pub fn late_favorite_config(&self) -> LateFavoriteStrategyConfig {
+        let climb_def = FavoriteClimbConfig::default();
+        let tail_def = ConvexTailConfig::default();
+        let c = &self.late_favorite.favorite_climb;
+        let t = &self.late_favorite.convex_tail;
+        LateFavoriteStrategyConfig {
+            favorite_climb: FavoriteClimbConfig {
+                enabled: c.enabled.unwrap_or(climb_def.enabled),
+                min_favorite_ask: c.min_favorite_ask.unwrap_or(climb_def.min_favorite_ask),
+                max_favorite_ask: c.max_favorite_ask.unwrap_or(climb_def.max_favorite_ask),
+                window_sec: c.window_sec.unwrap_or(climb_def.window_sec),
+                clip_usd: c.clip_usd.unwrap_or(climb_def.clip_usd),
+                max_load_usd: c.max_load_usd.unwrap_or(climb_def.max_load_usd),
+                maker_improve_ticks: c
+                    .maker_improve_ticks
+                    .unwrap_or(climb_def.maker_improve_ticks),
+                min_order_usd: c.min_order_usd.unwrap_or(climb_def.min_order_usd),
+            },
+            convex_tail: ConvexTailConfig {
+                enabled: t.enabled.unwrap_or(tail_def.enabled),
+                max_cheap_ask: t.max_cheap_ask.unwrap_or(tail_def.max_cheap_ask),
+                window_sec: t.window_sec.unwrap_or(tail_def.window_sec),
+                clip_usd: t.clip_usd.unwrap_or(tail_def.clip_usd),
+                max_load_usd: t.max_load_usd.unwrap_or(tail_def.max_load_usd),
+                maker_improve_ticks: t
+                    .maker_improve_ticks
+                    .unwrap_or(tail_def.maker_improve_ticks),
+                min_order_usd: t.min_order_usd.unwrap_or(tail_def.min_order_usd),
             },
         }
     }

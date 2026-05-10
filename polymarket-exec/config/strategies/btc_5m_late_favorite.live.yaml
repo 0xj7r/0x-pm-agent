@@ -1,0 +1,31 @@
+strategy: late_favorite_directional
+profile_name: btc_5m_late_favorite
+version: "0.1"
+last_updated: 2026-05-10
+description: |
+  Bonereaper-style late-favorite directional with convex tail hedge.
+  Phase A: load expensive leg as it climbs 0.85 -> 0.99 in last few min.
+  Phase B: massive convex tail buy on cheap leg compressed to <= 0.02 in
+  final ~30s. Source: live evidence 2026-05-10 + per-market dollar-skew
+  analysis (bonereaper -0.33 median notional skew). Note bonereaper is
+  net loss-making over short windows; this profile exists for
+  comparative perf analysis vs paired_mm and core_hedge_mm.
+
+late_favorite:
+  favorite_climb:
+    enabled: true
+    min_favorite_ask: 0.85
+    max_favorite_ask: 0.99
+    window_sec: 180
+    clip_usd: 20.0
+    max_load_usd: 200.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 1.0
+  convex_tail:
+    enabled: true
+    max_cheap_ask: 0.02
+    window_sec: 60
+    clip_usd: 2.0
+    max_load_usd: 15.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 0.5
