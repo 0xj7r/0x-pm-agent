@@ -511,24 +511,24 @@ fn rescue_math_uses_sell_fallback_when_buy_to_merge_is_worse() {
 fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
     for (path, expected) in [
         (
-            "config/strategies/btc_5m_pair_cost_arb.live.yaml",
+            "config/strategies/archive/btc_5m_pair_cost_arb.live.yaml",
             "pair_cost_arb",
         ),
-        ("config/strategies/btc_5m_paired_mm.live.yaml", "paired_mm"),
+        ("config/strategies/archive/btc_5m_paired_mm.live.yaml", "paired_mm"),
         (
-            "config/strategies/btc_5m_core_hedge.live.yaml",
+            "config/strategies/archive/btc_5m_core_hedge.live.yaml",
             "core_hedge_mm",
         ),
         (
-            "config/strategies/btc_5m_core_hedge_bonereaper.live.yaml",
+            "config/strategies/archive/btc_5m_core_hedge_bonereaper.live.yaml",
             "core_hedge_mm",
         ),
         (
-            "config/strategies/btc_5m_late_favorite.live.yaml",
+            "config/strategies/archive/btc_5m_late_favorite.live.yaml",
             "late_favorite_directional",
         ),
         (
-            "config/strategies/btc_5m_late_favorite_bonereaper.live.yaml",
+            "config/strategies/archive/btc_5m_late_favorite_bonereaper.live.yaml",
             "late_favorite_directional",
         ),
         (
@@ -548,8 +548,8 @@ fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
 
 #[test]
 fn core_hedge_profile_drives_live_strategy_adapter() {
-    let profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/btc_5m_core_hedge.live.yaml",
+        let profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/archive/btc_5m_core_hedge.live.yaml",
     ))
     .expect("core hedge profile");
     let market_id = MarketId::from("btc-5m-test");
@@ -585,7 +585,7 @@ fn core_hedge_profile_drives_live_strategy_adapter() {
 #[test]
 fn active_strategy_yaml_profiles_drive_strategy_configs() {
     let pair_cost_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/btc_5m_pair_cost_arb.live.yaml",
+        "config/strategies/archive/btc_5m_pair_cost_arb.live.yaml",
     ))
     .expect("pair-cost profile");
     let pair_cost_config = pair_cost_profile.pair_cost_arb_config();
@@ -600,7 +600,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(pair_cost_config.recycle_min_time_remaining_ms, 90_000);
 
     let paired_mm_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/btc_5m_paired_mm.live.yaml",
+        "config/strategies/archive/btc_5m_paired_mm.live.yaml",
     ))
     .expect("paired-mm profile");
     let paired_mm_config = paired_mm_profile.paired_mm_config();

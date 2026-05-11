@@ -1,0 +1,32 @@
+strategy: late_favorite_directional
+profile_name: btc_5m_late_favorite_bonereaper
+version: "0.2"
+last_updated: 2026-05-11
+description: |
+  Bonereaper-style late favorite overlay with strict BTC-direction filter and
+  pivot cutoff at bonereaper redeem-only switch.
+
+late_favorite:
+  favorite_climb:
+    enabled: true
+    min_favorite_ask: 0.90
+    max_favorite_ask: 0.99
+    window_sec: 120
+    start_frac: 0.0
+    clip_usd: 100.0
+    max_load_usd: 5000.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 1.0
+    spot_filter_bps: 10.0
+    require_spot_match: true
+    disable_after_ms: 1776747600000
+  convex_tail:
+    enabled: true
+    max_cheap_ask: 0.02
+    window_sec: 60
+    start_frac: 0.0
+    clip_usd: 2.0
+    max_load_usd: 15.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 0.5
+    disable_after_ms: 1776747600000

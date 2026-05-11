@@ -14,6 +14,7 @@ use crate::market_making::paired_mm::{
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketTenor, UnderlyingAsset};
 use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel};
+use crate::strategies::bonereaper_mm::BonereaperMmStrategy;
 use crate::strategies::core_hedge_mm::CoreHedgeMmStrategy;
 use crate::strategies::late_favorite_directional::LateFavoriteStrategy;
 use crate::strategies::pair_cost_arb::PairCostArbStrategy;
@@ -22,6 +23,7 @@ use crate::strategies::traits::{
     PairedOpenOrderExposure, StrategyFillInput, StrategyInput, StrategyOpenOrderSnapshot,
     TradingStrategy,
 };
+use crate::strategies::unlawful_mm::UnlawfulMmStrategy;
 pub use crate::strategy_profile::*;
 use crate::types::{
     EpochMillis, FillReport, InstrumentId, IntentKind, MarketId, MarketLedgerState, MarketSnapshot,
@@ -283,24 +285,19 @@ impl Strategy for StrategyMode {
 }
 
 fn parse_strategy_names(raw: &str) -> Vec<String> {
-    fn canonicalize(name: &str) -> Vec<&'static str> {
+    fn canonicalize(name: &str) -> Vec<String> {
         match name {
-            "unlawful" | "unlawful_core" | "unlawful_hedge" | "unlawful_core_mm"
-            | "unlawful_core_hedge" | "unlawful_mm" | "whale_unlawful" | "whale_unlawful_mm" => {
-                vec!["core_hedge_mm"]
+            "unlawful" | "unlawful_mm" => {
+                vec!["unlawful_mm".to_string()]
             }
-            "bonereaper"
-            | "bonereaper_mm"
-            | "bonereaper_late_fav"
-            | "whale_bonereaper"
-            | "whale_bonereaper_mm" => vec!["core_hedge_mm", "late_favorite_directional"],
-            "bonereaper_fav" | "bonereaper_directional" | "bonereaper_late_favorite" => {
-                vec!["late_favorite_directional"]
+            "bonereaper" | "bonereaper_mm" => vec!["bonereaper_mm".to_string()],
+            "late_favorite_directional" => {
+                vec!["late_favorite_directional".to_string()]
             }
             "hybrid" | "pair_cost_hybrid" => {
-                vec!["pair_cost_arb", "paired_mm"]
+                vec!["pair_cost_arb".to_string(), "paired_mm".to_string()]
             }
-            other => vec![other],
+            other => vec![other.to_string()],
         }
     }
 
@@ -308,7 +305,7 @@ fn parse_strategy_names(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .flat_map(|name| {
-            canonicalize(&name.to_ascii_lowercase()).into_iter().map(|n| n.to_string())
+            canonicalize(&name.to_ascii_lowercase()).into_iter()
         })
         .collect()
 }
@@ -320,6 +317,8 @@ pub struct HybridStrategy {
     paired_mm: Option<PairedMmStrategy>,
     core_hedge_mm: Option<CoreHedgeMmStrategy>,
     late_favorite: Option<LateFavoriteStrategy>,
+    unlawful_mm: Option<UnlawfulMmStrategy>,
+    bonereaper_mm: Option<BonereaperMmStrategy>,
     quotes_by_market: HashMap<MarketId, HashMap<InstrumentId, QuoteSnapshot>>,
     momentum_weight: f64,
     mm_overlay_capital_pct: f64,
@@ -339,6 +338,8 @@ impl HybridStrategy {
         let paired_mm_requested = requested.iter().any(|name| name == "paired_mm");
         let mut core_hedge_mm = None;
         let mut late_favorite = None;
+        let mut unlawful_mm = None;
+        let mut bonereaper_mm = None;
         let hybrid_overlay_enabled = if pair_cost_requested && paired_mm_requested {
             profile.hybrid_mm.enabled.unwrap_or(true)
         } else {
@@ -361,6 +362,12 @@ impl HybridStrategy {
                 "late_favorite_directional" => {
                     late_favorite = Some(LateFavoriteStrategy::new(profile.late_favorite_config()));
                 }
+                "unlawful_mm" => {
+                    unlawful_mm = Some(UnlawfulMmStrategy::new(profile.unlawful_mm_config()));
+                }
+                "bonereaper_mm" => {
+                    bonereaper_mm = Some(BonereaperMmStrategy::new(profile.bonereaper_mm_config()));
+                }
                 "noop" => {}
                 other => return Err(format!("unsupported strategy '{other}'")),
             }
@@ -369,6 +376,8 @@ impl HybridStrategy {
             && paired_mm.is_none()
             && core_hedge_mm.is_none()
             && late_favorite.is_none()
+            && unlawful_mm.is_none()
+            && bonereaper_mm.is_none()
         {
             return Err("configured strategy set contains no active strategy".to_string());
         }
@@ -379,6 +388,8 @@ impl HybridStrategy {
             paired_mm,
             core_hedge_mm,
             late_favorite,
+            unlawful_mm,
+            bonereaper_mm,
             quotes_by_market: HashMap::new(),
             momentum_weight: profile.momentum_weight(),
             mm_overlay_capital_pct: if pair_cost_requested && paired_mm_requested {
@@ -741,6 +752,14 @@ impl Strategy for HybridStrategy {
             let decision = Self::convert(strategy.on_tick(input));
             decisions.push(Self::filter_for_market_state(decision, context));
         }
+        if let Some(strategy) = self.unlawful_mm.as_mut() {
+            let decision = Self::convert(strategy.on_tick(input.clone()));
+            decisions.push(Self::filter_for_market_state(decision, context));
+        }
+        if let Some(strategy) = self.bonereaper_mm.as_mut() {
+            let decision = Self::convert(strategy.on_tick(input));
+            decisions.push(Self::filter_for_market_state(decision, context));
+        }
         Self::combine(decisions)
     }
 
@@ -762,6 +781,12 @@ impl Strategy for HybridStrategy {
             decisions.push(Self::convert(strategy.on_fill(fill_input.clone())));
         }
         if let Some(strategy) = self.late_favorite.as_mut() {
+            decisions.push(Self::convert(strategy.on_fill(fill_input)));
+        }
+        if let Some(strategy) = self.unlawful_mm.as_mut() {
+            decisions.push(Self::convert(strategy.on_fill(fill_input.clone())));
+        }
+        if let Some(strategy) = self.bonereaper_mm.as_mut() {
             decisions.push(Self::convert(strategy.on_fill(fill_input)));
         }
         Self::combine(decisions)

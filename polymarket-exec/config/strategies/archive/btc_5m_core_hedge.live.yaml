@@ -1,0 +1,19 @@
+strategy: unlawful_mm
+profile_name: btc_5m_core_hedge
+version: "0.1"
+last_updated: 2026-05-11
+description: |
+  Canonical unlawful-style paired-core fallback with fixed-size symmetric ladders
+  and paired recycle. Reworked to match documented 35x ladder profile.
+
+core_hedge:
+  enabled: true
+  ladder_levels: 35
+  ladder_span: 0.52
+  center_price: 0.50
+  clip_shares: 15.0
+  maker_improve_ticks: 0.0
+  merge_min_qty: 50.0
+  merge_batch_cap: 500.0
+  # Unlawful pivot to redeem-only was 2026-04-28 15:00 UTC.
+  merge_disabled_after_ms: 1777330800000

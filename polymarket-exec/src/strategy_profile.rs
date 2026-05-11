@@ -14,12 +14,16 @@ use crate::market_making::paired_mm::{
 };
 use crate::quote_engine::QuoteEngineConfig;
 use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
+use crate::strategies::bonereaper_mm::{
+    BonereaperMmConfig, BonereaperMmStrategyConfig, LateCertConfig,
+};
 use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
 use crate::strategies::late_favorite_directional::{
     ConvexTailConfig, FavoriteClimbConfig, LateFavoriteStrategyConfig,
 };
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
+use crate::strategies::unlawful_mm::{UnlawfulMmConfig, UnlawfulMmStrategyConfig};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,10 +68,15 @@ pub struct FavoriteClimbSubsection {
     pub min_favorite_ask: Option<f64>,
     pub max_favorite_ask: Option<f64>,
     pub window_sec: Option<u64>,
+    pub start_frac: Option<f64>,
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
+    pub spot_filter_bps: Option<f64>,
+    pub require_spot_match: Option<bool>,
+    pub disable_after_ms: Option<u64>,
+    pub clip_scale: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,27 +85,27 @@ pub struct ConvexTailSubsection {
     pub enabled: Option<bool>,
     pub max_cheap_ask: Option<f64>,
     pub window_sec: Option<u64>,
+    pub start_frac: Option<f64>,
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
+    pub disable_after_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CoreHedgeSection {
     pub enabled: Option<bool>,
-    pub cheap_leg_max_price: Option<f64>,
-    pub expensive_leg_min_price: Option<f64>,
-    pub expensive_leg_max_price: Option<f64>,
-    pub min_price_gap: Option<f64>,
-    pub bar_capital_usd: Option<f64>,
-    pub target_hedge_ratio: Option<f64>,
-    pub core_clip_usd: Option<f64>,
-    pub hedge_clip_usd: Option<f64>,
+    pub ladder_levels: Option<usize>,
+    pub ladder_span: Option<f64>,
+    pub center_price: Option<f64>,
+    pub clip_shares: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
-    pub min_order_usd: Option<f64>,
     pub merge_min_qty: Option<f64>,
+    pub merge_batch_cap: Option<f64>,
+    pub merge_disabled_after_ms: Option<u64>,
+    pub clip_scale: Option<f64>,
 }
 
 impl StrategyProfile {
@@ -254,33 +263,83 @@ impl StrategyProfile {
         config
     }
 
+    /// Build the new whale-replica unlawful_mm config from the existing
+    /// `core_hedge:` section. Unlawful-specific knobs (pair-cost stop,
+    /// strand cleanup, regime scales) fall back to module defaults.
+    pub fn unlawful_mm_config(&self) -> UnlawfulMmStrategyConfig {
+        let defaults = UnlawfulMmConfig::default();
+        let s = &self.core_hedge;
+        UnlawfulMmStrategyConfig {
+            unlawful: UnlawfulMmConfig {
+                enabled: s.enabled.unwrap_or(true),
+                ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
+                ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
+                center_price: s.center_price.unwrap_or(defaults.center_price),
+                clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
+                merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
+                merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
+                pair_cost_stop_usd: defaults.pair_cost_stop_usd,
+                strand_cleanup_ms: defaults.strand_cleanup_ms,
+                regime_scale_trending: defaults.regime_scale_trending,
+                regime_scale_high_vol: defaults.regime_scale_high_vol,
+                regime_scale_calm: defaults.regime_scale_calm,
+                clip_scale: s.clip_scale.unwrap_or(defaults.clip_scale),
+            },
+        }
+    }
+
+    /// Build the new whale-replica bonereaper_mm config from `core_hedge:`
+    /// (paired-MM core) + `late_favorite.favorite_climb:` (late-cert overlay).
+    pub fn bonereaper_mm_config(&self) -> BonereaperMmStrategyConfig {
+        let core_def = BonereaperMmConfig::default();
+        let late_def = LateCertConfig::default();
+        let s = &self.core_hedge;
+        let lf = &self.late_favorite.favorite_climb;
+        BonereaperMmStrategyConfig {
+            bonereaper: BonereaperMmConfig {
+                enabled: s.enabled.unwrap_or(true),
+                ladder_levels: s.ladder_levels.unwrap_or(core_def.ladder_levels),
+                ladder_span: s.ladder_span.unwrap_or(core_def.ladder_span),
+                center_price: s.center_price.unwrap_or(core_def.center_price),
+                merge_min_qty: s.merge_min_qty.unwrap_or(core_def.merge_min_qty),
+                merge_batch_cap: s.merge_batch_cap.unwrap_or(core_def.merge_batch_cap),
+                pair_cost_stop_usd: core_def.pair_cost_stop_usd,
+                strand_cleanup_ms: core_def.strand_cleanup_ms,
+                merge_post_bar_delay_ms: core_def.merge_post_bar_delay_ms,
+                regime_scale_trending: core_def.regime_scale_trending,
+                regime_scale_high_vol: core_def.regime_scale_high_vol,
+                regime_scale_calm: core_def.regime_scale_calm,
+                clip_scale: s.clip_scale.unwrap_or(core_def.clip_scale),
+            },
+            late_cert: LateCertConfig {
+                enabled: lf.enabled.unwrap_or(late_def.enabled),
+                window_sec: lf.window_sec.map(|w| w as f64).unwrap_or(late_def.window_sec),
+                favourite_ask_threshold: lf
+                    .min_favorite_ask
+                    .unwrap_or(late_def.favourite_ask_threshold),
+                max_load_usd: lf.max_load_usd.unwrap_or(late_def.max_load_usd),
+                spot_filter_bps: lf.spot_filter_bps.unwrap_or(late_def.spot_filter_bps),
+                clip_scale: lf.clip_scale.unwrap_or(late_def.clip_scale),
+            },
+        }
+    }
+
     pub fn core_hedge_mm_config(&self) -> CoreHedgeMmStrategyConfig {
         let defaults = CoreHedgeMmConfig::default();
         let s = &self.core_hedge;
         CoreHedgeMmStrategyConfig {
             core_hedge: CoreHedgeMmConfig {
                 enabled: s.enabled.unwrap_or(defaults.enabled),
-                cheap_leg_max_price: s
-                    .cheap_leg_max_price
-                    .unwrap_or(defaults.cheap_leg_max_price),
-                expensive_leg_min_price: s
-                    .expensive_leg_min_price
-                    .unwrap_or(defaults.expensive_leg_min_price),
-                expensive_leg_max_price: s
-                    .expensive_leg_max_price
-                    .unwrap_or(defaults.expensive_leg_max_price),
-                min_price_gap: s.min_price_gap.unwrap_or(defaults.min_price_gap),
-                bar_capital_usd: s.bar_capital_usd.unwrap_or(defaults.bar_capital_usd),
-                target_hedge_ratio: s
-                    .target_hedge_ratio
-                    .unwrap_or(defaults.target_hedge_ratio),
-                core_clip_usd: s.core_clip_usd.unwrap_or(defaults.core_clip_usd),
-                hedge_clip_usd: s.hedge_clip_usd.unwrap_or(defaults.hedge_clip_usd),
+                ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
+                ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
+                center_price: s.center_price.unwrap_or(defaults.center_price),
+                clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
                 maker_improve_ticks: s
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
-                min_order_usd: s.min_order_usd.unwrap_or(defaults.min_order_usd),
                 merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
+                merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
+                merge_disabled_after_ms: s.merge_disabled_after_ms,
             },
         }
     }
@@ -296,23 +355,31 @@ impl StrategyProfile {
                 min_favorite_ask: c.min_favorite_ask.unwrap_or(climb_def.min_favorite_ask),
                 max_favorite_ask: c.max_favorite_ask.unwrap_or(climb_def.max_favorite_ask),
                 window_sec: c.window_sec.unwrap_or(climb_def.window_sec),
+                start_frac: c.start_frac.unwrap_or(climb_def.start_frac),
                 clip_usd: c.clip_usd.unwrap_or(climb_def.clip_usd),
                 max_load_usd: c.max_load_usd.unwrap_or(climb_def.max_load_usd),
                 maker_improve_ticks: c
                     .maker_improve_ticks
                     .unwrap_or(climb_def.maker_improve_ticks),
                 min_order_usd: c.min_order_usd.unwrap_or(climb_def.min_order_usd),
+                spot_filter_bps: c.spot_filter_bps.unwrap_or(climb_def.spot_filter_bps),
+                require_spot_match: c
+                    .require_spot_match
+                    .unwrap_or(climb_def.require_spot_match),
+                disable_after_ms: c.disable_after_ms,
             },
             convex_tail: ConvexTailConfig {
                 enabled: t.enabled.unwrap_or(tail_def.enabled),
                 max_cheap_ask: t.max_cheap_ask.unwrap_or(tail_def.max_cheap_ask),
                 window_sec: t.window_sec.unwrap_or(tail_def.window_sec),
+                start_frac: t.start_frac.unwrap_or(tail_def.start_frac),
                 clip_usd: t.clip_usd.unwrap_or(tail_def.clip_usd),
                 max_load_usd: t.max_load_usd.unwrap_or(tail_def.max_load_usd),
                 maker_improve_ticks: t
                     .maker_improve_ticks
                     .unwrap_or(tail_def.maker_improve_ticks),
                 min_order_usd: t.min_order_usd.unwrap_or(tail_def.min_order_usd),
+                disable_after_ms: t.disable_after_ms,
             },
         }
     }
@@ -617,6 +684,10 @@ impl StrategyProfile {
             .entry_min_size_multiplier
             .unwrap_or(config.entry_min_size_multiplier);
         config.max_spread = self.quote.max_spread.or(config.max_spread);
+        config.max_entry_pair_cost = self
+            .pair_cost
+            .max_entry_pair_cost
+            .or(config.max_entry_pair_cost);
         config.max_quote_per_side_usd = self
             .quote
             .max_quote_per_side_usd
@@ -808,6 +879,7 @@ pub struct ProfileHealth {
 #[serde(default)]
 pub struct PairCostSection {
     pub threshold: Option<f64>,
+    pub max_entry_pair_cost: Option<f64>,
     pub high_vol_threshold: Option<f64>,
     pub min_merge_usd: Option<f64>,
     pub min_edge_bps: Option<f64>,
@@ -1003,7 +1075,7 @@ mod tests {
     #[test]
     fn live_paired_mm_profile_disables_sell_unwind() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("config/strategies/btc_5m_paired_mm.live.yaml");
+            .join("config/strategies/archive/btc_5m_paired_mm.live.yaml");
         let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
         let config = profile.paired_mm_config();
 
@@ -1017,7 +1089,7 @@ mod tests {
     #[test]
     fn live_paired_mm_profile_wires_quote_knobs_into_ladder() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("config/strategies/btc_5m_paired_mm.live.yaml");
+            .join("config/strategies/archive/btc_5m_paired_mm.live.yaml");
         let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
         let config = profile.paired_mm_config();
 

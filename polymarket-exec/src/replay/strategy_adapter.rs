@@ -610,6 +610,8 @@ impl ReplayStrategyAdapter {
                         enabled.push(EnabledStrategy::LateFavorite)
                     }
                     "paired_mm" => enabled.push(EnabledStrategy::PairedMm),
+                    "unlawful_mm" => enabled.push(EnabledStrategy::UnlawfulMm),
+                    "bonereaper_mm" => enabled.push(EnabledStrategy::BonereaperMm),
                     _ => {}
                 }
             }
@@ -624,17 +626,12 @@ impl ReplayStrategyAdapter {
         match raw.to_ascii_lowercase().as_str() {
             "pair_cost_arb" | "pair_cost" | "paircost" => vec!["pair_cost_arb"],
             "paired_mm" | "paired-mm" | "pairedmm" => vec!["paired_mm"],
-            "core_hedge_mm" | "core_hedge" | "unlawful_core"
-            | "unlawful_core_mm" | "unlawful_core_hedge" | "unlawful" | "unlawful_mm"
-            | "whale_unlawful" | "whale_unlawful_mm" => {
-                vec!["core_hedge_mm"]
-            }
-            "late_favorite_directional" | "late_favorite" | "late_fav" | "latefavorite"
-            | "bonereaper_directional" | "bonereaper_fav" | "bonereaper_late_favorite" => {
+            "core_hedge_mm" | "core_hedge" => vec!["core_hedge_mm"],
+            "unlawful" | "unlawful_mm" => vec!["unlawful_mm"],
+            "late_favorite_directional" | "late_favorite" | "late_fav" | "latefavorite" => {
                 vec!["late_favorite_directional"]
             }
-            "bonereaper" | "bonereaper_mm" | "bonereaper_late_fav" | "whale_bonereaper"
-            | "whale_bonereaper_mm" => vec!["core_hedge_mm", "late_favorite_directional"],
+            "bonereaper" | "bonereaper_mm" => vec!["bonereaper_mm"],
             "hybrid" | "pair_cost_hybrid" => {
                 // Keep legacy alias behavior. Historical "hybrid" means
                 // pair-cost + paired-mm.
@@ -671,6 +668,15 @@ impl ReplayStrategyAdapter {
                     let cfg = self.profile.late_favorite_config();
                     self.registry
                         .register_late_favorite(market_id.as_str(), cfg);
+                }
+                EnabledStrategy::UnlawfulMm => {
+                    let cfg = self.profile.unlawful_mm_config();
+                    self.registry.register_unlawful_mm(market_id.as_str(), cfg);
+                }
+                EnabledStrategy::BonereaperMm => {
+                    let cfg = self.profile.bonereaper_mm_config();
+                    self.registry
+                        .register_bonereaper_mm(market_id.as_str(), cfg);
                 }
             }
         }
@@ -943,18 +949,16 @@ impl ReplayStrategyAdapter {
             coid.clone(),
             IntentRecord::from_intent(&runtime_intent, leg),
         );
-        // Live/replay parity: `OrderIntent` does not carry a typed
-        // post_only flag yet, so the adapter derives it from
-        // `IntentKind`. Entry intents (paired-mm bids/asks, capital
-        // recycle, convex accumulation) are resting maker quotes and the
-        // live trader sets `post_only=true` on the venue request to keep
-        // the maker rebate. Close intents (hedge rescue, reduce-only
-        // sells) are FAK-style aggressive lifts and must NOT be
-        // post-only. This mirrors the live runtime's path through the
-        // execution adapter, where the same IntentKind drives the same
-        // venue-side flags.
-        let aggressive = matches!(intent.kind, IntentKind::Close);
-        let post_only = matches!(intent.kind, IntentKind::Entry);
+        // Live/replay parity: post_only / aggressive are derived from the
+        // intent's `aggressive` flag first, with `IntentKind` as a fallback
+        // for legacy strategies that haven't set the flag explicitly.
+        // - Close intents (hedge rescue, reduce-only sells) are FAK lifts.
+        // - Aggressive entries (bonereaper late-cert favourite load) bid
+        //   at best_ask and must NOT be post-only.
+        // - Passive entries (paired-MM bids, capital recycle, convex
+        //   accumulation) are resting maker quotes with post_only=true.
+        let aggressive = intent.aggressive || matches!(intent.kind, IntentKind::Close);
+        let post_only = !aggressive && matches!(intent.kind, IntentKind::Entry);
         Some(StrategyOrderIntent {
             client_order_id: coid,
             asset_id,
@@ -1356,7 +1360,7 @@ impl ReplayStrategyAdapter {
                     side: side_str,
                     price: limit_price,
                     size: quantity,
-                    post_only: matches!(intent_kind, IntentKind::Entry),
+                    post_only: sim_intent.post_only,
                     ladder_position,
                     reason_tag,
                 });
@@ -1488,7 +1492,7 @@ impl ReplayStrategyAdapter {
                 side: side_str,
                 price: limit_price,
                 size: quantity,
-                post_only: matches!(intent_kind, IntentKind::Entry),
+                post_only: sim_intent.post_only,
                 ladder_position,
                 reason_tag,
             });
@@ -1503,6 +1507,8 @@ enum EnabledStrategy {
     PairCostArb,
     CoreHedgeMm,
     LateFavorite,
+    UnlawfulMm,
+    BonereaperMm,
 }
 
 impl ReplayStrategy for ReplayStrategyAdapter {
@@ -1849,6 +1855,9 @@ mod tests {
             created_at_ms: 1_000,
             pair_id: None,
             kind: IntentKind::Entry,
+            aggressive: false,
+            
+            
         }
     }
 
