@@ -287,10 +287,10 @@ impl Strategy for StrategyMode {
 fn parse_strategy_names(raw: &str) -> Vec<String> {
     fn canonicalize(name: &str) -> Vec<String> {
         match name {
-            "unlawful" | "unlawful_mm" => {
+            "unlawful_mm" => {
                 vec!["unlawful_mm".to_string()]
             }
-            "bonereaper" | "bonereaper_mm" => vec!["bonereaper_mm".to_string()],
+            "bonereaper_mm" => vec!["bonereaper_mm".to_string()],
             "late_favorite_directional" => {
                 vec!["late_favorite_directional".to_string()]
             }

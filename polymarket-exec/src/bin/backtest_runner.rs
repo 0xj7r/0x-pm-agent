@@ -837,7 +837,7 @@ fn profile_requires_btc_ticks(profile: &StrategyProfile) -> bool {
     profile_strategy_tokens(profile).iter().any(|token| {
         matches!(
             token.as_str(),
-            "bonereaper" | "bonereaper_mm" | "late_favorite_directional"
+            "bonereaper_mm" | "late_favorite_directional"
         )
     })
 }

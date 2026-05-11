@@ -627,11 +627,11 @@ impl ReplayStrategyAdapter {
             "pair_cost_arb" | "pair_cost" | "paircost" => vec!["pair_cost_arb"],
             "paired_mm" | "paired-mm" | "pairedmm" => vec!["paired_mm"],
             "core_hedge_mm" | "core_hedge" => vec!["core_hedge_mm"],
-            "unlawful" | "unlawful_mm" => vec!["unlawful_mm"],
-            "late_favorite_directional" | "late_favorite" | "late_fav" | "latefavorite" => {
+            "unlawful_mm" => vec!["unlawful_mm"],
+            "late_favorite_directional" => {
                 vec!["late_favorite_directional"]
             }
-            "bonereaper" | "bonereaper_mm" => vec!["bonereaper_mm"],
+            "bonereaper_mm" => vec!["bonereaper_mm"],
             "hybrid" | "pair_cost_hybrid" => {
                 // Keep legacy alias behavior. Historical "hybrid" means
                 // pair-cost + paired-mm.
