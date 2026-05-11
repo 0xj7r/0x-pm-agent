@@ -15,7 +15,7 @@
 //! adapter calls, journal/checkpoint side effects. The replay path applies
 //! the strategy decisions directly to the simulator.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use serde_json::json;
 use serde_yaml::Value as YamlValue;
@@ -443,10 +443,9 @@ pub struct ReplayStrategyAdapter {
     books: BookAggregator,
     btc_regime: BtcRegimeAggregator,
     inventories: BTreeMap<MarketId, InventoryState>,
-    /// Live runtime inventory mirror per market. Mirrors the live trader's
-    /// `core::inventory::InventoryState` so the `RiskEngine` evaluates
-    /// against the same shapes the live trader sees.
-    runtime_inventories: BTreeMap<MarketId, RuntimeInventoryState>,
+    /// Live runtime inventory mirror for the whole replay portfolio. The live
+    /// trader has one wallet/equity pool, not one cash pool per market.
+    runtime_inventory: RuntimeInventoryState,
     risk: RiskEngine,
     /// Per-market open-intent counters, updated as the simulator accepts
     /// intents and decremented on fills. Feeds `RiskContext` so the
@@ -468,6 +467,7 @@ pub struct ReplayStrategyAdapter {
     /// the same strategy slot emit an implicit cancel of the prior
     /// adapter coid, mirroring the live runtime's replace semantics.
     coid_by_strategy_slot: BTreeMap<String, String>,
+    journal_enabled: bool,
     starting_cash_usd: f64,
     /// Last on_tick time per market, used to throttle on_tick calls. Without
     /// throttling we would call the strategy on every event which is the
@@ -523,7 +523,7 @@ impl ReplayStrategyAdapter {
             books: BookAggregator::default(),
             btc_regime: BtcRegimeAggregator::default(),
             inventories: BTreeMap::new(),
-            runtime_inventories: BTreeMap::new(),
+            runtime_inventory: RuntimeInventoryState::new(DEFAULT_STARTING_CASH_USD),
             risk: RiskEngine::new(limits),
             open_orders_total: 0,
             open_orders_per_market: BTreeMap::new(),
@@ -532,6 +532,7 @@ impl ReplayStrategyAdapter {
             runtime_state: InMemoryRuntimeStateStore::new(),
             quote_reconciler: QuoteReconciler::default(),
             coid_by_strategy_slot: BTreeMap::new(),
+            journal_enabled: true,
             starting_cash_usd: DEFAULT_STARTING_CASH_USD,
             sequence: 0,
         }
@@ -545,12 +546,21 @@ impl ReplayStrategyAdapter {
         } else {
             DEFAULT_STARTING_CASH_USD
         };
+        self.runtime_inventory = RuntimeInventoryState::new(self.starting_cash_usd);
         self
     }
 
     /// Enable or disable in-band `RiskEngine` evaluation of every intent.
     pub fn with_risk_evaluation(mut self, enabled: bool) -> Self {
         self.risk_evaluation_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable construction of replay journal rows inside the
+    /// adapter. `ReplayJournalMode::None` callers discard these rows, so
+    /// building hashes and strings there is pure overhead.
+    pub fn with_journal_enabled(mut self, enabled: bool) -> Self {
+        self.journal_enabled = enabled;
         self
     }
 
@@ -576,12 +586,62 @@ impl ReplayStrategyAdapter {
         self.build_input_for_market(&market, now_ms)
     }
 
-    fn enabled_strategy(&self) -> EnabledStrategy {
-        match self.profile.strategy.as_deref() {
-            Some("pair_cost_arb") => EnabledStrategy::PairCostArb,
-            Some("core_hedge_mm") => EnabledStrategy::CoreHedgeMm,
-            Some("late_favorite_directional") => EnabledStrategy::LateFavorite,
-            _ => EnabledStrategy::PairedMm,
+    fn enabled_strategies(&self) -> Vec<EnabledStrategy> {
+        let configured = self
+            .profile
+            .strategy
+            .as_deref()
+            .unwrap_or("paired_mm");
+        let mut enabled = Vec::new();
+        let mut seen = BTreeSet::new();
+        for raw_name in configured
+            .split([',', '+'])
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            for canonical_name in Self::canonicalize_strategy_names(raw_name) {
+                if !seen.insert(canonical_name) {
+                    continue;
+                }
+                match canonical_name {
+                    "pair_cost_arb" => enabled.push(EnabledStrategy::PairCostArb),
+                    "core_hedge_mm" => enabled.push(EnabledStrategy::CoreHedgeMm),
+                    "late_favorite_directional" => {
+                        enabled.push(EnabledStrategy::LateFavorite)
+                    }
+                    "paired_mm" => enabled.push(EnabledStrategy::PairedMm),
+                    _ => {}
+                }
+            }
+        }
+        if enabled.is_empty() {
+            enabled.push(EnabledStrategy::PairedMm);
+        }
+        enabled
+    }
+
+    fn canonicalize_strategy_names(raw: &str) -> Vec<&'static str> {
+        match raw.to_ascii_lowercase().as_str() {
+            "pair_cost_arb" | "pair_cost" | "paircost" => vec!["pair_cost_arb"],
+            "paired_mm" | "paired-mm" | "pairedmm" => vec!["paired_mm"],
+            "core_hedge_mm" | "core_hedge" | "unlawful_core"
+            | "unlawful_core_mm" | "unlawful_core_hedge" | "unlawful" | "unlawful_mm"
+            | "whale_unlawful" | "whale_unlawful_mm" => {
+                vec!["core_hedge_mm"]
+            }
+            "late_favorite_directional" | "late_favorite" | "late_fav" | "latefavorite"
+            | "bonereaper_directional" | "bonereaper_fav" | "bonereaper_late_favorite" => {
+                vec!["late_favorite_directional"]
+            }
+            "bonereaper" | "bonereaper_mm" | "bonereaper_late_fav" | "whale_bonereaper"
+            | "whale_bonereaper_mm" => vec!["core_hedge_mm", "late_favorite_directional"],
+            "hybrid" | "pair_cost_hybrid" => {
+                // Keep legacy alias behavior. Historical "hybrid" means
+                // pair-cost + paired-mm.
+                vec!["pair_cost_arb", "paired_mm"]
+            }
+            "noop" => vec![],
+            _ => vec![],
         }
     }
 
@@ -591,25 +651,27 @@ impl ReplayStrategyAdapter {
         }
         let market_id = market.market_id.clone();
         self.markets.insert(market.clone());
-        match self.enabled_strategy() {
-            EnabledStrategy::PairedMm => {
-                let cfg: PairedMmStrategyConfig = self.profile.paired_mm_config();
-                self.registry.register_paired_mm(market_id.as_str(), cfg);
-            }
-            EnabledStrategy::PairCostArb => {
-                let cfg: PairCostArbStrategyConfig = self.profile.pair_cost_arb_config();
-                self.registry
-                    .register_pair_cost_arb(market_id.as_str(), cfg);
-            }
-            EnabledStrategy::CoreHedgeMm => {
-                let cfg = self.profile.core_hedge_mm_config();
-                self.registry
-                    .register_core_hedge_mm(market_id.as_str(), cfg);
-            }
-            EnabledStrategy::LateFavorite => {
-                let cfg = self.profile.late_favorite_config();
-                self.registry
-                    .register_late_favorite(market_id.as_str(), cfg);
+        for strategy in self.enabled_strategies() {
+            match strategy {
+                EnabledStrategy::PairedMm => {
+                    let cfg: PairedMmStrategyConfig = self.profile.paired_mm_config();
+                    self.registry.register_paired_mm(market_id.as_str(), cfg);
+                }
+                EnabledStrategy::PairCostArb => {
+                    let cfg: PairCostArbStrategyConfig = self.profile.pair_cost_arb_config();
+                    self.registry
+                        .register_pair_cost_arb(market_id.as_str(), cfg);
+                }
+                EnabledStrategy::CoreHedgeMm => {
+                    let cfg = self.profile.core_hedge_mm_config();
+                    self.registry
+                        .register_core_hedge_mm(market_id.as_str(), cfg);
+                }
+                EnabledStrategy::LateFavorite => {
+                    let cfg = self.profile.late_favorite_config();
+                    self.registry
+                        .register_late_favorite(market_id.as_str(), cfg);
+                }
             }
         }
     }
@@ -627,17 +689,14 @@ impl ReplayStrategyAdapter {
         // synthesizer's `btc_price_at_window_open_usd` because btc-updown-5m
         // markets do not carry a fixed strike in the metadata - the strike IS
         // the BTC price at window open.
-        let strike = raw
-            .get("strike")
-            .and_then(|v| v.as_f64())
-            .or_else(|| {
-                raw.get("btc_price_at_window_open_usd")
-                    .and_then(|v| match v {
-                        serde_json::Value::Number(n) => n.as_f64(),
-                        serde_json::Value::String(s) => s.parse::<f64>().ok(),
-                        _ => None,
-                    })
-            });
+        let strike = raw.get("strike").and_then(|v| v.as_f64()).or_else(|| {
+            raw.get("btc_price_at_window_open_usd")
+                .and_then(|v| match v {
+                    serde_json::Value::Number(n) => n.as_f64(),
+                    serde_json::Value::String(s) => s.parse::<f64>().ok(),
+                    _ => None,
+                })
+        });
         let Some(strike) = strike.filter(|p| p.is_finite() && *p > 0.0) else {
             return;
         };
@@ -682,18 +741,39 @@ impl ReplayStrategyAdapter {
             .get("end_time_ms")
             .and_then(|v| v.as_i64())
             .map(|v| v as u64);
-        if let Some(end) = market.event_end_ms {
-            market.event_start_ms = Some(end.saturating_sub(market.tenor.window_ms()));
-        }
+        market.event_start_ms = raw
+            .get("start_time_ms")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as u64)
+            .or_else(|| {
+                market
+                    .event_end_ms
+                    .map(|end| end.saturating_sub(market.tenor.window_ms()))
+            });
         self.register_market_if_needed(market);
     }
 
-    /// All markets the adapter knows about. Used to drive on_tick across the
-    /// registry on every relevant event. We do not gate by `active_at` here:
-    /// the adapter's job is to drive the strategy whenever it has an input,
-    /// and the strategy itself owns end-of-bar/late-window logic.
-    fn all_markets(&self) -> Vec<BinaryOutcomeMarket> {
-        self.markets.iter().cloned().collect()
+    /// Markets that should receive a strategy tick for this event. Market
+    /// book/trade events only tick their own market; reference BTC ticks tick
+    /// the currently active registered markets because they update shared
+    /// fair-value/regime inputs.
+    fn tick_markets_for_event(&self, event: &Event, now_ms: u64) -> Vec<BinaryOutcomeMarket> {
+        match event.event_type {
+            EventType::BookSnapshot | EventType::BookDelta | EventType::Trade => event
+                .market_slug
+                .as_deref()
+                .map(MarketId::new)
+                .and_then(|market_id| self.markets.get(&market_id).cloned())
+                .into_iter()
+                .collect(),
+            EventType::BtcTick => self
+                .markets
+                .active_at(now_ms)
+                .into_iter()
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn build_input_for_market(
@@ -710,7 +790,7 @@ impl ReplayStrategyAdapter {
             yes_quote,
             no_quote,
         };
-        let inventory = self
+        let mut inventory = self
             .inventories
             .get(&market.market_id)
             .map(InventoryState::snapshot)
@@ -719,20 +799,26 @@ impl ReplayStrategyAdapter {
                 equity_usd: self.starting_cash_usd,
                 ..Default::default()
             });
+        inventory.free_cash_usd = self.runtime_inventory.free_cash_usd();
+        inventory.equity_usd =
+            self.runtime_inventory.total_cash_usd() + self.runtime_inventory.gross_exposure_usd();
         let mut open_convex_order_exposure =
             crate::strategies::traits::PairedOpenOrderExposure::default();
-        for managed in self.managed_open_orders().values().filter(|managed| {
-            managed.intent.market_id == market.market_id
-                && managed.intent.side == TradeSide::Buy
-                && !managed.intent.reduce_only
-                && managed.remaining_qty() > 1e-9
-                && managed
-                    .intent
-                    .quote_level_tag
-                    .as_deref()
-                    .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
-                    == Some(crate::types::MmQuoteKind::ConvexAccumulation)
-        }) {
+        for managed in self
+            .managed_open_orders_for_market(&market.market_id)
+            .values()
+            .filter(|managed| {
+                managed.intent.side == TradeSide::Buy
+                    && !managed.intent.reduce_only
+                    && managed.remaining_qty() > 1e-9
+                    && managed
+                        .intent
+                        .quote_level_tag
+                        .as_deref()
+                        .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+                        == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+            })
+        {
             let qty = managed.remaining_qty();
             let notional = managed.intent.limit_price.max(0.0) * qty;
             if managed.intent.instrument_id == market.yes_instrument_id {
@@ -835,11 +921,8 @@ impl ReplayStrategyAdapter {
         } else {
             now_ms
         };
-        let runtime_inventory = self
-            .runtime_inventories
-            .entry(runtime_intent.market_id.clone())
-            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
-        if runtime_inventory
+        if self
+            .runtime_inventory
             .reserve_for_order(&runtime_intent)
             .is_err()
         {
@@ -850,7 +933,7 @@ impl ReplayStrategyAdapter {
             .submit_order(runtime_intent.clone(), runtime_intent.created_at_ms)
             .is_err()
         {
-            let _ = runtime_inventory.release_reservation(
+            let _ = self.runtime_inventory.release_reservation(
                 &runtime_intent.client_order_id,
                 runtime_intent.created_at_ms,
             );
@@ -895,19 +978,21 @@ impl ReplayStrategyAdapter {
         now_ms: u64,
         out: &mut ReplayDecision,
     ) {
-        let now_ns = (now_ms as i64).saturating_mul(1_000_000);
-        let market_slug = market.market_id.as_str().to_string();
-        let decision_label = strategy_decision_label(&decision);
-        let reason_tag = strategy_decision_reason_tag(&decision);
-        let inputs_hash = self.build_input_hash(market, now_ms);
-        out.journal_events.push(JournalEvent::StrategyDecision {
-            ts_ns: now_ns,
-            market_slug,
-            asset_id: None,
-            decision_type: decision_label,
-            raw_inputs_hash: inputs_hash,
-            reason_tag,
-        });
+        if self.journal_enabled {
+            let now_ns = (now_ms as i64).saturating_mul(1_000_000);
+            let market_slug = market.market_id.as_str().to_string();
+            let decision_label = strategy_decision_label(&decision);
+            let reason_tag = strategy_decision_reason_tag(&decision);
+            let inputs_hash = self.build_input_hash(market, now_ms);
+            out.journal_events.push(JournalEvent::StrategyDecision {
+                ts_ns: now_ns,
+                market_slug,
+                asset_id: None,
+                decision_type: decision_label,
+                raw_inputs_hash: inputs_hash,
+                reason_tag,
+            });
+        }
         match decision {
             StrategyDecision::QuoteSet { intents, .. } => {
                 self.reconcile_and_emit_quote_set(intents, market, now_ms, out);
@@ -960,11 +1045,8 @@ impl ReplayStrategyAdapter {
         let gas_usd = intent.expected_gas_usd.max(0.0);
         let gross_cash_usd = intent.expected_cash_usd.max(0.0);
         let cost_usd = intent.expected_cost_usd.max(0.0);
-        let runtime_inventory = self
-            .runtime_inventories
-            .entry(intent.market_id.clone())
-            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
-        if runtime_inventory
+        if self
+            .runtime_inventory
             .apply_merge(
                 &intent.market_id,
                 &intent.yes_instrument_id,
@@ -1121,8 +1203,10 @@ impl ReplayStrategyAdapter {
         // iteration order does not leak. The conversion here is the seam
         // between the `BTreeMap`-only adapter world and the live live
         // reconciler signature.
-        let open_orders: HashMap<ClientOrderId, ManagedOrder> =
-            self.managed_open_orders().into_iter().collect();
+        let open_orders: HashMap<ClientOrderId, ManagedOrder> = self
+            .managed_open_orders_for_market(&market.market_id)
+            .into_iter()
+            .collect();
         let plan = self.quote_reconciler.plan(desired, &open_orders, now_ms);
 
         let now_ns = (now_ms as i64).saturating_mul(1_000_000);
@@ -1185,17 +1269,37 @@ impl ReplayStrategyAdapter {
         self.runtime_state.open_orders().into_iter().collect()
     }
 
+    fn managed_open_orders_for_market(
+        &self,
+        market_id: &MarketId,
+    ) -> BTreeMap<ClientOrderId, ManagedOrder> {
+        let mut orders = BTreeMap::new();
+        for (coid, record) in &self.open_intents {
+            if record.market_id != *market_id {
+                continue;
+            }
+            let client_order_id = ClientOrderId::from(coid.clone());
+            let Some(managed) = self.runtime_state.get_order(&client_order_id) else {
+                continue;
+            };
+            if managed.status.is_terminal() || managed.remaining_qty() <= 1e-9 {
+                continue;
+            }
+            debug_assert_eq!(managed.intent.market_id, *market_id);
+            orders.insert(client_order_id, managed.clone());
+        }
+        orders
+    }
+
     fn remove_strategy_slot_for_sim_coid(&mut self, sim_coid: &str) {
         self.coid_by_strategy_slot
             .retain(|_, coid| coid.as_str() != sim_coid);
     }
 
     fn cancel_runtime_order(&mut self, client_order_id: &ClientOrderId, now_ms: u64) {
-        if let Some(record) = self.open_intents.get(client_order_id.as_str()) {
-            if let Some(inventory) = self.runtime_inventories.get_mut(&record.market_id) {
-                let _ = inventory.release_reservation(client_order_id, now_ms);
-            }
-        }
+        let _ = self
+            .runtime_inventory
+            .release_reservation(client_order_id, now_ms);
         let _ = self.runtime_state.cancel_order(client_order_id, now_ms);
         self.open_intents.remove(client_order_id.as_str());
     }
@@ -1299,11 +1403,7 @@ impl ReplayStrategyAdapter {
             starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
-        let runtime_inv = self
-            .runtime_inventories
-            .entry(market.market_id.clone())
-            .or_insert_with(|| RuntimeInventoryState::new(self.starting_cash_usd));
-        let decision = self.risk.evaluate(runtime_inv, &intent, &ctx);
+        let decision = self.risk.evaluate(&self.runtime_inventory, &intent, &ctx);
         if !decision.accepted {
             let reason = decision
                 .reject_reason
@@ -1431,7 +1531,7 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         }
 
         let mut decision = ReplayDecision::default();
-        let markets = self.all_markets();
+        let markets = self.tick_markets_for_event(event, now_ms);
         for market in markets {
             // Ensure inventory state exists so the strategy sees a coherent
             // free-cash baseline before any fills.
@@ -1481,20 +1581,18 @@ impl ReplayStrategy for ReplayStrategyAdapter {
         // the live-style runtime inventory can apply the fill against its
         // reservation/cash state. This prevents replay PnL/accounting from
         // counting fills the live runtime could not settle.
-        if let Some(runtime_inv) = self.runtime_inventories.get_mut(&record.market_id) {
-            if let Err(err) = runtime_inv.apply_fill(&fill_report) {
-                tracing::warn!(
-                    target: "replay.strategy_adapter",
-                    client_order_id = %fill.client_order_id,
-                    market = %record.market_id,
-                    error = %err,
-                    "replay rejected simulator fill against runtime inventory"
-                );
-                return ReplayDecision {
-                    rejected_fills: vec![fill.client_order_id.clone()],
-                    ..ReplayDecision::default()
-                };
-            }
+        if let Err(err) = self.runtime_inventory.apply_fill(&fill_report) {
+            tracing::warn!(
+                target: "replay.strategy_adapter",
+                client_order_id = %fill.client_order_id,
+                market = %record.market_id,
+                error = %err,
+                "replay rejected simulator fill against runtime inventory"
+            );
+            return ReplayDecision {
+                rejected_fills: vec![fill.client_order_id.clone()],
+                ..ReplayDecision::default()
+            };
         }
 
         let inventory = self
@@ -1533,26 +1631,28 @@ impl ReplayStrategy for ReplayStrategyAdapter {
             fill: fill_report,
         };
         let mut decision = ReplayDecision::default();
-        let now_ns = (now_ms as i64).saturating_mul(1_000_000);
-        let market_slug = market.market_id.as_str().to_string();
-        decision
-            .journal_events
-            .push(JournalEvent::InventorySnapshot {
-                ts_ns: now_ns,
-                market_slug: market_slug.clone(),
-                asset_id: market.yes_instrument_id.as_str().to_string(),
-                qty: post_fill_yes_qty,
-                avg_cost: post_fill_yes_avg,
-            });
-        decision
-            .journal_events
-            .push(JournalEvent::InventorySnapshot {
-                ts_ns: now_ns,
-                market_slug,
-                asset_id: market.no_instrument_id.as_str().to_string(),
-                qty: post_fill_no_qty,
-                avg_cost: post_fill_no_avg,
-            });
+        if self.journal_enabled {
+            let now_ns = (now_ms as i64).saturating_mul(1_000_000);
+            let market_slug = market.market_id.as_str().to_string();
+            decision
+                .journal_events
+                .push(JournalEvent::InventorySnapshot {
+                    ts_ns: now_ns,
+                    market_slug: market_slug.clone(),
+                    asset_id: market.yes_instrument_id.as_str().to_string(),
+                    qty: post_fill_yes_qty,
+                    avg_cost: post_fill_yes_avg,
+                });
+            decision
+                .journal_events
+                .push(JournalEvent::InventorySnapshot {
+                    ts_ns: now_ns,
+                    market_slug,
+                    asset_id: market.no_instrument_id.as_str().to_string(),
+                    qty: post_fill_no_qty,
+                    avg_cost: post_fill_no_avg,
+                });
+        }
         let decisions = self.registry.on_fill(market.market_id.as_str(), fill_input);
         for d in decisions {
             self.handle_decision(d, &market, now_ms, &mut decision);
@@ -1789,6 +1889,107 @@ mod tests {
     }
 
     #[test]
+    fn quote_reconcile_is_scoped_to_current_market() {
+        let mut adapter = ReplayStrategyAdapter::from_profile(StrategyProfile::default());
+        let market_a = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-a"),
+            InstrumentId::from("yes-a"),
+            InstrumentId::from("no-a"),
+        );
+        let market_b = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-b"),
+            InstrumentId::from("yes-b"),
+            InstrumentId::from("no-b"),
+        );
+        let mut intent_a = replay_intent("slot-a", 0.42);
+        intent_a.market_id = market_a.market_id.clone();
+        intent_a.instrument_id = market_a.yes_instrument_id.clone();
+        let mut intent_b = replay_intent("slot-b", 0.43);
+        intent_b.market_id = market_b.market_id.clone();
+        intent_b.instrument_id = market_b.yes_instrument_id.clone();
+        adapter
+            .runtime_state
+            .submit_order(intent_b.clone(), 1_000)
+            .expect("seed other market order");
+        adapter.open_intents.insert(
+            "slot-b".to_string(),
+            IntentRecord::from_intent(&intent_b, Leg::Yes),
+        );
+        let mut decision = ReplayDecision::default();
+
+        adapter.reconcile_and_emit_quote_set(vec![intent_a], &market_a, 10_000, &mut decision);
+
+        assert!(
+            decision.cancels.is_empty(),
+            "market-a reconciliation must not cancel market-b orders: {:?}",
+            decision.cancels
+        );
+        assert!(adapter
+            .runtime_state
+            .get_order(&ClientOrderId::from("slot-b"))
+            .is_some());
+    }
+
+    #[test]
+    fn managed_open_orders_for_market_reads_only_live_orders_for_that_market() {
+        let mut adapter = ReplayStrategyAdapter::from_profile(StrategyProfile::default());
+        let market_a = MarketId::from("market-a");
+        let market_b = MarketId::from("market-b");
+        let mut intent_a = replay_intent("slot-a", 0.42);
+        intent_a.market_id = market_a.clone();
+        let mut intent_b = replay_intent("slot-b", 0.43);
+        intent_b.market_id = market_b;
+        let mut cancelled_a = replay_intent("slot-a-cancelled", 0.44);
+        cancelled_a.market_id = market_a.clone();
+
+        for intent in [&intent_a, &intent_b, &cancelled_a] {
+            adapter
+                .runtime_state
+                .submit_order(intent.clone(), 1_000)
+                .expect("seed order");
+            adapter.open_intents.insert(
+                intent.client_order_id.as_str().to_string(),
+                IntentRecord::from_intent(intent, Leg::Yes),
+            );
+        }
+        adapter
+            .runtime_state
+            .cancel_order(&cancelled_a.client_order_id, 2_000)
+            .expect("cancel seeded order");
+
+        let market_a_orders = adapter.managed_open_orders_for_market(&market_a);
+
+        assert_eq!(market_a_orders.len(), 1);
+        assert!(market_a_orders.contains_key(&intent_a.client_order_id));
+        assert!(!market_a_orders.contains_key(&intent_b.client_order_id));
+        assert!(!market_a_orders.contains_key(&cancelled_a.client_order_id));
+    }
+
+    #[test]
+    fn journal_disabled_skips_adapter_journal_rows() {
+        let mut adapter = ReplayStrategyAdapter::from_profile(StrategyProfile::default())
+            .with_journal_enabled(false);
+        let market = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-1"),
+            InstrumentId::from("yes-1"),
+            InstrumentId::from("no-1"),
+        );
+        let mut decision = ReplayDecision::default();
+
+        adapter.handle_decision(
+            StrategyDecision::QuoteSet {
+                intents: Vec::new(),
+                notes: vec!["unchanged".to_string()],
+            },
+            &market,
+            2_000,
+            &mut decision,
+        );
+
+        assert!(decision.journal_events.is_empty());
+    }
+
+    #[test]
     fn registry_populated_from_market_meta_events() {
         let profile = StrategyProfile::default();
         let mut adapter = ReplayStrategyAdapter::from_profile(profile);
@@ -1801,6 +2002,60 @@ mod tests {
         }
         assert_eq!(adapter.market_count(), 2);
         assert_eq!(adapter.strategy_count(), 2);
+    }
+
+    #[test]
+    fn market_meta_uses_explicit_start_time_when_present() {
+        let profile = StrategyProfile::default();
+        let mut adapter = ReplayStrategyAdapter::from_profile(profile);
+        let mut event = market_meta_event(1_000_000, "market-1", "yes-1", "no-1");
+        event.raw["start_time_ms"] = json!(123_000u64);
+        event.raw["end_time_ms"] = json!(456_000u64);
+
+        adapter.handle_market_meta(&event);
+
+        let market = adapter
+            .markets
+            .get(&MarketId::from("market-1"))
+            .expect("registered market");
+        assert_eq!(market.event_start_ms, Some(123_000));
+        assert_eq!(market.event_end_ms, Some(456_000));
+    }
+
+    #[test]
+    fn market_events_tick_only_their_own_market_btc_ticks_tick_active_markets() {
+        let mut adapter = ReplayStrategyAdapter::from_profile(StrategyProfile::default());
+        let mut market_a_meta = market_meta_event(100_000_000_000, "market-a", "yes-a", "no-a");
+        market_a_meta.raw["start_time_ms"] = json!(100_000u64);
+        market_a_meta.raw["end_time_ms"] = json!(400_000u64);
+        let mut market_b_meta = market_meta_event(100_000_000_001, "market-b", "yes-b", "no-b");
+        market_b_meta.raw["start_time_ms"] = json!(200_000u64);
+        market_b_meta.raw["end_time_ms"] = json!(500_000u64);
+        adapter.handle_market_meta(&market_a_meta);
+        adapter.handle_market_meta(&market_b_meta);
+
+        let mut trade = evt(250_000_000_000, EventType::Trade);
+        trade.market_slug = Some("market-a".to_string());
+        assert_eq!(
+            adapter
+                .tick_markets_for_event(&trade, 250_000)
+                .into_iter()
+                .map(|market| market.market_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["market-a".to_string()]
+        );
+
+        let mut btc_tick = evt(250_000_000_000, EventType::BtcTick);
+        btc_tick.market_type = "btc_ref".to_string();
+        btc_tick.market_slug = Some("btcusdt".to_string());
+        assert_eq!(
+            adapter
+                .tick_markets_for_event(&btc_tick, 250_000)
+                .into_iter()
+                .map(|market| market.market_id.as_str().to_string())
+                .collect::<Vec<_>>(),
+            vec!["market-a".to_string(), "market-b".to_string()]
+        );
     }
 
     #[test]
@@ -1856,12 +2111,8 @@ mod tests {
         let paired_inventory = adapter.inventories.get(&market.market_id);
         assert_eq!(paired_inventory.map(|inv| inv.yes_qty).unwrap_or(0.0), 0.0);
         assert_eq!(paired_inventory.map(|inv| inv.no_qty).unwrap_or(0.0), 0.0);
-        let runtime_inventory = adapter
-            .runtime_inventories
-            .get(&market.market_id)
-            .expect("runtime inventory exists from reservation");
-        assert!((runtime_inventory.free_cash_usd() - 750.0).abs() < 1e-9);
-        assert!((runtime_inventory.reserved_cash_usd() - 250.0).abs() < 1e-9);
+        assert!((adapter.runtime_inventory.free_cash_usd() - 750.0).abs() < 1e-9);
+        assert!((adapter.runtime_inventory.reserved_cash_usd() - 250.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1889,23 +2140,74 @@ mod tests {
             .first()
             .expect("close order accepted and reserved");
 
-        let runtime_inventory = adapter
-            .runtime_inventories
-            .get(&market.market_id)
-            .expect("runtime inventory exists from reservation");
-        assert!((runtime_inventory.free_cash_usd() - 995.0).abs() < 1e-9);
-        assert!((runtime_inventory.reserved_cash_usd() - 5.0).abs() < 1e-9);
+        assert!((adapter.runtime_inventory.free_cash_usd() - 995.0).abs() < 1e-9);
+        assert!((adapter.runtime_inventory.reserved_cash_usd() - 5.0).abs() < 1e-9);
 
         adapter.on_ioc_expired(&submitted.client_order_id, 2_000);
 
-        let runtime_inventory = adapter
-            .runtime_inventories
-            .get(&market.market_id)
-            .expect("runtime inventory remains");
-        assert!((runtime_inventory.free_cash_usd() - 1_000.0).abs() < 1e-9);
-        assert!(runtime_inventory.reserved_cash_usd().abs() < 1e-9);
+        assert!((adapter.runtime_inventory.free_cash_usd() - 1_000.0).abs() < 1e-9);
+        assert!(adapter.runtime_inventory.reserved_cash_usd().abs() < 1e-9);
         assert!(adapter.open_intents.is_empty());
         assert_eq!(adapter.managed_open_orders().len(), 0);
+    }
+
+    #[test]
+    fn replay_runtime_cash_is_shared_across_markets() {
+        let mut profile = StrategyProfile::default();
+        profile.inventory.min_free_cash_usd = Some(0.0);
+        profile.inventory.min_free_cash_bps = Some(0.0);
+        profile.inventory.max_order_notional_usd = Some(1_000.0);
+        profile.inventory.max_gross_notional_usd = Some(2_000.0);
+        profile.inventory.max_net_notional_per_market_usd = Some(2_000.0);
+        let mut adapter = ReplayStrategyAdapter::from_profile(profile);
+        let market_a = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-a"),
+            InstrumentId::from("yes-a"),
+            InstrumentId::from("no-a"),
+        );
+        let market_b = BinaryOutcomeMarket::btc_5m(
+            MarketId::from("market-b"),
+            InstrumentId::from("yes-b"),
+            InstrumentId::from("no-b"),
+        );
+        adapter.handle_market_meta(&market_meta_event(1_000_000, "market-a", "yes-a", "no-a"));
+        adapter.handle_market_meta(&market_meta_event(1_000_001, "market-b", "yes-b", "no-b"));
+        for (asset_id, side, price, size, ts) in [
+            ("yes-a", "buy", "0.50", "10", 1_100_000),
+            ("no-a", "sell", "0.50", "10", 1_100_001),
+        ] {
+            let mut event = evt(ts, EventType::BookSnapshot);
+            event.asset_id = Some(asset_id.to_string());
+            event.side = Some(side.to_string());
+            event.price = Some(price.to_string());
+            event.size = Some(size.to_string());
+            adapter.books.apply(&event);
+        }
+
+        let mut first = replay_intent("cash-a", 0.60);
+        first.market_id = market_a.market_id.clone();
+        first.instrument_id = market_a.yes_instrument_id.clone();
+        first.quantity = 1_000.0;
+        let mut first_out = ReplayDecision::default();
+        adapter.evaluate_and_emit(first, &market_a, 2_000, &mut first_out);
+        assert_eq!(first_out.submits.len(), 1);
+        assert!((adapter.runtime_inventory.free_cash_usd() - 400.0).abs() < 1e-9);
+        let snapshot = adapter
+            .build_input_snapshot(&market_a.market_id, 2_001)
+            .expect("market input");
+        assert!((snapshot.inventory.free_cash_usd - 400.0).abs() < 1e-9);
+
+        let mut second = replay_intent("cash-b", 0.60);
+        second.market_id = market_b.market_id.clone();
+        second.instrument_id = market_b.yes_instrument_id.clone();
+        second.quantity = 1_000.0;
+        let mut second_out = ReplayDecision::default();
+        adapter.evaluate_and_emit(second, &market_b, 2_001, &mut second_out);
+
+        assert!(second_out.submits.is_empty());
+        assert_eq!(second_out.risk_rejections.len(), 1);
+        assert!((adapter.runtime_inventory.free_cash_usd() - 400.0).abs() < 1e-9);
+        assert!((adapter.runtime_inventory.reserved_cash_usd() - 600.0).abs() < 1e-9);
     }
 
     #[test]

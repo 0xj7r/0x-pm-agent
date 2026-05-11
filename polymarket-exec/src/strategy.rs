@@ -14,6 +14,8 @@ use crate::market_making::paired_mm::{
 use crate::markets::{BinaryOutcomeMarket, MarketDescriptor, MarketTenor, UnderlyingAsset};
 use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{estimate_fair_value_with_momentum, FairValueEstimate, FairValueModel};
+use crate::strategies::core_hedge_mm::CoreHedgeMmStrategy;
+use crate::strategies::late_favorite_directional::LateFavoriteStrategy;
 use crate::strategies::pair_cost_arb::PairCostArbStrategy;
 use crate::strategies::paired_mm::PairedMmStrategy;
 use crate::strategies::traits::{
@@ -281,14 +283,32 @@ impl Strategy for StrategyMode {
 }
 
 fn parse_strategy_names(raw: &str) -> Vec<String> {
+    fn canonicalize(name: &str) -> Vec<&'static str> {
+        match name {
+            "unlawful" | "unlawful_core" | "unlawful_hedge" | "unlawful_core_mm"
+            | "unlawful_core_hedge" | "unlawful_mm" | "whale_unlawful" | "whale_unlawful_mm" => {
+                vec!["core_hedge_mm"]
+            }
+            "bonereaper"
+            | "bonereaper_mm"
+            | "bonereaper_late_fav"
+            | "whale_bonereaper"
+            | "whale_bonereaper_mm" => vec!["core_hedge_mm", "late_favorite_directional"],
+            "bonereaper_fav" | "bonereaper_directional" | "bonereaper_late_favorite" => {
+                vec!["late_favorite_directional"]
+            }
+            "hybrid" | "pair_cost_hybrid" => {
+                vec!["pair_cost_arb", "paired_mm"]
+            }
+            other => vec![other],
+        }
+    }
+
     raw.split([',', '+'])
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .flat_map(|name| match name {
-            "hybrid" | "pair_cost_hybrid" => {
-                vec!["pair_cost_arb".to_string(), "paired_mm".to_string()]
-            }
-            other => vec![other.to_string()],
+        .flat_map(|name| {
+            canonicalize(&name.to_ascii_lowercase()).into_iter().map(|n| n.to_string())
         })
         .collect()
 }
@@ -298,6 +318,8 @@ pub struct HybridStrategy {
     name: String,
     pair_cost_arb: Option<PairCostArbStrategy>,
     paired_mm: Option<PairedMmStrategy>,
+    core_hedge_mm: Option<CoreHedgeMmStrategy>,
+    late_favorite: Option<LateFavoriteStrategy>,
     quotes_by_market: HashMap<MarketId, HashMap<InstrumentId, QuoteSnapshot>>,
     momentum_weight: f64,
     mm_overlay_capital_pct: f64,
@@ -315,6 +337,8 @@ impl HybridStrategy {
         let mut paired_mm = None;
         let pair_cost_requested = requested.iter().any(|name| name == "pair_cost_arb");
         let paired_mm_requested = requested.iter().any(|name| name == "paired_mm");
+        let mut core_hedge_mm = None;
+        let mut late_favorite = None;
         let hybrid_overlay_enabled = if pair_cost_requested && paired_mm_requested {
             profile.hybrid_mm.enabled.unwrap_or(true)
         } else {
@@ -331,11 +355,21 @@ impl HybridStrategy {
                         paired_mm = Some(PairedMmStrategy::new(profile.paired_mm_config()));
                     }
                 }
+                "core_hedge_mm" => {
+                    core_hedge_mm = Some(CoreHedgeMmStrategy::new(profile.core_hedge_mm_config()));
+                }
+                "late_favorite_directional" => {
+                    late_favorite = Some(LateFavoriteStrategy::new(profile.late_favorite_config()));
+                }
                 "noop" => {}
                 other => return Err(format!("unsupported strategy '{other}'")),
             }
         }
-        if pair_cost_arb.is_none() && paired_mm.is_none() {
+        if pair_cost_arb.is_none()
+            && paired_mm.is_none()
+            && core_hedge_mm.is_none()
+            && late_favorite.is_none()
+        {
             return Err("configured strategy set contains no active strategy".to_string());
         }
         let name = requested.join(",");
@@ -343,6 +377,8 @@ impl HybridStrategy {
             name,
             pair_cost_arb,
             paired_mm,
+            core_hedge_mm,
+            late_favorite,
             quotes_by_market: HashMap::new(),
             momentum_weight: profile.momentum_weight(),
             mm_overlay_capital_pct: if pair_cost_requested && paired_mm_requested {
@@ -689,12 +725,20 @@ impl Strategy for HybridStrategy {
             decisions.push(decision);
         }
         if let Some(strategy) = self.paired_mm.as_mut() {
-            let decision = Self::convert(strategy.on_tick(input));
+            let decision = Self::convert(strategy.on_tick(input.clone()));
             let decision = self.cap_mm_overlay_decision(
                 decision,
                 context.inventory.free_cash_usd,
                 pair_cost_active,
             );
+            decisions.push(Self::filter_for_market_state(decision, context));
+        }
+        if let Some(strategy) = self.core_hedge_mm.as_mut() {
+            let decision = Self::convert(strategy.on_tick(input.clone()));
+            decisions.push(Self::filter_for_market_state(decision, context));
+        }
+        if let Some(strategy) = self.late_favorite.as_mut() {
+            let decision = Self::convert(strategy.on_tick(input));
             decisions.push(Self::filter_for_market_state(decision, context));
         }
         Self::combine(decisions)
@@ -712,6 +756,12 @@ impl Strategy for HybridStrategy {
         };
         let mut decisions = Vec::new();
         if let Some(strategy) = self.paired_mm.as_mut() {
+            decisions.push(Self::convert(strategy.on_fill(fill_input.clone())));
+        }
+        if let Some(strategy) = self.core_hedge_mm.as_mut() {
+            decisions.push(Self::convert(strategy.on_fill(fill_input.clone())));
+        }
+        if let Some(strategy) = self.late_favorite.as_mut() {
             decisions.push(Self::convert(strategy.on_fill(fill_input)));
         }
         Self::combine(decisions)
