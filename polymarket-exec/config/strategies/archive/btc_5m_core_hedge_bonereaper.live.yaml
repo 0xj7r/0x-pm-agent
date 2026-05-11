@@ -1,0 +1,17 @@
+strategy: unlawful_mm
+profile_name: btc_5m_core_hedge_bonereaper
+version: "0.1"
+last_updated: 2026-05-11
+description: |
+  Canonical paired-core baseline with tighter post-load behavior for bonereaper
+  pre-pivot windows.
+
+core_hedge:
+  enabled: true
+  ladder_levels: 17
+  ladder_span: 0.42
+  center_price: 0.50
+  clip_shares: 20.0
+  maker_improve_ticks: 0.0
+  merge_min_qty: 50.0
+  merge_batch_cap: 626.0
