@@ -1,0 +1,48 @@
+strategy: bonereaper_mm
+profile_name: whale_bonereaper_strategy
+version: "1.0"
+last_updated: 2026-05-11
+description: |
+  Bonereaper strategy as one profile with explicit paired MM core and late-favorite
+  directional overlay: paired-core is handled by core_hedge, directional timing by
+  late_favorite.
+
+  Important: late-favorite clips are heuristic shape+hard-cap driven (anti-Kelly in
+  the late window). They scale up as favorite price rises and are capped by max_load_usd.
+  The whale behavior is consistent with hard shape controls plus hard per-market clips,
+  not per-bet Kelly optimization.
+
+core_hedge:
+  enabled: true
+  ladder_levels: 17
+  ladder_span: 0.42
+  center_price: 0.50
+  clip_shares: 20.0
+  maker_improve_ticks: 0.0
+  merge_min_qty: 50.0
+  merge_batch_cap: 626.0
+
+late_favorite:
+  favorite_climb:
+    enabled: true
+    min_favorite_ask: 0.90
+    max_favorite_ask: 0.99
+    window_sec: 120
+    start_frac: 0.0
+    clip_usd: 100.0
+    max_load_usd: 5000.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 1.0
+    spot_filter_bps: 10.0
+    require_spot_match: true
+    disable_after_ms: 1776747600000
+  convex_tail:
+    enabled: true
+    max_cheap_ask: 0.02
+    window_sec: 60
+    start_frac: 0.0
+    clip_usd: 2.0
+    max_load_usd: 15.0
+    maker_improve_ticks: 0.0
+    min_order_usd: 0.5
+    disable_after_ms: 1776747600000

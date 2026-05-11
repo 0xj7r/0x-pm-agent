@@ -1,0 +1,19 @@
+strategy: unlawful_mm
+profile_name: whale_unlawful_strategy
+version: "1.0"
+last_updated: 2026-05-11
+description: |
+  Refit of the unlawful whale strategy as one single profile: core paired-MM
+  only, anchored at 35 levels per side, 0.52 span, 15-share clips.
+
+core_hedge:
+  enabled: true
+  ladder_levels: 35
+  ladder_span: 0.52
+  center_price: 0.50
+  clip_shares: 15.0
+  maker_improve_ticks: 0.0
+  merge_min_qty: 50.0
+  merge_batch_cap: 500.0
+  # Unlawful pivot-to-redeem cutoff: 2026-04-28 15:00 UTC.
+  merge_disabled_after_ms: 1777330800000

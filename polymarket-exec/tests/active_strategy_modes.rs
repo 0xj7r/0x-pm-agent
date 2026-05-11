@@ -128,12 +128,27 @@ fn drive_two_books(
     yes_quote: QuoteSnapshot,
     no_quote: QuoteSnapshot,
 ) -> StrategyDecision {
+    drive_two_books_with_profile(
+        strategy_name,
+        &StrategyProfile::default(),
+        ctx,
+        yes_quote,
+        no_quote,
+    )
+}
+
+fn drive_two_books_with_profile(
+    strategy_name: &str,
+    profile: &StrategyProfile,
+    ctx: &StrategyContext,
+    yes_quote: QuoteSnapshot,
+    no_quote: QuoteSnapshot,
+) -> StrategyDecision {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
     let no_id = InstrumentId::from("no-token");
     let mut strategy =
-        StrategyMode::try_from_name(strategy_name, Some(&StrategyProfile::default()))
-            .expect("strategy mode");
+        StrategyMode::try_from_name(strategy_name, Some(profile)).expect("strategy mode");
     let _ = strategy.on_market_snapshot(ctx, &snapshot(&market_id, &yes_id, yes_quote));
     strategy.on_market_snapshot(ctx, &snapshot(&market_id, &no_id, no_quote))
 }
@@ -500,11 +515,71 @@ fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
             "pair_cost_arb",
         ),
         ("config/strategies/btc_5m_paired_mm.live.yaml", "paired_mm"),
+        (
+            "config/strategies/btc_5m_core_hedge.live.yaml",
+            "core_hedge_mm",
+        ),
+        (
+            "config/strategies/btc_5m_core_hedge_bonereaper.live.yaml",
+            "core_hedge_mm",
+        ),
+        (
+            "config/strategies/btc_5m_late_favorite.live.yaml",
+            "late_favorite_directional",
+        ),
+        (
+            "config/strategies/btc_5m_late_favorite_bonereaper.live.yaml",
+            "late_favorite_directional",
+        ),
+        (
+            "config/strategies/whale_unlawful_strategy.live.yaml",
+            "unlawful_mm",
+        ),
+        (
+            "config/strategies/whale_bonereaper_strategy.live.yaml",
+            "bonereaper_mm",
+        ),
     ] {
         let profile = StrategyProfile::load(std::path::Path::new(path)).expect(path);
         assert_eq!(profile.strategy.as_deref(), Some(expected));
         StrategyMode::try_from_name(expected, Some(&profile)).expect("supported strategy");
     }
+}
+
+#[test]
+fn core_hedge_profile_drives_live_strategy_adapter() {
+    let profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/btc_5m_core_hedge.live.yaml",
+    ))
+    .expect("core hedge profile");
+    let market_id = MarketId::from("btc-5m-test");
+    let yes_id = InstrumentId::from("yes-token");
+    let no_id = InstrumentId::from("no-token");
+    let ctx = context(
+        120_000,
+        &market_id,
+        &yes_id,
+        &no_id,
+        inventory(vec![]),
+        101.0,
+    );
+
+    let decision = drive_two_books_with_profile(
+        "core_hedge_mm",
+        &profile,
+        &ctx,
+        quote(0.69, 0.70, 120_000),
+        quote(0.29, 0.30, 120_000),
+    );
+
+    let intents = decision.intents();
+    assert_eq!(intents.len(), 2, "{decision:?}");
+    assert!(intents
+        .iter()
+        .any(|intent| intent.quote_level_tag.as_deref() == Some("core-hedge:core")));
+    assert!(intents
+        .iter()
+        .any(|intent| intent.quote_level_tag.as_deref() == Some("core-hedge:hedge")));
 }
 
 #[test]
@@ -529,9 +604,9 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     ))
     .expect("paired-mm profile");
     let paired_mm_config = paired_mm_profile.paired_mm_config();
-    assert_eq!(paired_mm_config.ladder.max_depth, 3);
-    assert_eq!(paired_mm_config.ladder.base_clip_usd, 3.00);
-    assert_eq!(paired_mm_config.ladder.max_clip_usd, 8.0);
+    assert_eq!(paired_mm_config.ladder.max_depth, 12);
+    assert_eq!(paired_mm_config.ladder.base_clip_usd, 1.50);
+    assert_eq!(paired_mm_config.ladder.max_clip_usd, 5.0);
     assert_eq!(
         paired_mm_config
             .ladder
@@ -556,4 +631,27 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     );
     assert_eq!(paired_mm_config.capital_recycle.max_light_side_spread, 0.10);
     assert_eq!(paired_mm_config.capital_recycle.race_buffer_ticks, 3.0);
+
+    let unlawful_profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/whale_unlawful_strategy.live.yaml",
+    ))
+    .expect("unlawful whale profile");
+    let unlawful_config = unlawful_profile.core_hedge_mm_config();
+    assert_eq!(unlawful_config.core_hedge.ladder_levels, 35);
+    assert_eq!(unlawful_config.core_hedge.ladder_span, 0.52);
+    assert_eq!(unlawful_config.core_hedge.merge_min_qty, 50.0);
+    assert_eq!(unlawful_config.core_hedge.merge_batch_cap, 500.0);
+
+    let bonereaper_profile = StrategyProfile::load(std::path::Path::new(
+        "config/strategies/whale_bonereaper_strategy.live.yaml",
+    ))
+    .expect("bonereaper whale profile");
+    let bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
+    let bonereaper_late = bonereaper_profile.late_favorite_config();
+    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.42);
+    assert_eq!(bonereaper_paired.core_hedge.clip_shares, 20.0);
+    assert_eq!(bonereaper_late.favorite_climb.window_sec, 120);
+    assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.90);
+    assert_eq!(bonereaper_late.convex_tail.clip_usd, 2.0);
 }
