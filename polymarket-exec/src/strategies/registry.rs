@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use crate::markets::MarketDescriptor;
-use crate::strategies::pair_cost_arb::{PairCostArbStrategy, PairCostArbStrategyConfig};
+use crate::strategies::bonereaper_mm::{BonereaperMmStrategy, BonereaperMmStrategyConfig};
 use crate::strategies::paired_mm::{PairedMmStrategy, PairedMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
+use crate::strategies::unlawful_mm::{UnlawfulMmStrategy, UnlawfulMmStrategyConfig};
 use crate::types::StrategyDecision;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,7 +27,8 @@ impl StrategyKey {
 #[derive(Clone, Debug)]
 pub enum RegisteredStrategy {
     PairedMm(PairedMmStrategy),
-    PairCostArb(PairCostArbStrategy),
+    UnlawfulMm(UnlawfulMmStrategy),
+    BonereaperMm(BonereaperMmStrategy),
 }
 
 impl RegisteredStrategy {
@@ -35,7 +37,10 @@ impl RegisteredStrategy {
             Self::PairedMm(strategy) => <PairedMmStrategy as TradingStrategy<
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
-            Self::PairCostArb(strategy) => <PairCostArbStrategy as TradingStrategy<
+            Self::UnlawfulMm(strategy) => <UnlawfulMmStrategy as TradingStrategy<
+                crate::markets::BinaryOutcomeMarket,
+            >>::name(strategy),
+            Self::BonereaperMm(strategy) => <BonereaperMmStrategy as TradingStrategy<
                 crate::markets::BinaryOutcomeMarket,
             >>::name(strategy),
         }
@@ -43,21 +48,23 @@ impl RegisteredStrategy {
 
     pub fn on_tick<M>(&mut self, input: StrategyInput<M>) -> StrategyDecision
     where
-        M: MarketDescriptor,
+        M: MarketDescriptor + Clone,
     {
         match self {
             Self::PairedMm(strategy) => strategy.on_tick(input),
-            Self::PairCostArb(strategy) => strategy.on_tick(input),
+            Self::UnlawfulMm(strategy) => strategy.on_tick(input),
+            Self::BonereaperMm(strategy) => strategy.on_tick(input),
         }
     }
 
     pub fn on_fill<M>(&mut self, input: StrategyFillInput<M>) -> StrategyDecision
     where
-        M: MarketDescriptor,
+        M: MarketDescriptor + Clone,
     {
         match self {
             Self::PairedMm(strategy) => strategy.on_fill(input),
-            Self::PairCostArb(strategy) => strategy.on_fill(input),
+            Self::UnlawfulMm(strategy) => strategy.on_fill(input),
+            Self::BonereaperMm(strategy) => strategy.on_fill(input),
         }
     }
 }
@@ -84,15 +91,27 @@ impl StrategyRegistry {
         );
     }
 
-    pub fn register_pair_cost_arb(
+    pub fn register_unlawful_mm(
         &mut self,
         market_id: impl Into<String>,
-        config: PairCostArbStrategyConfig,
+        config: UnlawfulMmStrategyConfig,
     ) {
-        let key = StrategyKey::new(market_id, "pair_cost_arb");
+        let key = StrategyKey::new(market_id, "unlawful_mm");
         self.strategies.insert(
             key,
-            RegisteredStrategy::PairCostArb(PairCostArbStrategy::new(config)),
+            RegisteredStrategy::UnlawfulMm(UnlawfulMmStrategy::new(config)),
+        );
+    }
+
+    pub fn register_bonereaper_mm(
+        &mut self,
+        market_id: impl Into<String>,
+        config: BonereaperMmStrategyConfig,
+    ) {
+        let key = StrategyKey::new(market_id, "bonereaper_mm");
+        self.strategies.insert(
+            key,
+            RegisteredStrategy::BonereaperMm(BonereaperMmStrategy::new(config)),
         );
     }
 
@@ -101,7 +120,7 @@ impl StrategyRegistry {
             .get_mut(&StrategyKey::new(market_id, "paired_mm"))
             .and_then(|strategy| match strategy {
                 RegisteredStrategy::PairedMm(strategy) => Some(strategy),
-                RegisteredStrategy::PairCostArb(_) => None,
+                RegisteredStrategy::UnlawfulMm(_) | RegisteredStrategy::BonereaperMm(_) => None,
             })
     }
 

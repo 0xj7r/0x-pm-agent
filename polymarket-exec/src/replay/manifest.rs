@@ -32,6 +32,15 @@ pub struct WindowPlan {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputWindowDigest {
+    pub window_id: String,
+    pub total_events: u64,
+    pub event_type_counts: std::collections::BTreeMap<String, u64>,
+    pub event_checksum_sha256: String,
+    pub missing_required_event_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub run_id: String,
     pub git_rev: String,
@@ -41,6 +50,8 @@ pub struct Manifest {
     pub windows: Vec<WindowPlan>,
     pub fill_config: String,
     pub seed: String,
+    #[serde(default)]
+    pub input_windows: Vec<InputWindowDigest>,
 }
 
 /// Hex digest of an arbitrary byte slice.
@@ -172,7 +183,7 @@ mod tests {
     fn run_id_changes_when_inputs_change() {
         let profile = canonicalize("name: paired_mm\n").unwrap();
         let base = compute_run_id(&profile, &dummy_windows(), "abc", "nominal", 0);
-        let other_profile = canonicalize("name: pair_cost_arb\n").unwrap();
+        let other_profile = canonicalize("name: bonereaper_mm\n").unwrap();
         assert_ne!(
             base,
             compute_run_id(&other_profile, &dummy_windows(), "abc", "nominal", 0)

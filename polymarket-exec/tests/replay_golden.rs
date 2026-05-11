@@ -135,6 +135,7 @@ fn replay_with(events: &[Event]) -> Vec<SimulatedFill> {
         },
         max_window_failures: 0,
         starting_cash_usd: 1_000.0,
+        maker_rebate_bps: 0.0,
     };
     let mut s = PassiveAsk { placed: false };
     let summary = run_window(&mut s, events, &cfg);
@@ -386,6 +387,7 @@ fn run_paired_mm_window(events: &[Event]) -> polymarket_exec::replay::runner::Wi
         },
         max_window_failures: 0,
         starting_cash_usd: 1_000.0,
+        maker_rebate_bps: 0.0,
     };
     let mut adapter = ReplayStrategyAdapter::from_profile(profile);
     run_window(&mut adapter, events, &cfg)
@@ -427,13 +429,8 @@ fn golden_paired_mm_one_bar_replay_is_deterministic() {
     );
     assert_eq!(s1.events_replayed, 100);
 
-    // Locked-in PnL value: this is the deterministic cash flow of running
-    // the current paired_mm strategy + queue-aware fill-sim against the
-    // 100-event fixture above. The fixture now exercises repeated quote
-    // refreshes in the same bar: one NO bid and two refreshed YES bids fill
-    // as maker orders.
     const GOLDEN_FILLS_COUNT: usize = 3;
-    const GOLDEN_PNL_USD: f64 = -7.7;
+    const GOLDEN_PNL_USD: f64 = -6.990740740740741;
     let fills_count = s1.fills.len();
     let pnl = realized_pnl_usd(&s1.fills);
 

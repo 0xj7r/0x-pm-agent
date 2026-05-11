@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
             .ok()
             .or_else(|| std::env::var("POLYMARKET_PROXY_WALLET").ok())
             .or_else(|| std::env::var("POLYMARKET_FUNDER_ADDRESS").ok())
+            .or_else(|| std::env::var("POLYMARKET_FUNDER").ok()),
         polygon_rpc_url: std::env::var("POLYGON_RPC_URL").ok(),
     };
 

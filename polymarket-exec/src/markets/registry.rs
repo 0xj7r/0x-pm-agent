@@ -25,6 +25,10 @@ impl MarketRegistry {
         self.markets.get(market_id)
     }
 
+    pub fn get_mut(&mut self, market_id: &MarketId) -> Option<&mut BinaryOutcomeMarket> {
+        self.markets.get_mut(market_id)
+    }
+
     pub fn active_at(&self, now_ms: u64) -> Vec<&BinaryOutcomeMarket> {
         self.markets
             .values()
@@ -34,6 +38,13 @@ impl MarketRegistry {
                 start_ok && end_ok
             })
             .collect()
+    }
+
+    /// Iterate every registered market regardless of bar-window state.
+    /// Used by callers (e.g. the replay adapter) that need to enumerate
+    /// markets the strategy is bound to without imposing a time gate.
+    pub fn iter(&self) -> impl Iterator<Item = &BinaryOutcomeMarket> {
+        self.markets.values()
     }
 
     pub fn len(&self) -> usize {

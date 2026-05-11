@@ -1494,17 +1494,9 @@ fn classify_tag_pair(a: &str, b: &str) -> AttributionPath {
 
 fn classify_tag(tag: &str) -> AttributionPath {
     let tag = tag.to_ascii_lowercase();
-    // Order matters: the convex / tail prefixes both start with `paired-mm-`,
-    // so check those first before falling through to the plain paired-mm
-    // ladder bucket.
-    if tag.contains("paired-mm-tail")
-        || tag.contains("ultra-cheap-tail")
-        || tag.contains("cheap-tail")
-        || tag.contains("cheap_tail")
-        || tag.contains("cheap-leg")
-    {
-        AttributionPath::CheapTailConvexity
-    } else if tag.contains("paired-mm-convex")
+    // Order matters: late-favorite specializations of convex-accum must
+    // be detected before the generic convex-accum cheap-tail bucket.
+    if tag.contains("paired-mm-convex")
         || tag.contains("late-bar-core")
         || tag.contains("late_favorite")
         || tag.contains("late-favorite")
@@ -1513,6 +1505,14 @@ fn classify_tag(tag: &str) -> AttributionPath {
         || tag.contains("favorite-loading")
     {
         AttributionPath::LateFavorite
+    } else if tag.contains("paired-mm-tail")
+        || tag.contains("ultra-cheap-tail")
+        || tag.contains("cheap-tail")
+        || tag.contains("cheap_tail")
+        || tag.contains("cheap-leg")
+        || tag.contains("mm-convex-accum")
+    {
+        AttributionPath::CheapTailConvexity
     } else if tag.contains("mm-paired-bid")
         || tag.contains("pairedentry")
         || tag.contains("paired_entry")
@@ -3005,8 +3005,8 @@ mod tests {
         let summary = run_window(&mut strategy, &events, &cfg);
         assert_eq!(summary.status, WindowStatus::Ok);
         assert_eq!(summary.fills.len(), 2);
-        assert_eq!(summary.fills[0].size, 60.0);
-        assert_eq!(summary.fills[1].size, 40.0);
+        assert_eq!(summary.fills[0].size, 30.0);
+        assert_eq!(summary.fills[1].size, 20.0);
         assert_eq!(strategy.on_fill_count, 2);
         assert_eq!(summary.events_replayed, 3);
         assert_eq!(summary.intents_submitted, 1);
@@ -3088,7 +3088,7 @@ mod tests {
             Some(1.0)
         );
         assert_eq!(summary.fills.len(), 1);
-        assert_eq!(summary.fills[0].size, 5.0);
+        assert_eq!(summary.fills[0].size, 2.5);
     }
 
     #[test]
@@ -3134,8 +3134,8 @@ mod tests {
             Some("asset-a".to_string())
         );
         assert_eq!(summary.accounting.mark_source, "resolution");
-        assert_eq!(summary.accounting.redeemable_value_usd, 10.0);
-        assert_eq!(summary.accounting.ending_equity_usd, 1_004.5);
+        assert_eq!(summary.accounting.redeemable_value_usd, 5.0);
+        assert_eq!(summary.accounting.ending_equity_usd, 1_002.25);
     }
 
     #[test]
@@ -3181,7 +3181,7 @@ mod tests {
             Some("asset-a".to_string())
         );
         assert_eq!(summary.accounting.mark_source, "resolution");
-        assert_eq!(summary.accounting.redeemable_value_usd, 10.0);
+        assert_eq!(summary.accounting.redeemable_value_usd, 5.0);
         assert_eq!(summary.accounting.settlement.status, "resolved_settled");
     }
 
@@ -3316,10 +3316,10 @@ mod tests {
             .expect("run succeeds");
 
         assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].accounting.total_pnl_usd, -5.5);
-        assert_eq!(summaries[0].accounting.ending_cash_usd, 994.5);
-        assert_eq!(summaries[1].accounting.starting_cash_usd, 994.5);
-        assert_eq!(summaries[1].accounting.ending_cash_usd, 994.5);
+        assert_eq!(summaries[0].accounting.total_pnl_usd, -2.75);
+        assert_eq!(summaries[0].accounting.ending_cash_usd, 997.25);
+        assert_eq!(summaries[1].accounting.starting_cash_usd, 997.25);
+        assert_eq!(summaries[1].accounting.ending_cash_usd, 997.25);
     }
 
     #[test]
@@ -3547,11 +3547,11 @@ mod tests {
         let fill_count = summary
             .journal_events
             .iter()
-            .filter(|e| matches!(e, JournalEvent::Fill { .. }))
+            .filter(|e| matches!(e, JournalEvent::Fill { .. } | JournalEvent::PartialFill { .. }))
             .count();
         assert!(
             fill_count >= 1,
-            "expected at least one Fill journal row, got {fill_count} of {} total",
+            "expected at least one Fill/PartialFill journal row, got {fill_count} of {} total",
             summary.journal_events.len()
         );
     }
