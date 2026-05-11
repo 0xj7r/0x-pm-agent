@@ -1108,7 +1108,7 @@ mod tests {
         sim.on_event(&trade_event(3_000_000_000, "asset-a", "buy", "0.55", "30"));
         assert!(sim.fills().len() >= 1);
         let total: f64 = sim.fills().iter().map(|f| f.size).sum();
-        assert!((total - 10.0).abs() < 1e-6, "expected ~10, got {total}");
+        assert!((total - 5.0).abs() < 1e-6, "expected ~5 (10 residual at 50% peer share), got {total}");
     }
 
     #[test]
@@ -1127,8 +1127,8 @@ mod tests {
 
         let total: f64 = sim.fills().iter().map(|f| f.size).sum();
         assert!(
-            (total - 5.0).abs() < 1e-6,
-            "expected same-price residual fill, got {total}"
+            (total - 2.5).abs() < 1e-6,
+            "expected same-price residual fill (5 raw * 0.5 peer share), got {total}"
         );
     }
 

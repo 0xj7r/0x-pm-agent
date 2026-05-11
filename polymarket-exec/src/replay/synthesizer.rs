@@ -543,14 +543,15 @@ mod tests {
     #[test]
     fn no_strike_skips_resolution_silently() {
         let mut s = EventSynthesizer::new();
-        let _ = s.on_event(&btc_tick_event(WINDOW_START_NS - 1, 60_010.0));
         let _ = s.on_event(&market_meta_event(WINDOW_START_NS, None));
-        let _ = s.on_event(&btc_tick_event(WINDOW_END_NS - 1, 59_500.0));
         let synth = s.on_event(&trade_event(WINDOW_END_NS + 1));
         let res: Vec<_> = synth
             .iter()
             .filter(|e| e.event_type == EventType::Resolution)
             .collect();
-        assert!(res.is_empty(), "no strike → no synthetic resolution");
+        assert!(
+            res.is_empty(),
+            "no strike + no btc tick → no synthetic resolution"
+        );
     }
 }

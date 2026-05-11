@@ -3,11 +3,41 @@
 use crate::market_making::pairing::types::LadderLeg;
 use crate::types::OrderIntent;
 
+/// Configuration for the EV-gated rescue brain.
+///
+/// ## Operationally important interaction
+///
+/// `require_no_guaranteed_loss = true` rejects the merge-rescue arm whenever
+/// `avg_cost + opposite_best_ask > 1.0 - min_edge_bps/10_000`. In a market
+/// where the stranded leg was entered late at a high average cost (e.g.
+/// 0.65) and the opposite ask is also wide (e.g. 0.40), `0.65 + 0.40 = 1.05`
+/// exceeds the threshold and merge-rescue is blocked.
+///
+/// If `allow_sell_fallback = false` is set in the same config, the sell arm
+/// is also unavailable and `choose_rescue` returns `RescueAction::Hold`
+/// indefinitely. The stranded inventory then waits for one of the
+/// underlying inputs to move (opposite ask drops, or the operator
+/// intervenes manually).
+///
+/// Recommendation: when running `require_no_guaranteed_loss = true`, also
+/// keep `allow_sell_fallback = true` (the default) so the rescue brain
+/// always has a viable arm. Or, gate the strict mode on a "deadline
+/// pressure" flag that flips `allow_sell_fallback` on as
+/// `time_remaining_ms` shrinks.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RescueConfig {
+    /// Edge in basis points the rescue value must beat the model hold value
+    /// by before the rescue arm fires. Higher = more conservative.
     pub min_edge_bps: f64,
+    /// Hard cap on a single rescue's quantity, regardless of how much
+    /// stranded inventory is present. Larger rescues are split across ticks.
     pub max_rescue_qty: f64,
+    /// When false, only the merge-rescue arm (BuyOppositeForMerge) is
+    /// considered. See struct-level docs for the non-rescuable corner.
     pub allow_sell_fallback: bool,
+    /// When true, the merge-rescue arm is rejected if
+    /// `avg_cost + opposite_best_ask > 1.0 - min_edge_bps/10_000`.
+    /// See struct-level docs for the interaction with `allow_sell_fallback`.
     pub require_no_guaranteed_loss: bool,
 }
 

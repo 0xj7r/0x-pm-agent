@@ -75,17 +75,11 @@ impl MomentumEngine {
         }
 
         let mut weighted_sum = 0.0;
-        let mut weight_sum = 0.0;
         for (idx, ret) in window_returns.iter().enumerate() {
             let weight = self.config.decay_factor.clamp(0.0, 1.0).powi(idx as i32);
             weighted_sum += ret.signum() * weight;
-            weight_sum += weight;
         }
-        let score = if weight_sum > 0.0 {
-            weighted_sum / weight_sum
-        } else {
-            0.0
-        };
+        let score = weighted_sum;
         let latest_window_return_bps = window_returns.first().copied();
         let acceleration_bps = match (window_returns.first(), window_returns.get(1)) {
             (Some(latest), Some(previous)) => Some(latest - previous),

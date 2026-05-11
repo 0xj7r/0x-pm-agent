@@ -166,6 +166,7 @@ fn run_once() -> Vec<JournalEvent> {
         },
         max_window_failures: 0,
         starting_cash_usd: 1_000.0,
+        maker_rebate_bps: 0.0,
     };
 
     let mut windows: BTreeMap<String, Vec<Event>> = BTreeMap::new();

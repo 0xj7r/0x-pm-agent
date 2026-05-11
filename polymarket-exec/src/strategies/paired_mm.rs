@@ -43,7 +43,7 @@ impl PairedMmStrategy {
                 merge: config.merge,
                 capital_recycle: config.capital_recycle,
                 hard_policy: config.hard_policy,
-                auto_fill: Default::default(),
+                ..PairedMmEngineConfig::default()
             }),
         }
     }
@@ -69,9 +69,12 @@ where
             market: input.market,
             snapshot: input.snapshot,
             inventory: input.inventory,
+            open_convex_order_exposure: input.open_convex_order_exposure,
             pair_cost: input.pair_cost,
             fair_value: input.fair_value,
             btc_regime: input.btc_regime,
+            momentum: input.momentum,
+            order_book_pressure: input.order_book_pressure,
             merge_candidate: None,
             rescue: None,
             now_ms: input.now_ms,

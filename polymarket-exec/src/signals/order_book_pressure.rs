@@ -86,7 +86,7 @@ impl OrderBookPressureEngine {
             no_ask_notional,
         ]
         .iter()
-        .any(|notional| *notional < self.config.min_depth_notional_usd);
+        .all(|notional| *notional < self.config.min_depth_notional_usd);
 
         OrderBookPressureSignal {
             direction,

@@ -780,7 +780,7 @@ mod tests {
                 window_start_ns: 1_771_178_400_000_000_000,
                 window_end_ns: 1_771_178_700_000_000_000,
                 market_filter: "btc_5m".to_string(),
-                max_book_levels: 2,
+                max_book_levels: 25,
                 markets: vec![RawReplayMarket {
                     slug: "btc-updown-5m-1771178400".to_string(),
                     asset_ids: ["UP".to_string(), "DOWN".to_string()],

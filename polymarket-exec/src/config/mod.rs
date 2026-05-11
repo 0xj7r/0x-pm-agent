@@ -106,6 +106,7 @@ pub struct AppConfig {
     pub market_context_path: Option<PathBuf>,
     pub journal_path: Option<PathBuf>,
     pub journal_rotate_bytes: Option<u64>,
+    pub journal_firehose_stream: Option<String>,
     pub starting_cash_usd: f64,
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
@@ -220,8 +221,8 @@ impl AppConfig {
 
         let service_name = env_value("PM_BTC_5M_EXEC_SERVICE_NAME")
             .unwrap_or_else(|| "polymarket-exec".to_string());
-        let strategy_name = env_value("PM_BTC_5M_STRATEGY")
-            .unwrap_or_else(|| "pair_cost_arb,paired_mm".to_string());
+        let strategy_name =
+            env_value("PM_BTC_5M_STRATEGY").unwrap_or_else(|| "paired_mm".to_string());
         let strategy_profile_paths = parse_strategy_profile_paths();
         let strategy_profile_path = strategy_profile_paths.first().cloned();
         let strategy_profile = if strategy_profile_paths.is_empty() {
@@ -232,6 +233,17 @@ impl AppConfig {
             Some(StrategyProfile::load_merged(&strategy_profile_paths)?)
         };
         let paper_mode = parse_bool("PM_BTC_5M_PAPER_MODE", true)?;
+        if !paper_mode
+            && strategy_profile.is_none()
+            && strategy_name
+                .split([',', '+'])
+                .map(str::trim)
+                .any(|name| !name.is_empty() && name != "noop")
+        {
+            anyhow::bail!(
+                "live strategy `{strategy_name}` requires PM_BTC_5M_STRATEGY_PROFILE_PATH or PM_BTC_5M_STRATEGY_PROFILE_PATHS"
+            );
+        }
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("PM_BTC_5M_EXEC_LOG_FORMAT", "pretty"))?;
         let metrics_bind = parse_socket_addr("PM_BTC_5M_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
@@ -363,6 +375,8 @@ impl AppConfig {
                 })
             })
             .transpose()?;
+        let journal_firehose_stream = env_value("PM_BTC_5M_EXEC_JOURNAL_FIREHOSE_STREAM")
+            .filter(|value| !value.trim().is_empty());
         let starting_cash_usd = parse_f64("PM_BTC_5M_EXEC_STARTING_CASH_USD", 0.0)?;
         let event_log_capacity = parse_usize("PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
@@ -573,6 +587,7 @@ impl AppConfig {
             market_context_path,
             journal_path,
             journal_rotate_bytes,
+            journal_firehose_stream,
             starting_cash_usd,
             event_log_capacity,
             market_id_by_asset,

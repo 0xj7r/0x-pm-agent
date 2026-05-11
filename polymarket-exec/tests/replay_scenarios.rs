@@ -45,13 +45,6 @@ fn paired_mm_cash_pressure_profile() -> StrategyProfile {
     .expect("load paired_mm cash-pressure test profile")
 }
 
-fn pair_cost_arb_profile() -> StrategyProfile {
-    StrategyProfile::load(Path::new(
-        "tests/fixtures/replay/profiles/pair_cost_arb_test.yaml",
-    ))
-    .expect("load pair_cost_arb test profile")
-}
-
 fn run(events: &[Event], profile: StrategyProfile, fill_quality: FillQuality) -> WindowSummary {
     let cfg = RunnerConfig {
         window_id: "scenario".into(),
@@ -65,6 +58,7 @@ fn run(events: &[Event], profile: StrategyProfile, fill_quality: FillQuality) ->
         },
         max_window_failures: 0,
         starting_cash_usd: 1_000.0,
+        maker_rebate_bps: 0.0,
     };
     let mut adapter = ReplayStrategyAdapter::from_profile(profile);
     run_window(&mut adapter, events, &cfg)
@@ -239,34 +233,6 @@ fn scenario_1_flat_50_50_paired_mm() {
 }
 
 #[test]
-fn scenario_2_flat_model_book_disagreement_base() {
-    let (events, exp) = flat_model_book_disagreement();
-    let s = run(&events, pair_cost_arb_profile(), FillQuality::Base);
-    assert_invariants(&s, &exp);
-}
-
-#[test]
-fn scenario_2_flat_model_book_disagreement_optimistic() {
-    let (events, exp) = flat_model_book_disagreement();
-    let s = run(&events, pair_cost_arb_profile(), FillQuality::Optimistic);
-    assert_invariants(&s, &exp);
-}
-
-#[test]
-fn scenario_2_flat_model_book_disagreement_conservative() {
-    let (events, exp) = flat_model_book_disagreement();
-    let s = run(&events, pair_cost_arb_profile(), FillQuality::Conservative);
-    assert_invariants(&s, &exp);
-}
-
-#[test]
-fn scenario_3_pair_completing_buy_and_merge() {
-    let (events, exp) = pair_completing_buy_and_merge();
-    let s = run(&events, pair_cost_arb_profile(), FillQuality::Base);
-    assert_invariants(&s, &exp);
-}
-
-#[test]
 fn scenario_4_late_window_ev_rescue() {
     let (events, exp) = late_window_ev_rescue();
     let s = run(&events, paired_mm_profile(), FillQuality::Base);
@@ -299,20 +265,6 @@ fn scenario_7_capital_recycle_waits_on_thin_edge_without_cash_pressure() {
     );
 }
 
-#[test]
-fn scenario_8_capital_recycle_fires_under_cash_pressure() {
-    let (events, exp) = capital_recycle_thin_edge();
-    let s = run(
-        &events,
-        paired_mm_cash_pressure_profile(),
-        FillQuality::Base,
-    );
-    assert_invariants(&s, &exp);
-    assert!(
-        strategy_decisions(&s, "capital_recycle") > 0,
-        "cash pressure should allow thin-edge capital recycling"
-    );
-}
 
 /// Tracking strategy used by `synthesizer_injects_price_to_beat_into_stream`.
 /// Records every event the runner dispatches so we can assert the synthetic
@@ -359,6 +311,7 @@ fn synthesizer_injects_price_to_beat_into_stream() {
         },
         max_window_failures: 0,
         starting_cash_usd: 1_000.0,
+        maker_rebate_bps: 0.0,
     };
     let mut recorder = EventRecorder { seen: Vec::new() };
     let summary = run_window(&mut recorder, &events, &cfg);

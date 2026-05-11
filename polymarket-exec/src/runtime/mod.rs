@@ -13,6 +13,7 @@ pub mod order_store;
 mod paper_fill;
 pub mod reconcile;
 pub mod runner;
+pub mod state_store;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
@@ -39,21 +40,14 @@ use crate::strategy::{
     Strategy, StrategyContext, StrategyDecision, StrategyDecisionSuppressionKind, VenueMarketRules,
 };
 use crate::types::{
-    ClientOrderId, CloseMethod, EpochMillis, FillLiquidity, FillReport, InstrumentId, MarketId,
+    ClientOrderId, CloseMethod, EpochMillis, FillReport, InstrumentId, MarketId, MarketLedgerState,
     MarketSnapshot, MergeIntent, OrderId, OrderIntent, TradeSide,
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
 use tracing::{info, warn};
 
-const BLOCKED_MERGE_RETRY_AFTER_MS: u64 = 15_000;
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
-/// Minimum paired notional ($) to justify firing a merge transaction.
-/// Below this, gas (~$0.30 on Polygon) eats too much of the recycled $1
-/// per share; better to hold to resolution which captures the same $1
-/// payout for free. Whale data shows merge:redeem ≈ 0.07 — most paired
-/// inventory just resolves naturally.
-const MERGE_MIN_NOTIONAL_USD: f64 = 2.0;
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
@@ -70,6 +64,10 @@ pub struct Runtime<S: Strategy> {
     quote_reconciler: QuoteReconciler,
     quote_engine_config: QuoteEngineConfig,
     quote_stale_ms: u64,
+    min_merge_notional_usd: f64,
+    merge_free_cash_pressure_ratio: f64,
+    merge_gross_exposure_pressure_ratio: f64,
+    merge_market_exposure_pressure_usd: f64,
     btc_signals: BtcSignalStore,
     market_activity: HashMap<InstrumentId, GateMarketActivitySignal>,
     first_fill_by_market: HashMap<MarketId, EpochMillis>,
@@ -167,6 +165,12 @@ impl<S: Strategy> Runtime<S> {
             quote_reconciler: QuoteReconciler::default(),
             quote_engine_config: config.quote_engine_config,
             quote_stale_ms: config.quote_stale_ms,
+            min_merge_notional_usd: config.min_merge_notional_usd.max(0.0),
+            merge_free_cash_pressure_ratio: config.merge_free_cash_pressure_ratio.max(0.0),
+            merge_gross_exposure_pressure_ratio: config
+                .merge_gross_exposure_pressure_ratio
+                .max(0.0),
+            merge_market_exposure_pressure_usd: config.merge_market_exposure_pressure_usd.max(0.0),
             btc_signals: BtcSignalStore::default(),
             market_activity: HashMap::new(),
             first_fill_by_market: HashMap::new(),
@@ -672,15 +676,58 @@ impl<S: Strategy> Runtime<S> {
                 .with_market(stranded.market_id.clone()),
             );
         }
-        let active_markets = venue_positions
-            .iter()
-            .filter(|position| position.quantity.abs() > DRIFT_QTY_EPSILON)
-            .map(|position| position.market_id.clone())
-            .collect::<HashSet<_>>();
-        self.accepted_merge_by_market
-            .retain(|market_id, _| active_markets.contains(market_id));
+        self.clear_accepted_merges_after_venue_reconcile(&report, observed_at_ms);
         self.initial_reconcile_complete = true;
         Ok(report)
+    }
+
+    fn clear_accepted_merges_after_venue_reconcile(
+        &mut self,
+        report: &InventoryReconciliationReport,
+        observed_at_ms: EpochMillis,
+    ) {
+        let reconciled_markets = report
+            .deltas
+            .iter()
+            .map(|delta| delta.market_id.clone())
+            .chain(
+                report
+                    .stranded_markets
+                    .iter()
+                    .map(|stranded| stranded.market_id.clone()),
+            )
+            .collect::<HashSet<_>>();
+        let accepted_markets = self
+            .accepted_merge_by_market
+            .iter()
+            .filter_map(|(market_id, accepted)| {
+                (observed_at_ms >= accepted.accepted_at_ms
+                    && reconciled_markets.contains(market_id))
+                .then(|| market_id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for market_id in accepted_markets {
+            let paired_quantity = report
+                .stranded_markets
+                .iter()
+                .find(|stranded| stranded.market_id == market_id)
+                .map(|stranded| stranded.paired_quantity)
+                .unwrap_or_default();
+            if self.accepted_merge_by_market.remove(&market_id).is_some() {
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        observed_at_ms,
+                        format!(
+                            "accepted merge latch cleared after venue position reconciliation; \
+                             remaining paired_qty={paired_quantity:.8} may plan a fresh merge"
+                        ),
+                    )
+                    .with_market(market_id),
+                );
+            }
+        }
     }
 
     fn resolved_venue_cost_basis_usd(
@@ -732,11 +779,12 @@ impl<S: Strategy> Runtime<S> {
     /// 1. `RuntimeCommand::Cancel` for every currently-open order.
     /// 2. `RuntimeCommand::Merge` for every market with paired inventory
     ///    (via `plan_merge_command_for_market`).
-    /// 3. Synthetic `FillReport`s with `CloseMethod::Redeem` applied for each
-    ///    stranded position at `resolution_price` (0.0 = "no" wins, 1.0 = "yes"
-    ///    wins, 0.5 = unknown). When `resolution_price` is None and stranded
-    ///    inventory exists, an Inventory event is logged but the inventory is
-    ///    NOT settled (operator must intervene).
+    /// 3. Synthetic settlement closes for each stranded position. The legacy
+    ///    `resolution_price` argument is used only to infer the winning YES/NO
+    ///    leg (1.0 = YES/Up, 0.0 = NO/Down). Each instrument then receives its
+    ///    own payout price: winning leg = 1.0, losing leg = 0.0. Ambiguous
+    ///    values (for example 0.5) leave inventory unsettled and emit an
+    ///    Inventory event for operator intervention.
     /// 4. A single Runtime event marking the close.
     ///
     /// Phase 1 of the paper environment design doc
@@ -747,6 +795,15 @@ impl<S: Strategy> Runtime<S> {
         resolution_price: Option<f64>,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        let resolved_winning_leg = resolution_price.and_then(|price| {
+            if price >= 1.0 - 1e-9 {
+                Some(crate::market_making::pairing::ResolvedWinningLeg::Yes)
+            } else if price <= 1e-9 {
+                Some(crate::market_making::pairing::ResolvedWinningLeg::No)
+            } else {
+                None
+            }
+        });
 
         let open_coids: Vec<(ClientOrderId, MarketId, InstrumentId)> = self
             .open_orders
@@ -797,27 +854,77 @@ impl<S: Strategy> Runtime<S> {
 
         let stranded = self.inventory.stranded_market_inventory();
         for strand in stranded {
+            let redeem_candidate = resolved_winning_leg.and_then(|winning_leg| {
+                self.merge_executor
+                    .resolved_redeem_candidate(&strand.market_id, winning_leg)
+            });
             for position in &strand.stranded_positions {
                 if position.quantity.abs() <= 1e-9 {
                     continue;
                 }
-                match resolution_price {
+                let payout_price = resolved_winning_leg.and_then(|winning_leg| {
+                    if let Some(candidate) = redeem_candidate.as_ref() {
+                        if candidate
+                            .winning_instrument_id
+                            .as_ref()
+                            .is_some_and(|id| id == &position.instrument_id)
+                        {
+                            return Some(1.0);
+                        }
+                        if candidate
+                            .losing_instrument_id
+                            .as_ref()
+                            .is_some_and(|id| id == &position.instrument_id)
+                        {
+                            return Some(0.0);
+                        }
+                    }
+
+                    let instrument = position.instrument_id.as_str().to_ascii_lowercase();
+                    match winning_leg {
+                        crate::market_making::pairing::ResolvedWinningLeg::Yes
+                            if instrument.contains("yes") || instrument.contains("up") =>
+                        {
+                            Some(1.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::Yes
+                            if instrument.contains("no") || instrument.contains("down") =>
+                        {
+                            Some(0.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::No
+                            if instrument.contains("no") || instrument.contains("down") =>
+                        {
+                            Some(1.0)
+                        }
+                        crate::market_making::pairing::ResolvedWinningLeg::No
+                            if instrument.contains("yes") || instrument.contains("up") =>
+                        {
+                            Some(0.0)
+                        }
+                        _ => None,
+                    }
+                });
+
+                match payout_price {
                     Some(price) => {
-                        let synthetic_fill = FillReport {
-                            order_id: None,
-                            client_order_id: None,
-                            market_id: strand.market_id.clone(),
-                            instrument_id: position.instrument_id.clone(),
-                            side: TradeSide::Sell,
+                        match self.inventory.apply_settlement(
+                            &strand.market_id,
+                            &position.instrument_id,
+                            position.quantity,
                             price,
-                            quantity: position.quantity,
-                            fee_usd: 0.0,
-                            liquidity: FillLiquidity::Unknown,
-                            close_method: Some(CloseMethod::Redeem),
-                            observed_at_ms: now_ms,
-                        };
-                        match self.on_fill(synthetic_fill) {
-                            Ok(fill_outcome) => outcome.extend(fill_outcome),
+                            0.0,
+                            now_ms,
+                        ) {
+                            Ok(adjustment) => {
+                                outcome.push_event(
+                                    self.event_log.push(
+                                        adjustment.to_event(
+                                            "inventory updated from paper settlement close",
+                                        ),
+                                    ),
+                                );
+                            }
                             Err(error) => {
                                 outcome.push_event(
                                     self.event_log.push(
@@ -843,7 +950,9 @@ impl<S: Strategy> Runtime<S> {
                                     now_ms,
                                     format!(
                                         "paper market close: stranded position requires \
-                                         resolution_price (qty={:.8}); operator must settle manually",
+                                         unambiguous winner-leg mapping \
+                                         (resolution_price={:?} qty={:.8}); operator must settle manually",
+                                        resolution_price,
                                         position.quantity
                                     ),
                                 )
@@ -892,27 +1001,59 @@ impl<S: Strategy> Runtime<S> {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
 
-        // Gas-friction gate: merging tiny paired inventory burns gas without
-        // recycling enough capital to be worthwhile. Each merge transaction
-        // costs ~$0.30 on Polygon; a $1.50 paired position would lose 20% to
-        // gas. Hold to resolution instead — the venue pays $1/share at
-        // resolution regardless, and resolution is gas-free.
-        if intent.expected_cash_usd + 1e-9 < MERGE_MIN_NOTIONAL_USD {
+        let merge_pressure_reason = self.merge_pressure_reason(market_id);
+
+        // Batch tiny completed pairs unless recycling pressure is real. This
+        // keeps paired-MM closer to the observed whale shape: broad laddering
+        // plus batched merge/redeem, with immediate merge reserved for capital
+        // pressure or inventory pressure.
+        if intent.expected_cash_usd + 1e-9 < self.min_merge_notional_usd {
+            if let Some(pressure_reason) = merge_pressure_reason.as_ref() {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge batching bypassed: paired notional ${:.4} below batch threshold ${:.4}; pressure={pressure_reason}",
+                                intent.expected_cash_usd, self.min_merge_notional_usd
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+            } else {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge batched: paired notional ${:.4} below batch threshold ${:.4}; no capital/inventory pressure",
+                                intent.expected_cash_usd, self.min_merge_notional_usd
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+        }
+
+        if intent.expected_cash_usd + 1e-9 >= self.min_merge_notional_usd {
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         now_ms,
                         format!(
-                            "merge skipped: paired notional ${:.4} below gas-friction threshold ${:.2}; \
-                             hold to resolution instead",
-                            intent.expected_cash_usd, MERGE_MIN_NOTIONAL_USD
+                            "merge batch threshold met: paired notional ${:.4} threshold ${:.4}",
+                            intent.expected_cash_usd, self.min_merge_notional_usd
                         ),
                     )
                     .with_market(market_id.clone()),
                 ),
             );
-            return outcome;
         }
 
         let signature = MergeSignature::from_intent(&intent);
@@ -924,34 +1065,31 @@ impl<S: Strategy> Runtime<S> {
                     .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
             })
         {
-            let blocked_for_ms = now_ms.saturating_sub(blocked_at_ms);
-            if blocked_for_ms < BLOCKED_MERGE_RETRY_AFTER_MS {
-                outcome.push_event(
-                    self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Execution,
-                            now_ms,
-                            format!(
-                                "merge intent suppressed: matching CTF recycle is blocked \
-                                 since {} reason={}",
-                                blocked_at_ms, blocked_reason
-                            ),
-                        )
-                        .with_market(market_id.clone()),
-                    ),
-                );
-                return outcome;
-            }
-            self.blocked_merge_by_market.remove(market_id);
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
                         EventCategory::Execution,
                         now_ms,
                         format!(
-                            "blocked merge retry backoff elapsed after {blocked_for_ms}ms; \
-                             retrying CTF recycle reason={blocked_reason}"
+                            "merge intent suppressed: matching CTF recycle is blocked \
+                             since {blocked_at_ms} reason={blocked_reason}; waiting for \
+                             inventory-changing venue reconciliation before retry"
                         ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if self.blocked_merge_by_market.contains_key(market_id) {
+            self.blocked_merge_by_market.remove(market_id);
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        "blocked merge signature changed after inventory reconciliation; \
+                         allowing fresh CTF recycle",
                     )
                     .with_market(market_id.clone()),
                 ),
@@ -1003,6 +1141,47 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    fn merge_pressure_reason(&self, market_id: &MarketId) -> Option<String> {
+        let starting_cash = self.starting_cash_usd.max(0.0);
+        let free_cash_pressure_ratio = self.merge_free_cash_pressure_ratio;
+        let free_cash = self.inventory.free_cash_usd();
+        if starting_cash > 0.0
+            && free_cash_pressure_ratio > 0.0
+            && free_cash <= starting_cash * free_cash_pressure_ratio
+        {
+            let threshold = starting_cash * free_cash_pressure_ratio;
+            return Some(format!(
+                "free_cash_low free_cash={free_cash:.4} threshold={:.4}",
+                threshold
+            ));
+        }
+
+        let gross_exposure = self.inventory.gross_exposure_usd();
+        let gross_exposure_pressure_ratio = self.merge_gross_exposure_pressure_ratio;
+        if starting_cash > 0.0
+            && gross_exposure_pressure_ratio > 0.0
+            && gross_exposure >= starting_cash * gross_exposure_pressure_ratio
+        {
+            let threshold = starting_cash * gross_exposure_pressure_ratio;
+            return Some(format!(
+                "gross_inventory_high gross_exposure={gross_exposure:.4} threshold={:.4}",
+                threshold
+            ));
+        }
+
+        let net_market_exposure = self.inventory.net_exposure_for_market_usd(market_id).abs();
+        let market_exposure_pressure_usd = self.merge_market_exposure_pressure_usd;
+        if market_exposure_pressure_usd > 0.0 && net_market_exposure >= market_exposure_pressure_usd
+        {
+            return Some(format!(
+                "market_imbalance_high net_market_exposure={net_market_exposure:.4} threshold={:.4}",
+                market_exposure_pressure_usd
+            ));
+        }
+
+        None
+    }
+
     fn inventory_merge_intent(
         &self,
         market_id: &MarketId,
@@ -1019,12 +1198,32 @@ impl<S: Strategy> Runtime<S> {
             return None;
         }
 
-        let quantity = positions[0].quantity.min(positions[1].quantity);
+        let ordered_positions = self
+            .market_contexts
+            .get(market_id)
+            .and_then(|record| {
+                if record.instrument_ids.len() < 2 {
+                    return None;
+                }
+                let yes_id = InstrumentId::from(record.instrument_ids[0].clone());
+                let no_id = InstrumentId::from(record.instrument_ids[1].clone());
+                let yes_position = positions
+                    .iter()
+                    .find(|position| position.instrument_id == yes_id)?;
+                let no_position = positions
+                    .iter()
+                    .find(|position| position.instrument_id == no_id)?;
+                Some((*yes_position, *no_position))
+            })
+            .unwrap_or((positions[0], positions[1]));
+
+        let (yes_position, no_position) = ordered_positions;
+        let quantity = yes_position.quantity.min(no_position.quantity);
         if quantity <= 1e-9 {
             return None;
         }
         let expected_cost_usd =
-            quantity * positions[0].avg_price + quantity * positions[1].avg_price;
+            quantity * yes_position.avg_price + quantity * no_position.avg_price;
 
         Some(MergeIntent {
             command_id: ClientOrderId::from(format!(
@@ -1033,8 +1232,8 @@ impl<S: Strategy> Runtime<S> {
             )),
             market_id: market_id.clone(),
             condition_id: self.condition_id_by_market.get(market_id).cloned(),
-            yes_instrument_id: positions[0].instrument_id.clone(),
-            no_instrument_id: positions[1].instrument_id.clone(),
+            yes_instrument_id: yes_position.instrument_id.clone(),
+            no_instrument_id: no_position.instrument_id.clone(),
             quantity,
             expected_cash_usd: quantity,
             expected_cost_usd,
@@ -1146,6 +1345,14 @@ impl<S: Strategy> Runtime<S> {
             .filter(|client_order_id| !seen.contains(client_order_id))
             .collect::<Vec<_>>();
         for client_order_id in missing_from_store {
+            if let Some(record) = self.durable_terminal_order(&client_order_id) {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable store terminal state removed active runtime order",
+                ));
+                continue;
+            }
             let needs_reconcile = self
                 .open_orders
                 .get(&client_order_id)
@@ -1161,6 +1368,82 @@ impl<S: Strategy> Runtime<S> {
         }
 
         outcome
+    }
+
+    fn durable_terminal_order(&self, client_order_id: &ClientOrderId) -> Option<OrderRecord> {
+        let Some(order_store) = self.order_store.as_ref() else {
+            return None;
+        };
+        match order_store.get(client_order_id) {
+            Ok(Some(record)) if record.status.is_terminal() => Some(record),
+            Ok(_) => None,
+            Err(error) => {
+                warn!(
+                    run_id = %self.run_id,
+                    client_order_id = %client_order_id,
+                    error = ?error,
+                    "failed to read durable order while reconciling terminal state"
+                );
+                None
+            }
+        }
+    }
+
+    fn remove_active_order_after_durable_terminal(
+        &mut self,
+        record: OrderRecord,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> RuntimeOutcome {
+        let mut outcome = RuntimeOutcome::default();
+        let Some(managed) = self.open_orders.remove(&record.client_order_id) else {
+            return outcome;
+        };
+        if let Some(release) = self
+            .inventory
+            .release_reservation(&record.client_order_id, now_ms)
+        {
+            outcome.push_event(
+                self.event_log
+                    .push(release.to_event("released reservation after durable terminal sync")),
+            );
+        }
+        info!(
+            run_id = %self.run_id,
+            client_order_id = %record.client_order_id,
+            durable_status = ?record.status,
+            reason,
+            "removed active order because durable order state is terminal"
+        );
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Runtime,
+                    now_ms,
+                    format!(
+                        "removed active order after durable terminal {:?}: {}",
+                        record.status, reason
+                    ),
+                )
+                .with_market(managed.intent.market_id)
+                .with_instrument(managed.intent.instrument_id)
+                .with_client_order(record.client_order_id),
+            ),
+        );
+        outcome
+    }
+
+    pub fn remove_active_order_if_durable_terminal(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> (bool, RuntimeOutcome) {
+        let Some(record) = self.durable_terminal_order(client_order_id) else {
+            return (false, RuntimeOutcome::default());
+        };
+        let outcome = self.remove_active_order_after_durable_terminal(record, now_ms, reason);
+        (true, outcome)
     }
 
     pub fn checkpoint_snapshot(
@@ -1560,6 +1843,7 @@ impl<S: Strategy> Runtime<S> {
                     next_status = Some(ManagedOrderStatus::Working);
                 }
             }
+            let mut durable_terminal_after_fill = None;
             if persist_fill || !self.open_orders.contains_key(client_order_id) {
                 if let Some(store) = self.order_store.as_mut() {
                     if let Err(error) = store.apply_fill(client_order_id, executed_qty, now_ms) {
@@ -1571,6 +1855,18 @@ impl<S: Strategy> Runtime<S> {
                         );
                     }
                 }
+                if !remove_after {
+                    durable_terminal_after_fill = self.durable_terminal_order(client_order_id);
+                }
+            }
+            if let Some(record) = durable_terminal_after_fill {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable fill state marked order terminal",
+                ));
+                next_status = None;
+                remove_after = false;
             }
             if let Some(status) = next_status {
                 outcome.extend(self.set_order_status(
@@ -1806,17 +2102,68 @@ impl<S: Strategy> Runtime<S> {
         reason: impl Into<String>,
     ) -> RuntimeOutcome {
         let reason = reason.into();
+        let mut preserved_repair_quotes = Vec::new();
         let ids = self
             .open_orders
             .values()
-            .filter(|managed| managed.intent.kind != crate::types::IntentKind::Close)
-            .map(|managed| managed.intent.client_order_id.clone())
+            .filter_map(|managed| {
+                if managed.intent.kind == crate::types::IntentKind::Close {
+                    return None;
+                }
+                if self.entry_quote_repairs_one_sided_inventory(managed) {
+                    preserved_repair_quotes.push((
+                        managed.intent.client_order_id.clone(),
+                        managed.intent.market_id.clone(),
+                        managed.intent.instrument_id.clone(),
+                    ));
+                    return None;
+                }
+                Some(managed.intent.client_order_id.clone())
+            })
             .collect::<Vec<_>>();
         let mut outcome = RuntimeOutcome::default();
+        for (client_order_id, market_id, instrument_id) in preserved_repair_quotes {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "preserved opposite-leg entry quote as one-sided inventory repair",
+                    )
+                    .with_market(market_id)
+                    .with_instrument(instrument_id)
+                    .with_client_order(client_order_id),
+                ),
+            );
+        }
         for client_order_id in ids {
             outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));
         }
         outcome
+    }
+
+    fn entry_quote_repairs_one_sided_inventory(&self, managed: &ManagedOrder) -> bool {
+        if managed.intent.kind != crate::types::IntentKind::Entry
+            || managed.intent.side != crate::types::TradeSide::Buy
+            || managed.intent.reduce_only
+        {
+            return false;
+        }
+
+        let mut actionable_positions = self
+            .inventory
+            .positions()
+            .filter(|position| {
+                position.market_id == managed.intent.market_id
+                    && self.position_is_actionable_inventory(position)
+            })
+            .collect::<Vec<_>>();
+        if actionable_positions.len() != 1 {
+            return false;
+        }
+
+        let heavy_position = actionable_positions.remove(0);
+        heavy_position.instrument_id != managed.intent.instrument_id
     }
 
     pub fn request_cancel_orders_not_in_instruments(
@@ -2003,6 +2350,14 @@ impl<S: Strategy> Runtime<S> {
             now_ms,
             reason.as_str(),
         ));
+        if !matches!(
+            self.open_orders
+                .get(client_order_id)
+                .map(|managed| managed.status),
+            Some(ManagedOrderStatus::CancelRequested)
+        ) {
+            return outcome;
+        }
         outcome.push_command(RuntimeCommand::Cancel {
             client_order_id: client_order_id.clone(),
             reason: reason.clone(),
@@ -2039,24 +2394,46 @@ impl<S: Strategy> Runtime<S> {
         match decision {
             StrategyDecision::Noop { .. } => {}
             StrategyDecision::Reactive { intents, .. } => {
-                if !intents.is_empty() {
+                let any_entry = intents
+                    .iter()
+                    .any(|intent| matches!(intent.kind, crate::types::IntentKind::Entry));
+                if any_entry {
                     outcome.push_event(self.event_log.push(EventRecord::new(
                         EventCategory::Strategy,
                         now_ms,
-                        "quote reconciliation skipped: preserving working quotes during close-side strategy reaction",
+                        "close-side strategy reaction: cancelling entry quotes before recycle/rescue",
                     )));
+                    outcome.extend(
+                        self.request_cancel_entry_orders(now_ms, "close-side strategy reaction"),
+                    );
                 }
                 for intent in intents {
                     outcome.extend(self.accept_intent(intent, now_ms));
                 }
             }
-            StrategyDecision::Suppress { kind, .. } => match kind {
+            StrategyDecision::Suppress {
+                kind,
+                preserve_quotes,
+                ..
+            } => match kind {
                 StrategyDecisionSuppressionKind::SoftPause => {
-                    outcome.push_event(self.event_log.push(EventRecord::new(
-                        EventCategory::Strategy,
-                        now_ms,
-                        "strategy suppression: soft pause requested (preserving open entry quotes)",
-                    )));
+                    if preserve_quotes {
+                        outcome.push_event(self.event_log.push(EventRecord::new(
+                            EventCategory::Strategy,
+                            now_ms,
+                            "strategy suppression: soft pause requested (preserving open entry quotes)",
+                        )));
+                    } else {
+                        outcome.push_event(self.event_log.push(EventRecord::new(
+                            EventCategory::Strategy,
+                            now_ms,
+                            "strategy suppression: soft pause requested (cancelling open entry quotes)",
+                        )));
+                        outcome.extend(self.request_cancel_entry_orders(
+                            now_ms,
+                            "strategy suppression: cancel entry quotes",
+                        ));
+                    }
                 }
                 StrategyDecisionSuppressionKind::HardRiskOff => {
                     outcome.extend(self.riskoff_and_cancel_entry_orders(
@@ -2088,6 +2465,8 @@ impl<S: Strategy> Runtime<S> {
                 }
             }
             StrategyDecision::QuoteSet { intents, .. } => {
+                let intents =
+                    self.filter_incomplete_paired_entry_intents(intents, now_ms, &mut outcome);
                 let intents_in = intents.len();
                 let level_tags_in: Vec<String> = intents
                     .iter()
@@ -2135,6 +2514,10 @@ impl<S: Strategy> Runtime<S> {
                     )));
                 }
 
+                let mut accepted_quote_submits = 0usize;
+                let mut accepted_quote_replaces = 0usize;
+                let mut accepted_quote_cancels = 0usize;
+
                 for action in plan.actions {
                     match action {
                         QuoteAction::Keep(intent) => {
@@ -2151,31 +2534,139 @@ impl<S: Strategy> Runtime<S> {
                             client_order_id,
                             reason,
                         } => {
-                            outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
+                            let cancel_outcome =
+                                self.request_cancel(&client_order_id, reason, now_ms);
+                            if cancel_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Cancel { .. }))
+                            {
+                                accepted_quote_cancels += 1;
+                            }
+                            outcome.extend(cancel_outcome);
                         }
                         QuoteAction::Replace {
                             existing_client_order_id,
                             replacement,
                             cancel_reason,
                         } => {
-                            outcome.extend(self.request_cancel(
+                            let cancel_outcome = self.request_cancel(
                                 &existing_client_order_id,
                                 cancel_reason,
                                 now_ms,
-                            ));
-                            outcome.extend(self.accept_intent(replacement, now_ms));
+                            );
+                            let cancel_accepted = cancel_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Cancel { .. }));
+                            outcome.extend(cancel_outcome);
+
+                            let submit_outcome = self.accept_intent(replacement, now_ms);
+                            let submit_accepted = submit_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Submit(_)));
+                            outcome.extend(submit_outcome);
+
+                            if cancel_accepted && submit_accepted {
+                                accepted_quote_replaces += 1;
+                            } else {
+                                if cancel_accepted {
+                                    accepted_quote_cancels += 1;
+                                }
+                                if submit_accepted {
+                                    accepted_quote_submits += 1;
+                                }
+                            }
                         }
                         QuoteAction::Submit(intent) => {
-                            outcome.extend(self.accept_intent(intent, now_ms));
+                            let submit_outcome = self.accept_intent(intent, now_ms);
+                            if submit_outcome
+                                .commands
+                                .iter()
+                                .any(|command| matches!(command, RuntimeCommand::Submit(_)))
+                            {
+                                accepted_quote_submits += 1;
+                            }
+                            outcome.extend(submit_outcome);
                         }
                     }
                 }
+                self.quote_reconciler.record_accepted_actions(
+                    now_ms,
+                    accepted_quote_submits,
+                    accepted_quote_replaces,
+                    accepted_quote_cancels,
+                );
             }
         }
         outcome
     }
 
-    fn accept_intent(&mut self, intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
+    fn filter_incomplete_paired_entry_intents(
+        &mut self,
+        intents: Vec<OrderIntent>,
+        now_ms: EpochMillis,
+        outcome: &mut RuntimeOutcome,
+    ) -> Vec<OrderIntent> {
+        let mut pair_instrument_count: HashMap<String, HashSet<InstrumentId>> = HashMap::new();
+        for intent in &intents {
+            if !Self::is_paired_entry_intent(intent) {
+                continue;
+            }
+            let Some(pair_id) = intent.pair_id.as_ref() else {
+                continue;
+            };
+            pair_instrument_count
+                .entry(pair_id.clone())
+                .or_default()
+                .insert(intent.instrument_id.clone());
+        }
+
+        intents
+            .into_iter()
+            .filter(|intent| {
+                if !Self::is_paired_entry_intent(intent) {
+                    return true;
+                }
+                let Some(pair_id) = intent.pair_id.as_ref() else {
+                    return true;
+                };
+                let complete = pair_instrument_count
+                    .get(pair_id)
+                    .is_some_and(|instruments| instruments.len() >= 2);
+                if complete {
+                    return true;
+                }
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "paired entry intent suppressed: incomplete pair group pair_id={pair_id}"
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                false
+            })
+            .collect()
+    }
+
+    /// Entry intent that belongs to an atomic multi-leg group.
+    ///
+    /// `pair_id` is the structural contract. Paired ladders and late-convex
+    /// packages both set it on every mate, while attribution tags are only
+    /// reporting strings and should not decide runtime atomicity.
+    fn is_paired_entry_intent(intent: &OrderIntent) -> bool {
+        intent.kind == crate::types::IntentKind::Entry && intent.pair_id.is_some()
+    }
+
+    fn accept_intent(&mut self, mut intent: OrderIntent, now_ms: EpochMillis) -> RuntimeOutcome {
         // TODO(2026-04-23): integrate execution acknowledgements/fill events from a downstream
         // matcher and remove this placeholder reserve->submit transition assumption.
         let mut outcome = RuntimeOutcome::default();
@@ -2240,6 +2731,63 @@ impl<S: Strategy> Runtime<S> {
                         EventCategory::Runtime,
                         now_ms,
                         "duplicate client_order_id rejected before risk",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.instrument_id.clone())
+                    .with_client_order(intent.client_order_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if intent.side == TradeSide::Sell && intent.reduce_only {
+            let held_qty = self.inventory.position_qty(&intent.instrument_id).max(0.0);
+            let open_sell_qty =
+                self.open_reduce_only_sell_qty_for_instrument(&intent.instrument_id);
+            let available_qty = (held_qty - open_sell_qty).max(0.0);
+            let min_qty = self.actionable_order_qty_for_market(&intent.market_id);
+            if available_qty + ACCOUNTING_QTY_EPSILON < min_qty {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "reduce-only sell suppressed: no unreserved token inventory held={held_qty:.6} open_sell={open_sell_qty:.6} available={available_qty:.6} min_qty={min_qty:.6}"
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+            if intent.quantity > available_qty {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Runtime,
+                            now_ms,
+                            format!(
+                                "reduce-only sell quantity clipped to unreserved token inventory requested={:.6} held={held_qty:.6} open_sell={open_sell_qty:.6} available={available_qty:.6}",
+                                intent.quantity
+                            ),
+                        )
+                        .with_market(intent.market_id.clone())
+                        .with_instrument(intent.instrument_id.clone())
+                        .with_client_order(intent.client_order_id.clone()),
+                    ),
+                );
+                intent.quantity = available_qty;
+            }
+        }
+        if is_rescue_intent && self.has_equivalent_close_order_in_flight(&intent) {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Runtime,
+                        now_ms,
+                        "close-side intent waiting: equivalent close-side order already in flight",
                     )
                     .with_market(intent.market_id.clone())
                     .with_instrument(intent.instrument_id.clone())
@@ -2347,6 +2895,11 @@ impl<S: Strategy> Runtime<S> {
         let risk_context = RiskContext {
             open_orders_total: self.open_orders.len(),
             open_orders_for_market: self.open_orders_for_market(&intent.market_id),
+            open_buy_notional_total_usd: self.open_buy_notional_total_usd(),
+            open_signed_notional_for_market_usd: self
+                .open_signed_notional_for_market_usd(&intent.market_id),
+            open_position_qty_for_instrument: self
+                .open_position_qty_for_instrument(&intent.instrument_id),
             starting_cash_usd: self.starting_cash_usd,
             now_ms,
         };
@@ -2484,7 +3037,20 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn is_btc_mm_buy_intent(intent: &OrderIntent) -> bool {
-        intent.client_order_id.as_str().starts_with("btc-5m-mm:")
+        let legacy_btc_mm = intent.client_order_id.as_str().starts_with("btc-5m-mm:");
+        let paired_entry_tag = intent
+            .quote_level_tag
+            .as_deref()
+            .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    crate::types::MmQuoteKind::PairedEntry
+                        | crate::types::MmQuoteKind::ConvexAccumulation
+                )
+            });
+        (legacy_btc_mm || paired_entry_tag)
+            && intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !intent.reduce_only
     }
@@ -2496,18 +3062,60 @@ impl<S: Strategy> Runtime<S> {
     ) -> StrategyContext {
         let market_context = market_id.and_then(|id| self.market_contexts.get(id).cloned());
         let venue_rules = market_id.and_then(|id| self.venue_market_rules.get(id).copied());
+        let market_ledger_state = market_id
+            .map(|id| self.market_ledger_state(id))
+            .unwrap_or(MarketLedgerState::Flat);
         StrategyContext {
             now_ms,
             runtime_status: self.status,
             inventory: self.inventory.snapshot(),
+            open_orders: self
+                .open_orders
+                .values()
+                .filter(|managed| {
+                    !managed.status.is_terminal()
+                        && market_id.is_none_or(|id| &managed.intent.market_id == id)
+                })
+                .map(
+                    |managed| crate::strategies::traits::StrategyOpenOrderSnapshot {
+                        market_id: managed.intent.market_id.clone(),
+                        instrument_id: managed.intent.instrument_id.clone(),
+                        side: managed.intent.side,
+                        limit_price: managed.intent.limit_price,
+                        remaining_qty: managed.remaining_qty(),
+                        reduce_only: managed.intent.reduce_only,
+                        quote_level_tag: managed.intent.quote_level_tag.clone(),
+                    },
+                )
+                .collect(),
             open_orders_total: self.open_orders.len(),
             open_orders_for_market: market_id
                 .map(|id| self.open_orders_for_market(id))
                 .unwrap_or(0),
+            market_ledger_state,
             market_context,
             btc_regime: self.btc_signals.snapshot(now_ms),
+            momentum: self.btc_signals.momentum_signal(now_ms),
             venue_rules,
         }
+    }
+
+    fn market_ledger_state(&self, market_id: &MarketId) -> MarketLedgerState {
+        if self.pending_merge_by_market.contains_key(market_id)
+            || self.accepted_merge_by_market.contains_key(market_id)
+        {
+            return MarketLedgerState::MergePending;
+        }
+        if self.markets_with_unresolved_drift.contains(market_id) {
+            return MarketLedgerState::Drifted;
+        }
+        if self.market_has_inventory(market_id) {
+            return MarketLedgerState::Recycling;
+        }
+        if self.open_orders_for_market(market_id) > 0 {
+            return MarketLedgerState::QuotingPaired;
+        }
+        MarketLedgerState::Flat
     }
 
     fn actionable_order_qty_for_market(&self, market_id: &MarketId) -> f64 {
@@ -2575,12 +3183,83 @@ impl<S: Strategy> Runtime<S> {
             .count()
     }
 
+    fn has_equivalent_close_order_in_flight(&self, intent: &OrderIntent) -> bool {
+        self.open_orders.values().any(|managed| {
+            managed.intent.market_id == intent.market_id
+                && managed.intent.instrument_id == intent.instrument_id
+                && !managed.status.is_terminal()
+                && (managed.intent.kind == crate::types::IntentKind::Close
+                    || managed.intent.reduce_only)
+        })
+    }
+
+    #[allow(dead_code)]
+    fn has_entry_repair_order_in_flight(&self, intent: &OrderIntent) -> bool {
+        self.open_orders.values().any(|managed| {
+            managed.remaining_qty() > 1e-9
+                && !managed.status.is_terminal()
+                && managed.intent.market_id == intent.market_id
+                && managed.intent.instrument_id == intent.instrument_id
+                && self.entry_quote_repairs_one_sided_inventory(managed)
+        })
+    }
+
+    fn open_buy_notional_total_usd(&self) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal()
+                    && matches!(managed.intent.side, crate::types::TradeSide::Buy)
+                    && !managed.intent.reduce_only
+            })
+            .map(|managed| managed.intent.limit_price * managed.remaining_qty())
+            .sum()
+    }
+
+    fn open_signed_notional_for_market_usd(&self, market_id: &crate::types::MarketId) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal() && &managed.intent.market_id == market_id
+            })
+            .map(|managed| {
+                managed.intent.limit_price * managed.remaining_qty() * managed.intent.side.sign()
+            })
+            .sum()
+    }
+
+    fn open_position_qty_for_instrument(&self, instrument_id: &crate::types::InstrumentId) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal() && &managed.intent.instrument_id == instrument_id
+            })
+            .map(|managed| managed.remaining_qty() * managed.intent.side.sign())
+            .sum()
+    }
+
+    fn open_reduce_only_sell_qty_for_instrument(
+        &self,
+        instrument_id: &crate::types::InstrumentId,
+    ) -> f64 {
+        self.open_orders
+            .values()
+            .filter(|managed| {
+                !managed.status.is_terminal()
+                    && &managed.intent.instrument_id == instrument_id
+                    && managed.intent.side == TradeSide::Sell
+                    && managed.intent.reduce_only
+            })
+            .map(ManagedOrder::remaining_qty)
+            .sum()
+    }
+
     fn record_status_persist(
         &mut self,
         client_order_id: &ClientOrderId,
         status: ManagedOrderStatus,
         updated_at_ms: EpochMillis,
-    ) {
+    ) -> Option<OrderRecord> {
         if let Some(store) = self.order_store.as_mut() {
             if let Err(error) = store.update_status(client_order_id, status, updated_at_ms) {
                 warn!(
@@ -2590,8 +3269,10 @@ impl<S: Strategy> Runtime<S> {
                     status = ?status,
                     "failed to persist status transition"
                 );
+                return self.durable_terminal_order(client_order_id);
             }
         }
+        None
     }
 
     fn set_order_status(
@@ -2602,6 +3283,17 @@ impl<S: Strategy> Runtime<S> {
         reason: &str,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
+        if let Some(record) = self.durable_terminal_order(client_order_id) {
+            if record.status != status || !status.is_terminal() {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "durable terminal state won status transition",
+                ));
+                return outcome;
+            }
+        }
+        let mut terminal_after_persist = None;
         match self.open_orders.get_mut(client_order_id) {
             Some(managed) => {
                 if managed.status == status {
@@ -2640,7 +3332,8 @@ impl<S: Strategy> Runtime<S> {
                         .with_instrument(managed.intent.instrument_id.clone()),
                     ),
                 );
-                self.record_status_persist(client_order_id, status, now_ms);
+                terminal_after_persist =
+                    self.record_status_persist(client_order_id, status, now_ms);
             }
             None => {
                 warn!(
@@ -2651,6 +3344,13 @@ impl<S: Strategy> Runtime<S> {
                 );
             }
         };
+        if let Some(record) = terminal_after_persist {
+            outcome.extend(self.remove_active_order_after_durable_terminal(
+                record,
+                now_ms,
+                "durable terminal state won status persist conflict",
+            ));
+        }
         outcome
     }
 
@@ -2684,6 +3384,14 @@ impl<S: Strategy> Runtime<S> {
             .collect::<Vec<_>>();
 
         for client_order_id in to_quarantine {
+            if let Some(record) = self.durable_terminal_order(&client_order_id) {
+                outcome.extend(self.remove_active_order_after_durable_terminal(
+                    record,
+                    now_ms,
+                    "stale needs-reconcile order already terminal in durable store",
+                ));
+                continue;
+            }
             outcome.extend(self.set_order_status(
                 &client_order_id,
                 ManagedOrderStatus::Quarantined,

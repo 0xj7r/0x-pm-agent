@@ -41,7 +41,7 @@ use crate::runtime::types::ManagedOrder;
 use crate::signals::fair_value::NoSignalReason;
 use crate::signals::{BtcRegimeSnapshot, FairValueEstimate, FairValueModel};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput};
-use crate::strategies::{PairCostArbStrategyConfig, PairedMmStrategyConfig, StrategyRegistry};
+use crate::strategies::{PairedMmStrategyConfig, StrategyRegistry};
 use crate::strategy_profile::StrategyProfile;
 
 const DEFAULT_STARTING_CASH_USD: f64 = 1_000.0;
@@ -512,8 +512,7 @@ impl ReplayStrategyAdapter {
     /// Build the adapter from a parsed profile. The strategy registry is
     /// populated lazily, when `market_meta` events are observed (so each
     /// market in the input stream gets the strategy attached). This mirrors
-    /// the live runtime's per-market binding via `register_paired_mm` /
-    /// `register_pair_cost_arb`.
+    /// the live runtime's per-market binding via `register_paired_mm`.
     pub fn from_profile(profile: StrategyProfile) -> Self {
         let limits = profile.risk_limits();
         Self {
@@ -604,11 +603,6 @@ impl ReplayStrategyAdapter {
                     continue;
                 }
                 match canonical_name {
-                    "pair_cost_arb" => enabled.push(EnabledStrategy::PairCostArb),
-                    "core_hedge_mm" => enabled.push(EnabledStrategy::CoreHedgeMm),
-                    "late_favorite_directional" => {
-                        enabled.push(EnabledStrategy::LateFavorite)
-                    }
                     "paired_mm" => enabled.push(EnabledStrategy::PairedMm),
                     "unlawful_mm" => enabled.push(EnabledStrategy::UnlawfulMm),
                     "bonereaper_mm" => enabled.push(EnabledStrategy::BonereaperMm),
@@ -624,19 +618,11 @@ impl ReplayStrategyAdapter {
 
     fn canonicalize_strategy_names(raw: &str) -> Vec<&'static str> {
         match raw.to_ascii_lowercase().as_str() {
-            "pair_cost_arb" | "pair_cost" | "paircost" => vec!["pair_cost_arb"],
             "paired_mm" | "paired-mm" | "pairedmm" => vec!["paired_mm"],
-            "core_hedge_mm" | "core_hedge" => vec!["core_hedge_mm"],
+            "core_hedge_mm" | "core_hedge" => vec!["unlawful_mm"],
             "unlawful_mm" => vec!["unlawful_mm"],
-            "late_favorite_directional" => {
-                vec!["late_favorite_directional"]
-            }
+            "late_favorite_directional" => vec!["bonereaper_mm"],
             "bonereaper_mm" => vec!["bonereaper_mm"],
-            "hybrid" | "pair_cost_hybrid" => {
-                // Keep legacy alias behavior. Historical "hybrid" means
-                // pair-cost + paired-mm.
-                vec!["pair_cost_arb", "paired_mm"]
-            }
             "noop" => vec![],
             _ => vec![],
         }
@@ -653,21 +639,6 @@ impl ReplayStrategyAdapter {
                 EnabledStrategy::PairedMm => {
                     let cfg: PairedMmStrategyConfig = self.profile.paired_mm_config();
                     self.registry.register_paired_mm(market_id.as_str(), cfg);
-                }
-                EnabledStrategy::PairCostArb => {
-                    let cfg: PairCostArbStrategyConfig = self.profile.pair_cost_arb_config();
-                    self.registry
-                        .register_pair_cost_arb(market_id.as_str(), cfg);
-                }
-                EnabledStrategy::CoreHedgeMm => {
-                    let cfg = self.profile.core_hedge_mm_config();
-                    self.registry
-                        .register_core_hedge_mm(market_id.as_str(), cfg);
-                }
-                EnabledStrategy::LateFavorite => {
-                    let cfg = self.profile.late_favorite_config();
-                    self.registry
-                        .register_late_favorite(market_id.as_str(), cfg);
                 }
                 EnabledStrategy::UnlawfulMm => {
                     let cfg = self.profile.unlawful_mm_config();
@@ -957,7 +928,7 @@ impl ReplayStrategyAdapter {
         //   at best_ask and must NOT be post-only.
         // - Passive entries (paired-MM bids, capital recycle, convex
         //   accumulation) are resting maker quotes with post_only=true.
-        let aggressive = intent.aggressive || matches!(intent.kind, IntentKind::Close);
+        let aggressive = matches!(intent.kind, IntentKind::Close);
         let post_only = !aggressive && matches!(intent.kind, IntentKind::Entry);
         Some(StrategyOrderIntent {
             client_order_id: coid,
@@ -1348,7 +1319,6 @@ impl ReplayStrategyAdapter {
             .to_string();
             let limit_price = intent.limit_price;
             let quantity = intent.quantity;
-            let intent_kind = intent.kind;
             if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
                 self.coid_by_strategy_slot
                     .insert(strategy_slot, sim_intent.client_order_id.clone());
@@ -1475,7 +1445,6 @@ impl ReplayStrategyAdapter {
         .to_string();
         let limit_price = intent.limit_price;
         let quantity = intent.quantity;
-        let intent_kind = intent.kind;
         if let Some(sim_intent) = self.convert_intent(intent, market, now_ms) {
             self.coid_by_strategy_slot
                 .insert(strategy_slot, sim_intent.client_order_id.clone());
@@ -1504,9 +1473,6 @@ impl ReplayStrategyAdapter {
 #[derive(Clone, Copy, Debug)]
 enum EnabledStrategy {
     PairedMm,
-    PairCostArb,
-    CoreHedgeMm,
-    LateFavorite,
     UnlawfulMm,
     BonereaperMm,
 }
@@ -1855,9 +1821,6 @@ mod tests {
             created_at_ms: 1_000,
             pair_id: None,
             kind: IntentKind::Entry,
-            aggressive: false,
-            
-            
         }
     }
 
