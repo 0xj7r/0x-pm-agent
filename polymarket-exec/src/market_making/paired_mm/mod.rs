@@ -24,9 +24,7 @@ pub use crate::market_making::pairing::{
     PairCostTracker, PairedInventorySnapshot, PairedMarketSnapshot, RescueAction, RescueConfig,
     RescueDecision, RescueInputs, RunningInventoryCaps,
 };
-pub use engine::{
-    ConvexityOverlayConfig, PairedMmDecision, PairedMmEngine, PairedMmEngineConfig, PairedMmInput,
-};
+pub use engine::{PairedMmDecision, PairedMmEngine, PairedMmEngineConfig, PairedMmInput};
 pub use fill_automation::{
     AutoFillConfig, AutoFillDecision, AutoFillState, AutoFillStateSnapshot, AutoFillSuggestion,
 };

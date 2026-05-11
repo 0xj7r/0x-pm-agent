@@ -1,9 +1,7 @@
 //! Merge and redeem execution planning against paired YES/NO inventory.
 
 use crate::inventory::{InventoryAdjustment, InventoryError, InventoryState};
-use crate::market_making::pairing::pair_ledger::{
-    MarketPairLedger, MergeCandidate, MergePlan, ResolvedRedeemCandidate, ResolvedWinningLeg,
-};
+use crate::market_making::pairing::pair_ledger::{MarketPairLedger, MergeCandidate, MergePlan};
 use crate::types::{ClientOrderId, CloseMethod, EpochMillis, FillReport, MarketId, MergeIntent};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,15 +163,6 @@ impl MergeExecutor {
 
     pub fn preview_merge(&self, market_id: &MarketId, requested_qty: f64) -> Option<MergePlan> {
         self.ledger.preview_merge(market_id, requested_qty)
-    }
-
-    pub fn resolved_redeem_candidate(
-        &self,
-        market_id: &MarketId,
-        winning_leg: ResolvedWinningLeg,
-    ) -> Option<ResolvedRedeemCandidate> {
-        self.ledger
-            .resolved_redeem_candidate(market_id, winning_leg)
     }
 }
 

@@ -2,11 +2,11 @@
 
 use std::collections::VecDeque;
 
-use crate::signals::{BtcRegimeSnapshot, MomentumEngine, MomentumSignal};
+use crate::signals::BtcRegimeSnapshot;
 
 const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
-const BTC_SIGNAL_WINDOW_45M_MS: u64 = 45 * 60 * 1_000;
+const BTC_SIGNAL_WINDOW_20M_MS: u64 = 20 * 60 * 1_000;
 const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
 
 #[derive(Debug, Default)]
@@ -53,20 +53,15 @@ impl BtcSignalStore {
         }
     }
 
-    pub(super) fn momentum_signal(&self, now_ms: u64) -> MomentumSignal {
-        let samples = self.price_samples.iter().copied().collect::<Vec<_>>();
-        MomentumEngine::default().compute(now_ms, &samples)
-    }
-
     fn prune(&mut self, now_ms: u64) {
         while let Some((sample_ms, _)) = self.price_samples.front().copied() {
-            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_45M_MS {
+            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_20M_MS {
                 break;
             }
             self.price_samples.pop_front();
         }
         while let Some(sample_ms) = self.trade_times.front().copied() {
-            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_45M_MS {
+            if now_ms.saturating_sub(sample_ms) <= BTC_SIGNAL_WINDOW_20M_MS {
                 break;
             }
             self.trade_times.pop_front();

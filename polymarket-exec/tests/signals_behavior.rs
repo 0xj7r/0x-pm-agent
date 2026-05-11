@@ -1,13 +1,7 @@
-use polymarket_exec::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use polymarket_exec::signals::fair_value::{
     estimate_fair_value, estimate_fair_value_with_momentum, NoSignalReason,
 };
-use polymarket_exec::signals::{
-    BtcRegime, BtcRegimeSnapshot, CheapLegSignal, CheapLegSignalEngine, FairValueEstimate,
-    FairValueModel, MomentumConfig, MomentumEngine, MomentumSignal, OrderBookPressureEngine,
-    OrderBookPressureSignal, SignalDirection,
-};
-use polymarket_exec::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot};
+use polymarket_exec::signals::{BtcRegime, BtcRegimeSnapshot, FairValueModel};
 
 #[test]
 fn fair_value_moves_with_spot_time_and_volatility() {
@@ -87,94 +81,4 @@ fn btc_regime_classifies_whipsaw_vs_directional_tape() {
         ..Default::default()
     };
     assert_eq!(volatile_trend.regime(), Some(BtcRegime::TrendingVolatile));
-}
-
-#[test]
-fn btc_momentum_uses_underlying_windows_not_polymarket_prices() {
-    let samples = vec![
-        (0, 100.0),
-        (300_000, 99.0),
-        (600_000, 98.0),
-        (900_000, 97.0),
-    ];
-    let engine = MomentumEngine::new(MomentumConfig {
-        lookback_windows: 3,
-        window_ms: 300_000,
-        decay_factor: 0.75,
-        directional_deadband: 0.15,
-    });
-
-    let signal = engine.compute(900_000, &samples);
-
-    assert_eq!(signal.direction, SignalDirection::Down);
-    assert!(signal.score < -0.99);
-    assert_eq!(signal.window_returns_bps.len(), 3);
-}
-
-#[test]
-fn order_book_pressure_summarizes_execution_pressure_separately_from_btc_regime() {
-    let snapshot = PairedMarketSnapshot {
-        market_id: MarketId::new("m"),
-        yes_instrument_id: InstrumentId::new("yes"),
-        no_instrument_id: InstrumentId::new("no"),
-        yes_quote: QuoteSnapshot {
-            best_bid: Some(BookLevel::new(0.50, 100.0)),
-            best_ask: Some(BookLevel::new(0.51, 20.0)),
-            taker_buy_qty_60s: 40.0,
-            taker_sell_qty_60s: 5.0,
-            ..Default::default()
-        },
-        no_quote: QuoteSnapshot {
-            best_bid: Some(BookLevel::new(0.49, 10.0)),
-            best_ask: Some(BookLevel::new(0.50, 100.0)),
-            taker_buy_qty_60s: 2.0,
-            taker_sell_qty_60s: 35.0,
-            ..Default::default()
-        },
-    };
-
-    let pressure = OrderBookPressureEngine::default().compute(&snapshot);
-
-    assert_eq!(pressure.direction, SignalDirection::Up);
-    assert_eq!(pressure.pressure_leg(), Some(LadderLeg::Yes));
-    assert!(pressure.imbalance > 0.0);
-}
-
-#[test]
-fn cheap_leg_signal_combines_fair_value_pair_cost_and_momentum() {
-    let fair = FairValueEstimate {
-        p_up: 0.60,
-        p_down: 0.40,
-        log_moneyness: 0.0,
-        sigma_remaining: 0.0,
-        time_remaining_s: 120.0,
-        model: FairValueModel::BsmBinary,
-    };
-
-    let buy = CheapLegSignalEngine::default().decide(
-        &fair,
-        &MomentumSignal::default(),
-        &OrderBookPressureSignal::default(),
-        Some(0.96),
-        Some(0.54),
-        None,
-        None,
-    );
-    assert!(matches!(buy, CheapLegSignal::Buy { .. }));
-
-    let wait = CheapLegSignalEngine::default().decide(
-        &fair,
-        &MomentumSignal {
-            direction: SignalDirection::Down,
-            score: -1.0,
-            strength: 1.0,
-            ..Default::default()
-        },
-        &OrderBookPressureSignal::default(),
-        Some(0.96),
-        Some(0.54),
-        None,
-        None,
-    );
-    assert!(matches!(wait, CheapLegSignal::Wait { .. }));
 }

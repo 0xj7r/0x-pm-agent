@@ -2,44 +2,17 @@
 
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
 use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarketSnapshot};
-use crate::signals::{
-    BtcRegimeSnapshot, FairValueEstimate, MomentumSignal, OrderBookPressureSignal,
-};
+use crate::signals::{BtcRegimeSnapshot, FairValueEstimate};
 use crate::types::{EpochMillis, FillReport, StrategyDecision};
-use crate::types::{InstrumentId, MarketId, TradeSide};
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StrategyOpenOrderSnapshot {
-    pub market_id: MarketId,
-    pub instrument_id: InstrumentId,
-    pub side: TradeSide,
-    pub limit_price: f64,
-    pub remaining_qty: f64,
-    pub reduce_only: bool,
-    pub quote_level_tag: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PairedOpenOrderExposure {
-    pub yes_qty: f64,
-    pub yes_notional_usd: f64,
-    pub yes_count: usize,
-    pub no_qty: f64,
-    pub no_notional_usd: f64,
-    pub no_count: usize,
-}
 
 #[derive(Clone, Debug)]
 pub struct StrategyInput<M> {
     pub market: M,
     pub snapshot: PairedMarketSnapshot,
     pub inventory: PairedInventorySnapshot,
-    pub open_convex_order_exposure: PairedOpenOrderExposure,
     pub pair_cost: PairCostTracker,
     pub fair_value: FairValueEstimate,
     pub btc_regime: BtcRegimeSnapshot,
-    pub momentum: MomentumSignal,
-    pub order_book_pressure: OrderBookPressureSignal,
     pub now_ms: EpochMillis,
 }
 

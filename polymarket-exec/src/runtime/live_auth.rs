@@ -77,7 +77,6 @@ fn live_signature_type_from_env(auth: Option<&UserWsAuth>) -> Result<PolymarketS
 fn live_funder_from_env(auth: Option<&UserWsAuth>) -> Option<String> {
     auth.and_then(|auth| auth.funder_address.clone())
         .or_else(|| std::env::var("POLYMARKET_FUNDER_ADDRESS").ok())
-        .or_else(|| std::env::var("POLYMARKET_FUNDER").ok())
         .filter(|value| !value.trim().is_empty())
 }
 
@@ -102,7 +101,7 @@ fn resolve_funder_for_signature(
         PolymarketSignatureType::Eoa => {
             for (name, configured) in [
                 (
-                    "POLYMARKET_FUNDER/POLYMARKET_FUNDER_ADDRESS",
+                    "POLYMARKET_FUNDER_ADDRESS",
                     funder_address.as_ref(),
                 ),
                 (

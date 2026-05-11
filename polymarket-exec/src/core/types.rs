@@ -62,36 +62,6 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-/// Per-market execution state derived by the runtime from orders, inventory,
-/// venue reconciliation, and merge lifecycle state.
-///
-/// Strategies use this to distinguish fresh entry from close-side repair. The
-/// runtime remains the authority for accepting or rejecting resulting intents.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MarketLedgerState {
-    #[default]
-    Flat,
-    QuotingPaired,
-    PartiallyFilled,
-    Recycling,
-    MergePending,
-    Drifted,
-    Resolved,
-}
-
-impl MarketLedgerState {
-    pub fn allows_fresh_entry(self) -> bool {
-        matches!(self, Self::Flat | Self::QuotingPaired)
-    }
-
-    pub fn allows_close_side(self) -> bool {
-        matches!(
-            self,
-            Self::PartiallyFilled | Self::Recycling | Self::MergePending | Self::Drifted
-        )
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TradeSide {
     Buy,
@@ -217,7 +187,7 @@ impl MarketSnapshot {
 /// string checks across runtime/mod.rs, core/risk.rs, market_making/quote_reconciler.rs,
 /// strategy.rs, and accept_intent's drift block. Promoted to a typed
 /// enum so any future gate someone adds doesn't silently re-trap rescues.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum IntentKind {
     /// Adds exposure: paired-bid maker entries, single-leg accumulations.
     /// Subject to all entry-time caps.
@@ -398,12 +368,12 @@ pub enum MmQuoteKind {
 impl MmQuoteKind {
     pub fn from_quote_level_tag(tag: &str) -> Option<Self> {
         let tag = tag.to_ascii_lowercase();
-        if tag.contains("convex") {
-            Some(Self::ConvexAccumulation)
+        if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
+            Some(Self::PairedEntry)
         } else if tag.contains("capital-recycle") || tag.contains("buy-light") {
             Some(Self::CapitalRecycle)
-        } else if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
-            Some(Self::PairedEntry)
+        } else if tag.contains("convex") {
+            Some(Self::ConvexAccumulation)
         } else if tag.contains("hedge-rescue") || tag.contains("rescue") {
             Some(Self::HedgeRescue)
         } else if tag.contains("sell-unwind") || tag.contains("reduce") {
@@ -414,27 +384,6 @@ impl MmQuoteKind {
             None
         }
     }
-
-    /// Stable attribution bucket used by runtime metrics and paper reports.
-    pub fn attribution_bucket(self) -> &'static str {
-        match self {
-            Self::PairedEntry => "paired_ladder",
-            Self::CapitalRecycle => "capital_recycle",
-            Self::ConvexAccumulation => "convex_accum",
-            Self::HedgeRescue => "hedge_rescue",
-            Self::ReduceOnlyExit => "reduce_cleanup",
-            Self::LateBarCore => "other_submit",
-        }
-    }
-}
-
-pub fn classify_quote_level_tag_for_attribution(tag: &str) -> &'static str {
-    if tag.is_empty() {
-        return "untagged_submit";
-    }
-    MmQuoteKind::from_quote_level_tag(tag)
-        .map(MmQuoteKind::attribution_bucket)
-        .unwrap_or("other_submit")
 }
 
 /// Scope of a strategy suppression.

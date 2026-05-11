@@ -18,9 +18,7 @@ pub use capital_recycler::{choose_capital_recycle, CapitalRecycleConfig, Capital
 pub use merge_executor::{MergeExecution, MergeExecutor};
 pub use merge_policy::{choose_merge, MergePolicyConfig, MergePolicyDecision};
 pub use pair_cost_tracker::{Leg, PairCostTracker};
-pub use pair_ledger::{
-    MarketPairLedger, MergeCandidate, MergePlan, ResolvedRedeemCandidate, ResolvedWinningLeg,
-};
+pub use pair_ledger::{MarketPairLedger, MergeCandidate, MergePlan};
 pub use rescue_engine::{choose_rescue, RescueAction, RescueConfig, RescueDecision, RescueInputs};
 pub use risk_policy::{
     evaluate_hard_policy, HardPolicyAction, HardPolicyConfig, HardPolicyDecision,

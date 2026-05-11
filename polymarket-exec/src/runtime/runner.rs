@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
 use crate::inventory::VenuePositionSnapshot;
-use crate::journal::JournalFanout;
+use crate::journal::JournalWriter;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
 use crate::quote_reconciler::ReconcilerConfig;
@@ -36,9 +36,8 @@ use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
     deterministic_hash_0_95, paper_fill_from_book_snapshot, paper_post_only_should_reject,
 };
-use crate::runtime::types::{ManagedOrder, ManagedOrderStatus};
+use crate::runtime::types::ManagedOrderStatus;
 use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
-use crate::signals::BtcRegimeSnapshot;
 use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
@@ -618,11 +617,6 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
     let strategy_name = strategy.name().to_string();
     let paper_fee_coeff = strategy.taker_fee_coeff();
     let shutdown = CancellationToken::new();
-    let pair_profile = config
-        .strategy_profile
-        .as_ref()
-        .map(|profile| &profile.pair);
-    let runtime_defaults = crate::runtime::types::RuntimeConfig::default();
     let order_store = config
         .order_store_path
         .as_ref()
@@ -648,20 +642,6 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .and_then(|profile| profile.quote.min_quote_age_ms)
                 .unwrap_or(10_000),
             require_initial_reconcile_before_entry: !config.paper_mode,
-            min_merge_notional_usd: config
-                .strategy_profile
-                .as_ref()
-                .and_then(|profile| profile.pair.min_merge_notional_usd)
-                .unwrap_or(runtime_defaults.min_merge_notional_usd),
-            merge_free_cash_pressure_ratio: pair_profile
-                .and_then(|pair| pair.merge_pressure_free_cash_ratio)
-                .unwrap_or(runtime_defaults.merge_free_cash_pressure_ratio),
-            merge_gross_exposure_pressure_ratio: pair_profile
-                .and_then(|pair| pair.merge_pressure_gross_exposure_ratio)
-                .unwrap_or(runtime_defaults.merge_gross_exposure_pressure_ratio),
-            merge_market_exposure_pressure_usd: pair_profile
-                .and_then(|pair| pair.merge_market_exposure_pressure_usd)
-                .unwrap_or(runtime_defaults.merge_market_exposure_pressure_usd),
         },
         config.risk_limits.clone(),
         strategy,
@@ -682,12 +662,11 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         max_cancel_per_window: config.quote_max_cancel_per_window,
         ..ReconcilerConfig::default()
     });
-    let mut journal = JournalFanout::open(
-        config.journal_path.clone(),
-        config.journal_rotate_bytes,
-        config.journal_firehose_stream.clone(),
-    )
-    .await?;
+    let mut journal = config
+        .journal_path
+        .clone()
+        .map(|path| JournalWriter::open_with_rotation(path, config.journal_rotate_bytes))
+        .transpose()?;
     let mut audit = config
         .audit_path
         .as_deref()
@@ -1119,7 +1098,7 @@ async fn run_runtime_loop(
     metrics: Arc<AppMetrics>,
     shutdown: CancellationToken,
     runtime: &mut Runtime<StrategyMode>,
-    journal: &mut JournalFanout,
+    journal: &mut Option<JournalWriter>,
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
@@ -2006,28 +1985,30 @@ fn persist_audit_outcome(
 }
 
 fn persist_runtime_checkpoint(
-    journal: &mut JournalFanout,
+    journal: &mut Option<JournalWriter>,
     runtime: &mut Runtime<StrategyMode>,
     observed_at_ms: u64,
     name: &str,
 ) -> Result<()> {
     runtime.persist_strategy_state(observed_at_ms);
     runtime.persist_runtime_status(observed_at_ms);
-    let open_orders = runtime.open_order_snapshots();
-    let open_orders_count = open_orders.len();
-    let needs_reconcile_orders = open_orders
-        .iter()
-        .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
-        .count();
-    journal.append_checkpoint(
-        observed_at_ms,
-        runtime.run_id(),
-        name,
-        open_orders_count,
-        needs_reconcile_orders,
-        runtime.event_log().latest_seq(),
-    )?;
-    journal.flush()?;
+    if let Some(writer) = journal.as_mut() {
+        let open_orders = runtime.open_order_snapshots();
+        let open_orders_count = open_orders.len();
+        let needs_reconcile_orders = open_orders
+            .iter()
+            .filter(|managed| managed.status == ManagedOrderStatus::NeedsReconcile)
+            .count();
+        writer.append_checkpoint(
+            observed_at_ms,
+            runtime.run_id(),
+            name,
+            open_orders_count,
+            needs_reconcile_orders,
+            runtime.event_log().latest_seq(),
+        )?;
+        writer.flush()?;
+    }
     Ok(())
 }
 
@@ -2054,13 +2035,6 @@ async fn execute_execution_adapter(
 
     let observed_at_ms = now_unix_ms();
     let mut queue: VecDeque<RuntimeCommand> = outcome.commands.into_iter().collect();
-    let mut queued_submit_ids: HashSet<ClientOrderId> = queue
-        .iter()
-        .filter_map(|command| match command {
-            RuntimeCommand::Submit(intent) => Some(intent.client_order_id.clone()),
-            _ => None,
-        })
-        .collect();
     let mut paper_report = paper_report;
     let mut shadow_quote = shadow_quote;
 
@@ -2105,21 +2079,10 @@ async fn execute_execution_adapter(
         stage_outcome_commands(&mut combined, &mut queue, quarantine_outcome);
         let stale_cancel_outcome = cancel_stale_live_orders(
             runtime,
-            books,
             observed_at_ms,
             execution_policy.live_order_max_age_ms,
-        )
-        .await;
+        );
         stage_outcome_commands(&mut combined, &mut queue, stale_cancel_outcome);
-        let mut queued_cancel_ids: HashSet<ClientOrderId> = queue
-            .iter()
-            .filter_map(|command| match command {
-                RuntimeCommand::Cancel {
-                    client_order_id, ..
-                } => Some(client_order_id.clone()),
-                _ => None,
-            })
-            .collect();
         let mut dedupe = HashSet::new();
         for managed in runtime.open_order_snapshots() {
             if managed.remaining_qty() <= 0.0 {
@@ -2131,35 +2094,17 @@ async fn execute_execution_adapter(
             }
             match managed.status {
                 ManagedOrderStatus::PendingSubmit => {
-                    if queued_submit_ids.insert(client_order_id.clone()) {
-                        queue.push_back(RuntimeCommand::Submit(managed.intent.clone()));
-                    } else {
-                        debug!(
-                            mode = "live",
-                            client_order_id = %client_order_id,
-                            "pending submit already queued in current execution cycle"
-                        );
-                    }
+                    queue.push_back(RuntimeCommand::Submit(managed.intent.clone()))
                 }
                 ManagedOrderStatus::NeedsReconcile => debug!(
                     mode = "live",
                     client_order_id = %client_order_id,
                     "order requires reconciliation; skipping automatic submit replay"
                 ),
-                ManagedOrderStatus::CancelRequested => {
-                    if queued_cancel_ids.insert(client_order_id.clone()) {
-                        queue.push_back(RuntimeCommand::Cancel {
-                            client_order_id,
-                            reason: "recovering live order".to_string(),
-                        });
-                    } else {
-                        debug!(
-                            mode = "live",
-                            client_order_id = %client_order_id,
-                            "cancel already queued in current execution cycle"
-                        );
-                    }
-                }
+                ManagedOrderStatus::CancelRequested => queue.push_back(RuntimeCommand::Cancel {
+                    client_order_id,
+                    reason: "recovering live order".to_string(),
+                }),
                 _ => {}
             }
         }
@@ -2563,15 +2508,7 @@ async fn execute_execution_adapter(
                             "cancel rejected by venue; treating order state as uncertain"
                         );
                         metrics.observe_uncertain_submit();
-                        if uncertain_cancel {
-                            combined.extend(runtime.mark_order_needs_reconcile(
-                                &client_order_id,
-                                ack.accepted_at_ms,
-                                format!(
-                                    "cancel rejected because venue order is likely terminal; awaiting fill/cancel sync: {reason}"
-                                ),
-                            ));
-                        } else {
+                        if !uncertain_cancel {
                             combined.extend(runtime.mark_order_needs_reconcile(
                                 &client_order_id,
                                 ack.accepted_at_ms,
@@ -2712,16 +2649,12 @@ async fn execute_execution_adapter(
                             "execution venue rejected merge positions".to_string()
                         });
                         runtime.block_pending_merge(&intent.market_id, ack.accepted_at_ms, &reason);
-                        warn!(
-                            mode = "live",
-                            market_id = %intent.market_id,
-                            yes_instrument_id = %intent.yes_instrument_id,
-                            no_instrument_id = %intent.no_instrument_id,
-                            quantity = intent.quantity,
-                            command_id = %intent.command_id,
-                            reason = %reason,
-                            "live merge rejected; blocking identical CTF recycle without global risk-off"
+                        metrics.observe_riskoff_transition();
+                        let degrade_outcome = runtime.degrade_and_cancel_all(
+                            ack.accepted_at_ms,
+                            format!("live merge rejected; risk-off until recycle path is fixed: {reason}"),
                         );
+                        stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                     }
                     Err(error) => {
                         if error.is_retryable() {
@@ -2740,90 +2673,25 @@ async fn execute_execution_adapter(
                                 observed_at_ms,
                                 error.to_string(),
                             );
-                            warn!(
-                                mode = "live",
-                                market_id = %intent.market_id,
-                                yes_instrument_id = %intent.yes_instrument_id,
-                                no_instrument_id = %intent.no_instrument_id,
-                                quantity = intent.quantity,
-                                command_id = %intent.command_id,
-                                error = %error,
-                                "live merge failed; blocking identical CTF recycle without global risk-off"
+                            metrics.observe_riskoff_transition();
+                            let degrade_outcome = runtime.degrade_and_cancel_all(
+                                observed_at_ms,
+                                format!(
+                                    "live merge failed; risk-off until recycle path is fixed: {error}"
+                                ),
                             );
+                            stage_outcome_commands(&mut combined, &mut queue, degrade_outcome);
                         }
                     }
                 }
             }
             RuntimeCommand::Redeem(intent) => {
-                let Some(condition_id) = intent.condition_id.clone() else {
-                    warn!(
-                        mode = if execution_policy.paper_mode { "paper" } else { "live" },
-                        market_id = %intent.market_id,
-                        command_id = %intent.command_id,
-                        "redeem command skipped: missing condition_id"
-                    );
-                    continue;
-                };
-                let request = RedeemPositionsRequest {
-                    command_id: intent.command_id.clone(),
-                    market_id: intent.market_id.clone(),
-                    condition_id,
-                    collateral_token_address: None,
-                    index_sets: vec![1, 2],
-                    submitted_at_ms: observed_at_ms,
-                };
-                match execution_adapter.redeem_positions(request).await {
-                    Ok(ack) if ack.accepted => {
-                        info!(
-                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
-                            market_id = %intent.market_id,
-                            command_id = %intent.command_id,
-                            message = ?ack.venue_message,
-                            "redeem command accepted by execution adapter"
-                        );
-                        if !execution_policy.paper_mode {
-                            let report = sync_execution_state(
-                                execution_adapter.as_ref(),
-                                runtime,
-                                execution_venue_map,
-                                execution_policy,
-                                seen_venue_fill_keys,
-                                ack.accepted_at_ms,
-                            )
-                            .await;
-                            let sync_outcome = apply_sync_report(
-                                runtime,
-                                metrics,
-                                live_safety,
-                                execution_policy,
-                                market_assets,
-                                report,
-                                ack.accepted_at_ms,
-                                execution_adapter.as_ref(),
-                            )
-                            .await;
-                            stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
-                        }
-                    }
-                    Ok(ack) => {
-                        warn!(
-                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
-                            market_id = %intent.market_id,
-                            command_id = %intent.command_id,
-                            reason = ?ack.venue_message,
-                            "redeem command rejected by execution adapter"
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            mode = if execution_policy.paper_mode { "paper" } else { "live" },
-                            market_id = %intent.market_id,
-                            command_id = %intent.command_id,
-                            error = %error,
-                            "redeem command failed"
-                        );
-                    }
-                }
+                warn!(
+                    mode = if execution_policy.paper_mode { "paper" } else { "live" },
+                    market_id = %intent.market_id,
+                    command_id = %intent.command_id,
+                    "redeem command planned but relayer submission is not implemented"
+                );
             }
             RuntimeCommand::Noop => {}
         }
@@ -3120,64 +2988,7 @@ async fn apply_sync_report(
     if execution_policy.paper_mode {
         return outcome;
     }
-    let mut unresolved_missing_local_orders = Vec::new();
-    for client_order_id in &report.missing_local_orders {
-        let (removed, terminal_outcome) = runtime.remove_active_order_if_durable_terminal(
-            client_order_id,
-            now_ms,
-            "venue sync missing locally tracked order already terminal in durable store",
-        );
-        outcome.extend(terminal_outcome);
-        if !removed {
-            unresolved_missing_local_orders.push(client_order_id.clone());
-        }
-    }
-
-    let balance_observed_at_ms = report.venue_balance_observed_at_ms.unwrap_or(now_ms);
-    let authoritative_empty_balance_after_order =
-        |managed: &crate::runtime::types::ManagedOrder| {
-            report.balance_synced
-                && report.venue_positions_authoritative
-                && balance_observed_at_ms >= managed.last_update_ms
-                && !report.venue_positions.iter().any(|position| {
-                    position.market_id == managed.intent.market_id
-                        && position.instrument_id == managed.intent.instrument_id
-                        && position.quantity.abs() > 1e-9
-                })
-        };
-
-    let mut still_unresolved_missing_local_orders = Vec::new();
-    let open_order_by_client = runtime
-        .open_order_snapshots()
-        .into_iter()
-        .map(|managed| (managed.intent.client_order_id.clone(), managed))
-        .collect::<HashMap<_, _>>();
-    for client_order_id in unresolved_missing_local_orders {
-        let Some(managed) = open_order_by_client.get(&client_order_id) else {
-            continue;
-        };
-        if authoritative_empty_balance_after_order(managed) {
-            info!(
-                mode = "live",
-                client_order_id = %client_order_id,
-                market_id = %managed.intent.market_id,
-                instrument_id = %managed.intent.instrument_id,
-                balance_observed_at_ms,
-                order_last_update_ms = managed.last_update_ms,
-                "clearing missing live order as cancelled after authoritative empty balance sync"
-            );
-            outcome.extend(runtime.on_order_cancelled(
-                &client_order_id,
-                "venue open-order and authoritative balance sync show no active order or fill",
-                now_ms,
-            ));
-        } else {
-            still_unresolved_missing_local_orders.push(client_order_id);
-        }
-    }
-    let unresolved_missing_local_orders = still_unresolved_missing_local_orders;
-
-    if report.errors > 0 || !unresolved_missing_local_orders.is_empty() {
+    if report.errors > 0 || !report.missing_local_orders.is_empty() {
         live_safety.consecutive_reconcile_mismatches = live_safety
             .consecutive_reconcile_mismatches
             .saturating_add(1);
@@ -3381,7 +3192,7 @@ async fn apply_sync_report(
         );
     }
 
-    for client_order_id in unresolved_missing_local_orders {
+    for client_order_id in report.missing_local_orders {
         outcome.extend(runtime.mark_order_needs_reconcile(
             &client_order_id,
             now_ms,
@@ -3453,9 +3264,8 @@ fn enforce_live_error_budget(
     }
 }
 
-async fn cancel_stale_live_orders(
+fn cancel_stale_live_orders(
     runtime: &mut Runtime<StrategyMode>,
-    books: &Arc<BookStore>,
     now_ms: u64,
     max_age_ms: u64,
 ) -> RuntimeOutcome {
@@ -3463,8 +3273,7 @@ async fn cancel_stale_live_orders(
     if max_age_ms == 0 {
         return outcome;
     }
-    let btc_regime = runtime.btc_regime_snapshot(now_ms);
-    let stale_orders = runtime
+    let stale_ids = runtime
         .open_order_snapshots()
         .into_iter()
         .filter(|managed| {
@@ -3473,153 +3282,16 @@ async fn cancel_stale_live_orders(
                 ManagedOrderStatus::Submitted | ManagedOrderStatus::Working
             ) && now_ms.saturating_sub(managed.intent.created_at_ms) >= max_age_ms
         })
+        .map(|managed| managed.intent.client_order_id)
         .collect::<Vec<_>>();
-    for managed in stale_orders {
-        let client_order_id = managed.intent.client_order_id.clone();
-        let Some(book) = books.snapshot(managed.intent.instrument_id.as_str()).await else {
-            outcome.extend(runtime.request_cancel_order(
-                &client_order_id,
-                now_ms,
-                format!("live order max age exceeded {max_age_ms}ms; no current book snapshot"),
-            ));
-            continue;
-        };
-
-        match stale_live_order_action(&managed, &book, &btc_regime) {
-            StaleLiveOrderAction::Preserve { reason } => {
-                tracing::info!(
-                    client_order_id = %client_order_id,
-                    instrument_id = %managed.intent.instrument_id,
-                    limit_price = managed.intent.limit_price,
-                    best_bid = book.best_bid,
-                    best_ask = book.best_ask,
-                    btc_return_30s_bps = ?btc_regime.return_30s_bps,
-                    btc_return_60s_bps = ?btc_regime.return_60s_bps,
-                    age_ms = now_ms.saturating_sub(managed.intent.created_at_ms),
-                    reason,
-                    "preserving aged live order because current book still supports maker quote"
-                );
-            }
-            StaleLiveOrderAction::Cancel { reason } => {
-                outcome.extend(runtime.request_cancel_order(
-                    &client_order_id,
-                    now_ms,
-                    format!("live order max age exceeded {max_age_ms}ms; {reason}"),
-                ));
-            }
-        }
+    for client_order_id in stale_ids {
+        outcome.extend(runtime.request_cancel_order(
+            &client_order_id,
+            now_ms,
+            format!("live order max age exceeded {max_age_ms}ms"),
+        ));
     }
     outcome
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StaleLiveOrderAction {
-    Preserve { reason: &'static str },
-    Cancel { reason: &'static str },
-}
-
-fn stale_live_order_action(
-    order: &ManagedOrder,
-    book: &BookState,
-    btc_regime: &BtcRegimeSnapshot,
-) -> StaleLiveOrderAction {
-    let best_bid = book.best_bid;
-    let best_ask = book.best_ask;
-    if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask <= 0.0 {
-        return StaleLiveOrderAction::Cancel {
-            reason: "invalid current book",
-        };
-    }
-
-    let spread = (best_ask - best_bid).max(0.0);
-    let tolerance = spread.clamp(0.01, 0.03);
-    if last_trade_invalidates_order(order, book, tolerance) {
-        return StaleLiveOrderAction::Cancel {
-            reason: "last-trade drift invalidates aged quote price",
-        };
-    }
-    if btc_drift_invalidates_order(order, btc_regime) {
-        return StaleLiveOrderAction::Cancel {
-            reason: "btc drift invalidates aged quote side",
-        };
-    }
-    match order.intent.side {
-        TradeSide::Buy => {
-            if order.intent.limit_price >= best_ask {
-                return StaleLiveOrderAction::Cancel {
-                    reason: "buy quote would cross current ask",
-                };
-            }
-            if order.intent.limit_price > best_bid + tolerance {
-                return StaleLiveOrderAction::Cancel {
-                    reason: "buy quote is stale above current best bid",
-                };
-            }
-            StaleLiveOrderAction::Preserve {
-                reason: "buy quote remains behind current ask and near best bid",
-            }
-        }
-        TradeSide::Sell => {
-            if order.intent.limit_price <= best_bid {
-                return StaleLiveOrderAction::Cancel {
-                    reason: "sell quote would cross current bid",
-                };
-            }
-            if order.intent.limit_price < best_ask - tolerance {
-                return StaleLiveOrderAction::Cancel {
-                    reason: "sell quote is stale below current best ask",
-                };
-            }
-            StaleLiveOrderAction::Preserve {
-                reason: "sell quote remains above current bid and near best ask",
-            }
-        }
-    }
-}
-
-fn last_trade_invalidates_order(order: &ManagedOrder, book: &BookState, tolerance: f64) -> bool {
-    let last_trade_price = book.last_trade_price;
-    if !last_trade_price.is_finite() || last_trade_price <= 0.0 {
-        return false;
-    }
-    match order.intent.side {
-        TradeSide::Buy => order.intent.limit_price > last_trade_price + tolerance,
-        TradeSide::Sell => order.intent.limit_price < last_trade_price - tolerance,
-    }
-}
-
-fn btc_drift_invalidates_order(order: &ManagedOrder, btc_regime: &BtcRegimeSnapshot) -> bool {
-    let Some(tag) = order.intent.quote_level_tag.as_deref() else {
-        return false;
-    };
-    if !matches!(order.intent.side, TradeSide::Buy) {
-        return false;
-    }
-    let leg = if tag.contains(":yes:") {
-        Some(TradeSide::Buy)
-    } else if tag.contains(":no:") {
-        Some(TradeSide::Sell)
-    } else {
-        None
-    };
-    let Some(return_30s_bps) = btc_regime.return_30s_bps else {
-        return false;
-    };
-    let return_60s_bps = btc_regime.return_60s_bps.unwrap_or(return_30s_bps);
-    if return_30s_bps.signum() != return_60s_bps.signum() {
-        return false;
-    }
-    let vol_floor_bps = btc_regime
-        .realized_vol_5m_bps
-        .filter(|vol| vol.is_finite())
-        .unwrap_or(6.0)
-        .max(6.0);
-    let threshold_bps = (vol_floor_bps * 0.75).clamp(4.0, 25.0);
-    match leg {
-        Some(TradeSide::Buy) => return_30s_bps < -threshold_bps && return_60s_bps < -threshold_bps,
-        Some(TradeSide::Sell) => return_30s_bps > threshold_bps && return_60s_bps > threshold_bps,
-        _ => false,
-    }
 }
 
 fn venue_fill_key(fill: &VenueFill) -> String {

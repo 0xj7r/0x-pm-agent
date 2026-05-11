@@ -4,8 +4,6 @@
 //! with regime, visible book depth, time-to-bar-end, and inventory imbalance.
 //! It is pure: no venue calls, no state mutation, no runtime side effects.
 
-use std::collections::HashSet;
-
 use crate::market_making::paired_mm::risk_boundary::filter_entry_intents;
 use crate::market_making::paired_mm::stoikov::{stoikov_reservation_price, StoikovParams};
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
@@ -15,7 +13,6 @@ use crate::market_making::pairing::types::{
 use crate::markets::MarketDescriptor;
 use crate::signals::{
     BtcRegime, BtcRegimeSnapshot, FairValueEstimate, FairValueModel, IncentiveSignal,
-    MomentumSignal, OrderBookPressureSignal, SideScoreSignal, SignalDirection,
 };
 use crate::types::{ClientOrderId, EpochMillis, IntentKind, MmQuoteKind, OrderIntent, TradeSide};
 
@@ -47,20 +44,13 @@ pub struct LadderConfig {
     pub imbalanced_spacing_multiplier: f64,
     pub late_bar_cutoff_ms: u64,
     pub base_clip_usd: f64,
-    pub min_clip_usd: f64,
     pub fractional_kelly: f64,
     pub max_clip_usd: f64,
-    pub entry_min_size_multiplier: f64,
-    pub max_spread: Option<f64>,
-    pub max_quote_per_side_usd: Option<f64>,
     pub level_multipliers: Vec<f64>,
     pub stoikov: StoikovParams,
     pub caps: RunningInventoryCaps,
     pub incentives: IncentiveSignal,
     pub fair_value_anchoring: FairValueAnchoringConfig,
-    pub aligned_signal_clip_boost: f64,
-    pub adverse_signal_clip_cut: f64,
-    pub max_signal_clip_scale: f64,
 }
 
 impl Default for LadderConfig {
@@ -77,20 +67,13 @@ impl Default for LadderConfig {
             imbalanced_spacing_multiplier: 2.0,
             late_bar_cutoff_ms: 60_000,
             base_clip_usd: 10.0,
-            min_clip_usd: 0.0,
             fractional_kelly: 0.20,
             max_clip_usd: 25.0,
-            entry_min_size_multiplier: 1.0,
-            max_spread: None,
-            max_quote_per_side_usd: None,
             level_multipliers: vec![1.0, 1.8, 2.5, 3.5, 4.0, 4.5, 5.0, 5.5],
             stoikov: StoikovParams::default(),
             caps: RunningInventoryCaps::default(),
             incentives: IncentiveSignal::default(),
             fair_value_anchoring: FairValueAnchoringConfig::default(),
-            aligned_signal_clip_boost: 0.35,
-            adverse_signal_clip_cut: 0.25,
-            max_signal_clip_scale: 1.60,
         }
     }
 }
@@ -105,10 +88,6 @@ pub struct LadderDiagnostics {
     pub base_clip_usd: f64,
     pub suppressed_yes: bool,
     pub suppressed_no: bool,
-    pub yes_signal_scale: f64,
-    pub no_signal_scale: f64,
-    pub yes_side_score: f64,
-    pub no_side_score: f64,
     pub notes: Vec<String>,
 }
 
@@ -124,9 +103,6 @@ pub fn build_ladder<M: MarketDescriptor>(
     inventory: &PairedInventorySnapshot,
     fair_value: &FairValueEstimate,
     btc_regime: &BtcRegimeSnapshot,
-    momentum: &MomentumSignal,
-    order_book_pressure: &OrderBookPressureSignal,
-    side_score: &SideScoreSignal,
     pair_cost: &PairCostTracker,
     config: &LadderConfig,
     now_ms: EpochMillis,
@@ -184,67 +160,39 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
 
     let base_clip_usd = kelly_clip_size(inventory, fair_value, config, ladder_regime);
-    let yes_signal_scale = signal_clip_scale(LadderLeg::Yes, momentum, order_book_pressure, config);
-    let no_signal_scale = signal_clip_scale(LadderLeg::No, momentum, order_book_pressure, config);
-    let yes_spread_suppressed = spread_exceeds_limit(&snapshot.yes_quote, config.max_spread);
-    let no_spread_suppressed = spread_exceeds_limit(&snapshot.no_quote, config.max_spread);
-    if yes_spread_suppressed {
-        notes.push(format!(
-            "ladder yes suppressed: spread exceeds max_spread spread={:.4} max_spread={:.4}",
-            snapshot.yes_quote.spread().unwrap_or(f64::NAN),
-            config.max_spread.unwrap_or_default()
-        ));
-    }
-    if no_spread_suppressed {
-        notes.push(format!(
-            "ladder no suppressed: spread exceeds max_spread spread={:.4} max_spread={:.4}",
-            snapshot.no_quote.spread().unwrap_or(f64::NAN),
-            config.max_spread.unwrap_or_default()
-        ));
-    }
-    let suppress_yes =
-        should_suppress_leg(LadderLeg::Yes, inventory, config) || yes_spread_suppressed;
-    let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
+    let suppress_yes = should_suppress_leg(LadderLeg::Yes, inventory, config);
+    let suppress_no = should_suppress_leg(LadderLeg::No, inventory, config);
 
     let mut intents = Vec::with_capacity(depth * 2);
     if inventory.gross_cost_usd() < config.caps.max_gross_cost_usd {
-        let mut yes_intents = Vec::with_capacity(depth);
-        let mut no_intents = Vec::with_capacity(depth);
         append_leg_ladder(
-            &mut yes_intents,
+            &mut intents,
             market,
             LadderLeg::Yes,
             &snapshot.yes_quote,
             yes_reservation,
             depth,
             spacing_ticks,
-            base_clip_usd * yes_signal_scale,
+            base_clip_usd,
             suppress_yes,
             config,
             now_ms,
         );
         append_leg_ladder(
-            &mut no_intents,
+            &mut intents,
             market,
             LadderLeg::No,
             &snapshot.no_quote,
             no_reservation,
             depth,
             spacing_ticks,
-            base_clip_usd * no_signal_scale,
+            base_clip_usd,
             suppress_no,
             config,
             now_ms,
         );
-        normalize_paired_entry_quantities(
-            &mut yes_intents,
-            &mut no_intents,
-            market.min_order_size(),
-        );
-        interleave_leg_ladders(&mut intents, yes_intents, no_intents);
     }
 
-    let intents = aggregate_collapsed_ladder_levels(intents, market.min_order_size());
     let (intents, risk_rejects) = filter_entry_intents(inventory, intents, &config.caps);
     for reject in risk_rejects {
         notes.push(reject.note);
@@ -261,63 +209,8 @@ pub fn build_ladder<M: MarketDescriptor>(
             base_clip_usd,
             suppressed_yes: suppress_yes,
             suppressed_no: suppress_no,
-            yes_signal_scale,
-            no_signal_scale,
-            yes_side_score: side_score.yes.score,
-            no_side_score: side_score.no.score,
             notes,
         },
-    }
-}
-
-fn signal_clip_scale(
-    leg: LadderLeg,
-    momentum: &MomentumSignal,
-    pressure: &OrderBookPressureSignal,
-    config: &LadderConfig,
-) -> f64 {
-    let mut scale = 1.0;
-
-    match signal_direction_for_leg(leg) {
-        direction if direction == momentum.direction => {
-            scale += config.aligned_signal_clip_boost * momentum.strength.clamp(0.0, 1.0);
-        }
-        _ if momentum.direction != SignalDirection::Neutral => {
-            scale -= config.adverse_signal_clip_cut * momentum.strength.clamp(0.0, 1.0);
-        }
-        _ => {}
-    }
-
-    match pressure.pressure_leg() {
-        Some(pressure_leg) if pressure_leg == leg => {
-            scale += config.aligned_signal_clip_boost * pressure.imbalance.abs().clamp(0.0, 1.0);
-        }
-        Some(_) => {
-            scale -= config.adverse_signal_clip_cut * pressure.imbalance.abs().clamp(0.0, 1.0);
-        }
-        None => {}
-    }
-
-    if let Some(acceleration_bps) = momentum.acceleration_bps {
-        let acceleration_strength = (acceleration_bps.abs() / 10.0).clamp(0.0, 1.0);
-        match signal_direction_for_leg(leg) {
-            direction if direction == SignalDirection::from_signed(acceleration_bps, 0.5) => {
-                scale += 0.15 * acceleration_strength;
-            }
-            _ if acceleration_strength > 0.0 => {
-                scale -= 0.10 * acceleration_strength;
-            }
-            _ => {}
-        }
-    }
-
-    scale.clamp(0.35, config.max_signal_clip_scale.max(0.35))
-}
-
-fn signal_direction_for_leg(leg: LadderLeg) -> SignalDirection {
-    match leg {
-        LadderLeg::Yes => SignalDirection::Up,
-        LadderLeg::No => SignalDirection::Down,
     }
 }
 
@@ -425,23 +318,11 @@ fn kelly_clip_size(
         LadderRegime::LateBar => 0.35,
         LadderRegime::InventoryImbalanced => 0.35,
     };
-    let min_clip = config
-        .min_clip_usd
-        .max(0.0)
-        .min(config.max_clip_usd.max(0.0));
-    let max_clip = config.max_clip_usd.max(min_clip);
-    (config.base_clip_usd.max(kelly_component).min(max_clip) * regime_scale)
-        .max(min_clip)
-        .min(max_clip)
-}
-
-fn spread_exceeds_limit(quote: &crate::types::QuoteSnapshot, max_spread: Option<f64>) -> bool {
-    let Some(max_spread) = max_spread.filter(|value| value.is_finite() && *value > 0.0) else {
-        return false;
-    };
-    quote
-        .spread()
-        .is_some_and(|spread| spread.is_finite() && spread > max_spread)
+    config
+        .base_clip_usd
+        .max(kelly_component)
+        .min(config.max_clip_usd)
+        * regime_scale
 }
 
 fn should_suppress_leg(
@@ -485,9 +366,6 @@ fn append_leg_ladder<M: MarketDescriptor>(
         LadderLeg::No => "no",
     };
 
-    let mut leg_notional_usd = 0.0;
-    let mut last_emitted_price: Option<f64> = None;
-    let min_quantity = market.min_order_size() * config.entry_min_size_multiplier.max(0.0).max(1.0);
     for level in 0..depth {
         let multiplier = config
             .level_multipliers
@@ -505,41 +383,14 @@ fn append_leg_ladder<M: MarketDescriptor>(
         if limit_price >= quote.best_ask.as_ref().map(|ask| ask.price).unwrap_or(1.0) {
             continue;
         }
-        // If deeper levels collapse onto the same tick, stop this leg. Keeping
-        // multiple same-price paired entries with distinct pair_ids causes the
-        // later aggregation pass to orphan the opposite-leg mate.
-        if last_emitted_price.is_some_and(|prev| (prev - limit_price).abs() < 1e-9) {
-            break;
-        }
-        let mut clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
-        if let Some(max_quote_per_side_usd) = config
-            .max_quote_per_side_usd
-            .filter(|value| value.is_finite() && *value > 0.0)
-        {
-            let remaining = max_quote_per_side_usd - leg_notional_usd;
-            if remaining + 1e-9 < config.min_clip_usd.max(0.0) {
-                break;
-            }
-            clip_usd = clip_usd.min(remaining.max(0.0));
-        }
+        let clip_usd = (base_clip_usd * multiplier).min(config.caps.max_entry_notional_usd);
         let reward_qty = config.incentives.min_reward_quantity().unwrap_or(0.0);
         let quantity = (clip_usd / limit_price.max(tick_size))
-            .max(min_quantity)
+            .max(market.min_order_size())
             .max(reward_qty);
         if quantity <= 0.0 || !quantity.is_finite() {
             continue;
         }
-
-        let notional_usd = quantity * limit_price;
-        if config
-            .max_quote_per_side_usd
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .is_some_and(|cap| leg_notional_usd + notional_usd > cap + 1e-9)
-        {
-            break;
-        }
-        leg_notional_usd += notional_usd;
-        last_emitted_price = Some(limit_price);
 
         intents.push(OrderIntent {
             client_order_id: ClientOrderId::from(format!(
@@ -573,109 +424,6 @@ fn append_leg_ladder<M: MarketDescriptor>(
     }
 }
 
-fn interleave_leg_ladders(
-    intents: &mut Vec<OrderIntent>,
-    yes_intents: Vec<OrderIntent>,
-    no_intents: Vec<OrderIntent>,
-) {
-    let mut yes_iter = yes_intents.into_iter();
-    let mut no_iter = no_intents.into_iter();
-    loop {
-        let mut pushed = false;
-        if let Some(intent) = yes_iter.next() {
-            intents.push(intent);
-            pushed = true;
-        }
-        if let Some(intent) = no_iter.next() {
-            intents.push(intent);
-            pushed = true;
-        }
-        if !pushed {
-            break;
-        }
-    }
-}
-
-fn aggregate_collapsed_ladder_levels(
-    intents: Vec<OrderIntent>,
-    min_order_size: f64,
-) -> Vec<OrderIntent> {
-    let mut aggregated: Vec<OrderIntent> = Vec::with_capacity(intents.len());
-    let mut orphaned_pair_ids: HashSet<String> = HashSet::new();
-    for intent in intents {
-        if let Some(existing) = aggregated.iter_mut().find(|existing| {
-            existing.instrument_id == intent.instrument_id
-                && existing.side == intent.side
-                && (existing.limit_price - intent.limit_price).abs() < 1e-9
-                && existing.kind == intent.kind
-                && existing.reduce_only == intent.reduce_only
-        }) {
-            let old_tag = existing.quote_level_tag.clone().unwrap_or_default();
-            let new_tag = intent.quote_level_tag.clone().unwrap_or_default();
-            existing.quantity += intent.quantity;
-            existing.reason = format!(
-                "{}; aggregated collapsed ladder level: {}",
-                existing.reason, intent.reason
-            );
-            existing.quote_level_tag = Some(if old_tag.is_empty() {
-                new_tag
-            } else if new_tag.is_empty() {
-                old_tag
-            } else {
-                format!("{old_tag}+{new_tag}")
-            });
-            if let Some(pair_id) = existing.pair_id.take() {
-                orphaned_pair_ids.insert(pair_id);
-            }
-            if let Some(pair_id) = intent.pair_id {
-                orphaned_pair_ids.insert(pair_id);
-            }
-        } else {
-            aggregated.push(intent);
-        }
-    }
-
-    aggregated
-        .into_iter()
-        .filter(|intent| intent.quantity + 1e-9 >= min_order_size.max(0.0))
-        .filter(|intent| match intent.pair_id.as_ref() {
-            Some(pair_id) => !orphaned_pair_ids.contains(pair_id),
-            None => true,
-        })
-        .collect()
-}
-
-fn normalize_paired_entry_quantities(
-    yes_intents: &mut Vec<OrderIntent>,
-    no_intents: &mut Vec<OrderIntent>,
-    min_order_size: f64,
-) {
-    if yes_intents.is_empty() || no_intents.is_empty() {
-        return;
-    }
-
-    let min_order_size = min_order_size.max(0.0);
-    let mut normalized_yes = Vec::with_capacity(yes_intents.len().min(no_intents.len()));
-    let mut normalized_no = Vec::with_capacity(yes_intents.len().min(no_intents.len()));
-
-    for (mut yes, mut no) in std::mem::take(yes_intents)
-        .into_iter()
-        .zip(std::mem::take(no_intents).into_iter())
-    {
-        let paired_quantity = yes.quantity.min(no.quantity);
-        if !paired_quantity.is_finite() || paired_quantity < min_order_size {
-            continue;
-        }
-        yes.quantity = paired_quantity;
-        no.quantity = paired_quantity;
-        normalized_yes.push(yes);
-        normalized_no.push(no);
-    }
-
-    *yes_intents = normalized_yes;
-    *no_intents = normalized_no;
-}
-
 fn align_down_to_tick(price: f64, tick_size: f64) -> f64 {
     if !price.is_finite() || tick_size <= 0.0 {
         return price;
@@ -688,9 +436,7 @@ mod tests {
     use super::*;
     use crate::markets::BinaryOutcomeMarket;
     use crate::signals::FairValueModel;
-    use crate::types::{
-        BookLevel, ClientOrderId, InstrumentId, IntentKind, MarketId, QuoteSnapshot, TradeSide,
-    };
+    use crate::types::{BookLevel, InstrumentId, MarketId, QuoteSnapshot};
 
     fn market() -> BinaryOutcomeMarket {
         let mut market = BinaryOutcomeMarket::btc_5m(
@@ -728,65 +474,6 @@ mod tests {
         }
     }
 
-    fn snapshot_with_spreads(
-        yes_bid: f64,
-        yes_ask: f64,
-        no_bid: f64,
-        no_ask: f64,
-    ) -> PairedMarketSnapshot {
-        PairedMarketSnapshot {
-            yes_quote: QuoteSnapshot {
-                best_bid: Some(BookLevel::new(yes_bid, 100.0)),
-                best_ask: Some(BookLevel::new(yes_ask, 100.0)),
-                ..QuoteSnapshot::default()
-            },
-            no_quote: QuoteSnapshot {
-                best_bid: Some(BookLevel::new(no_bid, 100.0)),
-                best_ask: Some(BookLevel::new(no_ask, 100.0)),
-                ..QuoteSnapshot::default()
-            },
-            ..snapshot()
-        }
-    }
-
-    fn tagged_intent(tag: &str) -> OrderIntent {
-        OrderIntent {
-            client_order_id: ClientOrderId::from(tag),
-            market_id: MarketId::from("m"),
-            instrument_id: InstrumentId::from(tag),
-            side: TradeSide::Buy,
-            limit_price: 0.5,
-            quantity: 1.0,
-            reduce_only: false,
-            reason: tag.to_string(),
-            quote_level_tag: Some(tag.to_string()),
-            created_at_ms: 0,
-            pair_id: None,
-            kind: IntentKind::Entry,
-        }
-    }
-
-    #[test]
-    fn interleaves_yes_and_no_ladders_by_level_before_risk() {
-        let mut intents = Vec::new();
-
-        interleave_leg_ladders(
-            &mut intents,
-            vec![
-                tagged_intent("yes:l1"),
-                tagged_intent("yes:l2"),
-                tagged_intent("yes:l3"),
-            ],
-            vec![tagged_intent("no:l1"), tagged_intent("no:l2")],
-        );
-
-        let tags: Vec<&str> = intents
-            .iter()
-            .map(|intent| intent.quote_level_tag.as_deref().unwrap())
-            .collect();
-        assert_eq!(tags, vec!["yes:l1", "no:l1", "yes:l2", "no:l2", "yes:l3"]);
-    }
-
     #[test]
     fn high_inventory_suppresses_heavy_side() {
         let inventory = PairedInventorySnapshot {
@@ -821,9 +508,6 @@ mod tests {
                 return_180s_bps: Some(1.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::from_inventory(&inventory),
             &config,
             0,
@@ -858,9 +542,6 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -874,231 +555,6 @@ mod tests {
                 assert!(intent.limit_price < 0.21);
             }
         }
-    }
-
-    #[test]
-    fn paired_entry_levels_use_equal_share_quantity_on_both_legs() {
-        let result = build_ladder(
-            &market(),
-            &snapshot_with_asks(0.11, 0.91),
-            &PairedInventorySnapshot {
-                free_cash_usd: 1_000.0,
-                equity_usd: 1_000.0,
-                ..Default::default()
-            },
-            &FairValueEstimate {
-                p_up: 0.50,
-                p_down: 0.50,
-                log_moneyness: 0.0,
-                sigma_remaining: 0.0,
-                time_remaining_s: 100.0,
-                model: FairValueModel::BsmBinary,
-            },
-            &BtcRegimeSnapshot {
-                realized_vol_5m_bps: Some(2.0),
-                ..BtcRegimeSnapshot::default()
-            },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
-            &PairCostTracker::default(),
-            &LadderConfig {
-                max_depth: 2,
-                low_vol_depth: 2,
-                base_clip_usd: 5.0,
-                max_clip_usd: 5.0,
-                stoikov: StoikovParams {
-                    gamma: 0.0,
-                    k: 1.0,
-                    max_skew: 0.20,
-                },
-                ..LadderConfig::default()
-            },
-            0,
-        );
-
-        let yes: Vec<&OrderIntent> = result
-            .intents
-            .iter()
-            .filter(|intent| intent.instrument_id.as_str() == "yes")
-            .collect();
-        let no: Vec<&OrderIntent> = result
-            .intents
-            .iter()
-            .filter(|intent| intent.instrument_id.as_str() == "no")
-            .collect();
-
-        assert_eq!(yes.len(), no.len());
-        assert!(!yes.is_empty());
-        for (yes, no) in yes.iter().zip(no.iter()) {
-            assert!(
-                (yes.quantity - no.quantity).abs() < 1e-9,
-                "yes={yes:?} no={no:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn min_clip_usd_sets_paired_mm_ladder_floor() {
-        let clip = kelly_clip_size(
-            &PairedInventorySnapshot {
-                free_cash_usd: 1_000.0,
-                equity_usd: 1_000.0,
-                ..Default::default()
-            },
-            &FairValueEstimate {
-                p_up: 0.50,
-                p_down: 0.50,
-                log_moneyness: 0.0,
-                sigma_remaining: 0.0,
-                time_remaining_s: 100.0,
-                model: FairValueModel::BsmBinary,
-            },
-            &LadderConfig {
-                base_clip_usd: 0.10,
-                min_clip_usd: 0.50,
-                max_clip_usd: 5.0,
-                ..LadderConfig::default()
-            },
-            LadderRegime::Normal,
-        );
-
-        assert_eq!(clip, 0.50);
-    }
-
-    #[test]
-    fn entry_min_size_multiplier_controls_ladder_quantity_floor() {
-        let mut test_market = market();
-        test_market.min_order_size = 5.0;
-        let result = build_ladder(
-            &test_market,
-            &snapshot_with_asks(0.56, 0.46),
-            &PairedInventorySnapshot {
-                free_cash_usd: 1_000.0,
-                equity_usd: 1_000.0,
-                ..Default::default()
-            },
-            &FairValueEstimate {
-                p_up: 0.50,
-                p_down: 0.50,
-                log_moneyness: 0.0,
-                sigma_remaining: 0.0,
-                time_remaining_s: 100.0,
-                model: FairValueModel::BsmBinary,
-            },
-            &BtcRegimeSnapshot {
-                realized_vol_5m_bps: Some(2.0),
-                ..BtcRegimeSnapshot::default()
-            },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
-            &PairCostTracker::default(),
-            &LadderConfig {
-                max_depth: 1,
-                low_vol_depth: 1,
-                base_clip_usd: 0.50,
-                max_clip_usd: 0.50,
-                entry_min_size_multiplier: 2.0,
-                ..LadderConfig::default()
-            },
-            0,
-        );
-
-        assert!(!result.intents.is_empty());
-        assert!(result.intents.iter().all(|intent| intent.quantity >= 10.0));
-    }
-
-    #[test]
-    fn max_spread_suppresses_wide_paired_ladder_leg() {
-        let result = build_ladder(
-            &market(),
-            &snapshot_with_spreads(0.40, 0.56, 0.44, 0.45),
-            &PairedInventorySnapshot {
-                free_cash_usd: 1_000.0,
-                equity_usd: 1_000.0,
-                ..Default::default()
-            },
-            &FairValueEstimate {
-                p_up: 0.50,
-                p_down: 0.50,
-                log_moneyness: 0.0,
-                sigma_remaining: 0.0,
-                time_remaining_s: 100.0,
-                model: FairValueModel::BsmBinary,
-            },
-            &BtcRegimeSnapshot {
-                realized_vol_5m_bps: Some(2.0),
-                ..BtcRegimeSnapshot::default()
-            },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
-            &PairCostTracker::default(),
-            &LadderConfig {
-                max_spread: Some(0.08),
-                ..LadderConfig::default()
-            },
-            0,
-        );
-
-        assert!(result.diagnostics.suppressed_yes);
-        assert!(result.intents.is_empty());
-    }
-
-    #[test]
-    fn max_quote_per_side_usd_caps_paired_mm_ladder_notional() {
-        let result = build_ladder(
-            &market(),
-            &snapshot_with_asks(0.56, 0.46),
-            &PairedInventorySnapshot {
-                free_cash_usd: 1_000.0,
-                equity_usd: 1_000.0,
-                ..Default::default()
-            },
-            &FairValueEstimate {
-                p_up: 0.50,
-                p_down: 0.50,
-                log_moneyness: 0.0,
-                sigma_remaining: 0.0,
-                time_remaining_s: 100.0,
-                model: FairValueModel::BsmBinary,
-            },
-            &BtcRegimeSnapshot {
-                realized_vol_5m_bps: Some(2.0),
-                ..BtcRegimeSnapshot::default()
-            },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
-            &PairCostTracker::default(),
-            &LadderConfig {
-                max_depth: 8,
-                low_vol_depth: 8,
-                base_clip_usd: 2.0,
-                max_clip_usd: 5.0,
-                max_quote_per_side_usd: Some(6.0),
-                ..LadderConfig::default()
-            },
-            0,
-        );
-
-        assert!(!result.intents.is_empty());
-        let yes_notional: f64 = result
-            .intents
-            .iter()
-            .filter(|intent| intent.instrument_id.as_str() == "yes")
-            .map(OrderIntent::notional_usd)
-            .sum();
-        let no_notional: f64 = result
-            .intents
-            .iter()
-            .filter(|intent| intent.instrument_id.as_str() == "no")
-            .map(OrderIntent::notional_usd)
-            .sum();
-
-        assert!(yes_notional <= 6.0 + 1e-9);
-        assert!(no_notional <= 6.0 + 1e-9);
     }
 
     #[test]
@@ -1123,9 +579,6 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig::default(),
             0,
@@ -1157,9 +610,6 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -1202,9 +652,6 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 fair_value_anchoring: FairValueAnchoringConfig {
@@ -1249,9 +696,6 @@ mod tests {
                 realized_vol_5m_bps: Some(2.0),
                 ..BtcRegimeSnapshot::default()
             },
-            &MomentumSignal::default(),
-            &OrderBookPressureSignal::default(),
-            &SideScoreSignal::default(),
             &PairCostTracker::default(),
             &LadderConfig {
                 stoikov: StoikovParams {

@@ -116,21 +116,6 @@ impl DesiredQuoteSet {
         5
     }
 
-    fn paired_leg_rank(intent: &OrderIntent) -> u8 {
-        let tag = intent
-            .quote_level_tag
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if tag.contains(":yes:") {
-            0
-        } else if tag.contains(":no:") {
-            1
-        } else {
-            2
-        }
-    }
-
     pub fn from_intents(mut intents: Vec<OrderIntent>, config: &QuoteEngineConfig) -> Self {
         // Detect strategies that emit a pre-laddered intent set. Their level_tags
         // (e.g. "mm-paired-bid:l1", "mm-paired-bid:l2") already encode the level,
@@ -212,26 +197,6 @@ impl DesiredQuoteSet {
         }
 
         quotes.sort_by(|left, right| {
-            match (
-                left.intent.pair_id.as_deref(),
-                right.intent.pair_id.as_deref(),
-            ) {
-                (Some(left_pair), Some(right_pair)) => {
-                    let ordering = left_pair
-                        .cmp(right_pair)
-                        .then_with(|| {
-                            Self::paired_leg_rank(&left.intent)
-                                .cmp(&Self::paired_leg_rank(&right.intent))
-                        })
-                        .then_with(|| left.level.cmp(&right.level));
-                    if ordering != std::cmp::Ordering::Equal {
-                        return ordering;
-                    }
-                }
-                (Some(_), None) => return std::cmp::Ordering::Less,
-                (None, Some(_)) => return std::cmp::Ordering::Greater,
-                (None, None) => {}
-            }
             let left_key = (
                 &left.intent.market_id,
                 &left.intent.instrument_id,

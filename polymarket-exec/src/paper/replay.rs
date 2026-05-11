@@ -470,11 +470,6 @@ pub async fn replay_runtime_from_snapshots(
     )
     .map_err(anyhow::Error::msg)?;
     let replay_taker_fee_coeff = strategy.taker_fee_coeff();
-    let pair_profile = config
-        .strategy_profile
-        .as_ref()
-        .map(|profile| &profile.pair);
-    let runtime_defaults = crate::runtime::types::RuntimeConfig::default();
     let mut runtime = crate::runtime::Runtime::new(
         crate::runtime::types::RuntimeConfig {
             starting_cash_usd: config.starting_cash_usd,
@@ -483,20 +478,6 @@ pub async fn replay_runtime_from_snapshots(
             quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
             quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
             require_initial_reconcile_before_entry: false,
-            min_merge_notional_usd: config
-                .strategy_profile
-                .as_ref()
-                .and_then(|profile| profile.pair.min_merge_notional_usd)
-                .unwrap_or(runtime_defaults.min_merge_notional_usd),
-            merge_free_cash_pressure_ratio: pair_profile
-                .and_then(|pair| pair.merge_pressure_free_cash_ratio)
-                .unwrap_or(runtime_defaults.merge_free_cash_pressure_ratio),
-            merge_gross_exposure_pressure_ratio: pair_profile
-                .and_then(|pair| pair.merge_pressure_gross_exposure_ratio)
-                .unwrap_or(runtime_defaults.merge_gross_exposure_pressure_ratio),
-            merge_market_exposure_pressure_usd: pair_profile
-                .and_then(|pair| pair.merge_market_exposure_pressure_usd)
-                .unwrap_or(runtime_defaults.merge_market_exposure_pressure_usd),
         },
         config.risk_limits.clone(),
         strategy,
@@ -615,26 +596,8 @@ pub async fn replay_runtime_from_snapshots(
                     paper_order_ctx.remove(&client_order_id);
                     runtime.on_order_cancelled(&client_order_id, reason, record.t);
                 }
-                RuntimeCommand::Merge(intent) => {
-                    let fill = FillReport {
-                        order_id: None,
-                        client_order_id: Some(intent.command_id.clone()),
-                        market_id: intent.market_id.clone(),
-                        instrument_id: intent.yes_instrument_id.clone(),
-                        side: TradeSide::Buy,
-                        price: 1.0,
-                        quantity: intent.quantity,
-                        fee_usd: intent.expected_fee_usd + intent.expected_gas_usd,
-                        liquidity: FillLiquidity::Unknown,
-                        close_method: Some(crate::types::CloseMethod::Merge),
-                        observed_at_ms: record.t,
-                    };
-                    report.record_fill(&fill, None);
-                    runtime.on_fill(fill)?;
-                }
-                RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
-                    // Replay is venue-free; unresolved redeem commands need
-                    // winner-leg context before inventory can be closed.
+                RuntimeCommand::Merge(_) | RuntimeCommand::Redeem(_) | RuntimeCommand::Noop => {
+                    // Replay is venue-free; relayer actions remain no-ops.
                 }
             }
         }
