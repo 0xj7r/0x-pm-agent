@@ -69,9 +69,8 @@ pub(super) async fn refresh_runtime_market_universe(
     if next.market_assets.is_empty() {
         warn!(
             target: "market_discovery",
-            "market discovery returned no tradeable BTC 5m markets; keeping current universe until price_to_beat is available"
+            "market discovery returned no tradeable BTC 5m markets; standing down until price_to_beat is available"
         );
-        return Ok(None);
     }
 
     let mut guard = market_universe.write().await;

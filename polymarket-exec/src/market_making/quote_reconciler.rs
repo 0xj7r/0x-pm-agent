@@ -1,6 +1,6 @@
 //! Desired-vs-working quote diff logic that minimizes unnecessary cancel/replace churn.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::runtime::types::{ManagedOrder, ManagedOrderStatus};
 use crate::types::{ClientOrderId, EpochMillis, OrderIntent};
@@ -106,39 +106,6 @@ impl QuoteMatchKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CollapsedQuoteKey {
-    market_id: crate::types::MarketId,
-    instrument_id: crate::types::InstrumentId,
-    side: crate::types::TradeSide,
-    reduce_only: bool,
-    price_ticks: i64,
-    pair_id: Option<String>,
-    kind: crate::types::IntentKind,
-}
-
-impl CollapsedQuoteKey {
-    fn from_intent(intent: &OrderIntent) -> Self {
-        Self {
-            market_id: intent.market_id.clone(),
-            instrument_id: intent.instrument_id.clone(),
-            side: intent.side,
-            reduce_only: intent.reduce_only,
-            price_ticks: price_to_ticks(intent.limit_price),
-            pair_id: intent.pair_id.clone(),
-            kind: intent.kind,
-        }
-    }
-}
-
-fn price_to_ticks(price: f64) -> i64 {
-    (price * 1_000_000.0).round() as i64
-}
-
-fn ticks_to_price(ticks: i64) -> f64 {
-    ticks as f64 / 1_000_000.0
-}
-
 #[derive(Clone, Debug)]
 pub struct QuoteReconciler {
     config: ReconcilerConfig,
@@ -240,22 +207,6 @@ impl QuoteReconciler {
         self.cancel_events.push_back(now_ms);
     }
 
-    pub fn record_accepted_actions(
-        &mut self,
-        now_ms: EpochMillis,
-        submits: usize,
-        replaces: usize,
-        cancels: usize,
-    ) {
-        let churn = submits
-            .saturating_add(replaces.saturating_mul(2))
-            .saturating_add(cancels);
-        self.record_churn(now_ms, churn);
-        (0..submits).for_each(|_| self.record_submit(now_ms));
-        (0..replaces).for_each(|_| self.record_replace(now_ms));
-        (0..cancels).for_each(|_| self.record_cancel(now_ms));
-    }
-
     fn can_submit(&self, now_ms: EpochMillis, upcoming: usize) -> bool {
         Self::within_rate_cap(
             &self.submit_events,
@@ -338,14 +289,6 @@ impl QuoteReconciler {
             || (current.quantity - desired.quantity).abs() > quantity_threshold
     }
 
-    fn is_paired_entry(intent: &OrderIntent) -> bool {
-        intent.kind == crate::types::IntentKind::Entry
-            && intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
-    }
-
     pub fn plan(
         &mut self,
         desired: crate::quote_engine::DesiredQuoteSet,
@@ -375,94 +318,13 @@ impl QuoteReconciler {
             value.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
         }
 
-        let mut seen_desired_keys: HashSet<QuoteMatchKey> = HashSet::new();
-        let mut deduped_desired_quotes = Vec::with_capacity(desired.quotes.len());
-        let mut duplicate_desired_quotes = 0usize;
-        for desired_quote in desired.quotes {
-            let key = QuoteMatchKey::from_intent(&desired_quote.intent);
-            if seen_desired_keys.insert(key) {
-                deduped_desired_quotes.push(desired_quote);
-            } else {
-                duplicate_desired_quotes += 1;
-            }
-        }
-        if duplicate_desired_quotes > 0 {
-            plan.notes.push(format!(
-                "dropped {duplicate_desired_quotes} duplicate desired quote(s)"
-            ));
-        }
-
-        let mut collapsed_desired_quotes: Vec<crate::quote_engine::DesiredQuote> =
-            Vec::with_capacity(deduped_desired_quotes.len());
-        let mut collapsed_index: HashMap<CollapsedQuoteKey, usize> = HashMap::new();
-        let mut collapsed_desired_quote_count = 0usize;
-        for desired_quote in deduped_desired_quotes {
-            let key = CollapsedQuoteKey::from_intent(&desired_quote.intent);
-            if let Some(index) = collapsed_index.get(&key).copied() {
-                let existing = &mut collapsed_desired_quotes[index];
-                existing.intent.quantity += desired_quote.intent.quantity;
-                existing.intent.limit_price = ticks_to_price(key.price_ticks);
-                existing.intent.reason = format!(
-                    "{}; aggregated collapsed ladder level {}",
-                    existing.intent.reason,
-                    desired_quote
-                        .intent
-                        .quote_level_tag
-                        .as_deref()
-                        .unwrap_or("untagged")
-                );
-                let existing_tag = existing.intent.quote_level_tag.clone().unwrap_or_default();
-                if let Some(tag) = desired_quote.intent.quote_level_tag {
-                    existing.intent.quote_level_tag = if existing_tag.is_empty() {
-                        Some(tag)
-                    } else if existing_tag.split('+').any(|part| part == tag) {
-                        Some(existing_tag)
-                    } else {
-                        Some(format!("{existing_tag}+{tag}"))
-                    };
-                }
-                collapsed_desired_quote_count += 1;
-            } else {
-                let mut desired_quote = desired_quote;
-                desired_quote.intent.limit_price = ticks_to_price(key.price_ticks);
-                collapsed_index.insert(key, collapsed_desired_quotes.len());
-                collapsed_desired_quotes.push(desired_quote);
-            }
-        }
-        if collapsed_desired_quote_count > 0 {
-            plan.notes.push(format!(
-                "aggregated {collapsed_desired_quote_count} collapsed same-price ladder quote(s)"
-            ));
-        }
-        let desired_quotes = collapsed_desired_quotes;
-
-        let mut desired_pair_counts: HashMap<String, usize> = HashMap::new();
-        let mut missing_pair_submit_counts: HashMap<String, usize> = HashMap::new();
-        for desired_quote in &desired_quotes {
-            let Some(pair_id) = desired_quote.intent.pair_id.as_ref() else {
-                continue;
-            };
-            if desired_quote.intent.kind != crate::types::IntentKind::Entry {
-                continue;
-            }
-            *desired_pair_counts.entry(pair_id.clone()).or_default() += 1;
-            let key = QuoteMatchKey::from_intent(&desired_quote.intent);
-            if !by_key.contains_key(&key) {
-                *missing_pair_submit_counts
-                    .entry(pair_id.clone())
-                    .or_default() += 1;
-            }
-        }
-        let mut suppressed_pair_submits: HashSet<String> = HashSet::new();
-        let mut pair_submit_budget_checked: HashSet<String> = HashSet::new();
-
         let mut pending_replacements = 0usize;
         let mut planned_churn = 0usize;
         let mut planned_submits = 0usize;
         let mut planned_replaces = 0usize;
         let mut planned_cancels = 0usize;
 
-        for desired_quote in desired_quotes {
+        for desired_quote in desired.quotes {
             let desired_intent = desired_quote.intent;
             let key = QuoteMatchKey::from_intent(&desired_intent);
             // Hedge-rescue IOC orders are CLOSE operations that need to fill
@@ -474,37 +336,6 @@ impl QuoteReconciler {
             let is_rescue = desired_intent.kind == crate::types::IntentKind::Close;
             let mut matches = by_key.remove(&key).unwrap_or_default();
             if matches.is_empty() {
-                if !is_rescue {
-                    if let Some(pair_id) = desired_intent.pair_id.as_ref() {
-                        if suppressed_pair_submits.contains(pair_id) {
-                            continue;
-                        }
-                        let desired_pair_count =
-                            desired_pair_counts.get(pair_id).copied().unwrap_or(1);
-                        if desired_pair_count < 2 {
-                            suppressed_pair_submits.insert(pair_id.clone());
-                            plan.notes.push(format!(
-                                "paired submit suppressed: incomplete desired pair pair_id={pair_id}"
-                            ));
-                            continue;
-                        }
-                        if pair_submit_budget_checked.insert(pair_id.clone()) {
-                            let missing_pair_count = missing_pair_submit_counts
-                                .get(pair_id)
-                                .copied()
-                                .unwrap_or(1);
-                            if missing_pair_count > 1
-                                && !self.can_submit(now_ms, planned_submits + missing_pair_count)
-                            {
-                                suppressed_pair_submits.insert(pair_id.clone());
-                                plan.notes.push(format!(
-                                    "paired submit rate cap reached pair_id={pair_id} missing={missing_pair_count}"
-                                ));
-                                continue;
-                            }
-                        }
-                    }
-                }
                 if is_rescue || self.can_submit(now_ms, planned_submits + 1) {
                     plan.actions.push(QuoteAction::Submit(desired_intent));
                     planned_submits += 1;
@@ -519,15 +350,6 @@ impl QuoteReconciler {
             if !self.materially_different_quote(&existing_order.intent, &desired_intent) {
                 plan.actions
                     .push(QuoteAction::Keep(existing_order.intent.clone()));
-            } else if Self::is_paired_entry(&existing_order.intent)
-                || Self::is_paired_entry(&desired_intent)
-            {
-                plan.actions
-                    .push(QuoteAction::Keep(existing_order.intent.clone()));
-                plan.notes.push(
-                    "paired entry replace suppressed: keeping existing maker leg until fill/cancel"
-                        .to_string(),
-                );
             } else if self.can_change(existing_order, now_ms) {
                 if self.can_replace(now_ms, planned_replaces + 1) {
                     plan.actions.push(QuoteAction::Replace {
@@ -596,11 +418,14 @@ impl QuoteReconciler {
         if let ChurnGate::Throttle = self.evaluate_churn(now_ms, planned_churn) {
             self.hard_pull_until_ms = Some(now_ms.saturating_add(self.config.hard_pull_ms));
             plan.actions = self.build_keep_all(open_orders);
-            plan.notes
-                .push("quote churn throttle triggered".to_string());
+            plan.notes.push("quote churn throttle triggered".to_string());
             return plan;
         }
 
+        self.record_churn(now_ms, planned_churn);
+        (0..planned_submits).for_each(|_| self.record_submit(now_ms));
+        (0..planned_replaces).for_each(|_| self.record_replace(now_ms));
+        (0..planned_cancels).for_each(|_| self.record_cancel(now_ms));
         if pending_replacements > 0 {
             plan.notes.push(format!(
                 "reconciler prepared {} replace(s)",
@@ -819,155 +644,6 @@ mod tests {
         let plan = reconciler.plan(desired, &HashMap::new(), 2);
         assert!(plan.actions.is_empty());
         assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("submit rate cap reached")));
-    }
-
-    #[test]
-    fn quote_reconciler_dedupes_duplicate_desired_quote_slots() {
-        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
-            min_order_age_ms: 0,
-            max_churn_per_window: 16,
-            churn_window_ms: 10_000,
-            hard_pull_ms: 5_000,
-            max_submit_per_window: 6,
-            max_replace_per_window: 4,
-            max_cancel_per_window: 12,
-            ..ReconcilerConfig::default()
-        });
-        let mut duplicate = intent("duplicate", 0.22);
-        duplicate.quote_level_tag = Some("lvl-1".to_string());
-        let desired = crate::quote_engine::DesiredQuoteSet {
-            quotes: vec![
-                crate::quote_engine::DesiredQuote {
-                    intent: intent("new", 0.22),
-                    level: 0,
-                    is_cleanup: false,
-                    suppress_if_stale: false,
-                    expires_at_ms: None,
-                },
-                crate::quote_engine::DesiredQuote {
-                    intent: duplicate,
-                    level: 0,
-                    is_cleanup: false,
-                    suppress_if_stale: false,
-                    expires_at_ms: None,
-                },
-            ],
-            stale_quote_max_age_ms: None,
-            quote_expiry_ms: None,
-        };
-
-        let plan = reconciler.plan(desired, &HashMap::new(), 2);
-
-        assert_eq!(plan.actions.len(), 1);
-        assert!(matches!(plan.actions[0], QuoteAction::Submit(_)));
-        assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("dropped 1 duplicate desired quote")));
-    }
-
-    #[test]
-    fn quote_reconciler_aggregates_ladder_children_collapsed_to_same_price() {
-        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
-            min_order_age_ms: 0,
-            max_churn_per_window: 16,
-            churn_window_ms: 10_000,
-            hard_pull_ms: 5_000,
-            max_submit_per_window: 6,
-            max_replace_per_window: 4,
-            max_cancel_per_window: 12,
-            ..ReconcilerConfig::default()
-        });
-        let mut l1 = intent("l1", 0.43);
-        l1.quantity = 18.18;
-        l1.quote_level_tag = Some("l1".to_string());
-        let mut l2 = intent("l2", 0.43);
-        l2.quantity = 18.60;
-        l2.quote_level_tag = Some("l2".to_string());
-        let mut l3 = intent("l3", 0.43);
-        l3.quantity = 18.60;
-        l3.quote_level_tag = Some("l3".to_string());
-        let desired = crate::quote_engine::DesiredQuoteSet {
-            quotes: vec![
-                crate::quote_engine::DesiredQuote {
-                    intent: l1,
-                    level: 0,
-                    is_cleanup: false,
-                    suppress_if_stale: false,
-                    expires_at_ms: None,
-                },
-                crate::quote_engine::DesiredQuote {
-                    intent: l2,
-                    level: 1,
-                    is_cleanup: false,
-                    suppress_if_stale: false,
-                    expires_at_ms: None,
-                },
-                crate::quote_engine::DesiredQuote {
-                    intent: l3,
-                    level: 2,
-                    is_cleanup: false,
-                    suppress_if_stale: false,
-                    expires_at_ms: None,
-                },
-            ],
-            stale_quote_max_age_ms: None,
-            quote_expiry_ms: None,
-        };
-
-        let plan = reconciler.plan(desired, &HashMap::new(), 2);
-
-        assert_eq!(plan.actions.len(), 1);
-        let QuoteAction::Submit(intent) = &plan.actions[0] else {
-            panic!("expected one aggregated submit");
-        };
-        assert_eq!(intent.limit_price, 0.43);
-        assert!((intent.quantity - 55.38).abs() < 1e-9);
-        assert_eq!(intent.quote_level_tag.as_deref(), Some("l1+l2+l3"));
-        assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("aggregated 2 collapsed same-price ladder quote")));
-    }
-
-    #[test]
-    fn quote_reconciler_does_not_burn_submit_cap_until_action_accepted() {
-        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
-            min_order_age_ms: 0,
-            max_churn_per_window: 16,
-            churn_window_ms: 10_000,
-            hard_pull_ms: 5_000,
-            max_submit_per_window: 1,
-            max_replace_per_window: 4,
-            max_cancel_per_window: 12,
-            ..ReconcilerConfig::default()
-        });
-        let desired = crate::quote_engine::DesiredQuoteSet {
-            quotes: vec![crate::quote_engine::DesiredQuote {
-                intent: intent("new", 0.22),
-                level: 0,
-                is_cleanup: false,
-                suppress_if_stale: false,
-                expires_at_ms: None,
-            }],
-            stale_quote_max_age_ms: None,
-            quote_expiry_ms: None,
-        };
-
-        let first = reconciler.plan(desired.clone(), &HashMap::new(), 2);
-        let second = reconciler.plan(desired.clone(), &HashMap::new(), 3);
-
-        assert_eq!(first.actions.len(), 1);
-        assert_eq!(second.actions.len(), 1);
-
-        reconciler.record_accepted_actions(4, 1, 0, 0);
-        let third = reconciler.plan(desired, &HashMap::new(), 5);
-
-        assert!(third.actions.is_empty());
-        assert!(third
             .notes
             .iter()
             .any(|note| note.contains("submit rate cap reached")));

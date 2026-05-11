@@ -11,7 +11,7 @@ use crate::market_context::MarketContextStore;
 use crate::metrics::StreamKind;
 use crate::risk::RiskLimits;
 use crate::runtime::order_store::{OrderRecord, OrderStore, SqliteOrderStore};
-use crate::strategy::{NoopStrategy, StrategyProfile};
+use crate::strategy::NoopStrategy;
 use crate::wire::execution_adapter::{
     CancelOrderAck, ExecutionError, MergePositionsAck, MergePositionsRequest, SubmitOrderAck,
     VenueBalances, VenueFill, VenuePosition,
@@ -66,7 +66,6 @@ fn runner_test_config() -> AppConfig {
         market_context_path: None,
         journal_path: None,
         journal_rotate_bytes: None,
-        journal_firehose_stream: None,
         starting_cash_usd: 100.0,
         event_log_capacity: 128,
         market_id_by_asset: HashMap::new(),
@@ -413,67 +412,6 @@ async fn live_execution_ignores_stale_submit_after_order_left_memory() {
 }
 
 #[tokio::test]
-async fn live_execution_does_not_replay_pending_submit_already_in_current_queue() {
-    let client_order_id = ClientOrderId::from("client-fresh-pending");
-    let mut runtime = runtime_with_recovered_order(
-        client_order_id.clone(),
-        ManagedOrderStatus::PendingSubmit,
-        now_unix_ms(),
-        "polymarket-exec-live-pending-replay",
-    );
-    let intent = OrderIntent {
-        client_order_id: client_order_id.clone(),
-        market_id: MarketId::from("market-1"),
-        instrument_id: InstrumentId::from("token-1"),
-        side: TradeSide::Buy,
-        limit_price: 0.40,
-        quantity: 5.0,
-        reduce_only: false,
-        reason: "fresh pending submit".to_string(),
-        quote_level_tag: None,
-        created_at_ms: now_unix_ms(),
-        pair_id: None,
-        kind: crate::types::IntentKind::Entry,
-    };
-    let mut initial_outcome = RuntimeOutcome::default();
-    initial_outcome.push_command(RuntimeCommand::Submit(intent));
-
-    let adapter = Arc::new(RecordingAdapter::default());
-    let metrics = AppMetrics::new().expect("metrics");
-    let assets: Vec<String> = Vec::new();
-    let books = Arc::new(BookStore::new(&assets));
-    let mut paper_order_ctx = HashMap::new();
-    let mut execution_venue_map = HashMap::new();
-    let mut live_safety = LiveSafetyState::default();
-    let execution_policy = live_test_policy();
-    let mut seen_venue_fill_keys = HashSet::new();
-
-    let _outcome = execute_execution_adapter(
-        &mut runtime,
-        &books,
-        &assets,
-        0.0,
-        &metrics,
-        initial_outcome,
-        &mut paper_order_ctx,
-        &mut execution_venue_map,
-        &mut live_safety,
-        adapter.clone(),
-        &execution_policy,
-        &mut seen_venue_fill_keys,
-        None,
-        None,
-    )
-    .await
-    .expect("execute");
-
-    assert_eq!(
-        adapter.submitted.lock().expect("submitted lock").as_slice(),
-        &[client_order_id]
-    );
-}
-
-#[tokio::test]
 async fn live_sync_defers_recent_missing_working_order() {
     let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
     let adapter = Arc::new(RecordingAdapter::default());
@@ -659,7 +597,7 @@ async fn live_sync_reconciles_non_empty_venue_position_snapshot() {
 }
 
 #[tokio::test]
-async fn live_sync_blocks_failed_merge_without_global_riskoff() {
+async fn live_sync_executes_merge_plan_and_fails_closed_when_adapter_cannot_merge() {
     let mut runtime = Runtime::new(
         RuntimeConfig {
             starting_cash_usd: 100.0,
@@ -741,8 +679,8 @@ async fn live_sync_blocks_failed_merge_without_global_riskoff() {
         .commands
         .iter()
         .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-    assert_eq!(runtime.status(), RuntimeStatus::Running);
-    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
     assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
     let merges = adapter.merged.lock().expect("merged lock");
     assert_eq!(merges.len(), 1);
@@ -775,7 +713,7 @@ async fn live_sync_blocks_failed_merge_without_global_riskoff() {
         .commands
         .iter()
         .any(|command| matches!(command, RuntimeCommand::Merge(_))));
-    assert_eq!(runtime.status(), RuntimeStatus::Running);
+    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
     let merges = adapter.merged.lock().expect("merged lock");
     assert_eq!(
         merges.len(),
@@ -1071,238 +1009,6 @@ async fn matched_cancel_reject_reconciles_without_risk_off() {
             .position_qty(&InstrumentId::from("token-1")),
         5.0
     );
-}
-
-#[tokio::test]
-async fn matched_cancel_reject_does_not_replay_cancel_next_cycle() {
-    let mut runtime = runtime_with_recovered_working_order(now_unix_ms());
-    let client_order_id = ClientOrderId::from("client-working");
-    let cancel_outcome =
-        runtime.request_cancel_order(&client_order_id, now_unix_ms(), "test cancel race");
-
-    let adapter = Arc::new(RecordingAdapter {
-        cancel_reject_message: Some("matched orders can't be canceled".to_string()),
-        ..RecordingAdapter::default()
-    });
-    let metrics = AppMetrics::new().expect("metrics");
-    let assets = vec!["token-1".to_string()];
-    let books = Arc::new(BookStore::new(&assets));
-    let mut paper_order_ctx = HashMap::new();
-    let mut execution_venue_map =
-        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
-    let mut live_safety = LiveSafetyState::default();
-    let execution_policy = live_test_policy();
-    let mut seen_venue_fill_keys = HashSet::new();
-
-    let _outcome = execute_execution_adapter(
-        &mut runtime,
-        &books,
-        &assets,
-        0.0,
-        &metrics,
-        cancel_outcome,
-        &mut paper_order_ctx,
-        &mut execution_venue_map,
-        &mut live_safety,
-        adapter.clone(),
-        &execution_policy,
-        &mut seen_venue_fill_keys,
-        None,
-        None,
-    )
-    .await
-    .expect("first execute");
-
-    assert_eq!(
-        adapter.cancelled.lock().expect("cancelled lock").as_slice(),
-        &[client_order_id.clone()]
-    );
-    let status_after_reject = runtime
-        .open_order_snapshots()
-        .into_iter()
-        .find(|managed| managed.intent.client_order_id == client_order_id)
-        .map(|managed| managed.status);
-    assert_eq!(
-        status_after_reject,
-        Some(ManagedOrderStatus::NeedsReconcile)
-    );
-    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
-
-    let _outcome = execute_execution_adapter(
-        &mut runtime,
-        &books,
-        &assets,
-        0.0,
-        &metrics,
-        RuntimeOutcome::default(),
-        &mut paper_order_ctx,
-        &mut execution_venue_map,
-        &mut live_safety,
-        adapter.clone(),
-        &execution_policy,
-        &mut seen_venue_fill_keys,
-        None,
-        None,
-    )
-    .await
-    .expect("second execute");
-
-    assert_eq!(
-        adapter.cancelled.lock().expect("cancelled lock").as_slice(),
-        &[client_order_id]
-    );
-    assert_eq!(live_safety.consecutive_cancel_errors, 0);
-    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
-}
-
-#[tokio::test]
-async fn missing_live_order_with_durable_fill_does_not_trigger_risk_off() {
-    static SQLITE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let suffix = SQLITE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "polymarket-exec-live-missing-filled-{ts}-{suffix}.sqlite"
-    ));
-    let client_order_id = ClientOrderId::from("client-missing-filled");
-    let mut store = SqliteOrderStore::open(&path).expect("store");
-    let mut record = OrderRecord::from_intent(
-        "run-test",
-        &OrderIntent {
-            client_order_id: client_order_id.clone(),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            limit_price: 0.40,
-            quantity: 5.0,
-            reduce_only: false,
-            reason: "test recovered live order".to_string(),
-            quote_level_tag: None,
-            created_at_ms: 1,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        },
-        "noop",
-    );
-    record.status = ManagedOrderStatus::Working;
-    record.last_update_ms = 1;
-    store.insert(record).expect("insert order");
-
-    let mut runtime = Runtime::new_with_order_store(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Starting,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        StrategyMode::Noop(NoopStrategy),
-        MarketContextStore::empty(),
-        Some(Box::new(store)),
-        "run-test".to_string(),
-    );
-    runtime.recover_from_store(10_000, 100);
-    assert_eq!(runtime.open_order_snapshots().len(), 1);
-
-    let mut external_store = SqliteOrderStore::open(&path).expect("external store");
-    external_store
-        .update_status(&client_order_id, ManagedOrderStatus::Filled, 10_001)
-        .expect("durable fill");
-    drop(external_store);
-
-    let adapter = Arc::new(RecordingAdapter::default());
-    let metrics = AppMetrics::new().expect("metrics");
-    let assets = vec!["token-1".to_string()];
-    let books = Arc::new(BookStore::new(&assets));
-    let mut paper_order_ctx = HashMap::new();
-    let mut execution_venue_map =
-        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
-    let mut live_safety = LiveSafetyState::default();
-    let execution_policy = live_test_policy();
-    let mut seen_venue_fill_keys = HashSet::new();
-
-    let _outcome = execute_execution_adapter(
-        &mut runtime,
-        &books,
-        &assets,
-        0.0,
-        &metrics,
-        RuntimeOutcome::default(),
-        &mut paper_order_ctx,
-        &mut execution_venue_map,
-        &mut live_safety,
-        adapter,
-        &execution_policy,
-        &mut seen_venue_fill_keys,
-        None,
-        None,
-    )
-    .await
-    .expect("execute");
-
-    assert!(runtime.open_order_snapshots().is_empty());
-    assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
-    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
-    let _ = std::fs::remove_file(path);
-}
-
-#[tokio::test]
-async fn missing_live_order_with_authoritative_empty_balance_clears_as_cancelled() {
-    let client_order_id = ClientOrderId::from("client-missing-empty-balance");
-    let mut runtime = runtime_with_recovered_order(
-        client_order_id.clone(),
-        ManagedOrderStatus::Working,
-        1,
-        "polymarket-exec-live-missing-empty-balance",
-    );
-    assert_eq!(runtime.open_order_snapshots().len(), 1);
-
-    let adapter = Arc::new(RecordingAdapter {
-        balances: Some(VenueBalances {
-            cash_usd: 100.0,
-            positions: Vec::new(),
-            positions_authoritative: true,
-            observed_at_ms: 10_000,
-        }),
-        ..RecordingAdapter::default()
-    });
-    let metrics = AppMetrics::new().expect("metrics");
-    let assets = vec!["token-1".to_string()];
-    let books = Arc::new(BookStore::new(&assets));
-    let mut paper_order_ctx = HashMap::new();
-    let mut execution_venue_map =
-        HashMap::from([(client_order_id.clone(), Some(OrderId::from("venue-1")))]);
-    let mut live_safety = LiveSafetyState::default();
-    let execution_policy = live_test_policy();
-    let mut seen_venue_fill_keys = HashSet::new();
-
-    let _outcome = execute_execution_adapter(
-        &mut runtime,
-        &books,
-        &assets,
-        0.0,
-        &metrics,
-        RuntimeOutcome::default(),
-        &mut paper_order_ctx,
-        &mut execution_venue_map,
-        &mut live_safety,
-        adapter,
-        &execution_policy,
-        &mut seen_venue_fill_keys,
-        None,
-        None,
-    )
-    .await
-    .expect("execute");
-
-    assert!(runtime.open_order_snapshots().is_empty());
-    assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
-    assert_ne!(runtime.status(), RuntimeStatus::Degraded);
-    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
 }
 
 #[tokio::test]
@@ -1621,51 +1327,6 @@ fn live_degraded_auto_recover_promotes_running_after_healthy_window() {
 
     let recovered =
         auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
-    assert_eq!(runtime.status(), RuntimeStatus::Running);
-    assert!(!recovered.event_seqs.is_empty());
-    assert!(runtime
-        .event_log()
-        .recent(4)
-        .iter()
-        .any(|event| event.message.contains("runtime degraded auto-recovered")));
-}
-
-#[test]
-fn live_degraded_auto_recover_allows_connected_idle_user_ws() {
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Degraded,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        StrategyMode::Noop(NoopStrategy),
-        MarketContextStore::empty(),
-    );
-    let metrics = AppMetrics::new().expect("metrics");
-    metrics.set_stream_connected(StreamKind::Market, true);
-    metrics.set_stream_connected(StreamKind::User, true);
-    metrics.set_execution_adapter_connected(true);
-    metrics.observe_user_message("order", "matched");
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    metrics.refresh_stream_ages();
-    let mut config = runner_test_config();
-    config.strategy_profile = Some(StrategyProfile {
-        health: crate::strategy::ProfileHealth {
-            user_ws_stale_ms: Some(0),
-            ..Default::default()
-        },
-        ..StrategyProfile::default()
-    });
-    let live_safety = LiveSafetyState {
-        last_venue_cash_usd: Some(100.0),
-        ..LiveSafetyState::default()
-    };
-
-    let recovered =
-        auto_recover_live_riskoff(&mut runtime, &metrics, &config, &live_safety, 31_000, 0);
-
     assert_eq!(runtime.status(), RuntimeStatus::Running);
     assert!(!recovered.event_seqs.is_empty());
     assert!(runtime

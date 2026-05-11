@@ -7,23 +7,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::core::risk::RiskLimits;
 use crate::market_making::paired_mm::{
-    CapitalRecycleConfig, ConvexityOverlayConfig, HardPolicyConfig, LadderConfig,
-    MergePolicyConfig, RescueConfig, RunningInventoryCaps,
+    CapitalRecycleConfig, HardPolicyConfig, LadderConfig, MergePolicyConfig, RescueConfig,
+    RunningInventoryCaps,
 };
 use crate::quote_engine::QuoteEngineConfig;
-use crate::signals::{BookSanityConfig, ReversalConfig, SideScoreConfig};
-use crate::strategies::bonereaper_mm::{
-    BonereaperMmConfig, BonereaperMmStrategyConfig, LateCertConfig,
-};
-use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
-use crate::strategies::late_favorite_directional::{
-    ConvexTailConfig, FavoriteClimbConfig, LateFavoriteStrategyConfig,
-};
 use crate::strategies::pair_cost_arb::PairCostArbStrategyConfig;
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
-use crate::strategies::unlawful_mm::{UnlawfulMmConfig, UnlawfulMmStrategyConfig};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -42,70 +32,13 @@ pub struct StrategyProfile {
     pub pair_cost: PairCostSection,
     pub clip_sizing: ClipSizingSection,
     pub convexity: ConvexitySection,
-    pub convexity_overlay: ConvexityOverlaySection,
     pub fair_value: PairedMmFairValueSection,
     pub signals: SignalsSection,
     pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
     pub operational: OperationalSection,
-    pub core_hedge: CoreHedgeSection,
-    pub late_favorite: LateFavoriteSection,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LateFavoriteSection {
-    pub favorite_climb: FavoriteClimbSubsection,
-    pub convex_tail: ConvexTailSubsection,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FavoriteClimbSubsection {
-    pub enabled: Option<bool>,
-    pub min_favorite_ask: Option<f64>,
-    pub max_favorite_ask: Option<f64>,
-    pub window_sec: Option<u64>,
-    pub start_frac: Option<f64>,
-    pub clip_usd: Option<f64>,
-    pub max_load_usd: Option<f64>,
-    pub maker_improve_ticks: Option<f64>,
-    pub min_order_usd: Option<f64>,
-    pub spot_filter_bps: Option<f64>,
-    pub require_spot_match: Option<bool>,
-    pub disable_after_ms: Option<u64>,
-    pub clip_scale: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ConvexTailSubsection {
-    pub enabled: Option<bool>,
-    pub max_cheap_ask: Option<f64>,
-    pub window_sec: Option<u64>,
-    pub start_frac: Option<f64>,
-    pub clip_usd: Option<f64>,
-    pub max_load_usd: Option<f64>,
-    pub maker_improve_ticks: Option<f64>,
-    pub min_order_usd: Option<f64>,
-    pub disable_after_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CoreHedgeSection {
-    pub enabled: Option<bool>,
-    pub ladder_levels: Option<usize>,
-    pub ladder_span: Option<f64>,
-    pub center_price: Option<f64>,
-    pub clip_shares: Option<f64>,
-    pub maker_improve_ticks: Option<f64>,
-    pub merge_min_qty: Option<f64>,
-    pub merge_batch_cap: Option<f64>,
-    pub merge_disabled_after_ms: Option<u64>,
-    pub clip_scale: Option<f64>,
 }
 
 impl StrategyProfile {
@@ -122,9 +55,8 @@ impl StrategyProfile {
     }
 
     fn load_value(path: &Path) -> Result<serde_json::Value> {
-        let resolved_path = resolve_profile_path(path);
-        let raw = fs::read_to_string(&resolved_path)?;
-        match resolved_path
+        let raw = fs::read_to_string(path)?;
+        match path
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase())
@@ -177,12 +109,6 @@ impl StrategyProfile {
             .cheap_leg
             .price_deviation_bps
             .unwrap_or(config.price_deviation_bps);
-        config.max_fresh_entry_price = self
-            .signals
-            .cheap_leg
-            .max_entry_price
-            .unwrap_or(config.max_fresh_entry_price)
-            .clamp(0.0, 0.99);
         config.min_edge_bps = self.pair_cost.min_edge_bps.unwrap_or(config.min_edge_bps);
         config.base_clip_usd = self
             .clip_sizing
@@ -263,127 +189,6 @@ impl StrategyProfile {
         config
     }
 
-    /// Build the new whale-replica unlawful_mm config from the existing
-    /// `core_hedge:` section. Unlawful-specific knobs (pair-cost stop,
-    /// strand cleanup, regime scales) fall back to module defaults.
-    pub fn unlawful_mm_config(&self) -> UnlawfulMmStrategyConfig {
-        let defaults = UnlawfulMmConfig::default();
-        let s = &self.core_hedge;
-        UnlawfulMmStrategyConfig {
-            unlawful: UnlawfulMmConfig {
-                enabled: s.enabled.unwrap_or(true),
-                ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
-                ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
-                center_price: s.center_price.unwrap_or(defaults.center_price),
-                clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
-                merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
-                merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
-                pair_cost_stop_usd: defaults.pair_cost_stop_usd,
-                strand_cleanup_ms: defaults.strand_cleanup_ms,
-                regime_scale_trending: defaults.regime_scale_trending,
-                regime_scale_high_vol: defaults.regime_scale_high_vol,
-                regime_scale_calm: defaults.regime_scale_calm,
-                clip_scale: s.clip_scale.unwrap_or(defaults.clip_scale),
-            },
-        }
-    }
-
-    /// Build the new whale-replica bonereaper_mm config from `core_hedge:`
-    /// (paired-MM core) + `late_favorite.favorite_climb:` (late-cert overlay).
-    pub fn bonereaper_mm_config(&self) -> BonereaperMmStrategyConfig {
-        let core_def = BonereaperMmConfig::default();
-        let late_def = LateCertConfig::default();
-        let s = &self.core_hedge;
-        let lf = &self.late_favorite.favorite_climb;
-        BonereaperMmStrategyConfig {
-            bonereaper: BonereaperMmConfig {
-                enabled: s.enabled.unwrap_or(true),
-                ladder_levels: s.ladder_levels.unwrap_or(core_def.ladder_levels),
-                ladder_span: s.ladder_span.unwrap_or(core_def.ladder_span),
-                center_price: s.center_price.unwrap_or(core_def.center_price),
-                merge_min_qty: s.merge_min_qty.unwrap_or(core_def.merge_min_qty),
-                merge_batch_cap: s.merge_batch_cap.unwrap_or(core_def.merge_batch_cap),
-                pair_cost_stop_usd: core_def.pair_cost_stop_usd,
-                strand_cleanup_ms: core_def.strand_cleanup_ms,
-                merge_post_bar_delay_ms: core_def.merge_post_bar_delay_ms,
-                regime_scale_trending: core_def.regime_scale_trending,
-                regime_scale_high_vol: core_def.regime_scale_high_vol,
-                regime_scale_calm: core_def.regime_scale_calm,
-                clip_scale: s.clip_scale.unwrap_or(core_def.clip_scale),
-            },
-            late_cert: LateCertConfig {
-                enabled: lf.enabled.unwrap_or(late_def.enabled),
-                window_sec: lf.window_sec.map(|w| w as f64).unwrap_or(late_def.window_sec),
-                favourite_ask_threshold: lf
-                    .min_favorite_ask
-                    .unwrap_or(late_def.favourite_ask_threshold),
-                max_load_usd: lf.max_load_usd.unwrap_or(late_def.max_load_usd),
-                spot_filter_bps: lf.spot_filter_bps.unwrap_or(late_def.spot_filter_bps),
-                clip_scale: lf.clip_scale.unwrap_or(late_def.clip_scale),
-            },
-        }
-    }
-
-    pub fn core_hedge_mm_config(&self) -> CoreHedgeMmStrategyConfig {
-        let defaults = CoreHedgeMmConfig::default();
-        let s = &self.core_hedge;
-        CoreHedgeMmStrategyConfig {
-            core_hedge: CoreHedgeMmConfig {
-                enabled: s.enabled.unwrap_or(defaults.enabled),
-                ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
-                ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
-                center_price: s.center_price.unwrap_or(defaults.center_price),
-                clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
-                maker_improve_ticks: s
-                    .maker_improve_ticks
-                    .unwrap_or(defaults.maker_improve_ticks),
-                merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
-                merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
-                merge_disabled_after_ms: s.merge_disabled_after_ms,
-            },
-        }
-    }
-
-    pub fn late_favorite_config(&self) -> LateFavoriteStrategyConfig {
-        let climb_def = FavoriteClimbConfig::default();
-        let tail_def = ConvexTailConfig::default();
-        let c = &self.late_favorite.favorite_climb;
-        let t = &self.late_favorite.convex_tail;
-        LateFavoriteStrategyConfig {
-            favorite_climb: FavoriteClimbConfig {
-                enabled: c.enabled.unwrap_or(climb_def.enabled),
-                min_favorite_ask: c.min_favorite_ask.unwrap_or(climb_def.min_favorite_ask),
-                max_favorite_ask: c.max_favorite_ask.unwrap_or(climb_def.max_favorite_ask),
-                window_sec: c.window_sec.unwrap_or(climb_def.window_sec),
-                start_frac: c.start_frac.unwrap_or(climb_def.start_frac),
-                clip_usd: c.clip_usd.unwrap_or(climb_def.clip_usd),
-                max_load_usd: c.max_load_usd.unwrap_or(climb_def.max_load_usd),
-                maker_improve_ticks: c
-                    .maker_improve_ticks
-                    .unwrap_or(climb_def.maker_improve_ticks),
-                min_order_usd: c.min_order_usd.unwrap_or(climb_def.min_order_usd),
-                spot_filter_bps: c.spot_filter_bps.unwrap_or(climb_def.spot_filter_bps),
-                require_spot_match: c
-                    .require_spot_match
-                    .unwrap_or(climb_def.require_spot_match),
-                disable_after_ms: c.disable_after_ms,
-            },
-            convex_tail: ConvexTailConfig {
-                enabled: t.enabled.unwrap_or(tail_def.enabled),
-                max_cheap_ask: t.max_cheap_ask.unwrap_or(tail_def.max_cheap_ask),
-                window_sec: t.window_sec.unwrap_or(tail_def.window_sec),
-                start_frac: t.start_frac.unwrap_or(tail_def.start_frac),
-                clip_usd: t.clip_usd.unwrap_or(tail_def.clip_usd),
-                max_load_usd: t.max_load_usd.unwrap_or(tail_def.max_load_usd),
-                maker_improve_ticks: t
-                    .maker_improve_ticks
-                    .unwrap_or(tail_def.maker_improve_ticks),
-                min_order_usd: t.min_order_usd.unwrap_or(tail_def.min_order_usd),
-                disable_after_ms: t.disable_after_ms,
-            },
-        }
-    }
-
     pub fn paired_mm_config(&self) -> PairedMmStrategyConfig {
         let mut config = PairedMmStrategyConfig::default();
         config.ladder = self.ladder_config();
@@ -420,14 +225,6 @@ impl StrategyProfile {
                 .pair_cost
                 .threshold
                 .unwrap_or(config.capital_recycle.pair_cost_target),
-            routine_pair_cost_target: self
-                .operational
-                .recycle_routine_pair_cost_target
-                .unwrap_or(config.capital_recycle.routine_pair_cost_target),
-            cash_pressure_free_cash_ratio: self
-                .pair
-                .merge_pressure_free_cash_ratio
-                .unwrap_or(config.capital_recycle.cash_pressure_free_cash_ratio),
             min_imbalance_qty: self
                 .operational
                 .recycle_min_imbalance_qty
@@ -452,10 +249,6 @@ impl StrategyProfile {
                 .rescue
                 .hedge_rescue_race_buffer_ticks
                 .unwrap_or(config.capital_recycle.race_buffer_ticks),
-            cooldown_ms: self
-                .operational
-                .cooldown_ms
-                .unwrap_or(config.capital_recycle.cooldown_ms),
         };
         config.hard_policy = HardPolicyConfig {
             max_gross_cost_usd: self
@@ -475,184 +268,6 @@ impl StrategyProfile {
             max_realized_vol_5m_bps: config.hard_policy.max_realized_vol_5m_bps,
             max_abs_return_60s_bps: config.hard_policy.max_abs_return_60s_bps,
         };
-        config.convexity_overlay = ConvexityOverlayConfig {
-            enabled: self
-                .convexity_overlay
-                .enabled
-                .unwrap_or(config.convexity_overlay.enabled),
-            suppress_ladder_when_package_fires: self
-                .convexity_overlay
-                .suppress_ladder_when_package_fires
-                .unwrap_or(config.convexity_overlay.suppress_ladder_when_package_fires),
-            start_frac: self
-                .convexity_overlay
-                .start_frac
-                .unwrap_or(config.convexity_overlay.start_frac),
-            capital_pct: self
-                .convexity_overlay
-                .capital_pct
-                .unwrap_or(config.convexity_overlay.capital_pct),
-            fractional_kelly: self
-                .convexity_overlay
-                .fractional_kelly
-                .unwrap_or(config.convexity_overlay.fractional_kelly),
-            max_loss_usd: self
-                .convexity_overlay
-                .max_loss_usd
-                .or(self.convexity_overlay.max_excess_usd)
-                .or(self.convexity.max_excess_usd)
-                .unwrap_or(config.convexity_overlay.max_loss_usd),
-            max_book_take_pct: self
-                .convexity_overlay
-                .max_book_take_pct
-                .unwrap_or(config.convexity_overlay.max_book_take_pct),
-            min_order_usd: self
-                .convexity_overlay
-                .min_order_usd
-                .unwrap_or(config.convexity_overlay.min_order_usd),
-            max_active_orders_per_leg: self
-                .convexity_overlay
-                .max_active_orders_per_leg
-                .unwrap_or(config.convexity_overlay.max_active_orders_per_leg),
-            late_window_sec: self
-                .convexity_overlay
-                .late_window_sec
-                .or(self.convexity.late_window_sec)
-                .unwrap_or(config.convexity_overlay.late_window_sec),
-            convex_p_threshold: self
-                .convexity_overlay
-                .convex_p_threshold
-                .or(self.convexity.convex_p_threshold)
-                .unwrap_or(config.convexity_overlay.convex_p_threshold),
-            maker_safety_ticks: self
-                .convexity_overlay
-                .maker_safety_ticks
-                .or(self.quote.maker_safety_ticks)
-                .unwrap_or(config.convexity_overlay.maker_safety_ticks),
-            min_favorite_edge_bps: self
-                .convexity_overlay
-                .min_favorite_edge_bps
-                .unwrap_or(config.convexity_overlay.min_favorite_edge_bps),
-            tail_enabled: self
-                .convexity_overlay
-                .tail_enabled
-                .unwrap_or(config.convexity_overlay.tail_enabled),
-            max_favorite_win_loss_usd: self
-                .convexity_overlay
-                .max_favorite_win_loss_usd
-                .unwrap_or(config.convexity_overlay.max_favorite_win_loss_usd),
-            min_tail_win_profit_usd: self
-                .convexity_overlay
-                .min_tail_win_profit_usd
-                .unwrap_or(config.convexity_overlay.min_tail_win_profit_usd),
-            min_tail_payoff_multiple: self
-                .convexity_overlay
-                .min_tail_payoff_multiple
-                .unwrap_or(config.convexity_overlay.min_tail_payoff_multiple),
-        };
-        config.reversal = ReversalConfig {
-            enabled: self
-                .signals
-                .reversal
-                .enabled
-                .unwrap_or(config.reversal.enabled),
-            deceleration_weight: self
-                .signals
-                .reversal
-                .deceleration_weight
-                .unwrap_or(config.reversal.deceleration_weight),
-            momentum_flip_weight: self
-                .signals
-                .reversal
-                .momentum_flip_weight
-                .unwrap_or(config.reversal.momentum_flip_weight),
-            distance_weight: self
-                .signals
-                .reversal
-                .distance_weight
-                .unwrap_or(config.reversal.distance_weight),
-            orderflow_weight: self
-                .signals
-                .reversal
-                .orderflow_weight
-                .unwrap_or(config.reversal.orderflow_weight),
-            strong_momentum_bps: self
-                .signals
-                .reversal
-                .strong_momentum_bps
-                .unwrap_or(config.reversal.strong_momentum_bps),
-            flip_deadband_bps: self
-                .signals
-                .reversal
-                .flip_deadband_bps
-                .unwrap_or(config.reversal.flip_deadband_bps),
-        };
-        config.book_sanity = BookSanityConfig {
-            max_spread: self
-                .signals
-                .book_sanity
-                .max_spread
-                .or(self.quote.max_spread)
-                .unwrap_or(config.book_sanity.max_spread),
-            min_top_depth_notional_usd: self
-                .signals
-                .book_sanity
-                .min_top_depth_notional_usd
-                .or(self.quote.min_top_depth_notional_usd)
-                .unwrap_or(config.book_sanity.min_top_depth_notional_usd),
-            max_staleness_ms: self
-                .signals
-                .book_sanity
-                .max_staleness_ms
-                .unwrap_or(config.book_sanity.max_staleness_ms),
-            max_queue_depth_usd: self
-                .signals
-                .book_sanity
-                .max_queue_depth_usd
-                .unwrap_or(config.book_sanity.max_queue_depth_usd),
-            max_projected_pair_cost: self
-                .signals
-                .book_sanity
-                .max_projected_pair_cost
-                .unwrap_or(config.book_sanity.max_projected_pair_cost),
-        };
-        config.side_score = SideScoreConfig {
-            fair_value_weight: self
-                .signals
-                .side_score
-                .fair_value_weight
-                .unwrap_or(config.side_score.fair_value_weight),
-            momentum_weight: self
-                .signals
-                .side_score
-                .momentum_weight
-                .unwrap_or(config.side_score.momentum_weight),
-            orderflow_weight: self
-                .signals
-                .side_score
-                .orderflow_weight
-                .unwrap_or(config.side_score.orderflow_weight),
-            terminal_timing_weight: self
-                .signals
-                .side_score
-                .terminal_timing_weight
-                .unwrap_or(config.side_score.terminal_timing_weight),
-            reversal_risk_weight: self
-                .signals
-                .side_score
-                .reversal_risk_weight
-                .unwrap_or(config.side_score.reversal_risk_weight),
-            book_sanity_weight: self
-                .signals
-                .side_score
-                .book_sanity_weight
-                .unwrap_or(config.side_score.book_sanity_weight),
-            max_late_convex_tilt: self
-                .signals
-                .side_score
-                .max_late_convex_tilt
-                .unwrap_or(config.side_score.max_late_convex_tilt),
-        };
         config
     }
 
@@ -665,33 +280,12 @@ impl StrategyProfile {
             .unwrap_or(config.max_depth)
             .max(1);
         config.min_depth = config.min_depth.min(config.max_depth);
-        config.low_vol_depth = config.max_depth;
-        config.high_vol_depth = config.high_vol_depth.min(config.max_depth);
-        config.late_bar_depth = config.late_bar_depth.min(config.max_depth);
         config.normal_spacing_ticks = self
             .quote
             .entry_ladder_spacing_ticks
             .unwrap_or(config.normal_spacing_ticks);
         config.base_clip_usd = self.quote.base_clip_usd.unwrap_or(config.base_clip_usd);
-        config.min_clip_usd = self
-            .quote
-            .min_clip_usd
-            .or(self.clip_sizing.min_clip_usd)
-            .unwrap_or(config.min_clip_usd);
         config.max_clip_usd = self.quote.max_clip_usd.unwrap_or(config.max_clip_usd);
-        config.entry_min_size_multiplier = self
-            .quote
-            .entry_min_size_multiplier
-            .unwrap_or(config.entry_min_size_multiplier);
-        config.max_spread = self.quote.max_spread.or(config.max_spread);
-        config.max_entry_pair_cost = self
-            .pair_cost
-            .max_entry_pair_cost
-            .or(config.max_entry_pair_cost);
-        config.max_quote_per_side_usd = self
-            .quote
-            .max_quote_per_side_usd
-            .or(config.max_quote_per_side_usd);
         config.fractional_kelly = self
             .clip_sizing
             .fractional_kelly
@@ -733,62 +327,6 @@ impl StrategyProfile {
     pub fn momentum_weight(&self) -> f64 {
         self.signals.fair_value.momentum_weight.unwrap_or(0.65)
     }
-
-    /// Build a `RiskLimits` snapshot from the profile's `inventory:`
-    /// section. Each cap defaults to the corresponding `RiskLimits`
-    /// default when the profile leaves it unset, mirroring the live
-    /// runtime's `Runtime::new` mapping.
-    pub fn risk_limits(&self) -> RiskLimits {
-        let defaults = RiskLimits::default();
-        let inv = &self.inventory;
-        RiskLimits {
-            max_order_notional_usd: inv
-                .max_order_notional_usd
-                .unwrap_or(defaults.max_order_notional_usd),
-            max_gross_notional_usd: inv
-                .max_gross_notional_usd
-                .unwrap_or(defaults.max_gross_notional_usd),
-            max_net_notional_per_market_usd: inv
-                .max_net_notional_per_market_usd
-                .unwrap_or(defaults.max_net_notional_per_market_usd),
-            max_position_quantity_per_instrument: inv
-                .max_position_quantity_per_instrument
-                .unwrap_or(defaults.max_position_quantity_per_instrument),
-            min_free_cash_usd: inv.min_free_cash_usd.unwrap_or(defaults.min_free_cash_usd),
-            min_free_cash_bps: inv.min_free_cash_bps.unwrap_or(defaults.min_free_cash_bps),
-            min_portfolio_equity_usd: inv
-                .min_portfolio_equity_usd
-                .unwrap_or(defaults.min_portfolio_equity_usd),
-            min_portfolio_equity_bps: inv
-                .min_portfolio_equity_bps
-                .unwrap_or(defaults.min_portfolio_equity_bps),
-            max_session_loss_usd: inv
-                .max_session_loss_usd
-                .unwrap_or(defaults.max_session_loss_usd),
-            max_session_loss_bps: inv
-                .max_session_loss_bps
-                .unwrap_or(defaults.max_session_loss_bps),
-            max_open_orders_total: inv
-                .max_open_orders_total
-                .unwrap_or(defaults.max_open_orders_total),
-            max_open_orders_per_market: inv
-                .max_open_orders_per_market
-                .unwrap_or(defaults.max_open_orders_per_market),
-        }
-    }
-}
-
-fn resolve_profile_path(path: &Path) -> PathBuf {
-    if path.exists() || path.is_absolute() {
-        return path.to_path_buf();
-    }
-
-    let repo_root_path = Path::new("polymarket-exec").join(path);
-    if repo_root_path.exists() {
-        return repo_root_path;
-    }
-
-    path.to_path_buf()
 }
 
 fn merge_json_values(target: &mut serde_json::Value, incoming: serde_json::Value) {
@@ -857,9 +395,6 @@ pub struct ProfileRisk {
 #[serde(default)]
 pub struct ProfilePair {
     pub min_merge_notional_usd: Option<f64>,
-    pub merge_pressure_free_cash_ratio: Option<f64>,
-    pub merge_pressure_gross_exposure_ratio: Option<f64>,
-    pub merge_market_exposure_pressure_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -879,7 +414,6 @@ pub struct ProfileHealth {
 #[serde(default)]
 pub struct PairCostSection {
     pub threshold: Option<f64>,
-    pub max_entry_pair_cost: Option<f64>,
     pub high_vol_threshold: Option<f64>,
     pub min_merge_usd: Option<f64>,
     pub min_edge_bps: Option<f64>,
@@ -907,30 +441,6 @@ pub struct ConvexitySection {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ConvexityOverlaySection {
-    pub enabled: Option<bool>,
-    pub suppress_ladder_when_package_fires: Option<bool>,
-    pub start_frac: Option<f64>,
-    pub capital_pct: Option<f64>,
-    pub fractional_kelly: Option<f64>,
-    pub max_loss_usd: Option<f64>,
-    pub max_book_take_pct: Option<f64>,
-    pub min_order_usd: Option<f64>,
-    pub max_active_orders_per_leg: Option<usize>,
-    pub late_window_sec: Option<u64>,
-    pub convex_p_threshold: Option<f64>,
-    pub max_excess_usd: Option<f64>,
-    pub allow_extra_clip_on_winner: Option<bool>,
-    pub maker_safety_ticks: Option<f64>,
-    pub min_favorite_edge_bps: Option<f64>,
-    pub tail_enabled: Option<bool>,
-    pub max_favorite_win_loss_usd: Option<f64>,
-    pub min_tail_win_profit_usd: Option<f64>,
-    pub min_tail_payoff_multiple: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub struct PairedMmFairValueSection {
     pub max_model_divergence: Option<f64>,
     pub model_influence_weight: Option<f64>,
@@ -943,9 +453,6 @@ pub struct SignalsSection {
     pub cheap_leg: CheapLegSection,
     pub vol_regime: VolRegimeSection,
     pub late_window: LateWindowSection,
-    pub reversal: ReversalSection,
-    pub book_sanity: BookSanitySection,
-    pub side_score: SideScoreSection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -960,7 +467,6 @@ pub struct FairValueSection {
 #[serde(default)]
 pub struct CheapLegSection {
     pub price_deviation_bps: Option<f64>,
-    pub max_entry_price: Option<f64>,
     pub order_flow_imbalance_threshold: Option<f64>,
 }
 
@@ -976,40 +482,6 @@ pub struct VolRegimeSection {
 pub struct LateWindowSection {
     pub enabled: Option<bool>,
     pub p_threshold: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ReversalSection {
-    pub enabled: Option<bool>,
-    pub deceleration_weight: Option<f64>,
-    pub momentum_flip_weight: Option<f64>,
-    pub distance_weight: Option<f64>,
-    pub orderflow_weight: Option<f64>,
-    pub strong_momentum_bps: Option<f64>,
-    pub flip_deadband_bps: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BookSanitySection {
-    pub max_spread: Option<f64>,
-    pub min_top_depth_notional_usd: Option<f64>,
-    pub max_staleness_ms: Option<u64>,
-    pub max_queue_depth_usd: Option<f64>,
-    pub max_projected_pair_cost: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SideScoreSection {
-    pub fair_value_weight: Option<f64>,
-    pub momentum_weight: Option<f64>,
-    pub orderflow_weight: Option<f64>,
-    pub terminal_timing_weight: Option<f64>,
-    pub reversal_risk_weight: Option<f64>,
-    pub book_sanity_weight: Option<f64>,
-    pub max_late_convex_tilt: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1051,64 +523,6 @@ pub struct OperationalSection {
     pub max_session_loss_bps: Option<f64>,
     pub enable_buy_light_side_rebalance: Option<bool>,
     pub recycle_min_imbalance_qty: Option<f64>,
-    pub recycle_routine_pair_cost_target: Option<f64>,
     pub recycle_min_time_remaining_ms: Option<u64>,
     pub recycle_max_light_side_spread: Option<f64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paired_mm_default_disables_sell_unwind() {
-        let profile = StrategyProfile::default();
-        let config = profile.paired_mm_config();
-
-        assert!(
-            !config.rescue.allow_sell_fallback,
-            "paired_mm must be buy-only by default unless a profile explicitly opts into sell unwind"
-        );
-        assert!(config.rescue.require_no_guaranteed_loss);
-    }
-
-    #[test]
-    fn live_paired_mm_profile_disables_sell_unwind() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("config/strategies/archive/btc_5m_paired_mm.live.yaml");
-        let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
-        let config = profile.paired_mm_config();
-
-        assert!(
-            !config.rescue.allow_sell_fallback,
-            "live paired_mm profile must not permit sell unwind"
-        );
-        assert!(config.rescue.require_no_guaranteed_loss);
-    }
-
-    #[test]
-    fn live_paired_mm_profile_wires_quote_knobs_into_ladder() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("config/strategies/archive/btc_5m_paired_mm.live.yaml");
-        let profile = StrategyProfile::load(&path).expect("load live paired_mm profile");
-        let config = profile.paired_mm_config();
-
-        assert_eq!(config.ladder.min_clip_usd, 0.50);
-        assert_eq!(config.ladder.entry_min_size_multiplier, 1.0);
-        assert_eq!(config.ladder.max_spread, Some(0.08));
-    }
-
-    #[test]
-    fn paired_mm_profile_can_explicitly_opt_into_sell_unwind() {
-        let profile = StrategyProfile {
-            rescue: RescueSection {
-                sell_unwind_enabled: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let config = profile.paired_mm_config();
-
-        assert!(config.rescue.allow_sell_fallback);
-    }
 }

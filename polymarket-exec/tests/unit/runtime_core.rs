@@ -1,4 +1,4 @@
-use super::{ManagedOrderStatus, Runtime, RuntimeConfig};
+use super::{ManagedOrderStatus, Runtime, RuntimeConfig, BLOCKED_MERGE_RETRY_AFTER_MS};
 use crate::inventory::VenuePositionSnapshot;
 use crate::market_context::{MarketContextRecord, MarketContextStore};
 use crate::risk::RiskLimits;
@@ -46,41 +46,6 @@ impl Strategy for SingleShotStrategy {
             quantity: 10.0,
             reduce_only: false,
             reason: "enter".into(),
-            quote_level_tag: None,
-            created_at_ms: snapshot.quote.observed_at_ms,
-            pair_id: None,
-            kind: crate::types::IntentKind::Entry,
-        })
-    }
-}
-
-struct PassiveSingleShotStrategy {
-    fired: bool,
-}
-
-impl Strategy for PassiveSingleShotStrategy {
-    fn name(&self) -> &str {
-        "passive-single-shot"
-    }
-
-    fn on_market_snapshot(
-        &mut self,
-        context: &StrategyContext,
-        snapshot: &MarketSnapshot,
-    ) -> StrategyDecision {
-        if self.fired || context.runtime_status != RuntimeStatus::Running {
-            return StrategyDecision::none();
-        }
-        self.fired = true;
-        StrategyDecision::single(OrderIntent {
-            client_order_id: ClientOrderId::from("client-1"),
-            market_id: snapshot.market_id.clone(),
-            instrument_id: snapshot.instrument_id.clone(),
-            side: TradeSide::Buy,
-            limit_price: snapshot.quote.best_bid.as_ref().unwrap().price,
-            quantity: 10.0,
-            reduce_only: false,
-            reason: "enter-passive".into(),
             quote_level_tag: None,
             created_at_ms: snapshot.quote.observed_at_ms,
             pair_id: None,
@@ -198,7 +163,7 @@ fn runtime_reserves_then_applies_fill() {
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
-        PassiveSingleShotStrategy { fired: false },
+        SingleShotStrategy { fired: false },
         MarketContextStore::empty(),
     );
 
@@ -228,7 +193,7 @@ fn runtime_reserves_then_applies_fill() {
         }
         other => panic!("unexpected command: {other:?}"),
     }
-    assert!((runtime.inventory().free_cash_usd() - 96.1).abs() < 1e-9);
+    assert!((runtime.inventory().free_cash_usd() - 96.0).abs() < 1e-9);
     assert_eq!(runtime.open_orders().count(), 1);
 
     runtime
@@ -238,7 +203,7 @@ fn runtime_reserves_then_applies_fill() {
             market_id: MarketId::from("market-1"),
             instrument_id: InstrumentId::from("token-1"),
             side: TradeSide::Buy,
-            price: 0.39,
+            price: 0.40,
             quantity: 10.0,
             fee_usd: 0.10,
             liquidity: FillLiquidity::Taker,
@@ -254,7 +219,7 @@ fn runtime_reserves_then_applies_fill() {
             .position_qty(&InstrumentId::from("token-1")),
         10.0
     );
-    assert!((runtime.inventory().free_cash_usd() - 96.0).abs() < 1e-9);
+    assert!((runtime.inventory().free_cash_usd() - 95.9).abs() < 1e-9);
 }
 
 #[test]
@@ -292,7 +257,7 @@ fn late_partial_fill_after_cancel_request_keeps_cancel_pending() {
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
-        PassiveSingleShotStrategy { fired: false },
+        SingleShotStrategy { fired: false },
         MarketContextStore::empty(),
     );
 
@@ -341,98 +306,6 @@ fn late_partial_fill_after_cancel_request_keeps_cancel_pending() {
             .position_qty(&InstrumentId::from("token-1")),
         4.0
     );
-}
-
-#[test]
-fn durable_dust_fill_terminal_removes_active_order_before_cancel() {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("polymarket-exec-dust-fill-{ts}.sqlite"));
-    let store = SqliteOrderStore::open(&path).unwrap();
-    let client_order_id = ClientOrderId::from("client-1");
-
-    let mut runtime = Runtime::new_with_order_store(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Starting,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        PassiveSingleShotStrategy { fired: false },
-        MarketContextStore::empty(),
-        Some(Box::new(store)),
-        "run-dust-fill".to_string(),
-    );
-
-    runtime.start(1);
-    let quote_outcome = runtime
-        .on_market_snapshot(MarketSnapshot {
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            quote: QuoteSnapshot {
-                best_bid: Some(BookLevel::new(0.39, 100.0)),
-                best_ask: Some(BookLevel::new(0.40, 100.0)),
-                bid_levels: vec![BookLevel::new(0.39, 100.0)],
-                ask_levels: vec![BookLevel::new(0.40, 100.0)],
-                depth_observed_at_ms: Some(2),
-                last_trade_price: Some(0.40),
-                taker_buy_qty_60s: 0.0,
-                taker_sell_qty_60s: 0.0,
-                observed_at_ms: 2,
-            },
-        })
-        .expect("quote");
-    assert_eq!(
-        quote_outcome.commands.len(),
-        1,
-        "events: {:?}",
-        runtime
-            .event_log()
-            .recent(8)
-            .iter()
-            .map(|event| event.message.clone())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(runtime.open_orders().count(), 1);
-    runtime.on_order_opened(&client_order_id, 3);
-
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: Some(client_order_id.clone()),
-            market_id: MarketId::from("market-1"),
-            instrument_id: InstrumentId::from("token-1"),
-            side: TradeSide::Buy,
-            price: 0.40,
-            quantity: 9.995,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 4,
-        })
-        .expect("fill");
-
-    assert!(
-        runtime.open_order_snapshots().is_empty(),
-        "durable dust-complete fill must remove stale active order before quote churn can cancel it"
-    );
-    let cancel_outcome = runtime.request_cancel(&client_order_id, "desired changed", 5);
-    assert!(
-        cancel_outcome.commands.is_empty(),
-        "terminal durable fill must not emit a venue cancel"
-    );
-
-    let record = SqliteOrderStore::open(&path)
-        .unwrap()
-        .get(&client_order_id)
-        .unwrap()
-        .expect("order record");
-    assert_eq!(record.status, ManagedOrderStatus::Filled);
-    assert_eq!(record.remaining_qty, 0.0);
-    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -728,14 +601,13 @@ fn sub_venue_min_single_leg_dust_is_not_actionable_inventory() {
 }
 
 #[test]
-fn plan_merge_respects_profile_min_merge_notional() {
+fn plan_merge_skips_tiny_paired_inventory_below_gas_threshold() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(
         RuntimeConfig {
             starting_cash_usd: 100.0,
             event_log_capacity: 128,
             initial_status: RuntimeStatus::Running,
-            min_merge_notional_usd: 2.0,
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
@@ -743,8 +615,8 @@ fn plan_merge_respects_profile_min_merge_notional() {
         MarketContextStore::empty(),
     );
     // Seed two tiny paired legs ($1.50 paired notional ~ 1.5 paired qty).
-    // The configured merge-notional gate is a dust/noise control, not a
-    // Polygon gas-friction rule.
+    // Gas of ~$0.30 is 20% friction at this size — skip the merge and
+    // let positions resolve to capture the same $1/share without gas.
     runtime
         .on_fill(FillReport {
             order_id: None,
@@ -784,67 +656,17 @@ fn plan_merge_respects_profile_min_merge_notional() {
 
     assert!(
         outcome.commands.is_empty(),
-        "tiny paired inventory should respect the configured min merge notional. \
-             Got commands: {:?}",
+        "tiny paired inventory ($1.50 release) should be held to resolution, \
+             not merged at $0.30 gas (20% friction). Got commands: {:?}",
         outcome.commands.len()
     );
     assert!(
-        runtime
-            .event_log()
-            .recent(20)
-            .iter()
-            .any(|event| event.message.contains("below min merge notional")),
+        runtime.event_log().recent(20).iter().any(|event| event
+            .message
+            .contains("below gas-friction threshold")
+            || event.message.contains("hold to resolution")),
         "merge skip should emit a recognizable event for observability"
     );
-}
-
-#[test]
-fn plan_merge_allows_tiny_paired_inventory_when_min_merge_notional_is_zero() {
-    let market_id = MarketId::from("market-mm");
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Running,
-            min_merge_notional_usd: 0.0,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        NoopStrategy,
-        MarketContextStore::empty(),
-    );
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("up"),
-            side: TradeSide::Buy,
-            price: 0.30,
-            quantity: 1.50,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 10,
-        })
-        .expect("up leg");
-    let outcome = runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("down"),
-            side: TradeSide::Buy,
-            price: 0.65,
-            quantity: 1.50,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 11,
-        })
-        .expect("down leg");
-
-    assert_eq!(outcome.commands.len(), 1);
 }
 
 #[test]
@@ -861,7 +683,7 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
         NoopStrategy,
         MarketContextStore::empty(),
     );
-    // Paired qty = 6.5 -> $6.50 release.
+    // Paired qty = 6.5 → $6.50 release. Worth the $0.30 gas.
     runtime
         .on_fill(FillReport {
             order_id: None,
@@ -896,211 +718,15 @@ fn plan_merge_fires_normally_for_substantial_paired_inventory() {
     // The second leg's on_fill should auto-plan the merge for substantial
     // paired inventory.
     assert!(
-        second_outcome
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, RuntimeCommand::Merge(_))),
-        "$6.50 paired notional should fire merge on second leg fill (gas friction ~5%, within threshold). \
+            second_outcome.commands.iter().any(|cmd| matches!(cmd, RuntimeCommand::Merge(_))),
+            "$6.50 paired notional should fire merge on second leg fill (gas friction ~5%, within threshold). \
              Got commands: {:?}",
-        second_outcome.commands.len()
-    );
+            second_outcome.commands.len()
+        );
 }
 
 #[test]
-fn plan_merge_bypasses_tiny_threshold_under_free_cash_pressure() {
-    let market_id = MarketId::from("market-mm");
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 5.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Running,
-            min_merge_notional_usd: 2.0,
-            merge_free_cash_pressure_ratio: 0.95,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        NoopStrategy,
-        MarketContextStore::empty(),
-    );
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("up"),
-            side: TradeSide::Buy,
-            price: 0.10,
-            quantity: 1.50,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 10,
-        })
-        .expect("up leg");
-    let second_outcome = runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("down"),
-            side: TradeSide::Buy,
-            price: 0.10,
-            quantity: 1.50,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 11,
-        })
-        .expect("down leg");
-
-    assert_eq!(
-        second_outcome.commands.len(),
-        1,
-        "free-cash-pressure should trigger immediate merge planning on fill path"
-    );
-
-    assert!(
-        runtime
-            .event_log()
-            .recent(20)
-            .iter()
-            .any(|event| event.message.contains("merge batching bypassed")),
-        "expected pressure bypass logging when free cash is low"
-    );
-}
-
-#[test]
-fn plan_merge_bypasses_tiny_threshold_under_gross_exposure_pressure() {
-    let market_id = MarketId::from("market-mm");
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 50.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Running,
-            min_merge_notional_usd: 6.0,
-            merge_free_cash_pressure_ratio: 0.0,
-            merge_gross_exposure_pressure_ratio: 0.02,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        NoopStrategy,
-        MarketContextStore::empty(),
-    );
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("up"),
-            side: TradeSide::Buy,
-            price: 1.0,
-            quantity: 2.75,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 10,
-        })
-        .expect("up leg");
-    let second_outcome = runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("down"),
-            side: TradeSide::Buy,
-            price: 1.0,
-            quantity: 2.75,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 11,
-        })
-        .expect("down leg");
-
-    assert_eq!(
-        second_outcome.commands.len(),
-        1,
-        "gross exposure pressure should trigger immediate merge planning on fill path"
-    );
-
-    assert!(
-        runtime
-            .event_log()
-            .recent(20)
-            .iter()
-            .any(|event| event.message.contains("gross_inventory_high")),
-        "expected gross exposure pressure logging"
-    );
-}
-
-#[test]
-fn plan_merge_bypasses_tiny_threshold_under_market_imbalance_pressure() {
-    let market_id = MarketId::from("market-mm");
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Running,
-            min_merge_notional_usd: 6.0,
-            merge_free_cash_pressure_ratio: 0.0,
-            merge_gross_exposure_pressure_ratio: 0.0,
-            merge_market_exposure_pressure_usd: 1.5,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        NoopStrategy,
-        MarketContextStore::empty(),
-    );
-
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("up"),
-            side: TradeSide::Buy,
-            price: 1.0,
-            quantity: 3.0,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 10,
-        })
-        .expect("up leg");
-    let second_outcome = runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("down"),
-            side: TradeSide::Buy,
-            price: 1.0,
-            quantity: 1.0,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 11,
-        })
-        .expect("down leg");
-
-    assert_eq!(
-        second_outcome.commands.len(),
-        1,
-        "market imbalance pressure should trigger immediate merge planning on fill path"
-    );
-
-    assert!(
-        runtime
-            .event_log()
-            .recent(20)
-            .iter()
-            .any(|event| event.message.contains("market_imbalance_high")),
-        "expected market imbalance pressure logging"
-    );
-}
-
-#[test]
-fn blocked_merge_waits_for_inventory_change_not_timer_backoff() {
+fn blocked_merge_retries_after_backoff_instead_of_permanent_suppression() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(
         RuntimeConfig {
@@ -1152,136 +778,17 @@ fn blocked_merge_waits_for_inventory_change_not_timer_backoff() {
         "identical merge should still be suppressed during short backoff"
     );
 
-    let still_blocked = runtime.plan_merge_command_for_market(&market_id, 30_000, "timer retry");
-    assert!(
-        still_blocked.commands.is_empty(),
-        "identical reverted merge should not retry just because time passed"
+    let retry = runtime.plan_merge_command_for_market(
+        &market_id,
+        12 + BLOCKED_MERGE_RETRY_AFTER_MS + 1,
+        "retry after reconcile",
     );
-
-    runtime
-        .reconcile_venue_positions(
-            &[
-                VenuePositionSnapshot {
-                    market_id: market_id.clone(),
-                    condition_id: Some("condition-1".to_string()),
-                    instrument_id: InstrumentId::from("up"),
-                    quantity: 5.0,
-                    average_cost_usd: 0.20,
-                    mark_price: Some(0.20),
-                    observed_at_ms: 31_000,
-                },
-                VenuePositionSnapshot {
-                    market_id: market_id.clone(),
-                    condition_id: Some("condition-1".to_string()),
-                    instrument_id: InstrumentId::from("down"),
-                    quantity: 5.0,
-                    average_cost_usd: 0.70,
-                    mark_price: Some(0.70),
-                    observed_at_ms: 31_000,
-                },
-            ],
-            31_000,
-        )
-        .expect("inventory-changing reconcile");
-
-    let retry = runtime.plan_merge_command_for_market(&market_id, 31_001, "retry after reconcile");
     assert!(
         retry
             .commands
             .iter()
             .any(|command| matches!(command, RuntimeCommand::Merge(_))),
         "blocked merge must not be suppressed forever"
-    );
-}
-
-#[test]
-fn accepted_merge_latch_clears_after_post_accept_venue_reconcile() {
-    let market_id = MarketId::from("market-mm");
-    let mut runtime = Runtime::new(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Running,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        NoopStrategy,
-        MarketContextStore::empty(),
-    );
-
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("up"),
-            side: TradeSide::Buy,
-            price: 0.20,
-            quantity: 5.0,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 10,
-        })
-        .expect("first leg");
-    runtime
-        .on_fill(FillReport {
-            order_id: None,
-            client_order_id: None,
-            market_id: market_id.clone(),
-            instrument_id: InstrumentId::from("down"),
-            side: TradeSide::Buy,
-            price: 0.70,
-            quantity: 5.0,
-            fee_usd: 0.0,
-            liquidity: FillLiquidity::Maker,
-            close_method: None,
-            observed_at_ms: 11,
-        })
-        .expect("second leg");
-
-    runtime.mark_pending_merge_accepted(&market_id, 12);
-    let duplicate_before_reconcile =
-        runtime.plan_merge_command_for_market(&market_id, 13, "duplicate before reconcile");
-    assert!(
-        duplicate_before_reconcile.commands.is_empty(),
-        "identical merge should still be suppressed before a post-accept venue reconcile"
-    );
-
-    runtime
-        .reconcile_venue_positions(
-            &[
-                VenuePositionSnapshot {
-                    market_id: market_id.clone(),
-                    condition_id: Some("condition-1".to_string()),
-                    instrument_id: InstrumentId::from("up"),
-                    quantity: 5.0,
-                    average_cost_usd: 0.20,
-                    mark_price: Some(0.20),
-                    observed_at_ms: 14,
-                },
-                VenuePositionSnapshot {
-                    market_id: market_id.clone(),
-                    condition_id: Some("condition-1".to_string()),
-                    instrument_id: InstrumentId::from("down"),
-                    quantity: 5.0,
-                    average_cost_usd: 0.70,
-                    mark_price: Some(0.70),
-                    observed_at_ms: 14,
-                },
-            ],
-            14,
-        )
-        .expect("venue reconcile after accepted merge");
-
-    let fresh_merge =
-        runtime.plan_merge_command_for_market(&market_id, 15, "remaining paired inventory");
-    assert!(
-        fresh_merge
-            .commands
-            .iter()
-            .any(|command| matches!(command, RuntimeCommand::Merge(_))),
-        "post-accept venue reconcile must clear the accepted latch so remaining paired inventory can merge"
     );
 }
 
@@ -1675,11 +1182,9 @@ fn live_runtime_suppresses_entries_until_initial_position_reconcile() {
         runtime.accept_intent(btc_mm_intent("market-mm", "up", "mm-paired-bid", 0.44), 1);
     assert!(early_entry.commands.is_empty());
     assert_eq!(runtime.open_orders().count(), 0);
-    assert!(runtime.event_log().recent(4).iter().any(|event| {
-        event
-            .message
-            .contains("initial venue position reconcile has not completed")
-    }));
+    assert!(runtime.event_log().recent(4).iter().any(|event| event
+        .message
+        .contains("initial venue position reconcile has not completed")));
 
     let rescue = runtime.accept_intent(
         btc_mm_intent("market-mm", "down", "mm-hedge-rescue:l1", 0.55),
@@ -2034,69 +1539,6 @@ fn recover_from_store_reconstructs_orders_and_marks_uncertain_submits() {
 }
 
 #[test]
-fn stale_needs_reconcile_order_uses_durable_terminal_state_instead_of_quarantine() {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("polymarket-exec-terminal-sync-{ts}.sqlite"));
-    let mut store = SqliteOrderStore::open(&path).unwrap();
-    let client_order_id = ClientOrderId::from("coid-terminal-sync");
-    let intent = OrderIntent {
-        client_order_id: client_order_id.clone(),
-        market_id: MarketId::from("market-1"),
-        instrument_id: InstrumentId::from("token-1"),
-        side: TradeSide::Buy,
-        limit_price: 0.41,
-        quantity: 5.0,
-        reduce_only: false,
-        reason: "recover".to_string(),
-        quote_level_tag: None,
-        created_at_ms: 10,
-        pair_id: None,
-        kind: crate::types::IntentKind::Entry,
-    };
-    let mut record = OrderRecord::from_intent("run-1", &intent, "single-shot");
-    record.status = ManagedOrderStatus::NeedsReconcile;
-    record.last_update_ms = 10;
-    store.insert(record).unwrap();
-
-    let mut runtime = Runtime::new_with_order_store(
-        RuntimeConfig {
-            starting_cash_usd: 100.0,
-            event_log_capacity: 128,
-            initial_status: RuntimeStatus::Starting,
-            ..RuntimeConfig::default()
-        },
-        RiskLimits::default(),
-        SingleShotStrategy { fired: false },
-        MarketContextStore::empty(),
-        Some(Box::new(store)),
-        "run-1".to_string(),
-    );
-    runtime.recover_from_store(20, 5_000);
-    assert_eq!(runtime.open_order_snapshots().len(), 1);
-
-    let mut external_store = SqliteOrderStore::open(&path).unwrap();
-    external_store
-        .update_status(&client_order_id, ManagedOrderStatus::Filled, 30)
-        .unwrap();
-    drop(external_store);
-
-    let outcome = runtime.quarantine_stale_needs_reconcile_orders(20_000, 100);
-
-    assert!(!outcome.event_seqs.is_empty());
-    assert!(runtime.open_order_snapshots().is_empty());
-    let store_record = SqliteOrderStore::open(&path)
-        .unwrap()
-        .get(&client_order_id)
-        .unwrap()
-        .expect("order record");
-    assert_eq!(store_record.status, ManagedOrderStatus::Filled);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn venue_position_reconciliation_recovers_missing_cost_basis_from_filled_buys() {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2270,11 +1712,9 @@ fn recover_from_store_restores_sticky_riskoff_status() {
     let start_outcome = recovered.start(30);
     assert_eq!(recovered.status(), RuntimeStatus::RiskOff);
     assert!(start_outcome.commands.is_empty());
-    assert!(recovered.event_log().recent(8).iter().any(|event| {
-        event
-            .message
-            .contains("restored runtime status from durable store status=RiskOff")
-    }));
+    assert!(recovered.event_log().recent(8).iter().any(|event| event
+        .message
+        .contains("restored runtime status from durable store status=RiskOff")));
 }
 
 #[test]

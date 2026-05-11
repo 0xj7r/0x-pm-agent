@@ -120,10 +120,7 @@ where
         api_passphrase,
         private_key: lookup_first_env(&lookup, &["POLYMARKET_PRIVATE_KEY"]),
         signature_type: lookup_first_env(&lookup, &["POLYMARKET_SIGNATURE_TYPE"]),
-        funder_address: lookup_first_env(
-            &lookup,
-            &["POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_FUNDER"],
-        ),
+        funder_address: lookup_first_env(&lookup, &["POLYMARKET_FUNDER_ADDRESS"]),
     })
 }
 
@@ -217,7 +214,7 @@ mod tests {
             ("POLYMARKET_API_KEY", "key"),
             ("POLYMARKET_SECRET", "secret"),
             ("POLYMARKET_PASSPHRASE", "passphrase"),
-            ("POLYMARKET_FUNDER", "0xfunder"),
+            ("POLYMARKET_FUNDER_ADDRESS", "0xfunder"),
         ]);
 
         let auth = load_user_auth_from_lookup(|key| values.get(key).map(|value| value.to_string()))

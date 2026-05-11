@@ -8,8 +8,7 @@ use polymarket_exec::strategy::{
     Strategy, StrategyContext, StrategyDecision, StrategyMode, StrategyProfile, VenueMarketRules,
 };
 use polymarket_exec::types::{
-    BookLevel, InstrumentId, MarketId, MarketLedgerState, MarketSnapshot, QuoteSnapshot,
-    RuntimeCommand, RuntimeStatus,
+    BookLevel, InstrumentId, MarketId, MarketSnapshot, QuoteSnapshot, RuntimeCommand, RuntimeStatus,
 };
 
 fn quote(bid: f64, ask: f64, now_ms: u64) -> QuoteSnapshot {
@@ -96,10 +95,8 @@ fn context(
         now_ms,
         runtime_status: RuntimeStatus::Running,
         inventory,
-        open_orders: Vec::new(),
         open_orders_total: 0,
         open_orders_for_market: 0,
-        market_ledger_state: MarketLedgerState::Flat,
         market_context: Some(market_context(market_id, yes_id, no_id)),
         btc_regime: BtcRegimeSnapshot {
             last_price: Some(spot),
@@ -113,7 +110,6 @@ fn context(
             return_180s_bps: Some(20.0),
             observed_at_ms: now_ms,
         },
-        momentum: polymarket_exec::signals::MomentumSignal::default(),
         venue_rules: Some(VenueMarketRules {
             minimum_order_size: 5.0,
             minimum_tick_size: 0.01,
@@ -128,27 +124,12 @@ fn drive_two_books(
     yes_quote: QuoteSnapshot,
     no_quote: QuoteSnapshot,
 ) -> StrategyDecision {
-    drive_two_books_with_profile(
-        strategy_name,
-        &StrategyProfile::default(),
-        ctx,
-        yes_quote,
-        no_quote,
-    )
-}
-
-fn drive_two_books_with_profile(
-    strategy_name: &str,
-    profile: &StrategyProfile,
-    ctx: &StrategyContext,
-    yes_quote: QuoteSnapshot,
-    no_quote: QuoteSnapshot,
-) -> StrategyDecision {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
     let no_id = InstrumentId::from("no-token");
     let mut strategy =
-        StrategyMode::try_from_name(strategy_name, Some(profile)).expect("strategy mode");
+        StrategyMode::try_from_name(strategy_name, Some(&StrategyProfile::default()))
+            .expect("strategy mode");
     let _ = strategy.on_market_snapshot(ctx, &snapshot(&market_id, &yes_id, yes_quote));
     strategy.on_market_snapshot(ctx, &snapshot(&market_id, &no_id, no_quote))
 }
@@ -377,80 +358,6 @@ fn paired_mm_emits_two_sided_ladder_quotes() {
 }
 
 #[test]
-fn paired_mm_emits_capital_recycle_when_inventory_is_one_sided() {
-    let market_id = MarketId::from("btc-5m-test");
-    let yes_id = InstrumentId::from("yes-token");
-    let no_id = InstrumentId::from("no-token");
-    let ctx = context(
-        120_000,
-        &market_id,
-        &yes_id,
-        &no_id,
-        inventory(vec![position(&market_id, &yes_id, 20.0, 0.20, 120_000)]),
-        100.0,
-    );
-
-    let decision = drive_two_books(
-        "paired_mm",
-        &ctx,
-        quote(0.70, 0.71, 120_000),
-        quote(0.20, 0.21, 120_000),
-    );
-
-    assert!(
-        matches!(decision, StrategyDecision::Reactive { .. }),
-        "{decision:?}"
-    );
-    let intents = decision.intents();
-    assert_eq!(intents.len(), 1, "{decision:?}");
-    assert_eq!(intents[0].instrument_id, no_id);
-    assert_eq!(
-        intents[0].quote_level_tag.as_deref(),
-        Some("mm-capital-recycle:no:CapitalRecycle")
-    );
-    assert!(decision
-        .notes()
-        .iter()
-        .any(|note| note.contains("capital recycle emitted")));
-}
-
-#[test]
-fn paired_mm_repair_mode_does_not_add_to_heavy_leg_when_recycle_waits() {
-    let market_id = MarketId::from("btc-5m-test");
-    let yes_id = InstrumentId::from("yes-token");
-    let no_id = InstrumentId::from("no-token");
-    let ctx = context(
-        120_000,
-        &market_id,
-        &yes_id,
-        &no_id,
-        inventory(vec![position(&market_id, &yes_id, 10.0, 0.55, 120_000)]),
-        100.0,
-    );
-
-    let decision = drive_two_books(
-        "paired_mm",
-        &ctx,
-        quote(0.49, 0.51, 120_000),
-        quote(0.49, 0.50, 120_000),
-    );
-
-    let intents = decision.intents();
-    assert!(!intents.is_empty(), "{decision:?}");
-    assert!(
-        intents.iter().all(|intent| intent.instrument_id == no_id),
-        "{decision:?}"
-    );
-    assert!(intents
-        .iter()
-        .all(|intent| intent.side == polymarket_exec::types::TradeSide::Buy));
-    assert!(decision
-        .notes()
-        .iter()
-        .any(|note| note.contains("mode=repair_first")));
-}
-
-#[test]
 fn hybrid_mode_combines_pair_cost_and_paired_mm_outputs() {
     let market_id = MarketId::from("btc-5m-test");
     let yes_id = InstrumentId::from("yes-token");
@@ -511,34 +418,10 @@ fn rescue_math_uses_sell_fallback_when_buy_to_merge_is_worse() {
 fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
     for (path, expected) in [
         (
-            "config/strategies/archive/btc_5m_pair_cost_arb.live.yaml",
+            "config/strategies/btc_5m_pair_cost_arb.live.yaml",
             "pair_cost_arb",
         ),
-        ("config/strategies/archive/btc_5m_paired_mm.live.yaml", "paired_mm"),
-        (
-            "config/strategies/archive/btc_5m_core_hedge.live.yaml",
-            "core_hedge_mm",
-        ),
-        (
-            "config/strategies/archive/btc_5m_core_hedge_bonereaper.live.yaml",
-            "core_hedge_mm",
-        ),
-        (
-            "config/strategies/archive/btc_5m_late_favorite.live.yaml",
-            "late_favorite_directional",
-        ),
-        (
-            "config/strategies/archive/btc_5m_late_favorite_bonereaper.live.yaml",
-            "late_favorite_directional",
-        ),
-        (
-            "config/strategies/whale_unlawful_strategy.live.yaml",
-            "unlawful_mm",
-        ),
-        (
-            "config/strategies/whale_bonereaper_strategy.live.yaml",
-            "bonereaper_mm",
-        ),
+        ("config/strategies/btc_5m_paired_mm.live.yaml", "paired_mm"),
     ] {
         let profile = StrategyProfile::load(std::path::Path::new(path)).expect(path);
         assert_eq!(profile.strategy.as_deref(), Some(expected));
@@ -547,65 +430,29 @@ fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
 }
 
 #[test]
-fn core_hedge_profile_drives_live_strategy_adapter() {
-        let profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/archive/btc_5m_core_hedge.live.yaml",
-    ))
-    .expect("core hedge profile");
-    let market_id = MarketId::from("btc-5m-test");
-    let yes_id = InstrumentId::from("yes-token");
-    let no_id = InstrumentId::from("no-token");
-    let ctx = context(
-        120_000,
-        &market_id,
-        &yes_id,
-        &no_id,
-        inventory(vec![]),
-        101.0,
-    );
-
-    let decision = drive_two_books_with_profile(
-        "core_hedge_mm",
-        &profile,
-        &ctx,
-        quote(0.69, 0.70, 120_000),
-        quote(0.29, 0.30, 120_000),
-    );
-
-    let intents = decision.intents();
-    assert_eq!(intents.len(), 2, "{decision:?}");
-    assert!(intents
-        .iter()
-        .any(|intent| intent.quote_level_tag.as_deref() == Some("core-hedge:core")));
-    assert!(intents
-        .iter()
-        .any(|intent| intent.quote_level_tag.as_deref() == Some("core-hedge:hedge")));
-}
-
-#[test]
 fn active_strategy_yaml_profiles_drive_strategy_configs() {
     let pair_cost_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/archive/btc_5m_pair_cost_arb.live.yaml",
+        "config/strategies/btc_5m_pair_cost_arb.live.yaml",
     ))
     .expect("pair-cost profile");
     let pair_cost_config = pair_cost_profile.pair_cost_arb_config();
     assert_eq!(pair_cost_config.pair_cost_threshold, 0.99);
     assert_eq!(pair_cost_config.high_vol_pair_cost_threshold, 0.97);
-    assert_eq!(pair_cost_config.base_clip_usd, 6.0);
+    assert_eq!(pair_cost_config.base_clip_usd, 1.5);
     assert_eq!(pair_cost_config.max_clip_usd, 5.0);
-    assert_eq!(pair_cost_config.rescue_enabled, false);
+    assert_eq!(pair_cost_config.rescue_enabled, true);
     assert_eq!(pair_cost_config.rescue_late_window_sec, 90);
     assert_eq!(pair_cost_config.rescue_rehedge_pair_cost_threshold, 1.03);
     assert_eq!(pair_cost_config.recycle_min_imbalance_qty, 5.0);
     assert_eq!(pair_cost_config.recycle_min_time_remaining_ms, 90_000);
 
     let paired_mm_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/archive/btc_5m_paired_mm.live.yaml",
+        "config/strategies/btc_5m_paired_mm.live.yaml",
     ))
     .expect("paired-mm profile");
     let paired_mm_config = paired_mm_profile.paired_mm_config();
-    assert_eq!(paired_mm_config.ladder.max_depth, 12);
-    assert_eq!(paired_mm_config.ladder.base_clip_usd, 1.50);
+    assert_eq!(paired_mm_config.ladder.max_depth, 3);
+    assert_eq!(paired_mm_config.ladder.base_clip_usd, 1.10);
     assert_eq!(paired_mm_config.ladder.max_clip_usd, 5.0);
     assert_eq!(
         paired_mm_config
@@ -623,35 +470,15 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     );
     assert_eq!(paired_mm_config.capital_recycle.pair_cost_target, 0.99);
     assert_eq!(paired_mm_config.capital_recycle.min_imbalance_qty, 5.0);
-    assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 10.0);
-    assert_eq!(paired_mm_config.capital_recycle.max_buy_notional_usd, 1.00);
+    assert_eq!(paired_mm_config.capital_recycle.max_buy_qty, 25.0);
+    assert_eq!(
+        paired_mm_config.capital_recycle.max_buy_notional_usd,
+        2.50
+    );
     assert_eq!(
         paired_mm_config.capital_recycle.min_time_remaining_ms,
         90_000
     );
     assert_eq!(paired_mm_config.capital_recycle.max_light_side_spread, 0.10);
     assert_eq!(paired_mm_config.capital_recycle.race_buffer_ticks, 3.0);
-
-    let unlawful_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/whale_unlawful_strategy.live.yaml",
-    ))
-    .expect("unlawful whale profile");
-    let unlawful_config = unlawful_profile.core_hedge_mm_config();
-    assert_eq!(unlawful_config.core_hedge.ladder_levels, 35);
-    assert_eq!(unlawful_config.core_hedge.ladder_span, 0.52);
-    assert_eq!(unlawful_config.core_hedge.merge_min_qty, 50.0);
-    assert_eq!(unlawful_config.core_hedge.merge_batch_cap, 500.0);
-
-    let bonereaper_profile = StrategyProfile::load(std::path::Path::new(
-        "config/strategies/whale_bonereaper_strategy.live.yaml",
-    ))
-    .expect("bonereaper whale profile");
-    let bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
-    let bonereaper_late = bonereaper_profile.late_favorite_config();
-    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.42);
-    assert_eq!(bonereaper_paired.core_hedge.clip_shares, 20.0);
-    assert_eq!(bonereaper_late.favorite_climb.window_sec, 120);
-    assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.90);
-    assert_eq!(bonereaper_late.convex_tail.clip_usd, 2.0);
 }
