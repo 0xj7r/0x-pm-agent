@@ -380,8 +380,12 @@ fn favorite_direction_signal<M: MarketDescriptor>(
             .flatten()
             .any(|r| r >= threshold * 0.35);
     let model_ok = model_favorite >= (legs.favorite_ask + 0.03).min(0.98)
-        && side_strike.map(|m| m >= 2.0).unwrap_or(false)
-        && no_sharp_reversal;
+        && no_sharp_reversal
+        && (side_strike.map(|m| m >= 0.5).unwrap_or(false)
+            || [side_60, side_120, side_180]
+                .into_iter()
+                .flatten()
+                .any(|r| r >= threshold * 0.50));
 
     let ok = momentum_ok || strike_ok || model_ok;
     (
