@@ -51,6 +51,9 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use polymarket_exec::collector::schema::{Event, EventType};
+use polymarket_exec::replay::data_quality::{
+    summarize_data_quality_windows, validate_data_quality, DataQualityConfig,
+};
 use polymarket_exec::replay::fill_sim::{FillQuality, FillSimConfig, LatencyPreset, SimulatedFill};
 use polymarket_exec::replay::journal::{write_journal_parquet, JournalEvent};
 use polymarket_exec::replay::manifest::{
@@ -65,6 +68,9 @@ use polymarket_exec::replay::runner::{
 };
 use polymarket_exec::replay::strategy_adapter::ReplayStrategyAdapter;
 use polymarket_exec::replay::tape::events::{read_tape_replay_windows, TapeReplayOptions};
+use polymarket_exec::replay::walk_forward::{
+    build_walk_forward_plan, TrainingMode, WalkForwardConfig,
+};
 use polymarket_exec::strategy_profile::StrategyProfile;
 use sha2::{Digest, Sha256};
 
@@ -204,6 +210,26 @@ struct Cli {
     #[arg(long, value_enum, default_value = "full")]
     journal_mode: CliJournalMode,
 
+    /// Emit walk-forward train/test/holdout boundaries into the manifest.
+    #[arg(long, value_enum, default_value = "none")]
+    walk_forward_mode: CliWalkForwardMode,
+
+    /// Minimum training windows for walk-forward planning.
+    #[arg(long, default_value_t = 0)]
+    walk_forward_min_train_windows: usize,
+
+    /// Test windows per walk-forward fold.
+    #[arg(long, default_value_t = 0)]
+    walk_forward_test_windows: usize,
+
+    /// Fold step in windows for walk-forward planning.
+    #[arg(long, default_value_t = 1)]
+    walk_forward_step_windows: usize,
+
+    /// Final holdout windows excluded from calibration folds.
+    #[arg(long, default_value_t = 0)]
+    walk_forward_holdout_windows: usize,
+
     /// Plan + manifest only, skip replay.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -213,6 +239,13 @@ struct Cli {
 enum CliJournalMode {
     Full,
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliWalkForwardMode {
+    None,
+    Expanding,
+    Rolling,
 }
 
 impl From<CliJournalMode> for ReplayJournalMode {
@@ -393,6 +426,38 @@ fn parse_fill_quality(s: &str) -> Result<FillQuality> {
         "conservative" => Ok(FillQuality::Conservative),
         other => anyhow::bail!("unknown fill-quality regime: {other}"),
     }
+}
+
+fn walk_forward_config(cli: &Cli) -> Result<Option<WalkForwardConfig>> {
+    let mode = match cli.walk_forward_mode {
+        CliWalkForwardMode::None => return Ok(None),
+        CliWalkForwardMode::Expanding => TrainingMode::Expanding,
+        CliWalkForwardMode::Rolling => TrainingMode::Rolling,
+    };
+    if cli.walk_forward_min_train_windows == 0 {
+        anyhow::bail!("--walk-forward-min-train-windows must be > 0 when enabled");
+    }
+    if cli.walk_forward_test_windows == 0 {
+        anyhow::bail!("--walk-forward-test-windows must be > 0 when enabled");
+    }
+    if cli.walk_forward_holdout_windows == 0 {
+        anyhow::bail!("--walk-forward-holdout-windows must be > 0 when enabled");
+    }
+
+    Ok(Some(match mode {
+        TrainingMode::Expanding => WalkForwardConfig::expanding(
+            cli.walk_forward_min_train_windows,
+            cli.walk_forward_test_windows,
+            cli.walk_forward_step_windows,
+            cli.walk_forward_holdout_windows,
+        ),
+        TrainingMode::Rolling => WalkForwardConfig::rolling(
+            cli.walk_forward_min_train_windows,
+            cli.walk_forward_test_windows,
+            cli.walk_forward_step_windows,
+            cli.walk_forward_holdout_windows,
+        ),
+    }))
 }
 
 fn parse_market_filter(s: &str) -> Vec<String> {
@@ -885,7 +950,8 @@ fn summarize_input_windows(
                     .entry(event_type_key(&event.event_type))
                     .or_insert(0) += 1;
                 checksum_payload.extend(
-                    serde_json::to_vec(event).context("serialize replay event for manifest checksum")?,
+                    serde_json::to_vec(event)
+                        .context("serialize replay event for manifest checksum")?,
                 );
                 checksum_payload.push(b'\n');
             }
@@ -1038,8 +1104,10 @@ fn run_main(cli: Cli) -> Result<i32> {
         eprintln!("input prefix not found: {}", cli.input_prefix.display());
         return Ok(3);
     }
-    let (mut windows, diagnostic_windows): (BTreeMap<String, Vec<Event>>, BTreeMap<String, Vec<Event>>) =
-        match cli.input_format.as_str() {
+    let (mut windows, diagnostic_windows): (
+        BTreeMap<String, Vec<Event>>,
+        BTreeMap<String, Vec<Event>>,
+    ) = match cli.input_format.as_str() {
         "rust-event" => {
             let mut events = read_local_filtered(&cli.input_prefix, None)
                 .with_context(|| format!("reading input from {}", cli.input_prefix.display()))?;
@@ -1060,12 +1128,8 @@ fn run_main(cli: Cli) -> Result<i32> {
                     max_book_levels: 0,
                     markets: Vec::new(),
                 };
-                let btc_events = read_raw_replay(btc_prefix, &btc_options).with_context(|| {
-                    format!(
-                        "reading btc-tick prefix {}",
-                        btc_prefix.display()
-                    )
-                })?;
+                let btc_events = read_raw_replay(btc_prefix, &btc_options)
+                    .with_context(|| format!("reading btc-tick prefix {}", btc_prefix.display()))?;
                 eprintln!(
                     "backtest_runner: loaded {} btc_tick events from {}",
                     btc_events.len(),
@@ -1167,6 +1231,9 @@ fn run_main(cli: Cli) -> Result<i32> {
     };
     let input_windows = summarize_input_windows(&diagnostic_windows, &required_types)?;
     validate_input_window_digests(&input_windows)?;
+    let data_quality =
+        summarize_data_quality_windows(&diagnostic_windows, &DataQualityConfig::default());
+    validate_data_quality(&data_quality)?;
     if !cli.independent_windows && cli.input_format != "rust-event" {
         windows = portfolio_windows_from_grouped(&windows, &cli.window_start, &cli.window_end);
     }
@@ -1180,17 +1247,25 @@ fn run_main(cli: Cli) -> Result<i32> {
             end_ns: evs.last().map(|e| e.received_ns).unwrap_or(0),
         })
         .collect();
+    let walk_forward = walk_forward_config(&cli)?
+        .map(|cfg| build_walk_forward_plan(&window_plans, &cfg))
+        .transpose()?;
 
     // Compute run-id. We hash BOTH `fill_config` (latency preset) and
     // `fill_quality` so two runs differing only on either knob produce
     // distinct run-ids.
     let combined_fill_config = format!(
-        "{}+{}+submit_ms={:?}+cancel_ms={:?}+journal={:?}",
+        "{}+{}+submit_ms={:?}+cancel_ms={:?}+journal={:?}+wf={:?}:train={}:test={}:step={}:holdout={}",
         cli.fill_config,
         cli.fill_quality,
         cli.submit_latency_ms,
         cli.cancel_latency_ms,
-        cli.journal_mode
+        cli.journal_mode,
+        cli.walk_forward_mode,
+        cli.walk_forward_min_train_windows,
+        cli.walk_forward_test_windows,
+        cli.walk_forward_step_windows,
+        cli.walk_forward_holdout_windows
     );
     let derived_run_id = compute_run_id(
         &canonical_profile,
@@ -1223,6 +1298,8 @@ fn run_main(cli: Cli) -> Result<i32> {
         fill_config: combined_fill_config.clone(),
         seed: format!("0x{:016x}", seed),
         input_windows,
+        data_quality,
+        walk_forward,
     };
 
     // Output: <output_prefix>/runs/run_id=<id>/manifest.json

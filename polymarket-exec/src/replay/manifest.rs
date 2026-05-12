@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::collector::schema::Event;
+use crate::replay::data_quality::DataQualitySummary;
+use crate::replay::walk_forward::WalkForwardPlan;
 
 /// Frozen schema version we read.
 pub const SCHEMA_VERSION: u32 = Event::SCHEMA_VERSION;
@@ -52,6 +54,10 @@ pub struct Manifest {
     pub seed: String,
     #[serde(default)]
     pub input_windows: Vec<InputWindowDigest>,
+    #[serde(default)]
+    pub data_quality: Vec<DataQualitySummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_forward: Option<WalkForwardPlan>,
 }
 
 /// Hex digest of an arbitrary byte slice.
