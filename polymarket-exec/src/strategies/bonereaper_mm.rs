@@ -22,6 +22,8 @@ pub struct FavoriteClimbConfig {
     pub window_sec: u64,
     /// Optional bar-relative start fraction.
     pub start_frac: f64,
+    /// Do not load the favorite during the opening noise window.
+    pub min_elapsed_sec: u64,
     /// Base clip size, used as floor before ramping.
     pub clip_usd: f64,
     /// Hard cap on directional notional per market.
@@ -45,6 +47,7 @@ impl Default for FavoriteClimbConfig {
             max_favorite_ask: 0.99,
             window_sec: 120,
             start_frac: 0.0,
+            min_elapsed_sec: 10,
             clip_usd: 20.0,
             max_load_usd: 200.0,
             maker_improve_ticks: 0.0,
@@ -239,6 +242,13 @@ fn phase_window_ms(window_sec: u64, start_frac: f64, bar_window_ms: u64) -> u64 
     absolute_ms.max(fractional_ms)
 }
 
+fn elapsed_ms<M: MarketDescriptor>(market: &M, now_ms: EpochMillis, remaining_ms: u64) -> u64 {
+    market
+        .event_start_ms()
+        .map(|start_ms| now_ms.saturating_sub(start_ms))
+        .unwrap_or_else(|| market.window_ms().saturating_sub(remaining_ms))
+}
+
 fn directional_exposure_usd(favorite_qty: f64, other_qty: f64, px: f64) -> f64 {
     let unmatched = (favorite_qty - other_qty).abs().max(0.0);
     unmatched * px.max(0.0)
@@ -253,9 +263,27 @@ fn remaining_directional_load_usd(
     (max_load_usd - directional_exposure_usd(favorite_qty, other_qty, px)).max(0.0)
 }
 
-fn late_climb_clip_usd(cfg: &FavoriteClimbConfig, remaining_ms: u64) -> f64 {
+fn reactive_climb_clip_usd(
+    cfg: &FavoriteClimbConfig,
+    elapsed_ms: u64,
+    remaining_ms: u64,
+    bar_window_ms: u64,
+) -> f64 {
     let remaining_sec = (remaining_ms as f64) / 1000.0;
-    let ramp: f64 = if remaining_sec > 60.0 {
+    let elapsed_sec = (elapsed_ms as f64) / 1000.0;
+    let min_elapsed_sec = cfg.min_elapsed_sec.max(1) as f64;
+    let progress = if bar_window_ms > 0 {
+        (elapsed_ms as f64 / bar_window_ms as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let ramp = if elapsed_sec <= min_elapsed_sec {
+        0.0
+    } else if remaining_sec > 120.0 {
+        // Mid-bar reactive load: the BTC move has already happened, but
+        // there is still reversal risk, so keep this below the late-cert ramp.
+        (cfg.clip_usd * (0.25 + 0.75 * progress)).max(cfg.min_order_usd)
+    } else if remaining_sec > 60.0 {
         100.0
     } else if remaining_sec > 30.0 {
         130.0
@@ -266,7 +294,8 @@ fn late_climb_clip_usd(cfg: &FavoriteClimbConfig, remaining_ms: u64) -> f64 {
     } else {
         250.0
     };
-    ramp.max(cfg.clip_usd)
+    };
+    ramp.max(cfg.min_order_usd)
 }
 
 impl<M> TradingStrategy<M> for LateFavoriteStrategy
@@ -298,6 +327,8 @@ where
         };
 
         let tick = input.market.tick_size().max(0.0001);
+        let bar_window_ms = input.market.window_ms();
+        let elapsed_ms = elapsed_ms(&input.market, input.now_ms, remaining_ms);
         let mut intents = Vec::new();
         let mut notes = Vec::new();
         let climb_enabled = climb_cfg
@@ -320,11 +351,12 @@ where
         let climb_window_ms = phase_window_ms(
             climb_cfg.window_sec,
             climb_cfg.start_frac,
-            input.market.window_ms(),
+            bar_window_ms,
         );
         if climb_cfg.enabled
             && climb_enabled
             && remaining_ms <= climb_window_ms
+            && elapsed_ms >= climb_cfg.min_elapsed_sec.saturating_mul(1_000)
             && legs.favorite_ask >= climb_cfg.min_favorite_ask
             && legs.favorite_ask <= climb_cfg.max_favorite_ask
         {
@@ -371,12 +403,17 @@ where
                         tick,
                         climb_cfg.maker_improve_ticks,
                     ) {
-                        let clip = late_climb_clip_usd(climb_cfg, remaining_ms)
+                        let clip = reactive_climb_clip_usd(
+                            climb_cfg,
+                            elapsed_ms,
+                            remaining_ms,
+                            bar_window_ms,
+                        )
                             .min(remaining_load)
                             .max(climb_cfg.min_order_usd);
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "late_favorite climb leg={:?} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} remaining_ms={remaining_ms}",
+                            "late_favorite climb leg={:?} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
                             legs.favorite_leg,
                             px,
                             legs.favorite_ask,
@@ -456,8 +493,8 @@ where
             StrategyDecision::Noop {
                 notes: if notes.is_empty() {
                     vec![format!(
-                        "late_favorite no fire favorite_ask={:.4} cheap_ask={:.4} remaining_ms={}",
-                        legs.favorite_ask, legs.cheap_ask, remaining_ms
+                        "late_favorite no fire favorite_ask={:.4} cheap_ask={:.4} elapsed_ms={} remaining_ms={}",
+                        legs.favorite_ask, legs.cheap_ask, elapsed_ms, remaining_ms
                     )]
                 } else {
                     notes
@@ -637,6 +674,23 @@ mod tests {
         assert_eq!(phase_window_ms(0, 0.90, 300_000), 30_000);
         assert_eq!(phase_window_ms(0, 0.90, 900_000), 90_000);
         assert_eq!(phase_window_ms(60, 0.0, 300_000), 60_000);
+    }
+
+    #[test]
+    fn reactive_climb_clip_respects_opening_guard_and_time_ramp() {
+        let cfg = FavoriteClimbConfig {
+            clip_usd: 20.0,
+            min_order_usd: 1.0,
+            min_elapsed_sec: 10,
+            ..FavoriteClimbConfig::default()
+        };
+
+        assert_eq!(reactive_climb_clip_usd(&cfg, 5_000, 295_000, 300_000), 1.0);
+        let mid_bar = reactive_climb_clip_usd(&cfg, 90_000, 210_000, 300_000);
+        let late_bar = reactive_climb_clip_usd(&cfg, 210_000, 90_000, 300_000);
+        assert!(mid_bar > cfg.min_order_usd);
+        assert!(mid_bar < cfg.clip_usd);
+        assert!(late_bar >= 100.0);
     }
 
     #[test]

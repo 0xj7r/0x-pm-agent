@@ -64,6 +64,7 @@ pub struct FavoriteClimbSubsection {
     pub max_favorite_ask: Option<f64>,
     pub window_sec: Option<u64>,
     pub start_frac: Option<f64>,
+    pub min_elapsed_sec: Option<u64>,
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
@@ -187,6 +188,7 @@ impl StrategyProfile {
                 max_favorite_ask: c.max_favorite_ask.unwrap_or(climb_def.max_favorite_ask),
                 window_sec: c.window_sec.unwrap_or(climb_def.window_sec),
                 start_frac: c.start_frac.unwrap_or(climb_def.start_frac),
+                min_elapsed_sec: c.min_elapsed_sec.unwrap_or(climb_def.min_elapsed_sec),
                 clip_usd: c.clip_usd.unwrap_or(climb_def.clip_usd),
                 max_load_usd: c.max_load_usd.unwrap_or(climb_def.max_load_usd),
                 maker_improve_ticks: c
