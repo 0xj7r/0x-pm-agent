@@ -294,7 +294,6 @@ fn reactive_climb_clip_usd(
     } else {
         250.0
     };
-    };
     ramp.max(cfg.min_order_usd)
 }
 
