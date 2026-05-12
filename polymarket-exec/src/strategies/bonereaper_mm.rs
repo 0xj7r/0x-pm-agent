@@ -312,6 +312,109 @@ fn favorite_load_price_scale(favorite_ask: f64, min_favorite_ask: f64) -> f64 {
     0.15 + 0.85 * progress
 }
 
+fn signed_for_favorite(leg: LadderLeg, value_bps: f64) -> f64 {
+    match leg {
+        LadderLeg::Yes => value_bps,
+        LadderLeg::No => -value_bps,
+    }
+}
+
+fn favorite_probability(leg: LadderLeg, p_up: f64, p_down: f64) -> f64 {
+    match leg {
+        LadderLeg::Yes => p_up,
+        LadderLeg::No => p_down,
+    }
+}
+
+fn spot_vs_strike_bps<M: MarketDescriptor>(
+    market: &M,
+    spot: Option<f64>,
+    leg: LadderLeg,
+) -> Option<f64> {
+    let spot = spot.filter(|v| v.is_finite() && *v > 0.0)?;
+    let strike = market.price_to_beat().filter(|v| v.is_finite() && *v > 0.0)?;
+    Some(signed_for_favorite(leg, ((spot - strike) / strike) * 10_000.0))
+}
+
+fn favorite_direction_signal<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    cfg: &FavoriteClimbConfig,
+) -> (bool, String) {
+    if !cfg.require_spot_match {
+        return (true, "spot gate disabled".to_string());
+    }
+
+    let threshold = cfg.spot_filter_bps.abs();
+    let side_30 = input
+        .btc_regime
+        .return_30s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_60 = input
+        .btc_regime
+        .return_60s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_120 = input
+        .btc_regime
+        .return_120s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_180 = input
+        .btc_regime
+        .return_180s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_strike = spot_vs_strike_bps(&input.market, input.btc_regime.last_price, legs.favorite_leg);
+    let model_favorite =
+        favorite_probability(legs.favorite_leg, input.fair_value.p_up, input.fair_value.p_down);
+
+    let momentum_ok = [side_60, side_120, side_180]
+        .into_iter()
+        .flatten()
+        .any(|r| r >= threshold * 0.75);
+    let no_sharp_reversal = side_30.map(|r| r >= -threshold * 0.35).unwrap_or(true);
+    let strike_ok = side_strike
+        .map(|m| m >= (threshold * 0.40).max(4.0))
+        .unwrap_or(false)
+        && no_sharp_reversal
+        && [side_60, side_120, side_180]
+            .into_iter()
+            .flatten()
+            .any(|r| r >= threshold * 0.35);
+    let model_ok = model_favorite >= (legs.favorite_ask + 0.03).min(0.98)
+        && side_strike.map(|m| m >= 2.0).unwrap_or(false)
+        && no_sharp_reversal;
+
+    let ok = momentum_ok || strike_ok || model_ok;
+    (
+        ok,
+        format!(
+            "favorite_signal favorite={:?} ok={} ask={:.4} side_strike_bps={:?} side_30s_bps={:?} side_60s_bps={:?} side_120s_bps={:?} side_180s_bps={:?} model_favorite={:.4} threshold_bps={:.2} momentum_ok={} strike_ok={} model_ok={}",
+            legs.favorite_leg,
+            ok,
+            legs.favorite_ask,
+            side_strike,
+            side_30,
+            side_60,
+            side_120,
+            side_180,
+            model_favorite,
+            threshold,
+            momentum_ok,
+            strike_ok,
+            model_ok,
+        ),
+    )
+}
+
+fn favorite_load_levels(favorite_ask: f64, remaining_ms: u64) -> usize {
+    if favorite_ask >= 0.90 && remaining_ms <= 120_000 {
+        3
+    } else if favorite_ask >= 0.75 {
+        2
+    } else {
+        1
+    }
+}
+
 impl<M> TradingStrategy<M> for LateFavoriteStrategy
 where
     M: MarketDescriptor,
@@ -374,27 +477,15 @@ where
             && legs.favorite_ask >= climb_cfg.min_favorite_ask
             && legs.favorite_ask <= climb_cfg.max_favorite_ask
         {
-            let spot_bps = input.btc_regime.return_120s_bps;
-            let direction_ok = if let Some(r) = spot_bps {
-                if climb_cfg.require_spot_match {
-                    let threshold = climb_cfg.spot_filter_bps.abs();
-                    match legs.favorite_leg {
-                        LadderLeg::Yes => r >= threshold,
-                        LadderLeg::No => r <= -threshold,
-                    }
-                } else {
-                    true
-                }
-            } else {
-                !climb_cfg.require_spot_match
-            };
+            let (direction_ok, signal_note) =
+                favorite_direction_signal(&input, &legs, climb_cfg);
 
             if !direction_ok {
                 notes.push(format!(
-                    "late_favorite blocked by spot direction filter favorite={:?} return_120s_bps={:?}",
-                    legs.favorite_leg, spot_bps,
+                    "late_favorite blocked by favorite signal {signal_note}",
                 ));
             } else {
+                notes.push(signal_note);
                 let (favorite_qty, other_qty) = match legs.favorite_leg {
                     LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                     LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
@@ -411,42 +502,55 @@ where
                     climb_cfg.max_load_usd,
                 );
                 if remaining_load >= climb_cfg.min_order_usd {
-                    if let Some(px) = maker_limit_price(
+                    if let Some(base_px) = maker_limit_price(
                         legs.favorite_bid,
                         legs.favorite_ask,
                         tick,
                         climb_cfg.maker_improve_ticks,
                     ) {
-                        let clip = reactive_climb_clip_usd(
+                        let per_level_clip = reactive_climb_clip_usd(
                             climb_cfg,
                             legs.favorite_ask,
                             elapsed_ms,
                             remaining_ms,
                             bar_window_ms,
                         )
-                            .min(remaining_load)
                             .max(climb_cfg.min_order_usd);
-                        let qty = (clip / px).max(input.market.min_order_size());
-                        let reason = format!(
-                            "late_favorite climb leg={:?} px={:.4} ask={:.4} price_scale={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
-                            legs.favorite_leg,
-                            px,
-                            legs.favorite_ask,
-                            favorite_load_price_scale(legs.favorite_ask, climb_cfg.min_favorite_ask),
-                            clip,
-                            current_exposure_usd,
-                            climb_cfg.max_load_usd,
-                        );
-                        notes.push(reason.clone());
-                        intents.push(build_late_favorite_intent(
-                            &input.market,
-                            legs.favorite_leg,
-                            px,
-                            qty,
-                            "climb",
-                            reason,
-                            input.now_ms,
-                        ));
+                        let mut load_left = remaining_load;
+                        let level_count = favorite_load_levels(legs.favorite_ask, remaining_ms);
+                        for level in 0..level_count {
+                            if load_left < climb_cfg.min_order_usd {
+                                break;
+                            }
+                            let px = base_px - tick * level as f64;
+                            if px <= 0.0 || px >= legs.favorite_ask {
+                                continue;
+                            }
+                            let clip = per_level_clip.min(load_left).max(climb_cfg.min_order_usd);
+                            let qty = (clip / px).max(input.market.min_order_size());
+                            let reason = format!(
+                                "late_favorite climb leg={:?} level={} px={:.4} ask={:.4} price_scale={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
+                                legs.favorite_leg,
+                                level,
+                                px,
+                                legs.favorite_ask,
+                                favorite_load_price_scale(legs.favorite_ask, climb_cfg.min_favorite_ask),
+                                clip,
+                                current_exposure_usd + (remaining_load - load_left),
+                                climb_cfg.max_load_usd,
+                            );
+                            notes.push(reason.clone());
+                            intents.push(build_late_favorite_intent(
+                                &input.market,
+                                legs.favorite_leg,
+                                px,
+                                qty,
+                                &format!("climb:{level}"),
+                                reason,
+                                input.now_ms,
+                            ));
+                            load_left -= clip;
+                        }
                     }
                 }
             }
