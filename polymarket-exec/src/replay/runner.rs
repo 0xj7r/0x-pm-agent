@@ -1496,10 +1496,14 @@ fn classify_tag(tag: &str) -> AttributionPath {
     let tag = tag.to_ascii_lowercase();
     // Order matters: late-favorite specializations of convex-accum must
     // be detected before the generic convex-accum cheap-tail bucket.
-    if tag.contains("paired-mm-convex")
+    if tag.contains("late-fav-tail") {
+        AttributionPath::CheapTailConvexity
+    } else if tag.contains("paired-mm-convex")
         || tag.contains("late-bar-core")
+        || tag.contains("late-fav-climb")
         || tag.contains("late_favorite")
         || tag.contains("late-favorite")
+        || tag.contains("late-fav")
         || tag.contains("late favorite")
         || tag.contains("favorite_loading")
         || tag.contains("favorite-loading")
@@ -1519,6 +1523,8 @@ fn classify_tag(tag: &str) -> AttributionPath {
         || tag.contains("paired-mm:")
         || tag.contains("paired-mm-merge")
         || tag.contains("capital-recycle")
+        || tag.contains("core-hedge")
+        || tag.contains("core_hedge")
     {
         AttributionPath::PairedMm
     } else {
@@ -3616,6 +3622,22 @@ mod tests {
         );
         assert_eq!(
             classify_tag("mm-convex-accum:ultra-cheap-tail:no:convex_accum"),
+            AttributionPath::CheapTailConvexity
+        );
+        assert_eq!(
+            classify_tag("core-hedge:core"),
+            AttributionPath::PairedMm
+        );
+        assert_eq!(
+            classify_tag("core_hedge geometry mismatch yes_ask=None no_ask=Some(0.55)"),
+            AttributionPath::PairedMm
+        );
+        assert_eq!(
+            classify_tag("late-fav-climb"),
+            AttributionPath::LateFavorite
+        );
+        assert_eq!(
+            classify_tag("late-fav-tail"),
             AttributionPath::CheapTailConvexity
         );
     }
