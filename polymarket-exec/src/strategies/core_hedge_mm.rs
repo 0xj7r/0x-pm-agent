@@ -39,6 +39,15 @@ pub struct CoreHedgeMmConfig {
     pub bar_capital_usd: f64,
     /// Target cheap-to-expensive notional ratio. Whale sits at ~0.47.
     pub target_hedge_ratio: f64,
+    /// Canonical paired ladder levels per side. When > 1, emit a symmetric
+    /// two-leg ladder instead of the legacy one-core/one-hedge quote.
+    pub ladder_levels: usize,
+    /// Total price span covered by the paired ladder on each leg.
+    pub ladder_span: f64,
+    /// Fallback ladder center when a leg lacks a visible midpoint.
+    pub center_price: f64,
+    /// Per-level share clip for the canonical paired ladder.
+    pub clip_shares: f64,
     /// Per-clip size by leg.
     pub core_clip_usd: f64,
     pub hedge_clip_usd: f64,
@@ -67,6 +76,10 @@ impl Default for CoreHedgeMmConfig {
             min_price_gap: 0.12,
             bar_capital_usd: 50.0,
             target_hedge_ratio: 0.47,
+            ladder_levels: 0,
+            ladder_span: 0.42,
+            center_price: 0.50,
+            clip_shares: 20.0,
             core_clip_usd: 13.0,
             hedge_clip_usd: 5.0,
             maker_improve_ticks: 0.0,
@@ -99,7 +112,7 @@ impl Default for CoreHedgeMmStrategyConfig {
 /// second instead of accumulating it over minutes like a real maker.
 /// That artifact lets the simulator fill us on tiny trade-through
 /// events that wouldn't reach a long-resting maker.
-type LastEmitKey = (MarketId, LadderLeg, &'static str);
+type LastEmitKey = (MarketId, LadderLeg, String);
 
 #[derive(Clone, Debug)]
 pub struct CoreHedgeMmStrategy {
@@ -122,8 +135,8 @@ impl CoreHedgeMmStrategy {
     /// Returns true (and records) if this leg+tag should re-emit at the
     /// given price/qty. Returns false if the prior emission was identical
     /// within tolerance — caller should skip the intent.
-    fn should_emit(&mut self, market_id: &MarketId, leg: LadderLeg, tag: &'static str, price: f64, qty: f64) -> bool {
-        let key = (market_id.clone(), leg, tag);
+    fn should_emit(&mut self, market_id: &MarketId, leg: LadderLeg, tag: &str, price: f64, qty: f64) -> bool {
+        let key = (market_id.clone(), leg, tag.to_string());
         let changed = match self.last_emit.get(&key) {
             Some(&(prev_px, prev_qty)) => {
                 (price - prev_px).abs() > 1e-6 || (qty - prev_qty).abs() > 1e-6
@@ -213,14 +226,12 @@ fn build_clip<M: MarketDescriptor>(
         LadderLeg::Yes => market.yes_instrument_id().clone(),
         LadderLeg::No => market.no_instrument_id().clone(),
     };
-    // Stable CoID per (market, leg, tag): same string across ticks. The
-    // strategy gates re-emits via `should_emit` so we only submit when
-    // (price, qty) actually change.
     let coid = ClientOrderId::from(format!(
-        "core-hedge:{}:{:?}:{}",
+        "core-hedge:{}:{:?}:{}:{}",
         market.market_id(),
         leg,
         tag,
+        now_ms,
     ));
     let mut intent = OrderIntent::new_buy(
         coid,
@@ -239,6 +250,80 @@ fn build_clip<M: MarketDescriptor>(
     Some(intent)
 }
 
+fn quote_mid(best_bid: f64, best_ask: f64, fallback: f64) -> f64 {
+    if best_bid > 0.0 && best_ask > best_bid && best_ask < 1.0 {
+        (best_bid + best_ask) / 2.0
+    } else {
+        fallback
+    }
+}
+
+fn canonical_clip_shares(price: f64, base_clip: f64) -> f64 {
+    let d = (price - 0.5).abs();
+    let scale = if d <= 0.05 {
+        1.0
+    } else if d <= 0.10 {
+        1.10
+    } else if d <= 0.20 {
+        1.25
+    } else if d <= 0.30 {
+        1.50
+    } else if d <= 0.40 {
+        1.85
+    } else {
+        3.0
+    };
+    (base_clip * scale).max(0.0)
+}
+
+fn build_ladder_level<M: MarketDescriptor>(
+    market: &M,
+    leg: LadderLeg,
+    best_ask: f64,
+    price: f64,
+    quantity: f64,
+    tag: &str,
+    min_order_usd: f64,
+    now_ms: EpochMillis,
+) -> Option<OrderIntent> {
+    let tick = market.tick_size().max(0.0001);
+    let max_passive = (best_ask - tick).max(tick);
+    let limit_price = price.min(max_passive);
+    if limit_price <= 0.0 || limit_price >= 1.0 {
+        return None;
+    }
+    let mut qty = quantity.max(market.min_order_size());
+    if qty * limit_price < min_order_usd {
+        qty = (min_order_usd / limit_price).max(market.min_order_size());
+    }
+    let instrument_id = match leg {
+        LadderLeg::Yes => market.yes_instrument_id().clone(),
+        LadderLeg::No => market.no_instrument_id().clone(),
+    };
+    let coid = ClientOrderId::from(format!(
+        "core-hedge:{}:{:?}:{}:{}",
+        market.market_id(),
+        leg,
+        tag,
+        now_ms,
+    ));
+    let mut intent = OrderIntent::new_buy(
+        coid,
+        market.market_id().clone(),
+        instrument_id,
+        limit_price,
+        qty,
+        format!(
+            "core_hedge ladder leg={:?} tag={} px={:.4} qty={:.4}",
+            leg, tag, limit_price, qty,
+        ),
+        now_ms,
+    );
+    intent.kind = IntentKind::Entry;
+    intent.quote_level_tag = Some(format!("core-hedge:{}", tag));
+    Some(intent)
+}
+
 impl<M> TradingStrategy<M> for CoreHedgeMmStrategy
 where
     M: MarketDescriptor,
@@ -248,7 +333,7 @@ where
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
-        let cfg = &self.config.core_hedge;
+        let cfg = self.config.core_hedge;
         if !cfg.enabled {
             return StrategyDecision::Noop {
                 notes: vec!["core_hedge disabled".to_string()],
@@ -303,7 +388,67 @@ where
             }
         }
 
-        let Some(geom) = classify_legs(&input.snapshot, cfg) else {
+        if cfg.ladder_levels > 1 {
+            let yes_bid = input.snapshot.yes_quote.best_bid.as_ref().map(|l| l.price);
+            let yes_ask = input.snapshot.yes_quote.best_ask.as_ref().map(|l| l.price);
+            let no_bid = input.snapshot.no_quote.best_bid.as_ref().map(|l| l.price);
+            let no_ask = input.snapshot.no_quote.best_ask.as_ref().map(|l| l.price);
+            let (Some(yes_bid), Some(yes_ask), Some(no_bid), Some(no_ask)) =
+                (yes_bid, yes_ask, no_bid, no_ask)
+            else {
+                return StrategyDecision::Noop {
+                    notes: vec![format!(
+                        "core_hedge ladder missing quotes yes_bid={yes_bid:?} yes_ask={yes_ask:?} no_bid={no_bid:?} no_ask={no_ask:?}",
+                    )],
+                };
+            };
+
+            let mut intents = Vec::new();
+            let mut notes = Vec::new();
+            let levels = cfg.ladder_levels.max(2);
+            let half_span = (cfg.ladder_span / 2.0).max(0.0);
+            let market_id = input.market.market_id().clone();
+            for (leg, best_bid, best_ask) in [
+                (LadderLeg::Yes, yes_bid, yes_ask),
+                (LadderLeg::No, no_bid, no_ask),
+            ] {
+                let mid = quote_mid(best_bid, best_ask, cfg.center_price).clamp(0.01, 0.99);
+                let low = (mid - half_span).clamp(0.01, 0.99);
+                let high = (mid + half_span).clamp(0.01, 0.99);
+                let denom = (levels - 1) as f64;
+                for idx in 0..levels {
+                    let raw_price = low + (high - low) * (idx as f64 / denom);
+                    let qty = canonical_clip_shares(raw_price, cfg.clip_shares);
+                    let tag = format!("ladder:{idx}");
+                    if let Some(intent) = build_ladder_level(
+                        &input.market,
+                        leg,
+                        best_ask,
+                        raw_price,
+                        qty,
+                        &tag,
+                        cfg.min_order_usd,
+                        input.now_ms,
+                    ) {
+                        if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
+                            intents.push(intent);
+                        }
+                    }
+                }
+                notes.push(format!(
+                    "core_hedge ladder leg={leg:?} levels={levels} span={:.4} mid={mid:.4} low={low:.4} high={high:.4}",
+                    cfg.ladder_span,
+                ));
+            }
+
+            return if intents.is_empty() {
+                StrategyDecision::Noop { notes }
+            } else {
+                StrategyDecision::QuoteSet { intents, notes }
+            };
+        }
+
+        let Some(geom) = classify_legs(&input.snapshot, &cfg) else {
             return StrategyDecision::Noop {
                 notes: vec![format!(
                     "core_hedge geometry mismatch yes_ask={:?} no_ask={:?}",
