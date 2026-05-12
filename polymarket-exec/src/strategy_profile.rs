@@ -165,6 +165,10 @@ impl StrategyProfile {
         CoreHedgeMmStrategyConfig {
             core_hedge: CoreHedgeMmConfig {
                 enabled: s.enabled.unwrap_or(defaults.enabled),
+                ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
+                ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
+                center_price: s.center_price.unwrap_or(defaults.center_price),
+                clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
                 maker_improve_ticks: s
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
