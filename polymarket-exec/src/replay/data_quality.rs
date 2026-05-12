@@ -20,6 +20,7 @@ pub struct DataQualityConfig {
     pub book_gap_warn_ns: i64,
     pub book_gap_reject_ns: i64,
     pub crossed_book_reject_samples: u64,
+    pub crossed_book_reject_duration_ns: i64,
 }
 
 impl Default for DataQualityConfig {
@@ -30,6 +31,7 @@ impl Default for DataQualityConfig {
             book_gap_warn_ns: 10 * NS_PER_SECOND,
             book_gap_reject_ns: 60 * NS_PER_SECOND,
             crossed_book_reject_samples: 100,
+            crossed_book_reject_duration_ns: 250_000_000,
         }
     }
 }
@@ -66,6 +68,8 @@ pub struct DataQualitySummary {
     pub max_book_gap_ns: i64,
     pub missing_book_asset_ids: Vec<String>,
     pub crossed_book_samples: u64,
+    pub crossed_book_max_duration_ns: i64,
+    pub crossed_book_persistent_count: u64,
     pub warnings: Vec<String>,
     pub reject_reasons: Vec<String>,
 }
@@ -109,6 +113,7 @@ struct BookState {
     bids: BookSide,
     asks: BookSide,
     saw_snapshot: bool,
+    crossed_since_ns: Option<i64>,
 }
 
 pub fn summarize_data_quality(
@@ -190,7 +195,13 @@ pub fn summarize_data_quality(
                 {
                     if let Some(asset) = event.asset_id.as_deref().filter(|asset| !asset.is_empty())
                     {
-                        books.entry(asset.to_string()).or_default().saw_snapshot = true;
+                        books.insert(
+                            asset.to_string(),
+                            BookState {
+                                saw_snapshot: true,
+                                ..BookState::default()
+                            },
+                        );
                         continue;
                     }
                 }
@@ -215,13 +226,7 @@ pub fn summarize_data_quality(
                         "sell" | "ask" | "asks" => state.asks.update(price, size),
                         _ => summary.invalid_size_count += 1,
                     }
-                    if let (Some(best_bid), Some(best_ask)) =
-                        (state.bids.best_bid(), state.asks.best_ask())
-                    {
-                        if best_bid >= best_ask {
-                            summary.crossed_book_samples += 1;
-                        }
-                    }
+                    record_cross_status(state, event.received_ns, &mut summary, cfg);
                 }
             }
             EventType::Trade => {
@@ -259,6 +264,11 @@ pub fn summarize_data_quality(
             .is_none_or(|book| !book.saw_snapshot || book.bids.is_empty() || book.asks.is_empty());
         if missing {
             summary.missing_book_asset_ids.push(asset_id);
+        }
+    }
+    if let Some(last_ns) = summary.last_received_ns {
+        for state in books.values_mut() {
+            close_open_cross(state, last_ns, &mut summary, cfg);
         }
     }
 
@@ -335,10 +345,10 @@ fn classify_data_quality(summary: &mut DataQualitySummary, cfg: &DataQualityConf
             .reject_reasons
             .push(format!("max_book_gap_ns={}", summary.max_book_gap_ns));
     }
-    if summary.crossed_book_samples > cfg.crossed_book_reject_samples {
+    if summary.crossed_book_persistent_count > 0 {
         summary.reject_reasons.push(format!(
-            "crossed_book_samples={}",
-            summary.crossed_book_samples
+            "crossed_book_persistent_count={},max_duration_ns={}",
+            summary.crossed_book_persistent_count, summary.crossed_book_max_duration_ns
         ));
     }
 
@@ -372,8 +382,8 @@ fn classify_data_quality(summary: &mut DataQualitySummary, cfg: &DataQualityConf
     }
     if summary.crossed_book_samples > 0 {
         summary.warnings.push(format!(
-            "crossed_book_samples={}",
-            summary.crossed_book_samples
+            "crossed_book_samples={},max_duration_ns={}",
+            summary.crossed_book_samples, summary.crossed_book_max_duration_ns
         ));
     }
     if summary.resolution_event_count == 0 {
@@ -465,13 +475,45 @@ fn apply_raw_book_snapshot(
         }
     }
 
-    if let (Some(best_bid), Some(best_ask)) = (state.bids.best_bid(), state.asks.best_ask()) {
-        if best_bid >= best_ask {
-            summary.crossed_book_samples += 1;
-        }
-    }
+    record_cross_status(state, event.received_ns, summary, &DataQualityConfig::default());
 
     true
+}
+
+fn record_cross_status(
+    state: &mut BookState,
+    received_ns: i64,
+    summary: &mut DataQualitySummary,
+    cfg: &DataQualityConfig,
+) {
+    let crossed = matches!(
+        (state.bids.best_bid(), state.asks.best_ask()),
+        (Some(best_bid), Some(best_ask)) if best_bid > best_ask
+    );
+    if crossed {
+        summary.crossed_book_samples += 1;
+        if state.crossed_since_ns.is_none() {
+            state.crossed_since_ns = Some(received_ns);
+        }
+        return;
+    }
+    close_open_cross(state, received_ns, summary, cfg);
+}
+
+fn close_open_cross(
+    state: &mut BookState,
+    received_ns: i64,
+    summary: &mut DataQualitySummary,
+    cfg: &DataQualityConfig,
+) {
+    let Some(start_ns) = state.crossed_since_ns.take() else {
+        return;
+    };
+    let duration = received_ns.saturating_sub(start_ns);
+    summary.crossed_book_max_duration_ns = summary.crossed_book_max_duration_ns.max(duration);
+    if duration > cfg.crossed_book_reject_duration_ns {
+        summary.crossed_book_persistent_count += 1;
+    }
 }
 
 fn price_tick(price: f64) -> i64 {
