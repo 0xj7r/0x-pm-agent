@@ -27,7 +27,7 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::live_health::portfolio_equity_floor_usd;
 use crate::runtime::live_health::{
     auto_recover_live_riskoff, enforce_capital_guard, enforce_live_health,
-    needs_reconcile_order_count,
+    live_kill_switch_reason, needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
     fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
@@ -2264,8 +2264,33 @@ async fn execute_execution_adapter(
                     continue;
                 }
 
-                let submit_req =
-                    submit_request_from_intent(&intent, observed_at_ms, execution_policy);
+                if let Some(reason) =
+                    live_kill_switch_reason(execution_policy.live_kill_switch_path.as_deref())
+                {
+                    warn!(
+                        target: "polymarket_exec::runtime::runner",
+                        mode = "live",
+                        client_order_id = %intent.client_order_id,
+                        reason = %reason,
+                        "blocking live submit before venue"
+                    );
+                    if runtime.status() == RuntimeStatus::Running {
+                        metrics.observe_riskoff_transition();
+                        let kill_outcome = runtime.degrade_and_cancel_all(
+                            observed_at_ms,
+                            format!("live health failure: {reason}"),
+                        );
+                        let chained_commands = kill_outcome.commands.clone();
+                        combined.extend(kill_outcome);
+                        for command in chained_commands {
+                            queue.push_back(command);
+                        }
+                    }
+                    paper_order_ctx.remove(&intent.client_order_id);
+                    execution_venue_map.remove(&intent.client_order_id);
+                    continue;
+                }
+
                 if !runtime_has_active_order(runtime, &intent.client_order_id) {
                     debug!(
                         mode = "live",
@@ -2276,6 +2301,8 @@ async fn execute_execution_adapter(
                     execution_venue_map.remove(&intent.client_order_id);
                     continue;
                 }
+                let submit_req =
+                    submit_request_from_intent(&intent, observed_at_ms, execution_policy);
                 // Latency instrumentation (2026-04-29): measure two spans —
                 // wire_latency (submit call → adapter return) and
                 // pipeline_latency (intent creation → adapter return). Used

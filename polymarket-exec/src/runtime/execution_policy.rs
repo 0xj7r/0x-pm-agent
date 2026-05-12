@@ -1,6 +1,7 @@
 use crate::config::AppConfig;
 use crate::types::ClientOrderId;
 use crate::wire::execution_adapter::{VenueFill, VenuePosition};
+use std::path::PathBuf;
 
 #[derive(Debug, Default)]
 pub(super) struct LiveSafetyState {
@@ -37,6 +38,7 @@ pub(super) struct ExecutionPolicy {
     pub(super) live_max_submit_errors: usize,
     pub(super) live_max_cancel_errors: usize,
     pub(super) live_kill_on_reconcile_mismatch: bool,
+    pub(super) live_kill_switch_path: Option<PathBuf>,
     pub(super) paper_min_fill_notional_usd: f64,
     pub(super) paper_max_fills_per_order: usize,
     pub(super) paper_min_fill_interval_ms: u64,
@@ -61,6 +63,7 @@ impl ExecutionPolicy {
             live_max_submit_errors: config.live_max_submit_errors,
             live_max_cancel_errors: config.live_max_cancel_errors,
             live_kill_on_reconcile_mismatch: config.live_kill_on_reconcile_mismatch,
+            live_kill_switch_path: config.live_kill_switch_path.clone(),
             paper_min_fill_notional_usd: config.paper_min_fill_notional_usd,
             paper_max_fills_per_order: config.paper_max_fills_per_order,
             paper_min_fill_interval_ms: config.paper_min_fill_interval.as_millis() as u64,
