@@ -4,16 +4,17 @@ version: "1.0"
 last_updated: 2026-05-11
 description: |
   Bonereaper strategy as one profile with explicit paired MM core and late-favorite
-  directional overlay: paired-core is handled by core_hedge, directional timing by
+  directional overlay: paired-core is handled by paired_core, directional timing by
   late_favorite. The favorite load is reactive to BTC spot direction throughout
-  the eligible bar, with an opening-noise guard and size increasing toward expiry.
+  the eligible bar, with an opening-noise guard, smaller sub-90c overlays, and
+  size increasing toward expiry.
 
   Important: late-favorite clips are heuristic shape+hard-cap driven (anti-Kelly).
   They scale with bar progress and are capped by max_load_usd.
   The whale behavior is consistent with hard shape controls plus hard per-market clips,
   not per-bet Kelly optimization.
 
-core_hedge:
+paired_core:
   enabled: true
   ladder_levels: 17
   ladder_span: 0.42
@@ -26,7 +27,7 @@ core_hedge:
 late_favorite:
   favorite_climb:
     enabled: true
-    min_favorite_ask: 0.90
+    min_favorite_ask: 0.70
     max_favorite_ask: 0.99
     window_sec: 300
     start_frac: 0.10

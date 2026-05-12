@@ -1671,14 +1671,24 @@ fn add_fill_attr(map: &mut BTreeMap<String, FillAttribution>, key: &str, fill: &
 }
 
 fn fill_path(fill: &SimulatedFill) -> &'static str {
-    let coid = fill.client_order_id.as_str();
+    let coid = fill.client_order_id.to_ascii_lowercase();
     if coid.contains("convex") {
         "convex_overlay"
+    } else if coid.contains("late-fav:tail") {
+        "cheap_tail_convexity"
+    } else if coid.contains("late-fav") {
+        "late_favorite_loading"
     } else if coid.contains("capital-recycle") {
         "capital_recycle"
     } else if coid.contains("hedge-rescue") {
         "hedge_rescue"
-    } else if coid.contains("paired-mm") || coid.contains("paired-bid") {
+    } else if coid.contains("paired-mm")
+        || coid.contains("paired-bid")
+        || coid.contains("paired-core")
+        || coid.contains("paired_core")
+        || coid.contains("core-hedge")
+        || coid.contains("core_hedge")
+    {
         "paired_ladder"
     } else {
         "other"
@@ -1686,7 +1696,7 @@ fn fill_path(fill: &SimulatedFill) -> &'static str {
 }
 
 fn fill_leg(fill: &SimulatedFill) -> &'static str {
-    let coid = fill.client_order_id.as_str();
+    let coid = fill.client_order_id.to_ascii_lowercase();
     if coid.contains(":yes:") {
         "yes"
     } else if coid.contains(":no:") {
