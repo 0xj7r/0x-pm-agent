@@ -413,6 +413,75 @@ async fn live_execution_ignores_stale_submit_after_order_left_memory() {
 }
 
 #[tokio::test]
+async fn live_execution_blocks_submit_when_kill_switch_active() {
+    let client_order_id = ClientOrderId::from("client-kill-switch");
+    let mut runtime = runtime_with_recovered_order(
+        client_order_id.clone(),
+        ManagedOrderStatus::PendingSubmit,
+        now_unix_ms(),
+        "polymarket-exec-live-kill-switch",
+    );
+    let intent = OrderIntent {
+        client_order_id: client_order_id.clone(),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.40,
+        quantity: 5.0,
+        reduce_only: false,
+        reason: "kill switch submit".to_string(),
+        quote_level_tag: None,
+        created_at_ms: now_unix_ms(),
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let mut initial_outcome = RuntimeOutcome::default();
+    initial_outcome.push_command(RuntimeCommand::Submit(intent));
+
+    let kill_path = std::env::temp_dir().join(format!(
+        "polymarket-exec-test-kill-switch-{}",
+        now_unix_ms()
+    ));
+    std::fs::write(&kill_path, b"kill").expect("write kill switch");
+
+    let adapter = Arc::new(RecordingAdapter::default());
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets: Vec<String> = Vec::new();
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map = HashMap::new();
+    let mut live_safety = LiveSafetyState::default();
+    let mut execution_policy = live_test_policy();
+    execution_policy.live_kill_switch_path = Some(kill_path.clone());
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let _outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        initial_outcome,
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter.clone(),
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("execute");
+
+    let _ = std::fs::remove_file(&kill_path);
+
+    assert!(adapter.submitted.lock().expect("submitted lock").is_empty());
+    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 1);
+}
+
+#[tokio::test]
 async fn live_execution_does_not_replay_pending_submit_already_in_current_queue() {
     let client_order_id = ClientOrderId::from("client-fresh-pending");
     let mut runtime = runtime_with_recovered_order(
@@ -2063,6 +2132,7 @@ fn live_test_policy() -> ExecutionPolicy {
         live_max_submit_errors: 1,
         live_max_cancel_errors: 1,
         live_kill_on_reconcile_mismatch: true,
+        live_kill_switch_path: None,
         paper_min_fill_notional_usd: 0.05,
         paper_max_fills_per_order: 3,
         paper_min_fill_interval_ms: 750,

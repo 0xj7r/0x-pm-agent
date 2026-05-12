@@ -5,6 +5,7 @@ use crate::runtime::execution_policy::LiveSafetyState;
 use crate::runtime::{Runtime, RuntimeOutcome};
 use crate::strategy::StrategyMode;
 use crate::types::RuntimeStatus;
+use std::path::Path;
 
 const LIVE_HEALTH_STARTUP_GRACE_MS: u64 = 15_000;
 
@@ -28,6 +29,10 @@ pub(super) fn enforce_live_health(
 ) -> RuntimeOutcome {
     if config.paper_mode || runtime.status() != RuntimeStatus::Running {
         return RuntimeOutcome::default();
+    }
+    if let Some(reason) = live_kill_switch_reason(config.live_kill_switch_path.as_deref()) {
+        metrics.observe_riskoff_transition();
+        return runtime.degrade_and_cancel_all(now_ms, format!("live health failure: {reason}"));
     }
     if now_ms.saturating_sub(started_at_ms) < LIVE_HEALTH_STARTUP_GRACE_MS {
         return RuntimeOutcome::default();
@@ -178,16 +183,16 @@ fn live_health_failures(
             }
         }
     }
-    if let Some(path) = config.live_kill_switch_path.as_ref() {
-        if path.exists() {
-            health_failures.push(format!(
-                "operator kill switch active path={}",
-                path.display()
-            ));
-        }
+    if let Some(reason) = live_kill_switch_reason(config.live_kill_switch_path.as_deref()) {
+        health_failures.push(reason);
     }
 
     (health_failures, risk_failures)
+}
+
+pub(super) fn live_kill_switch_reason(path: Option<&Path>) -> Option<String> {
+    path.filter(|path| path.exists())
+        .map(|path| format!("operator kill switch active path={}", path.display()))
 }
 
 pub(super) fn enforce_capital_guard(
