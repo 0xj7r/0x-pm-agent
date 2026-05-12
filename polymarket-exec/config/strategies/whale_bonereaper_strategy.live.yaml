@@ -35,9 +35,8 @@ late_favorite:
     min_order_usd: 1.0
     spot_filter_bps: 10.0
     require_spot_match: true
-    disable_after_ms: 1776747600000
   convex_tail:
-    enabled: true
+    enabled: false
     max_cheap_ask: 0.02
     window_sec: 60
     start_frac: 0.0
@@ -45,4 +44,3 @@ late_favorite:
     max_load_usd: 15.0
     maker_improve_ticks: 0.0
     min_order_usd: 0.5
-    disable_after_ms: 1776747600000

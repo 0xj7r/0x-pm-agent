@@ -39,7 +39,7 @@ fn btc_5m_hybrid_env_example_matches_active_strategy_contract() {
     let values = parse_env_example(&raw);
     assert_eq!(
         values.get("PM_BTC_5M_STRATEGY").map(String::as_str),
-        Some("paired_mm")
+        Some("bonereaper_mm")
     );
     assert_eq!(
         values.get("PM_BTC_5M_PAPER_MODE").map(String::as_str),

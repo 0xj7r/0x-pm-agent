@@ -10,6 +10,7 @@ This workspace contains the Rust execution scaffold for whale-pair.
 
 ## Operational runbooks
 
+- Backtest pipeline: `docs/backtest_aws_fleet.md`
 - Paper/tiny-live runbook: `docs/architecture/2026-04-23-btc-5m-mm-paper-and-tiny-live-runbook.md`
 - Infra requirements: `docs/architecture/2026-04-23-btc-5m-mm-infra-requirements.md`
 - Paper storage/archive plan: `docs/architecture/2026-04-24-paper-storage-archive-plan.md`
