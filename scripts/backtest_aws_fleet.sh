@@ -20,6 +20,11 @@ Common options:
   --fill-config STRING            default: nominal
   --fill-quality STRING           default: base
   --journal-mode none|full        default: none
+  --walk-forward-mode none|expanding|rolling
+  --walk-forward-min-train-windows N
+  --walk-forward-test-windows N
+  --walk-forward-step-windows N
+  --walk-forward-holdout-windows N
   --starting-cash-usd N           default: 1000
   --runner PATH                   default: target/release/backtest_runner
   --cache-root PATH               local cache root (local mode) default: .cache/backtest-events
@@ -32,6 +37,7 @@ Common options:
   --aws-workdir PATH              default: /work/polymarket-agent
   --seed N                        default: 0xC0FFEE
   --sync-only                     only sync inputs, no backtests
+  --validate-cache                with --sync-only, dry-run Rust parser/preflight against prepared shard
   --dry-run                       print planned commands only
   --force-reload                   resync day shard even if manifest indicates ready
   --skip-sync                     skip syncing and use cached local shard
@@ -65,6 +71,11 @@ MARKET_FILTER="btc_5m"
 FILL_CONFIG="nominal"
 FILL_QUALITY="base"
 JOURNAL_MODE="none"
+WALK_FORWARD_MODE="none"
+WALK_FORWARD_MIN_TRAIN_WINDOWS=0
+WALK_FORWARD_TEST_WINDOWS=0
+WALK_FORWARD_STEP_WINDOWS=1
+WALK_FORWARD_HOLDOUT_WINDOWS=0
 PROFILE_PATH=""
 RUNNER="$RUNNER_DEFAULT"
 START_CASH=1000
@@ -78,6 +89,7 @@ AWS_BATCH_DEF=""
 AWS_WORKDIR="$AWS_DEFAULT_WORKDIR"
 SEED="0xC0FFEE"
 SYNC_ONLY=0
+VALIDATE_CACHE=0
 DRY_RUN=0
 FORCE_RELOAD=0
 SKIP_SYNC=0
@@ -151,6 +163,26 @@ while [ "$#" -gt 0 ]; do
       JOURNAL_MODE="$2"
       shift 2
       ;;
+    --walk-forward-mode)
+      WALK_FORWARD_MODE="$2"
+      shift 2
+      ;;
+    --walk-forward-min-train-windows)
+      WALK_FORWARD_MIN_TRAIN_WINDOWS="$2"
+      shift 2
+      ;;
+    --walk-forward-test-windows)
+      WALK_FORWARD_TEST_WINDOWS="$2"
+      shift 2
+      ;;
+    --walk-forward-step-windows)
+      WALK_FORWARD_STEP_WINDOWS="$2"
+      shift 2
+      ;;
+    --walk-forward-holdout-windows)
+      WALK_FORWARD_HOLDOUT_WINDOWS="$2"
+      shift 2
+      ;;
     --starting-cash-usd|--starting-cash)
       START_CASH="$2"
       shift 2
@@ -201,6 +233,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --sync-only)
       SYNC_ONLY=1
+      shift
+      ;;
+    --validate-cache)
+      VALIDATE_CACHE=1
       shift
       ;;
     --dry-run)
@@ -307,6 +343,16 @@ fi
 if [ "$JOURNAL_MODE" != "none" ] && [ "$JOURNAL_MODE" != "full" ]; then
   echo "--journal-mode must be none|full" >&2
   exit 2
+fi
+if [ "$WALK_FORWARD_MODE" != "none" ] && [ "$WALK_FORWARD_MODE" != "expanding" ] && [ "$WALK_FORWARD_MODE" != "rolling" ]; then
+  echo "--walk-forward-mode must be none|expanding|rolling" >&2
+  exit 2
+fi
+if [ "$WALK_FORWARD_MODE" != "none" ]; then
+  if [ "$WALK_FORWARD_MIN_TRAIN_WINDOWS" -lt 1 ] || [ "$WALK_FORWARD_TEST_WINDOWS" -lt 1 ] || [ "$WALK_FORWARD_STEP_WINDOWS" -lt 1 ] || [ "$WALK_FORWARD_HOLDOUT_WINDOWS" -lt 1 ]; then
+    echo "walk-forward window counts must be >=1 when enabled" >&2
+    exit 2
+  fi
 fi
 if [ "$MODE" != "local" ] && [ "$MODE" != "aws-batch" ]; then
   echo "--mode must be local|aws-batch" >&2
@@ -455,16 +501,31 @@ cache_ready_for_day() {
   done < <(required_types)
 
   if [ -f "$manifest" ]; then
-    if python3 - "$manifest" "${needed[@]}" <<'PY'
+    if python3 - "$manifest" "$MARKET_FILTER" "$S3_PREFIX" "$REQUIRE_BTC_TICK" "$REQUIRE_MARKET_META" "${needed[@]}" <<'PY'
 import json
 import sys
 
 manifest_path = sys.argv[1]
-required = sys.argv[2:]
+market_filter = sys.argv[2]
+s3_prefix = sys.argv[3]
+require_btc_tick = bool(int(sys.argv[4]))
+require_market_meta = bool(int(sys.argv[5]))
+required = sys.argv[6:]
 with open(manifest_path, "r", encoding="utf-8") as f:
     manifest = json.load(f)
+if manifest.get("schema_version") != 2:
+    raise SystemExit(1)
+if manifest.get("market_filter") != market_filter:
+    raise SystemExit(1)
+if manifest.get("s3_prefix") != s3_prefix:
+    raise SystemExit(1)
+if bool(manifest.get("require_btc_tick")) != require_btc_tick:
+    raise SystemExit(1)
+if bool(manifest.get("require_market_meta")) != require_market_meta:
+    raise SystemExit(1)
+counts = manifest.get("event_counts", {})
 for kind in required:
-    if int(manifest.get(kind, 0)) <= 0:
+    if int(counts.get(kind, 0)) <= 0:
         raise SystemExit(1)
 PY
     then
@@ -485,26 +546,73 @@ write_manifest() {
   local day="$1"
   local day_dir="$2"
   local manifest="$3"
-  local trade_count
-  local book_delta_count
-  local market_meta_count
-  local book_snapshot_count
-  local btc_tick_count
-  trade_count="$(event_type_count "$day_dir" trade "$MARKET_FILTER")"
-  book_delta_count="$(event_type_count "$day_dir" book_delta "$MARKET_FILTER")"
-  market_meta_count="$(event_type_count "$day_dir" market_meta "$MARKET_FILTER")"
-  book_snapshot_count="$(event_type_count "$day_dir" book_snapshot "$MARKET_FILTER")"
-  btc_tick_count="$(event_type_count "$day_dir" btc_tick "btc_ref")"
-  cat > "$manifest" <<JSON
-{
-  "date": "$day",
-  "trade": $trade_count,
-  "book_delta": $book_delta_count,
-  "market_meta": $market_meta_count,
-  "book_snapshot": $book_snapshot_count,
-  "btc_tick": $btc_tick_count
+  local -a needed=()
+
+  while IFS= read -r kind; do
+    needed+=("$kind")
+  done < <(required_types)
+
+  mkdir -p "$day_dir"
+  python3 - "$day" "$day_dir" "$manifest" "$MARKET_FILTER" "$S3_PREFIX" "$REQUIRE_BTC_TICK" "$REQUIRE_MARKET_META" "${needed[@]}" <<'PY'
+from datetime import datetime, timezone
+import json
+import os
+import sys
+
+day, day_dir, manifest_path = sys.argv[1:4]
+market_filter, s3_prefix = sys.argv[4:6]
+require_btc_tick = bool(int(sys.argv[6]))
+require_market_meta = bool(int(sys.argv[7]))
+required = sys.argv[8:]
+kinds = ["trade", "book_delta", "book_snapshot", "market_meta", "btc_tick"]
+
+def scope_for(kind: str) -> str:
+    return "btc_ref" if kind == "btc_tick" else market_filter
+
+counts = {kind: 0 for kind in kinds}
+bytes_by_kind = {kind: 0 for kind in kinds}
+latest_mtime = None
+for root, _, files in os.walk(day_dir):
+    parts = set(root.split(os.sep))
+    for kind in kinds:
+        if f"market_type={scope_for(kind)}" not in parts:
+            continue
+        if f"event_type={kind}" not in parts:
+            continue
+        for name in files:
+            if not name.endswith(".parquet"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                stat = os.stat(path)
+            except FileNotFoundError:
+                continue
+            if stat.st_size <= 0:
+                continue
+            counts[kind] += 1
+            bytes_by_kind[kind] += stat.st_size
+            latest_mtime = max(latest_mtime or stat.st_mtime, stat.st_mtime)
+
+manifest = {
+    "schema_version": 2,
+    "date": day,
+    "market_filter": market_filter,
+    "s3_prefix": s3_prefix,
+    "require_btc_tick": require_btc_tick,
+    "require_market_meta": require_market_meta,
+    "required_event_types": required,
+    "event_counts": counts,
+    "event_bytes": bytes_by_kind,
+    "ready": all(counts.get(kind, 0) > 0 for kind in required),
+    "latest_input_mtime": latest_mtime,
+    "generated_at": datetime.now(timezone.utc).isoformat(),
 }
-JSON
+tmp_path = f"{manifest_path}.tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write("\n")
+os.replace(tmp_path, manifest_path)
+PY
 }
 
 sync_day_input() {
@@ -520,6 +628,7 @@ sync_day_input() {
   manifest="$(cache_manifest_path "$day_dir")"
   if [ "$SKIP_SYNC" -eq 1 ]; then
     if cache_ready_for_day "$day_dir" "$manifest"; then
+      write_manifest "$day" "$day_dir" "$manifest"
       return 0
     fi
     log "cache miss for $day (skip-sync enabled)"
@@ -527,6 +636,7 @@ sync_day_input() {
   fi
 
   if [ "$FORCE_RELOAD" -eq 0 ] && cache_ready_for_day "$day_dir" "$manifest"; then
+    write_manifest "$day" "$day_dir" "$manifest"
     log "using cached data for $day"
     return 0
   fi
@@ -567,6 +677,7 @@ build_runner_args() {
   local day="$1"
   local day_end="$2"
   local run_id="$3"
+  local force_dry_run="${4:-0}"
   local input_root="$CACHE_ROOT"
   local output_prefix_arg="$OUTPUT_ROOT"
   if [ "$AS_WORKER" -eq 1 ] && [ "$MODE" = "aws-batch" ]; then
@@ -595,10 +706,36 @@ build_runner_args() {
   if [ "$DAY_CONCURRENCY" -gt 1 ]; then
     args+=(--concurrency "$DAY_CONCURRENCY")
   fi
-  if [ "$DRY_RUN" -eq 1 ]; then
+  if [ "$WALK_FORWARD_MODE" != "none" ]; then
+    args+=(
+      --walk-forward-mode "$WALK_FORWARD_MODE"
+      --walk-forward-min-train-windows "$WALK_FORWARD_MIN_TRAIN_WINDOWS"
+      --walk-forward-test-windows "$WALK_FORWARD_TEST_WINDOWS"
+      --walk-forward-step-windows "$WALK_FORWARD_STEP_WINDOWS"
+      --walk-forward-holdout-windows "$WALK_FORWARD_HOLDOUT_WINDOWS"
+    )
+  fi
+  if [ "$DRY_RUN" -eq 1 ] || [ "$force_dry_run" -eq 1 ]; then
     args+=(--dry-run)
   fi
   printf '%s\n' "${args[@]}"
+}
+
+validate_prepared_day() {
+  local day="$1"
+  local day_end="$2"
+  local run_id="$3"
+  local log_file="$4"
+  local -a args=()
+
+  while IFS= read -r arg; do
+    args+=("$arg")
+  done < <(build_runner_args "$day" "$day_end" "${run_id}_validate" 1)
+
+  {
+    echo "[validate-cache] ${args[*]}"
+    "${args[@]}"
+  } >> "$log_file" 2>&1
 }
 
 publish_run_outputs() {
@@ -744,6 +881,12 @@ run_one_day() {
       echo "FAIL sync_only_missing" > "$status"
       return 1
     fi
+    if [ "$VALIDATE_CACHE" -eq 1 ]; then
+      if ! validate_prepared_day "$day" "$day_end" "$day_id" "$log_file"; then
+        echo "FAIL sync_only_validation_failed" > "$status"
+        return 1
+      fi
+    fi
     echo "OK sync_only" > "$status"
     return 0
   fi
@@ -792,7 +935,10 @@ submit_batch_job() {
   local run_id="${RUN_ID}_dt=${day}"
   local wrapped_cmd
 
-  wrapped_cmd="$AWS_WORKDIR/scripts/backtest_aws_fleet.sh --as-worker --day \"$day\" --strategy-profile \"$PROFILE_PATH\" --workers \"$WORKERS\" --day-concurrency \"$DAY_CONCURRENCY\" --market-filter \"$MARKET_FILTER\" --fill-config \"$FILL_CONFIG\" --fill-quality \"$FILL_QUALITY\" --journal-mode \"$JOURNAL_MODE\" --starting-cash-usd \"$START_CASH\" --runner \"$RUNNER\" --cache-root \"$WORKER_CACHE_ROOT\" --s3-prefix \"$S3_PREFIX\" --s3-output-prefix \"$S3_OUTPUT_PREFIX\" --run-id \"$RUN_ID\" --mode \"$MODE\" --seed \"$SEED\""
+  wrapped_cmd="$AWS_WORKDIR/scripts/backtest_aws_fleet.sh --as-worker --day \"$day\" --strategy-profile \"$PROFILE_PATH\" --workers \"$WORKERS\" --day-concurrency \"$DAY_CONCURRENCY\" --market-filter \"$MARKET_FILTER\" --fill-config \"$FILL_CONFIG\" --fill-quality \"$FILL_QUALITY\" --journal-mode \"$JOURNAL_MODE\" --walk-forward-mode \"$WALK_FORWARD_MODE\" --walk-forward-min-train-windows \"$WALK_FORWARD_MIN_TRAIN_WINDOWS\" --walk-forward-test-windows \"$WALK_FORWARD_TEST_WINDOWS\" --walk-forward-step-windows \"$WALK_FORWARD_STEP_WINDOWS\" --walk-forward-holdout-windows \"$WALK_FORWARD_HOLDOUT_WINDOWS\" --starting-cash-usd \"$START_CASH\" --runner \"$RUNNER\" --cache-root \"$WORKER_CACHE_ROOT\" --s3-prefix \"$S3_PREFIX\" --s3-output-prefix \"$S3_OUTPUT_PREFIX\" --run-id \"$RUN_ID\" --mode \"$MODE\" --seed \"$SEED\""
+  if [ "$VALIDATE_CACHE" -eq 1 ]; then
+    wrapped_cmd="$wrapped_cmd --validate-cache"
+  fi
 
   if [ "$SYNC_ONLY" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
     echo "would submit: $wrapped_cmd"

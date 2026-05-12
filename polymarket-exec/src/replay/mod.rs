@@ -16,6 +16,7 @@
 //!   schema_version || fill_sim_version)[..16]`.
 
 pub mod checkpoint;
+pub mod data_quality;
 pub mod fill_sim;
 pub mod journal;
 pub mod latency;
@@ -28,4 +29,5 @@ pub mod runner;
 pub mod strategy_adapter;
 pub mod synthesizer;
 pub mod tape;
+pub mod walk_forward;
 pub mod window_summary;
