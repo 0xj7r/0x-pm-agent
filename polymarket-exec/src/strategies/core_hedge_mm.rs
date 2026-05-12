@@ -288,7 +288,10 @@ fn build_ladder_level<M: MarketDescriptor>(
 ) -> Option<OrderIntent> {
     let tick = market.tick_size().max(0.0001);
     let max_passive = (best_ask - tick).max(tick);
-    let limit_price = price.min(max_passive);
+    if price > max_passive + 1e-9 {
+        return None;
+    }
+    let limit_price = price;
     if limit_price <= 0.0 || limit_price >= 1.0 {
         return None;
     }
