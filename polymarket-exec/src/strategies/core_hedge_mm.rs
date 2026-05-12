@@ -227,7 +227,7 @@ fn build_clip<M: MarketDescriptor>(
         LadderLeg::No => market.no_instrument_id().clone(),
     };
     let coid = ClientOrderId::from(format!(
-        "core-hedge:{}:{:?}:{}:{}",
+        "paired-core:{}:{:?}:{}:{}",
         market.market_id(),
         leg,
         tag,
@@ -240,13 +240,13 @@ fn build_clip<M: MarketDescriptor>(
         limit_price,
         qty,
         format!(
-            "core_hedge {} leg={:?} px={:.4} sz_usd={:.2} (best_bid={:.4} best_ask={:.4})",
+            "paired_core {} leg={:?} px={:.4} sz_usd={:.2} (best_bid={:.4} best_ask={:.4})",
             tag, leg, limit_price, clip_usd, best_bid, best_ask
         ),
         now_ms,
     );
     intent.kind = IntentKind::Entry;
-    intent.quote_level_tag = Some(format!("core-hedge:{}", tag));
+    intent.quote_level_tag = Some(format!("paired-core:{}", tag));
     Some(intent)
 }
 
@@ -301,7 +301,7 @@ fn build_ladder_level<M: MarketDescriptor>(
         LadderLeg::No => market.no_instrument_id().clone(),
     };
     let coid = ClientOrderId::from(format!(
-        "core-hedge:{}:{:?}:{}:{}",
+        "paired-core:{}:{:?}:{}:{}",
         market.market_id(),
         leg,
         tag,
@@ -314,13 +314,13 @@ fn build_ladder_level<M: MarketDescriptor>(
         limit_price,
         qty,
         format!(
-            "core_hedge ladder leg={:?} tag={} px={:.4} qty={:.4}",
+            "paired_core ladder leg={:?} tag={} px={:.4} qty={:.4}",
             leg, tag, limit_price, qty,
         ),
         now_ms,
     );
     intent.kind = IntentKind::Entry;
-    intent.quote_level_tag = Some(format!("core-hedge:{}", tag));
+    intent.quote_level_tag = Some(format!("paired-core:{}", tag));
     Some(intent)
 }
 
@@ -336,7 +336,7 @@ where
         let cfg = self.config.core_hedge;
         if !cfg.enabled {
             return StrategyDecision::Noop {
-                notes: vec!["core_hedge disabled".to_string()],
+                notes: vec!["paired_core disabled".to_string()],
             };
         }
 
@@ -358,7 +358,7 @@ where
                 let expected_cash_usd = paired_qty;
                 let merge_intent = MergeIntent {
                     command_id: ClientOrderId::new(format!(
-                        "core-hedge-merge:{}:{}",
+                        "paired-core-merge:{}:{}",
                         input.market.market_id(),
                         input.now_ms,
                     )),
@@ -372,7 +372,7 @@ where
                     expected_fee_usd: 0.0,
                     expected_gas_usd: 0.0,
                     reason: format!(
-                        "core_hedge merge paired_qty={:.4} expected_net={:.4}",
+                        "paired_core merge paired_qty={:.4} expected_net={:.4}",
                         paired_qty,
                         expected_cash_usd - expected_cost_usd
                     ),
@@ -381,7 +381,7 @@ where
                 return StrategyDecision::Merge {
                     intent: merge_intent,
                     notes: vec![format!(
-                        "core_hedge merging paired_qty={:.4} cost={:.2} cash={:.2} batch_cap={:.4}",
+                        "paired_core merging paired_qty={:.4} cost={:.2} cash={:.2} batch_cap={:.4}",
                         paired_qty, expected_cost_usd, expected_cash_usd, cfg.merge_batch_cap
                     )],
                 };
@@ -398,7 +398,7 @@ where
             else {
                 return StrategyDecision::Noop {
                     notes: vec![format!(
-                        "core_hedge ladder missing quotes yes_bid={yes_bid:?} yes_ask={yes_ask:?} no_bid={no_bid:?} no_ask={no_ask:?}",
+                        "paired_core ladder missing quotes yes_bid={yes_bid:?} yes_ask={yes_ask:?} no_bid={no_bid:?} no_ask={no_ask:?}",
                     )],
                 };
             };
@@ -436,7 +436,7 @@ where
                     }
                 }
                 notes.push(format!(
-                    "core_hedge ladder leg={leg:?} levels={levels} span={:.4} mid={mid:.4} low={low:.4} high={high:.4}",
+                    "paired_core ladder leg={leg:?} levels={levels} span={:.4} mid={mid:.4} low={low:.4} high={high:.4}",
                     cfg.ladder_span,
                 ));
             }
@@ -451,7 +451,7 @@ where
         let Some(geom) = classify_legs(&input.snapshot, &cfg) else {
             return StrategyDecision::Noop {
                 notes: vec![format!(
-                    "core_hedge geometry mismatch yes_ask={:?} no_ask={:?}",
+                    "paired_core geometry mismatch yes_ask={:?} no_ask={:?}",
                     input.snapshot.yes_quote.best_ask.as_ref().map(|l| l.price),
                     input.snapshot.no_quote.best_ask.as_ref().map(|l| l.price),
                 )],
@@ -488,7 +488,7 @@ where
         let mut intents = Vec::new();
         let mut notes = Vec::new();
         notes.push(format!(
-            "core_hedge geom expensive={:?}@{:.4} cheap={:?}@{:.4} gap={:.4}",
+            "paired_core geom expensive={:?}@{:.4} cheap={:?}@{:.4} gap={:.4}",
             geom.expensive_leg,
             geom.expensive_ask,
             geom.cheap_leg,
@@ -496,7 +496,7 @@ where
             geom.expensive_ask - geom.cheap_ask,
         ));
         notes.push(format!(
-            "core_hedge alloc expensive_notional={:.2}/{:.2} cheap_notional={:.2}/{:.2}",
+            "paired_core alloc expensive_notional={:.2}/{:.2} cheap_notional={:.2}/{:.2}",
             expensive_notional, expensive_target, cheap_notional, cheap_target,
         ));
 
@@ -553,7 +553,7 @@ where
     fn on_fill(&mut self, _input: StrategyFillInput<M>) -> StrategyDecision {
         // P2: trigger merge planner when paired_qty crosses threshold.
         StrategyDecision::Noop {
-            notes: vec!["core_hedge on_fill not yet wired".to_string()],
+            notes: vec!["paired_core on_fill not yet wired".to_string()],
         }
     }
 }

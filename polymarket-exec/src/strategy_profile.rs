@@ -44,6 +44,7 @@ pub struct StrategyProfile {
     pub rescue: RescueSection,
     pub operational: OperationalSection,
     pub core_hedge: CoreHedgeSection,
+    pub paired_core: CoreHedgeSection,
     pub late_favorite: LateFavoriteSection,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -161,7 +162,11 @@ impl StrategyProfile {
 
     pub fn core_hedge_mm_config(&self) -> CoreHedgeMmStrategyConfig {
         let defaults = CoreHedgeMmConfig::default();
-        let s = &self.core_hedge;
+        let s = if core_hedge_section_has_overrides(&self.paired_core) {
+            &self.paired_core
+        } else {
+            &self.core_hedge
+        };
         CoreHedgeMmStrategyConfig {
             core_hedge: CoreHedgeMmConfig {
                 enabled: s.enabled.unwrap_or(defaults.enabled),
@@ -428,6 +433,19 @@ impl StrategyProfile {
                 .unwrap_or(defaults.max_open_orders_per_market),
         }
     }
+}
+
+fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
+    s.enabled.is_some()
+        || s.ladder_levels.is_some()
+        || s.ladder_span.is_some()
+        || s.center_price.is_some()
+        || s.clip_shares.is_some()
+        || s.maker_improve_ticks.is_some()
+        || s.merge_min_qty.is_some()
+        || s.merge_batch_cap.is_some()
+        || s.merge_disabled_after_ms.is_some()
+        || s.clip_scale.is_some()
 }
 
 fn resolve_profile_path(path: &Path) -> PathBuf {

@@ -14,7 +14,9 @@ use crate::types::{CoolingReason, StrategyDecision, SuppressionScope};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
     pub enabled: bool,
-    /// Minimum favorite ask to qualify as “loadable favorite”.
+    /// Minimum favorite ask to qualify as loadable favorite. Sub-90c loads
+    /// are allowed only as small spot-confirmed overlays; 90c+ is the heavy
+    /// late-cert regime.
     pub min_favorite_ask: f64,
     /// Maximum favorite ask to qualify (avoid zero edge near 0.99+).
     pub max_favorite_ask: f64,
@@ -43,7 +45,7 @@ impl Default for FavoriteClimbConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_favorite_ask: 0.90,
+            min_favorite_ask: 0.70,
             max_favorite_ask: 0.99,
             window_sec: 120,
             start_frac: 0.0,
@@ -115,7 +117,7 @@ pub struct BonereaperMmStrategyConfig {
 
 #[derive(Clone, Debug)]
 pub struct BonereaperMmStrategy {
-    core_hedge_mm: CoreHedgeMmStrategy,
+    paired_core: CoreHedgeMmStrategy,
     late_favorite: LateFavoriteStrategy,
     config: BonereaperMmStrategyConfig,
 }
@@ -265,6 +267,7 @@ fn remaining_directional_load_usd(
 
 fn reactive_climb_clip_usd(
     cfg: &FavoriteClimbConfig,
+    favorite_ask: f64,
     elapsed_ms: u64,
     remaining_ms: u64,
     bar_window_ms: u64,
@@ -277,7 +280,7 @@ fn reactive_climb_clip_usd(
     } else {
         0.0
     };
-    let ramp = if elapsed_sec <= min_elapsed_sec {
+    let raw_ramp = if elapsed_sec <= min_elapsed_sec {
         0.0
     } else if remaining_sec > 120.0 {
         // Mid-bar reactive load: the BTC move has already happened, but
@@ -294,7 +297,19 @@ fn reactive_climb_clip_usd(
     } else {
         250.0
     };
+    let price_scale = favorite_load_price_scale(favorite_ask, cfg.min_favorite_ask);
+    let ramp = raw_ramp * price_scale;
     ramp.max(cfg.min_order_usd)
+}
+
+fn favorite_load_price_scale(favorite_ask: f64, min_favorite_ask: f64) -> f64 {
+    if favorite_ask >= 0.90 {
+        return 1.0;
+    }
+    let floor = min_favorite_ask.clamp(0.01, 0.89);
+    let span = (0.90 - floor).max(0.01);
+    let progress = ((favorite_ask - floor) / span).clamp(0.0, 1.0);
+    0.15 + 0.85 * progress
 }
 
 impl<M> TradingStrategy<M> for LateFavoriteStrategy
@@ -404,6 +419,7 @@ where
                     ) {
                         let clip = reactive_climb_clip_usd(
                             climb_cfg,
+                            legs.favorite_ask,
                             elapsed_ms,
                             remaining_ms,
                             bar_window_ms,
@@ -412,10 +428,11 @@ where
                             .max(climb_cfg.min_order_usd);
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "late_favorite climb leg={:?} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
+                            "late_favorite climb leg={:?} px={:.4} ask={:.4} price_scale={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
                             legs.favorite_leg,
                             px,
                             legs.favorite_ask,
+                            favorite_load_price_scale(legs.favorite_ask, climb_cfg.min_favorite_ask),
                             clip,
                             current_exposure_usd,
                             climb_cfg.max_load_usd,
@@ -514,7 +531,7 @@ where
 impl BonereaperMmStrategy {
     pub fn new(config: BonereaperMmStrategyConfig) -> Self {
         Self {
-            core_hedge_mm: CoreHedgeMmStrategy::new(config.core_hedge),
+            paired_core: CoreHedgeMmStrategy::new(config.core_hedge),
             late_favorite: LateFavoriteStrategy::new(config.late_favorite),
             config,
         }
@@ -681,15 +698,23 @@ mod tests {
             clip_usd: 20.0,
             min_order_usd: 1.0,
             min_elapsed_sec: 10,
+            min_favorite_ask: 0.70,
             ..FavoriteClimbConfig::default()
         };
 
-        assert_eq!(reactive_climb_clip_usd(&cfg, 5_000, 295_000, 300_000), 1.0);
-        let mid_bar = reactive_climb_clip_usd(&cfg, 90_000, 210_000, 300_000);
-        let late_bar = reactive_climb_clip_usd(&cfg, 210_000, 90_000, 300_000);
+        assert_eq!(reactive_climb_clip_usd(&cfg, 0.90, 5_000, 295_000, 300_000), 1.0);
+        let mid_bar = reactive_climb_clip_usd(&cfg, 0.90, 90_000, 210_000, 300_000);
+        let late_bar = reactive_climb_clip_usd(&cfg, 0.90, 210_000, 90_000, 300_000);
         assert!(mid_bar > cfg.min_order_usd);
         assert!(mid_bar < cfg.clip_usd);
         assert!(late_bar >= 100.0);
+    }
+
+    #[test]
+    fn favorite_load_price_scale_keeps_sub_90c_loads_smaller() {
+        assert!(favorite_load_price_scale(0.70, 0.70) < favorite_load_price_scale(0.80, 0.70));
+        assert!(favorite_load_price_scale(0.80, 0.70) < favorite_load_price_scale(0.90, 0.70));
+        assert_eq!(favorite_load_price_scale(0.90, 0.70), 1.0);
     }
 
     #[test]
@@ -710,13 +735,13 @@ impl<M: MarketDescriptor + Clone> TradingStrategy<M> for BonereaperMmStrategy {
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
-        let core_decision = self.core_hedge_mm.on_tick(input.clone());
+        let core_decision = self.paired_core.on_tick(input.clone());
         let late_decision = self.late_favorite.on_tick(input);
         Self::combine(core_decision, late_decision)
     }
 
     fn on_fill(&mut self, input: StrategyFillInput<M>) -> StrategyDecision {
-        let core_decision = self.core_hedge_mm.on_fill(input.clone());
+        let core_decision = self.paired_core.on_fill(input.clone());
         let late_decision = self.late_favorite.on_fill(input);
         Self::combine(core_decision, late_decision)
     }
