@@ -22,7 +22,7 @@ quote:
 
 inventory:
   max_open_orders_total: 80
-  max_open_orders_per_market: 10
+  max_open_orders_per_market: 14
   max_order_notional_usd: 7.0
   max_net_notional_per_market_usd: 70.0
 
@@ -38,13 +38,16 @@ pair:
 
 paired_core:
   enabled: true
-  ladder_levels: 5
-  ladder_span: 0.20
+  # Broad mergeable maker ladder. This is intentionally not a strict
+  # pre-paired package: fills become mergeable inventory and can later recycle
+  # with any opposite-side mergeable fill if realised pair cost is positive.
+  ladder_levels: 7
+  ladder_span: 0.44
   center_price: 0.50
-  clip_shares: 1.0
-  max_unpaired_core_qty: 5.0
+  clip_shares: 0.8
+  max_unpaired_core_qty: 8.0
   ladder_min_price: 0.20
-  ladder_max_price: 0.70
+  ladder_max_price: 0.69
   maker_improve_ticks: 0.0
   merge_min_qty: 5.0
   merge_batch_cap: 100.0
