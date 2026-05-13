@@ -1010,6 +1010,16 @@ async fn maybe_auto_wrap_pusd_after_redeem(config: &AppConfig, adapter: &dyn Exe
     }
 }
 
+async fn maybe_auto_wrap_pusd_after_merge(config: &AppConfig, adapter: &dyn ExecutionAdapter) {
+    if let Err(error) = maybe_auto_wrap_pusd(config, adapter, "merge").await {
+        warn!(
+            target: "live_collateral",
+            error = %error,
+            "pUSD auto-wrap after merge failed; continuing live loop"
+        );
+    }
+}
+
 async fn maybe_auto_wrap_pusd_at_startup(config: &AppConfig, adapter: &dyn ExecutionAdapter) {
     if let Err(error) = maybe_auto_wrap_pusd(config, adapter, "startup").await {
         warn!(
@@ -1205,6 +1215,11 @@ async fn run_runtime_loop(
             maybe_user_event = user_events.recv(), if user_events_open => {
                 match maybe_user_event {
                     Some(event) => {
+                        let should_auto_wrap_pusd = matches!(
+                            event,
+                            UserOrderEvent::OrderMerged { .. }
+                                | UserOrderEvent::OrderRedeemed { .. }
+                        );
                         let user_outcome = handle_user_event(
                             runtime,
                             paper_order_ctx,
@@ -1221,6 +1236,21 @@ async fn run_runtime_loop(
                             user_outcome.clone(),
                         )?;
                         persist_audit_outcome(audit, "user-ws", runtime, &user_outcome)?;
+                        if should_auto_wrap_pusd && !execution_policy.paper_mode {
+                            if let Err(error) = maybe_auto_wrap_pusd(
+                                &config,
+                                execution_adapter.as_ref(),
+                                "user_ws_merge_or_redeem",
+                            )
+                            .await
+                            {
+                                warn!(
+                                    target: "live_collateral",
+                                    error = %error,
+                                    "pUSD auto-wrap after user websocket merge/redeem failed; continuing live loop"
+                                );
+                            }
+                        }
                         let assets = market_universe.read().await.market_assets.clone();
                         refresh_dashboard_state(
                             runtime,
@@ -1258,6 +1288,7 @@ async fn run_runtime_loop(
                             &assets,
                             paper_fee_coeff,
                             metrics.as_ref(),
+                            config,
                             outcome,
                             paper_order_ctx,
                             execution_venue_map,
@@ -1327,6 +1358,7 @@ async fn run_runtime_loop(
                                 &current_assets,
                                 paper_fee_coeff,
                                 metrics.as_ref(),
+                                config,
                                 close_outcome,
                                 paper_order_ctx,
                                 execution_venue_map,
@@ -1376,6 +1408,7 @@ async fn run_runtime_loop(
                         &current_assets,
                         paper_fee_coeff,
                         metrics.as_ref(),
+                        config,
                         capital_outcome,
                         paper_order_ctx,
                         execution_venue_map,
@@ -1413,6 +1446,7 @@ async fn run_runtime_loop(
                             &current_assets,
                             paper_fee_coeff,
                             metrics.as_ref(),
+                            config,
                             health_outcome,
                             paper_order_ctx,
                             execution_venue_map,
@@ -1451,6 +1485,7 @@ async fn run_runtime_loop(
                             &current_assets,
                             paper_fee_coeff,
                             metrics.as_ref(),
+                            config,
                             recover_outcome,
                             paper_order_ctx,
                             execution_venue_map,
@@ -1523,6 +1558,7 @@ async fn run_runtime_loop(
                                 &current_assets,
                                 paper_fee_coeff,
                                 metrics.as_ref(),
+                                config,
                                 outcome,
                                 paper_order_ctx,
                                 execution_venue_map,
@@ -2037,6 +2073,7 @@ async fn execute_execution_adapter(
     market_assets: &[String],
     paper_fee_coeff: f64,
     metrics: &AppMetrics,
+    config: &AppConfig,
     outcome: RuntimeOutcome,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
@@ -2274,7 +2311,7 @@ async fn execute_execution_adapter(
                         reason = %reason,
                         "blocking live submit before venue"
                     );
-                    if runtime.status() == RuntimeStatus::Running {
+                    if runtime.status() != RuntimeStatus::Degraded {
                         metrics.observe_riskoff_transition();
                         let kill_outcome = runtime.degrade_and_cancel_all(
                             observed_at_ms,
@@ -2301,8 +2338,60 @@ async fn execute_execution_adapter(
                     execution_venue_map.remove(&intent.client_order_id);
                     continue;
                 }
-                let submit_req =
+                let mut submit_req =
                     submit_request_from_intent(&intent, observed_at_ms, execution_policy);
+                if submit_req.post_only {
+                    let tick = runtime
+                        .venue_market_rules(&intent.market_id)
+                        .map(|rules| rules.minimum_tick_size)
+                        .filter(|tick| tick.is_finite() && *tick > 0.0)
+                        .unwrap_or(0.01);
+                    if let Some(book) = books.snapshot(intent.instrument_id.as_str()).await {
+                        match passive_post_only_limit_price(&submit_req, &book, tick) {
+                            Some(adjusted_price) => {
+                                if (adjusted_price - submit_req.limit_price).abs() > f64::EPSILON {
+                                    warn!(
+                                        mode = "live",
+                                        client_order_id = %submit_req.client_order_id,
+                                        instrument_id = %submit_req.instrument_id,
+                                        old_limit_price = submit_req.limit_price,
+                                        adjusted_limit_price = adjusted_price,
+                                        best_bid = book.best_bid,
+                                        best_ask = book.best_ask,
+                                        tick,
+                                        "adjusting post-only submit to current passive book price"
+                                    );
+                                    submit_req.limit_price = adjusted_price;
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    mode = "live",
+                                    client_order_id = %submit_req.client_order_id,
+                                    instrument_id = %submit_req.instrument_id,
+                                    limit_price = submit_req.limit_price,
+                                    best_bid = book.best_bid,
+                                    best_ask = book.best_ask,
+                                    tick,
+                                    "rejecting post-only submit locally because current book has no passive price"
+                                );
+                                paper_order_ctx.remove(&intent.client_order_id);
+                                execution_venue_map.remove(&intent.client_order_id);
+                                let reject_outcome = runtime.on_order_rejected(
+                                    &intent.client_order_id,
+                                    "post-only-cross-live-preflight",
+                                    observed_at_ms,
+                                );
+                                let chained_commands = reject_outcome.commands.clone();
+                                combined.extend(reject_outcome);
+                                for command in chained_commands {
+                                    queue.push_back(command);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Latency instrumentation (2026-04-29): measure two spans —
                 // wire_latency (submit call → adapter return) and
                 // pipeline_latency (intent creation → adapter return). Used
@@ -2531,9 +2620,61 @@ async fn execute_execution_adapter(
                     continue;
                 }
 
+                let venue_order_id = execution_venue_map.get(&client_order_id).cloned().flatten();
+                let Some(venue_order_id) = venue_order_id else {
+                    warn!(
+                        mode = "live",
+                        client_order_id = %client_order_id,
+                        "live cancel missing venue_order_id; forcing venue sync before deciding local cancel"
+                    );
+                    live_safety.consecutive_cancel_errors = 0;
+                    let report = sync_execution_state(
+                        execution_adapter.as_ref(),
+                        runtime,
+                        execution_venue_map,
+                        execution_policy,
+                        seen_venue_fill_keys,
+                        observed_at_ms,
+                    )
+                    .await;
+                    let sync_outcome = apply_sync_report(
+                        runtime,
+                        metrics,
+                        live_safety,
+                        execution_policy,
+                        market_assets,
+                        report,
+                        observed_at_ms,
+                        execution_adapter.as_ref(),
+                    )
+                    .await;
+                    stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
+                    if execution_venue_map
+                        .get(&client_order_id)
+                        .cloned()
+                        .flatten()
+                        .is_some()
+                    {
+                        queue.push_front(RuntimeCommand::Cancel {
+                            client_order_id,
+                            reason,
+                        });
+                        continue;
+                    }
+                    let cancelled_outcome = runtime.on_order_cancelled(
+                        &client_order_id,
+                        "cancelled locally before venue_order_id was observed after venue sync",
+                        observed_at_ms,
+                    );
+                    combined.extend(cancelled_outcome);
+                    paper_order_ctx.remove(&client_order_id);
+                    execution_venue_map.remove(&client_order_id);
+                    continue;
+                };
+
                 let cancel_req = CancelOrderRequest {
                     client_order_id: client_order_id.clone(),
-                    venue_order_id: execution_venue_map.get(&client_order_id).cloned().flatten(),
+                    venue_order_id: Some(venue_order_id),
                     reason,
                     submitted_at_ms: observed_at_ms,
                 };
@@ -2733,6 +2874,7 @@ async fn execute_execution_adapter(
                         .await;
                         stage_outcome_commands(&mut combined, &mut queue, sync_outcome);
                         runtime.mark_pending_merge_accepted(&intent.market_id, ack.accepted_at_ms);
+                        maybe_auto_wrap_pusd_after_merge(&config, execution_adapter.as_ref()).await;
                     }
                     Ok(ack) => {
                         let reason = ack.venue_message.unwrap_or_else(|| {
@@ -2960,16 +3102,21 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("mm-late-bar-core"));
+    let is_aggressive_late_fav = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("late-fav-taker"));
     let live_expires_at_ms = (!execution_policy.paper_mode
         && execution_policy.live_order_ttl_ms > 0
         && !is_hedge_rescue
+        && !is_aggressive_late_fav
         && !is_late_bar_core)
         .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
         .or_else(|| {
             (!execution_policy.paper_mode && is_late_bar_core)
                 .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
-    let (time_in_force, post_only) = if is_hedge_rescue {
+    let (time_in_force, post_only) = if is_hedge_rescue || is_aggressive_late_fav {
         (TimeInForce::Ioc, false)
     } else if is_late_bar_core {
         (TimeInForce::Gtd, !execution_policy.paper_mode)
@@ -3004,6 +3151,34 @@ fn submit_request_from_intent(
         strategy_tag: "runtime".to_string(),
         quote_level_tag: intent.quote_level_tag.clone(),
         submitted_at_ms: observed_at_ms,
+    }
+}
+
+fn passive_post_only_limit_price(
+    request: &SubmitOrderRequest,
+    book: &BookState,
+    tick: f64,
+) -> Option<f64> {
+    let tick = tick.max(0.0001);
+    match request.side {
+        TradeSide::Buy => {
+            let best_ask = book.best_ask;
+            if !best_ask.is_finite() || best_ask <= tick {
+                return None;
+            }
+            let max_passive = best_ask - tick;
+            let price = request.limit_price.min(max_passive);
+            (price > 0.0 && price < best_ask && price < 1.0).then_some(price)
+        }
+        TradeSide::Sell => {
+            let best_bid = book.best_bid;
+            if !best_bid.is_finite() || best_bid <= 0.0 {
+                return None;
+            }
+            let min_passive = best_bid + tick;
+            let price = request.limit_price.max(min_passive);
+            (price > best_bid && price > 0.0 && price < 1.0).then_some(price)
+        }
     }
 }
 
@@ -3434,7 +3609,9 @@ fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) ->
     !(lower.contains("post-only")
         || lower.contains("crosses book")
         || lower.contains("would cross")
-        || lower.contains("would take liquidity"))
+        || lower.contains("would take liquidity")
+        || lower.contains("no orders found to match")
+        || lower.contains("fak orders are partially filled or killed"))
 }
 
 fn submit_rejection_requires_immediate_live_stop(reason: &str) -> bool {
@@ -3550,6 +3727,17 @@ fn stale_live_order_action(
     book: &BookState,
     btc_regime: &BtcRegimeSnapshot,
 ) -> StaleLiveOrderAction {
+    if order
+        .intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("paired-core:"))
+    {
+        return StaleLiveOrderAction::Cancel {
+            reason: "paired-core quote aged out; require strategy to revalidate paired placement",
+        };
+    }
+
     let best_bid = book.best_bid;
     let best_ask = book.best_ask;
     if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask <= 0.0 {

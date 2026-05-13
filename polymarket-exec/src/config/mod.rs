@@ -351,13 +351,11 @@ impl AppConfig {
         let order_store_path = parse_path_optional("PM_BTC_5M_ORDER_STORE_PATH");
         let runtime_run_id =
             env_value("PM_BTC_5M_RUNTIME_RUN_ID").filter(|value| !value.trim().is_empty());
-        let book_stale_after = parse_duration_ms_or_profile(
-            "PM_BTC_5M_EXEC_BOOK_STALE_MS",
-            strategy_profile
-                .as_ref()
-                .and_then(|profile| profile.risk.book_stale_ms),
-            2_000,
-        )?;
+        let book_stale_after = strategy_profile
+            .as_ref()
+            .and_then(|profile| profile.risk.book_stale_ms)
+            .map(Duration::from_millis)
+            .unwrap_or(parse_duration_ms("PM_BTC_5M_EXEC_BOOK_STALE_MS", 2_000)?);
         let ping_interval = parse_duration_ms("PM_BTC_5M_EXEC_PING_INTERVAL_MS", 10_000)?;
         let spot_ws_conn_stale_timeout =
             parse_duration_ms("PM_BTC_5M_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS", 30_000)?;
@@ -433,16 +431,12 @@ impl AppConfig {
                 profile_inventory.and_then(|profile| profile.max_session_loss_bps),
                 0.0,
             )?,
-            max_open_orders_total: parse_usize_or_profile(
-                "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL",
-                profile_inventory.and_then(|profile| profile.max_open_orders_total),
-                32,
-            )?,
-            max_open_orders_per_market: parse_usize_or_profile(
-                "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
-                profile_inventory.and_then(|profile| profile.max_open_orders_per_market),
-                8,
-            )?,
+            max_open_orders_total: profile_inventory
+                .and_then(|profile| profile.max_open_orders_total)
+                .unwrap_or(parse_usize("PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL", 32)?),
+            max_open_orders_per_market: profile_inventory
+                .and_then(|profile| profile.max_open_orders_per_market)
+                .unwrap_or(parse_usize("PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET", 8)?),
         };
         let user_auth = load_user_auth();
         let dashboard_whale_events_path =

@@ -17,8 +17,8 @@ use crate::signals::{estimate_fair_value_with_momentum, FairValueEstimate, FairV
 use crate::strategies::bonereaper_mm::BonereaperMmStrategy;
 use crate::strategies::paired_mm::PairedMmStrategy;
 use crate::strategies::traits::{
-    PairedOpenOrderExposure, StrategyFillInput, StrategyInput, StrategyOpenOrderSnapshot,
-    TradingStrategy,
+    PairedOpenOrderExposure, StrategyDirectionalInventorySnapshot, StrategyFillInput,
+    StrategyInput, StrategyOpenOrderSnapshot, TradingStrategy,
 };
 use crate::strategies::unlawful_mm::UnlawfulMmStrategy;
 pub use crate::strategy_profile::*;
@@ -77,6 +77,12 @@ pub enum StrategyDecision {
         commands: Vec<RuntimeCommand>,
         notes: Vec<String>,
     },
+    Mixed {
+        intents: Vec<OrderIntent>,
+        commands: Vec<RuntimeCommand>,
+        reactive: bool,
+        notes: Vec<String>,
+    },
     Suppress {
         kind: StrategyDecisionSuppressionKind,
         preserve_quotes: bool,
@@ -108,6 +114,20 @@ impl StrategyDecision {
         Self::Commands { commands, notes }
     }
 
+    pub fn mixed(
+        intents: Vec<OrderIntent>,
+        commands: Vec<RuntimeCommand>,
+        reactive: bool,
+        notes: Vec<String>,
+    ) -> Self {
+        Self::Mixed {
+            intents,
+            commands,
+            reactive,
+            notes,
+        }
+    }
+
     pub fn suppress(
         kind: StrategyDecisionSuppressionKind,
         preserve_quotes: bool,
@@ -122,7 +142,9 @@ impl StrategyDecision {
 
     pub fn intents(&self) -> &[OrderIntent] {
         match self {
-            Self::QuoteSet { intents, .. } | Self::Reactive { intents, .. } => intents,
+            Self::QuoteSet { intents, .. }
+            | Self::Reactive { intents, .. }
+            | Self::Mixed { intents, .. } => intents,
             Self::Noop { .. } | Self::Commands { .. } | Self::Suppress { .. } => &[],
         }
     }
@@ -133,6 +155,7 @@ impl StrategyDecision {
             | Self::QuoteSet { notes, .. }
             | Self::Reactive { notes, .. }
             | Self::Commands { notes, .. }
+            | Self::Mixed { notes, .. }
             | Self::Suppress { notes, .. } => notes.clone(),
         }
     }
@@ -151,6 +174,12 @@ impl StrategyDecision {
                 intents.is_empty() && notes.is_empty()
             }
             Self::Commands { commands, notes } => commands.is_empty() && notes.is_empty(),
+            Self::Mixed {
+                intents,
+                commands,
+                notes,
+                ..
+            } => intents.is_empty() && commands.is_empty() && notes.is_empty(),
             Self::Suppress { .. } => false,
         }
     }
@@ -161,6 +190,10 @@ pub struct StrategyContext {
     pub now_ms: EpochMillis,
     pub runtime_status: RuntimeStatus,
     pub inventory: InventorySnapshot,
+    pub paired_core_inventory: Option<PairedInventorySnapshot>,
+    pub directional_inventory: Vec<StrategyDirectionalInventorySnapshot>,
+    pub late_fav_inventory: Vec<StrategyDirectionalInventorySnapshot>,
+    pub cheap_tail_inventory: Vec<StrategyDirectionalInventorySnapshot>,
     pub open_orders: Vec<StrategyOpenOrderSnapshot>,
     pub open_orders_total: usize,
     pub open_orders_for_market: usize,
@@ -403,9 +436,36 @@ impl HybridStrategy {
         };
         let inventory =
             paired_inventory_from_context(&context.inventory, market_id, &yes_id, &no_id);
+        let paired_core_inventory = context
+            .paired_core_inventory
+            .unwrap_or_else(|| {
+                paired_core_inventory_from_context(
+                    inventory,
+                    &context.directional_inventory,
+                    market_id,
+                    &yes_id,
+                    &no_id,
+                )
+            });
+        let late_fav_inventory = paired_inventory_from_directional_snapshots(
+            &context.late_fav_inventory,
+            market_id,
+            &yes_id,
+            &no_id,
+        );
+        let cheap_tail_inventory = paired_inventory_from_directional_snapshots(
+            &context.cheap_tail_inventory,
+            market_id,
+            &yes_id,
+            &no_id,
+        );
         let open_convex_order_exposure =
             paired_convex_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id);
-        let pair_cost = PairCostTracker::from_inventory(&inventory);
+        let open_late_fav_order_exposure =
+            paired_tagged_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id, "late-fav");
+        let open_paired_core_order_exposure =
+            paired_tagged_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id, "paired-core:");
+        let pair_cost = PairCostTracker::from_inventory(&paired_core_inventory);
         let fair_value = fair_value_from_context(context, &market, self.momentum_weight);
         let order_book_pressure =
             crate::signals::OrderBookPressureEngine::default().compute(&snapshot);
@@ -413,7 +473,12 @@ impl HybridStrategy {
             market,
             snapshot,
             inventory,
+            paired_core_inventory,
+            late_fav_inventory,
+            cheap_tail_inventory,
             open_convex_order_exposure,
+            open_late_fav_order_exposure,
+            open_paired_core_order_exposure,
             pair_cost,
             fair_value,
             btc_regime: context.btc_regime.clone(),
@@ -435,6 +500,11 @@ impl HybridStrategy {
             crate::types::StrategyDecision::Merge { intent, notes } => {
                 StrategyDecision::commands(vec![RuntimeCommand::Merge(intent)], notes)
             }
+            crate::types::StrategyDecision::Mixed {
+                intents,
+                commands,
+                notes,
+            } => StrategyDecision::mixed(intents, commands, true, notes),
             crate::types::StrategyDecision::Suppress {
                 scope,
                 reason,
@@ -460,6 +530,7 @@ impl HybridStrategy {
         let mut quote_intents = Vec::new();
         let mut reactive_intents = Vec::new();
         let mut commands = Vec::new();
+        let mut has_reactive_mixed = false;
         let mut hard_suppressed = false;
         let mut soft_suppressed = false;
         let mut soft_preserve_quotes = true;
@@ -490,6 +561,21 @@ impl HybridStrategy {
                     commands.extend(decision_commands);
                     notes.extend(decision_notes);
                 }
+                StrategyDecision::Mixed {
+                    intents,
+                    commands: decision_commands,
+                    reactive,
+                    notes: decision_notes,
+                } => {
+                    if reactive {
+                        has_reactive_mixed = true;
+                        reactive_intents.extend(intents);
+                    } else {
+                        quote_intents.extend(intents);
+                    }
+                    commands.extend(decision_commands);
+                    notes.extend(decision_notes);
+                }
                 StrategyDecision::Suppress {
                     kind,
                     preserve_quotes,
@@ -514,15 +600,26 @@ impl HybridStrategy {
                 notes,
             );
         }
-        if !commands.is_empty() {
-            return StrategyDecision::commands(commands, notes);
-        }
         if !reactive_intents.is_empty() {
             reactive_intents.extend(quote_intents);
+            if !commands.is_empty() {
+                return StrategyDecision::mixed(reactive_intents, commands, true, notes);
+            }
             return StrategyDecision::reactive(reactive_intents, notes);
         }
         if !quote_intents.is_empty() {
+            if !commands.is_empty() {
+                return StrategyDecision::mixed(
+                    quote_intents,
+                    commands,
+                    has_reactive_mixed,
+                    notes,
+                );
+            }
             return StrategyDecision::quote_set(quote_intents, notes);
+        }
+        if !commands.is_empty() {
+            return StrategyDecision::commands(commands, notes);
         }
         if soft_suppressed {
             return StrategyDecision::suppress(
@@ -640,6 +737,35 @@ impl HybridStrategy {
                 } else {
                     notes.push(format!("{reason}; allowing close-side command"));
                     StrategyDecision::Commands { commands, notes }
+                }
+            }
+            StrategyDecision::Mixed {
+                intents,
+                commands,
+                reactive,
+                mut notes,
+            } => {
+                let original_count = intents.len();
+                let kept = intents
+                    .into_iter()
+                    .filter(|intent| intent.kind == IntentKind::Close || intent.reduce_only)
+                    .collect::<Vec<_>>();
+                if kept.len() < original_count {
+                    notes.push(format!(
+                        "{reason}; kept {} close-side mixed intents and dropped {} entry intents",
+                        kept.len(),
+                        original_count - kept.len()
+                    ));
+                }
+                if kept.is_empty() && commands.is_empty() {
+                    StrategyDecision::Noop { notes }
+                } else {
+                    StrategyDecision::Mixed {
+                        intents: kept,
+                        commands,
+                        reactive,
+                        notes,
+                    }
                 }
             }
             StrategyDecision::Noop { mut notes } => {
@@ -769,6 +895,81 @@ fn paired_inventory_from_context(
     paired
 }
 
+fn paired_core_inventory_from_context(
+    total: PairedInventorySnapshot,
+    directional_inventory: &[StrategyDirectionalInventorySnapshot],
+    market_id: &MarketId,
+    yes_id: &InstrumentId,
+    no_id: &InstrumentId,
+) -> PairedInventorySnapshot {
+    let mut paired_core = total;
+    for position in directional_inventory
+        .iter()
+        .filter(|position| &position.market_id == market_id)
+    {
+        if &position.instrument_id == yes_id {
+            paired_core.yes_qty = (paired_core.yes_qty - position.quantity.max(0.0)).max(0.0);
+        } else if &position.instrument_id == no_id {
+            paired_core.no_qty = (paired_core.no_qty - position.quantity.max(0.0)).max(0.0);
+        }
+    }
+    paired_core
+}
+
+fn paired_inventory_from_directional_snapshots(
+    directional_inventory: &[StrategyDirectionalInventorySnapshot],
+    market_id: &MarketId,
+    yes_id: &InstrumentId,
+    no_id: &InstrumentId,
+) -> PairedInventorySnapshot {
+    let mut paired = PairedInventorySnapshot::default();
+    for position in directional_inventory
+        .iter()
+        .filter(|position| &position.market_id == market_id)
+    {
+        if &position.instrument_id == yes_id {
+            paired.yes_qty += position.quantity.max(0.0);
+        } else if &position.instrument_id == no_id {
+            paired.no_qty += position.quantity.max(0.0);
+        }
+    }
+    paired
+}
+
+fn paired_tagged_open_order_exposure(
+    open_orders: &[StrategyOpenOrderSnapshot],
+    market_id: &MarketId,
+    yes_id: &InstrumentId,
+    no_id: &InstrumentId,
+    tag_prefix: &str,
+) -> PairedOpenOrderExposure {
+    let mut exposure = PairedOpenOrderExposure::default();
+    for order in open_orders.iter().filter(|order| {
+        &order.market_id == market_id
+            && order.side == crate::types::TradeSide::Buy
+            && !order.reduce_only
+            && order.remaining_qty > 1e-9
+            && order
+                .quote_level_tag
+                .as_deref()
+                .map(|tag| tag.to_ascii_lowercase().starts_with(tag_prefix))
+                .unwrap_or(false)
+    }) {
+        let qty = order.remaining_qty.max(0.0);
+        let notional = order.limit_price.max(0.0) * qty;
+        if &order.instrument_id == yes_id {
+            exposure.yes_qty += qty;
+            exposure.yes_notional_usd += notional;
+            exposure.yes_count += 1;
+        } else if &order.instrument_id == no_id {
+            exposure.no_qty += qty;
+            exposure.no_notional_usd += notional;
+            exposure.no_count += 1;
+        }
+    }
+    exposure
+}
+
 fn paired_convex_open_order_exposure(
     open_orders: &[StrategyOpenOrderSnapshot],
     market_id: &MarketId,
@@ -781,11 +982,15 @@ fn paired_convex_open_order_exposure(
             && order.side == crate::types::TradeSide::Buy
             && !order.reduce_only
             && order.remaining_qty > 1e-9
-            && order
+            && {
+                let tag = order.quote_level_tag.as_deref().unwrap_or_default();
+                tag.to_ascii_lowercase().contains("cheap-tail")
+                    || order
                 .quote_level_tag
                 .as_deref()
                 .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
                 == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+            }
     }) {
         let notional = order.limit_price.max(0.0) * order.remaining_qty.max(0.0);
         if &order.instrument_id == yes_id {

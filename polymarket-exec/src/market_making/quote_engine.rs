@@ -110,7 +110,10 @@ impl DesiredQuoteSet {
         if tag.starts_with("mm-capital-recycle") || intent.kind == crate::types::IntentKind::Close {
             return 1;
         }
-        if tag.starts_with("mm-paired-bid") {
+        if tag.starts_with("late-fav") {
+            return 1;
+        }
+        if tag.starts_with("mm-paired-bid") || tag.starts_with("paired-core") {
             return 10;
         }
         5

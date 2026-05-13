@@ -17,14 +17,36 @@ description: |
   The whale behavior is consistent with hard shape controls plus hard per-market clips,
   not per-bet Kelly optimization.
 
+quote:
+  levels_per_side: 17
+
+inventory:
+  max_open_orders_total: 80
+  max_open_orders_per_market: 10
+  max_order_notional_usd: 7.0
+  max_net_notional_per_market_usd: 70.0
+
+health:
+  market_ws_stale_ms: 15000
+
+risk:
+  book_stale_ms: 5000
+
+pair:
+  min_merge_notional_usd: 5.0
+  merge_market_exposure_pressure_usd: 20.0
+
 paired_core:
   enabled: true
-  ladder_levels: 17
-  ladder_span: 0.42
+  ladder_levels: 5
+  ladder_span: 0.20
   center_price: 0.50
-  clip_shares: 2.0
+  clip_shares: 1.0
+  max_unpaired_core_qty: 5.0
+  ladder_min_price: 0.20
+  ladder_max_price: 0.70
   maker_improve_ticks: 0.0
-  merge_min_qty: 15.0
+  merge_min_qty: 5.0
   merge_batch_cap: 100.0
 
 late_favorite:
@@ -34,19 +56,28 @@ late_favorite:
     max_favorite_ask: 0.99
     window_sec: 300
     start_frac: 0.10
-    min_elapsed_sec: 10
-    clip_usd: 5.0
-    max_load_usd: 25.0
+    min_elapsed_sec: 75
+    clip_usd: 7.0
+    max_load_usd: 35.0
     maker_improve_ticks: 0.0
     min_order_usd: 1.0
     spot_filter_bps: 10.0
     require_spot_match: true
+    regime_whipsaw_multiplier: 0.25
+    regime_flat_multiplier: 0.50
+    regime_trending_volatile_multiplier: 0.60
+    regime_unknown_multiplier: 0.70
+    reversal_multiplier: 0.50
+    taker_min_favorite_ask: 0.90
+    taker_window_sec: 120
   convex_tail:
-    enabled: false
-    max_cheap_ask: 0.02
+    enabled: true
+    max_cheap_ask: 0.35
     window_sec: 60
     start_frac: 0.0
-    clip_usd: 2.0
-    max_load_usd: 15.0
+    clip_usd: 1.25
+    max_load_usd: 5.0
+    max_favorite_exposure_fraction: 0.25
+    max_win_edge_spend_fraction: 0.50
     maker_improve_ticks: 0.0
     min_order_usd: 0.5

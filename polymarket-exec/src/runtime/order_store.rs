@@ -367,22 +367,6 @@ impl SqliteOrderStore {
         }
     }
 
-    fn list_open_query_for_market(include_terminal: bool) -> String {
-        if include_terminal {
-            "SELECT * FROM orders
-             WHERE market_id = ?1
-               AND remaining_qty > 0.0
-             ORDER BY last_update_ms ASC"
-                .to_string()
-        } else {
-            "SELECT * FROM orders
-             WHERE market_id = ?1
-               AND status IN ('PendingSubmit', 'Submitted', 'Working', 'CancelRequested', 'NeedsReconcile')
-               AND remaining_qty > 0.0
-             ORDER BY last_update_ms ASC"
-                .to_string()
-        }
-    }
 }
 
 impl OrderStore for SqliteOrderStore {
@@ -654,10 +638,16 @@ impl OrderStore for SqliteOrderStore {
         &self,
         market_id: &MarketId,
     ) -> std::result::Result<Vec<OrderRecord>, OrderStoreError> {
-        let query = Self::list_open_query_for_market(false);
-        let mut statement = self.connection.prepare(&query).map_err(|error| {
-            OrderStoreError::Sqlite(format!("failed to list by market query: {error}"))
-        })?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT * FROM orders
+                 WHERE market_id = ?1
+                 ORDER BY last_update_ms ASC",
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to list by market query: {error}"))
+            })?;
 
         let rows = statement
             .query_map(params![market_id.as_str()], |row| Self::row_to_record(row))

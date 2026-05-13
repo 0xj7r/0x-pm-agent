@@ -81,7 +81,14 @@ pub enum MarketLedgerState {
 
 impl MarketLedgerState {
     pub fn allows_fresh_entry(self) -> bool {
-        matches!(self, Self::Flat | Self::QuotingPaired)
+        matches!(
+            self,
+            Self::Flat
+                | Self::QuotingPaired
+                | Self::Recycling
+                | Self::MergePending
+                | Self::Drifted
+        )
     }
 
     pub fn allows_close_side(self) -> bool {
@@ -510,6 +517,11 @@ pub enum StrategyDecision {
         intent: MergeIntent,
         notes: Vec<String>,
     },
+    Mixed {
+        intents: Vec<OrderIntent>,
+        commands: Vec<RuntimeCommand>,
+        notes: Vec<String>,
+    },
     Suppress {
         scope: SuppressionScope,
         reason: CoolingReason,
@@ -552,7 +564,8 @@ impl StrategyDecision {
         match self {
             Self::QuoteSet { intents, .. }
             | Self::CapitalRecycle { intents, .. }
-            | Self::Rescue { intents, .. } => intents,
+            | Self::Rescue { intents, .. }
+            | Self::Mixed { intents, .. } => intents,
             Self::Merge { .. } | Self::Suppress { .. } | Self::Noop { .. } => &[],
         }
     }
@@ -565,6 +578,12 @@ impl StrategyDecision {
                 intents.into_iter().map(RuntimeCommand::Submit).collect()
             }
             Self::Merge { intent, .. } => vec![RuntimeCommand::Merge(intent)],
+            Self::Mixed {
+                intents, commands, ..
+            } => commands
+                .into_iter()
+                .chain(intents.into_iter().map(RuntimeCommand::Submit))
+                .collect(),
             Self::Suppress { .. } | Self::Noop { .. } => Vec::new(),
         }
     }
