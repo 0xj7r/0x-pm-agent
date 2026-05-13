@@ -794,6 +794,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         input.btc_regime.regime(),
         Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
     );
+    let flat_regime = matches!(input.btc_regime.regime(), Some(BtcRegime::Flat));
     let model_favorite = favorite_probability(
         legs.favorite_leg,
         input.fair_value.p_up,
@@ -835,7 +836,13 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
 
     if legs.favorite_ask < 0.90 {
-        if early_late && (!clean_regime || strongest < threshold || model_favorite < 0.82) {
+        if early_late
+            && if flat_regime {
+                strongest < threshold * 1.15 || model_favorite < 0.86
+            } else {
+                !clean_regime || strongest < threshold || model_favorite < 0.82
+            }
+        {
             return None;
         }
         if whipsaw && (model_favorite < 0.88 || strongest < threshold * 1.50) {
@@ -843,6 +850,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         }
         let reversal_scale = (1.0 - 0.50 * path_reversal_risk).clamp(0.50, 1.0);
         let whipsaw_scale = if whipsaw { 0.50 } else { 1.0 };
+        let flat_scale = if flat_regime && early_late { 0.80 } else { 1.0 };
         return Some(FavoriteEntryPolicy {
             min_price: 0.80,
             max_levels: if whipsaw {
@@ -852,12 +860,20 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             } else {
                 3
             },
-            clip_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale * whipsaw_scale,
-            cap_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale * whipsaw_scale,
+            clip_multiplier: (if early_late { 0.40 } else { 0.70 })
+                * reversal_scale
+                * whipsaw_scale
+                * flat_scale,
+            cap_multiplier: (if early_late { 0.40 } else { 0.70 })
+                * reversal_scale
+                * whipsaw_scale
+                * flat_scale,
             allow_taker: false,
             path_reversal_risk,
             label: if whipsaw {
                 "maker_ladder_80_89_whipsaw"
+            } else if flat_regime && early_late {
+                "maker_ladder_80_89_flat_early"
             } else if early_late {
                 "maker_ladder_80_89_early"
             } else {
