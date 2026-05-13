@@ -50,6 +50,7 @@ use tracing::{info, warn};
 
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
 const MIN_MERGE_NET_GAIN_USD: f64 = 0.01;
+const MERGE_NOTIONAL_THRESHOLD_EPSILON_USD: f64 = 0.01;
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
@@ -1192,7 +1193,9 @@ impl<S: Strategy> Runtime<S> {
         // keeps paired-MM closer to the observed whale shape: broad laddering
         // plus batched merge/redeem, with immediate merge reserved for capital
         // pressure or inventory pressure.
-        if intent.expected_cash_usd + 1e-9 < self.min_merge_notional_usd {
+        if intent.expected_cash_usd + MERGE_NOTIONAL_THRESHOLD_EPSILON_USD
+            < self.min_merge_notional_usd
+        {
             if let Some(pressure_reason) = merge_pressure_reason.as_ref() {
                 outcome.push_event(
                     self.event_log.push(
@@ -1225,7 +1228,9 @@ impl<S: Strategy> Runtime<S> {
             }
         }
 
-        if intent.expected_cash_usd + 1e-9 >= self.min_merge_notional_usd {
+        if intent.expected_cash_usd + MERGE_NOTIONAL_THRESHOLD_EPSILON_USD
+            >= self.min_merge_notional_usd
+        {
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
@@ -3646,7 +3651,7 @@ impl<S: Strategy> Runtime<S> {
         let (no_qty, _) =
             self.durable_lane_qty_cost(market_id, &no_instrument_id, AccountingLane::PairedCore);
         let pair_qty = yes_qty.min(no_qty).max(0.0);
-        if pair_qty + ACCOUNTING_QTY_EPSILON < self.min_merge_notional_usd {
+        if pair_qty + MERGE_NOTIONAL_THRESHOLD_EPSILON_USD < self.min_merge_notional_usd {
             return RuntimeOutcome::default();
         }
         self.plan_merge_command_for_market(
