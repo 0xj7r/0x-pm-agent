@@ -3322,6 +3322,15 @@ async fn apply_sync_report(
     if execution_policy.paper_mode {
         return outcome;
     }
+    let reported_missing_local_orders = report
+        .missing_local_orders
+        .iter()
+        .chain(report.pending_missing_local_orders.iter())
+        .cloned()
+        .collect::<HashSet<_>>();
+    live_safety
+        .suspect_missing_local_orders
+        .retain(|client_order_id, _| reported_missing_local_orders.contains(client_order_id));
     let mut unresolved_missing_local_orders = Vec::new();
     for client_order_id in &report.missing_local_orders {
         let (removed, terminal_outcome) = runtime.remove_active_order_if_durable_terminal(
@@ -3354,6 +3363,30 @@ async fn apply_sync_report(
         let Some(managed) = open_order_by_client.get(&client_order_id) else {
             continue;
         };
+        if can_defer_missing_local_order_escalation(managed) {
+            let suspect = live_safety
+                .suspect_missing_local_orders
+                .entry(client_order_id.clone())
+                .or_default();
+            if suspect.first_seen_ms == 0 {
+                suspect.first_seen_ms = now_ms;
+            }
+            suspect.observed_count = suspect.observed_count.saturating_add(1);
+            let suspect_age_ms = now_ms.saturating_sub(suspect.first_seen_ms);
+            if suspect.observed_count < 3 && suspect_age_ms < 8_000 {
+                debug!(
+                    mode = "live",
+                    client_order_id = %client_order_id,
+                    market_id = %managed.intent.market_id,
+                    instrument_id = %managed.intent.instrument_id,
+                    status = ?managed.status,
+                    suspect_observed_count = suspect.observed_count,
+                    suspect_age_ms,
+                    "passive live order absent from open-order sync; deferring NeedsReconcile for fill/cancel race"
+                );
+                continue;
+            }
+        }
         debug!(
             mode = "live",
             client_order_id = %client_order_id,
@@ -3586,6 +3619,25 @@ async fn apply_sync_report(
         outcome.extend(runtime.degrade_and_cancel_all(now_ms, reason));
     }
     outcome
+}
+
+fn can_defer_missing_local_order_escalation(managed: &ManagedOrder) -> bool {
+    if !matches!(
+        managed.status,
+        ManagedOrderStatus::Submitted
+            | ManagedOrderStatus::Working
+            | ManagedOrderStatus::CancelRequested
+    ) {
+        return false;
+    }
+    if managed.intent.kind == crate::types::IntentKind::Close {
+        return false;
+    }
+    !managed
+        .intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("late-fav-taker"))
 }
 
 fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) -> bool {
