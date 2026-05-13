@@ -99,7 +99,9 @@ pub struct ConvexTailConfig {
     pub start_frac: f64,
     pub clip_usd: f64,
     pub max_load_usd: f64,
-    /// Hard upper bound as a fraction of filled late-favorite notional.
+    /// Target fraction of filled late-favorite cost to protect if the favorite
+    /// reverses. The actual tail spend is payoff-aware, so cheaper tails buy
+    /// more protection for the same favorite-upside erosion budget.
     pub max_favorite_exposure_fraction: f64,
     /// Hard upper bound as a fraction of the late-favorite win-upside. If the
     /// favorite wins, cheap-tail loses; this cap prevents the hedge from
@@ -115,7 +117,7 @@ impl Default for ConvexTailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_cheap_ask: 0.35,
+            max_cheap_ask: 0.20,
             window_sec: 60,
             start_frac: 0.0,
             clip_usd: 1.25,
@@ -643,17 +645,45 @@ fn cheap_tail_cap_usd(
     cfg: &ConvexTailConfig,
     late_fav_qty: f64,
     favorite_ask: f64,
-    regime_multiplier: f64,
+    cheap_ask: f64,
+    regime: Option<BtcRegime>,
 ) -> f64 {
-    if late_fav_qty <= 0.0 || favorite_ask <= 0.0 || favorite_ask >= 1.0 {
+    if late_fav_qty <= 0.0
+        || favorite_ask <= 0.0
+        || favorite_ask >= 1.0
+        || cheap_ask <= 0.0
+        || cheap_ask >= 1.0
+    {
         return 0.0;
     }
     let favorite_notional = late_fav_qty * favorite_ask;
     let favorite_win_upside = late_fav_qty * (1.0 - favorite_ask);
+    let tail_payoff_multiple = (1.0 / cheap_ask) - 1.0;
+    if tail_payoff_multiple <= 0.0 {
+        return 0.0;
+    }
+    let coverage_fraction = cheap_tail_coverage_fraction(cfg, regime);
+    let spend_for_reversal_coverage =
+        (favorite_notional * coverage_fraction) / tail_payoff_multiple;
+    let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
+
     cfg.max_load_usd
-        .min(favorite_notional * cfg.max_favorite_exposure_fraction.max(0.0))
-        .min(favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0))
-        * regime_multiplier.clamp(0.05, 1.0)
+        .min(spend_for_reversal_coverage)
+        .min(edge_erosion_cap)
+}
+
+fn cheap_tail_coverage_fraction(cfg: &ConvexTailConfig, regime: Option<BtcRegime>) -> f64 {
+    let base = cfg.max_favorite_exposure_fraction.max(0.0);
+    let regime_multiplier = match regime {
+        // Choppy tape is exactly where cheap convexity is most useful: the
+        // favorite signal can still be right, but late reversals are common.
+        Some(BtcRegime::Whipsaw) => 2.0,
+        Some(BtcRegime::Flat) => 1.5,
+        Some(BtcRegime::TrendingVolatile) => 1.25,
+        Some(BtcRegime::DirectionalSmooth) => 0.75,
+        None => 1.0,
+    };
+    (base * regime_multiplier).clamp(0.0, 1.0)
 }
 
 fn cheap_tail_ladder_levels(cheap_ask: f64, budget_usd: f64, min_order_usd: f64) -> usize {
@@ -875,7 +905,8 @@ where
                 &tail_cfg,
                 late_fav_filled_qty,
                 legs.favorite_ask,
-                regime_multiplier,
+                legs.cheap_ask,
+                input.btc_regime.regime(),
             );
             let remaining_load = (tail_cap_usd - current_exposure_usd).max(0.0);
             if remaining_load >= tail_cfg.min_order_usd {
@@ -989,8 +1020,6 @@ impl BonereaperMmStrategy {
         let mut notes = Vec::new();
         let mut quote_intents = Vec::new();
         let mut reactive_intents = Vec::new();
-        let mut merge = None;
-        let mut commands_notes = Vec::new();
         let mut hard_suppressed = false;
         let mut soft_suppressed = false;
 
@@ -1019,15 +1048,14 @@ impl BonereaperMmStrategy {
                     notes.extend(decision_notes);
                 }
                 Merge {
-                    intent,
+                    intent: _,
                     notes: decision_notes,
                 } => {
-                    notes.extend(decision_notes);
-                    commands_notes.push(format!(
-                        "bonereaper merge retained command_id={} qty={:.4}",
-                        intent.command_id, intent.quantity,
-                    ));
-                    merge = Some(intent);
+                    notes.extend(
+                        decision_notes
+                            .into_iter()
+                            .filter(|note| !is_merge_planner_note(note)),
+                    );
                 }
                 Mixed {
                     intents,
@@ -1035,14 +1063,16 @@ impl BonereaperMmStrategy {
                     notes: decision_notes,
                 } => {
                     reactive_intents.extend(intents);
-                    notes.extend(decision_notes);
+                    notes.extend(
+                        decision_notes
+                            .into_iter()
+                            .filter(|note| !is_merge_planner_note(note)),
+                    );
                     for command in commands {
-                        if let RuntimeCommand::Merge(intent) = command {
-                            commands_notes.push(format!(
-                                "bonereaper merge retained command_id={} qty={:.4}",
-                                intent.command_id, intent.quantity,
-                            ));
-                            merge = Some(intent);
+                        if !matches!(command, RuntimeCommand::Merge(_)) {
+                            notes.push(
+                                "bonereaper ignored unsupported child runtime command".to_string(),
+                            );
                         }
                     }
                 }
@@ -1064,7 +1094,6 @@ impl BonereaperMmStrategy {
             }
         }
 
-        notes.extend(commands_notes);
         if hard_suppressed {
             return StrategyDecision::Suppress {
                 scope: SuppressionScope::AllActions,
@@ -1073,39 +1102,18 @@ impl BonereaperMmStrategy {
                 notes,
             };
         }
-        let merge_commands = merge
-            .into_iter()
-            .map(RuntimeCommand::Merge)
-            .collect::<Vec<_>>();
         if !reactive_intents.is_empty() {
             reactive_intents.extend(quote_intents);
-            if !merge_commands.is_empty() {
-                return StrategyDecision::Mixed {
-                    intents: reactive_intents,
-                    commands: merge_commands,
-                    notes,
-                };
-            }
             return StrategyDecision::Rescue {
                 intents: reactive_intents,
                 notes,
             };
         }
         if !quote_intents.is_empty() {
-            if !merge_commands.is_empty() {
-                return StrategyDecision::Mixed {
-                    intents: quote_intents,
-                    commands: merge_commands,
-                    notes,
-                };
-            }
             return StrategyDecision::QuoteSet {
                 intents: quote_intents,
                 notes,
             };
-        }
-        if let Some(RuntimeCommand::Merge(intent)) = merge_commands.into_iter().next() {
-            return StrategyDecision::Merge { intent, notes };
         }
         if soft_suppressed {
             return StrategyDecision::Suppress {
@@ -1117,6 +1125,12 @@ impl BonereaperMmStrategy {
         }
         StrategyDecision::Noop { notes }
     }
+}
+
+fn is_merge_planner_note(note: &str) -> bool {
+    note.contains("paired_core merging")
+        || note.contains("paired_core merge skipped")
+        || note.contains("bonereaper merge retained")
 }
 
 #[cfg(test)]
@@ -1215,11 +1229,21 @@ mod tests {
 
         // 100 shares loaded at 95c has $95 notional but only $5 win-upside.
         // Tail spend must be capped by upside budget, not raw favorite notional.
-        assert!((cheap_tail_cap_usd(&cfg, 100.0, 0.95, 1.0) - 2.5).abs() < 1e-9);
+        assert!(
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.01,
+                Some(BtcRegime::Whipsaw)
+            ) - 2.5)
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
-    fn cheap_tail_cap_scales_down_in_choppy_regime() {
+    fn cheap_tail_cap_uses_payoff_aware_reversal_coverage() {
         let cfg = ConvexTailConfig {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
@@ -1227,7 +1251,60 @@ mod tests {
             ..ConvexTailConfig::default()
         };
 
-        assert!((cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.25) - 0.625).abs() < 1e-9);
+        // 100 shares at 95c costs $95. In whipsaw, coverage target is doubled
+        // from 25% to 50%, so a 5c tail needs $47.50 / 19 = $2.50 of spend.
+        // This is still bounded by the favorite-upside erosion cap.
+        assert!(
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.05,
+                Some(BtcRegime::Whipsaw)
+            ) - 2.5)
+                .abs()
+                < 1e-9
+        );
+
+        // At 25c, the same coverage is too expensive, so the edge-erosion cap
+        // remains the binding constraint.
+        assert!(
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.25,
+                Some(BtcRegime::Whipsaw)
+            ) - 2.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn cheap_tail_cap_is_lower_in_directional_smooth_regime() {
+        let cfg = ConvexTailConfig {
+            max_load_usd: 100.0,
+            max_favorite_exposure_fraction: 0.25,
+            max_win_edge_spend_fraction: 0.50,
+            ..ConvexTailConfig::default()
+        };
+
+        assert!(
+            cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.05,
+                Some(BtcRegime::DirectionalSmooth)
+            ) < cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.05,
+                Some(BtcRegime::Whipsaw)
+            )
+        );
     }
 
     #[test]
