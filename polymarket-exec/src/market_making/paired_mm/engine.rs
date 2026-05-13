@@ -68,6 +68,14 @@ pub struct ConvexityOverlayConfig {
     pub min_tail_payoff_multiple: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LateFavoriteEntryPolicy {
+    favorite_scale: f64,
+    tail_scale: f64,
+    budget_scale: f64,
+    label: &'static str,
+}
+
 impl Default for ConvexityOverlayConfig {
     fn default() -> Self {
         Self {
@@ -553,6 +561,90 @@ fn record_convex_pmax(p_max: f64) {
     bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+fn elapsed_ms(window_ms: u64, remaining_ms: u64) -> u64 {
+    window_ms.saturating_sub(remaining_ms.min(window_ms))
+}
+
+fn late_favorite_entry_policy(
+    favorite_price: f64,
+    favorite_prob: f64,
+    elapsed_ms: u64,
+    regime: Option<BtcRegime>,
+    favorite_side_score: crate::signals::side_score::SideScoreLeg,
+) -> Option<LateFavoriteEntryPolicy> {
+    if !favorite_price.is_finite() || favorite_price < 0.70 || favorite_price >= 1.0 {
+        return None;
+    }
+
+    let elapsed_sec = elapsed_ms as f64 / 1_000.0;
+    if elapsed_sec < 180.0 {
+        return None;
+    }
+
+    let adverse_reversal = favorite_side_score.reversal_component < -0.20;
+    let bad_book = favorite_side_score.book_sanity_penalty > 0.45;
+    if adverse_reversal || bad_book {
+        return None;
+    }
+
+    let early_late = elapsed_sec < 230.0;
+    let whipsaw = matches!(regime, Some(BtcRegime::Whipsaw));
+    let clean_regime = matches!(
+        regime,
+        Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
+    );
+
+    if favorite_price < 0.80 {
+        if whipsaw || favorite_prob < 0.86 || favorite_side_score.score < 0.30 {
+            return None;
+        }
+        return Some(LateFavoriteEntryPolicy {
+            favorite_scale: if early_late { 0.20 } else { 0.35 },
+            tail_scale: if early_late { 0.20 } else { 0.35 },
+            budget_scale: if early_late { 0.20 } else { 0.35 },
+            label: if early_late {
+                "probe_70_79_early"
+            } else {
+                "probe_70_79_late"
+            },
+        });
+    }
+
+    if favorite_price < 0.90 {
+        if early_late && (!clean_regime || favorite_prob < 0.82) {
+            return None;
+        }
+        if whipsaw && favorite_prob < 0.90 {
+            return None;
+        }
+        return Some(LateFavoriteEntryPolicy {
+            favorite_scale: if early_late { 0.40 } else { 0.70 },
+            tail_scale: if early_late { 0.40 } else { 0.70 },
+            budget_scale: if early_late { 0.40 } else { 0.70 },
+            label: if early_late {
+                "maker_ladder_80_89_early"
+            } else {
+                "maker_ladder_80_89_late"
+            },
+        });
+    }
+
+    if early_late && whipsaw {
+        return None;
+    }
+
+    Some(LateFavoriteEntryPolicy {
+        favorite_scale: if early_late { 0.60 } else { 1.0 },
+        tail_scale: if early_late { 0.60 } else { 1.0 },
+        budget_scale: if early_late { 0.60 } else { 1.0 },
+        label: if early_late {
+            "true_late_fav_90_plus_early"
+        } else {
+            "true_late_fav_90_plus"
+        },
+    })
+}
+
 fn choose_convex_overlay<M: MarketDescriptor>(
     market: &M,
     snapshot: &PairedMarketSnapshot,
@@ -592,9 +684,13 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             CONVEX_FAIR_NOSIGNAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bucket = match reason {
                 crate::signals::fair_value::NoSignalReason::SpotInvalid => &CONVEX_NOSIGNAL_SPOT,
-                crate::signals::fair_value::NoSignalReason::StrikeInvalid => &CONVEX_NOSIGNAL_STRIKE,
+                crate::signals::fair_value::NoSignalReason::StrikeInvalid => {
+                    &CONVEX_NOSIGNAL_STRIKE
+                }
                 crate::signals::fair_value::NoSignalReason::VolInvalid => &CONVEX_NOSIGNAL_VOL,
-                crate::signals::fair_value::NoSignalReason::TimeRemainingInvalid => &CONVEX_NOSIGNAL_TIME,
+                crate::signals::fair_value::NoSignalReason::TimeRemainingInvalid => {
+                    &CONVEX_NOSIGNAL_TIME
+                }
             };
             bucket.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -669,6 +765,21 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         CONVEX_GATE_EDGE_TOO_THIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
     }
+    let Some(entry_policy) = late_favorite_entry_policy(
+        favorite_limit_price,
+        favorite.win_prob,
+        elapsed_ms(market.window_ms(), remaining_ms),
+        btc_regime.regime(),
+        side_score.leg(favorite.leg),
+    ) else {
+        CONVEX_GATE_PLAN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Vec::new();
+    };
+    let pressure_bias = ConvexPressureBias {
+        favorite_scale: pressure_bias.favorite_scale * entry_policy.favorite_scale,
+        tail_scale: pressure_bias.tail_scale * entry_policy.tail_scale,
+        label: pressure_bias.label,
+    };
 
     let effective_favorite_qty = favorite.effective_qty();
     let effective_tail_qty = tail.effective_qty();
@@ -682,8 +793,10 @@ fn choose_convex_overlay<M: MarketDescriptor>(
     // independent of stranded losses).
     let convex_attributed_cost =
         favorite.convex_attributed_cost_usd() + tail.convex_attributed_cost_usd();
-    let convex_remaining_budget =
-        (config.max_loss_usd.max(0.0) - convex_attributed_cost).max(0.0);
+    let convex_remaining_budget = ((config.max_loss_usd.max(0.0) - convex_attributed_cost)
+        .max(0.0)
+        * entry_policy.budget_scale)
+        .max(0.0);
     if convex_remaining_budget <= 0.0 {
         CONVEX_GATE_PLAN_REJECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Vec::new();
@@ -749,7 +862,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             favorite_limit_price,
             plan.favorite_qty,
             format!(
-                "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_favorite={:.4} regime={}",
+                "paired-mm late asymmetric package favorite leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_favorite={:.4} regime={} entry_policy={}",
                 favorite_edge * 10_000.0,
                 plan.ev_delta,
                 plan.pnl_if_favorite,
@@ -762,7 +875,8 @@ fn choose_convex_overlay<M: MarketDescriptor>(
                 side_score.leg(tail_leg).score,
                 side_score.leg(favorite_leg).reversal_component.abs(),
                 side_score.leg(favorite_leg).book_sanity_penalty,
-                plan.regime_label
+                plan.regime_label,
+                entry_policy.label
             ),
             now_ms,
         );
@@ -786,7 +900,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             tail_limit_price,
             plan.tail_qty,
             format!(
-                "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_tail={:.4} regime={}",
+                "paired-mm late asymmetric package ultra-cheap tail leg={tail_tag} p_win={tail_prob:.4} price={tail_limit_price:.4} ask={tail_best_ask:.4} package_ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_tail={:.4} favorite_notional={:.4} tail_notional={:.4} tail_payoff_multiple={:.2} pressure={} side_score_favorite={:.4} side_score_tail={:.4} reversal_prob={:.4} book_penalty_tail={:.4} regime={} entry_policy={}",
                 plan.ev_delta,
                 plan.pnl_if_favorite,
                 plan.pnl_if_tail,
@@ -798,7 +912,8 @@ fn choose_convex_overlay<M: MarketDescriptor>(
                 side_score.leg(tail_leg).score,
                 side_score.leg(favorite_leg).reversal_component.abs(),
                 side_score.leg(tail_leg).book_sanity_penalty,
-                plan.regime_label
+                plan.regime_label,
+                entry_policy.label
             ),
             now_ms,
         );
@@ -846,7 +961,7 @@ fn choose_convex_overlay<M: MarketDescriptor>(
         favorite_limit_price,
         favorite_plan.qty,
         format!(
-            "paired-mm late favorite-only load leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_other={:.4} notional={:.4} pressure={} side_score={:.4} reversal_prob={:.4} book_penalty={:.4} regime={}",
+            "paired-mm late favorite-only load leg={favorite_tag} p_win={favorite_prob:.4} price={favorite_limit_price:.4} ask={favorite_best_ask:.4} edge_bps={:.2} ev_delta={:.4} pnl_if_favorite={:.4} pnl_if_other={:.4} notional={:.4} pressure={} side_score={:.4} reversal_prob={:.4} book_penalty={:.4} regime={} entry_policy={}",
             favorite_edge * 10_000.0,
             favorite_plan.ev_delta,
             favorite_plan.pnl_if_favorite,
@@ -856,7 +971,8 @@ fn choose_convex_overlay<M: MarketDescriptor>(
             side_score.leg(favorite_leg).score,
             side_score.leg(favorite_leg).reversal_component.abs(),
             side_score.leg(favorite_leg).book_sanity_penalty,
-            favorite_plan.regime_label
+            favorite_plan.regime_label,
+            entry_policy.label
         ),
         now_ms,
     );
@@ -1246,7 +1362,9 @@ fn choose_late_asymmetric_package(
         } else if favorite_stranded {
             let fav_reserve = per_leg_floor.min(favorite_notional);
             let tail_cap = tail_notional.min((remaining_budget_usd - fav_reserve).max(0.0));
-            let fav_cap = (remaining_budget_usd - tail_cap).max(0.0).min(favorite_notional);
+            let fav_cap = (remaining_budget_usd - tail_cap)
+                .max(0.0)
+                .min(favorite_notional);
             favorite_notional = fav_cap;
             tail_notional = tail_cap;
         } else {

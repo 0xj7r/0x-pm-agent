@@ -215,7 +215,10 @@ fn rescue_math_uses_sell_fallback_when_buy_to_merge_is_worse() {
 #[test]
 fn active_strategy_yaml_profiles_load_and_select_supported_modes() {
     for (path, expected) in [
-        ("config/strategies/archive/btc_5m_paired_mm.live.yaml", "paired_mm"),
+        (
+            "config/strategies/archive/btc_5m_paired_mm.live.yaml",
+            "paired_mm",
+        ),
         (
             "config/strategies/whale_unlawful_strategy.live.yaml",
             "unlawful_mm",
@@ -282,8 +285,16 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     let bonereaper_late = bonereaper_profile.late_favorite_config();
     assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
     assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
-    assert_eq!(bonereaper_late.favorite_climb.regime_whipsaw_multiplier, 0.25);
-    assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.50);
-    assert_eq!(bonereaper_late.convex_tail.clip_usd, 1.25);
-    assert_eq!(bonereaper_late.convex_tail.max_win_edge_spend_fraction, 0.50);
+    assert_eq!(bonereaper_late.favorite_climb.clip_usd, 10.0);
+    assert_eq!(bonereaper_late.favorite_climb.max_load_usd, 55.0);
+    assert_eq!(
+        bonereaper_late.favorite_climb.regime_whipsaw_multiplier,
+        0.45
+    );
+    assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.70);
+    assert_eq!(bonereaper_late.convex_tail.clip_usd, 3.0);
+    assert_eq!(
+        bonereaper_late.convex_tail.max_win_edge_spend_fraction,
+        0.80
+    );
 }

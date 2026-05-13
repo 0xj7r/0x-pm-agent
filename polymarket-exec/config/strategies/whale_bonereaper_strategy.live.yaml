@@ -60,8 +60,8 @@ late_favorite:
     window_sec: 300
     start_frac: 0.10
     min_elapsed_sec: 75
-    clip_usd: 7.0
-    max_load_usd: 35.0
+    clip_usd: 10.0
+    max_load_usd: 55.0
     maker_improve_ticks: 0.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
