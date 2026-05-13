@@ -654,14 +654,6 @@ impl PolymarketExecutionAdapter {
         })
     }
 
-    fn v2_l2_address(&self) -> SdkAddress {
-        if self.signature_type == PolymarketSignatureType::Eoa {
-            self.signer.address()
-        } else {
-            self.trade_address.unwrap_or_else(|| self.signer.address())
-        }
-    }
-
     /// Checks whether a single live order is currently scoring for
     /// maker rewards. Returns the venue's boolean. Logs a structured
     /// event so operators can see (a) which orders qualify and (b)
@@ -840,26 +832,18 @@ impl PolymarketExecutionAdapter {
             let amount = SdkV2Amount::usdc(market_buy_amount).map_err(|error| {
                 ExecutionError::BadRequest(format!("invalid V2 SDK USDC amount: {error}"))
             })?;
-            let builder = client
+            client
                 .market_order()
                 .token_id(token_id)
                 .side(side)
                 .price(price)
                 .amount(amount)
                 .order_type(order_type)
-                .builder_code(builder_code_b256);
-            if self.signature_type == PolymarketSignatureType::Poly1271 {
-                let order = builder.build().await.map_err(|error| {
-                    ExecutionError::VenueRejection(format!("V2 SDK build: {error}"))
-                })?;
-                let signed_order = client.sign(&sdk_signer, order).await.map_err(|error| {
-                    ExecutionError::VenueRejection(format!("V2 SDK sign: {error}"))
-                })?;
-                return self.post_v2_sdk_signed_order(req, signed_order).await;
-            }
-            builder.build_sign_and_post(&sdk_signer).await
+                .builder_code(builder_code_b256)
+                .build_sign_and_post(&sdk_signer)
+                .await
         } else {
-            let builder = client
+            client
                 .limit_order()
                 .token_id(token_id)
                 .side(side)
@@ -868,17 +852,9 @@ impl PolymarketExecutionAdapter {
                 .order_type(order_type)
                 .expiration(expiration_dt)
                 .post_only(req.post_only)
-                .builder_code(builder_code_b256);
-            if self.signature_type == PolymarketSignatureType::Poly1271 {
-                let order = builder.build().await.map_err(|error| {
-                    ExecutionError::VenueRejection(format!("V2 SDK build: {error}"))
-                })?;
-                let signed_order = client.sign(&sdk_signer, order).await.map_err(|error| {
-                    ExecutionError::VenueRejection(format!("V2 SDK sign: {error}"))
-                })?;
-                return self.post_v2_sdk_signed_order(req, signed_order).await;
-            }
-            builder.build_sign_and_post(&sdk_signer).await
+                .builder_code(builder_code_b256)
+                .build_sign_and_post(&sdk_signer)
+                .await
         }
         .map_err(|error| {
             ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
@@ -1078,7 +1054,7 @@ impl PolymarketExecutionAdapter {
         let mut headers = HeaderMap::new();
         headers.insert(
             "POLY_ADDRESS",
-            HeaderValue::from_str(&self.v2_l2_address().to_string())
+            HeaderValue::from_str(&self.signer.address().to_string())
                 .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
         );
         headers.insert(
