@@ -177,7 +177,7 @@ impl CtfRelayerClient {
         request: CtfMergeRequest,
     ) -> Result<RelayerSubmitAck, ExecutionError> {
         match self.config.signature_type_code {
-            1 => {
+            1 | 2 => {
                 let from = request.signer.address();
                 let relay_payload = self.relay_payload(from, "PROXY").await?;
                 let body = self
@@ -193,7 +193,7 @@ impl CtfRelayerClient {
             }
             0 => self.submit_eoa_merge(&request).await,
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+                "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
             ))),
         }
     }
@@ -231,7 +231,7 @@ impl CtfRelayerClient {
             ));
         }
         match self.config.signature_type_code {
-            1 => {
+            1 | 2 => {
                 let from = request.signer.address();
                 let relay_payload = self.relay_payload(from, "PROXY").await?;
                 let body = self
@@ -248,7 +248,7 @@ impl CtfRelayerClient {
             }
             0 => self.submit_eoa_redeem(&request).await,
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF relayer redeem supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+                "CTF relayer redeem supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
             ))),
         }
     }
@@ -277,9 +277,9 @@ impl CtfRelayerClient {
     fn merge_actor_address(&self, signer: &PrivateKeySigner) -> Result<Address, ExecutionError> {
         match self.config.signature_type_code {
             0 => Ok(signer.address()),
-            1 => self.proxy_wallet(signer.address()),
+            1 | 2 => self.proxy_wallet(signer.address()),
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF merge dry-run supports POLYMARKET_SIGNATURE_TYPE=0 (EOA) or =1 (proxy), got {other}",
+                "CTF merge dry-run supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
             ))),
         }
     }
