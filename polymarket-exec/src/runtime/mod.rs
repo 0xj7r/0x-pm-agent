@@ -24,6 +24,7 @@ use crate::inventory::{
     InventoryReconciliationReport, InventoryState, StrandedMarketInventory, VenuePositionSnapshot,
 };
 use crate::market_context::MarketContextStore;
+use crate::market_making::paired_mm::PairedInventorySnapshot;
 use crate::merge_executor::MergeExecutor;
 use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
 use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
@@ -48,6 +49,7 @@ pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
 use tracing::{info, warn};
 
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
+const MIN_MERGE_NET_GAIN_USD: f64 = 0.01;
 
 pub struct Runtime<S: Strategy> {
     strategy: S,
@@ -75,6 +77,9 @@ pub struct Runtime<S: Strategy> {
     pending_merge_by_market: HashMap<MarketId, MergeIntent>,
     accepted_merge_by_market: HashMap<MarketId, AcceptedMerge>,
     blocked_merge_by_market: HashMap<MarketId, BlockedMerge>,
+    directional_inventory_by_market_instrument: HashMap<(MarketId, InstrumentId), f64>,
+    late_fav_inventory_by_market_instrument: HashMap<(MarketId, InstrumentId), f64>,
+    cheap_tail_inventory_by_market_instrument: HashMap<(MarketId, InstrumentId), f64>,
     condition_id_by_market: HashMap<MarketId, String>,
     venue_market_rules: HashMap<MarketId, VenueMarketRules>,
     markets_with_unresolved_drift: HashSet<MarketId>,
@@ -99,6 +104,30 @@ struct MergeSignature {
     yes_instrument_id: InstrumentId,
     no_instrument_id: InstrumentId,
     quantity_units: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InventoryLane {
+    MergeablePaired,
+    Directional,
+    Other,
+}
+
+fn inventory_lane_from_tag(tag: Option<&str>) -> InventoryLane {
+    let Some(tag) = tag else {
+        return InventoryLane::Other;
+    };
+    let tag = tag.to_ascii_lowercase();
+    if tag.starts_with("late-fav") || tag.contains("cheap-tail") || tag.contains("convex") {
+        InventoryLane::Directional
+    } else if tag.starts_with("paired-core:")
+        || tag.contains("paired-mm")
+        || tag.contains("mm-paired-bid")
+    {
+        InventoryLane::MergeablePaired
+    } else {
+        InventoryLane::Other
+    }
 }
 
 impl MergeSignature {
@@ -178,6 +207,9 @@ impl<S: Strategy> Runtime<S> {
             pending_merge_by_market: HashMap::new(),
             accepted_merge_by_market: HashMap::new(),
             blocked_merge_by_market: HashMap::new(),
+            directional_inventory_by_market_instrument: HashMap::new(),
+            late_fav_inventory_by_market_instrument: HashMap::new(),
+            cheap_tail_inventory_by_market_instrument: HashMap::new(),
             condition_id_by_market: HashMap::new(),
             venue_market_rules: HashMap::new(),
             markets_with_unresolved_drift: HashSet::new(),
@@ -662,16 +694,29 @@ impl<S: Strategy> Runtime<S> {
                 }),
             );
         }
+        self.clamp_directional_inventory_to_current_positions();
         for stranded in &report.stranded_markets {
+            let tracked_directional_qty =
+                self.directional_inventory_qty_for_market(&stranded.market_id);
+            let message = if tracked_directional_qty > ACCOUNTING_QTY_EPSILON {
+                format!(
+                    "venue reconciliation found directional residual: paired_qty={:.8} residual_legs={} tracked_directional_qty={:.8}",
+                    stranded.paired_quantity,
+                    stranded.stranded_positions.len(),
+                    tracked_directional_qty
+                )
+            } else {
+                format!(
+                    "venue reconciliation found stranded inventory: paired_qty={:.8} stranded_legs={}",
+                    stranded.paired_quantity,
+                    stranded.stranded_positions.len()
+                )
+            };
             self.event_log.push(
                 EventRecord::new(
                     EventCategory::Inventory,
                     observed_at_ms,
-                    format!(
-                        "venue reconciliation found stranded inventory: paired_qty={:.8} stranded_legs={}",
-                        stranded.paired_quantity,
-                        stranded.stranded_positions.len()
-                    ),
+                    message,
                 )
                 .with_market(stranded.market_id.clone()),
             );
@@ -1001,6 +1046,104 @@ impl<S: Strategy> Runtime<S> {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
 
+        let (yes_position_qty, yes_position_avg_price) = self
+            .inventory
+            .positions()
+            .find(|position| {
+                &position.market_id == market_id
+                    && position.instrument_id == intent.yes_instrument_id
+            })
+            .map(|position| (position.quantity.max(0.0), position.avg_price.max(0.0)))
+            .unwrap_or((0.0, 0.0));
+        let (no_position_qty, no_position_avg_price) = self
+            .inventory
+            .positions()
+            .find(|position| {
+                &position.market_id == market_id
+                    && position.instrument_id == intent.no_instrument_id
+            })
+            .map(|position| (position.quantity.max(0.0), position.avg_price.max(0.0)))
+            .unwrap_or((0.0, 0.0));
+        let protected_yes_qty = self
+            .directional_inventory_qty(market_id, &intent.yes_instrument_id)
+            .max(self.durable_directional_inventory_qty(
+                market_id,
+                &intent.yes_instrument_id,
+            ))
+            .min(yes_position_qty)
+            .max(0.0);
+        let protected_no_qty = self
+            .directional_inventory_qty(market_id, &intent.no_instrument_id)
+            .max(self.durable_directional_inventory_qty(
+                market_id,
+                &intent.no_instrument_id,
+            ))
+            .min(no_position_qty)
+            .max(0.0);
+        let inventory_mergeable_quantity = (yes_position_qty - protected_yes_qty)
+            .min(no_position_qty - protected_no_qty)
+            .max(0.0);
+        let durable_mergeable_quantity = if self.order_store.is_some() {
+            let (yes_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+                market_id,
+                &intent.yes_instrument_id,
+                InventoryLane::MergeablePaired,
+            );
+            let (no_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+                market_id,
+                &intent.no_instrument_id,
+                InventoryLane::MergeablePaired,
+            );
+            yes_durable_mergeable_qty.min(no_durable_mergeable_qty)
+        } else {
+            f64::INFINITY
+        };
+        let mergeable_quantity = inventory_mergeable_quantity
+            .min(durable_mergeable_quantity)
+            .max(0.0);
+        if mergeable_quantity + ACCOUNTING_QTY_EPSILON < intent.quantity {
+            let original_quantity = intent.quantity.max(ACCOUNTING_QTY_EPSILON);
+            if mergeable_quantity <= ACCOUNTING_QTY_EPSILON {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge skipped: paired inventory is protected directional residual yes_qty={yes_position_qty:.4} no_qty={no_position_qty:.4} protected_yes={protected_yes_qty:.4} protected_no={protected_no_qty:.4}"
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+                return outcome;
+            }
+            let scale = mergeable_quantity / original_quantity;
+            intent.quantity = mergeable_quantity;
+            intent.expected_cash_usd *= scale;
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "merge clipped to protect directional residual original_qty={original_quantity:.4} mergeable_qty={mergeable_quantity:.4} protected_yes={protected_yes_qty:.4} protected_no={protected_no_qty:.4}"
+                        ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+        }
+        intent.expected_cash_usd = intent.quantity;
+        intent.expected_cost_usd = self.mergeable_paired_cost_basis_usd(
+            market_id,
+            &intent.yes_instrument_id,
+            &intent.no_instrument_id,
+            intent.quantity,
+            yes_position_avg_price,
+            no_position_avg_price,
+        );
+
         let merge_pressure_reason = self.merge_pressure_reason(market_id);
 
         // Batch tiny completed pairs unless recycling pressure is real. This
@@ -1116,6 +1259,33 @@ impl<S: Strategy> Runtime<S> {
             self.accepted_merge_by_market.remove(market_id);
         }
 
+        let expected_net_gain_usd = intent.expected_net_gain_usd();
+        if !expected_net_gain_usd.is_finite() || expected_net_gain_usd < MIN_MERGE_NET_GAIN_USD {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "merge intent blocked insufficient_ev: qty={:.8} cash={:.4} cost={:.4} fee={:.4} gas={:.4} net_gain={:.4} min_net_gain={:.4} reason={}",
+                            intent.quantity,
+                            intent.expected_cash_usd,
+                            intent.expected_cost_usd,
+                            intent.expected_fee_usd,
+                            intent.expected_gas_usd,
+                            expected_net_gain_usd,
+                            MIN_MERGE_NET_GAIN_USD,
+                            intent.reason
+                        ),
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.yes_instrument_id.clone())
+                    .with_client_order(intent.command_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+
         self.pending_merge_by_market
             .insert(market_id.clone(), intent.clone());
         outcome.push_event(
@@ -1128,7 +1298,7 @@ impl<S: Strategy> Runtime<S> {
                         intent.quantity,
                         intent.expected_cash_usd,
                         intent.expected_cost_usd,
-                        intent.expected_net_gain_usd(),
+                        expected_net_gain_usd,
                         intent.reason
                     ),
                 )
@@ -1218,7 +1388,35 @@ impl<S: Strategy> Runtime<S> {
             .unwrap_or((positions[0], positions[1]));
 
         let (yes_position, no_position) = ordered_positions;
-        let quantity = yes_position.quantity.min(no_position.quantity);
+        let yes_directional_qty = self
+            .directional_inventory_qty(market_id, &yes_position.instrument_id)
+            .max(self.durable_directional_inventory_qty(market_id, &yes_position.instrument_id));
+        let no_directional_qty = self
+            .directional_inventory_qty(market_id, &no_position.instrument_id)
+            .max(self.durable_directional_inventory_qty(market_id, &no_position.instrument_id));
+        let yes_inventory_mergeable_qty = (yes_position.quantity - yes_directional_qty).max(0.0);
+        let no_inventory_mergeable_qty = (no_position.quantity - no_directional_qty).max(0.0);
+        let (yes_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+            market_id,
+            &yes_position.instrument_id,
+            InventoryLane::MergeablePaired,
+        );
+        let (no_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+            market_id,
+            &no_position.instrument_id,
+            InventoryLane::MergeablePaired,
+        );
+        let yes_mergeable_qty = if self.order_store.is_some() {
+            yes_inventory_mergeable_qty.min(yes_durable_mergeable_qty)
+        } else {
+            yes_inventory_mergeable_qty
+        };
+        let no_mergeable_qty = if self.order_store.is_some() {
+            no_inventory_mergeable_qty.min(no_durable_mergeable_qty)
+        } else {
+            no_inventory_mergeable_qty
+        };
+        let quantity = yes_mergeable_qty.min(no_mergeable_qty);
         if quantity <= 1e-9 {
             return None;
         }
@@ -1596,11 +1794,19 @@ impl<S: Strategy> Runtime<S> {
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self.strategy.on_market_snapshot(&context, &snapshot);
             outcome.extend(self.accept_strategy_decision(decision, now_ms));
+            outcome.extend(self.plan_durable_paired_core_merge_sweep(
+                &snapshot.market_id,
+                now_ms,
+            ));
             Ok(outcome)
         } else {
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self.strategy.on_market_snapshot(&context, &snapshot);
-            let outcome = self.accept_strategy_decision(decision, now_ms);
+            let mut outcome = self.accept_strategy_decision(decision, now_ms);
+            outcome.extend(self.plan_durable_paired_core_merge_sweep(
+                &snapshot.market_id,
+                now_ms,
+            ));
             Ok(outcome)
         }
     }
@@ -1671,6 +1877,7 @@ impl<S: Strategy> Runtime<S> {
         );
         let redeem_flow = matches!(fill.close_method, Some(CloseMethod::Redeem));
         let mut outcome = RuntimeOutcome::default();
+        let mut post_persist_auto_merge_market = None;
         outcome.push_event(
             self.event_log.push(
                 EventRecord::new(
@@ -1800,18 +2007,89 @@ impl<S: Strategy> Runtime<S> {
                 );
             }
         } else {
+            let auto_merge_tag = fill
+                .client_order_id
+                .as_ref()
+                .and_then(|client_order_id| self.open_orders.get(client_order_id))
+                .and_then(|managed| managed.intent.quote_level_tag.as_deref())
+                .map(str::to_string)
+                .or_else(|| {
+                    fill.client_order_id.as_ref().and_then(|client_order_id| {
+                        self.order_store
+                            .as_ref()
+                            .and_then(|store| match store.get(client_order_id) {
+                                Ok(Some(record)) => record.quote_level_tag,
+                                Ok(None) => None,
+                                Err(error) => {
+                                    warn!(
+                                        run_id = %self.run_id,
+                                        error = ?error,
+                                        client_order_id = %client_order_id,
+                                        "failed to load durable order tag for fill lane classification"
+                                    );
+                                    None
+                                }
+                            })
+                    })
+                });
+            let inventory_lane = inventory_lane_from_tag(auto_merge_tag.as_deref());
+            let legacy_anonymous_merge_allowed =
+                self.order_store.is_none() && fill.client_order_id.is_none();
+            let auto_merge_allowed = inventory_lane == InventoryLane::MergeablePaired
+                || legacy_anonymous_merge_allowed;
             let adjustment = self.inventory.apply_fill(&fill)?;
-            self.merge_executor.on_fill(&fill);
             executed_qty = fill.quantity;
+            if fill.side == crate::types::TradeSide::Buy
+                && inventory_lane == InventoryLane::Directional
+            {
+                let key = (fill.market_id.clone(), fill.instrument_id.clone());
+                *self
+                    .directional_inventory_by_market_instrument
+                    .entry(key)
+                    .or_insert(0.0) += fill.quantity;
+                if auto_merge_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.starts_with("late-fav"))
+                {
+                    let key = (fill.market_id.clone(), fill.instrument_id.clone());
+                    *self
+                        .late_fav_inventory_by_market_instrument
+                        .entry(key)
+                        .or_insert(0.0) += fill.quantity;
+                } else if auto_merge_tag.as_deref().is_some_and(|tag| {
+                    let tag = tag.to_ascii_lowercase();
+                    tag.contains("cheap-tail") || tag.contains("convex")
+                }) {
+                    let key = (fill.market_id.clone(), fill.instrument_id.clone());
+                    *self
+                        .cheap_tail_inventory_by_market_instrument
+                        .entry(key)
+                        .or_insert(0.0) += fill.quantity;
+                }
+            }
             outcome.push_event(
                 self.event_log
                     .push(adjustment.to_event("inventory updated from fill")),
             );
-            outcome.extend(self.plan_merge_command_for_market(
-                &fill.market_id,
-                now_ms,
-                "paired inventory after fill",
-            ));
+            if auto_merge_allowed {
+                self.merge_executor.on_fill(&fill);
+                post_persist_auto_merge_market = Some(fill.market_id.clone());
+            } else {
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Strategy,
+                            now_ms,
+                            format!(
+                                "auto merge skipped for non-paired fill tag={}",
+                                auto_merge_tag.as_deref().unwrap_or("<missing>")
+                            ),
+                        )
+                        .with_market(fill.market_id.clone())
+                        .with_instrument(fill.instrument_id.clone()),
+                    ),
+                );
+            }
         }
 
         if executed_qty > 0.0 {
@@ -1890,6 +2168,14 @@ impl<S: Strategy> Runtime<S> {
                 }
                 self.open_orders.remove(client_order_id);
             }
+        }
+
+        if let Some(market_id) = post_persist_auto_merge_market {
+            outcome.extend(self.plan_merge_command_for_market(
+                &market_id,
+                now_ms,
+                "paired-core inventory after durable fill persistence",
+            ));
         }
 
         let context = self.strategy_context(now_ms, Some(&fill.market_id));
@@ -2464,6 +2750,50 @@ impl<S: Strategy> Runtime<S> {
                     }
                 }
             }
+            StrategyDecision::Mixed {
+                intents,
+                commands,
+                reactive,
+                ..
+            } => {
+                if reactive
+                    && intents
+                        .iter()
+                        .any(|intent| matches!(intent.kind, crate::types::IntentKind::Entry))
+                {
+                    outcome.push_event(self.event_log.push(EventRecord::new(
+                        EventCategory::Strategy,
+                        now_ms,
+                        "mixed strategy reaction: cancelling entry quotes before recycle/rescue",
+                    )));
+                    outcome.extend(
+                        self.request_cancel_entry_orders(now_ms, "mixed strategy reaction"),
+                    );
+                }
+                for command in commands {
+                    match command {
+                        RuntimeCommand::Submit(intent) => {
+                            outcome.extend(self.accept_intent(intent, now_ms));
+                        }
+                        RuntimeCommand::Cancel {
+                            client_order_id,
+                            reason,
+                        } => {
+                            outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
+                        }
+                        RuntimeCommand::Merge(intent) => {
+                            outcome.push_command(RuntimeCommand::Merge(intent));
+                        }
+                        RuntimeCommand::Redeem(intent) => {
+                            outcome.push_command(RuntimeCommand::Redeem(intent));
+                        }
+                        RuntimeCommand::Noop => {}
+                    }
+                }
+                for intent in intents {
+                    outcome.extend(self.accept_intent(intent, now_ms));
+                }
+            }
             StrategyDecision::QuoteSet { intents, .. } => {
                 let intents =
                     self.filter_incomplete_paired_entry_intents(intents, now_ms, &mut outcome);
@@ -2799,6 +3129,10 @@ impl<S: Strategy> Runtime<S> {
         if intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !is_rescue_intent
+            && !intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("late-fav-taker"))
             && self
                 .last_quotes
                 .get(&intent.instrument_id)
@@ -2834,6 +3168,10 @@ impl<S: Strategy> Runtime<S> {
             && self
                 .markets_with_unresolved_drift
                 .contains(&intent.market_id)
+            && !matches!(
+                inventory_lane_from_tag(intent.quote_level_tag.as_deref()),
+                InventoryLane::MergeablePaired | InventoryLane::Directional
+            )
         {
             outcome.push_event(
                 self.event_log.push(
@@ -3065,10 +3403,63 @@ impl<S: Strategy> Runtime<S> {
         let market_ledger_state = market_id
             .map(|id| self.market_ledger_state(id))
             .unwrap_or(MarketLedgerState::Flat);
+        let inventory = self.inventory.snapshot();
+        let paired_core_inventory = market_id
+            .and_then(|id| market_context.as_ref().map(|record| (id, record)))
+            .and_then(|(id, record)| self.durable_paired_core_inventory_snapshot(id, record, &inventory));
         StrategyContext {
             now_ms,
             runtime_status: self.status,
-            inventory: self.inventory.snapshot(),
+            inventory,
+            paired_core_inventory,
+            directional_inventory: self
+                .directional_inventory_by_market_instrument
+                .iter()
+                .filter(|((tracked_market_id, _), qty)| {
+                    **qty > ACCOUNTING_QTY_EPSILON
+                        && market_id.is_none_or(|id| tracked_market_id == id)
+                })
+                .map(|((tracked_market_id, instrument_id), qty)| {
+                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
+                        market_id: tracked_market_id.clone(),
+                        instrument_id: instrument_id.clone(),
+                        quantity: (*qty).max(0.0),
+                        quote_level_tag: None,
+                    }
+                })
+                .collect(),
+            late_fav_inventory: self
+                .late_fav_inventory_by_market_instrument
+                .iter()
+                .filter(|((tracked_market_id, _), qty)| {
+                    **qty > ACCOUNTING_QTY_EPSILON
+                        && market_id.is_none_or(|id| tracked_market_id == id)
+                })
+                .map(|((tracked_market_id, instrument_id), qty)| {
+                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
+                        market_id: tracked_market_id.clone(),
+                        instrument_id: instrument_id.clone(),
+                        quantity: (*qty).max(0.0),
+                        quote_level_tag: Some("late-fav".to_string()),
+                    }
+                })
+                .collect(),
+            cheap_tail_inventory: self
+                .cheap_tail_inventory_by_market_instrument
+                .iter()
+                .filter(|((tracked_market_id, _), qty)| {
+                    **qty > ACCOUNTING_QTY_EPSILON
+                        && market_id.is_none_or(|id| tracked_market_id == id)
+                })
+                .map(|((tracked_market_id, instrument_id), qty)| {
+                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
+                        market_id: tracked_market_id.clone(),
+                        instrument_id: instrument_id.clone(),
+                        quantity: (*qty).max(0.0),
+                        quote_level_tag: Some("cheap-tail".to_string()),
+                    }
+                })
+                .collect(),
             open_orders: self
                 .open_orders
                 .values()
@@ -3129,6 +3520,256 @@ impl<S: Strategy> Runtime<S> {
     fn position_is_actionable_inventory(&self, position: &crate::inventory::PositionState) -> bool {
         position.quantity.abs() + ACCOUNTING_QTY_EPSILON
             >= self.actionable_order_qty_for_market(&position.market_id)
+    }
+
+    fn directional_inventory_qty(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+    ) -> f64 {
+        self.directional_inventory_by_market_instrument
+            .get(&(market_id.clone(), instrument_id.clone()))
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0)
+    }
+
+    fn durable_directional_inventory_qty(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+    ) -> f64 {
+        let Some(order_store) = self.order_store.as_ref() else {
+            return 0.0;
+        };
+        let records = match order_store.list_by_market(market_id) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(
+                    run_id = %self.run_id,
+                    market_id = %market_id,
+                    instrument_id = %instrument_id,
+                    error = ?error,
+                    "failed to load durable directional inventory for merge exclusion"
+                );
+                return 0.0;
+            }
+        };
+        records
+            .iter()
+            .filter(|record| {
+                record.instrument_id == *instrument_id
+                    && record.side == TradeSide::Buy
+                    && !record.reduce_only
+                    && record.filled_qty > ACCOUNTING_QTY_EPSILON
+                    && inventory_lane_from_tag(record.quote_level_tag.as_deref())
+                        == InventoryLane::Directional
+            })
+            .map(|record| record.filled_qty.max(0.0))
+            .sum()
+    }
+
+    fn durable_lane_qty_cost(
+        &self,
+        market_id: &MarketId,
+        instrument_id: &InstrumentId,
+        lane: InventoryLane,
+    ) -> (f64, f64) {
+        let Some(order_store) = self.order_store.as_ref() else {
+            return (0.0, 0.0);
+        };
+        let records = match order_store.list_by_market(market_id) {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(
+                    run_id = %self.run_id,
+                    market_id = %market_id,
+                    instrument_id = %instrument_id,
+                    error = ?error,
+                    "failed to load durable lane inventory cost"
+                );
+                return (0.0, 0.0);
+            }
+        };
+        records
+            .iter()
+            .filter(|record| {
+                record.instrument_id == *instrument_id
+                    && record.side == TradeSide::Buy
+                    && !record.reduce_only
+                    && record.filled_qty > ACCOUNTING_QTY_EPSILON
+                    && inventory_lane_from_tag(record.quote_level_tag.as_deref()) == lane
+            })
+            .fold((0.0, 0.0), |(qty, cost), record| {
+                let filled_qty = record.filled_qty.max(0.0);
+                (qty + filled_qty, cost + filled_qty * record.limit_price.max(0.0))
+            })
+    }
+
+    fn plan_durable_paired_core_merge_sweep(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+    ) -> RuntimeOutcome {
+        if self.order_store.is_none() || self.pending_merge_by_market.contains_key(market_id) {
+            return RuntimeOutcome::default();
+        }
+        let Some(market_context) = self.market_contexts.get(market_id) else {
+            return RuntimeOutcome::default();
+        };
+        let Some(yes_raw) = market_context.instrument_ids.first() else {
+            return RuntimeOutcome::default();
+        };
+        let Some(no_raw) = market_context.instrument_ids.get(1) else {
+            return RuntimeOutcome::default();
+        };
+        let yes_instrument_id = InstrumentId::from(yes_raw.clone());
+        let no_instrument_id = InstrumentId::from(no_raw.clone());
+        let (yes_qty, _) = self.durable_lane_qty_cost(
+            market_id,
+            &yes_instrument_id,
+            InventoryLane::MergeablePaired,
+        );
+        let (no_qty, _) =
+            self.durable_lane_qty_cost(market_id, &no_instrument_id, InventoryLane::MergeablePaired);
+        let pair_qty = yes_qty.min(no_qty).max(0.0);
+        if pair_qty + ACCOUNTING_QTY_EPSILON < self.min_merge_notional_usd {
+            return RuntimeOutcome::default();
+        }
+        self.plan_merge_command_for_market(
+            market_id,
+            now_ms,
+            "durable paired-core merge sweep",
+        )
+    }
+
+    fn mergeable_paired_cost_basis_usd(
+        &self,
+        market_id: &MarketId,
+        yes_instrument_id: &InstrumentId,
+        no_instrument_id: &InstrumentId,
+        quantity: f64,
+        fallback_yes_avg_price: f64,
+        fallback_no_avg_price: f64,
+    ) -> f64 {
+        let (yes_qty, yes_cost) =
+            self.durable_lane_qty_cost(market_id, yes_instrument_id, InventoryLane::MergeablePaired);
+        let (no_qty, no_cost) =
+            self.durable_lane_qty_cost(market_id, no_instrument_id, InventoryLane::MergeablePaired);
+        let yes_avg = if yes_qty > ACCOUNTING_QTY_EPSILON {
+            yes_cost / yes_qty
+        } else {
+            fallback_yes_avg_price
+        };
+        let no_avg = if no_qty > ACCOUNTING_QTY_EPSILON {
+            no_cost / no_qty
+        } else {
+            fallback_no_avg_price
+        };
+        quantity * yes_avg.max(0.0) + quantity * no_avg.max(0.0)
+    }
+
+    fn durable_paired_core_inventory_snapshot(
+        &self,
+        market_id: &MarketId,
+        market_context: &crate::market_context::MarketContextRecord,
+        inventory: &crate::inventory::InventorySnapshot,
+    ) -> Option<PairedInventorySnapshot> {
+        let yes_instrument_id = InstrumentId::from(market_context.instrument_ids.first()?.clone());
+        let no_instrument_id = InstrumentId::from(market_context.instrument_ids.get(1)?.clone());
+        let (yes_qty, yes_cost) = self.durable_lane_qty_cost(
+            market_id,
+            &yes_instrument_id,
+            InventoryLane::MergeablePaired,
+        );
+        let (no_qty, no_cost) = self.durable_lane_qty_cost(
+            market_id,
+            &no_instrument_id,
+            InventoryLane::MergeablePaired,
+        );
+        Some(PairedInventorySnapshot {
+            yes_qty: yes_qty.max(0.0),
+            no_qty: no_qty.max(0.0),
+            yes_avg_cost: if yes_qty > ACCOUNTING_QTY_EPSILON {
+                yes_cost / yes_qty
+            } else {
+                0.0
+            },
+            no_avg_cost: if no_qty > ACCOUNTING_QTY_EPSILON {
+                no_cost / no_qty
+            } else {
+                0.0
+            },
+            free_cash_usd: inventory.free_cash_usd,
+            equity_usd: inventory.total_cash_usd + inventory.gross_exposure_usd,
+        })
+    }
+
+    fn directional_inventory_qty_for_market(&self, market_id: &MarketId) -> f64 {
+        self.directional_inventory_by_market_instrument
+            .iter()
+            .filter(|((tracked_market_id, _), _)| tracked_market_id == market_id)
+            .map(|(_, qty)| qty.max(0.0))
+            .sum()
+    }
+
+    fn clamp_directional_inventory_to_current_positions(&mut self) {
+        let mut retained = HashMap::new();
+        for ((market_id, instrument_id), tracked_qty) in
+            self.directional_inventory_by_market_instrument.drain()
+        {
+            let current_qty = self
+                .inventory
+                .positions()
+                .find(|position| {
+                    position.market_id == market_id && position.instrument_id == instrument_id
+                })
+                .map(|position| position.quantity.max(0.0))
+                .unwrap_or(0.0);
+            let qty = tracked_qty.min(current_qty).max(0.0);
+            if qty > ACCOUNTING_QTY_EPSILON {
+                retained.insert((market_id, instrument_id), qty);
+            }
+        }
+        self.directional_inventory_by_market_instrument = retained;
+
+        let mut retained_late_fav = HashMap::new();
+        for ((market_id, instrument_id), tracked_qty) in
+            self.late_fav_inventory_by_market_instrument.drain()
+        {
+            let current_qty = self
+                .inventory
+                .positions()
+                .find(|position| {
+                    position.market_id == market_id && position.instrument_id == instrument_id
+                })
+                .map(|position| position.quantity.max(0.0))
+                .unwrap_or(0.0);
+            let qty = tracked_qty.min(current_qty).max(0.0);
+            if qty > ACCOUNTING_QTY_EPSILON {
+                retained_late_fav.insert((market_id, instrument_id), qty);
+            }
+        }
+        self.late_fav_inventory_by_market_instrument = retained_late_fav;
+
+        let mut retained_cheap_tail = HashMap::new();
+        for ((market_id, instrument_id), tracked_qty) in
+            self.cheap_tail_inventory_by_market_instrument.drain()
+        {
+            let current_qty = self
+                .inventory
+                .positions()
+                .find(|position| {
+                    position.market_id == market_id && position.instrument_id == instrument_id
+                })
+                .map(|position| position.quantity.max(0.0))
+                .unwrap_or(0.0);
+            let qty = tracked_qty.min(current_qty).max(0.0);
+            if qty > ACCOUNTING_QTY_EPSILON {
+                retained_cheap_tail.insert((market_id, instrument_id), qty);
+            }
+        }
+        self.cheap_tail_inventory_by_market_instrument = retained_cheap_tail;
     }
 
     fn market_has_inventory(&self, market_id: &MarketId) -> bool {

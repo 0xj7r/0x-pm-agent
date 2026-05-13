@@ -689,6 +689,237 @@ fn paired_inventory_fill_emits_explicit_merge_command() {
 }
 
 #[test]
+fn paired_core_fill_uses_durable_order_tag_when_active_order_is_absent() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!("polymarket-exec-durable-paired-core-fill-{ts}.sqlite"));
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    let market_id = MarketId::from("market-mm");
+    let up = InstrumentId::from("up");
+    let down = InstrumentId::from("down");
+    let up_client_order_id = ClientOrderId::from("paired-core:market-mm:up:0");
+    let down_client_order_id = ClientOrderId::from("paired-core:market-mm:down:0");
+
+    for (client_order_id, instrument_id, price) in [
+        (up_client_order_id.clone(), up.clone(), 0.40),
+        (down_client_order_id.clone(), down.clone(), 0.50),
+    ] {
+        let intent = OrderIntent {
+            client_order_id,
+            market_id: market_id.clone(),
+            instrument_id,
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "paired-core regression fixture".to_string(),
+            quote_level_tag: Some("paired-core:ladder:0".to_string()),
+            created_at_ms: 10,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let mut record = OrderRecord::from_intent("run-1", &intent, "bonereaper_mm");
+        record.status = ManagedOrderStatus::Working;
+        store.insert(record).unwrap();
+    }
+
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 5.0,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+
+    runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: Some(up_client_order_id),
+            market_id: market_id.clone(),
+            instrument_id: up,
+            side: TradeSide::Buy,
+            price: 0.40,
+            quantity: 5.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 20,
+        })
+        .expect("first durable tagged leg");
+    let outcome = runtime
+        .on_fill(FillReport {
+            order_id: None,
+            client_order_id: Some(down_client_order_id),
+            market_id: market_id.clone(),
+            instrument_id: down,
+            side: TradeSide::Buy,
+            price: 0.50,
+            quantity: 5.0,
+            fee_usd: 0.0,
+            liquidity: FillLiquidity::Maker,
+            close_method: None,
+            observed_at_ms: 21,
+        })
+        .expect("second durable tagged leg");
+
+    let merge = outcome
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            RuntimeCommand::Merge(intent) => Some(intent),
+            _ => None,
+        })
+        .expect("durable paired-core fill should plan merge");
+    assert_eq!(merge.market_id, market_id);
+    assert!((merge.quantity - 5.0).abs() < 1e-9);
+    assert!((merge.expected_cash_usd - 5.0).abs() < 1e-9);
+    assert!((merge.expected_cost_usd - 4.50).abs() < 1e-9);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn durable_paired_core_inventory_sweep_plans_merge_without_new_fill() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!("polymarket-exec-durable-paired-core-sweep-{ts}.sqlite"));
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    let market_id = MarketId::from("market-mm");
+    let up = InstrumentId::from("up");
+    let down = InstrumentId::from("down");
+
+    for (client_order_id, instrument_id, price, filled_qty) in [
+        (ClientOrderId::from("paired-core:market-mm:up:0"), up.clone(), 0.40, 10.0),
+        (
+            ClientOrderId::from("paired-core:market-mm:down:0"),
+            down.clone(),
+            0.50,
+            10.0,
+        ),
+    ] {
+        let intent = OrderIntent {
+            client_order_id,
+            market_id: market_id.clone(),
+            instrument_id,
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: filled_qty,
+            reduce_only: false,
+            reason: "paired-core durable sweep fixture".to_string(),
+            quote_level_tag: Some("paired-core:ladder:0".to_string()),
+            created_at_ms: 10,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let mut record = OrderRecord::from_intent("run-1", &intent, "bonereaper_mm");
+        record.status = ManagedOrderStatus::Filled;
+        record.remaining_qty = 0.0;
+        record.filled_qty = filled_qty;
+        store.insert(record).unwrap();
+    }
+
+    let market_contexts = MarketContextStore::from_records(
+        vec![MarketContextRecord {
+            market_id: market_id.as_str().to_string(),
+            instrument_ids: vec![up.as_str().to_string(), down.as_str().to_string()],
+            ..MarketContextRecord::default()
+        }],
+        Some("test".to_string()),
+        Some(10),
+    );
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 5.0,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        market_contexts,
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-mm".to_string()),
+                    instrument_id: up.clone(),
+                    quantity: 10.0,
+                    average_cost_usd: 0.40,
+                    mark_price: Some(0.45),
+                    observed_at_ms: 20,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-mm".to_string()),
+                    instrument_id: down.clone(),
+                    quantity: 10.0,
+                    average_cost_usd: 0.50,
+                    mark_price: Some(0.55),
+                    observed_at_ms: 20,
+                },
+            ],
+            21,
+        )
+        .expect("venue inventory reconciliation");
+
+    let outcome = runtime
+        .on_market_snapshot(MarketSnapshot {
+            market_id: market_id.clone(),
+            instrument_id: up,
+            quote: QuoteSnapshot {
+                best_bid: Some(BookLevel::new(0.44, 100.0)),
+                best_ask: Some(BookLevel::new(0.45, 100.0)),
+                bid_levels: vec![BookLevel::new(0.44, 100.0)],
+                ask_levels: vec![BookLevel::new(0.45, 100.0)],
+                depth_observed_at_ms: Some(30),
+                last_trade_price: Some(0.45),
+                taker_buy_qty_60s: 0.0,
+                taker_sell_qty_60s: 0.0,
+                observed_at_ms: 30,
+            },
+        })
+        .expect("market snapshot");
+
+    let merge = outcome
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            RuntimeCommand::Merge(intent) => Some(intent),
+            _ => None,
+        })
+        .expect("durable paired-core inventory should be swept into merge");
+    assert_eq!(merge.market_id, market_id);
+    assert!((merge.quantity - 10.0).abs() < 1e-9);
+    assert!((merge.expected_cash_usd - 10.0).abs() < 1e-9);
+    assert!((merge.expected_cost_usd - 9.0).abs() < 1e-9);
+    assert!(
+        merge.reason.contains("durable paired-core merge sweep"),
+        "unexpected merge reason: {}",
+        merge.reason
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sub_venue_min_single_leg_dust_is_not_actionable_inventory() {
     let market_id = MarketId::from("market-mm");
     let mut runtime = Runtime::new(
@@ -998,7 +1229,7 @@ fn plan_merge_bypasses_tiny_threshold_under_gross_exposure_pressure() {
             market_id: market_id.clone(),
             instrument_id: InstrumentId::from("up"),
             side: TradeSide::Buy,
-            price: 1.0,
+            price: 0.40,
             quantity: 2.75,
             fee_usd: 0.0,
             liquidity: FillLiquidity::Maker,
@@ -1013,7 +1244,7 @@ fn plan_merge_bypasses_tiny_threshold_under_gross_exposure_pressure() {
             market_id: market_id.clone(),
             instrument_id: InstrumentId::from("down"),
             side: TradeSide::Buy,
-            price: 1.0,
+            price: 0.40,
             quantity: 2.75,
             fee_usd: 0.0,
             liquidity: FillLiquidity::Maker,
@@ -1064,8 +1295,8 @@ fn plan_merge_bypasses_tiny_threshold_under_market_imbalance_pressure() {
             market_id: market_id.clone(),
             instrument_id: InstrumentId::from("up"),
             side: TradeSide::Buy,
-            price: 1.0,
-            quantity: 3.0,
+            price: 0.40,
+            quantity: 5.0,
             fee_usd: 0.0,
             liquidity: FillLiquidity::Maker,
             close_method: None,
@@ -1079,7 +1310,7 @@ fn plan_merge_bypasses_tiny_threshold_under_market_imbalance_pressure() {
             market_id: market_id.clone(),
             instrument_id: InstrumentId::from("down"),
             side: TradeSide::Buy,
-            price: 1.0,
+            price: 0.40,
             quantity: 1.0,
             fee_usd: 0.0,
             liquidity: FillLiquidity::Maker,

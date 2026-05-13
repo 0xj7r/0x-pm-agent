@@ -684,7 +684,12 @@ mod tests {
                 equity_usd: 50.0,
                 ..Default::default()
             },
+            paired_core_inventory: PairedInventorySnapshot::default(),
+            late_fav_inventory: PairedInventorySnapshot::default(),
+            cheap_tail_inventory: PairedInventorySnapshot::default(),
             open_convex_order_exposure: Default::default(),
+            open_late_fav_order_exposure: Default::default(),
+            open_paired_core_order_exposure: Default::default(),
             pair_cost: PairCostTracker::default(),
             fair_value: FairValueEstimate {
                 p_up: 0.92,

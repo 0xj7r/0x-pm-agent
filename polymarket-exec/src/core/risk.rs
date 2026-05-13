@@ -184,6 +184,10 @@ impl RiskEngine {
         // balance check. Still enforce InvalidOrder above and the
         // sufficient-balance check (rescue can't spend cash we don't have).
         let is_rescue = order.kind == crate::types::IntentKind::Close;
+        let is_paired_core_repair = order
+            .quote_level_tag
+            .as_deref()
+            .is_some_and(|tag| tag.starts_with("paired-core:"));
 
         let portfolio_equity_usd = inventory.total_cash_usd() + inventory.gross_exposure_usd();
         let equity_floor_usd = self
@@ -352,7 +356,9 @@ impl RiskEngine {
             + context.open_signed_notional_for_market_usd
             + order.signed_notional_usd())
         .abs();
-        if projected_market_net_notional_usd > self.limits.max_net_notional_per_market_usd {
+        if !is_paired_core_repair
+            && projected_market_net_notional_usd > self.limits.max_net_notional_per_market_usd
+        {
             return self.reject(
                 RiskRejectReason::MarketNetExposureTooLarge,
                 context.now_ms.max(order.created_at_ms),

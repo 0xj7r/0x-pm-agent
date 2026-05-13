@@ -19,6 +19,14 @@ pub struct StrategyOpenOrderSnapshot {
     pub quote_level_tag: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrategyDirectionalInventorySnapshot {
+    pub market_id: MarketId,
+    pub instrument_id: InstrumentId,
+    pub quantity: f64,
+    pub quote_level_tag: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PairedOpenOrderExposure {
     pub yes_qty: f64,
@@ -33,8 +41,25 @@ pub struct PairedOpenOrderExposure {
 pub struct StrategyInput<M> {
     pub market: M,
     pub snapshot: PairedMarketSnapshot,
+    /// Total venue/account inventory for this market. Directional lanes use
+    /// this to cap favorite/tail exposure.
     pub inventory: PairedInventorySnapshot,
+    /// Inventory attributable to the paired-core lane only. Paired-core merge
+    /// and repair gates must use this, not total inventory, otherwise a
+    /// late-favorite load looks like imbalance to repair.
+    pub paired_core_inventory: PairedInventorySnapshot,
+    /// Filled inventory attributable specifically to the late-favorite lane.
+    /// Cheap-tail hedges must size from this plus working late-fav orders,
+    /// not from aggregate directional inventory, otherwise cheap-tail can
+    /// bootstrap itself without any favorite exposure.
+    pub late_fav_inventory: PairedInventorySnapshot,
+    /// Filled inventory attributable specifically to the cheap-tail hedge
+    /// lane. Tail sizing must account for already-filled hedge cost so the
+    /// hedge cannot repeatedly consume the late-favorite win-upside.
+    pub cheap_tail_inventory: PairedInventorySnapshot,
     pub open_convex_order_exposure: PairedOpenOrderExposure,
+    pub open_late_fav_order_exposure: PairedOpenOrderExposure,
+    pub open_paired_core_order_exposure: PairedOpenOrderExposure,
     pub pair_cost: PairCostTracker,
     pub fair_value: FairValueEstimate,
     pub btc_regime: BtcRegimeSnapshot,

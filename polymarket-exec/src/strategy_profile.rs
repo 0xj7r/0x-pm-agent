@@ -72,6 +72,13 @@ pub struct FavoriteClimbSubsection {
     pub min_order_usd: Option<f64>,
     pub spot_filter_bps: Option<f64>,
     pub require_spot_match: Option<bool>,
+    pub regime_whipsaw_multiplier: Option<f64>,
+    pub regime_flat_multiplier: Option<f64>,
+    pub regime_trending_volatile_multiplier: Option<f64>,
+    pub regime_unknown_multiplier: Option<f64>,
+    pub reversal_multiplier: Option<f64>,
+    pub taker_min_favorite_ask: Option<f64>,
+    pub taker_window_sec: Option<u64>,
     pub disable_after_ms: Option<u64>,
     pub clip_scale: Option<f64>,
 }
@@ -85,6 +92,8 @@ pub struct ConvexTailSubsection {
     pub start_frac: Option<f64>,
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
+    pub max_favorite_exposure_fraction: Option<f64>,
+    pub max_win_edge_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
     pub disable_after_ms: Option<u64>,
@@ -98,6 +107,9 @@ pub struct CoreHedgeSection {
     pub ladder_span: Option<f64>,
     pub center_price: Option<f64>,
     pub clip_shares: Option<f64>,
+    pub max_unpaired_core_qty: Option<f64>,
+    pub ladder_min_price: Option<f64>,
+    pub ladder_max_price: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub merge_min_qty: Option<f64>,
     pub merge_batch_cap: Option<f64>,
@@ -174,6 +186,11 @@ impl StrategyProfile {
                 ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
                 center_price: s.center_price.unwrap_or(defaults.center_price),
                 clip_shares: s.clip_shares.unwrap_or(defaults.clip_shares),
+                max_unpaired_core_qty: s
+                    .max_unpaired_core_qty
+                    .unwrap_or(defaults.max_unpaired_core_qty),
+                ladder_min_price: s.ladder_min_price.unwrap_or(defaults.ladder_min_price),
+                ladder_max_price: s.ladder_max_price.unwrap_or(defaults.ladder_max_price),
                 maker_improve_ticks: s
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
@@ -208,6 +225,25 @@ impl StrategyProfile {
                 require_spot_match: c
                     .require_spot_match
                     .unwrap_or(climb_def.require_spot_match),
+                regime_whipsaw_multiplier: c
+                    .regime_whipsaw_multiplier
+                    .unwrap_or(climb_def.regime_whipsaw_multiplier),
+                regime_flat_multiplier: c
+                    .regime_flat_multiplier
+                    .unwrap_or(climb_def.regime_flat_multiplier),
+                regime_trending_volatile_multiplier: c
+                    .regime_trending_volatile_multiplier
+                    .unwrap_or(climb_def.regime_trending_volatile_multiplier),
+                regime_unknown_multiplier: c
+                    .regime_unknown_multiplier
+                    .unwrap_or(climb_def.regime_unknown_multiplier),
+                reversal_multiplier: c
+                    .reversal_multiplier
+                    .unwrap_or(climb_def.reversal_multiplier),
+                taker_min_favorite_ask: c
+                    .taker_min_favorite_ask
+                    .unwrap_or(climb_def.taker_min_favorite_ask),
+                taker_window_sec: c.taker_window_sec.unwrap_or(climb_def.taker_window_sec),
                 disable_after_ms: c.disable_after_ms,
             },
             convex_tail: ConvexTailConfig {
@@ -217,6 +253,12 @@ impl StrategyProfile {
                 start_frac: t.start_frac.unwrap_or(tail_def.start_frac),
                 clip_usd: t.clip_usd.unwrap_or(tail_def.clip_usd),
                 max_load_usd: t.max_load_usd.unwrap_or(tail_def.max_load_usd),
+                max_favorite_exposure_fraction: t
+                    .max_favorite_exposure_fraction
+                    .unwrap_or(tail_def.max_favorite_exposure_fraction),
+                max_win_edge_spend_fraction: t
+                    .max_win_edge_spend_fraction
+                    .unwrap_or(tail_def.max_win_edge_spend_fraction),
                 maker_improve_ticks: t
                     .maker_improve_ticks
                     .unwrap_or(tail_def.maker_improve_ticks),
@@ -441,6 +483,8 @@ fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
         || s.ladder_span.is_some()
         || s.center_price.is_some()
         || s.clip_shares.is_some()
+        || s.ladder_min_price.is_some()
+        || s.ladder_max_price.is_some()
         || s.maker_improve_ticks.is_some()
         || s.merge_min_qty.is_some()
         || s.merge_batch_cap.is_some()

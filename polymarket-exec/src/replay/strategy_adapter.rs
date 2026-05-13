@@ -23,7 +23,7 @@ use serde_yaml::Value as YamlValue;
 use crate::collector::schema::{Event, EventType, Source};
 use crate::core::types::{
     BookLevel, ClientOrderId, FillLiquidity, FillReport, InstrumentId, IntentKind, MarketId,
-    OrderIntent, QuoteSnapshot, StrategyDecision, TradeSide,
+    OrderIntent, QuoteSnapshot, RuntimeCommand, StrategyDecision, TradeSide,
 };
 use crate::inventory::InventoryState as RuntimeInventoryState;
 use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
@@ -781,6 +781,8 @@ impl ReplayStrategyAdapter {
             self.runtime_inventory.total_cash_usd() + self.runtime_inventory.gross_exposure_usd();
         let mut open_convex_order_exposure =
             crate::strategies::traits::PairedOpenOrderExposure::default();
+        let mut open_paired_core_order_exposure =
+            crate::strategies::traits::PairedOpenOrderExposure::default();
         for managed in self
             .managed_open_orders_for_market(&market.market_id)
             .values()
@@ -788,27 +790,37 @@ impl ReplayStrategyAdapter {
                 managed.intent.side == TradeSide::Buy
                     && !managed.intent.reduce_only
                     && managed.remaining_qty() > 1e-9
-                    && managed
-                        .intent
-                        .quote_level_tag
-                        .as_deref()
-                        .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
-                        == Some(crate::types::MmQuoteKind::ConvexAccumulation)
             })
         {
             let qty = managed.remaining_qty();
             let notional = managed.intent.limit_price.max(0.0) * qty;
-            if managed.intent.instrument_id == market.yes_instrument_id {
-                open_convex_order_exposure.yes_qty += qty;
-                open_convex_order_exposure.yes_notional_usd += notional;
-                open_convex_order_exposure.yes_count += 1;
-            } else if managed.intent.instrument_id == market.no_instrument_id {
-                open_convex_order_exposure.no_qty += qty;
-                open_convex_order_exposure.no_notional_usd += notional;
-                open_convex_order_exposure.no_count += 1;
+            let tag = managed.intent.quote_level_tag.as_deref().unwrap_or_default();
+            let lower_tag = tag.to_ascii_lowercase();
+            let target = if lower_tag.starts_with("paired-core:") {
+                Some(&mut open_paired_core_order_exposure)
+            } else if lower_tag.contains("late-fav")
+                || lower_tag.contains("cheap-tail")
+                || crate::types::MmQuoteKind::from_quote_level_tag(tag)
+                    == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+            {
+                Some(&mut open_convex_order_exposure)
+            } else {
+                None
+            };
+            if let Some(exposure) = target {
+                if managed.intent.instrument_id == market.yes_instrument_id {
+                    exposure.yes_qty += qty;
+                    exposure.yes_notional_usd += notional;
+                    exposure.yes_count += 1;
+                } else if managed.intent.instrument_id == market.no_instrument_id {
+                    exposure.no_qty += qty;
+                    exposure.no_notional_usd += notional;
+                    exposure.no_count += 1;
+                }
             }
         }
-        let pair_cost = PairCostTracker::from_inventory(&inventory);
+        let paired_core_inventory = inventory;
+        let pair_cost = PairCostTracker::from_inventory(&paired_core_inventory);
         let btc_regime = self.btc_regime.snapshot();
         let fair_value = self.fair_value_for(market, &btc_regime, now_ms);
         let order_book_pressure =
@@ -817,7 +829,12 @@ impl ReplayStrategyAdapter {
             market: market.clone(),
             snapshot,
             inventory,
+            paired_core_inventory,
+            late_fav_inventory: PairedInventorySnapshot::default(),
+            cheap_tail_inventory: PairedInventorySnapshot::default(),
             open_convex_order_exposure,
+            open_late_fav_order_exposure: crate::strategies::traits::PairedOpenOrderExposure::default(),
+            open_paired_core_order_exposure,
             pair_cost,
             fair_value,
             btc_regime,
@@ -1000,6 +1017,34 @@ impl ReplayStrategyAdapter {
             }
             StrategyDecision::Merge { intent, .. } => {
                 self.apply_merge_decision(intent, market, now_ms, out);
+            }
+            StrategyDecision::Mixed {
+                intents, commands, ..
+            } => {
+                for command in commands {
+                    if let RuntimeCommand::Merge(intent) = command {
+                        self.apply_merge_decision(intent, market, now_ms, out);
+                    }
+                }
+                for intent in intents {
+                    if matches!(intent.kind, IntentKind::Close) && intent.reduce_only {
+                        let inv = self.inventories.get(&market.market_id);
+                        let qty_avail =
+                            match (inv, intent.instrument_id == market.yes_instrument_id) {
+                                (Some(state), true) => state.yes_qty,
+                                (Some(state), false)
+                                    if intent.instrument_id == market.no_instrument_id =>
+                                {
+                                    state.no_qty
+                                }
+                                _ => 0.0,
+                            };
+                        if qty_avail < intent.quantity {
+                            continue;
+                        }
+                    }
+                    self.evaluate_and_emit(intent, market, now_ms, out);
+                }
             }
             StrategyDecision::Suppress { .. } | StrategyDecision::Noop { .. } => {}
         }
@@ -1646,6 +1691,7 @@ fn strategy_decision_label(decision: &StrategyDecision) -> String {
         StrategyDecision::CapitalRecycle { .. } => "capital_recycle".to_string(),
         StrategyDecision::Rescue { .. } => "rescue".to_string(),
         StrategyDecision::Merge { .. } => "merge".to_string(),
+        StrategyDecision::Mixed { .. } => "mixed".to_string(),
         StrategyDecision::Suppress { reason, .. } => format!("suppress:{:?}", reason),
         StrategyDecision::Noop { .. } => "noop".to_string(),
     }
@@ -1662,6 +1708,7 @@ fn strategy_decision_reason_tag(decision: &StrategyDecision) -> String {
         | StrategyDecision::CapitalRecycle { notes, .. }
         | StrategyDecision::Rescue { notes, .. }
         | StrategyDecision::Merge { notes, .. }
+        | StrategyDecision::Mixed { notes, .. }
         | StrategyDecision::Suppress { notes, .. }
         | StrategyDecision::Noop { notes } => notes,
     };

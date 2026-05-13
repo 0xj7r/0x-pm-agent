@@ -96,6 +96,10 @@ fn context(
         now_ms,
         runtime_status: RuntimeStatus::Running,
         inventory,
+        paired_core_inventory: None,
+        directional_inventory: Vec::new(),
+        late_fav_inventory: Vec::new(),
+        cheap_tail_inventory: Vec::new(),
         open_orders: Vec::new(),
         open_orders_total: 0,
         open_orders_for_market: 0,
@@ -276,7 +280,10 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     .expect("bonereaper whale profile");
     let _bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
     let bonereaper_late = bonereaper_profile.late_favorite_config();
-    assert_eq!(bonereaper_late.favorite_climb.window_sec, 120);
-    assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.90);
-    assert_eq!(bonereaper_late.convex_tail.clip_usd, 2.0);
+    assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
+    assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
+    assert_eq!(bonereaper_late.favorite_climb.regime_whipsaw_multiplier, 0.25);
+    assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.50);
+    assert_eq!(bonereaper_late.convex_tail.clip_usd, 1.25);
+    assert_eq!(bonereaper_late.convex_tail.max_win_edge_spend_fraction, 0.50);
 }

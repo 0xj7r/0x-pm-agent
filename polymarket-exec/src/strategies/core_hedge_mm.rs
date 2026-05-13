@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
+use crate::signals::BtcRegime;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{MergeIntent, MarketId, StrategyDecision};
 
@@ -48,6 +49,15 @@ pub struct CoreHedgeMmConfig {
     pub center_price: f64,
     /// Per-level share clip for the canonical paired ladder.
     pub clip_shares: f64,
+    /// Maximum projected one-sided paired-core imbalance, including
+    /// pending/working paired-core orders. This prevents a full ladder on
+    /// one leg from becoming accidental directional inventory before the
+    /// other leg fills.
+    pub max_unpaired_core_qty: f64,
+    /// Price band for mergeable paired-core ladder rungs. Rungs outside this
+    /// band belong to explicit directional lanes, not mergeable paired-core.
+    pub ladder_min_price: f64,
+    pub ladder_max_price: f64,
     /// Per-clip size by leg.
     pub core_clip_usd: f64,
     pub hedge_clip_usd: f64,
@@ -80,6 +90,9 @@ impl Default for CoreHedgeMmConfig {
             ladder_span: 0.42,
             center_price: 0.50,
             clip_shares: 20.0,
+            max_unpaired_core_qty: 10.0,
+            ladder_min_price: 0.0,
+            ladder_max_price: 1.0,
             core_clip_usd: 13.0,
             hedge_clip_usd: 5.0,
             maker_improve_ticks: 0.0,
@@ -276,6 +289,119 @@ fn canonical_clip_shares(price: f64, base_clip: f64) -> f64 {
     (base_clip * scale).max(0.0)
 }
 
+fn paired_core_leg_allowed(leg: LadderLeg, yes_qty: f64, no_qty: f64, tolerance: f64) -> bool {
+    match leg {
+        LadderLeg::Yes => yes_qty <= no_qty + tolerance,
+        LadderLeg::No => no_qty <= yes_qty + tolerance,
+    }
+}
+
+fn paired_core_projected_qty<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    leg: LadderLeg,
+) -> f64 {
+    match leg {
+        LadderLeg::Yes => {
+            input.paired_core_inventory.yes_qty + input.open_paired_core_order_exposure.yes_qty
+        }
+        LadderLeg::No => {
+            input.paired_core_inventory.no_qty + input.open_paired_core_order_exposure.no_qty
+        }
+    }
+    .max(0.0)
+}
+
+fn signed_pair_cost_for_repair<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    leg: LadderLeg,
+    repair_price: f64,
+) -> Option<f64> {
+    let other_avg = match leg {
+        LadderLeg::Yes => input.paired_core_inventory.no_avg_cost,
+        LadderLeg::No => input.paired_core_inventory.yes_avg_cost,
+    };
+    if other_avg.is_finite() && other_avg > 0.0 {
+        Some(repair_price + other_avg)
+    } else {
+        None
+    }
+}
+
+fn paired_core_chop_gate<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    max_opening_ms: u64,
+) -> Option<String> {
+    let elapsed_ms = input
+        .market
+        .event_start_ms()
+        .map(|start_ms| input.now_ms.saturating_sub(start_ms))
+        .unwrap_or(input.market.window_ms());
+    let vol = input.btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
+    let r30 = input.btc_regime.return_30s_bps.unwrap_or(0.0);
+    let r60 = input.btc_regime.return_60s_bps.unwrap_or(0.0);
+    let r120 = input.btc_regime.return_120s_bps.unwrap_or(0.0);
+    let r180 = input.btc_regime.return_180s_bps.unwrap_or(0.0);
+    let sign_flip = (r30 > 1.0 && r120 < -1.0)
+        || (r30 < -1.0 && r120 > 1.0)
+        || (r60 > 1.0 && r180 < -1.0)
+        || (r60 < -1.0 && r180 > 1.0);
+    if matches!(input.btc_regime.regime(), Some(BtcRegime::Whipsaw)) {
+        return Some(format!(
+            "paired_core paused: whipsaw regime vol_5m_bps={vol:.2} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
+        ));
+    }
+    if elapsed_ms <= max_opening_ms && (vol >= BtcRegime::VOL_LOW_HIGH_BPS || sign_flip) {
+        return Some(format!(
+            "paired_core paused: opening chop elapsed_ms={elapsed_ms} vol_5m_bps={vol:.2} sign_flip={sign_flip} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
+        ));
+    }
+    None
+}
+
+fn market_elapsed_ms<M: MarketDescriptor>(input: &StrategyInput<M>) -> u64 {
+    input
+        .market
+        .event_start_ms()
+        .map(|start_ms| input.now_ms.saturating_sub(start_ms))
+        .unwrap_or(input.market.window_ms())
+}
+
+fn ladder_candidate<M: MarketDescriptor>(
+    market: &M,
+    leg: LadderLeg,
+    best_bid: f64,
+    best_ask: f64,
+    levels: usize,
+    half_span: f64,
+    center_price: f64,
+    idx: usize,
+    min_price: f64,
+    max_price: f64,
+    clip_shares: f64,
+    min_order_usd: f64,
+    now_ms: EpochMillis,
+) -> Option<OrderIntent> {
+    let mid = quote_mid(best_bid, best_ask, center_price).clamp(0.01, 0.99);
+    let low = (mid - half_span).clamp(0.01, 0.99);
+    let high = (mid + half_span).clamp(0.01, 0.99);
+    let denom = (levels - 1) as f64;
+    let raw_price = low + (high - low) * (idx as f64 / denom);
+    if raw_price < min_price || raw_price > max_price {
+        return None;
+    }
+    let qty = canonical_clip_shares(raw_price, clip_shares);
+    build_ladder_level(
+        market,
+        leg,
+        best_ask,
+        raw_price,
+        qty,
+        &format!("ladder:{idx}"),
+        min_order_usd,
+        now_ms,
+    )
+}
+
 fn build_ladder_level<M: MarketDescriptor>(
     market: &M,
     leg: LadderLeg,
@@ -350,15 +476,29 @@ where
             .is_none_or(|cutoff_ms| input.now_ms < cutoff_ms);
 
         if merge_window_open {
-            let mut paired_qty = input.inventory.yes_qty.min(input.inventory.no_qty);
+            let mut paired_qty = input
+                .paired_core_inventory
+                .yes_qty
+                .min(input.paired_core_inventory.no_qty);
             if cfg.merge_batch_cap.is_finite() && cfg.merge_batch_cap > 0.0 {
                 paired_qty = paired_qty.min(cfg.merge_batch_cap);
             }
             if paired_qty >= cfg.merge_min_qty {
-                let yes_avg = input.inventory.yes_avg_cost.max(0.0);
-                let no_avg = input.inventory.no_avg_cost.max(0.0);
+                let yes_avg = input.paired_core_inventory.yes_avg_cost.max(0.0);
+                let no_avg = input.paired_core_inventory.no_avg_cost.max(0.0);
                 let expected_cost_usd = paired_qty * (yes_avg + no_avg);
                 let expected_cash_usd = paired_qty;
+                if expected_cash_usd + 1e-9 < expected_cost_usd {
+                    return StrategyDecision::Noop {
+                        notes: vec![format!(
+                            "paired_core merge skipped negative_ev paired_qty={:.4} cost={:.2} cash={:.2} expected_net={:.4}",
+                            paired_qty,
+                            expected_cost_usd,
+                            expected_cash_usd,
+                            expected_cash_usd - expected_cost_usd,
+                        )],
+                    };
+                }
                 let merge_intent = MergeIntent {
                     command_id: ClientOrderId::new(format!(
                         "paired-core-merge:{}:{}",
@@ -408,41 +548,246 @@ where
 
             let mut intents = Vec::new();
             let mut notes = Vec::new();
+            let chop_note = paired_core_chop_gate(&input, 90_000);
+            if let Some(note) = &chop_note {
+                notes.push(note.clone());
+            }
+            let elapsed_ms = market_elapsed_ms(&input);
             let levels = cfg.ladder_levels.max(2);
             let half_span = (cfg.ladder_span / 2.0).max(0.0);
             let market_id = input.market.market_id().clone();
-            for (leg, best_bid, best_ask) in [
-                (LadderLeg::Yes, yes_bid, yes_ask),
-                (LadderLeg::No, no_bid, no_ask),
-            ] {
-                let mid = quote_mid(best_bid, best_ask, cfg.center_price).clamp(0.01, 0.99);
-                let low = (mid - half_span).clamp(0.01, 0.99);
-                let high = (mid + half_span).clamp(0.01, 0.99);
-                let denom = (levels - 1) as f64;
+            let yes_mid = quote_mid(yes_bid, yes_ask, cfg.center_price).clamp(0.01, 0.99);
+            let no_mid = quote_mid(no_bid, no_ask, cfg.center_price).clamp(0.01, 0.99);
+            if yes_mid < cfg.ladder_min_price
+                || yes_mid > cfg.ladder_max_price
+                || no_mid < cfg.ladder_min_price
+                || no_mid > cfg.ladder_max_price
+                || yes_ask > cfg.ladder_max_price
+                || no_ask > cfg.ladder_max_price
+            {
+                return StrategyDecision::Noop {
+                    notes: vec![format!(
+                        "paired_core ladder paused: quotes outside pairable band yes_mid={yes_mid:.4} no_mid={no_mid:.4} yes_ask={yes_ask:.4} no_ask={no_ask:.4} band={:.4}-{:.4}",
+                        cfg.ladder_min_price, cfg.ladder_max_price,
+                    )],
+                };
+            }
+            let imbalance_tolerance =
+                (cfg.clip_shares.max(input.market.min_order_size()) * 0.25).max(0.5);
+            let mut projected_yes_qty = paired_core_projected_qty(&input, LadderLeg::Yes);
+            let mut projected_no_qty = paired_core_projected_qty(&input, LadderLeg::No);
+            let filled_yes_qty = input.paired_core_inventory.yes_qty.max(0.0);
+            let filled_no_qty = input.paired_core_inventory.no_qty.max(0.0);
+            let open_yes_qty = input.open_paired_core_order_exposure.yes_qty.max(0.0);
+            let open_no_qty = input.open_paired_core_order_exposure.no_qty.max(0.0);
+            let max_unpaired_core_qty = cfg.max_unpaired_core_qty.max(0.0);
+            notes.push(format!(
+                "paired_core inventory gate core_yes={:.4} core_no={:.4} total_yes={:.4} total_no={:.4} open_yes={:.4} open_no={:.4} projected_yes={:.4} projected_no={:.4} tolerance={:.4} max_unpaired={:.4}",
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.no_qty,
+                input.inventory.yes_qty,
+                input.inventory.no_qty,
+                input.open_paired_core_order_exposure.yes_qty,
+                input.open_paired_core_order_exposure.no_qty,
+                projected_yes_qty,
+                projected_no_qty,
+                imbalance_tolerance,
+                max_unpaired_core_qty,
+            ));
+
+            let min_repair_qty = input.market.min_order_size().max(0.0);
+            let repair_leg = if filled_yes_qty + min_repair_qty <= filled_no_qty {
+                Some(LadderLeg::Yes)
+            } else if filled_no_qty + min_repair_qty <= filled_yes_qty {
+                Some(LadderLeg::No)
+            } else {
+                None
+            };
+
+            if let Some(leg) = repair_leg {
+                if let Some(note) = chop_note {
+                    return StrategyDecision::Noop {
+                        notes: vec![format!(
+                            "{note}; paired_core repair suppressed until market is stable"
+                        )],
+                    };
+                }
+                let (best_bid, best_ask) = match leg {
+                    LadderLeg::Yes => (yes_bid, yes_ask),
+                    LadderLeg::No => (no_bid, no_ask),
+                };
+                notes.push(format!(
+                    "paired_core repair mode leg={leg:?} projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
+                ));
                 for idx in 0..levels {
-                    let raw_price = low + (high - low) * (idx as f64 / denom);
-                    let qty = canonical_clip_shares(raw_price, cfg.clip_shares);
-                    let tag = format!("ladder:{idx}");
-                    if let Some(intent) = build_ladder_level(
+                    let Some(intent) = ladder_candidate(
                         &input.market,
                         leg,
+                        best_bid,
                         best_ask,
-                        raw_price,
-                        qty,
-                        &tag,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        cfg.ladder_min_price,
+                        cfg.ladder_max_price,
+                        cfg.clip_shares,
                         cfg.min_order_usd,
                         input.now_ms,
-                    ) {
-                        if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
-                            intents.push(intent);
+                    ) else {
+                        continue;
+                    };
+                    let tag = format!("ladder:{idx}");
+                    match leg {
+                        LadderLeg::Yes => {
+                            if let Some(pair_cost) =
+                                signed_pair_cost_for_repair(&input, leg, intent.limit_price)
+                            {
+                                if pair_cost > 1.0 + 1e-9 {
+                                    notes.push(format!(
+                                        "paired_core repair level blocked negative_ev leg=Yes idx={idx} repair_px={:.4} pair_cost={pair_cost:.4}",
+                                        intent.limit_price,
+                                    ));
+                                    continue;
+                                }
+                            }
+                            if projected_yes_qty + intent.quantity > filled_no_qty + 1e-9 {
+                                notes.push(format!(
+                                    "paired_core repair level blocked leg=Yes idx={idx} qty={:.4} projected_after={:.4} target_filled_no={filled_no_qty:.4}",
+                                    intent.quantity,
+                                    projected_yes_qty + intent.quantity,
+                                ));
+                                continue;
+                            }
+                            if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
+                                projected_yes_qty += intent.quantity;
+                                intents.push(intent);
+                            }
+                        }
+                        LadderLeg::No => {
+                            if let Some(pair_cost) =
+                                signed_pair_cost_for_repair(&input, leg, intent.limit_price)
+                            {
+                                if pair_cost > 1.0 + 1e-9 {
+                                    notes.push(format!(
+                                        "paired_core repair level blocked negative_ev leg=No idx={idx} repair_px={:.4} pair_cost={pair_cost:.4}",
+                                        intent.limit_price,
+                                    ));
+                                    continue;
+                                }
+                            }
+                            if projected_no_qty + intent.quantity > filled_yes_qty + 1e-9 {
+                                notes.push(format!(
+                                    "paired_core repair level blocked leg=No idx={idx} qty={:.4} projected_after={:.4} target_filled_yes={filled_yes_qty:.4}",
+                                    intent.quantity,
+                                    projected_no_qty + intent.quantity,
+                                ));
+                                continue;
+                            }
+                            if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
+                                projected_no_qty += intent.quantity;
+                                intents.push(intent);
+                            }
                         }
                     }
                 }
+            } else {
+                if open_yes_qty > 1e-9 || open_no_qty > 1e-9 {
+                    notes.push(format!(
+                        "paired_core balanced bundle suppressed: awaiting open paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}",
+                    ));
+                    notes.push(format!(
+                        "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
+                        cfg.ladder_span,
+                    ));
+                    return StrategyDecision::Noop { notes };
+                }
                 notes.push(format!(
-                    "paired_core ladder leg={leg:?} levels={levels} span={:.4} mid={mid:.4} low={low:.4} high={high:.4}",
-                    cfg.ladder_span,
+                    "paired_core balanced bundle mode projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
                 ));
+                for idx in 0..levels {
+                    if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
+                        notes.push(format!(
+                            "paired_core opening presence only: suppressing non-center bundle idx={idx} elapsed_ms={elapsed_ms}",
+                        ));
+                        continue;
+                    }
+                    let Some(yes_intent) = ladder_candidate(
+                        &input.market,
+                        LadderLeg::Yes,
+                        yes_bid,
+                        yes_ask,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        cfg.ladder_min_price,
+                        cfg.ladder_max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        input.now_ms,
+                    ) else {
+                        continue;
+                    };
+                    let Some(no_intent) = ladder_candidate(
+                        &input.market,
+                        LadderLeg::No,
+                        no_bid,
+                        no_ask,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        cfg.ladder_min_price,
+                        cfg.ladder_max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        input.now_ms,
+                    ) else {
+                        continue;
+                    };
+                    if yes_intent.limit_price + no_intent.limit_price > 1.0 + 1e-9 {
+                        notes.push(format!(
+                            "paired_core bundle level blocked idx={idx} pair_cost={:.4}",
+                            yes_intent.limit_price + no_intent.limit_price,
+                        ));
+                        continue;
+                    }
+                    let next_yes = projected_yes_qty + yes_intent.quantity;
+                    let next_no = projected_no_qty + no_intent.quantity;
+                    if (next_yes - next_no).abs() > max_unpaired_core_qty + 1e-9 {
+                        notes.push(format!(
+                            "paired_core bundle level blocked idx={idx} next_yes={next_yes:.4} next_no={next_no:.4} max_unpaired={max_unpaired_core_qty:.4}",
+                        ));
+                        continue;
+                    }
+                    let tag = format!("ladder:{idx}");
+                    let yes_changed = self.should_emit(
+                        &market_id,
+                        LadderLeg::Yes,
+                        &tag,
+                        yes_intent.limit_price,
+                        yes_intent.quantity,
+                    );
+                    let no_changed = self.should_emit(
+                        &market_id,
+                        LadderLeg::No,
+                        &tag,
+                        no_intent.limit_price,
+                        no_intent.quantity,
+                    );
+                    if yes_changed || no_changed {
+                        projected_yes_qty = next_yes;
+                        projected_no_qty = next_no;
+                        intents.push(yes_intent);
+                        intents.push(no_intent);
+                    }
+                }
             }
+            notes.push(format!(
+                "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
+                cfg.ladder_span,
+            ));
 
             return if intents.is_empty() {
                 StrategyDecision::Noop { notes }
@@ -464,16 +809,16 @@ where
         // Current per-leg notional from inventory (cost basis, not market).
         let (expensive_qty, expensive_avg, cheap_qty, cheap_avg) = match geom.expensive_leg {
             LadderLeg::Yes => (
-                input.inventory.yes_qty,
-                input.inventory.yes_avg_cost,
-                input.inventory.no_qty,
-                input.inventory.no_avg_cost,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.yes_avg_cost,
+                input.paired_core_inventory.no_qty,
+                input.paired_core_inventory.no_avg_cost,
             ),
             LadderLeg::No => (
-                input.inventory.no_qty,
-                input.inventory.no_avg_cost,
-                input.inventory.yes_qty,
-                input.inventory.yes_avg_cost,
+                input.paired_core_inventory.no_qty,
+                input.paired_core_inventory.no_avg_cost,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.yes_avg_cost,
             ),
         };
         let expensive_notional = expensive_qty.max(0.0) * expensive_avg.max(0.0);
@@ -508,7 +853,15 @@ where
         let cfg_core_clip = cfg.core_clip_usd;
         let cfg_hedge_clip = cfg.hedge_clip_usd;
         let cfg_improve = cfg.maker_improve_ticks;
-        if expensive_gap >= cfg_min_order {
+        let imbalance_tolerance = input.market.min_order_size().max(0.5);
+        if expensive_gap >= cfg_min_order
+            && paired_core_leg_allowed(
+                geom.expensive_leg,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.no_qty,
+                imbalance_tolerance,
+            )
+        {
             let clip = cfg_core_clip.min(expensive_gap).max(cfg_min_order);
             if let Some(intent) = build_clip(
                 &input.market,
@@ -525,9 +878,23 @@ where
                     intents.push(intent);
                 }
             }
+        } else if expensive_gap >= cfg_min_order {
+            notes.push(format!(
+                "paired_core suppressing heavier expensive leg={:?} core_yes={:.4} core_no={:.4}",
+                geom.expensive_leg,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.no_qty,
+            ));
         }
 
-        if cheap_gap >= cfg_min_order {
+        if cheap_gap >= cfg_min_order
+            && paired_core_leg_allowed(
+                geom.cheap_leg,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.no_qty,
+                imbalance_tolerance,
+            )
+        {
             let clip = cfg_hedge_clip.min(cheap_gap).max(cfg_min_order);
             if let Some(intent) = build_clip(
                 &input.market,
@@ -544,6 +911,13 @@ where
                     intents.push(intent);
                 }
             }
+        } else if cheap_gap >= cfg_min_order {
+            notes.push(format!(
+                "paired_core suppressing heavier cheap leg={:?} core_yes={:.4} core_no={:.4}",
+                geom.cheap_leg,
+                input.paired_core_inventory.yes_qty,
+                input.paired_core_inventory.no_qty,
+            ));
         }
 
         if intents.is_empty() {
