@@ -159,16 +159,28 @@ impl CoreHedgeMmStrategy {
         qty: f64,
     ) -> bool {
         let key = (market_id.clone(), leg, tag.to_string());
-        let changed = match self.last_emit.get(&key) {
-            Some(&(prev_px, prev_qty)) => {
-                (price - prev_px).abs() > 1e-6 || (qty - prev_qty).abs() > 1e-6
-            }
-            None => true,
-        };
+        let changed = self.would_emit(market_id, leg, tag, price, qty);
         if changed {
             self.last_emit.insert(key, (price, qty));
         }
         changed
+    }
+
+    fn would_emit(
+        &self,
+        market_id: &MarketId,
+        leg: LadderLeg,
+        tag: &str,
+        price: f64,
+        qty: f64,
+    ) -> bool {
+        let key = (market_id.clone(), leg, tag.to_string());
+        match self.last_emit.get(&key) {
+            Some(&(prev_px, prev_qty)) => {
+                (price - prev_px).abs() > 1e-6 || (qty - prev_qty).abs() > 1e-6
+            }
+            None => true,
+        }
     }
 }
 
@@ -719,6 +731,105 @@ where
                                 intents.push(intent);
                             }
                         }
+                    }
+                }
+                let residual_abs_imbalance = (projected_yes_qty - projected_no_qty).abs();
+                notes.push(format!(
+                    "paired_core balanced continuation with residual repair leg={leg:?} residual_abs_imbalance={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}",
+                ));
+                for idx in 0..levels {
+                    if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
+                        notes.push(format!(
+                            "paired_core opening presence only: suppressing residual-balanced bundle idx={idx} elapsed_ms={elapsed_ms}",
+                        ));
+                        continue;
+                    }
+                    let Some(yes_intent) = ladder_candidate(
+                        &input.market,
+                        LadderLeg::Yes,
+                        yes_bid,
+                        yes_ask,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        cfg.ladder_min_price,
+                        cfg.ladder_max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        input.now_ms,
+                    ) else {
+                        continue;
+                    };
+                    let Some(no_intent) = ladder_candidate(
+                        &input.market,
+                        LadderLeg::No,
+                        no_bid,
+                        no_ask,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        cfg.ladder_min_price,
+                        cfg.ladder_max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        input.now_ms,
+                    ) else {
+                        continue;
+                    };
+                    let pair_cost = yes_intent.limit_price + no_intent.limit_price;
+                    if pair_cost > 1.0 + 1e-9 {
+                        notes.push(format!(
+                            "paired_core residual-balanced level blocked idx={idx} pair_cost={pair_cost:.4}",
+                        ));
+                        continue;
+                    }
+                    let next_yes = projected_yes_qty + yes_intent.quantity;
+                    let next_no = projected_no_qty + no_intent.quantity;
+                    let next_abs_imbalance = (next_yes - next_no).abs();
+                    if next_abs_imbalance > max_unpaired_core_qty + 1e-9
+                        && next_abs_imbalance > residual_abs_imbalance + 1e-9
+                    {
+                        notes.push(format!(
+                            "paired_core residual-balanced level blocked idx={idx} next_yes={next_yes:.4} next_no={next_no:.4} residual_abs={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}",
+                        ));
+                        continue;
+                    }
+                    let tag = format!("ladder:{idx}");
+                    let yes_changed = self.would_emit(
+                        &market_id,
+                        LadderLeg::Yes,
+                        &tag,
+                        yes_intent.limit_price,
+                        yes_intent.quantity,
+                    );
+                    let no_changed = self.would_emit(
+                        &market_id,
+                        LadderLeg::No,
+                        &tag,
+                        no_intent.limit_price,
+                        no_intent.quantity,
+                    );
+                    if yes_changed && no_changed {
+                        self.should_emit(
+                            &market_id,
+                            LadderLeg::Yes,
+                            &tag,
+                            yes_intent.limit_price,
+                            yes_intent.quantity,
+                        );
+                        self.should_emit(
+                            &market_id,
+                            LadderLeg::No,
+                            &tag,
+                            no_intent.limit_price,
+                            no_intent.quantity,
+                        );
+                        projected_yes_qty = next_yes;
+                        projected_no_qty = next_no;
+                        intents.push(yes_intent);
+                        intents.push(no_intent);
                     }
                 }
             } else {

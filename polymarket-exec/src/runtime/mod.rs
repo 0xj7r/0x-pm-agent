@@ -30,7 +30,7 @@ use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
 use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
 use crate::runtime::btc_signals::BtcSignalStore;
-use crate::runtime::order_store::{OrderRecord, OrderStore};
+use crate::runtime::order_store::{AccountingLane, OrderRecord, OrderStore};
 pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
@@ -104,30 +104,6 @@ struct MergeSignature {
     yes_instrument_id: InstrumentId,
     no_instrument_id: InstrumentId,
     quantity_units: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InventoryLane {
-    MergeablePaired,
-    Directional,
-    Other,
-}
-
-fn inventory_lane_from_tag(tag: Option<&str>) -> InventoryLane {
-    let Some(tag) = tag else {
-        return InventoryLane::Other;
-    };
-    let tag = tag.to_ascii_lowercase();
-    if tag.starts_with("late-fav") || tag.contains("cheap-tail") || tag.contains("convex") {
-        InventoryLane::Directional
-    } else if tag.starts_with("paired-core:")
-        || tag.contains("paired-mm")
-        || tag.contains("mm-paired-bid")
-    {
-        InventoryLane::MergeablePaired
-    } else {
-        InventoryLane::Other
-    }
 }
 
 impl MergeSignature {
@@ -1102,12 +1078,12 @@ impl<S: Strategy> Runtime<S> {
             let (yes_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
                 market_id,
                 &intent.yes_instrument_id,
-                InventoryLane::MergeablePaired,
+                AccountingLane::PairedCore,
             );
             let (no_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
                 market_id,
                 &intent.no_instrument_id,
-                InventoryLane::MergeablePaired,
+                AccountingLane::PairedCore,
             );
             yes_durable_mergeable_qty.min(no_durable_mergeable_qty)
         } else {
@@ -1414,12 +1390,12 @@ impl<S: Strategy> Runtime<S> {
         let (yes_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
             market_id,
             &yes_position.instrument_id,
-            InventoryLane::MergeablePaired,
+            AccountingLane::PairedCore,
         );
         let (no_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
             market_id,
             &no_position.instrument_id,
-            InventoryLane::MergeablePaired,
+            AccountingLane::PairedCore,
         );
         let yes_mergeable_qty = if self.order_store.is_some() {
             yes_inventory_mergeable_qty.min(yes_durable_mergeable_qty)
@@ -2047,39 +2023,35 @@ impl<S: Strategy> Runtime<S> {
                             })
                     })
                 });
-            let inventory_lane = inventory_lane_from_tag(auto_merge_tag.as_deref());
+            let inventory_lane = AccountingLane::from_quote_level_tag(auto_merge_tag.as_deref());
             let legacy_anonymous_merge_allowed =
                 self.order_store.is_none() && fill.client_order_id.is_none();
-            let auto_merge_allowed = inventory_lane == InventoryLane::MergeablePaired
+            let auto_merge_allowed = inventory_lane == AccountingLane::PairedCore
                 || legacy_anonymous_merge_allowed;
             let adjustment = self.inventory.apply_fill(&fill)?;
             executed_qty = fill.quantity;
-            if fill.side == crate::types::TradeSide::Buy
-                && inventory_lane == InventoryLane::Directional
-            {
+            if fill.side == crate::types::TradeSide::Buy && inventory_lane.is_directional() {
                 let key = (fill.market_id.clone(), fill.instrument_id.clone());
                 *self
                     .directional_inventory_by_market_instrument
                     .entry(key)
                     .or_insert(0.0) += fill.quantity;
-                if auto_merge_tag
-                    .as_deref()
-                    .is_some_and(|tag| tag.starts_with("late-fav"))
-                {
-                    let key = (fill.market_id.clone(), fill.instrument_id.clone());
-                    *self
-                        .late_fav_inventory_by_market_instrument
-                        .entry(key)
-                        .or_insert(0.0) += fill.quantity;
-                } else if auto_merge_tag.as_deref().is_some_and(|tag| {
-                    let tag = tag.to_ascii_lowercase();
-                    tag.contains("cheap-tail") || tag.contains("convex")
-                }) {
-                    let key = (fill.market_id.clone(), fill.instrument_id.clone());
-                    *self
-                        .cheap_tail_inventory_by_market_instrument
-                        .entry(key)
-                        .or_insert(0.0) += fill.quantity;
+                match inventory_lane {
+                    AccountingLane::LateFavorite => {
+                        let key = (fill.market_id.clone(), fill.instrument_id.clone());
+                        *self
+                            .late_fav_inventory_by_market_instrument
+                            .entry(key)
+                            .or_insert(0.0) += fill.quantity;
+                    }
+                    AccountingLane::CheapTail | AccountingLane::ReversalHedge => {
+                        let key = (fill.market_id.clone(), fill.instrument_id.clone());
+                        *self
+                            .cheap_tail_inventory_by_market_instrument
+                            .entry(key)
+                            .or_insert(0.0) += fill.quantity;
+                    }
+                    AccountingLane::PairedCore | AccountingLane::Other => {}
                 }
             }
             outcome.push_event(
@@ -3209,10 +3181,10 @@ impl<S: Strategy> Runtime<S> {
             && self
                 .markets_with_unresolved_drift
                 .contains(&intent.market_id)
-            && !matches!(
-                inventory_lane_from_tag(intent.quote_level_tag.as_deref()),
-                InventoryLane::MergeablePaired | InventoryLane::Directional
-            )
+            && {
+                let lane = AccountingLane::from_quote_level_tag(intent.quote_level_tag.as_deref());
+                !(lane == AccountingLane::PairedCore || lane.is_directional())
+            }
         {
             outcome.push_event(
                 self.event_log.push(
@@ -3453,54 +3425,25 @@ impl<S: Strategy> Runtime<S> {
             runtime_status: self.status,
             inventory,
             paired_core_inventory,
-            directional_inventory: self
-                .directional_inventory_by_market_instrument
-                .iter()
-                .filter(|((tracked_market_id, _), qty)| {
-                    **qty > ACCOUNTING_QTY_EPSILON
-                        && market_id.is_none_or(|id| tracked_market_id == id)
-                })
-                .map(|((tracked_market_id, instrument_id), qty)| {
-                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
-                        market_id: tracked_market_id.clone(),
-                        instrument_id: instrument_id.clone(),
-                        quantity: (*qty).max(0.0),
-                        quote_level_tag: None,
-                    }
-                })
-                .collect(),
-            late_fav_inventory: self
-                .late_fav_inventory_by_market_instrument
-                .iter()
-                .filter(|((tracked_market_id, _), qty)| {
-                    **qty > ACCOUNTING_QTY_EPSILON
-                        && market_id.is_none_or(|id| tracked_market_id == id)
-                })
-                .map(|((tracked_market_id, instrument_id), qty)| {
-                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
-                        market_id: tracked_market_id.clone(),
-                        instrument_id: instrument_id.clone(),
-                        quantity: (*qty).max(0.0),
-                        quote_level_tag: Some("late-fav".to_string()),
-                    }
-                })
-                .collect(),
-            cheap_tail_inventory: self
-                .cheap_tail_inventory_by_market_instrument
-                .iter()
-                .filter(|((tracked_market_id, _), qty)| {
-                    **qty > ACCOUNTING_QTY_EPSILON
-                        && market_id.is_none_or(|id| tracked_market_id == id)
-                })
-                .map(|((tracked_market_id, instrument_id), qty)| {
-                    crate::strategies::traits::StrategyDirectionalInventorySnapshot {
-                        market_id: tracked_market_id.clone(),
-                        instrument_id: instrument_id.clone(),
-                        quantity: (*qty).max(0.0),
-                        quote_level_tag: Some("cheap-tail".to_string()),
-                    }
-                })
-                .collect(),
+            directional_inventory: self.durable_accounting_inventory_snapshots(
+                market_id,
+                &[
+                    AccountingLane::LateFavorite,
+                    AccountingLane::CheapTail,
+                    AccountingLane::ReversalHedge,
+                ],
+                None,
+            ),
+            late_fav_inventory: self.durable_accounting_inventory_snapshots(
+                market_id,
+                &[AccountingLane::LateFavorite],
+                Some("late-fav"),
+            ),
+            cheap_tail_inventory: self.durable_accounting_inventory_snapshots(
+                market_id,
+                &[AccountingLane::CheapTail, AccountingLane::ReversalHedge],
+                Some("cheap-tail"),
+            ),
             open_orders: self
                 .open_orders
                 .values()
@@ -3603,8 +3546,7 @@ impl<S: Strategy> Runtime<S> {
                     && record.side == TradeSide::Buy
                     && !record.reduce_only
                     && record.filled_qty > ACCOUNTING_QTY_EPSILON
-                    && inventory_lane_from_tag(record.quote_level_tag.as_deref())
-                        == InventoryLane::Directional
+                    && record.accounting_lane.is_directional()
             })
             .map(|record| record.filled_qty.max(0.0))
             .sum()
@@ -3614,7 +3556,7 @@ impl<S: Strategy> Runtime<S> {
         &self,
         market_id: &MarketId,
         instrument_id: &InstrumentId,
-        lane: InventoryLane,
+        lane: AccountingLane,
     ) -> (f64, f64) {
         let Some(order_store) = self.order_store.as_ref() else {
             return (0.0, 0.0);
@@ -3639,7 +3581,7 @@ impl<S: Strategy> Runtime<S> {
                     && record.side == TradeSide::Buy
                     && !record.reduce_only
                     && record.filled_qty > ACCOUNTING_QTY_EPSILON
-                    && inventory_lane_from_tag(record.quote_level_tag.as_deref()) == lane
+                    && record.accounting_lane == lane
             })
             .fold((0.0, 0.0), |(qty, cost), record| {
                 let filled_qty = record.filled_qty.max(0.0);
@@ -3669,10 +3611,10 @@ impl<S: Strategy> Runtime<S> {
         let (yes_qty, _) = self.durable_lane_qty_cost(
             market_id,
             &yes_instrument_id,
-            InventoryLane::MergeablePaired,
+            AccountingLane::PairedCore,
         );
         let (no_qty, _) =
-            self.durable_lane_qty_cost(market_id, &no_instrument_id, InventoryLane::MergeablePaired);
+            self.durable_lane_qty_cost(market_id, &no_instrument_id, AccountingLane::PairedCore);
         let pair_qty = yes_qty.min(no_qty).max(0.0);
         if pair_qty + ACCOUNTING_QTY_EPSILON < self.min_merge_notional_usd {
             return RuntimeOutcome::default();
@@ -3694,9 +3636,9 @@ impl<S: Strategy> Runtime<S> {
         fallback_no_avg_price: f64,
     ) -> f64 {
         let (yes_qty, yes_cost) =
-            self.durable_lane_qty_cost(market_id, yes_instrument_id, InventoryLane::MergeablePaired);
+            self.durable_lane_qty_cost(market_id, yes_instrument_id, AccountingLane::PairedCore);
         let (no_qty, no_cost) =
-            self.durable_lane_qty_cost(market_id, no_instrument_id, InventoryLane::MergeablePaired);
+            self.durable_lane_qty_cost(market_id, no_instrument_id, AccountingLane::PairedCore);
         let yes_avg = if yes_qty > ACCOUNTING_QTY_EPSILON {
             yes_cost / yes_qty
         } else {
@@ -3721,12 +3663,12 @@ impl<S: Strategy> Runtime<S> {
         let (yes_qty, yes_cost) = self.durable_lane_qty_cost(
             market_id,
             &yes_instrument_id,
-            InventoryLane::MergeablePaired,
+            AccountingLane::PairedCore,
         );
         let (no_qty, no_cost) = self.durable_lane_qty_cost(
             market_id,
             &no_instrument_id,
-            InventoryLane::MergeablePaired,
+            AccountingLane::PairedCore,
         );
         Some(PairedInventorySnapshot {
             yes_qty: yes_qty.max(0.0),
@@ -3744,6 +3686,89 @@ impl<S: Strategy> Runtime<S> {
             free_cash_usd: inventory.free_cash_usd,
             equity_usd: inventory.total_cash_usd + inventory.gross_exposure_usd,
         })
+    }
+
+    fn durable_accounting_inventory_snapshots(
+        &self,
+        market_id: Option<&MarketId>,
+        lanes: &[AccountingLane],
+        quote_level_tag: Option<&str>,
+    ) -> Vec<crate::strategies::traits::StrategyDirectionalInventorySnapshot> {
+        if let (Some(order_store), Some(market_id)) = (self.order_store.as_ref(), market_id) {
+            let records = match order_store.list_by_market(market_id) {
+                Ok(records) => records,
+                Err(error) => {
+                    warn!(
+                        run_id = %self.run_id,
+                        market_id = %market_id,
+                        error = ?error,
+                        "failed to load durable accounting inventory"
+                    );
+                    return Vec::new();
+                }
+            };
+            let mut qty_by_instrument: HashMap<InstrumentId, f64> = HashMap::new();
+            for record in records {
+                if record.side == TradeSide::Buy
+                    && !record.reduce_only
+                    && record.filled_qty > ACCOUNTING_QTY_EPSILON
+                    && lanes.contains(&record.accounting_lane)
+                {
+                    *qty_by_instrument
+                        .entry(record.instrument_id)
+                        .or_insert(0.0) += record.filled_qty.max(0.0);
+                }
+            }
+            return qty_by_instrument
+                .into_iter()
+                .filter_map(|(instrument_id, tracked_qty)| {
+                    let current_qty = self
+                        .inventory
+                        .positions()
+                        .find(|position| {
+                            position.market_id == *market_id
+                                && position.instrument_id == instrument_id
+                        })
+                        .map(|position| position.quantity.max(0.0))
+                        .unwrap_or(0.0);
+                    let quantity = tracked_qty.min(current_qty).max(0.0);
+                    (quantity > ACCOUNTING_QTY_EPSILON).then(|| {
+                        crate::strategies::traits::StrategyDirectionalInventorySnapshot {
+                            market_id: market_id.clone(),
+                            instrument_id,
+                            quantity,
+                            quote_level_tag: quote_level_tag.map(str::to_string),
+                        }
+                    })
+                })
+                .collect();
+        }
+
+        let source = if lanes.len() == 1 && lanes[0] == AccountingLane::LateFavorite {
+            &self.late_fav_inventory_by_market_instrument
+        } else if lanes
+            .iter()
+            .all(|lane| matches!(lane, AccountingLane::CheapTail | AccountingLane::ReversalHedge))
+        {
+            &self.cheap_tail_inventory_by_market_instrument
+        } else {
+            &self.directional_inventory_by_market_instrument
+        };
+        source
+            .iter()
+            .filter(|((tracked_market_id, _), qty)| {
+                **qty > ACCOUNTING_QTY_EPSILON
+                    && market_id.is_none_or(|id| tracked_market_id == id)
+            })
+            .map(|((tracked_market_id, instrument_id), qty)| {
+                crate::strategies::traits::StrategyDirectionalInventorySnapshot {
+                    market_id: tracked_market_id.clone(),
+                    instrument_id: instrument_id.clone(),
+                    quantity: (*qty).max(0.0),
+                    quote_level_tag: quote_level_tag.map(str::to_string),
+                }
+            })
+            .collect()
     }
 
     fn directional_inventory_qty_for_market(&self, market_id: &MarketId) -> f64 {
