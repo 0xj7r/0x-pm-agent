@@ -614,14 +614,17 @@ fn late_favorite_entry_policy(
         if early_late && (!clean_regime || favorite_prob < 0.82) {
             return None;
         }
-        if whipsaw && favorite_prob < 0.90 {
+        if whipsaw && (favorite_prob < 0.88 || favorite_side_score.score < 0.40) {
             return None;
         }
+        let whipsaw_scale = if whipsaw { 0.50 } else { 1.0 };
         return Some(LateFavoriteEntryPolicy {
-            favorite_scale: if early_late { 0.40 } else { 0.70 },
-            tail_scale: if early_late { 0.40 } else { 0.70 },
-            budget_scale: if early_late { 0.40 } else { 0.70 },
-            label: if early_late {
+            favorite_scale: (if early_late { 0.40 } else { 0.70 }) * whipsaw_scale,
+            tail_scale: (if early_late { 0.40 } else { 0.70 }) * whipsaw_scale,
+            budget_scale: (if early_late { 0.40 } else { 0.70 }) * whipsaw_scale,
+            label: if whipsaw {
+                "maker_ladder_80_89_whipsaw"
+            } else if early_late {
                 "maker_ladder_80_89_early"
             } else {
                 "maker_ladder_80_89_late"

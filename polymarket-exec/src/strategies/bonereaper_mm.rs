@@ -838,18 +838,27 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         if early_late && (!clean_regime || strongest < threshold || model_favorite < 0.82) {
             return None;
         }
-        if whipsaw && model_favorite < 0.90 {
+        if whipsaw && (model_favorite < 0.88 || strongest < threshold * 1.50) {
             return None;
         }
         let reversal_scale = (1.0 - 0.50 * path_reversal_risk).clamp(0.50, 1.0);
+        let whipsaw_scale = if whipsaw { 0.50 } else { 1.0 };
         return Some(FavoriteEntryPolicy {
             min_price: 0.80,
-            max_levels: if early_late { 2 } else { 3 },
-            clip_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale,
-            cap_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale,
+            max_levels: if whipsaw {
+                1
+            } else if early_late {
+                2
+            } else {
+                3
+            },
+            clip_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale * whipsaw_scale,
+            cap_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale * whipsaw_scale,
             allow_taker: false,
             path_reversal_risk,
-            label: if early_late {
+            label: if whipsaw {
+                "maker_ladder_80_89_whipsaw"
+            } else if early_late {
                 "maker_ladder_80_89_early"
             } else {
                 "maker_ladder_80_89_late"
