@@ -46,7 +46,7 @@ use crate::types::{
 };
 use crate::types::{RuntimeCommand, RuntimeStatus};
 pub use checkpoint::{RuntimeCheckpoint, RuntimeCheckpointOrder};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const ACCOUNTING_QTY_EPSILON: f64 = 1e-9;
 const MIN_MERGE_NET_GAIN_USD: f64 = 0.01;
@@ -1196,19 +1196,11 @@ impl<S: Strategy> Runtime<S> {
                     .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
             })
         {
-            outcome.push_event(
-                self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Execution,
-                        now_ms,
-                        format!(
-                            "merge intent suppressed: matching CTF recycle is blocked \
-                             since {blocked_at_ms} reason={blocked_reason}; waiting for \
-                             inventory-changing venue reconciliation before retry"
-                        ),
-                    )
-                    .with_market(market_id.clone()),
-                ),
+            debug!(
+                market_id = %market_id,
+                blocked_at_ms,
+                blocked_reason = %blocked_reason,
+                "merge intent suppressed: matching CTF recycle is blocked until inventory changes"
             );
             return outcome;
         }
