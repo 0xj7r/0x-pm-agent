@@ -696,18 +696,22 @@ fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Dura
 }
 
 fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result<f64> {
-    if env_value(key).is_some() {
+    if let Some(profile) = profile {
+        Ok(profile)
+    } else if env_value(key).is_some() {
         parse_f64(key, default)
     } else {
-        Ok(profile.unwrap_or(default))
+        Ok(default)
     }
 }
 
 fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> Result<usize> {
-    if env_value(key).is_some() {
+    if let Some(profile) = profile {
+        Ok(profile)
+    } else if env_value(key).is_some() {
         parse_usize(key, default)
     } else {
-        Ok(profile.unwrap_or(default))
+        Ok(default)
     }
 }
 
