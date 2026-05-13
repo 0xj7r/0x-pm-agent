@@ -367,9 +367,8 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(POLYGON));
 
-        let use_v2_only =
-            config.protocol == ClobProtocolVersion::V2
-                && credentials.signature_type == PolymarketSignatureType::Poly1271;
+        let use_v2_only = config.protocol == ClobProtocolVersion::V2
+            && credentials.signature_type == PolymarketSignatureType::Poly1271;
         let mut auth_builder = if use_v2_only {
             None
         } else {
@@ -456,9 +455,8 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(POLYGON));
 
-        let use_v2_only =
-            config.protocol == ClobProtocolVersion::V2
-                && credentials.signature_type == PolymarketSignatureType::Poly1271;
+        let use_v2_only = config.protocol == ClobProtocolVersion::V2
+            && credentials.signature_type == PolymarketSignatureType::Poly1271;
         let mut auth_builder = if use_v2_only {
             None
         } else {
@@ -656,6 +654,14 @@ impl PolymarketExecutionAdapter {
         })
     }
 
+    fn v2_l2_address(&self) -> SdkAddress {
+        if self.signature_type == PolymarketSignatureType::Eoa {
+            self.signer.address()
+        } else {
+            self.trade_address.unwrap_or_else(|| self.signer.address())
+        }
+    }
+
     /// Checks whether a single live order is currently scoring for
     /// maker rewards. Returns the venue's boolean. Logs a structured
     /// event so operators can see (a) which orders qualify and (b)
@@ -834,18 +840,26 @@ impl PolymarketExecutionAdapter {
             let amount = SdkV2Amount::usdc(market_buy_amount).map_err(|error| {
                 ExecutionError::BadRequest(format!("invalid V2 SDK USDC amount: {error}"))
             })?;
-            client
+            let builder = client
                 .market_order()
                 .token_id(token_id)
                 .side(side)
                 .price(price)
                 .amount(amount)
                 .order_type(order_type)
-                .builder_code(builder_code_b256)
-                .build_sign_and_post(&sdk_signer)
-                .await
+                .builder_code(builder_code_b256);
+            if self.signature_type == PolymarketSignatureType::Poly1271 {
+                let order = builder.build().await.map_err(|error| {
+                    ExecutionError::VenueRejection(format!("V2 SDK build: {error}"))
+                })?;
+                let signed_order = client.sign(&sdk_signer, order).await.map_err(|error| {
+                    ExecutionError::VenueRejection(format!("V2 SDK sign: {error}"))
+                })?;
+                return self.post_v2_sdk_signed_order(req, signed_order).await;
+            }
+            builder.build_sign_and_post(&sdk_signer).await
         } else {
-            client
+            let builder = client
                 .limit_order()
                 .token_id(token_id)
                 .side(side)
@@ -854,9 +868,17 @@ impl PolymarketExecutionAdapter {
                 .order_type(order_type)
                 .expiration(expiration_dt)
                 .post_only(req.post_only)
-                .builder_code(builder_code_b256)
-                .build_sign_and_post(&sdk_signer)
-                .await
+                .builder_code(builder_code_b256);
+            if self.signature_type == PolymarketSignatureType::Poly1271 {
+                let order = builder.build().await.map_err(|error| {
+                    ExecutionError::VenueRejection(format!("V2 SDK build: {error}"))
+                })?;
+                let signed_order = client.sign(&sdk_signer, order).await.map_err(|error| {
+                    ExecutionError::VenueRejection(format!("V2 SDK sign: {error}"))
+                })?;
+                return self.post_v2_sdk_signed_order(req, signed_order).await;
+            }
+            builder.build_sign_and_post(&sdk_signer).await
         }
         .map_err(|error| {
             ExecutionError::VenueRejection(format!("V2 SDK build_sign_and_post: {error}"))
@@ -870,6 +892,69 @@ impl PolymarketExecutionAdapter {
             accepted_at_ms: now_ms,
             venue_message: Some(format!("v2-sdk status={:?}", resp.status)),
         })
+    }
+
+    async fn post_v2_sdk_signed_order(
+        &self,
+        req: SubmitOrderRequest,
+        signed_order: polymarket_client_sdk_v2::clob::types::SignedOrder,
+    ) -> Result<SubmitOrderAck, ExecutionError> {
+        let body_json = serde_json::to_string(&signed_order).map_err(|error| {
+            ExecutionError::BadRequest(format!(
+                "failed to serialize CLOB V2 SDK order body: {error}"
+            ))
+        })?;
+        let url = join_url(&self._config.api_url, "order");
+        let timestamp_s = (now_unix_ms() / 1_000) as i64;
+        let headers = self.v2_l2_headers(Method::POST, &url, &body_json, timestamp_s)?;
+        let response = self
+            .raw_http
+            .post(&url)
+            .headers(headers)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body_json)
+            .send()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        if !status.is_success() {
+            return Err(ExecutionError::VenueRejection(format!(
+                "CLOB V2 SDK order POST failed {status}: {response_text}"
+            )));
+        }
+        let response: RawPostOrderResponse =
+            serde_json::from_str(&response_text).map_err(|error| {
+                ExecutionError::VenueRejection(format!(
+                    "failed to decode CLOB V2 SDK order response `{response_text}`: {error}"
+                ))
+            })?;
+        let ack = SubmitOrderAck {
+            client_order_id: req.client_order_id.clone(),
+            venue_order_id: if response.order_id.is_empty() {
+                None
+            } else {
+                Some(OrderId::from(response.order_id.clone()))
+            },
+            accepted: response.success,
+            accepted_at_ms: now_unix_ms(),
+            venue_message: response
+                .error_msg
+                .or_else(|| Some("v2-sdk poly1271 deposit-wallet post accepted".to_string())),
+        };
+        if ack.accepted {
+            if let Some(order_id) = ack.venue_order_id.clone() {
+                self.state
+                    .write()
+                    .await
+                    .venue_order_map
+                    .insert(req.client_order_id, order_id);
+            }
+        }
+        Ok(ack)
     }
 
     async fn submit_v2(&self, req: SubmitOrderRequest) -> Result<SubmitOrderAck, ExecutionError> {
@@ -918,12 +1003,7 @@ impl PolymarketExecutionAdapter {
         })?;
         let signature = draft.sign(&self.signer, POLYGON, exchange).await?;
         let (api_key, _, _) = self.api_credential_parts()?;
-        let body = draft.post_body(
-            api_key,
-            order_type,
-            req.post_only,
-            signature,
-        )?;
+        let body = draft.post_body(api_key, order_type, req.post_only, signature)?;
         let body_json = serde_json::to_string(&body).map_err(|error| {
             ExecutionError::BadRequest(format!("failed to serialize CLOB V2 order body: {error}"))
         })?;
@@ -998,7 +1078,7 @@ impl PolymarketExecutionAdapter {
         let mut headers = HeaderMap::new();
         headers.insert(
             "POLY_ADDRESS",
-            HeaderValue::from_str(&self.signer.address().to_string())
+            HeaderValue::from_str(&self.v2_l2_address().to_string())
                 .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
         );
         headers.insert(
@@ -1601,9 +1681,7 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
                 .await?
                 .cancel_order(order_id.as_str())
                 .await
-                .map_err(|error| {
-                    ExecutionError::TransientNetwork(format!("V2 cancel: {error}"))
-                })?;
+                .map_err(|error| ExecutionError::TransientNetwork(format!("V2 cancel: {error}")))?;
             (
                 response
                     .canceled
