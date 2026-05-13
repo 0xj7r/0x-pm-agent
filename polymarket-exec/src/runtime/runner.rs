@@ -3331,6 +3331,15 @@ async fn apply_sync_report(
         );
         outcome.extend(terminal_outcome);
         if !removed {
+            let (finalized, partial_fill_outcome) = runtime.finalize_missing_partial_fill_order(
+                client_order_id,
+                now_ms,
+                "non-resting partial fill absent from open-order sync; expiring unfilled remainder",
+            );
+            outcome.extend(partial_fill_outcome);
+            if finalized {
+                continue;
+            }
             unresolved_missing_local_orders.push(client_order_id.clone());
         }
     }

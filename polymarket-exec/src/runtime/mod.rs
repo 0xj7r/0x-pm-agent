@@ -1670,6 +1670,50 @@ impl<S: Strategy> Runtime<S> {
         (true, outcome)
     }
 
+    pub fn finalize_missing_partial_fill_order(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        now_ms: EpochMillis,
+        reason: &str,
+    ) -> (bool, RuntimeOutcome) {
+        let Some(managed) = self.open_orders.get(client_order_id) else {
+            return (false, RuntimeOutcome::default());
+        };
+        if managed.cumulative_filled_qty <= 0.0 {
+            return (false, RuntimeOutcome::default());
+        }
+        let quote_level_tag = managed.intent.quote_level_tag.as_deref().unwrap_or_default();
+        let non_resting_partial = quote_level_tag.starts_with("late-fav-taker")
+            || quote_level_tag.starts_with("mm-hedge-rescue")
+            || managed.intent.kind == crate::types::IntentKind::Close;
+        if !non_resting_partial {
+            return (false, RuntimeOutcome::default());
+        }
+        if let Some(store) = self.order_store.as_mut() {
+            if let Err(error) = store.expire_remaining_after_partial_fill(client_order_id, now_ms) {
+                warn!(
+                    run_id = %self.run_id,
+                    error = ?error,
+                    client_order_id = %client_order_id,
+                    reason,
+                    "failed to persist partial-fill terminal expiry"
+                );
+                return (false, RuntimeOutcome::default());
+            }
+        }
+        let Some(record) = self.durable_terminal_order(client_order_id) else {
+            warn!(
+                run_id = %self.run_id,
+                client_order_id = %client_order_id,
+                reason,
+                "partial-fill expiry did not produce durable terminal record"
+            );
+            return (false, RuntimeOutcome::default());
+        };
+        let outcome = self.remove_active_order_after_durable_terminal(record, now_ms, reason);
+        (true, outcome)
+    }
+
     pub fn checkpoint_snapshot(
         &self,
         observed_at_ms: EpochMillis,
