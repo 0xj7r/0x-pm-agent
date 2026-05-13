@@ -740,6 +740,31 @@ fn paired_core_fill_uses_durable_order_tag_when_active_order_is_absent() {
         Some(Box::new(store)),
         "run-1".to_string(),
     );
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-mm".to_string()),
+                    instrument_id: up.clone(),
+                    quantity: 0.0,
+                    average_cost_usd: 0.0,
+                    mark_price: Some(0.40),
+                    observed_at_ms: 19,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-mm".to_string()),
+                    instrument_id: down.clone(),
+                    quantity: 0.0,
+                    average_cost_usd: 0.0,
+                    mark_price: Some(0.50),
+                    observed_at_ms: 19,
+                },
+            ],
+            19,
+        )
+        .expect("condition id preseed");
 
     runtime
         .on_fill(FillReport {
@@ -1032,6 +1057,150 @@ fn plan_merge_respects_profile_min_merge_notional() {
             .any(|event| event.message.contains("below batch threshold")),
         "merge skip should emit a recognizable event for observability"
     );
+}
+
+#[test]
+fn plan_merge_defers_until_condition_id_is_known() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!("polymarket-exec-merge-condition-id-{ts}.sqlite"));
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    let market_id = MarketId::from("market-mm");
+    let up = InstrumentId::from("up");
+    let down = InstrumentId::from("down");
+
+    for (client_order_id, instrument_id, price) in [
+        (ClientOrderId::from("paired-core:market-mm:up:0"), up.clone(), 0.20),
+        (
+            ClientOrderId::from("paired-core:market-mm:down:0"),
+            down.clone(),
+            0.70,
+        ),
+    ] {
+        let intent = OrderIntent {
+            client_order_id,
+            market_id: market_id.clone(),
+            instrument_id,
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: 5.0,
+            reduce_only: false,
+            reason: "paired-core condition-id fixture".to_string(),
+            quote_level_tag: Some("paired-core:ladder:0".to_string()),
+            created_at_ms: 10,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let mut record = OrderRecord::from_intent("run-1", &intent, "bonereaper_mm");
+        record.status = ManagedOrderStatus::Filled;
+        record.remaining_qty = 0.0;
+        record.filled_qty = 5.0;
+        store.insert(record).unwrap();
+    }
+
+    let market_contexts = MarketContextStore::from_records(
+        vec![MarketContextRecord {
+            market_id: market_id.as_str().to_string(),
+            instrument_ids: vec![up.as_str().to_string(), down.as_str().to_string()],
+            ..MarketContextRecord::default()
+        }],
+        Some("test".to_string()),
+        Some(10),
+    );
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            min_merge_notional_usd: 0.0,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        market_contexts,
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: None,
+                    instrument_id: up.clone(),
+                    quantity: 5.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 11,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: None,
+                    instrument_id: down.clone(),
+                    quantity: 5.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 11,
+                },
+            ],
+            11,
+        )
+        .expect("condition-less reconcile");
+
+    let deferred = runtime.plan_merge_command_for_market(&market_id, 12, "missing condition");
+    assert!(
+        deferred.commands.is_empty(),
+        "live merge must not be planned without the condition id required by CTF"
+    );
+    assert!(
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("missing condition_id")),
+        "missing condition id should be observable"
+    );
+
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: up,
+                    quantity: 5.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 13,
+                },
+                VenuePositionSnapshot {
+                    market_id: market_id.clone(),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: down,
+                    quantity: 5.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 13,
+                },
+            ],
+            13,
+        )
+        .expect("condition id reconcile");
+
+    let planned = runtime.plan_merge_command_for_market(&market_id, 14, "condition known");
+    let merge = planned.commands.iter().find_map(|command| match command {
+        RuntimeCommand::Merge(intent) => Some(intent),
+        _ => None,
+    });
+    assert_eq!(
+        merge.and_then(|intent| intent.condition_id.as_deref()),
+        Some("condition-1")
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
