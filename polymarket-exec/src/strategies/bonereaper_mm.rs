@@ -857,18 +857,28 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         });
     }
 
-    if early_late && whipsaw {
-        return None;
-    }
+    let whipsaw_scale = if whipsaw {
+        if early_late { 0.45 } else { 0.70 }
+    } else {
+        1.0
+    };
     let reversal_scale = (1.0 - 0.55 * path_reversal_risk).clamp(0.35, 1.0);
     Some(FavoriteEntryPolicy {
         min_price: if early_late { 0.90 } else { 0.85 },
-        max_levels: if early_late { 3 } else { 5 },
-        clip_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale,
-        cap_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale,
+        max_levels: if early_late && whipsaw {
+            2
+        } else if early_late {
+            3
+        } else {
+            5
+        },
+        clip_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
+        cap_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
         allow_taker: true,
         path_reversal_risk,
-        label: if early_late {
+        label: if early_late && whipsaw {
+            "true_late_fav_90_plus_whipsaw_early"
+        } else if early_late {
             "true_late_fav_90_plus_early"
         } else {
             "true_late_fav_90_plus"
