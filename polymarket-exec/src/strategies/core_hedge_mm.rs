@@ -626,6 +626,7 @@ where
             ));
 
             let min_repair_qty = input.market.min_order_size().max(0.0);
+            let filled_abs_imbalance = (filled_yes_qty - filled_no_qty).abs();
             let repair_leg = if filled_yes_qty + min_repair_qty <= filled_no_qty {
                 Some(LadderLeg::Yes)
             } else if filled_no_qty + min_repair_qty <= filled_yes_qty {
@@ -751,6 +752,16 @@ where
                 notes.push(format!(
                     "paired_core balanced bundle sees live paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}; projected exposure guard will prevent worsening imbalance",
                 ));
+                if !in_repair_mode {
+                    notes.push(format!(
+                        "paired_core balanced bundle suppressed: awaiting open paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}",
+                    ));
+                    notes.push(format!(
+                        "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
+                        cfg.ladder_span,
+                    ));
+                    return StrategyDecision::Noop { notes };
+                }
             }
             if in_repair_mode {
                 notes.push(format!(
@@ -762,6 +773,22 @@ where
                 ));
             }
             for idx in 0..levels {
+                if in_repair_mode {
+                    let max_repair_continuation_imbalance =
+                        cfg.clip_shares.max(input.market.min_order_size()).max(0.0);
+                    if filled_abs_imbalance > max_repair_continuation_imbalance + 1e-9 {
+                        notes.push(format!(
+                            "paired_core repair-continuation suppressed: filled_abs_imbalance={filled_abs_imbalance:.4} max_allowed={max_repair_continuation_imbalance:.4}",
+                        ));
+                        break;
+                    }
+                    if idx != levels / 2 {
+                        notes.push(format!(
+                            "paired_core repair-continuation suppressing non-center bundle idx={idx}",
+                        ));
+                        continue;
+                    }
+                }
                 if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
                     notes.push(format!(
                         "paired_core opening presence only: suppressing non-center bundle idx={idx} elapsed_ms={elapsed_ms}",
