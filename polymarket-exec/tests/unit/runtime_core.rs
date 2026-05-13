@@ -291,18 +291,44 @@ fn runtime_reserves_then_applies_fill() {
 }
 
 #[test]
-fn strategy_commands_emit_merge_without_quote_reconciliation() {
+fn strategy_commands_route_merge_through_runtime_planner() {
     let mut runtime = Runtime::new(
         RuntimeConfig {
             starting_cash_usd: 100.0,
             event_log_capacity: 128,
             initial_status: RuntimeStatus::Starting,
+            min_merge_notional_usd: 0.0,
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
         MergeCommandStrategy,
         MarketContextStore::empty(),
     );
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: MarketId::from("market-1"),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("yes"),
+                    quantity: 3.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 0,
+                },
+                VenuePositionSnapshot {
+                    market_id: MarketId::from("market-1"),
+                    condition_id: Some("condition-1".to_string()),
+                    instrument_id: InstrumentId::from("no"),
+                    quantity: 3.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 0,
+                },
+            ],
+            0,
+        )
+        .expect("paired venue inventory");
 
     let started = runtime.start(1);
     assert_eq!(started.commands.len(), 1);
@@ -310,6 +336,10 @@ fn strategy_commands_emit_merge_without_quote_reconciliation() {
         RuntimeCommand::Merge(intent) => {
             assert_eq!(intent.market_id, MarketId::from("market-1"));
             assert_eq!(intent.quantity, 3.0);
+            assert!(
+                intent.command_id.as_str().starts_with("merge:"),
+                "strategy merge should be reissued by the runtime merge planner"
+            );
         }
         other => panic!("expected merge command, got {other:?}"),
     }
@@ -323,20 +353,79 @@ fn live_strategy_merge_command_defers_without_condition_id() {
         .as_nanos();
     let path = std::env::temp_dir()
         .join(format!("polymarket-exec-strategy-merge-condition-id-{ts}.sqlite"));
-    let store = SqliteOrderStore::open(&path).unwrap();
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    for (client_order_id, instrument_id, price) in [
+        (ClientOrderId::from("paired-core:market-1:yes:0"), InstrumentId::from("yes"), 0.20),
+        (ClientOrderId::from("paired-core:market-1:no:0"), InstrumentId::from("no"), 0.70),
+    ] {
+        let intent = OrderIntent {
+            client_order_id,
+            market_id: MarketId::from("market-1"),
+            instrument_id,
+            side: TradeSide::Buy,
+            limit_price: price,
+            quantity: 3.0,
+            reduce_only: false,
+            reason: "strategy merge missing condition fixture".to_string(),
+            quote_level_tag: Some("paired-core:ladder:0".to_string()),
+            created_at_ms: 0,
+            pair_id: None,
+            kind: crate::types::IntentKind::Entry,
+        };
+        let mut record = OrderRecord::from_intent("run-1", &intent, "bonereaper_mm");
+        record.status = ManagedOrderStatus::Filled;
+        record.remaining_qty = 0.0;
+        record.filled_qty = 3.0;
+        store.insert(record).unwrap();
+    }
+    let market_contexts = MarketContextStore::from_records(
+        vec![MarketContextRecord {
+            market_id: "market-1".to_string(),
+            instrument_ids: vec!["yes".to_string(), "no".to_string()],
+            ..MarketContextRecord::default()
+        }],
+        Some("test".to_string()),
+        Some(1),
+    );
     let mut runtime = Runtime::new_with_order_store(
         RuntimeConfig {
             starting_cash_usd: 100.0,
             event_log_capacity: 128,
             initial_status: RuntimeStatus::Starting,
+            min_merge_notional_usd: 0.0,
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
         MissingConditionMergeCommandStrategy,
-        MarketContextStore::empty(),
+        market_contexts,
         Some(Box::new(store)),
         "run-1".to_string(),
     );
+    runtime
+        .reconcile_venue_positions(
+            &[
+                VenuePositionSnapshot {
+                    market_id: MarketId::from("market-1"),
+                    condition_id: None,
+                    instrument_id: InstrumentId::from("yes"),
+                    quantity: 3.0,
+                    average_cost_usd: 0.20,
+                    mark_price: Some(0.20),
+                    observed_at_ms: 0,
+                },
+                VenuePositionSnapshot {
+                    market_id: MarketId::from("market-1"),
+                    condition_id: None,
+                    instrument_id: InstrumentId::from("no"),
+                    quantity: 3.0,
+                    average_cost_usd: 0.70,
+                    mark_price: Some(0.70),
+                    observed_at_ms: 0,
+                },
+            ],
+            0,
+        )
+        .expect("condition-less reconcile");
 
     let started = runtime.start(1);
     assert!(

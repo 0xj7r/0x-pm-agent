@@ -2681,31 +2681,27 @@ impl<S: Strategy> Runtime<S> {
     fn push_merge_command_or_defer(
         &mut self,
         outcome: &mut RuntimeOutcome,
-        mut intent: crate::types::MergeIntent,
+        intent: crate::types::MergeIntent,
         now_ms: EpochMillis,
     ) {
-        if intent.condition_id.is_none() {
-            intent.condition_id = self
-                .condition_id_by_market
-                .get(&intent.market_id)
-                .cloned();
-        }
-        if self.order_store.is_some() && intent.condition_id.is_none() {
-            outcome.push_event(
-                self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Execution,
-                        now_ms,
-                        "merge deferred: missing condition_id; waiting for venue position reconciliation",
-                    )
-                    .with_market(intent.market_id.clone())
-                    .with_instrument(intent.yes_instrument_id.clone())
-                    .with_client_order(intent.command_id.clone()),
-                ),
-            );
-            return;
-        }
-        outcome.push_command(RuntimeCommand::Merge(intent));
+        let market_id = intent.market_id.clone();
+        let reason = format!(
+            "strategy merge normalized command_id={} requested_qty={:.8} reason={}",
+            intent.command_id, intent.quantity, intent.reason
+        );
+        outcome.push_event(
+            self.event_log.push(
+                EventRecord::new(
+                    EventCategory::Execution,
+                    now_ms,
+                    "strategy merge intent routed through runtime merge planner",
+                )
+                .with_market(market_id.clone())
+                .with_instrument(intent.yes_instrument_id.clone())
+                .with_client_order(intent.command_id.clone()),
+            ),
+        );
+        outcome.extend(self.plan_merge_command_for_market(&market_id, now_ms, reason));
     }
 
     fn accept_strategy_decision(
