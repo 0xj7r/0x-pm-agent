@@ -99,9 +99,9 @@ pub struct ConvexTailConfig {
     pub start_frac: f64,
     pub clip_usd: f64,
     pub max_load_usd: f64,
-    /// Target fraction of filled late-favorite cost to protect if the favorite
-    /// reverses. The actual tail spend is payoff-aware, so cheaper tails buy
-    /// more protection for the same favorite-upside erosion budget.
+    /// Maximum hedge spend as a fraction of filled late-favorite cost. Cheaper
+    /// tails naturally buy more shares for the same spend, but the budget is
+    /// set from exposure so the hedge remains material in choppy tape.
     pub max_favorite_exposure_fraction: f64,
     /// Hard upper bound as a fraction of the late-favorite win-upside. If the
     /// favorite wins, cheap-tail loses; this cap prevents the hedge from
@@ -146,8 +146,8 @@ pub struct ReversalHedgeConfig {
     pub start_frac: f64,
     pub clip_usd: f64,
     pub max_load_usd: f64,
-    /// Target fraction of filled late-favorite cost to protect when reversal
-    /// risk is present. Multiplied by the live reversal score.
+    /// Maximum hedge spend as a fraction of filled late-favorite cost when
+    /// reversal risk is present. Multiplied by the live reversal score.
     pub max_favorite_exposure_fraction: f64,
     /// Shared edge-erosion cap against the favorite's win-upside. Existing
     /// cheap-tail/reversal-hedge fills and open orders count against it.
@@ -772,18 +772,11 @@ fn cheap_tail_cap_usd(
     }
     let favorite_notional = late_fav_qty * favorite_ask;
     let favorite_win_upside = late_fav_qty * (1.0 - favorite_ask);
-    let tail_payoff_multiple = (1.0 / cheap_ask) - 1.0;
-    if tail_payoff_multiple <= 0.0 {
-        return 0.0;
-    }
     let coverage_fraction = cheap_tail_coverage_fraction(cfg, regime);
-    let spend_for_reversal_coverage =
-        (favorite_notional * coverage_fraction) / tail_payoff_multiple;
+    let exposure_budget = favorite_notional * coverage_fraction;
     let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
 
-    cfg.max_load_usd
-        .min(spend_for_reversal_coverage)
-        .min(edge_erosion_cap)
+    cfg.max_load_usd.min(exposure_budget).min(edge_erosion_cap)
 }
 
 fn reversal_hedge_cap_usd(
@@ -804,20 +797,13 @@ fn reversal_hedge_cap_usd(
     }
     let favorite_notional = late_fav_qty * favorite_ask;
     let favorite_win_upside = late_fav_qty * (1.0 - favorite_ask);
-    let hedge_payoff_multiple = (1.0 / hedge_ask) - 1.0;
-    if hedge_payoff_multiple <= 0.0 {
-        return 0.0;
-    }
     let coverage_fraction = (cfg.max_favorite_exposure_fraction.max(0.0)
         * reversal_score.clamp(0.0, 1.0))
     .clamp(0.0, 1.0);
-    let spend_for_reversal_coverage =
-        (favorite_notional * coverage_fraction) / hedge_payoff_multiple;
+    let exposure_budget = favorite_notional * coverage_fraction;
     let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
 
-    cfg.max_load_usd
-        .min(spend_for_reversal_coverage)
-        .min(edge_erosion_cap)
+    cfg.max_load_usd.min(exposure_budget).min(edge_erosion_cap)
 }
 
 fn cheap_tail_coverage_fraction(cfg: &ConvexTailConfig, regime: Option<BtcRegime>) -> f64 {
@@ -1578,15 +1564,15 @@ mod tests {
         };
 
         // 100 shares at 95c costs $95. In whipsaw, coverage target is doubled
-        // from 25% to 50%, so a 5c tail needs $47.50 / 19 = $2.50 of spend.
-        // This is still bounded by the favorite-upside erosion cap.
+        // from 25% to 50%. Spend is now budgeted directly from exposure,
+        // then bounded by the favorite-upside erosion cap.
         assert!(
             (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw)) - 2.5).abs()
                 < 1e-9
         );
 
-        // At 25c, the same coverage is too expensive, so the edge-erosion cap
-        // remains the binding constraint.
+        // At 25c, the same dollar budget buys fewer shares, but the cap is
+        // still governed by exposure budget vs edge erosion, not payoff math.
         assert!(
             (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.25, Some(BtcRegime::Whipsaw)) - 2.5).abs()
                 < 1e-9
