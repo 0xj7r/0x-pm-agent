@@ -27,12 +27,35 @@ build is only a compile check.
 ## Safe deploy sequence
 
 1. Commit intended code to `main` locally.
-2. Get the host onto that exact `main` commit or rsync the source patch as a temporary incident workaround.
-3. Build the binary on the Linux host.
-4. Install to a versioned binary path, for example `~/.local/bin/polymarket-exec-<sha>`.
-5. Point `~/.local/bin/polymarket-exec` at the new versioned binary.
-6. Restart the service only when allowed for the current live market.
-7. Verify `systemctl --user is-active`, `readlink -f`, runtime state, and live logs.
+2. Use the first-class deploy command below. Do not hand-write SSH build wrappers.
+3. Restart the service only when allowed for the current live market.
+4. Verify `systemctl --user is-active`, `readlink -f`, runtime state, and live logs.
+
+## First-class Bonereaper tinylive deploy
+
+Run from the repo root after the intended code is committed and pushed to
+`main`:
+
+```bash
+AWS_LIVE_HOST=34.242.101.97 \
+AWS_LIVE_KEY_PATH=~/.ssh/whale_pair_dublin_ed25519.pem \
+AWS_LIVE_REF=origin/main \
+AWS_LIVE_SLEEVE=bonereaper_tinylive \
+AWS_LIVE_SKIP_RESTART=0 \
+ops/deploy/deploy_live_aws_ec2.sh
+```
+
+This command:
+
+- Creates a clean git archive from the requested ref.
+- Builds `polymarket-exec` on the Linux host through the host login shell.
+- Installs a versioned host binary.
+- Updates `/home/ubuntu/.local/bin/polymarket-exec`.
+- Writes `/home/ubuntu/go/polymarket-agent/.deploy_commit`.
+- Restarts `polymarket-exec@bonereaper_tinylive.service`.
+
+If the service should not restart during the current live market, set
+`AWS_LIVE_SKIP_RESTART=1`, then restart manually at the market boundary.
 
 ## Required verification commands
 
