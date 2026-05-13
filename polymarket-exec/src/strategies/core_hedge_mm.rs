@@ -692,6 +692,18 @@ where
                     }
                 }
             } else {
+                let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
+                let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
+                if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
+                    notes.push(format!(
+                        "paired_core balanced bundle suppressed: late_fav active yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; leave reversal hedge to cheap-tail lane",
+                    ));
+                    notes.push(format!(
+                        "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
+                        cfg.ladder_span,
+                    ));
+                    return StrategyDecision::Noop { notes };
+                }
                 if open_yes_qty > 1e-9 || open_no_qty > 1e-9 {
                     notes.push(format!(
                         "paired_core balanced bundle suppressed: awaiting open paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}",

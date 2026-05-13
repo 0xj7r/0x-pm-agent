@@ -84,9 +84,9 @@ late_favorite:
     max_cheap_ask: 0.20
     window_sec: 60
     start_frac: 0.0
-    clip_usd: 1.25
-    max_load_usd: 5.0
-    max_favorite_exposure_fraction: 0.25
-    max_win_edge_spend_fraction: 0.50
+    clip_usd: 2.0
+    max_load_usd: 8.0
+    max_favorite_exposure_fraction: 0.35
+    max_win_edge_spend_fraction: 0.65
     maker_improve_ticks: 0.0
     min_order_usd: 0.5
