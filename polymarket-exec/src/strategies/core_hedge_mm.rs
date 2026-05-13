@@ -634,8 +634,9 @@ where
                 None
             };
 
+            let in_repair_mode = repair_leg.is_some();
             if let Some(leg) = repair_leg {
-                if let Some(note) = chop_note {
+                if let Some(note) = chop_note.as_deref() {
                     return StrategyDecision::Noop {
                         notes: vec![format!(
                             "{note}; paired_core repair suppressed until market is stable"
@@ -735,106 +736,115 @@ where
                 }
                 let residual_abs_imbalance = (projected_yes_qty - projected_no_qty).abs();
                 notes.push(format!(
-                    "paired_core repair mode mate-only leg={leg:?} residual_abs_imbalance={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}; balanced continuation suppressed until core exposure is repaired",
+                    "paired_core repair mode mate-only leg={leg:?} residual_abs_imbalance={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}; balanced continuation allowed if it does not worsen imbalance",
+                ));
+            }
+
+            let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
+            let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
+            if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
+                notes.push(format!(
+                    "paired_core broad ladder remains active with late_fav inventory yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; late_fav/hedge lanes stay non-mergeable",
+                ));
+            }
+            if open_yes_qty > 1e-9 || open_no_qty > 1e-9 {
+                notes.push(format!(
+                    "paired_core balanced bundle sees live paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}; projected exposure guard will prevent worsening imbalance",
+                ));
+            }
+            if in_repair_mode {
+                notes.push(format!(
+                    "paired_core balanced continuation mode projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
                 ));
             } else {
-                let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
-                let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
-                if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
-                    notes.push(format!(
-                        "paired_core broad ladder remains active with late_fav inventory yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; late_fav/hedge lanes stay non-mergeable",
-                    ));
-                }
-                if open_yes_qty > 1e-9 || open_no_qty > 1e-9 {
-                    notes.push(format!(
-                        "paired_core balanced bundle suppressed: awaiting open paired-core orders open_yes={open_yes_qty:.4} open_no={open_no_qty:.4}",
-                    ));
-                    notes.push(format!(
-                        "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
-                        cfg.ladder_span,
-                    ));
-                    return StrategyDecision::Noop { notes };
-                }
                 notes.push(format!(
                     "paired_core balanced bundle mode projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
                 ));
-                for idx in 0..levels {
-                    if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
-                        notes.push(format!(
-                            "paired_core opening presence only: suppressing non-center bundle idx={idx} elapsed_ms={elapsed_ms}",
-                        ));
-                        continue;
-                    }
-                    let Some(yes_intent) = ladder_candidate(
-                        &input.market,
-                        LadderLeg::Yes,
-                        yes_bid,
-                        yes_ask,
-                        levels,
-                        half_span,
-                        cfg.center_price,
-                        idx,
-                        cfg.ladder_min_price,
-                        cfg.ladder_max_price,
-                        cfg.clip_shares,
-                        cfg.min_order_usd,
-                        input.now_ms,
-                    ) else {
-                        continue;
-                    };
-                    let Some(no_intent) = ladder_candidate(
-                        &input.market,
-                        LadderLeg::No,
-                        no_bid,
-                        no_ask,
-                        levels,
-                        half_span,
-                        cfg.center_price,
-                        idx,
-                        cfg.ladder_min_price,
-                        cfg.ladder_max_price,
-                        cfg.clip_shares,
-                        cfg.min_order_usd,
-                        input.now_ms,
-                    ) else {
-                        continue;
-                    };
-                    if yes_intent.limit_price + no_intent.limit_price > 1.0 + 1e-9 {
-                        notes.push(format!(
-                            "paired_core bundle level blocked idx={idx} pair_cost={:.4}",
-                            yes_intent.limit_price + no_intent.limit_price,
-                        ));
-                        continue;
-                    }
-                    let next_yes = projected_yes_qty + yes_intent.quantity;
-                    let next_no = projected_no_qty + no_intent.quantity;
-                    if (next_yes - next_no).abs() > max_unpaired_core_qty + 1e-9 {
-                        notes.push(format!(
-                            "paired_core bundle level blocked idx={idx} next_yes={next_yes:.4} next_no={next_no:.4} max_unpaired={max_unpaired_core_qty:.4}",
-                        ));
-                        continue;
-                    }
-                    let tag = format!("ladder:{idx}");
-                    let yes_changed = self.should_emit(
-                        &market_id,
-                        LadderLeg::Yes,
-                        &tag,
-                        yes_intent.limit_price,
-                        yes_intent.quantity,
-                    );
-                    let no_changed = self.should_emit(
-                        &market_id,
-                        LadderLeg::No,
-                        &tag,
-                        no_intent.limit_price,
-                        no_intent.quantity,
-                    );
-                    if yes_changed || no_changed {
-                        projected_yes_qty = next_yes;
-                        projected_no_qty = next_no;
-                        intents.push(yes_intent);
-                        intents.push(no_intent);
-                    }
+            }
+            for idx in 0..levels {
+                if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
+                    notes.push(format!(
+                        "paired_core opening presence only: suppressing non-center bundle idx={idx} elapsed_ms={elapsed_ms}",
+                    ));
+                    continue;
+                }
+                let Some(yes_intent) = ladder_candidate(
+                    &input.market,
+                    LadderLeg::Yes,
+                    yes_bid,
+                    yes_ask,
+                    levels,
+                    half_span,
+                    cfg.center_price,
+                    idx,
+                    cfg.ladder_min_price,
+                    cfg.ladder_max_price,
+                    cfg.clip_shares,
+                    cfg.min_order_usd,
+                    input.now_ms,
+                ) else {
+                    continue;
+                };
+                let Some(no_intent) = ladder_candidate(
+                    &input.market,
+                    LadderLeg::No,
+                    no_bid,
+                    no_ask,
+                    levels,
+                    half_span,
+                    cfg.center_price,
+                    idx,
+                    cfg.ladder_min_price,
+                    cfg.ladder_max_price,
+                    cfg.clip_shares,
+                    cfg.min_order_usd,
+                    input.now_ms,
+                ) else {
+                    continue;
+                };
+                if yes_intent.limit_price + no_intent.limit_price > 1.0 + 1e-9 {
+                    notes.push(format!(
+                        "paired_core bundle level blocked idx={idx} pair_cost={:.4}",
+                        yes_intent.limit_price + no_intent.limit_price,
+                    ));
+                    continue;
+                }
+                let current_abs_imbalance = (projected_yes_qty - projected_no_qty).abs();
+                let next_yes = projected_yes_qty + yes_intent.quantity;
+                let next_no = projected_no_qty + no_intent.quantity;
+                let next_abs_imbalance = (next_yes - next_no).abs();
+                if next_abs_imbalance > max_unpaired_core_qty + 1e-9 {
+                    notes.push(format!(
+                        "paired_core bundle level blocked idx={idx} next_yes={next_yes:.4} next_no={next_no:.4} max_unpaired={max_unpaired_core_qty:.4}",
+                    ));
+                    continue;
+                }
+                if in_repair_mode && next_abs_imbalance > current_abs_imbalance + 1e-9 {
+                    notes.push(format!(
+                        "paired_core repair-continuation bundle blocked idx={idx} current_abs_imbalance={current_abs_imbalance:.4} next_abs_imbalance={next_abs_imbalance:.4}",
+                    ));
+                    continue;
+                }
+                let tag = format!("ladder:{idx}");
+                let yes_changed = self.should_emit(
+                    &market_id,
+                    LadderLeg::Yes,
+                    &tag,
+                    yes_intent.limit_price,
+                    yes_intent.quantity,
+                );
+                let no_changed = self.should_emit(
+                    &market_id,
+                    LadderLeg::No,
+                    &tag,
+                    no_intent.limit_price,
+                    no_intent.quantity,
+                );
+                if yes_changed || no_changed {
+                    projected_yes_qty = next_yes;
+                    projected_no_qty = next_no;
+                    intents.push(yes_intent);
+                    intents.push(no_intent);
                 }
             }
             notes.push(format!(

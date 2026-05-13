@@ -173,6 +173,11 @@ pub trait OrderStore {
         fill_qty: f64,
         updated_at_ms: EpochMillis,
     ) -> std::result::Result<(), OrderStoreError>;
+    fn expire_remaining_after_partial_fill(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        updated_at_ms: EpochMillis,
+    ) -> std::result::Result<(), OrderStoreError>;
     fn get(
         &self,
         client_order_id: &ClientOrderId,
@@ -741,6 +746,56 @@ impl OrderStore for SqliteOrderStore {
                 ],
             )
             .map_err(|error| OrderStoreError::Sqlite(format!("failed to apply fill: {error}")))?;
+
+        if updated == 0 {
+            return Err(OrderStoreError::NotFound(client_order_id.clone()));
+        }
+
+        Ok(())
+    }
+
+    fn expire_remaining_after_partial_fill(
+        &mut self,
+        client_order_id: &ClientOrderId,
+        updated_at_ms: EpochMillis,
+    ) -> std::result::Result<(), OrderStoreError> {
+        let record = self
+            .get(client_order_id)?
+            .ok_or_else(|| OrderStoreError::NotFound(client_order_id.clone()))?;
+        if record.filled_qty <= 0.0 {
+            return Err(OrderStoreError::Conflict(format!(
+                "cannot expire unfilled order {} as partial fill",
+                client_order_id
+            )));
+        }
+        if record.status.is_terminal() {
+            return Ok(());
+        }
+        if !record.status.can_transition_to(ManagedOrderStatus::Filled) {
+            return Err(OrderStoreError::Conflict(format!(
+                "invalid partial-fill expiry transition for {}: {:?} -> Filled",
+                client_order_id, record.status
+            )));
+        }
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE orders
+                 SET remaining_qty = 0.0,
+                     status = ?1,
+                     last_update_ms = ?2
+                 WHERE client_order_id = ?3",
+                params![
+                    Self::status_to_db(ManagedOrderStatus::Filled),
+                    updated_at_ms,
+                    client_order_id.as_str()
+                ],
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to expire partial-fill remainder: {error}"
+                ))
+            })?;
 
         if updated == 0 {
             return Err(OrderStoreError::NotFound(client_order_id.clone()));
