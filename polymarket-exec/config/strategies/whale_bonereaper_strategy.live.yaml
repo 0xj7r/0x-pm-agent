@@ -23,8 +23,8 @@ quote:
 inventory:
   max_open_orders_total: 80
   max_open_orders_per_market: 14
-  max_order_notional_usd: 12.0
-  max_net_notional_per_market_usd: 70.0
+  max_order_notional_usd: 18.0
+  max_net_notional_per_market_usd: 90.0
 
 health:
   market_ws_stale_ms: 15000
@@ -41,7 +41,7 @@ paired_core:
   # Broad mergeable maker ladder. This is intentionally not a strict
   # pre-paired package: fills become mergeable inventory and can later recycle
   # with any opposite-side mergeable fill if realised pair cost is positive.
-  ladder_levels: 7
+  ladder_levels: 9
   ladder_span: 0.44
   center_price: 0.50
   clip_shares: 0.8
@@ -60,8 +60,8 @@ late_favorite:
     window_sec: 300
     start_frac: 0.10
     min_elapsed_sec: 75
-    clip_usd: 10.0
-    max_load_usd: 55.0
+    clip_usd: 15.0
+    max_load_usd: 85.0
     maker_improve_ticks: 0.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
