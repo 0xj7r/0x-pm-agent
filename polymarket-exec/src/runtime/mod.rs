@@ -2678,6 +2678,36 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    fn push_merge_command_or_defer(
+        &mut self,
+        outcome: &mut RuntimeOutcome,
+        mut intent: crate::types::MergeIntent,
+        now_ms: EpochMillis,
+    ) {
+        if intent.condition_id.is_none() {
+            intent.condition_id = self
+                .condition_id_by_market
+                .get(&intent.market_id)
+                .cloned();
+        }
+        if self.order_store.is_some() && intent.condition_id.is_none() {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        "merge deferred: missing condition_id; waiting for venue position reconciliation",
+                    )
+                    .with_market(intent.market_id.clone())
+                    .with_instrument(intent.yes_instrument_id.clone())
+                    .with_client_order(intent.command_id.clone()),
+                ),
+            );
+            return;
+        }
+        outcome.push_command(RuntimeCommand::Merge(intent));
+    }
+
     fn accept_strategy_decision(
         &mut self,
         decision: StrategyDecision,
@@ -2756,7 +2786,7 @@ impl<S: Strategy> Runtime<S> {
                             outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
                         }
                         RuntimeCommand::Merge(intent) => {
-                            outcome.push_command(RuntimeCommand::Merge(intent));
+                            self.push_merge_command_or_defer(&mut outcome, intent, now_ms);
                         }
                         RuntimeCommand::Redeem(intent) => {
                             outcome.push_command(RuntimeCommand::Redeem(intent));
@@ -2797,7 +2827,7 @@ impl<S: Strategy> Runtime<S> {
                             outcome.extend(self.request_cancel(&client_order_id, reason, now_ms));
                         }
                         RuntimeCommand::Merge(intent) => {
-                            outcome.push_command(RuntimeCommand::Merge(intent));
+                            self.push_merge_command_or_defer(&mut outcome, intent, now_ms);
                         }
                         RuntimeCommand::Redeem(intent) => {
                             outcome.push_command(RuntimeCommand::Redeem(intent));
