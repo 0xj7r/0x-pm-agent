@@ -816,12 +816,18 @@ where
                             * regime_multiplier)
                             .max(climb_cfg.min_order_usd);
                         let mut load_left = remaining_load;
-                        let level_count = favorite_load_levels(legs.favorite_ask, remaining_ms);
                         let use_aggressive_taker = should_use_aggressive_favorite_taker(
                             &climb_cfg,
                             legs.favorite_ask,
                             remaining_ms,
                         );
+                        let level_count = if use_aggressive_taker {
+                            favorite_load_levels(legs.favorite_ask, remaining_ms)
+                        } else if legs.favorite_ask < climb_cfg.taker_min_favorite_ask {
+                            favorite_load_levels(legs.favorite_ask, remaining_ms).max(3)
+                        } else {
+                            favorite_load_levels(legs.favorite_ask, remaining_ms)
+                        };
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
