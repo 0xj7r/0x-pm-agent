@@ -60,14 +60,20 @@ late_favorite:
     clip_usd: 7.0
     max_load_usd: 35.0
     maker_improve_ticks: 0.0
-    min_order_usd: 1.0
+    # Keep accepted late-favorite signals economically meaningful. Smaller
+    # computed clips were collapsing to venue-min 5-share dribbles, which
+    # under-expresses the Bonereaper lane while still taking reversal risk.
+    min_order_usd: 4.0
     spot_filter_bps: 10.0
     require_spot_match: true
-    regime_whipsaw_multiplier: 0.25
-    regime_flat_multiplier: 0.50
-    regime_trending_volatile_multiplier: 0.60
-    regime_unknown_multiplier: 0.70
-    reversal_multiplier: 0.50
+    # These remain defensive, but not so punitive that valid favourite signals
+    # only place nominal size. Reversal protection is handled by cheap-tail /
+    # future reversal-hedge accounting, not by suppressing the main lane to zero.
+    regime_whipsaw_multiplier: 0.45
+    regime_flat_multiplier: 0.75
+    regime_trending_volatile_multiplier: 0.75
+    regime_unknown_multiplier: 0.80
+    reversal_multiplier: 0.70
     taker_min_favorite_ask: 0.90
     taker_window_sec: 120
   convex_tail:
