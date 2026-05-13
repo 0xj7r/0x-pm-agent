@@ -12,6 +12,7 @@ REMOTE_WORKDIR="${AWS_LIVE_WORKDIR:-/home/$REMOTE_USER/go/polymarket-agent}"
 REMOTE_CARGO_TARGET_DIR="${AWS_LIVE_CARGO_TARGET_DIR:-/home/$REMOTE_USER/.cache/polymarket-agent-cargo-target}"
 AWS_REGION="${AWS_REGION:-eu-west-1}"
 DEPLOY_REF="${AWS_LIVE_REF:-origin/main}"
+LIVE_SLEEVE="${AWS_LIVE_SLEEVE:-}"
 SKIP_FETCH="${AWS_LIVE_SKIP_FETCH:-0}"
 SKIP_BUILD="${AWS_LIVE_SKIP_BUILD:-0}"
 SKIP_RESTART="${AWS_LIVE_SKIP_RESTART:-1}"
@@ -60,6 +61,8 @@ git rev-parse --verify "$DEPLOY_REF^{commit}" >/dev/null ||
   fail "deploy ref does not resolve to a commit: $DEPLOY_REF"
 DEPLOY_COMMIT="$(git rev-parse "$DEPLOY_REF^{commit}")"
 DEPLOY_SHORT="${DEPLOY_COMMIT:0:7}"
+REMOTE_BINARY_NAME="${AWS_LIVE_BINARY_NAME:-polymarket-exec-${LIVE_SLEEVE:-live}-${DEPLOY_SHORT}}"
+REMOTE_SERVICE_UNIT="${AWS_LIVE_SERVICE_UNIT:-polymarket-exec@${LIVE_SLEEVE}.service}"
 ARCHIVE_PATH="$(mktemp "/tmp/polymarket-agent-${DEPLOY_SHORT}.XXXXXX.tar")"
 trap 'rm -f "$ARCHIVE_PATH"' EXIT
 
@@ -124,11 +127,13 @@ else
   ssh_base "
     set -euo pipefail
     cd '$REMOTE_RELEASE_DIR'
-    CARGO_BIN=\$(command -v cargo || printf '%s/.cargo/bin/cargo' \"\$HOME\")
-    CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR' \"\$CARGO_BIN\" build --release -p polymarket-exec --bin polymarket-exec
-    install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
-    ln -sfn \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\" \"\$HOME/.local/bin/polymarket-exec\"
-    test -x \"\$HOME/.local/bin/polymarket-exec-${DEPLOY_SHORT}\"
+    export CARGO_TARGET_DIR='$REMOTE_CARGO_TARGET_DIR'
+    bash -lc 'cargo build --release -p polymarket-exec --bin polymarket-exec'
+    install -m 0755 '$REMOTE_CARGO_TARGET_DIR/release/polymarket-exec' \"\$HOME/.local/bin/$REMOTE_BINARY_NAME\"
+    ln -sfn \"\$HOME/.local/bin/$REMOTE_BINARY_NAME\" \"\$HOME/.local/bin/polymarket-exec\"
+    printf '%s' '$DEPLOY_COMMIT' > '$REMOTE_WORKDIR/.deploy_commit'
+    date -u +%FT%TZ > '$REMOTE_WORKDIR/.last_binary_restart_utc'
+    test -x \"\$HOME/.local/bin/$REMOTE_BINARY_NAME\"
   "
 fi
 
@@ -146,9 +151,12 @@ if [[ "$SKIP_RESTART" == "1" ]]; then
 elif [[ -n "$RESTART_CMD" ]]; then
   log "running custom restart command"
   ssh_base "$RESTART_CMD"
+elif [[ -n "$LIVE_SLEEVE" ]]; then
+  log "restarting service unit: $REMOTE_SERVICE_UNIT"
+  ssh_base "systemctl --user restart '$REMOTE_SERVICE_UNIT'"
 elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
-  log "running poly-safe-restart for ${AWS_LIVE_SLEEVE:-btc_5m_paired_mm_tinylive}"
-  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh ${AWS_LIVE_SLEEVE:-btc_5m_paired_mm_tinylive}"
+  log "running poly-safe-restart for btc_5m_paired_mm_tinylive"
+  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh btc_5m_paired_mm_tinylive"
 else
   log "poly-safe-restart.sh not found on remote; skipping (manual restart required)"
 fi
