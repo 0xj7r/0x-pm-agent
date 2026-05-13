@@ -714,6 +714,7 @@ impl OrderStore for SqliteOrderStore {
             (record.status, status),
             (ManagedOrderStatus::Cancelled, ManagedOrderStatus::Filled)
                 | (ManagedOrderStatus::Rejected, ManagedOrderStatus::Filled)
+                | (ManagedOrderStatus::Quarantined, ManagedOrderStatus::Filled)
         );
         if !terminal_fill_correction && !record.status.can_transition_to(status) {
             return Err(OrderStoreError::Conflict(format!(
@@ -1186,6 +1187,50 @@ mod tests {
         assert_eq!(row.status, ManagedOrderStatus::Filled);
         assert_eq!(row.remaining_qty, 0.0);
         assert_eq!(row.filled_qty, 6.5);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_fill_corrects_terminal_quarantine_to_filled() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "polymarket-exec-order-store-quarantine-fill-{ts}.sqlite"
+        ));
+        let mut store = SqliteOrderStore::open(path)?;
+        let now: EpochMillis = 1;
+        let client_order_id = ClientOrderId::from("coid-quarantine-fill");
+
+        store.insert(crate::runtime::order_store::OrderRecord::from_intent(
+            "run-1",
+            &OrderIntent {
+                client_order_id: client_order_id.clone(),
+                market_id: MarketId::from("mkt-1"),
+                instrument_id: InstrumentId::from("inst-1"),
+                side: TradeSide::Buy,
+                limit_price: 0.44,
+                quantity: 5.0,
+                reduce_only: false,
+                reason: "test".to_string(),
+                quote_level_tag: Some("paired-core:ladder:0".to_string()),
+                created_at_ms: now,
+                pair_id: None,
+                kind: crate::types::IntentKind::Entry,
+            },
+            "strat",
+        ))?;
+        store.update_status(&client_order_id, ManagedOrderStatus::Working, now + 1)?;
+        store.update_status(&client_order_id, ManagedOrderStatus::Quarantined, now + 2)?;
+
+        store.apply_fill(&client_order_id, 5.0, now + 3)?;
+
+        let row = store.get(&client_order_id)?.expect("row");
+        assert_eq!(row.accounting_lane, AccountingLane::PairedCore);
+        assert_eq!(row.status, ManagedOrderStatus::Filled);
+        assert_eq!(row.remaining_qty, 0.0);
+        assert_eq!(row.filled_qty, 5.0);
         Ok(())
     }
 
