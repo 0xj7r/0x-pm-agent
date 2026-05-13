@@ -23,7 +23,7 @@ quote:
 inventory:
   max_open_orders_total: 80
   max_open_orders_per_market: 14
-  max_order_notional_usd: 7.0
+  max_order_notional_usd: 12.0
   max_net_notional_per_market_usd: 70.0
 
 health:
