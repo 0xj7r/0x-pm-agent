@@ -737,6 +737,11 @@ where
                 notes.push(format!(
                     "paired_core balanced continuation with residual repair leg={leg:?} residual_abs_imbalance={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}",
                 ));
+                if residual_abs_imbalance >= max_unpaired_core_qty - 1e-9 {
+                    notes.push(format!(
+                        "paired_core residual-balanced continuation blocked while residual is at cap residual_abs={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}; mate repair only",
+                    ));
+                } else {
                 for idx in 0..levels {
                     if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
                         notes.push(format!(
@@ -831,6 +836,7 @@ where
                         intents.push(yes_intent);
                         intents.push(no_intent);
                     }
+                }
                 }
             } else {
                 let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
