@@ -24,7 +24,11 @@ inventory:
   max_open_orders_total: 80
   max_open_orders_per_market: 14
   max_order_notional_usd: 12.0
+  max_gross_notional_usd: 250.0
   max_net_notional_per_market_usd: 70.0
+  max_position_quantity_per_instrument: 250.0
+  min_free_cash_usd: 350.0
+  min_free_cash_bps: 4000.0
 
 health:
   market_ws_stale_ms: 15000
