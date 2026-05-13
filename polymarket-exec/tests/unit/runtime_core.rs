@@ -193,6 +193,34 @@ impl Strategy for MergeCommandStrategy {
     }
 }
 
+struct MissingConditionMergeCommandStrategy;
+
+impl Strategy for MissingConditionMergeCommandStrategy {
+    fn name(&self) -> &str {
+        "missing-condition-merge-command-test"
+    }
+
+    fn on_start(&mut self, _context: &StrategyContext) -> StrategyDecision {
+        StrategyDecision::commands(
+            vec![RuntimeCommand::Merge(MergeIntent {
+                command_id: ClientOrderId::from("merge-missing-condition"),
+                market_id: MarketId::from("market-1"),
+                condition_id: None,
+                yes_instrument_id: InstrumentId::from("yes"),
+                no_instrument_id: InstrumentId::from("no"),
+                quantity: 3.0,
+                expected_cash_usd: 3.0,
+                expected_cost_usd: 2.85,
+                expected_fee_usd: 0.0,
+                expected_gas_usd: 0.0,
+                reason: "test missing condition merge command".to_string(),
+                created_at_ms: 1,
+            })],
+            vec!["missing condition merge command emitted".to_string()],
+        )
+    }
+}
+
 #[test]
 fn runtime_reserves_then_applies_fill() {
     let mut runtime = Runtime::new(
@@ -285,6 +313,46 @@ fn strategy_commands_emit_merge_without_quote_reconciliation() {
         }
         other => panic!("expected merge command, got {other:?}"),
     }
+}
+
+#[test]
+fn live_strategy_merge_command_defers_without_condition_id() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir()
+        .join(format!("polymarket-exec-strategy-merge-condition-id-{ts}.sqlite"));
+    let store = SqliteOrderStore::open(&path).unwrap();
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Starting,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        MissingConditionMergeCommandStrategy,
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+
+    let started = runtime.start(1);
+    assert!(
+        started.commands.is_empty(),
+        "live strategy-emitted merge must wait until runtime has condition id"
+    );
+    assert!(
+        runtime
+            .event_log()
+            .recent(20)
+            .iter()
+            .any(|event| event.message.contains("missing condition_id")),
+        "missing condition id should be observable"
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
