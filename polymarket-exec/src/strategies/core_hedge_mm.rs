@@ -23,7 +23,7 @@ use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::BtcRegime;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{MergeIntent, MarketId, StrategyDecision};
+use crate::types::{MarketId, MergeIntent, StrategyDecision};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
@@ -148,7 +148,14 @@ impl CoreHedgeMmStrategy {
     /// Returns true (and records) if this leg+tag should re-emit at the
     /// given price/qty. Returns false if the prior emission was identical
     /// within tolerance — caller should skip the intent.
-    fn should_emit(&mut self, market_id: &MarketId, leg: LadderLeg, tag: &str, price: f64, qty: f64) -> bool {
+    fn should_emit(
+        &mut self,
+        market_id: &MarketId,
+        leg: LadderLeg,
+        tag: &str,
+        price: f64,
+        qty: f64,
+    ) -> bool {
         let key = (market_id.clone(), leg, tag.to_string());
         let changed = match self.last_emit.get(&key) {
             Some(&(prev_px, prev_qty)) => {
@@ -184,9 +191,23 @@ fn classify_legs(
 
     let (expensive_leg, cheap_leg, expensive_ask, cheap_ask, expensive_bid, cheap_bid) =
         if yes_ask >= no_ask {
-            (LadderLeg::Yes, LadderLeg::No, yes_ask, no_ask, yes_bid, no_bid)
+            (
+                LadderLeg::Yes,
+                LadderLeg::No,
+                yes_ask,
+                no_ask,
+                yes_bid,
+                no_bid,
+            )
         } else {
-            (LadderLeg::No, LadderLeg::Yes, no_ask, yes_ask, no_bid, yes_bid)
+            (
+                LadderLeg::No,
+                LadderLeg::Yes,
+                no_ask,
+                yes_ask,
+                no_bid,
+                yes_bid,
+            )
         };
 
     if cheap_ask > config.cheap_leg_max_price {
@@ -296,10 +317,7 @@ fn paired_core_leg_allowed(leg: LadderLeg, yes_qty: f64, no_qty: f64, tolerance:
     }
 }
 
-fn paired_core_projected_qty<M: MarketDescriptor>(
-    input: &StrategyInput<M>,
-    leg: LadderLeg,
-) -> f64 {
+fn paired_core_projected_qty<M: MarketDescriptor>(input: &StrategyInput<M>, leg: LadderLeg) -> f64 {
     match leg {
         LadderLeg::Yes => {
             input.paired_core_inventory.yes_qty + input.open_paired_core_order_exposure.yes_qty
@@ -659,7 +677,13 @@ where
                                 ));
                                 continue;
                             }
-                            if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
+                            if self.should_emit(
+                                &market_id,
+                                leg,
+                                &tag,
+                                intent.limit_price,
+                                intent.quantity,
+                            ) {
                                 projected_yes_qty += intent.quantity;
                                 intents.push(intent);
                             }
@@ -684,7 +708,13 @@ where
                                 ));
                                 continue;
                             }
-                            if self.should_emit(&market_id, leg, &tag, intent.limit_price, intent.quantity) {
+                            if self.should_emit(
+                                &market_id,
+                                leg,
+                                &tag,
+                                intent.limit_price,
+                                intent.quantity,
+                            ) {
                                 projected_no_qty += intent.quantity;
                                 intents.push(intent);
                             }
@@ -696,7 +726,7 @@ where
                 let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
                 if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
                     notes.push(format!(
-                        "paired_core balanced bundle suppressed: late_fav active yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; leave reversal hedge to cheap-tail lane",
+                        "paired_core balanced bundle suppressed: late_fav active yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; leave reversal hedge to directional hedge lanes",
                     ));
                     notes.push(format!(
                         "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
@@ -886,7 +916,13 @@ where
                 cfg_min_order,
                 input.now_ms,
             ) {
-                if self.should_emit(&market_id, geom.expensive_leg, "core", intent.limit_price, intent.quantity) {
+                if self.should_emit(
+                    &market_id,
+                    geom.expensive_leg,
+                    "core",
+                    intent.limit_price,
+                    intent.quantity,
+                ) {
                     intents.push(intent);
                 }
             }
@@ -919,7 +955,13 @@ where
                 cfg_min_order,
                 input.now_ms,
             ) {
-                if self.should_emit(&market_id, geom.cheap_leg, "hedge", intent.limit_price, intent.quantity) {
+                if self.should_emit(
+                    &market_id,
+                    geom.cheap_leg,
+                    "hedge",
+                    intent.limit_price,
+                    intent.quantity,
+                ) {
                     intents.push(intent);
                 }
             }
@@ -953,7 +995,12 @@ mod tests {
     use crate::core::types::BookLevel;
     use crate::types::QuoteSnapshot;
 
-    fn snap_with_quotes(yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64) -> PairedMarketSnapshot {
+    fn snap_with_quotes(
+        yes_bid: f64,
+        yes_ask: f64,
+        no_bid: f64,
+        no_ask: f64,
+    ) -> PairedMarketSnapshot {
         let yes_quote = QuoteSnapshot {
             best_bid: Some(BookLevel::new(yes_bid, 100.0)),
             best_ask: Some(BookLevel::new(yes_ask, 100.0)),
