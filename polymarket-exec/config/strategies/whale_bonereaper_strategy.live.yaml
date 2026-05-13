@@ -90,3 +90,24 @@ late_favorite:
     max_win_edge_spend_fraction: 0.65
     maker_improve_ticks: 0.0
     min_order_usd: 0.5
+  reversal_hedge:
+    enabled: true
+    # Separate from pure cheap-tail insurance. This lane only buys the
+    # opposite leg when filled late-favorite exposure exists and the live
+    # tape shows reversal/whipsaw risk. It shares the same hedge inventory
+    # accounting as cheap-tail so both lanes cannot over-hedge the favorite.
+    min_hedge_ask: 0.20
+    max_hedge_ask: 0.45
+    window_sec: 120
+    start_frac: 0.0
+    clip_usd: 2.0
+    max_load_usd: 8.0
+    max_favorite_exposure_fraction: 0.30
+    max_win_edge_spend_fraction: 0.65
+    maker_improve_ticks: 0.0
+    min_order_usd: 1.0
+    min_reversal_score: 0.45
+    whipsaw_score_bonus: 0.25
+    flat_score_bonus: 0.15
+    trending_volatile_score_bonus: 0.10
+    directional_smooth_score_penalty: 0.20

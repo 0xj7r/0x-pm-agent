@@ -15,6 +15,7 @@ use crate::market_making::paired_mm::{
 use crate::quote_engine::QuoteEngineConfig;
 use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, FavoriteClimbConfig, LateFavoriteStrategyConfig,
+    ReversalHedgeConfig,
 };
 use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
@@ -55,6 +56,7 @@ pub struct StrategyProfile {
 pub struct LateFavoriteSection {
     pub favorite_climb: FavoriteClimbSubsection,
     pub convex_tail: ConvexTailSubsection,
+    pub reversal_hedge: ReversalHedgeSubsection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -96,6 +98,28 @@ pub struct ConvexTailSubsection {
     pub max_win_edge_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
+    pub disable_after_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReversalHedgeSubsection {
+    pub enabled: Option<bool>,
+    pub min_hedge_ask: Option<f64>,
+    pub max_hedge_ask: Option<f64>,
+    pub window_sec: Option<u64>,
+    pub start_frac: Option<f64>,
+    pub clip_usd: Option<f64>,
+    pub max_load_usd: Option<f64>,
+    pub max_favorite_exposure_fraction: Option<f64>,
+    pub max_win_edge_spend_fraction: Option<f64>,
+    pub maker_improve_ticks: Option<f64>,
+    pub min_order_usd: Option<f64>,
+    pub min_reversal_score: Option<f64>,
+    pub whipsaw_score_bonus: Option<f64>,
+    pub flat_score_bonus: Option<f64>,
+    pub trending_volatile_score_bonus: Option<f64>,
+    pub directional_smooth_score_penalty: Option<f64>,
     pub disable_after_ms: Option<u64>,
 }
 
@@ -205,8 +229,10 @@ impl StrategyProfile {
     pub fn late_favorite_config(&self) -> LateFavoriteStrategyConfig {
         let climb_def = FavoriteClimbConfig::default();
         let tail_def = ConvexTailConfig::default();
+        let reversal_def = ReversalHedgeConfig::default();
         let c = &self.late_favorite.favorite_climb;
         let t = &self.late_favorite.convex_tail;
+        let r = &self.late_favorite.reversal_hedge;
         LateFavoriteStrategyConfig {
             favorite_climb: FavoriteClimbConfig {
                 enabled: c.enabled.unwrap_or(climb_def.enabled),
@@ -222,9 +248,7 @@ impl StrategyProfile {
                     .unwrap_or(climb_def.maker_improve_ticks),
                 min_order_usd: c.min_order_usd.unwrap_or(climb_def.min_order_usd),
                 spot_filter_bps: c.spot_filter_bps.unwrap_or(climb_def.spot_filter_bps),
-                require_spot_match: c
-                    .require_spot_match
-                    .unwrap_or(climb_def.require_spot_match),
+                require_spot_match: c.require_spot_match.unwrap_or(climb_def.require_spot_match),
                 regime_whipsaw_multiplier: c
                     .regime_whipsaw_multiplier
                     .unwrap_or(climb_def.regime_whipsaw_multiplier),
@@ -264,6 +288,39 @@ impl StrategyProfile {
                     .unwrap_or(tail_def.maker_improve_ticks),
                 min_order_usd: t.min_order_usd.unwrap_or(tail_def.min_order_usd),
                 disable_after_ms: t.disable_after_ms,
+            },
+            reversal_hedge: ReversalHedgeConfig {
+                enabled: r.enabled.unwrap_or(reversal_def.enabled),
+                min_hedge_ask: r.min_hedge_ask.unwrap_or(reversal_def.min_hedge_ask),
+                max_hedge_ask: r.max_hedge_ask.unwrap_or(reversal_def.max_hedge_ask),
+                window_sec: r.window_sec.unwrap_or(reversal_def.window_sec),
+                start_frac: r.start_frac.unwrap_or(reversal_def.start_frac),
+                clip_usd: r.clip_usd.unwrap_or(reversal_def.clip_usd),
+                max_load_usd: r.max_load_usd.unwrap_or(reversal_def.max_load_usd),
+                max_favorite_exposure_fraction: r
+                    .max_favorite_exposure_fraction
+                    .unwrap_or(reversal_def.max_favorite_exposure_fraction),
+                max_win_edge_spend_fraction: r
+                    .max_win_edge_spend_fraction
+                    .unwrap_or(reversal_def.max_win_edge_spend_fraction),
+                maker_improve_ticks: r
+                    .maker_improve_ticks
+                    .unwrap_or(reversal_def.maker_improve_ticks),
+                min_order_usd: r.min_order_usd.unwrap_or(reversal_def.min_order_usd),
+                min_reversal_score: r
+                    .min_reversal_score
+                    .unwrap_or(reversal_def.min_reversal_score),
+                whipsaw_score_bonus: r
+                    .whipsaw_score_bonus
+                    .unwrap_or(reversal_def.whipsaw_score_bonus),
+                flat_score_bonus: r.flat_score_bonus.unwrap_or(reversal_def.flat_score_bonus),
+                trending_volatile_score_bonus: r
+                    .trending_volatile_score_bonus
+                    .unwrap_or(reversal_def.trending_volatile_score_bonus),
+                directional_smooth_score_penalty: r
+                    .directional_smooth_score_penalty
+                    .unwrap_or(reversal_def.directional_smooth_score_penalty),
+                disable_after_ms: r.disable_after_ms,
             },
         }
     }

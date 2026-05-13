@@ -83,11 +83,7 @@ impl MarketLedgerState {
     pub fn allows_fresh_entry(self) -> bool {
         matches!(
             self,
-            Self::Flat
-                | Self::QuotingPaired
-                | Self::Recycling
-                | Self::MergePending
-                | Self::Drifted
+            Self::Flat | Self::QuotingPaired | Self::Recycling | Self::MergePending | Self::Drifted
         )
     }
 
@@ -405,7 +401,7 @@ pub enum MmQuoteKind {
 impl MmQuoteKind {
     pub fn from_quote_level_tag(tag: &str) -> Option<Self> {
         let tag = tag.to_ascii_lowercase();
-        if tag.contains("convex") {
+        if tag.contains("convex") || tag.contains("cheap-tail") || tag.contains("reversal-hedge") {
             Some(Self::ConvexAccumulation)
         } else if tag.contains("capital-recycle") || tag.contains("buy-light") {
             Some(Self::CapitalRecycle)
