@@ -1187,6 +1187,46 @@ impl<S: Strategy> Runtime<S> {
             no_position_avg_price,
         );
 
+        let signature = MergeSignature::from_intent(&intent);
+        if let Some((blocked_at_ms, blocked_reason)) = self
+            .blocked_merge_by_market
+            .get(market_id)
+            .and_then(|blocked| {
+                (blocked.signature == signature)
+                    .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
+            })
+        {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "merge intent suppressed: matching CTF recycle is blocked \
+                             since {blocked_at_ms} reason={blocked_reason}; waiting for \
+                             inventory-changing venue reconciliation before retry"
+                        ),
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+            return outcome;
+        }
+        if self.blocked_merge_by_market.contains_key(market_id) {
+            self.blocked_merge_by_market.remove(market_id);
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        "blocked merge signature changed after inventory reconciliation; \
+                         allowing fresh CTF recycle",
+                    )
+                    .with_market(market_id.clone()),
+                ),
+            );
+        }
+
         let merge_pressure_reason = self.merge_pressure_reason(market_id);
 
         // Batch tiny completed pairs unless recycling pressure is real. This
@@ -1246,47 +1286,20 @@ impl<S: Strategy> Runtime<S> {
             );
         }
 
-        let signature = MergeSignature::from_intent(&intent);
-        if let Some((blocked_at_ms, blocked_reason)) = self
-            .blocked_merge_by_market
-            .get(market_id)
-            .and_then(|blocked| {
-                (blocked.signature == signature)
-                    .then(|| (blocked.blocked_at_ms, blocked.reason.clone()))
-            })
-        {
-            outcome.push_event(
-                self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Execution,
-                        now_ms,
-                        format!(
-                            "merge intent suppressed: matching CTF recycle is blocked \
-                             since {blocked_at_ms} reason={blocked_reason}; waiting for \
-                             inventory-changing venue reconciliation before retry"
-                        ),
-                    )
-                    .with_market(market_id.clone()),
-                ),
-            );
-            return outcome;
-        }
-        if self.blocked_merge_by_market.contains_key(market_id) {
-            self.blocked_merge_by_market.remove(market_id);
-            outcome.push_event(
-                self.event_log.push(
-                    EventRecord::new(
-                        EventCategory::Execution,
-                        now_ms,
-                        "blocked merge signature changed after inventory reconciliation; \
-                         allowing fresh CTF recycle",
-                    )
-                    .with_market(market_id.clone()),
-                ),
-            );
-        }
         let expected_net_gain_usd = intent.expected_net_gain_usd();
         if !expected_net_gain_usd.is_finite() || expected_net_gain_usd < MIN_MERGE_NET_GAIN_USD {
+            let blocked_reason = format!(
+                "insufficient_ev net_gain={expected_net_gain_usd:.4} min_net_gain={MIN_MERGE_NET_GAIN_USD:.4} reason={}",
+                intent.reason
+            );
+            self.blocked_merge_by_market.insert(
+                market_id.clone(),
+                BlockedMerge {
+                    signature,
+                    reason: blocked_reason,
+                    blocked_at_ms: now_ms,
+                },
+            );
             outcome.push_event(
                 self.event_log.push(
                     EventRecord::new(
