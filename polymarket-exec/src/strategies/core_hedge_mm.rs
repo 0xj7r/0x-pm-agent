@@ -40,8 +40,10 @@ pub struct CoreHedgeMmConfig {
     pub bar_capital_usd: f64,
     /// Target cheap-to-expensive notional ratio. Whale sits at ~0.47.
     pub target_hedge_ratio: f64,
-    /// Canonical paired ladder levels per side. When > 1, emit a symmetric
-    /// two-leg ladder instead of the legacy one-core/one-hedge quote.
+    /// Broad mergeable maker-ladder levels per side. When > 1, emit a
+    /// symmetric two-leg ladder. The ladder is mergeable inventory, but it is
+    /// not treated as a strict quote-pair package: fills can be recycled with
+    /// any opposite-side mergeable inventory if realised pair cost is positive.
     pub ladder_levels: usize,
     /// Total price span covered by the paired ladder on each leg.
     pub ladder_span: f64,
@@ -54,8 +56,8 @@ pub struct CoreHedgeMmConfig {
     /// one leg from becoming accidental directional inventory before the
     /// other leg fills.
     pub max_unpaired_core_qty: f64,
-    /// Price band for mergeable paired-core ladder rungs. Rungs outside this
-    /// band belong to explicit directional lanes, not mergeable paired-core.
+    /// Price band for mergeable maker-ladder rungs. Rungs outside this band
+    /// belong to explicit directional lanes, not mergeable paired-core.
     pub ladder_min_price: f64,
     pub ladder_max_price: f64,
     /// Per-clip size by leg.
@@ -583,12 +585,10 @@ where
                 || yes_ask > cfg.ladder_max_price
                 || no_ask > cfg.ladder_max_price
             {
-                return StrategyDecision::Noop {
-                    notes: vec![format!(
-                        "paired_core ladder paused: quotes outside pairable band yes_mid={yes_mid:.4} no_mid={no_mid:.4} yes_ask={yes_ask:.4} no_ask={no_ask:.4} band={:.4}-{:.4}",
-                        cfg.ladder_min_price, cfg.ladder_max_price,
-                    )],
-                };
+                notes.push(format!(
+                    "paired_core broad ladder: book center/ask outside mergeable band but eligible rungs may remain yes_mid={yes_mid:.4} no_mid={no_mid:.4} yes_ask={yes_ask:.4} no_ask={no_ask:.4} band={:.4}-{:.4}",
+                    cfg.ladder_min_price, cfg.ladder_max_price,
+                ));
             }
             let imbalance_tolerance =
                 (cfg.clip_shares.max(input.market.min_order_size()) * 0.25).max(0.5);
@@ -726,13 +726,8 @@ where
                 let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
                 if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
                     notes.push(format!(
-                        "paired_core balanced bundle suppressed: late_fav active yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; leave reversal hedge to directional hedge lanes",
+                        "paired_core broad ladder remains active with late_fav inventory yes={late_fav_yes_qty:.4} no={late_fav_no_qty:.4}; late_fav/hedge lanes stay non-mergeable",
                     ));
-                    notes.push(format!(
-                        "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
-                        cfg.ladder_span,
-                    ));
-                    return StrategyDecision::Noop { notes };
                 }
                 if open_yes_qty > 1e-9 || open_no_qty > 1e-9 {
                     notes.push(format!(
