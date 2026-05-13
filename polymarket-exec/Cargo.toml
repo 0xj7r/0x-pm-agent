@@ -34,7 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 polymarket-client-sdk = { version = "0.4.4", features = ["clob", "data", "heartbeats"] }
-polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "data", "heartbeats", "tracing"] }
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "data", "heartbeats", "tracing"] }
 chrono = "0.4.44"
 aws-config = "1.5"
 aws-sdk-firehose = "1.40"
