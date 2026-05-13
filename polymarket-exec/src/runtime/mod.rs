@@ -115,6 +115,16 @@ impl MergeSignature {
             quantity_units: (intent.quantity * 1_000_000.0).round().max(0.0) as u64,
         }
     }
+
+    fn quantity(&self) -> f64 {
+        self.quantity_units as f64 / 1_000_000.0
+    }
+
+    fn matches_pair(&self, intent: &MergeIntent) -> bool {
+        self.condition_id == intent.condition_id
+            && self.yes_instrument_id == intent.yes_instrument_id
+            && self.no_instrument_id == intent.no_instrument_id
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1125,6 +1135,47 @@ impl<S: Strategy> Runtime<S> {
                 ),
             );
         }
+
+        if let Some(accepted) = self.accepted_merge_by_market.get(market_id).cloned() {
+            if accepted.signature.matches_pair(&intent) {
+                let accepted_quantity = accepted.signature.quantity();
+                if accepted_quantity + ACCOUNTING_QTY_EPSILON >= intent.quantity {
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Execution,
+                                now_ms,
+                                format!(
+                                    "merge intent suppressed: accepted CTF recycle qty={accepted_quantity:.8} covers mergeable qty={:.8}; awaiting venue reconciliation",
+                                    intent.quantity
+                                ),
+                            )
+                            .with_market(market_id.clone()),
+                        ),
+                    );
+                    return outcome;
+                }
+                let original_quantity = intent.quantity;
+                intent.quantity = (intent.quantity - accepted_quantity).max(0.0);
+                intent.expected_cash_usd = intent.quantity;
+                outcome.push_event(
+                    self.event_log.push(
+                        EventRecord::new(
+                            EventCategory::Execution,
+                            now_ms,
+                            format!(
+                                "merge clipped by accepted CTF recycle original_qty={original_quantity:.8} accepted_qty={accepted_quantity:.8} residual_qty={:.8}",
+                                intent.quantity
+                            ),
+                        )
+                        .with_market(market_id.clone()),
+                    ),
+                );
+            } else {
+                self.accepted_merge_by_market.remove(market_id);
+            }
+        }
+
         intent.expected_cash_usd = intent.quantity;
         intent.expected_cost_usd = self.mergeable_paired_cost_basis_usd(
             market_id,
@@ -1229,27 +1280,6 @@ impl<S: Strategy> Runtime<S> {
                 ),
             );
         }
-        if let Some(accepted) = self.accepted_merge_by_market.get(market_id) {
-            if accepted.signature == signature {
-                outcome.push_event(
-                    self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Execution,
-                            now_ms,
-                            format!(
-                                "merge intent suppressed: matching CTF recycle was already \
-                                 accepted at {}; awaiting venue reconciliation",
-                                accepted.accepted_at_ms
-                            ),
-                        )
-                        .with_market(market_id.clone()),
-                    ),
-                );
-                return outcome;
-            }
-            self.accepted_merge_by_market.remove(market_id);
-        }
-
         let expected_net_gain_usd = intent.expected_net_gain_usd();
         if !expected_net_gain_usd.is_finite() || expected_net_gain_usd < MIN_MERGE_NET_GAIN_USD {
             outcome.push_event(
