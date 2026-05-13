@@ -87,10 +87,10 @@ late_favorite:
     max_cheap_ask: 0.20
     window_sec: 60
     start_frac: 0.0
-    clip_usd: 2.0
-    max_load_usd: 8.0
-    max_favorite_exposure_fraction: 0.35
-    max_win_edge_spend_fraction: 0.65
+    clip_usd: 3.0
+    max_load_usd: 14.0
+    max_favorite_exposure_fraction: 0.50
+    max_win_edge_spend_fraction: 0.80
     maker_improve_ticks: 0.0
     min_order_usd: 0.5
   reversal_hedge:
@@ -103,10 +103,10 @@ late_favorite:
     max_hedge_ask: 0.45
     window_sec: 120
     start_frac: 0.0
-    clip_usd: 2.0
-    max_load_usd: 8.0
-    max_favorite_exposure_fraction: 0.30
-    max_win_edge_spend_fraction: 0.65
+    clip_usd: 3.0
+    max_load_usd: 14.0
+    max_favorite_exposure_fraction: 0.45
+    max_win_edge_spend_fraction: 0.80
     maker_improve_ticks: 0.0
     min_order_usd: 1.0
     min_reversal_score: 0.45
