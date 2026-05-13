@@ -14,6 +14,69 @@ use crate::types::{
 const DUST_REMAINING_QTY: f64 = 0.01;
 const DUST_REMAINING_NOTIONAL_USD: f64 = 0.01;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccountingLane {
+    PairedCore,
+    LateFavorite,
+    CheapTail,
+    ReversalHedge,
+    #[default]
+    Other,
+}
+
+impl AccountingLane {
+    pub fn from_quote_level_tag(tag: Option<&str>) -> Self {
+        let Some(tag) = tag else {
+            return Self::Other;
+        };
+        let tag = tag.to_ascii_lowercase();
+        if tag.starts_with("paired-core:")
+            || tag.contains("paired-mm")
+            || tag.contains("mm-paired-bid")
+        {
+            Self::PairedCore
+        } else if tag.contains("reversal-hedge") {
+            Self::ReversalHedge
+        } else if tag.starts_with("cheap-tail") || tag.contains("convex") {
+            Self::CheapTail
+        } else if tag.starts_with("late-fav") {
+            Self::LateFavorite
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PairedCore => "paired_core",
+            Self::LateFavorite => "late_favorite",
+            Self::CheapTail => "cheap_tail",
+            Self::ReversalHedge => "reversal_hedge",
+            Self::Other => "other",
+        }
+    }
+
+    fn from_db(raw: &str) -> std::result::Result<Self, OrderStoreError> {
+        match raw {
+            "paired_core" => Ok(Self::PairedCore),
+            "late_favorite" => Ok(Self::LateFavorite),
+            "cheap_tail" => Ok(Self::CheapTail),
+            "reversal_hedge" => Ok(Self::ReversalHedge),
+            "other" => Ok(Self::Other),
+            value => Err(OrderStoreError::Serialization(format!(
+                "invalid accounting lane `{value}`"
+            ))),
+        }
+    }
+
+    pub fn is_directional(self) -> bool {
+        matches!(
+            self,
+            Self::LateFavorite | Self::CheapTail | Self::ReversalHedge
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderRecord {
     pub run_id: String,
@@ -33,6 +96,7 @@ pub struct OrderRecord {
     pub reason: Option<String>,
     pub strategy_tag: String,
     pub quote_level_tag: Option<String>,
+    pub accounting_lane: AccountingLane,
 }
 
 impl OrderRecord {
@@ -59,6 +123,7 @@ impl OrderRecord {
             reason: Some(intent.reason.clone()),
             strategy_tag: strategy_tag.into(),
             quote_level_tag: intent.quote_level_tag.clone(),
+            accounting_lane: AccountingLane::from_quote_level_tag(intent.quote_level_tag.as_deref()),
         }
     }
 }
@@ -187,12 +252,44 @@ impl SqliteOrderStore {
                     last_update_ms INTEGER NOT NULL,
                     reason TEXT,
                     strategy_tag TEXT NOT NULL,
-                    quote_level_tag TEXT
+                    quote_level_tag TEXT,
+                    accounting_lane TEXT NOT NULL DEFAULT 'other'
                 )",
                 (),
             )
             .map_err(|error| {
                 OrderStoreError::Sqlite(format!("failed to create orders table: {error}"))
+            })?;
+
+        self.add_column_if_missing(
+            "orders",
+            "accounting_lane",
+            "TEXT NOT NULL DEFAULT 'other'",
+        )?;
+
+        self.connection
+            .execute(
+                "UPDATE orders
+                 SET accounting_lane =
+                    CASE
+                        WHEN lower(coalesce(quote_level_tag, '')) LIKE 'paired-core:%'
+                          OR lower(coalesce(quote_level_tag, '')) LIKE '%paired-mm%'
+                          OR lower(coalesce(quote_level_tag, '')) LIKE '%mm-paired-bid%'
+                            THEN 'paired_core'
+                        WHEN lower(coalesce(quote_level_tag, '')) LIKE '%reversal-hedge%'
+                            THEN 'reversal_hedge'
+                        WHEN lower(coalesce(quote_level_tag, '')) LIKE 'cheap-tail%'
+                          OR lower(coalesce(quote_level_tag, '')) LIKE '%convex%'
+                            THEN 'cheap_tail'
+                        WHEN lower(coalesce(quote_level_tag, '')) LIKE 'late-fav%'
+                            THEN 'late_favorite'
+                        ELSE 'other'
+                    END
+                 WHERE accounting_lane = 'other'",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to backfill accounting lane: {error}"))
             })?;
 
         self.connection
@@ -241,6 +338,46 @@ impl SqliteOrderStore {
                 OrderStoreError::Sqlite(format!("failed to create runtime_state table: {error}"))
             })?;
 
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> std::result::Result<(), OrderStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to inspect {table} schema: {error}"))
+            })?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to query {table} schema: {error}"))
+            })?;
+        for existing in columns {
+            if existing
+                .map_err(|error| {
+                    OrderStoreError::Sqlite(format!("failed to decode {table} schema: {error}"))
+                })?
+                == column
+            {
+                return Ok(());
+            }
+        }
+        self.connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to add {table}.{column} column: {error}"
+                ))
+            })?;
         Ok(())
     }
 
@@ -313,6 +450,15 @@ impl SqliteOrderStore {
             .map(|value| OrderId::from(value.as_str()));
         let market_id = MarketId::from(row.get::<_, String>(3)?.as_str());
         let instrument_id = InstrumentId::from(row.get::<_, String>(4)?.as_str());
+        let accounting_lane = row
+            .get::<_, Option<String>>(17)?
+            .as_deref()
+            .map(AccountingLane::from_db)
+            .transpose()
+            .map_err(|error| Self::sqlite_conversion_error(17, Type::Text, error))?
+            .unwrap_or_else(|| {
+                AccountingLane::from_quote_level_tag(row.get::<_, Option<String>>(16).ok().flatten().as_deref())
+            });
         Ok(OrderRecord {
             run_id: row.get(1)?,
             client_order_id,
@@ -331,6 +477,7 @@ impl SqliteOrderStore {
             reason: row.get(14)?,
             strategy_tag: row.get(15)?,
             quote_level_tag: row.get(16)?,
+            accounting_lane,
         })
     }
 
@@ -391,8 +538,9 @@ impl OrderStore for SqliteOrderStore {
                     last_update_ms,
                     reason,
                     strategy_tag,
-                    quote_level_tag
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    quote_level_tag,
+                    accounting_lane
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                 params![
                     record.client_order_id.as_str(),
                     record.run_id,
@@ -411,6 +559,7 @@ impl OrderStore for SqliteOrderStore {
                     record.reason,
                     record.strategy_tag,
                     record.quote_level_tag,
+                    record.accounting_lane.as_str(),
                 ],
             )
             .map_err(|error| {
