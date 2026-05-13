@@ -189,6 +189,17 @@ impl Default for ReversalHedgeConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct FavoriteEntryPolicy {
+    min_price: f64,
+    max_levels: usize,
+    clip_multiplier: f64,
+    cap_multiplier: f64,
+    allow_taker: bool,
+    path_reversal_risk: f64,
+    label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LateFavoriteStrategyConfig {
     pub favorite_climb: FavoriteClimbConfig,
     pub convex_tail: ConvexTailConfig,
@@ -744,6 +755,186 @@ fn favorite_load_levels(favorite_ask: f64, remaining_ms: u64) -> usize {
     }
 }
 
+fn favorite_entry_policy<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    cfg: &FavoriteClimbConfig,
+    elapsed_ms: u64,
+) -> Option<FavoriteEntryPolicy> {
+    let elapsed_sec = elapsed_ms / 1_000;
+    if elapsed_sec < 180 || legs.favorite_ask < 0.70 || legs.favorite_ask > cfg.max_favorite_ask {
+        return None;
+    }
+
+    let threshold = cfg.spot_filter_bps.abs().max(1.0);
+    let side_30 = input
+        .btc_regime
+        .return_30s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_60 = input
+        .btc_regime
+        .return_60s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_120 = input
+        .btc_regime
+        .return_120s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_180 = input
+        .btc_regime
+        .return_180s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let strongest = [side_60, side_120, side_180]
+        .into_iter()
+        .flatten()
+        .fold(0.0_f64, f64::max);
+    let recent = side_30.unwrap_or(strongest);
+    let early_late = elapsed_sec < 230;
+    let whipsaw = matches!(input.btc_regime.regime(), Some(BtcRegime::Whipsaw));
+    let clean_regime = matches!(
+        input.btc_regime.regime(),
+        Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
+    );
+    let model_favorite = favorite_probability(
+        legs.favorite_leg,
+        input.fair_value.p_up,
+        input.fair_value.p_down,
+    );
+    let path_reversal_risk = path_reversal_risk_score(input, legs);
+
+    if recent < -threshold * 0.35 {
+        return None;
+    }
+    if legs.favorite_ask < 0.90 && path_reversal_risk >= 0.50 {
+        return None;
+    }
+    if early_late && path_reversal_risk >= 0.75 {
+        return None;
+    }
+
+    if legs.favorite_ask < 0.80 {
+        if whipsaw
+            || path_reversal_risk >= 0.35
+            || strongest < threshold * 1.25
+            || model_favorite < 0.86
+        {
+            return None;
+        }
+        return Some(FavoriteEntryPolicy {
+            min_price: 0.70,
+            max_levels: 1,
+            clip_multiplier: if early_late { 0.20 } else { 0.35 },
+            cap_multiplier: if early_late { 0.20 } else { 0.35 },
+            allow_taker: false,
+            path_reversal_risk,
+            label: if early_late {
+                "probe_70_79_early"
+            } else {
+                "probe_70_79_late"
+            },
+        });
+    }
+
+    if legs.favorite_ask < 0.90 {
+        if early_late && (!clean_regime || strongest < threshold || model_favorite < 0.82) {
+            return None;
+        }
+        if whipsaw && model_favorite < 0.90 {
+            return None;
+        }
+        let reversal_scale = (1.0 - 0.50 * path_reversal_risk).clamp(0.50, 1.0);
+        return Some(FavoriteEntryPolicy {
+            min_price: 0.80,
+            max_levels: if early_late { 2 } else { 3 },
+            clip_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale,
+            cap_multiplier: (if early_late { 0.40 } else { 0.70 }) * reversal_scale,
+            allow_taker: false,
+            path_reversal_risk,
+            label: if early_late {
+                "maker_ladder_80_89_early"
+            } else {
+                "maker_ladder_80_89_late"
+            },
+        });
+    }
+
+    if early_late && whipsaw {
+        return None;
+    }
+    let reversal_scale = (1.0 - 0.55 * path_reversal_risk).clamp(0.35, 1.0);
+    Some(FavoriteEntryPolicy {
+        min_price: if early_late { 0.90 } else { 0.85 },
+        max_levels: if early_late { 3 } else { 5 },
+        clip_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale,
+        cap_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale,
+        allow_taker: true,
+        path_reversal_risk,
+        label: if early_late {
+            "true_late_fav_90_plus_early"
+        } else {
+            "true_late_fav_90_plus"
+        },
+    })
+}
+
+fn path_reversal_risk_score<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+) -> f64 {
+    let side_30 = input
+        .btc_regime
+        .return_30s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_60 = input
+        .btc_regime
+        .return_60s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_120 = input
+        .btc_regime
+        .return_120s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_180 = input
+        .btc_regime
+        .return_180s_bps
+        .map(|r| signed_for_favorite(legs.favorite_leg, r));
+    let side_strike = spot_vs_strike_bps(
+        &input.market,
+        input.btc_regime.last_price,
+        legs.favorite_leg,
+    );
+    let prior_support = [side_60, side_120, side_180]
+        .into_iter()
+        .flatten()
+        .fold(0.0_f64, f64::max);
+    let recent = side_30.unwrap_or(prior_support);
+    let reversal_component = if prior_support > 0.0 && recent < prior_support * 0.25 {
+        ((prior_support - recent).max(0.0) / prior_support.max(1.0)).clamp(0.0, 0.45)
+    } else {
+        0.0
+    };
+    let strike_component = side_strike
+        .map(|m| {
+            if prior_support >= 8.0 && m < 6.0 {
+                ((6.0 - m) / 18.0).clamp(0.0, 0.25)
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+    let vol_component = input
+        .btc_regime
+        .realized_vol_5m_bps
+        .map(|vol| ((vol - 8.0) / 24.0).clamp(0.0, 0.20))
+        .unwrap_or(0.0);
+    let regime_component = match input.btc_regime.regime() {
+        Some(BtcRegime::Whipsaw) => 0.25,
+        Some(BtcRegime::TrendingVolatile) => 0.12,
+        Some(BtcRegime::Flat) => 0.10,
+        Some(BtcRegime::DirectionalSmooth) | None => 0.0,
+    };
+
+    (reversal_component + strike_component + vol_component + regime_component).clamp(0.0, 1.0)
+}
+
 fn should_use_aggressive_favorite_taker(
     cfg: &FavoriteClimbConfig,
     favorite_ask: f64,
@@ -761,6 +952,7 @@ fn cheap_tail_cap_usd(
     favorite_ask: f64,
     cheap_ask: f64,
     regime: Option<BtcRegime>,
+    path_reversal_risk: f64,
 ) -> f64 {
     if late_fav_qty <= 0.0
         || favorite_ask <= 0.0
@@ -772,7 +964,9 @@ fn cheap_tail_cap_usd(
     }
     let favorite_notional = late_fav_qty * favorite_ask;
     let favorite_win_upside = late_fav_qty * (1.0 - favorite_ask);
-    let coverage_fraction = cheap_tail_coverage_fraction(cfg, regime);
+    let coverage_fraction = (cheap_tail_coverage_fraction(cfg, regime)
+        * (1.0 + path_reversal_risk.clamp(0.0, 1.0)))
+    .clamp(0.0, 1.0);
     let exposure_budget = favorite_notional * coverage_fraction;
     let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
 
@@ -876,8 +1070,13 @@ fn reversal_hedge_score<M: MarketDescriptor>(
         Some(BtcRegime::DirectionalSmooth) => -cfg.directional_smooth_score_penalty,
         None => 0.0,
     };
+    let path_component = path_reversal_risk_score(input, legs) * 0.50;
 
-    (reversal_component + momentum_decay_component + strike_decay_component + regime_component)
+    (reversal_component
+        + momentum_decay_component
+        + strike_decay_component
+        + regime_component
+        + path_component)
         .clamp(0.0, 1.0)
 }
 
@@ -968,12 +1167,35 @@ where
         {
             let (direction_ok, signal_note) = favorite_direction_signal(&input, &legs, &climb_cfg);
 
-            if !direction_ok {
+            let entry_policy = if !direction_ok {
                 notes.push(format!(
                     "late_favorite blocked by favorite signal {signal_note}",
                 ));
-            } else {
+                None
+            } else if let Some(entry_policy) =
+                favorite_entry_policy(&input, &legs, &climb_cfg, elapsed_ms)
+            {
                 notes.push(signal_note);
+                notes.push(format!(
+                    "late_favorite entry_policy={} min_price={:.2} max_levels={} clip_mult={:.2} cap_mult={:.2} path_reversal_risk={:.2}",
+                    entry_policy.label,
+                    entry_policy.min_price,
+                    entry_policy.max_levels,
+                    entry_policy.clip_multiplier,
+                    entry_policy.cap_multiplier,
+                    entry_policy.path_reversal_risk
+                ));
+                Some(entry_policy)
+            } else {
+                notes.push(format!(
+                    "late_favorite blocked by entry tier ask={:.4} elapsed_ms={} regime={:?}",
+                    legs.favorite_ask,
+                    elapsed_ms,
+                    input.btc_regime.regime()
+                ));
+                None
+            };
+            if let Some(entry_policy) = entry_policy {
                 let (favorite_qty, other_qty) = match legs.favorite_leg {
                     LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                     LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
@@ -991,7 +1213,8 @@ where
                     self.reserved_notional(input.market.market_id(), legs.favorite_leg);
                 let current_exposure_usd = filled_late_fav_usd.max(net_directional_exposure_usd)
                     + working_late_fav_usd.max(reserved_late_fav_usd);
-                let adjusted_max_load_usd = climb_cfg.max_load_usd * regime_multiplier;
+                let adjusted_max_load_usd =
+                    climb_cfg.max_load_usd * regime_multiplier * entry_policy.cap_multiplier;
                 let remaining_load = (adjusted_max_load_usd - current_exposure_usd).max(0.0);
                 if remaining_load >= climb_cfg.min_order_usd {
                     if let Some(base_px) = maker_limit_price(
@@ -1009,21 +1232,26 @@ where
                         );
                         let confidence_multiplier =
                             favorite_momentum_clip_multiplier(&input, &legs, &climb_cfg);
-                        let per_level_clip = (raw_clip * confidence_multiplier * regime_multiplier)
+                        let per_level_clip = (raw_clip
+                            * confidence_multiplier
+                            * regime_multiplier
+                            * entry_policy.clip_multiplier)
                             .max(climb_cfg.min_order_usd);
                         let mut load_left = remaining_load;
-                        let use_aggressive_taker = should_use_aggressive_favorite_taker(
-                            &climb_cfg,
-                            legs.favorite_ask,
-                            remaining_ms,
-                        );
-                        let level_count = if use_aggressive_taker {
+                        let use_aggressive_taker = entry_policy.allow_taker
+                            && should_use_aggressive_favorite_taker(
+                                &climb_cfg,
+                                legs.favorite_ask,
+                                remaining_ms,
+                            );
+                        let level_count = (if use_aggressive_taker {
                             favorite_load_levels(legs.favorite_ask, remaining_ms)
                         } else if legs.favorite_ask < climb_cfg.taker_min_favorite_ask {
                             favorite_load_levels(legs.favorite_ask, remaining_ms).max(3)
                         } else {
                             favorite_load_levels(legs.favorite_ask, remaining_ms)
-                        };
+                        })
+                        .min(entry_policy.max_levels);
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -1034,6 +1262,9 @@ where
                             } else {
                                 base_px - tick * level as f64
                             };
+                            if px + 1e-9 < entry_policy.min_price {
+                                continue;
+                            }
                             if px <= 0.0 || px > legs.favorite_ask {
                                 continue;
                             }
@@ -1046,12 +1277,13 @@ where
                                 .max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
                             let reason = format!(
-                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} price_scale={:.2} confidence_multiplier={:.2} regime_multiplier={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
+                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} price_scale={:.2} confidence_multiplier={:.2} regime_multiplier={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
                                 legs.favorite_leg,
                                 level,
                                 if aggressive_taker { "taker_fak" } else { "maker_post_only" },
                                 px,
                                 legs.favorite_ask,
+                                entry_policy.label,
                                 favorite_load_price_scale(legs.favorite_ask, climb_cfg.min_favorite_ask),
                                 confidence_multiplier,
                                 regime_multiplier,
@@ -1111,6 +1343,7 @@ where
                 legs.favorite_ask,
                 legs.cheap_ask,
                 input.btc_regime.regime(),
+                path_reversal_risk_score(&input, &legs),
             );
             let remaining_load = (tail_cap_usd - current_exposure_usd).max(0.0);
             if remaining_load >= tail_cfg.min_order_usd {
@@ -1144,7 +1377,7 @@ where
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "cheap_tail leg={:?} level={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} favorite_exposure={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} remaining_ms={remaining_ms}",
+                            "cheap_tail leg={:?} level={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} favorite_exposure={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             px,
@@ -1155,6 +1388,7 @@ where
                             favorite_exposure_usd,
                             late_fav_filled_qty * (1.0 - legs.favorite_ask).max(0.0),
                             regime_multiplier,
+                            path_reversal_risk_score(&input, &legs),
                         );
                         notes.push(reason.clone());
                         intents.push(build_cheap_tail_intent(
@@ -1549,7 +1783,8 @@ mod tests {
         // 100 shares loaded at 95c has $95 notional but only $5 win-upside.
         // Tail spend must be capped by upside budget, not raw favorite notional.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.01, Some(BtcRegime::Whipsaw)) - 2.5).abs()
+            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.01, Some(BtcRegime::Whipsaw), 0.0) - 2.5)
+                .abs()
                 < 1e-9
         );
     }
@@ -1567,14 +1802,16 @@ mod tests {
         // from 25% to 50%. Spend is now budgeted directly from exposure,
         // then bounded by the favorite-upside erosion cap.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw)) - 2.5).abs()
+            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw), 0.0) - 2.5)
+                .abs()
                 < 1e-9
         );
 
         // At 25c, the same dollar budget buys fewer shares, but the cap is
         // still governed by exposure budget vs edge erosion, not payoff math.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.25, Some(BtcRegime::Whipsaw)) - 2.5).abs()
+            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.25, Some(BtcRegime::Whipsaw), 0.0) - 2.5)
+                .abs()
                 < 1e-9
         );
     }
@@ -1589,8 +1826,14 @@ mod tests {
         };
 
         assert!(
-            cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::DirectionalSmooth))
-                < cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw))
+            cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.05,
+                Some(BtcRegime::DirectionalSmooth),
+                0.0,
+            ) < cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw), 0.0)
         );
     }
 
