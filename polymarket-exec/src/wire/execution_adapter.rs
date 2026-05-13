@@ -267,12 +267,13 @@ impl ExecutionAdapter for PaperExecutionAdapter {
 type V2SdkAuthClient = polymarket_client_sdk_v2::clob::Client<
     polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>,
 >;
+type LegacySdkAuthClient = SdkClobClient<auth::state::Authenticated<auth::Normal>>;
 
 pub struct PolymarketExecutionAdapter {
     _config: PolymarketConfig,
     signer: PrivateKeySigner,
     signature_type: PolymarketSignatureType,
-    client: SdkClobClient<auth::state::Authenticated<auth::Normal>>,
+    client: Option<LegacySdkAuthClient>,
     data_client: SdkDataClient,
     relayer_client: CtfRelayerClient,
     raw_http: reqwest::Client,
@@ -366,13 +367,22 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(POLYGON));
 
-        let mut auth_builder = SdkClobClient::new(
-            api_url.as_str(),
-            SdkClobConfig::builder().use_server_time(true).build(),
-        )
-        .map_err(map_sdk_error)?
-        .authentication_builder(&signer)
-        .signature_type(credentials.signature_type.as_legacy_sdk()?);
+        let use_v2_only =
+            config.protocol == ClobProtocolVersion::V2
+                && credentials.signature_type == PolymarketSignatureType::Poly1271;
+        let mut auth_builder = if use_v2_only {
+            None
+        } else {
+            Some(
+                SdkClobClient::new(
+                    api_url.as_str(),
+                    SdkClobConfig::builder().use_server_time(true).build(),
+                )
+                .map_err(map_sdk_error)?
+                .authentication_builder(&signer)
+                .signature_type(credentials.signature_type.as_legacy_sdk()?),
+            )
+        };
 
         let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
@@ -385,10 +395,15 @@ impl PolymarketExecutionAdapter {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
             })?;
             trade_address = Some(funder);
-            auth_builder = auth_builder.funder(funder);
+            if let Some(builder) = auth_builder.take() {
+                auth_builder = Some(builder.funder(funder));
+            }
         }
 
-        let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+        let client = match auth_builder {
+            Some(builder) => Some(builder.authenticate().await.map_err(map_sdk_error)?),
+            None => None,
+        };
         let data_client = SdkDataClient::new(data_api_url.as_str()).map_err(map_sdk_error)?;
         let relayer_client = CtfRelayerClient::new(CtfRelayerConfig {
             relayer_url: config.relayer_url.clone(),
@@ -441,14 +456,23 @@ impl PolymarketExecutionAdapter {
             })?
             .with_chain_id(Some(POLYGON));
 
-        let mut auth_builder = SdkClobClient::new(
-            config.api_url.as_str(),
-            SdkClobConfig::builder().use_server_time(true).build(),
-        )
-        .map_err(map_sdk_error)?
-        .authentication_builder(&signer)
-        .credentials(sdk_credentials)
-        .signature_type(credentials.signature_type.as_legacy_sdk()?);
+        let use_v2_only =
+            config.protocol == ClobProtocolVersion::V2
+                && credentials.signature_type == PolymarketSignatureType::Poly1271;
+        let mut auth_builder = if use_v2_only {
+            None
+        } else {
+            Some(
+                SdkClobClient::new(
+                    config.api_url.as_str(),
+                    SdkClobConfig::builder().use_server_time(true).build(),
+                )
+                .map_err(map_sdk_error)?
+                .authentication_builder(&signer)
+                .credentials(sdk_credentials)
+                .signature_type(credentials.signature_type.as_legacy_sdk()?),
+            )
+        };
 
         let mut trade_address = Some(signer.address());
         if let Some(funder) = credentials
@@ -461,10 +485,15 @@ impl PolymarketExecutionAdapter {
                 ExecutionError::AuthFailure(format!("invalid POLYMARKET_FUNDER_ADDRESS: {error}"))
             })?;
             trade_address = Some(funder);
-            auth_builder = auth_builder.funder(funder);
+            if let Some(builder) = auth_builder.take() {
+                auth_builder = Some(builder.funder(funder));
+            }
         }
 
-        let client = auth_builder.authenticate().await.map_err(map_sdk_error)?;
+        let client = match auth_builder {
+            Some(builder) => Some(builder.authenticate().await.map_err(map_sdk_error)?),
+            None => None,
+        };
         let data_client =
             SdkDataClient::new(config.data_api_url.as_str()).map_err(map_sdk_error)?;
         let relayer_client = CtfRelayerClient::new(CtfRelayerConfig {
@@ -571,24 +600,22 @@ impl PolymarketExecutionAdapter {
         Ok(client_ref.clone())
     }
 
-    /// Checks whether a single live order is currently scoring for
-    /// maker rewards. Returns the venue's boolean. Logs a structured
-    /// event so operators can see (a) which orders qualify and (b)
-    /// whether the strategy is actually capturing the rebate side of
-    /// the edge whales rely on. Cheap GET (~30ms after warm-up since
-    /// the cached client is reused).
-    pub async fn check_order_scoring(&self, venue_order_id: &str) -> Result<bool, ExecutionError> {
+    fn v2_signature_type(&self) -> polymarket_client_sdk_v2::clob::types::SignatureType {
         use polymarket_client_sdk_v2::clob::types::SignatureType as SdkV2SigType;
-        let signature_type_v2 = match self.signature_type {
+        match self.signature_type {
             PolymarketSignatureType::Eoa => SdkV2SigType::Eoa,
             PolymarketSignatureType::Proxy => SdkV2SigType::Proxy,
             PolymarketSignatureType::GnosisSafe => SdkV2SigType::GnosisSafe,
             PolymarketSignatureType::Poly1271 => SdkV2SigType::Poly1271,
-        };
+        }
+    }
+
+    async fn authenticated_v2_sdk_client(
+        &self,
+        operation: &str,
+    ) -> Result<V2SdkAuthClient, ExecutionError> {
         let pk_hex = self._stored_private_key.as_deref().ok_or_else(|| {
-            ExecutionError::AuthFailure(
-                "check_order_scoring requires _stored_private_key".to_string(),
-            )
+            ExecutionError::AuthFailure(format!("{operation} requires POLYMARKET_PRIVATE_KEY"))
         })?;
         let sdk_signer =
             alloy::signers::local::LocalSigner::from_str(pk_hex.trim()).map_err(|error| {
@@ -596,8 +623,48 @@ impl PolymarketExecutionAdapter {
             })?;
         use alloy::signers::Signer as _;
         let sdk_signer = sdk_signer.with_chain_id(Some(polymarket_client_sdk_v2::POLYGON));
+        self.ensure_v2_sdk_client(&sdk_signer, self.v2_signature_type())
+            .await
+    }
+
+    fn api_credential_parts(&self) -> Result<(String, String, String), ExecutionError> {
+        if let Some(client) = &self.client {
+            let credentials = client.credentials();
+            return Ok((
+                credentials.key().to_string(),
+                credentials.secret().expose_secret().to_string(),
+                credentials.passphrase().expose_secret().to_string(),
+            ));
+        }
+        let credentials = self._config.credentials.as_ref().ok_or_else(|| {
+            ExecutionError::AuthFailure(
+                "api credentials unavailable without legacy CLOB client".to_string(),
+            )
+        })?;
+        Ok((
+            credentials.api_key.clone(),
+            credentials.api_secret.clone(),
+            credentials.api_passphrase.clone(),
+        ))
+    }
+
+    fn legacy_client(&self, operation: &str) -> Result<&LegacySdkAuthClient, ExecutionError> {
+        self.client.as_ref().ok_or_else(|| {
+            ExecutionError::AuthFailure(format!(
+                "{operation} requires legacy CLOB client, but this session is V2-only"
+            ))
+        })
+    }
+
+    /// Checks whether a single live order is currently scoring for
+    /// maker rewards. Returns the venue's boolean. Logs a structured
+    /// event so operators can see (a) which orders qualify and (b)
+    /// whether the strategy is actually capturing the rebate side of
+    /// the edge whales rely on. Cheap GET (~30ms after warm-up since
+    /// the cached client is reused).
+    pub async fn check_order_scoring(&self, venue_order_id: &str) -> Result<bool, ExecutionError> {
         let client = self
-            .ensure_v2_sdk_client(&sdk_signer, signature_type_v2)
+            .authenticated_v2_sdk_client("check_order_scoring")
             .await?;
         let resp = client
             .is_order_scoring(venue_order_id)
@@ -850,9 +917,9 @@ impl PolymarketExecutionAdapter {
             ExecutionError::BadRequest(format!("invalid configured CLOB V2 exchange: {error}"))
         })?;
         let signature = draft.sign(&self.signer, POLYGON, exchange).await?;
-        let credentials = self.client.credentials();
+        let (api_key, _, _) = self.api_credential_parts()?;
         let body = draft.post_body(
-            credentials.key().to_string(),
+            api_key,
             order_type,
             req.post_only,
             signature,
@@ -926,8 +993,8 @@ impl PolymarketExecutionAdapter {
             .map_err(|error| ExecutionError::BadRequest(error.to_string()))?;
         let path = request.url().path();
         let message = format!("{timestamp_s}{method}{path}{body}");
-        let credentials = self.client.credentials();
-        let signature = l2_hmac(credentials.secret().expose_secret(), &message)?;
+        let (api_key, api_secret, api_passphrase) = self.api_credential_parts()?;
+        let signature = l2_hmac(&api_secret, &message)?;
         let mut headers = HeaderMap::new();
         headers.insert(
             "POLY_ADDRESS",
@@ -936,12 +1003,12 @@ impl PolymarketExecutionAdapter {
         );
         headers.insert(
             "POLY_API_KEY",
-            HeaderValue::from_str(&credentials.key().to_string())
+            HeaderValue::from_str(&api_key)
                 .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
         );
         headers.insert(
             "POLY_PASSPHRASE",
-            HeaderValue::from_str(credentials.passphrase().expose_secret())
+            HeaderValue::from_str(&api_passphrase)
                 .map_err(|error| ExecutionError::AuthFailure(error.to_string()))?,
         );
         headers.insert(
@@ -958,12 +1025,7 @@ impl PolymarketExecutionAdapter {
     }
 
     pub fn api_credentials(&self) -> (String, String, String) {
-        let credentials = self.client.credentials();
-        (
-            credentials.key().to_string(),
-            credentials.secret().expose_secret().to_string(),
-            credentials.passphrase().expose_secret().to_string(),
-        )
+        self.api_credential_parts().unwrap_or_default()
     }
 
     pub async fn ensure_pusd_collateral_from_usdce(
@@ -1247,8 +1309,11 @@ impl PolymarketExecutionAdapter {
     }
 
     async fn sync_open_orders_from_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
-        let page = self
-            .client
+        if self._config.protocol == ClobProtocolVersion::V2 {
+            return self.sync_open_orders_from_v2_client().await;
+        }
+        let client = self.legacy_client("sync_open_orders")?;
+        let page = client
             .orders(&OrdersRequest::default(), None)
             .await
             .map_err(map_sdk_error)?;
@@ -1281,12 +1346,75 @@ impl PolymarketExecutionAdapter {
         Ok(orders)
     }
 
+    async fn sync_open_orders_from_v2_client(&self) -> Result<Vec<VenueOpenOrder>, ExecutionError> {
+        use polymarket_client_sdk_v2::clob::types::request::OrdersRequest as V2OrdersRequest;
+        use polymarket_client_sdk_v2::clob::types::{
+            OrderStatusType as V2OrderStatusType, Side as V2Side,
+        };
+
+        let client = self.authenticated_v2_sdk_client("sync_open_orders").await?;
+        let page = client
+            .orders(&V2OrdersRequest::default(), None)
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(format!("V2 orders: {error}")))?;
+        let mut orders = Vec::new();
+        for item in page.data {
+            if !matches!(
+                item.status,
+                V2OrderStatusType::Live | V2OrderStatusType::Delayed
+            ) {
+                continue;
+            }
+            let original_qty = item.original_size.to_string().parse::<f64>().unwrap_or(0.0);
+            let matched_qty = item.size_matched.to_string().parse::<f64>().unwrap_or(0.0);
+            orders.push(VenueOpenOrder {
+                venue_order_id: OrderId::from(item.id),
+                client_order_id: None,
+                market_id: MarketId::from(format!("{:#x}", item.market)),
+                instrument_id: InstrumentId::from(item.asset_id.to_string()),
+                side: match item.side {
+                    V2Side::Buy => TradeSide::Buy,
+                    _ => TradeSide::Sell,
+                },
+                limit_price: item.price.to_string().parse::<f64>().unwrap_or(0.0),
+                original_qty,
+                remaining_qty: (original_qty - matched_qty).max(0.0),
+                created_at_ms: item.created_at.timestamp_millis().max(0) as u64,
+            });
+        }
+
+        Ok(orders)
+    }
+
     async fn sync_balances_from_client(&self) -> Result<VenueBalances, ExecutionError> {
-        let response = self
-            .client
+        if self._config.protocol == ClobProtocolVersion::V2 {
+            return self.sync_balances_from_v2_client().await;
+        }
+        let client = self.legacy_client("sync_balances")?;
+        let response = client
             .balance_allowance(BalanceAllowanceRequest::default())
             .await
             .map_err(map_sdk_error)?;
+        let raw_balance = response.balance.to_string();
+        let positions = self.sync_positions_from_data_api().await?;
+        Ok(VenueBalances {
+            cash_usd: Self::usdc_balance_to_usd(&raw_balance),
+            positions,
+            positions_authoritative: true,
+            observed_at_ms: now_unix_ms(),
+        })
+    }
+
+    async fn sync_balances_from_v2_client(&self) -> Result<VenueBalances, ExecutionError> {
+        use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest as V2BalanceAllowanceRequest;
+
+        let client = self.authenticated_v2_sdk_client("sync_balances").await?;
+        let response = client
+            .balance_allowance(V2BalanceAllowanceRequest::default())
+            .await
+            .map_err(|error| {
+                ExecutionError::TransientNetwork(format!("V2 balance_allowance: {error}"))
+            })?;
         let raw_balance = response.balance.to_string();
         let positions = self.sync_positions_from_data_api().await?;
         Ok(VenueBalances {
@@ -1391,8 +1519,8 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
         let order_type = Self::map_order_type(&req)?;
         let price = Self::decimal_from_f64(req.limit_price, 2, "limit_price")?;
         let size = Self::decimal_from_f64(req.quantity, 2, "quantity")?;
-        let mut builder = self
-            .client
+        let client = self.legacy_client("submit")?;
+        let mut builder = client
             .limit_order()
             .token_id(token_id)
             .order_type(order_type)
@@ -1419,13 +1547,11 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             builder = builder.expiration(expires_at);
         }
         let order = builder.build().await.map_err(map_sdk_error)?;
-        let signed_order = self
-            .client
+        let signed_order = client
             .sign(&self.signer, order)
             .await
             .map_err(map_sdk_error)?;
-        let response = self
-            .client
+        let response = client
             .post_order(signed_order)
             .await
             .map_err(map_sdk_error)?;
@@ -1469,26 +1595,51 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
                 req.client_order_id
             )));
         };
-        let response = self
-            .client
-            .cancel_order(order_id.as_str())
-            .await
-            .map_err(map_sdk_error)?;
+        let (accepted, venue_message) = if self._config.protocol == ClobProtocolVersion::V2 {
+            let response = self
+                .authenticated_v2_sdk_client("cancel")
+                .await?
+                .cancel_order(order_id.as_str())
+                .await
+                .map_err(|error| {
+                    ExecutionError::TransientNetwork(format!("V2 cancel: {error}"))
+                })?;
+            (
+                response
+                    .canceled
+                    .iter()
+                    .any(|canceled| canceled == order_id.as_str()),
+                response
+                    .not_canceled
+                    .get(order_id.as_str())
+                    .cloned()
+                    .or_else(|| Some("cancel submitted to Polymarket CLOB V2".to_string())),
+            )
+        } else {
+            let response = self
+                .legacy_client("cancel")?
+                .cancel_order(order_id.as_str())
+                .await
+                .map_err(map_sdk_error)?;
+            (
+                response
+                    .canceled
+                    .iter()
+                    .any(|canceled| canceled == order_id.as_str()),
+                response
+                    .not_canceled
+                    .get(order_id.as_str())
+                    .cloned()
+                    .or_else(|| Some("cancel submitted to Polymarket CLOB".to_string())),
+            )
+        };
 
-        let accepted = response
-            .canceled
-            .iter()
-            .any(|canceled| canceled == order_id.as_str());
         let ack = CancelOrderAck {
             client_order_id: req.client_order_id.clone(),
             venue_order_id: Some(order_id.clone()),
             accepted,
             accepted_at_ms: now_unix_ms(),
-            venue_message: response
-                .not_canceled
-                .get(order_id.as_str())
-                .cloned()
-                .or_else(|| Some("cancel submitted to Polymarket CLOB".to_string())),
+            venue_message,
         };
 
         if accepted {
