@@ -629,15 +629,31 @@ fn late_favorite_entry_policy(
         });
     }
 
-    if early_late && whipsaw {
-        return None;
-    }
+    let whipsaw_scale = if whipsaw {
+        if early_late { 0.45 } else { 0.70 }
+    } else {
+        1.0
+    };
 
     Some(LateFavoriteEntryPolicy {
-        favorite_scale: if early_late { 0.60 } else { 1.0 },
-        tail_scale: if early_late { 0.60 } else { 1.0 },
-        budget_scale: if early_late { 0.60 } else { 1.0 },
-        label: if early_late {
+        favorite_scale: if early_late {
+            0.60 * whipsaw_scale
+        } else {
+            whipsaw_scale
+        },
+        tail_scale: if early_late {
+            0.60 * whipsaw_scale
+        } else {
+            whipsaw_scale
+        },
+        budget_scale: if early_late {
+            0.60 * whipsaw_scale
+        } else {
+            whipsaw_scale
+        },
+        label: if early_late && whipsaw {
+            "true_late_fav_90_plus_whipsaw_early"
+        } else if early_late {
             "true_late_fav_90_plus_early"
         } else {
             "true_late_fav_90_plus"
