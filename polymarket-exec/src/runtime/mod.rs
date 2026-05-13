@@ -1045,6 +1045,21 @@ impl<S: Strategy> Runtime<S> {
         if intent.condition_id.is_none() {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
+        if self.order_store.is_some() && intent.condition_id.is_none() {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        "merge deferred: missing condition_id; waiting for venue position reconciliation",
+                    )
+                    .with_market(market_id.clone())
+                    .with_instrument(intent.yes_instrument_id.clone())
+                    .with_client_order(intent.command_id.clone()),
+                ),
+            );
+            return outcome;
+        }
 
         let (yes_position_qty, yes_position_avg_price) = self
             .inventory
