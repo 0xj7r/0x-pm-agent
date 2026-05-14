@@ -9,9 +9,10 @@ description: |
   the eligible bar, with an opening-noise guard, smaller sub-90c overlays, and
   size increasing toward expiry.
 
-  Important: this profile is capital-scaled for tinylive. It preserves the
-  Bonereaper shape, but reduces per-level shares and late-favorite clips so
-  generated orders fit the live wallet's per-order and per-market risk caps.
+  Important: this profile is capital-scaled for the 3K live wallet. It preserves
+  the Bonereaper shape, but keeps per-level shares at the venue minimum and
+  broadens the ladder through more levels, wider spacing, and larger per-market
+  headroom rather than by making any one ticket large.
   Late-favorite clips are heuristic shape+hard-cap driven (anti-Kelly), scale
   with bar progress, and are capped by max_load_usd.
   The whale behavior is consistent with hard shape controls plus hard per-market clips,
@@ -22,9 +23,14 @@ quote:
 
 inventory:
   max_open_orders_total: 80
-  max_open_orders_per_market: 14
+  max_open_orders_per_market: 32
   max_order_notional_usd: 18.0
-  max_net_notional_per_market_usd: 90.0
+  max_gross_notional_usd: 250.0
+  max_net_notional_per_market_usd: 120.0
+  max_position_quantity_per_instrument: 250.0
+  min_free_cash_usd: 25.0
+  min_free_cash_bps: 500.0
+  max_session_loss_bps: 2500.0
 
 health:
   market_ws_stale_ms: 15000
@@ -41,11 +47,13 @@ paired_core:
   # Broad mergeable maker ladder. This is intentionally not a strict
   # pre-paired package: fills become mergeable inventory and can later recycle
   # with any opposite-side mergeable fill if realised pair cost is positive.
-  ladder_levels: 9
-  ladder_span: 0.44
+  ladder_levels: 13
+  ladder_span: 0.58
   center_price: 0.50
-  clip_shares: 0.8
-  max_unpaired_core_qty: 8.0
+  # Polymarket BTC 5m venue minimum is 5 shares. Sub-5 clips are coerced to
+  # 5 by runtime sizing, so keep the profile explicit and broaden via levels.
+  clip_shares: 5.0
+  max_unpaired_core_qty: 25.0
   ladder_min_price: 0.20
   ladder_max_price: 0.69
   maker_improve_ticks: 0.0

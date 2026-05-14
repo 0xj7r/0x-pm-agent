@@ -70,6 +70,23 @@ fn btc_5m_hybrid_env_example_matches_active_strategy_contract() {
             "strategy profile path does not exist: {profile_path}"
         );
     }
+
+    for yaml_owned_cap in [
+        "PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD",
+        "PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD",
+        "PM_BTC_5M_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
+        "PM_BTC_5M_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
+        "PM_BTC_5M_EXEC_MIN_FREE_CASH_USD",
+        "PM_BTC_5M_EXEC_MIN_FREE_CASH_BPS",
+        "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_BPS",
+        "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL",
+        "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+    ] {
+        assert!(
+            !values.contains_key(yaml_owned_cap),
+            "{yaml_owned_cap} must stay YAML-owned in bonereaper; leave env overrides commented"
+        );
+    }
 }
 
 #[test]

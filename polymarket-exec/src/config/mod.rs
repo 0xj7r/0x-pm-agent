@@ -799,6 +799,16 @@ mod tests {
     }
 
     #[test]
+    fn profile_owned_float_caps_take_precedence_over_env_overrides() {
+        std::env::set_var("TEST_PROFILE_OWNED_FLOAT_CAP", "7");
+        let value = parse_f64_or_profile("TEST_PROFILE_OWNED_FLOAT_CAP", Some(18.0), 250.0)
+            .expect("parse profile-owned cap");
+        std::env::remove_var("TEST_PROFILE_OWNED_FLOAT_CAP");
+
+        assert_eq!(value, 18.0);
+    }
+
+    #[test]
     fn live_quote_min_order_age_has_rebate_scoring_floor() {
         assert_eq!(
             effective_quote_min_order_age(false, Duration::from_millis(250)),

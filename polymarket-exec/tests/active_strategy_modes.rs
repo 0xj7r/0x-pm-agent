@@ -281,7 +281,24 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
         "config/strategies/whale_bonereaper_strategy.live.yaml",
     ))
     .expect("bonereaper whale profile");
-    let _bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
+    let bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
+    let bonereaper_inventory = bonereaper_profile.risk_limits();
+    assert_eq!(bonereaper_inventory.max_order_notional_usd, 18.0);
+    assert_eq!(bonereaper_inventory.max_gross_notional_usd, 250.0);
+    assert_eq!(bonereaper_inventory.max_net_notional_per_market_usd, 120.0);
+    assert_eq!(
+        bonereaper_inventory.max_position_quantity_per_instrument,
+        250.0
+    );
+    assert_eq!(bonereaper_inventory.min_free_cash_usd, 25.0);
+    assert_eq!(bonereaper_inventory.min_free_cash_bps, 500.0);
+    assert_eq!(bonereaper_inventory.max_session_loss_bps, 2500.0);
+    assert_eq!(bonereaper_inventory.max_open_orders_total, 80);
+    assert_eq!(bonereaper_inventory.max_open_orders_per_market, 32);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 13);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.58);
+    assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
+    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 25.0);
     let bonereaper_late = bonereaper_profile.late_favorite_config();
     assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
     assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
