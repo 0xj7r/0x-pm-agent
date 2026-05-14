@@ -795,7 +795,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     elapsed_ms: u64,
 ) -> Option<FavoriteEntryPolicy> {
     let elapsed_sec = elapsed_ms / 1_000;
-    if elapsed_sec < 180 || legs.favorite_ask < 0.70 || legs.favorite_ask > cfg.max_favorite_ask {
+    if legs.favorite_ask < 0.70 || legs.favorite_ask > cfg.max_favorite_ask {
         return None;
     }
 
@@ -834,6 +834,12 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         input.fair_value.p_down,
     );
     let path_reversal_risk = path_reversal_risk_score(input, legs);
+    let pre_standard_late_window = elapsed_sec < 180;
+    let directional_barbell = legs.favorite_ask >= 0.90 && legs.cheap_ask <= 0.12;
+
+    if pre_standard_late_window && !directional_barbell {
+        return None;
+    }
 
     if recent < -threshold * 0.35 {
         return None;
@@ -843,6 +849,14 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
     if early_late && path_reversal_risk >= 0.75 {
         return None;
+    }
+    if pre_standard_late_window {
+        if whipsaw && path_reversal_risk >= 0.45 && legs.favorite_ask < 0.93 {
+            return None;
+        }
+        if strongest < threshold * 0.50 && model_favorite < 0.90 {
+            return None;
+        }
     }
 
     if legs.favorite_ask < 0.80 {
@@ -936,21 +950,36 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         1.0
     };
     let reversal_scale = (1.0 - 0.55 * path_reversal_risk).clamp(0.35, 1.0);
+    let timing_scale = if pre_standard_late_window {
+        0.35
+    } else if early_late {
+        0.60
+    } else {
+        1.0
+    };
     Some(FavoriteEntryPolicy {
         min_price: if early_late { 0.90 } else { 0.85 },
-        max_levels: if early_late && whipsaw {
+        max_levels: if pre_standard_late_window && whipsaw {
+            1
+        } else if pre_standard_late_window {
+            2
+        } else if early_late && whipsaw {
             2
         } else if early_late {
             3
         } else {
             5
         },
-        clip_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
-        cap_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
+        clip_multiplier: timing_scale * reversal_scale * whipsaw_scale,
+        cap_multiplier: timing_scale * reversal_scale * whipsaw_scale,
         allow_taker: true,
         near_touch_maker: true,
         path_reversal_risk,
-        label: if early_late && whipsaw {
+        label: if pre_standard_late_window && whipsaw {
+            "true_late_fav_90_plus_barbell_whipsaw_early"
+        } else if pre_standard_late_window {
+            "true_late_fav_90_plus_barbell_early"
+        } else if early_late && whipsaw {
             "true_late_fav_90_plus_whipsaw_early"
         } else if early_late {
             "true_late_fav_90_plus_early"
