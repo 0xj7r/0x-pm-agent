@@ -67,6 +67,8 @@ pub struct Runtime<S: Strategy> {
     quote_reconciler: QuoteReconciler,
     quote_engine_config: QuoteEngineConfig,
     quote_stale_ms: u64,
+    merge_enabled: bool,
+    pressure_merge_enabled: bool,
     min_merge_notional_usd: f64,
     merge_free_cash_pressure_ratio: f64,
     merge_gross_exposure_pressure_ratio: f64,
@@ -181,6 +183,8 @@ impl<S: Strategy> Runtime<S> {
             quote_reconciler: QuoteReconciler::default(),
             quote_engine_config: config.quote_engine_config,
             quote_stale_ms: config.quote_stale_ms,
+            merge_enabled: config.merge_enabled,
+            pressure_merge_enabled: config.pressure_merge_enabled,
             min_merge_notional_usd: config.min_merge_notional_usd.max(0.0),
             merge_free_cash_pressure_ratio: config.merge_free_cash_pressure_ratio.max(0.0),
             merge_gross_exposure_pressure_ratio: config
@@ -1025,6 +1029,24 @@ impl<S: Strategy> Runtime<S> {
         else {
             return outcome;
         };
+        if !self.merge_enabled {
+            outcome.push_event(
+                self.event_log.push(
+                    EventRecord::new(
+                        EventCategory::Execution,
+                        now_ms,
+                        format!(
+                            "merge disabled by runtime profile; holding paired inventory to redeem reason={}",
+                            intent.reason
+                        ),
+                    )
+                    .with_market(market_id.clone())
+                    .with_instrument(intent.yes_instrument_id.clone())
+                    .with_client_order(intent.command_id.clone()),
+                ),
+            );
+            return outcome;
+        }
         if intent.condition_id.is_none() {
             intent.condition_id = self.condition_id_by_market.get(market_id).cloned();
         }
@@ -1225,20 +1247,37 @@ impl<S: Strategy> Runtime<S> {
         if intent.expected_cash_usd + MERGE_NOTIONAL_THRESHOLD_EPSILON_USD
             < self.min_merge_notional_usd
         {
-            if let Some(pressure_reason) = merge_pressure_reason.as_ref() {
-                outcome.push_event(
-                    self.event_log.push(
-                        EventRecord::new(
-                            EventCategory::Execution,
-                            now_ms,
-                            format!(
-                                "merge batching bypassed: paired notional ${:.4} below batch threshold ${:.4}; pressure={pressure_reason}",
-                                intent.expected_cash_usd, self.min_merge_notional_usd
-                            ),
-                        )
-                        .with_market(market_id.clone()),
-                    ),
-                );
+            if self.pressure_merge_enabled {
+                if let Some(pressure_reason) = merge_pressure_reason.as_ref() {
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Execution,
+                                now_ms,
+                                format!(
+                                    "merge batching bypassed: paired notional ${:.4} below batch threshold ${:.4}; pressure={pressure_reason}",
+                                    intent.expected_cash_usd, self.min_merge_notional_usd
+                                ),
+                            )
+                            .with_market(market_id.clone()),
+                        ),
+                    );
+                } else {
+                    outcome.push_event(
+                        self.event_log.push(
+                            EventRecord::new(
+                                EventCategory::Execution,
+                                now_ms,
+                                format!(
+                                    "merge batched: paired notional ${:.4} below batch threshold ${:.4}; no capital/inventory pressure",
+                                    intent.expected_cash_usd, self.min_merge_notional_usd
+                                ),
+                            )
+                            .with_market(market_id.clone()),
+                        ),
+                    );
+                    return outcome;
+                }
             } else {
                 outcome.push_event(
                     self.event_log.push(
@@ -1246,7 +1285,7 @@ impl<S: Strategy> Runtime<S> {
                             EventCategory::Execution,
                             now_ms,
                             format!(
-                                "merge batched: paired notional ${:.4} below batch threshold ${:.4}; no capital/inventory pressure",
+                                "merge batched: paired notional ${:.4} below batch threshold ${:.4}; pressure bypass disabled",
                                 intent.expected_cash_usd, self.min_merge_notional_usd
                             ),
                         )
@@ -2500,6 +2539,40 @@ impl<S: Strategy> Runtime<S> {
         outcome
     }
 
+    pub fn request_cancel_entry_orders_with_quote_tag_prefix(
+        &mut self,
+        now_ms: EpochMillis,
+        quote_tag_prefix: &str,
+        reason: impl Into<String>,
+    ) -> RuntimeOutcome {
+        let reason = reason.into();
+        let ids = self
+            .open_orders
+            .values()
+            .filter_map(|managed| {
+                if managed.intent.kind == crate::types::IntentKind::Close {
+                    return None;
+                }
+                let tag = managed.intent.quote_level_tag.as_deref()?;
+                tag.starts_with(quote_tag_prefix)
+                    .then(|| managed.intent.client_order_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut outcome = RuntimeOutcome::default();
+        for client_order_id in ids {
+            outcome.extend(self.request_cancel(&client_order_id, reason.clone(), now_ms));
+        }
+        outcome
+    }
+
+    fn soft_pause_cancels_paired_core_only(notes: &[String]) -> bool {
+        notes.iter().any(|note| {
+            note.contains("paired_core broad stopped")
+                || note.contains("paired_core broad suppressed")
+                || note.contains("scope=PairedOnly")
+        })
+    }
+
     fn entry_quote_repairs_one_sided_inventory(&self, managed: &ManagedOrder) -> bool {
         if managed.intent.kind != crate::types::IntentKind::Entry
             || managed.intent.side != crate::types::TradeSide::Buy
@@ -2767,7 +2840,10 @@ impl<S: Strategy> Runtime<S> {
         now_ms: EpochMillis,
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
-        for note in decision.notes() {
+        let decision_notes = decision.notes();
+        let soft_pause_paired_only =
+            Self::soft_pause_cancels_paired_core_only(&decision_notes);
+        for note in decision_notes {
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Strategy,
                 now_ms,
@@ -2811,12 +2887,24 @@ impl<S: Strategy> Runtime<S> {
                         outcome.push_event(self.event_log.push(EventRecord::new(
                             EventCategory::Strategy,
                             now_ms,
-                            "strategy suppression: soft pause requested (cancelling open entry quotes)",
+                            if soft_pause_paired_only {
+                                "strategy suppression: soft pause requested (cancelling paired-core entry quotes only)"
+                            } else {
+                                "strategy suppression: soft pause requested (cancelling open entry quotes)"
+                            },
                         )));
-                        outcome.extend(self.request_cancel_entry_orders(
-                            now_ms,
-                            "strategy suppression: cancel entry quotes",
-                        ));
+                        if soft_pause_paired_only {
+                            outcome.extend(self.request_cancel_entry_orders_with_quote_tag_prefix(
+                                now_ms,
+                                "paired-core:",
+                                "strategy suppression: cancel paired-core entry quotes",
+                            ));
+                        } else {
+                            outcome.extend(self.request_cancel_entry_orders(
+                                now_ms,
+                                "strategy suppression: cancel entry quotes",
+                            ));
+                        }
                     }
                 }
                 StrategyDecisionSuppressionKind::HardRiskOff => {

@@ -47,14 +47,16 @@ use crate::types::{
 use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
-    CancelOrderRequest, ExecutionAdapter, MergePositionsRequest, PaperExecutionAdapter,
-    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce, VenueFill, VenuePosition,
+    CancelOrderRequest, ExecutionAdapter, ExecutionError, MergePositionsRequest,
+    PaperExecutionAdapter, RedeemPositionsRequest, SubmitOrderRequest, TimeInForce, VenueFill,
+    VenuePosition,
 };
 use crate::wire::market_ws::MarketWsClient;
 use crate::wire::spot_ws::{SpotTradeEvent, SpotWsClient};
 use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
+const LATE_FAV_MAKER_TTL_MS: u64 = 30_000;
 
 fn runtime_env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -648,6 +650,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 .and_then(|profile| profile.quote.min_quote_age_ms)
                 .unwrap_or(10_000),
             require_initial_reconcile_before_entry: !config.paper_mode,
+            merge_enabled: config
+                .strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.pair.merge_enabled)
+                .unwrap_or(runtime_defaults.merge_enabled),
+            pressure_merge_enabled: config
+                .strategy_profile
+                .as_ref()
+                .and_then(|profile| profile.pair.pressure_merge_enabled)
+                .unwrap_or(runtime_defaults.pressure_merge_enabled),
             min_merge_notional_usd: config
                 .strategy_profile
                 .as_ref()
@@ -2831,13 +2843,69 @@ async fn execute_execution_adapter(
                     continue;
                 }
 
+                let submitted_merge_qty = match venue_confirmed_merge_quantity(
+                    execution_adapter.as_ref(),
+                    intent.condition_id.as_deref(),
+                    &intent.yes_instrument_id,
+                    &intent.no_instrument_id,
+                )
+                .await
+                {
+                    Ok(confirmed_qty) if confirmed_qty <= 1e-9 => {
+                        let reason = "venue position sync found no mergeable paired quantity";
+                        runtime.block_pending_merge(&intent.market_id, observed_at_ms, reason);
+                        warn!(
+                            mode = "live",
+                            market_id = %intent.market_id,
+                            yes_instrument_id = %intent.yes_instrument_id,
+                            no_instrument_id = %intent.no_instrument_id,
+                            requested_quantity = intent.quantity,
+                            confirmed_quantity = confirmed_qty,
+                            command_id = %intent.command_id,
+                            "live merge skipped before submit; venue has no mergeable pair"
+                        );
+                        continue;
+                    }
+                    Ok(confirmed_qty) => {
+                        let capped_qty = intent.quantity.min(confirmed_qty);
+                        if capped_qty + 1e-9 < intent.quantity {
+                            warn!(
+                                mode = "live",
+                                market_id = %intent.market_id,
+                                yes_instrument_id = %intent.yes_instrument_id,
+                                no_instrument_id = %intent.no_instrument_id,
+                                requested_quantity = intent.quantity,
+                                confirmed_quantity = confirmed_qty,
+                                submitted_quantity = capped_qty,
+                                command_id = %intent.command_id,
+                                "live merge quantity capped by venue-confirmed paired balance"
+                            );
+                        }
+                        capped_qty
+                    }
+                    Err(error) => {
+                        runtime.clear_pending_merge(&intent.market_id, observed_at_ms);
+                        warn!(
+                            mode = "live",
+                            market_id = %intent.market_id,
+                            yes_instrument_id = %intent.yes_instrument_id,
+                            no_instrument_id = %intent.no_instrument_id,
+                            quantity = intent.quantity,
+                            command_id = %intent.command_id,
+                            error = %error,
+                            "live merge skipped; venue position confirmation failed"
+                        );
+                        continue;
+                    }
+                };
+
                 let merge_req = MergePositionsRequest {
                     command_id: intent.command_id.clone(),
                     market_id: intent.market_id.clone(),
                     condition_id: intent.condition_id.clone(),
                     yes_instrument_id: intent.yes_instrument_id.clone(),
                     no_instrument_id: intent.no_instrument_id.clone(),
-                    quantity: intent.quantity,
+                    quantity: submitted_merge_qty,
                     submitted_at_ms: observed_at_ms,
                 };
                 match execution_adapter.merge_positions(merge_req).await {
@@ -2847,7 +2915,7 @@ async fn execute_execution_adapter(
                             market_id = %intent.market_id,
                             yes_instrument_id = %intent.yes_instrument_id,
                             no_instrument_id = %intent.no_instrument_id,
-                            quantity = intent.quantity,
+                            quantity = submitted_merge_qty,
                             command_id = %intent.command_id,
                             message = ?ack.venue_message,
                             "merge command accepted by execution adapter; awaiting venue reconciliation"
@@ -2886,7 +2954,7 @@ async fn execute_execution_adapter(
                             market_id = %intent.market_id,
                             yes_instrument_id = %intent.yes_instrument_id,
                             no_instrument_id = %intent.no_instrument_id,
-                            quantity = intent.quantity,
+                            quantity = submitted_merge_qty,
                             command_id = %intent.command_id,
                             reason = %reason,
                             "live merge rejected; blocking identical CTF recycle without global risk-off"
@@ -2914,7 +2982,7 @@ async fn execute_execution_adapter(
                                 market_id = %intent.market_id,
                                 yes_instrument_id = %intent.yes_instrument_id,
                                 no_instrument_id = %intent.no_instrument_id,
-                                quantity = intent.quantity,
+                                quantity = submitted_merge_qty,
                                 command_id = %intent.command_id,
                                 error = %error,
                                 "live merge failed; blocking identical CTF recycle without global risk-off"
@@ -3106,12 +3174,22 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("late-fav-taker"));
+    let is_late_fav_maker = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("late-fav-") && !tag.starts_with("late-fav-taker"));
     let live_expires_at_ms = (!execution_policy.paper_mode
+        && is_late_fav_maker)
+        .then_some(observed_at_ms.saturating_add(LATE_FAV_MAKER_TTL_MS))
+        .or_else(|| {
+            (!execution_policy.paper_mode
         && execution_policy.live_order_ttl_ms > 0
         && !is_hedge_rescue
         && !is_aggressive_late_fav
-        && !is_late_bar_core)
-        .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
+                && !is_late_bar_core
+                && !is_late_fav_maker)
+                .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
+        })
         .or_else(|| {
             (!execution_policy.paper_mode && is_late_bar_core)
                 .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
@@ -3794,6 +3872,33 @@ async fn cancel_stale_live_orders(
     outcome
 }
 
+async fn venue_confirmed_merge_quantity(
+    execution_adapter: &dyn ExecutionAdapter,
+    condition_id: Option<&str>,
+    yes_instrument_id: &InstrumentId,
+    no_instrument_id: &InstrumentId,
+) -> Result<f64, ExecutionError> {
+    let balances = execution_adapter.sync_balances().await?;
+    let mut yes_qty = 0.0_f64;
+    let mut no_qty = 0.0_f64;
+    for position in balances.positions {
+        if !position.mergeable {
+            continue;
+        }
+        if let Some(expected_condition_id) = condition_id {
+            if position.condition_id.as_deref() != Some(expected_condition_id) {
+                continue;
+            }
+        }
+        if &position.instrument_id == yes_instrument_id {
+            yes_qty += position.quantity.max(0.0);
+        } else if &position.instrument_id == no_instrument_id {
+            no_qty += position.quantity.max(0.0);
+        }
+    }
+    Ok(yes_qty.min(no_qty))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StaleLiveOrderAction {
     Preserve { reason: &'static str },
@@ -3841,6 +3946,11 @@ fn stale_live_order_action(
             if order.intent.limit_price >= best_ask {
                 return StaleLiveOrderAction::Cancel {
                     reason: "buy quote would cross current ask",
+                };
+            }
+            if order.intent.limit_price < best_bid - tolerance {
+                return StaleLiveOrderAction::Cancel {
+                    reason: "buy quote is stale below current best bid",
                 };
             }
             if order.intent.limit_price > best_bid + tolerance {

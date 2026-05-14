@@ -22,8 +22,8 @@ quote:
   levels_per_side: 17
 
 inventory:
-  max_open_orders_total: 80
-  max_open_orders_per_market: 32
+  max_open_orders_total: 120
+  max_open_orders_per_market: 48
   max_order_notional_usd: 18.0
   max_gross_notional_usd: 250.0
   max_net_notional_per_market_usd: 120.0
@@ -39,25 +39,33 @@ risk:
   book_stale_ms: 5000
 
 pair:
-  min_merge_notional_usd: 5.0
-  merge_market_exposure_pressure_usd: 20.0
+  merge_enabled: true
+  pressure_merge_enabled: false
+  min_merge_notional_usd: 15.0
+  merge_pressure_free_cash_ratio: 0.0
+  merge_pressure_gross_exposure_ratio: 999999.0
+  merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
   enabled: true
   # Broad mergeable maker ladder. This is intentionally not a strict
   # pre-paired package: fills become mergeable inventory and can later recycle
   # with any opposite-side mergeable fill if realised pair cost is positive.
-  ladder_levels: 13
-  ladder_span: 0.58
+  ladder_levels: 17
+  ladder_span: 0.60
   center_price: 0.50
   # Polymarket BTC 5m venue minimum is 5 shares. Sub-5 clips are coerced to
   # 5 by runtime sizing, so keep the profile explicit and broaden via levels.
   clip_shares: 5.0
-  max_unpaired_core_qty: 25.0
+  max_unpaired_core_qty: 12.0
   ladder_min_price: 0.20
-  ladder_max_price: 0.69
+  ladder_max_price: 0.70
+  # Stop fresh paired-core in the late window. After 180s elapsed, the bar
+  # should allocate new risk to explicit late-favorite and cheap-tail/reversal
+  # lanes; any existing paired-core inventory can still merge or redeem.
+  disable_after_elapsed_ms: 180000
   maker_improve_ticks: 0.0
-  merge_min_qty: 5.0
+  merge_min_qty: 15.0
   merge_batch_cap: 100.0
 
 late_favorite:
@@ -68,9 +76,11 @@ late_favorite:
     window_sec: 300
     start_frac: 0.10
     min_elapsed_sec: 75
-    clip_usd: 15.0
-    max_load_usd: 85.0
-    maker_improve_ticks: 0.0
+    clip_usd: 25.0
+    max_load_usd: 150.0
+    maker_improve_ticks: 1.0
+    near_touch_min_favorite_ask: 0.85
+    near_touch_maker_improve_ticks: 3.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
@@ -81,6 +91,7 @@ late_favorite:
     # only place nominal size. Reversal protection is handled by cheap-tail /
     # future reversal-hedge accounting, not by suppressing the main lane to zero.
     regime_whipsaw_multiplier: 0.45
+    whipsaw_true_favorite_multiplier: 0.75
     regime_flat_multiplier: 0.75
     regime_trending_volatile_multiplier: 0.75
     regime_unknown_multiplier: 0.80
