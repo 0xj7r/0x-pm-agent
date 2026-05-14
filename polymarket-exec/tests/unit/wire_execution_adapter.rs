@@ -413,9 +413,9 @@ fn signature_type_parser_accepts_polymarket_codes() {
 }
 
 #[test]
-fn poly1271_uses_proxy_mode_for_ctf_relayer() {
+fn poly1271_uses_wallet_mode_for_ctf_relayer() {
     assert_eq!(PolymarketSignatureType::Poly1271.as_polymarket_code(), 3);
-    assert_eq!(PolymarketSignatureType::Poly1271.as_ctf_relayer_code(), 1);
+    assert_eq!(PolymarketSignatureType::Poly1271.as_ctf_relayer_code(), 3);
     assert_eq!(PolymarketSignatureType::GnosisSafe.as_ctf_relayer_code(), 2);
 }
 
@@ -427,13 +427,19 @@ fn relayer_config_prefers_explicit_proxy_wallet_over_funder() {
     };
     let funder = Some("0x2222222222222222222222222222222222222222".to_string());
     assert_eq!(
-        relayer_proxy_wallet_address(&config, &funder).as_deref(),
+        relayer_proxy_wallet_address(&config, &funder, PolymarketSignatureType::Poly1271)
+            .as_deref(),
         Some("0x1111111111111111111111111111111111111111")
     );
 
     let config = PolymarketConfig::default();
     assert_eq!(
-        relayer_proxy_wallet_address(&config, &funder).as_deref(),
+        relayer_proxy_wallet_address(&config, &funder, PolymarketSignatureType::Proxy).as_deref(),
+        None
+    );
+    assert_eq!(
+        relayer_proxy_wallet_address(&config, &funder, PolymarketSignatureType::Poly1271)
+            .as_deref(),
         Some("0x2222222222222222222222222222222222222222")
     );
 }

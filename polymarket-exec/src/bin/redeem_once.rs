@@ -11,7 +11,8 @@ use std::str::FromStr;
 use anyhow::{anyhow, Context, Result};
 use polymarket_exec::wire::execution_adapter::PolymarketSignatureType;
 use polymarket_exec::wire::relayer::{
-    CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
+    CtfRedeemRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS,
+    DEFAULT_PUSD_ADDRESS, DEFAULT_RELAYER_URL,
 };
 
 #[tokio::main]
@@ -76,13 +77,17 @@ async fn main() -> Result<()> {
     let config = CtfRelayerConfig {
         relayer_url: std::env::var("POLYMARKET_RELAYER_URL")
             .unwrap_or_else(|_| DEFAULT_RELAYER_URL.to_string()),
-        api_key: std::env::var("RELAYER_API_KEY").ok(),
-        api_key_address: std::env::var("RELAYER_API_KEY_ADDRESS").ok(),
+        api_key: std::env::var("RELAYER_API_KEY")
+            .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY"))
+            .ok(),
+        api_key_address: std::env::var("RELAYER_API_KEY_ADDRESS")
+            .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY_ADDRESS"))
+            .ok(),
         ctf_contract_address: std::env::var("POLYMARKET_CTF_CONTRACT_ADDRESS")
             .unwrap_or_else(|_| DEFAULT_CTF_ADDRESS.to_string()),
         collateral_token_address: std::env::var("POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS")
             .or_else(|_| std::env::var("POLYMARKET_COLLATERAL_TOKEN_ADDRESS"))
-            .context("POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS must be set")?,
+            .unwrap_or_else(|_| DEFAULT_PUSD_ADDRESS.to_string()),
         collateral_decimals: std::env::var("POLYMARKET_COLLATERAL_DECIMALS")
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())

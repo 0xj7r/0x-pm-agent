@@ -4,6 +4,7 @@
 //!
 //! Usage (env must be loaded first):
 //!   merge_once --condition-id 0xabc... --quantity 5 --dry-run
+//!   merge_once --condition-id 0xabc... --quantity 5 --relayer-envelope-only
 //!   merge_once --condition-id 0xabc... --quantity 5
 
 use std::str::FromStr;
@@ -12,7 +13,8 @@ use anyhow::{anyhow, Context, Result};
 use polymarket_exec::wire::execution_adapter::PolymarketSignatureType;
 use polymarket_exec::wire::polygon_rpc::redact_rpc_url;
 use polymarket_exec::wire::relayer::{
-    CtfMergeRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_RELAYER_URL,
+    CtfMergeRequest, CtfRelayerClient, CtfRelayerConfig, DEFAULT_CTF_ADDRESS, DEFAULT_PUSD_ADDRESS,
+    DEFAULT_RELAYER_URL,
 };
 
 #[tokio::main]
@@ -20,6 +22,7 @@ async fn main() -> Result<()> {
     let mut condition_id: Option<String> = None;
     let mut quantity: Option<f64> = None;
     let mut dry_run = false;
+    let mut relayer_envelope_only = false;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut iter = args.iter();
@@ -43,8 +46,11 @@ async fn main() -> Result<()> {
                 );
             }
             "--dry-run" => dry_run = true,
+            "--relayer-envelope-only" => relayer_envelope_only = true,
             "-h" | "--help" => {
-                println!("merge_once --condition-id 0x... --quantity 5 [--dry-run]");
+                println!(
+                    "merge_once --condition-id 0x... --quantity 5 [--dry-run|--relayer-envelope-only]"
+                );
                 return Ok(());
             }
             other => return Err(anyhow!("unknown arg: {other}")),
@@ -73,13 +79,17 @@ async fn main() -> Result<()> {
     let config = CtfRelayerConfig {
         relayer_url: std::env::var("POLYMARKET_RELAYER_URL")
             .unwrap_or_else(|_| DEFAULT_RELAYER_URL.to_string()),
-        api_key: std::env::var("RELAYER_API_KEY").ok(),
-        api_key_address: std::env::var("RELAYER_API_KEY_ADDRESS").ok(),
+        api_key: std::env::var("RELAYER_API_KEY")
+            .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY"))
+            .ok(),
+        api_key_address: std::env::var("RELAYER_API_KEY_ADDRESS")
+            .or_else(|_| std::env::var("POLYMARKET_RELAYER_API_KEY_ADDRESS"))
+            .ok(),
         ctf_contract_address: std::env::var("POLYMARKET_CTF_CONTRACT_ADDRESS")
             .unwrap_or_else(|_| DEFAULT_CTF_ADDRESS.to_string()),
         collateral_token_address: std::env::var("POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS")
             .or_else(|_| std::env::var("POLYMARKET_COLLATERAL_TOKEN_ADDRESS"))
-            .context("POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS must be set")?,
+            .unwrap_or_else(|_| DEFAULT_PUSD_ADDRESS.to_string()),
         collateral_decimals: std::env::var("POLYMARKET_COLLATERAL_DECIMALS")
             .ok()
             .and_then(|v| v.trim().parse::<u8>().ok())
@@ -114,6 +124,7 @@ async fn main() -> Result<()> {
     eprintln!("  signer:       {signer_address}");
     eprintln!("  proxy_wallet: {:?}", config.proxy_wallet_address);
     eprintln!("  dry_run:      {dry_run}");
+    eprintln!("  envelope_only:{relayer_envelope_only}");
     eprintln!();
 
     let client = CtfRelayerClient::new(config);
@@ -124,6 +135,25 @@ async fn main() -> Result<()> {
         metadata: format!("merge_once tool condition={condition_id} quantity={quantity}"),
     };
 
+    if relayer_envelope_only {
+        if signature_type_code != 3 {
+            return Err(anyhow!(
+                "--relayer-envelope-only is implemented for POLY_1271/WALLET mode"
+            ));
+        }
+        eprintln!("building POLY_1271 WALLET relayer envelope without submitting...");
+        let envelope = client.dry_run_merge_submission_envelope(&request).await?;
+        println!("OK relayer-envelope dry-run");
+        println!("  type:         {}", envelope.tx_type);
+        println!("  from:         {:?}", envelope.from);
+        println!("  to:           {:?}", envelope.to);
+        println!("  wallet:       {:?}", envelope.deposit_wallet);
+        println!("  nonce:        {}", envelope.nonce);
+        println!("  calls:        {}", envelope.call_count);
+        println!("  sig_bytes:    {}", envelope.signature_bytes);
+        return Ok(());
+    }
+
     if dry_run {
         eprintln!("simulating merge via eth_call...");
         match client.dry_run_merge_positions(&request).await {
@@ -132,6 +162,18 @@ async fn main() -> Result<()> {
                 println!("  from:         {:?}", report.from);
                 println!("  to:           {:?}", report.to);
                 println!("  calldata:     {}", report.calldata_hex);
+                if signature_type_code == 3 {
+                    eprintln!("building POLY_1271 WALLET relayer envelope without submitting...");
+                    let envelope = client.dry_run_merge_submission_envelope(&request).await?;
+                    println!("OK relayer-envelope dry-run");
+                    println!("  type:         {}", envelope.tx_type);
+                    println!("  from:         {:?}", envelope.from);
+                    println!("  to:           {:?}", envelope.to);
+                    println!("  wallet:       {:?}", envelope.deposit_wallet);
+                    println!("  nonce:        {}", envelope.nonce);
+                    println!("  calls:        {}", envelope.call_count);
+                    println!("  sig_bytes:    {}", envelope.signature_bytes);
+                }
                 return Ok(());
             }
             Err(error) => {
