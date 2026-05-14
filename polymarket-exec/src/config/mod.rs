@@ -696,9 +696,15 @@ fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Dura
 }
 
 fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result<f64> {
+    let env = env_value(key);
+    if let (Some(_), Some(_)) = (profile, env.as_ref()) {
+        anyhow::bail!(
+            "ambiguous config for {key}: value is set in both strategy profile and environment; remove the env var so the profile remains the single source of truth"
+        );
+    }
     if let Some(profile) = profile {
         Ok(profile)
-    } else if env_value(key).is_some() {
+    } else if env.is_some() {
         parse_f64(key, default)
     } else {
         Ok(default)
@@ -706,9 +712,15 @@ fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result
 }
 
 fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> Result<usize> {
+    let env = env_value(key);
+    if let (Some(_), Some(_)) = (profile, env.as_ref()) {
+        anyhow::bail!(
+            "ambiguous config for {key}: value is set in both strategy profile and environment; remove the env var so the profile remains the single source of truth"
+        );
+    }
     if let Some(profile) = profile {
         Ok(profile)
-    } else if env_value(key).is_some() {
+    } else if env.is_some() {
         parse_usize(key, default)
     } else {
         Ok(default)
