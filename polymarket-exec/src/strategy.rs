@@ -330,9 +330,7 @@ fn parse_strategy_names(raw: &str) -> Vec<String> {
     raw.split([',', '+'])
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .flat_map(|name| {
-            canonicalize(&name.to_ascii_lowercase()).into_iter()
-        })
+        .flat_map(|name| canonicalize(&name.to_ascii_lowercase()).into_iter())
         .collect()
 }
 
@@ -436,17 +434,15 @@ impl HybridStrategy {
         };
         let inventory =
             paired_inventory_from_context(&context.inventory, market_id, &yes_id, &no_id);
-        let paired_core_inventory = context
-            .paired_core_inventory
-            .unwrap_or_else(|| {
-                paired_core_inventory_from_context(
-                    inventory,
-                    &context.directional_inventory,
-                    market_id,
-                    &yes_id,
-                    &no_id,
-                )
-            });
+        let paired_core_inventory = context.paired_core_inventory.unwrap_or_else(|| {
+            paired_core_inventory_from_context(
+                inventory,
+                &context.directional_inventory,
+                market_id,
+                &yes_id,
+                &no_id,
+            )
+        });
         let late_fav_inventory = paired_inventory_from_directional_snapshots(
             &context.late_fav_inventory,
             market_id,
@@ -461,10 +457,20 @@ impl HybridStrategy {
         );
         let open_convex_order_exposure =
             paired_convex_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id);
-        let open_late_fav_order_exposure =
-            paired_tagged_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id, "late-fav");
-        let open_paired_core_order_exposure =
-            paired_tagged_open_order_exposure(&context.open_orders, market_id, &yes_id, &no_id, "paired-core:");
+        let open_late_fav_order_exposure = paired_tagged_open_order_exposure(
+            &context.open_orders,
+            market_id,
+            &yes_id,
+            &no_id,
+            "late-fav",
+        );
+        let open_paired_core_order_exposure = paired_tagged_open_order_exposure(
+            &context.open_orders,
+            market_id,
+            &yes_id,
+            &no_id,
+            "paired-core:",
+        );
         let pair_cost = PairCostTracker::from_inventory(&paired_core_inventory);
         let fair_value = fair_value_from_context(context, &market, self.momentum_weight);
         let order_book_pressure =
@@ -609,12 +615,7 @@ impl HybridStrategy {
         }
         if !quote_intents.is_empty() {
             if !commands.is_empty() {
-                return StrategyDecision::mixed(
-                    quote_intents,
-                    commands,
-                    has_reactive_mixed,
-                    notes,
-                );
+                return StrategyDecision::mixed(quote_intents, commands, has_reactive_mixed, notes);
             }
             return StrategyDecision::quote_set(quote_intents, notes);
         }
@@ -986,10 +987,10 @@ fn paired_convex_open_order_exposure(
                 let tag = order.quote_level_tag.as_deref().unwrap_or_default();
                 tag.to_ascii_lowercase().contains("cheap-tail")
                     || order
-                .quote_level_tag
-                .as_deref()
-                .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
-                == Some(crate::types::MmQuoteKind::ConvexAccumulation)
+                        .quote_level_tag
+                        .as_deref()
+                        .and_then(crate::types::MmQuoteKind::from_quote_level_tag)
+                        == Some(crate::types::MmQuoteKind::ConvexAccumulation)
             }
     }) {
         let notional = order.limit_price.max(0.0) * order.remaining_qty.max(0.0);

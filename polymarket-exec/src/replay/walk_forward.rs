@@ -131,7 +131,10 @@ pub fn build_walk_forward_plan(
         let test = &ordered[test_start..test_end];
         splits.push(WalkForwardSplit {
             fold_index: splits.len(),
-            train_window_ids: train.iter().map(|window| window.window_id.clone()).collect(),
+            train_window_ids: train
+                .iter()
+                .map(|window| window.window_id.clone())
+                .collect(),
             test_window_ids: test.iter().map(|window| window.window_id.clone()).collect(),
             train_start_ns: train.first().map(|window| window.start_ns).unwrap_or(0),
             train_end_ns: train.last().map(|window| window.end_ns).unwrap_or(0),
@@ -144,7 +147,10 @@ pub fn build_walk_forward_plan(
     let holdout = &ordered[calibration_len..];
     Ok(WalkForwardPlan {
         splits,
-        holdout_window_ids: holdout.iter().map(|window| window.window_id.clone()).collect(),
+        holdout_window_ids: holdout
+            .iter()
+            .map(|window| window.window_id.clone())
+            .collect(),
         holdout_start_ns: holdout.first().map(|window| window.start_ns),
         holdout_end_ns: holdout.last().map(|window| window.end_ns),
     })
@@ -166,9 +172,8 @@ mod tests {
 
     #[test]
     fn expanding_plan_keeps_final_holdout_unseen() {
-        let plan =
-            build_walk_forward_plan(&windows(10), &WalkForwardConfig::expanding(4, 2, 2, 2))
-                .unwrap();
+        let plan = build_walk_forward_plan(&windows(10), &WalkForwardConfig::expanding(4, 2, 2, 2))
+            .unwrap();
 
         assert_eq!(
             plan.holdout_window_ids,
@@ -188,20 +193,16 @@ mod tests {
             plan.splits[0].test_window_ids,
             vec!["btc_5m/2026-05-01/w4", "btc_5m/2026-05-01/w5"]
         );
-        assert!(plan
-            .splits
+        assert!(plan.splits.iter().all(|split| split
+            .test_window_ids
             .iter()
-            .all(|split| split
-                .test_window_ids
-                .iter()
-                .all(|id| !plan.holdout_window_ids.contains(id))));
+            .all(|id| !plan.holdout_window_ids.contains(id))));
     }
 
     #[test]
     fn rolling_plan_limits_training_history() {
         let plan =
-            build_walk_forward_plan(&windows(12), &WalkForwardConfig::rolling(3, 2, 2, 1))
-                .unwrap();
+            build_walk_forward_plan(&windows(12), &WalkForwardConfig::rolling(3, 2, 2, 1)).unwrap();
 
         assert_eq!(plan.splits[0].train_window_ids.len(), 3);
         assert_eq!(plan.splits[1].train_window_ids.len(), 3);
@@ -220,8 +221,8 @@ mod tests {
         let mut ws = windows(5);
         ws[2].start_ns = ws[1].start_ns;
 
-        let err = build_walk_forward_plan(&ws, &WalkForwardConfig::expanding(2, 1, 1, 1))
-            .unwrap_err();
+        let err =
+            build_walk_forward_plan(&ws, &WalkForwardConfig::expanding(2, 1, 1, 1)).unwrap_err();
 
         assert!(err.to_string().contains("non-overlapping"));
     }

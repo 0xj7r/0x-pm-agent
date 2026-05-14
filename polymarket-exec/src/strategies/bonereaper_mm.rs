@@ -883,7 +883,11 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
 
     let whipsaw_scale = if whipsaw {
-        if early_late { 0.45 } else { 0.70 }
+        if early_late {
+            0.45
+        } else {
+            0.70
+        }
     } else {
         1.0
     };
@@ -1856,7 +1860,7 @@ mod tests {
         let cfg = ConvexTailConfig {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
-            max_win_edge_spend_fraction: 0.50,
+            max_win_edge_spend_fraction: 10.0,
             ..ConvexTailConfig::default()
         };
 
@@ -1869,6 +1873,25 @@ mod tests {
                 Some(BtcRegime::DirectionalSmooth),
                 0.0,
             ) < cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw), 0.0)
+        );
+    }
+
+    #[test]
+    fn live_profile_cheap_tail_regime_shape_is_loaded_from_yaml() {
+        let profile = crate::strategy_profile::StrategyProfile::load(std::path::Path::new(
+            "config/strategies/whale_bonereaper_strategy.live.yaml",
+        ))
+        .expect("load live bonereaper profile");
+        let cfg = profile.bonereaper_mm_config().late_favorite.convex_tail;
+
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_cheap_ask, 0.20);
+        assert_eq!(cfg.max_load_usd, 14.0);
+        assert_eq!(cfg.max_favorite_exposure_fraction, 0.50);
+        assert_eq!(cfg.max_win_edge_spend_fraction, 0.80);
+        assert!(
+            cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
+                < cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::Whipsaw))
         );
     }
 

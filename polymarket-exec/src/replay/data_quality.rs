@@ -189,9 +189,7 @@ pub fn summarize_data_quality(
                 {
                     continue;
                 }
-                if event.event_type == EventType::BookSnapshot
-                    && price.is_none()
-                    && size.is_none()
+                if event.event_type == EventType::BookSnapshot && price.is_none() && size.is_none()
                 {
                     if let Some(asset) = event.asset_id.as_deref().filter(|asset| !asset.is_empty())
                     {
@@ -475,7 +473,12 @@ fn apply_raw_book_snapshot(
         }
     }
 
-    record_cross_status(state, event.received_ns, summary, &DataQualityConfig::default());
+    record_cross_status(
+        state,
+        event.received_ns,
+        summary,
+        &DataQualityConfig::default(),
+    );
 
     true
 }

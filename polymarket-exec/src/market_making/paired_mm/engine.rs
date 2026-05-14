@@ -643,7 +643,11 @@ fn late_favorite_entry_policy(
     }
 
     let whipsaw_scale = if whipsaw {
-        if early_late { 0.45 } else { 0.70 }
+        if early_late {
+            0.45
+        } else {
+            0.70
+        }
     } else {
         1.0
     };

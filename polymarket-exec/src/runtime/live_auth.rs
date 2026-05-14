@@ -331,8 +331,6 @@ mod tests {
         )
         .expect_err("proxy mode without funder must fail");
 
-        assert!(error
-            .to_string()
-            .contains("signature types require"));
+        assert!(error.to_string().contains("signature types require"));
     }
 }

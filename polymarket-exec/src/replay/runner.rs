@@ -635,27 +635,12 @@ mod replay_accounting_tests {
     fn unrealized_lots_bucket_stranded_cost_per_path() {
         let events = vec![market_meta_event("UP", "DOWN")];
         let fills = vec![
-            tagged_buy_fill(
-                "paired-mm:btc-updown-5m-1:yes:l1:1",
-                "UP",
-                0.40,
-                10.0,
-            ),
-            tagged_buy_fill(
-                "paired-mm-convex:btc-updown-5m-1:yes:1",
-                "UP",
-                0.55,
-                7.0,
-            ),
+            tagged_buy_fill("paired-mm:btc-updown-5m-1:yes:l1:1", "UP", 0.40, 10.0),
+            tagged_buy_fill("paired-mm-convex:btc-updown-5m-1:yes:1", "UP", 0.55, 7.0),
         ];
         let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
-        let attribution = compute_pnl_attribution(
-            &events,
-            &fills,
-            &[],
-            &accounting,
-            FillQuality::Base,
-        );
+        let attribution =
+            compute_pnl_attribution(&events, &fills, &[], &accounting, FillQuality::Base);
 
         assert!((attribution.paired_mm.stranded_cost_usd - 4.0).abs() < 1e-9);
         assert!((attribution.paired_mm.stranded_qty - 10.0).abs() < 1e-9);
@@ -674,27 +659,12 @@ mod replay_accounting_tests {
             resolution_outcome_event("Up", 0.0, 0.0),
         ];
         let fills = vec![
-            tagged_buy_fill(
-                "paired-mm:btc-updown-5m-1:no:l1:1",
-                "DOWN",
-                0.45,
-                10.0,
-            ),
-            tagged_buy_fill(
-                "paired-mm-convex:btc-updown-5m-1:no:1",
-                "DOWN",
-                0.60,
-                5.0,
-            ),
+            tagged_buy_fill("paired-mm:btc-updown-5m-1:no:l1:1", "DOWN", 0.45, 10.0),
+            tagged_buy_fill("paired-mm-convex:btc-updown-5m-1:no:1", "DOWN", 0.60, 5.0),
         ];
         let accounting = compute_accounting(&events, &fills, 1_000.0, 0.0);
-        let attribution = compute_pnl_attribution(
-            &events,
-            &fills,
-            &[],
-            &accounting,
-            FillQuality::Base,
-        );
+        let attribution =
+            compute_pnl_attribution(&events, &fills, &[], &accounting, FillQuality::Base);
 
         assert!((attribution.paired_mm.expired_losing_cost_usd - 4.5).abs() < 1e-9);
         assert!((attribution.paired_mm.expired_losing_qty - 10.0).abs() < 1e-9);
@@ -3553,7 +3523,12 @@ mod tests {
         let fill_count = summary
             .journal_events
             .iter()
-            .filter(|e| matches!(e, JournalEvent::Fill { .. } | JournalEvent::PartialFill { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    JournalEvent::Fill { .. } | JournalEvent::PartialFill { .. }
+                )
+            })
             .count();
         assert!(
             fill_count >= 1,
@@ -3624,10 +3599,7 @@ mod tests {
             classify_tag("mm-convex-accum:ultra-cheap-tail:no:convex_accum"),
             AttributionPath::CheapTailConvexity
         );
-        assert_eq!(
-            classify_tag("core-hedge:core"),
-            AttributionPath::PairedMm
-        );
+        assert_eq!(classify_tag("core-hedge:core"), AttributionPath::PairedMm);
         assert_eq!(
             classify_tag("core_hedge geometry mismatch yes_ask=None no_ask=Some(0.55)"),
             AttributionPath::PairedMm
@@ -3641,5 +3613,4 @@ mod tests {
             AttributionPath::CheapTailConvexity
         );
     }
-
 }

@@ -8,9 +8,7 @@
 //! post-pivot redeem-only behavior from Canonical.md.
 
 use crate::markets::MarketDescriptor;
-use crate::strategies::core_hedge_mm::{
-    CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig,
-};
+use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::StrategyDecision;
 
