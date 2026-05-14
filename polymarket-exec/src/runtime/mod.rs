@@ -700,12 +700,8 @@ impl<S: Strategy> Runtime<S> {
                 )
             };
             self.event_log.push(
-                EventRecord::new(
-                    EventCategory::Inventory,
-                    observed_at_ms,
-                    message,
-                )
-                .with_market(stranded.market_id.clone()),
+                EventRecord::new(EventCategory::Inventory, observed_at_ms, message)
+                    .with_market(stranded.market_id.clone()),
             );
         }
         self.clear_accepted_merges_after_venue_reconcile(&report, observed_at_ms);
@@ -1068,18 +1064,12 @@ impl<S: Strategy> Runtime<S> {
             .unwrap_or((0.0, 0.0));
         let protected_yes_qty = self
             .directional_inventory_qty(market_id, &intent.yes_instrument_id)
-            .max(self.durable_directional_inventory_qty(
-                market_id,
-                &intent.yes_instrument_id,
-            ))
+            .max(self.durable_directional_inventory_qty(market_id, &intent.yes_instrument_id))
             .min(yes_position_qty)
             .max(0.0);
         let protected_no_qty = self
             .directional_inventory_qty(market_id, &intent.no_instrument_id)
-            .max(self.durable_directional_inventory_qty(
-                market_id,
-                &intent.no_instrument_id,
-            ))
+            .max(self.durable_directional_inventory_qty(market_id, &intent.no_instrument_id))
             .min(no_position_qty)
             .max(0.0);
         let inventory_mergeable_quantity = (yes_position_qty - protected_yes_qty)
@@ -1687,7 +1677,11 @@ impl<S: Strategy> Runtime<S> {
         if managed.cumulative_filled_qty <= 0.0 {
             return (false, RuntimeOutcome::default());
         }
-        let quote_level_tag = managed.intent.quote_level_tag.as_deref().unwrap_or_default();
+        let quote_level_tag = managed
+            .intent
+            .quote_level_tag
+            .as_deref()
+            .unwrap_or_default();
         let non_resting_partial = quote_level_tag.starts_with("late-fav-taker")
             || quote_level_tag.starts_with("mm-hedge-rescue")
             || managed.intent.kind == crate::types::IntentKind::Close;
@@ -1869,19 +1863,13 @@ impl<S: Strategy> Runtime<S> {
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self.strategy.on_market_snapshot(&context, &snapshot);
             outcome.extend(self.accept_strategy_decision(decision, now_ms));
-            outcome.extend(self.plan_durable_paired_core_merge_sweep(
-                &snapshot.market_id,
-                now_ms,
-            ));
+            outcome.extend(self.plan_durable_paired_core_merge_sweep(&snapshot.market_id, now_ms));
             Ok(outcome)
         } else {
             let context = self.strategy_context(now_ms, Some(&snapshot.market_id));
             let decision = self.strategy.on_market_snapshot(&context, &snapshot);
             let mut outcome = self.accept_strategy_decision(decision, now_ms);
-            outcome.extend(self.plan_durable_paired_core_merge_sweep(
-                &snapshot.market_id,
-                now_ms,
-            ));
+            outcome.extend(self.plan_durable_paired_core_merge_sweep(&snapshot.market_id, now_ms));
             Ok(outcome)
         }
     }
@@ -2110,8 +2098,8 @@ impl<S: Strategy> Runtime<S> {
             let inventory_lane = AccountingLane::from_quote_level_tag(auto_merge_tag.as_deref());
             let legacy_anonymous_merge_allowed =
                 self.order_store.is_none() && fill.client_order_id.is_none();
-            let auto_merge_allowed = inventory_lane == AccountingLane::PairedCore
-                || legacy_anonymous_merge_allowed;
+            let auto_merge_allowed =
+                inventory_lane == AccountingLane::PairedCore || legacy_anonymous_merge_allowed;
             let adjustment = self.inventory.apply_fill(&fill)?;
             executed_qty = fill.quantity;
             if fill.side == crate::types::TradeSide::Buy && inventory_lane.is_directional() {
@@ -3503,7 +3491,9 @@ impl<S: Strategy> Runtime<S> {
         let inventory = self.inventory.snapshot();
         let paired_core_inventory = market_id
             .and_then(|id| market_context.as_ref().map(|record| (id, record)))
-            .and_then(|(id, record)| self.durable_paired_core_inventory_snapshot(id, record, &inventory));
+            .and_then(|(id, record)| {
+                self.durable_paired_core_inventory_snapshot(id, record, &inventory)
+            });
         StrategyContext {
             now_ms,
             runtime_status: self.status,
@@ -3590,11 +3580,7 @@ impl<S: Strategy> Runtime<S> {
             >= self.actionable_order_qty_for_market(&position.market_id)
     }
 
-    fn directional_inventory_qty(
-        &self,
-        market_id: &MarketId,
-        instrument_id: &InstrumentId,
-    ) -> f64 {
+    fn directional_inventory_qty(&self, market_id: &MarketId, instrument_id: &InstrumentId) -> f64 {
         self.directional_inventory_by_market_instrument
             .get(&(market_id.clone(), instrument_id.clone()))
             .copied()
@@ -3669,7 +3655,10 @@ impl<S: Strategy> Runtime<S> {
             })
             .fold((0.0, 0.0), |(qty, cost), record| {
                 let filled_qty = record.filled_qty.max(0.0);
-                (qty + filled_qty, cost + filled_qty * record.limit_price.max(0.0))
+                (
+                    qty + filled_qty,
+                    cost + filled_qty * record.limit_price.max(0.0),
+                )
             })
     }
 
@@ -3692,22 +3681,15 @@ impl<S: Strategy> Runtime<S> {
         };
         let yes_instrument_id = InstrumentId::from(yes_raw.clone());
         let no_instrument_id = InstrumentId::from(no_raw.clone());
-        let (yes_qty, _) = self.durable_lane_qty_cost(
-            market_id,
-            &yes_instrument_id,
-            AccountingLane::PairedCore,
-        );
+        let (yes_qty, _) =
+            self.durable_lane_qty_cost(market_id, &yes_instrument_id, AccountingLane::PairedCore);
         let (no_qty, _) =
             self.durable_lane_qty_cost(market_id, &no_instrument_id, AccountingLane::PairedCore);
         let pair_qty = yes_qty.min(no_qty).max(0.0);
         if pair_qty + MERGE_NOTIONAL_THRESHOLD_EPSILON_USD < self.min_merge_notional_usd {
             return RuntimeOutcome::default();
         }
-        self.plan_merge_command_for_market(
-            market_id,
-            now_ms,
-            "durable paired-core merge sweep",
-        )
+        self.plan_merge_command_for_market(market_id, now_ms, "durable paired-core merge sweep")
     }
 
     fn mergeable_paired_cost_basis_usd(
@@ -3744,16 +3726,10 @@ impl<S: Strategy> Runtime<S> {
     ) -> Option<PairedInventorySnapshot> {
         let yes_instrument_id = InstrumentId::from(market_context.instrument_ids.first()?.clone());
         let no_instrument_id = InstrumentId::from(market_context.instrument_ids.get(1)?.clone());
-        let (yes_qty, yes_cost) = self.durable_lane_qty_cost(
-            market_id,
-            &yes_instrument_id,
-            AccountingLane::PairedCore,
-        );
-        let (no_qty, no_cost) = self.durable_lane_qty_cost(
-            market_id,
-            &no_instrument_id,
-            AccountingLane::PairedCore,
-        );
+        let (yes_qty, yes_cost) =
+            self.durable_lane_qty_cost(market_id, &yes_instrument_id, AccountingLane::PairedCore);
+        let (no_qty, no_cost) =
+            self.durable_lane_qty_cost(market_id, &no_instrument_id, AccountingLane::PairedCore);
         Some(PairedInventorySnapshot {
             yes_qty: yes_qty.max(0.0),
             no_qty: no_qty.max(0.0),
@@ -3798,9 +3774,8 @@ impl<S: Strategy> Runtime<S> {
                     && record.filled_qty > ACCOUNTING_QTY_EPSILON
                     && lanes.contains(&record.accounting_lane)
                 {
-                    *qty_by_instrument
-                        .entry(record.instrument_id)
-                        .or_insert(0.0) += record.filled_qty.max(0.0);
+                    *qty_by_instrument.entry(record.instrument_id).or_insert(0.0) +=
+                        record.filled_qty.max(0.0);
                 }
             }
             return qty_by_instrument
@@ -3830,10 +3805,12 @@ impl<S: Strategy> Runtime<S> {
 
         let source = if lanes.len() == 1 && lanes[0] == AccountingLane::LateFavorite {
             &self.late_fav_inventory_by_market_instrument
-        } else if lanes
-            .iter()
-            .all(|lane| matches!(lane, AccountingLane::CheapTail | AccountingLane::ReversalHedge))
-        {
+        } else if lanes.iter().all(|lane| {
+            matches!(
+                lane,
+                AccountingLane::CheapTail | AccountingLane::ReversalHedge
+            )
+        }) {
             &self.cheap_tail_inventory_by_market_instrument
         } else {
             &self.directional_inventory_by_market_instrument
@@ -3841,8 +3818,7 @@ impl<S: Strategy> Runtime<S> {
         source
             .iter()
             .filter(|((tracked_market_id, _), qty)| {
-                **qty > ACCOUNTING_QTY_EPSILON
-                    && market_id.is_none_or(|id| tracked_market_id == id)
+                **qty > ACCOUNTING_QTY_EPSILON && market_id.is_none_or(|id| tracked_market_id == id)
             })
             .map(|((tracked_market_id, instrument_id), qty)| {
                 crate::strategies::traits::StrategyDirectionalInventorySnapshot {

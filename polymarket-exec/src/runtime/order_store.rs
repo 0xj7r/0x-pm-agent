@@ -123,7 +123,9 @@ impl OrderRecord {
             reason: Some(intent.reason.clone()),
             strategy_tag: strategy_tag.into(),
             quote_level_tag: intent.quote_level_tag.clone(),
-            accounting_lane: AccountingLane::from_quote_level_tag(intent.quote_level_tag.as_deref()),
+            accounting_lane: AccountingLane::from_quote_level_tag(
+                intent.quote_level_tag.as_deref(),
+            ),
         }
     }
 }
@@ -266,11 +268,7 @@ impl SqliteOrderStore {
                 OrderStoreError::Sqlite(format!("failed to create orders table: {error}"))
             })?;
 
-        self.add_column_if_missing(
-            "orders",
-            "accounting_lane",
-            "TEXT NOT NULL DEFAULT 'other'",
-        )?;
+        self.add_column_if_missing("orders", "accounting_lane", "TEXT NOT NULL DEFAULT 'other'")?;
 
         self.connection
             .execute(
@@ -364,11 +362,9 @@ impl SqliteOrderStore {
                 OrderStoreError::Sqlite(format!("failed to query {table} schema: {error}"))
             })?;
         for existing in columns {
-            if existing
-                .map_err(|error| {
-                    OrderStoreError::Sqlite(format!("failed to decode {table} schema: {error}"))
-                })?
-                == column
+            if existing.map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to decode {table} schema: {error}"))
+            })? == column
             {
                 return Ok(());
             }
@@ -379,9 +375,7 @@ impl SqliteOrderStore {
                 (),
             )
             .map_err(|error| {
-                OrderStoreError::Sqlite(format!(
-                    "failed to add {table}.{column} column: {error}"
-                ))
+                OrderStoreError::Sqlite(format!("failed to add {table}.{column} column: {error}"))
             })?;
         Ok(())
     }
@@ -462,7 +456,9 @@ impl SqliteOrderStore {
             .transpose()
             .map_err(|error| Self::sqlite_conversion_error(17, Type::Text, error))?
             .unwrap_or_else(|| {
-                AccountingLane::from_quote_level_tag(row.get::<_, Option<String>>(16).ok().flatten().as_deref())
+                AccountingLane::from_quote_level_tag(
+                    row.get::<_, Option<String>>(16).ok().flatten().as_deref(),
+                )
             });
         Ok(OrderRecord {
             run_id: row.get(1)?,
@@ -518,7 +514,6 @@ impl SqliteOrderStore {
                 .to_string()
         }
     }
-
 }
 
 impl OrderStore for SqliteOrderStore {
@@ -792,9 +787,7 @@ impl OrderStore for SqliteOrderStore {
                 ],
             )
             .map_err(|error| {
-                OrderStoreError::Sqlite(format!(
-                    "failed to expire partial-fill remainder: {error}"
-                ))
+                OrderStoreError::Sqlite(format!("failed to expire partial-fill remainder: {error}"))
             })?;
 
         if updated == 0 {
@@ -1011,7 +1004,7 @@ impl OrderStore for SqliteOrderStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{OrderStore, OrderStoreError, SqliteOrderStore};
+    use super::{AccountingLane, OrderStore, OrderStoreError, SqliteOrderStore};
     use crate::types::{
         ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, RuntimeStatus,
         TradeSide,

@@ -265,7 +265,6 @@ fn scenario_7_capital_recycle_waits_on_thin_edge_without_cash_pressure() {
     );
 }
 
-
 /// Tracking strategy used by `synthesizer_injects_price_to_beat_into_stream`.
 /// Records every event the runner dispatches so we can assert the synthetic
 /// `price_to_beat` event is interleaved alongside real events at the

@@ -57,10 +57,7 @@ pub fn read_raw_replay(path: &Path, options: &RawReplayOptions) -> Result<Vec<Ev
     Ok(dedupe_and_sort(events))
 }
 
-fn route_btc_ticks_per_market(
-    ticks: &[Event],
-    options: &RawReplayOptions,
-) -> Result<Vec<Event>> {
+fn route_btc_ticks_per_market(ticks: &[Event], options: &RawReplayOptions) -> Result<Vec<Event>> {
     if options.markets.is_empty() {
         return Ok(ticks.to_vec());
     }
@@ -68,10 +65,9 @@ fn route_btc_ticks_per_market(
         .markets
         .iter()
         .map(|market| {
-            let start_ms = market_start_ms(&market.slug)
-                .unwrap_or(options.window_start_ns / 1_000_000);
-            let end_ms = market_end_ms(&market.slug)
-                .unwrap_or(options.window_end_ns / 1_000_000);
+            let start_ms =
+                market_start_ms(&market.slug).unwrap_or(options.window_start_ns / 1_000_000);
+            let end_ms = market_end_ms(&market.slug).unwrap_or(options.window_end_ns / 1_000_000);
             (
                 market.slug.clone(),
                 start_ms.saturating_mul(1_000_000),
@@ -84,10 +80,8 @@ fn route_btc_ticks_per_market(
     let min_start = windows.iter().map(|w| w.1).min().unwrap_or(i64::MIN);
     let max_end = windows.iter().map(|w| w.2).max().unwrap_or(i64::MAX);
 
-    let mut hits_per_market: BTreeMap<String, usize> = windows
-        .iter()
-        .map(|w| (w.0.clone(), 0))
-        .collect();
+    let mut hits_per_market: BTreeMap<String, usize> =
+        windows.iter().map(|w| (w.0.clone(), 0)).collect();
     let mut dropped_before = 0_usize;
     let mut dropped_after = 0_usize;
     let mut dropped_gap = 0_usize;
@@ -989,21 +983,19 @@ mod tests {
             .iter()
             .filter(|e| {
                 e.event_type == EventType::BtcTick
-                    && e.market_slug.as_deref()
-                        == Some(&format!("btc-updown-5m-{}", m1_start_s))
+                    && e.market_slug.as_deref() == Some(&format!("btc-updown-5m-{}", m1_start_s))
             })
             .collect();
 
         assert_eq!(m0_ticks.len(), 2);
         assert_eq!(m1_ticks.len(), 2);
-        assert!(m0_ticks
+        assert!(m0_ticks.iter().all(|e| e.market_type == "btc_ref"
+            && e.received_ns >= m0_start_s * 1_000_000_000
+            && e.received_ns < m1_start_s * 1_000_000_000));
+        assert!(m1_ticks
             .iter()
-            .all(|e| e.market_type == "btc_ref"
-                && e.received_ns >= m0_start_s * 1_000_000_000
-                && e.received_ns < m1_start_s * 1_000_000_000));
-        assert!(m1_ticks.iter().all(|e| e.received_ns
-            >= m1_start_s * 1_000_000_000
-            && e.received_ns < (m1_start_s + 300) * 1_000_000_000));
+            .all(|e| e.received_ns >= m1_start_s * 1_000_000_000
+                && e.received_ns < (m1_start_s + 300) * 1_000_000_000));
     }
 
     #[test]

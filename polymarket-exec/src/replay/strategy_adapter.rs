@@ -586,11 +586,7 @@ impl ReplayStrategyAdapter {
     }
 
     fn enabled_strategies(&self) -> Vec<EnabledStrategy> {
-        let configured = self
-            .profile
-            .strategy
-            .as_deref()
-            .unwrap_or("paired_mm");
+        let configured = self.profile.strategy.as_deref().unwrap_or("paired_mm");
         let mut enabled = Vec::new();
         let mut seen = BTreeSet::new();
         for raw_name in configured
@@ -794,7 +790,11 @@ impl ReplayStrategyAdapter {
         {
             let qty = managed.remaining_qty();
             let notional = managed.intent.limit_price.max(0.0) * qty;
-            let tag = managed.intent.quote_level_tag.as_deref().unwrap_or_default();
+            let tag = managed
+                .intent
+                .quote_level_tag
+                .as_deref()
+                .unwrap_or_default();
             let lower_tag = tag.to_ascii_lowercase();
             let target = if lower_tag.starts_with("paired-core:") {
                 Some(&mut open_paired_core_order_exposure)
@@ -833,7 +833,8 @@ impl ReplayStrategyAdapter {
             late_fav_inventory: PairedInventorySnapshot::default(),
             cheap_tail_inventory: PairedInventorySnapshot::default(),
             open_convex_order_exposure,
-            open_late_fav_order_exposure: crate::strategies::traits::PairedOpenOrderExposure::default(),
+            open_late_fav_order_exposure:
+                crate::strategies::traits::PairedOpenOrderExposure::default(),
             open_paired_core_order_exposure,
             pair_cost,
             fair_value,

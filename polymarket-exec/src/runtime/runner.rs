@@ -26,8 +26,8 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 #[cfg(test)]
 use crate::runtime::live_health::portfolio_equity_floor_usd;
 use crate::runtime::live_health::{
-    auto_recover_live_riskoff, enforce_capital_guard, enforce_live_health,
-    live_kill_switch_reason, needs_reconcile_order_count,
+    auto_recover_live_riskoff, enforce_capital_guard, enforce_live_health, live_kill_switch_reason,
+    needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
     fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,

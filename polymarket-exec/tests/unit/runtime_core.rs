@@ -351,12 +351,21 @@ fn live_strategy_merge_command_defers_without_condition_id() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir()
-        .join(format!("polymarket-exec-strategy-merge-condition-id-{ts}.sqlite"));
+    let path = std::env::temp_dir().join(format!(
+        "polymarket-exec-strategy-merge-condition-id-{ts}.sqlite"
+    ));
     let mut store = SqliteOrderStore::open(&path).unwrap();
     for (client_order_id, instrument_id, price) in [
-        (ClientOrderId::from("paired-core:market-1:yes:0"), InstrumentId::from("yes"), 0.20),
-        (ClientOrderId::from("paired-core:market-1:no:0"), InstrumentId::from("no"), 0.70),
+        (
+            ClientOrderId::from("paired-core:market-1:yes:0"),
+            InstrumentId::from("yes"),
+            0.20,
+        ),
+        (
+            ClientOrderId::from("paired-core:market-1:no:0"),
+            InstrumentId::from("no"),
+            0.70,
+        ),
     ] {
         let intent = OrderIntent {
             client_order_id,
@@ -851,8 +860,9 @@ fn paired_core_fill_uses_durable_order_tag_when_active_order_is_absent() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir()
-        .join(format!("polymarket-exec-durable-paired-core-fill-{ts}.sqlite"));
+    let path = std::env::temp_dir().join(format!(
+        "polymarket-exec-durable-paired-core-fill-{ts}.sqlite"
+    ));
     let mut store = SqliteOrderStore::open(&path).unwrap();
     let market_id = MarketId::from("market-mm");
     let up = InstrumentId::from("up");
@@ -976,15 +986,21 @@ fn durable_paired_core_inventory_sweep_plans_merge_without_new_fill() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir()
-        .join(format!("polymarket-exec-durable-paired-core-sweep-{ts}.sqlite"));
+    let path = std::env::temp_dir().join(format!(
+        "polymarket-exec-durable-paired-core-sweep-{ts}.sqlite"
+    ));
     let mut store = SqliteOrderStore::open(&path).unwrap();
     let market_id = MarketId::from("market-mm");
     let up = InstrumentId::from("up");
     let down = InstrumentId::from("down");
 
     for (client_order_id, instrument_id, price, filled_qty) in [
-        (ClientOrderId::from("paired-core:market-mm:up:0"), up.clone(), 0.40, 10.0),
+        (
+            ClientOrderId::from("paired-core:market-mm:up:0"),
+            up.clone(),
+            0.40,
+            10.0,
+        ),
         (
             ClientOrderId::from("paired-core:market-mm:down:0"),
             down.clone(),
@@ -1222,15 +1238,18 @@ fn plan_merge_defers_until_condition_id_is_known() {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = std::env::temp_dir()
-        .join(format!("polymarket-exec-merge-condition-id-{ts}.sqlite"));
+    let path = std::env::temp_dir().join(format!("polymarket-exec-merge-condition-id-{ts}.sqlite"));
     let mut store = SqliteOrderStore::open(&path).unwrap();
     let market_id = MarketId::from("market-mm");
     let up = InstrumentId::from("up");
     let down = InstrumentId::from("down");
 
     for (client_order_id, instrument_id, price) in [
-        (ClientOrderId::from("paired-core:market-mm:up:0"), up.clone(), 0.20),
+        (
+            ClientOrderId::from("paired-core:market-mm:up:0"),
+            up.clone(),
+            0.20,
+        ),
         (
             ClientOrderId::from("paired-core:market-mm:down:0"),
             down.clone(),

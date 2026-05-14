@@ -116,6 +116,16 @@ impl PolymarketSignatureType {
             Self::Poly1271 => 3,
         }
     }
+
+    fn as_ctf_relayer_code(self) -> u8 {
+        match self {
+            // POLY1271 is only a CLOB order-signing mode. The CTF relayer
+            // accepts EOA/proxy/safe transaction envelopes, so deposit-wallet
+            // sessions must recycle through the configured proxy wallet.
+            Self::Poly1271 => 1,
+            other => other.as_polymarket_code(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -415,7 +425,7 @@ impl PolymarketExecutionAdapter {
                 &config,
                 &credentials.funder_address,
             ),
-            signature_type_code: credentials.signature_type.as_polymarket_code(),
+            signature_type_code: credentials.signature_type.as_ctf_relayer_code(),
             polygon_rpc_url: config.polygon_rpc_url.clone(),
         });
 
@@ -505,7 +515,7 @@ impl PolymarketExecutionAdapter {
                 &config,
                 &credentials.funder_address,
             ),
-            signature_type_code: credentials.signature_type.as_polymarket_code(),
+            signature_type_code: credentials.signature_type.as_ctf_relayer_code(),
             polygon_rpc_url: config.polygon_rpc_url.clone(),
         });
 
@@ -1526,13 +1536,17 @@ impl PolymarketExecutionAdapter {
             ("after", (after_ms / 1_000).to_string()),
         ];
         let timestamp_s = (now_unix_ms() / 1_000) as i64;
-        let headers = self.v2_l2_headers(Method::GET, &url, "", timestamp_s)?;
-        let response = self
+        let mut request = self
             .raw_http
             .get(&url)
-            .headers(headers)
             .query(&params)
-            .send()
+            .build()
+            .map_err(|error| ExecutionError::BadRequest(error.to_string()))?;
+        let headers = self.v2_l2_headers(Method::GET, request.url().as_str(), "", timestamp_s)?;
+        *request.headers_mut() = headers;
+        let response = self
+            .raw_http
+            .execute(request)
             .await
             .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
         let status = response.status();

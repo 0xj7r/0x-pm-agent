@@ -204,7 +204,8 @@ pub fn build_ladder<M: MarketDescriptor>(
     }
     let mut suppress_yes =
         should_suppress_leg(LadderLeg::Yes, inventory, config) || yes_spread_suppressed;
-    let mut suppress_no = should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
+    let mut suppress_no =
+        should_suppress_leg(LadderLeg::No, inventory, config) || no_spread_suppressed;
     if yes_spread_suppressed || no_spread_suppressed {
         suppress_yes = true;
         suppress_no = true;
