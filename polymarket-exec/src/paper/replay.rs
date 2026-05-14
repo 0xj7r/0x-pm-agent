@@ -483,6 +483,12 @@ pub async fn replay_runtime_from_snapshots(
             quote_engine_config: crate::quote_engine::QuoteEngineConfig::default(),
             quote_stale_ms: config.quote_min_order_age.as_millis() as u64,
             require_initial_reconcile_before_entry: false,
+            merge_enabled: pair_profile
+                .and_then(|pair| pair.merge_enabled)
+                .unwrap_or(runtime_defaults.merge_enabled),
+            pressure_merge_enabled: pair_profile
+                .and_then(|pair| pair.pressure_merge_enabled)
+                .unwrap_or(runtime_defaults.pressure_merge_enabled),
             min_merge_notional_usd: config
                 .strategy_profile
                 .as_ref()

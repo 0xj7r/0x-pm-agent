@@ -23,7 +23,7 @@ use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::BtcRegime;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
-use crate::types::{MarketId, MergeIntent, StrategyDecision};
+use crate::types::{CoolingReason, MarketId, MergeIntent, StrategyDecision, SuppressionScope};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
@@ -76,6 +76,11 @@ pub struct CoreHedgeMmConfig {
     pub merge_batch_cap: f64,
     /// Disable merge planning after this epoch-ms timestamp (redeem-only mode).
     pub disable_merge_after_ms: Option<EpochMillis>,
+    /// Disable new broad paired-core quote placement after this elapsed bar age.
+    /// Late-window exposure belongs to late-favorite plus cheap-tail/reversal
+    /// lanes; existing paired inventory may still merge/redeem and mate-repair
+    /// can clean up pre-existing imbalance.
+    pub disable_after_elapsed_ms: Option<u64>,
 }
 
 impl Default for CoreHedgeMmConfig {
@@ -102,6 +107,7 @@ impl Default for CoreHedgeMmConfig {
             merge_min_qty: 1.0,
             merge_batch_cap: f64::INFINITY,
             disable_merge_after_ms: None,
+            disable_after_elapsed_ms: None,
         }
     }
 }
@@ -390,6 +396,62 @@ fn paired_core_chop_gate<M: MarketDescriptor>(
     None
 }
 
+fn paired_core_broad_suppression_note<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    elapsed_ms: u64,
+    hard_cutoff_ms: Option<u64>,
+    yes_ask: f64,
+    no_ask: f64,
+) -> Option<String> {
+    let favorite_ask = yes_ask.max(no_ask);
+    let cheap_ask = yes_ask.min(no_ask);
+    if paired_core_directional_barbell_book(yes_ask, no_ask) {
+        return Some(format!(
+            "paired_core broad stopped: directional barbell book favorite_ask={favorite_ask:.4} cheap_ask={cheap_ask:.4} elapsed_ms={elapsed_ms}; route fresh risk exclusively to late-fav/cheap-tail"
+        ));
+    }
+    if let Some(cutoff_ms) = hard_cutoff_ms {
+        if elapsed_ms >= cutoff_ms {
+            return Some(format!(
+                "paired_core broad suppressed: late-window cutoff elapsed_ms={elapsed_ms} cutoff_ms={cutoff_ms}; late-fav/cheap-tail lanes own fresh risk"
+            ));
+        }
+    }
+    match input.btc_regime.regime() {
+        Some(BtcRegime::Whipsaw) if elapsed_ms >= 90_000 => Some(format!(
+            "paired_core broad suppressed: whipsaw path elapsed_ms={elapsed_ms}; avoid adding inventory whose mate side may not return"
+        )),
+        Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
+            if elapsed_ms >= 120_000 =>
+        {
+            Some(format!(
+                "paired_core broad suppressed: directional late path regime={:?} elapsed_ms={elapsed_ms}; route fresh risk to late-fav/cheap-tail",
+                input.btc_regime.regime()
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn paired_core_directional_barbell_book(yes_ask: f64, no_ask: f64) -> bool {
+    let favorite_ask = yes_ask.max(no_ask);
+    let cheap_ask = yes_ask.min(no_ask);
+    (favorite_ask >= 0.80 && cheap_ask <= 0.20)
+        || (favorite_ask >= 0.90 && cheap_ask <= 0.10)
+}
+
+fn opening_chop_center_band(levels: usize, yes_ask: f64, no_ask: f64) -> usize {
+    let favorite_ask = yes_ask.max(no_ask);
+    let cheap_ask = yes_ask.min(no_ask);
+    if favorite_ask <= 0.65 && cheap_ask >= 0.35 {
+        3.min(levels / 2)
+    } else if favorite_ask <= 0.75 && cheap_ask >= 0.25 {
+        2.min(levels / 2)
+    } else {
+        0
+    }
+}
+
 fn market_elapsed_ms<M: MarketDescriptor>(input: &StrategyInput<M>) -> u64 {
     input
         .market
@@ -625,6 +687,27 @@ where
                 max_unpaired_core_qty,
             ));
 
+            if paired_core_directional_barbell_book(yes_ask, no_ask) {
+                if let Some(note) = paired_core_broad_suppression_note(
+                    &input,
+                    elapsed_ms,
+                    cfg.disable_after_elapsed_ms,
+                    yes_ask,
+                    no_ask,
+                ) {
+                    notes.push(note);
+                }
+                notes.push(
+                    "paired_core repair suppressed in directional barbell; avoid quote/cancel churn and route fresh risk to late-fav/cheap-tail".to_string(),
+                );
+                return StrategyDecision::Suppress {
+                    scope: SuppressionScope::PairedOnly,
+                    reason: CoolingReason::BtcTrending,
+                    preserve_quotes: false,
+                    notes,
+                };
+            }
+
             let min_repair_qty = input.market.min_order_size().max(0.0);
             let filled_abs_imbalance = (filled_yes_qty - filled_no_qty).abs();
             let repair_leg = if filled_yes_qty + min_repair_qty <= filled_no_qty {
@@ -741,6 +824,31 @@ where
                 ));
             }
 
+            if let Some(note) = paired_core_broad_suppression_note(
+                &input,
+                elapsed_ms,
+                cfg.disable_after_elapsed_ms,
+                yes_ask,
+                no_ask,
+            )
+            {
+                notes.push(note);
+                notes.push(format!(
+                    "paired_core broad suppressed with mate-repair preserved repair_mode={in_repair_mode} repair_intents={}",
+                    intents.len()
+                ));
+                return if intents.is_empty() {
+                    StrategyDecision::Suppress {
+                        scope: SuppressionScope::PairedOnly,
+                        reason: CoolingReason::BtcTrending,
+                        preserve_quotes: false,
+                        notes,
+                    }
+                } else {
+                    StrategyDecision::QuoteSet { intents, notes }
+                };
+            }
+
             let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
             let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
             if late_fav_yes_qty.max(late_fav_no_qty) >= min_repair_qty {
@@ -774,26 +882,23 @@ where
             }
             for idx in 0..levels {
                 if in_repair_mode {
-                    let max_repair_continuation_imbalance =
-                        cfg.clip_shares.max(input.market.min_order_size()).max(0.0);
-                    if filled_abs_imbalance > max_repair_continuation_imbalance + 1e-9 {
+                    if filled_abs_imbalance >= max_unpaired_core_qty + 1e-9 {
                         notes.push(format!(
-                            "paired_core repair-continuation suppressed: filled_abs_imbalance={filled_abs_imbalance:.4} max_allowed={max_repair_continuation_imbalance:.4}",
+                            "paired_core repair-continuation suppressed: filled_abs_imbalance={filled_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}",
                         ));
                         break;
                     }
-                    if idx != levels / 2 {
-                        notes.push(format!(
-                            "paired_core repair-continuation suppressing non-center bundle idx={idx}",
-                        ));
-                        continue;
-                    }
                 }
-                if chop_note.is_some() && elapsed_ms <= 90_000 && idx != levels / 2 {
+                if chop_note.is_some() && elapsed_ms <= 90_000 {
+                    let center_idx = levels / 2;
+                    let center_band = opening_chop_center_band(levels, yes_ask, no_ask);
+                    let distance_from_center = idx.abs_diff(center_idx);
+                    if distance_from_center > center_band {
                     notes.push(format!(
-                        "paired_core opening presence only: suppressing non-center bundle idx={idx} elapsed_ms={elapsed_ms}",
+                        "paired_core opening presence band: suppressing outer bundle idx={idx} center_idx={center_idx} center_band={center_band} elapsed_ms={elapsed_ms} yes_ask={yes_ask:.4} no_ask={no_ask:.4}",
                     ));
                     continue;
+                    }
                 }
                 let Some(yes_intent) = ladder_candidate(
                     &input.market,

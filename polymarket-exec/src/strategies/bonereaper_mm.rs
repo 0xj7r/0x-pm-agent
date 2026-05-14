@@ -42,6 +42,13 @@ pub struct FavoriteClimbConfig {
     pub require_spot_match: bool,
     /// Clip/cap multiplier in noise-dominant high-vol regimes.
     pub regime_whipsaw_multiplier: f64,
+    /// Override multiplier once the favorite is 90c+ in whipsaw. This keeps
+    /// sub-90 probes defensive while allowing true late-cert to express.
+    pub whipsaw_true_favorite_multiplier: f64,
+    /// Extra maker improvement for 85-89c favorite orders. These are still
+    /// post-only, but should sit near-touch rather than passively behind.
+    pub near_touch_min_favorite_ask: f64,
+    pub near_touch_maker_improve_ticks: f64,
     /// Clip/cap multiplier in low-vol, low-trend regimes.
     pub regime_flat_multiplier: f64,
     /// Clip/cap multiplier when trend is present but volatility is elevated.
@@ -77,6 +84,9 @@ impl Default for FavoriteClimbConfig {
             spot_filter_bps: 10.0,
             require_spot_match: true,
             regime_whipsaw_multiplier: 0.25,
+            whipsaw_true_favorite_multiplier: 0.70,
+            near_touch_min_favorite_ask: 0.85,
+            near_touch_maker_improve_ticks: 3.0,
             regime_flat_multiplier: 0.50,
             regime_trending_volatile_multiplier: 0.60,
             regime_unknown_multiplier: 0.70,
@@ -195,6 +205,7 @@ struct FavoriteEntryPolicy {
     clip_multiplier: f64,
     cap_multiplier: f64,
     allow_taker: bool,
+    near_touch_maker: bool,
     path_reversal_risk: f64,
     label: &'static str,
 }
@@ -356,6 +367,28 @@ fn maker_limit_price(bid: f64, ask: f64, tick: f64, improve_ticks: f64) -> Optio
         return None;
     }
     Some(px)
+}
+
+fn late_favorite_maker_base_price(
+    bid: f64,
+    ask: f64,
+    tick: f64,
+    cfg: &FavoriteClimbConfig,
+    entry_policy: &FavoriteEntryPolicy,
+) -> Option<f64> {
+    if !entry_policy.near_touch_maker {
+        return maker_limit_price(bid, ask, tick, cfg.maker_improve_ticks);
+    }
+    let passive_px = maker_limit_price(bid, ask, tick, cfg.maker_improve_ticks)?;
+    let near_touch_ticks = if ask >= cfg.near_touch_min_favorite_ask {
+        1.0
+    } else {
+        2.0
+    };
+    let near_touch_px = ask - tick * near_touch_ticks;
+    let max_passive = (ask - tick).max(tick);
+    let px = passive_px.max(near_touch_px).min(max_passive);
+    (px > 0.0 && px < ask && px < 1.0).then_some(px)
 }
 
 fn build_late_favorite_intent<M: MarketDescriptor>(
@@ -826,6 +859,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             clip_multiplier: if early_late { 0.20 } else { 0.35 },
             cap_multiplier: if early_late { 0.20 } else { 0.35 },
             allow_taker: false,
+            near_touch_maker: false,
             path_reversal_risk,
             label: if early_late {
                 "probe_70_79_early"
@@ -851,6 +885,15 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         let reversal_scale = (1.0 - 0.50 * path_reversal_risk).clamp(0.50, 1.0);
         let whipsaw_scale = if whipsaw { 0.50 } else { 1.0 };
         let flat_scale = if flat_regime && early_late { 0.80 } else { 1.0 };
+        let clean_directional_persistence = !whipsaw
+            && path_reversal_risk <= 0.20
+            && strongest >= threshold * 1.50
+            && recent >= threshold * 0.25
+            && model_favorite >= 0.88;
+        let near_touch_maker = legs.favorite_ask >= 0.85
+            && !whipsaw
+            && path_reversal_risk <= 0.35
+            && (clean_directional_persistence || strongest >= threshold * 1.15);
         return Some(FavoriteEntryPolicy {
             min_price: 0.80,
             max_levels: if whipsaw {
@@ -868,9 +911,14 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 * reversal_scale
                 * whipsaw_scale
                 * flat_scale,
-            allow_taker: false,
+            allow_taker: clean_directional_persistence
+                && legs.favorite_ask >= 0.85
+                && elapsed_sec >= 210,
+            near_touch_maker,
             path_reversal_risk,
-            label: if whipsaw {
+            label: if clean_directional_persistence && legs.favorite_ask >= 0.85 {
+                "maker_ladder_80_89_clean_persistent"
+            } else if whipsaw {
                 "maker_ladder_80_89_whipsaw"
             } else if flat_regime && early_late {
                 "maker_ladder_80_89_flat_early"
@@ -883,11 +931,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
 
     let whipsaw_scale = if whipsaw {
-        if early_late {
-            0.45
-        } else {
-            0.70
-        }
+        cfg.whipsaw_true_favorite_multiplier.clamp(0.0, 1.0)
     } else {
         1.0
     };
@@ -904,6 +948,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         clip_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
         cap_multiplier: (if early_late { 0.60 } else { 1.0 }) * reversal_scale * whipsaw_scale,
         allow_taker: true,
+        near_touch_maker: true,
         path_reversal_risk,
         label: if early_late && whipsaw {
             "true_late_fav_90_plus_whipsaw_early"
@@ -1256,11 +1301,12 @@ where
                     climb_cfg.max_load_usd * regime_multiplier * entry_policy.cap_multiplier;
                 let remaining_load = (adjusted_max_load_usd - current_exposure_usd).max(0.0);
                 if remaining_load >= climb_cfg.min_order_usd {
-                    if let Some(base_px) = maker_limit_price(
+                    if let Some(base_px) = late_favorite_maker_base_price(
                         legs.favorite_bid,
                         legs.favorite_ask,
                         tick,
-                        climb_cfg.maker_improve_ticks,
+                        &climb_cfg,
+                        &entry_policy,
                     ) {
                         let raw_clip = reactive_climb_clip_usd(
                             &climb_cfg,
@@ -1277,12 +1323,16 @@ where
                             * entry_policy.clip_multiplier)
                             .max(climb_cfg.min_order_usd);
                         let mut load_left = remaining_load;
+                        let use_sub90_fak = entry_policy.allow_taker
+                            && legs.favorite_ask >= 0.80
+                            && legs.favorite_ask < climb_cfg.taker_min_favorite_ask
+                            && remaining_ms <= climb_cfg.taker_window_sec.saturating_mul(1_000);
                         let use_aggressive_taker = entry_policy.allow_taker
-                            && should_use_aggressive_favorite_taker(
+                            && (should_use_aggressive_favorite_taker(
                                 &climb_cfg,
                                 legs.favorite_ask,
                                 remaining_ms,
-                            );
+                            ) || use_sub90_fak);
                         let level_count = (if use_aggressive_taker {
                             favorite_load_levels(legs.favorite_ask, remaining_ms)
                         } else if legs.favorite_ask < climb_cfg.taker_min_favorite_ask {
@@ -1607,6 +1657,7 @@ impl BonereaperMmStrategy {
         let mut notes = Vec::new();
         let mut quote_intents = Vec::new();
         let mut reactive_intents = Vec::new();
+        let mut runtime_commands = Vec::new();
         let mut hard_suppressed = false;
         let mut soft_suppressed = false;
 
@@ -1637,9 +1688,10 @@ impl BonereaperMmStrategy {
                     notes.extend(decision_notes);
                 }
                 Merge {
-                    intent: _,
+                    intent,
                     notes: decision_notes,
                 } => {
+                    runtime_commands.push(RuntimeCommand::Merge(intent));
                     notes.extend(
                         decision_notes
                             .into_iter()
@@ -1658,7 +1710,9 @@ impl BonereaperMmStrategy {
                             .filter(|note| !is_merge_planner_note(note)),
                     );
                     for command in commands {
-                        if !matches!(command, RuntimeCommand::Merge(_)) {
+                        if matches!(command, RuntimeCommand::Merge(_)) {
+                            runtime_commands.push(command);
+                        } else {
                             notes.push(
                                 "bonereaper ignored unsupported child runtime command".to_string(),
                             );
@@ -1693,14 +1747,37 @@ impl BonereaperMmStrategy {
         }
         if !reactive_intents.is_empty() {
             reactive_intents.extend(quote_intents);
-            return StrategyDecision::Rescue {
-                intents: reactive_intents,
-                notes,
+            return if runtime_commands.is_empty() {
+                StrategyDecision::Rescue {
+                    intents: reactive_intents,
+                    notes,
+                }
+            } else {
+                StrategyDecision::Mixed {
+                    intents: reactive_intents,
+                    commands: runtime_commands,
+                    notes,
+                }
             };
         }
         if !quote_intents.is_empty() {
-            return StrategyDecision::QuoteSet {
-                intents: quote_intents,
+            return if runtime_commands.is_empty() {
+                StrategyDecision::QuoteSet {
+                    intents: quote_intents,
+                    notes,
+                }
+            } else {
+                StrategyDecision::Mixed {
+                    intents: quote_intents,
+                    commands: runtime_commands,
+                    notes,
+                }
+            };
+        }
+        if !runtime_commands.is_empty() {
+            return StrategyDecision::Mixed {
+                intents: Vec::new(),
+                commands: runtime_commands,
                 notes,
             };
         }

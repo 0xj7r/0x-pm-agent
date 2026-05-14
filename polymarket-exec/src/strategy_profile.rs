@@ -75,6 +75,9 @@ pub struct FavoriteClimbSubsection {
     pub spot_filter_bps: Option<f64>,
     pub require_spot_match: Option<bool>,
     pub regime_whipsaw_multiplier: Option<f64>,
+    pub whipsaw_true_favorite_multiplier: Option<f64>,
+    pub near_touch_min_favorite_ask: Option<f64>,
+    pub near_touch_maker_improve_ticks: Option<f64>,
     pub regime_flat_multiplier: Option<f64>,
     pub regime_trending_volatile_multiplier: Option<f64>,
     pub regime_unknown_multiplier: Option<f64>,
@@ -138,6 +141,7 @@ pub struct CoreHedgeSection {
     pub merge_min_qty: Option<f64>,
     pub merge_batch_cap: Option<f64>,
     pub merge_disabled_after_ms: Option<u64>,
+    pub disable_after_elapsed_ms: Option<u64>,
     pub clip_scale: Option<f64>,
 }
 
@@ -221,6 +225,7 @@ impl StrategyProfile {
                 merge_min_qty: s.merge_min_qty.unwrap_or(defaults.merge_min_qty),
                 merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
                 disable_merge_after_ms: s.merge_disabled_after_ms,
+                disable_after_elapsed_ms: s.disable_after_elapsed_ms,
                 ..defaults
             },
         }
@@ -252,6 +257,15 @@ impl StrategyProfile {
                 regime_whipsaw_multiplier: c
                     .regime_whipsaw_multiplier
                     .unwrap_or(climb_def.regime_whipsaw_multiplier),
+                whipsaw_true_favorite_multiplier: c
+                    .whipsaw_true_favorite_multiplier
+                    .unwrap_or(climb_def.whipsaw_true_favorite_multiplier),
+                near_touch_min_favorite_ask: c
+                    .near_touch_min_favorite_ask
+                    .unwrap_or(climb_def.near_touch_min_favorite_ask),
+                near_touch_maker_improve_ticks: c
+                    .near_touch_maker_improve_ticks
+                    .unwrap_or(climb_def.near_touch_maker_improve_ticks),
                 regime_flat_multiplier: c
                     .regime_flat_multiplier
                     .unwrap_or(climb_def.regime_flat_multiplier),
@@ -546,6 +560,7 @@ fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
         || s.merge_min_qty.is_some()
         || s.merge_batch_cap.is_some()
         || s.merge_disabled_after_ms.is_some()
+        || s.disable_after_elapsed_ms.is_some()
         || s.clip_scale.is_some()
 }
 
@@ -627,6 +642,8 @@ pub struct ProfileRisk {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfilePair {
+    pub merge_enabled: Option<bool>,
+    pub pressure_merge_enabled: Option<bool>,
     pub min_merge_notional_usd: Option<f64>,
     pub merge_pressure_free_cash_ratio: Option<f64>,
     pub merge_pressure_gross_exposure_ratio: Option<f64>,
