@@ -1,13 +1,15 @@
 //! Polymarket builder-relayer helpers for CTF merge transactions.
 
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::dyn_abi::Eip712Domain;
 use alloy::hex::ToHexExt as _;
 use alloy::primitives::{address, keccak256, Address, Bytes, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolStruct as _};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 
@@ -21,9 +23,12 @@ pub const DEFAULT_PUSD_ADDRESS: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82D
 
 const POLYMARKET_PROXY_FACTORY: Address = address!("aB45c5A4B0c941a2F231C04C3f49182e1A254052");
 const POLYMARKET_RELAY_HUB: Address = address!("D216153c06E857cD7f72665E0aF1d7D82172F494");
+const POLYMARKET_DEPOSIT_WALLET_FACTORY: Address =
+    address!("00000000000Fb5C9ADea0298D729A0CB3823Cc07");
 const PROXY_INIT_CODE_HASH: &str =
     "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b";
 const DEFAULT_PROXY_GAS_LIMIT: u64 = 10_000_000;
+const DEFAULT_WALLET_BATCH_DEADLINE_SECS: u64 = 600;
 
 sol! {
     #[derive(Debug, PartialEq)]
@@ -53,6 +58,21 @@ sol! {
 
     #[derive(Debug, PartialEq)]
     function proxy(ProxyTransactionCall[] transactions);
+
+    #[derive(Debug, PartialEq)]
+    struct Call {
+        address target;
+        uint256 value;
+        bytes data;
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Batch {
+        address wallet;
+        uint256 nonce;
+        uint256 deadline;
+        Call[] calls;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,10 +131,27 @@ pub struct CtfMergeDryRunReport {
     pub calldata_hex: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CtfRelayerEnvelopeDryRunReport {
+    pub tx_type: String,
+    pub from: Address,
+    pub to: Address,
+    pub deposit_wallet: Option<Address>,
+    pub nonce: String,
+    pub call_count: usize,
+    pub signature_bytes: usize,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayPayload {
     address: String,
+    nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NoncePayload {
     nonce: String,
 }
 
@@ -154,6 +191,35 @@ struct TransactionRequest {
     metadata: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WalletTransactionRequest {
+    #[serde(rename = "type")]
+    tx_type: String,
+    from: String,
+    to: String,
+    nonce: String,
+    signature: String,
+    deposit_wallet_params: DepositWalletParams,
+    metadata: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DepositWalletParams {
+    deposit_wallet: String,
+    deadline: String,
+    calls: Vec<DepositWalletCallRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DepositWalletCallRequest {
+    target: String,
+    value: String,
+    data: String,
+}
+
 impl CtfRelayerClient {
     pub fn new(config: CtfRelayerConfig) -> Self {
         let eoa_submitter = if config.signature_type_code == 0 {
@@ -191,9 +257,10 @@ impl CtfRelayerClient {
                     .await?;
                 self.submit(body).await
             }
+            3 => self.submit_wallet_merge(&request).await,
             0 => self.submit_eoa_merge(&request).await,
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
+                "CTF relayer merge supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), =2 (gnosis_safe), or =3 (poly_1271), got {other}",
             ))),
         }
     }
@@ -221,6 +288,43 @@ impl CtfRelayerClient {
         })
     }
 
+    pub async fn dry_run_merge_submission_envelope(
+        &self,
+        request: &CtfMergeRequest,
+    ) -> Result<CtfRelayerEnvelopeDryRunReport, ExecutionError> {
+        match self.config.signature_type_code {
+            3 => {
+                let calldata =
+                    self.merge_positions_calldata(&request.condition_id, request.quantity)?;
+                let body = self
+                    .build_wallet_transaction_request(
+                        &request.signer,
+                        vec![wallet_call_request(
+                            &self.config.ctf_contract_address,
+                            Bytes::from(calldata),
+                        )?],
+                        request.metadata.clone(),
+                    )
+                    .await?;
+                Ok(CtfRelayerEnvelopeDryRunReport {
+                    tx_type: body.tx_type,
+                    from: parse_address(&body.from, "dry-run from")?,
+                    to: parse_address(&body.to, "dry-run to")?,
+                    deposit_wallet: Some(parse_address(
+                        &body.deposit_wallet_params.deposit_wallet,
+                        "dry-run deposit wallet",
+                    )?),
+                    nonce: body.nonce,
+                    call_count: body.deposit_wallet_params.calls.len(),
+                    signature_bytes: signature_hex_len_bytes(&body.signature)?,
+                })
+            }
+            other => Err(ExecutionError::BadRequest(format!(
+                "merge relayer envelope dry-run is implemented for POLYMARKET_SIGNATURE_TYPE=3 (poly_1271), got {other}",
+            ))),
+        }
+    }
+
     pub async fn redeem_positions(
         &self,
         request: CtfRedeemRequest,
@@ -246,9 +350,10 @@ impl CtfRelayerClient {
                     .await?;
                 self.submit(body).await
             }
+            3 => self.submit_wallet_redeem(&request).await,
             0 => self.submit_eoa_redeem(&request).await,
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF relayer redeem supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
+                "CTF relayer redeem supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), =2 (gnosis_safe), or =3 (poly_1271), got {other}",
             ))),
         }
     }
@@ -278,8 +383,9 @@ impl CtfRelayerClient {
         match self.config.signature_type_code {
             0 => Ok(signer.address()),
             1 | 2 => self.proxy_wallet(signer.address()),
+            3 => self.deposit_wallet(),
             other => Err(ExecutionError::BadRequest(format!(
-                "CTF merge dry-run supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), or =2 (gnosis_safe), got {other}",
+                "CTF merge dry-run supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), =2 (gnosis_safe), or =3 (poly_1271), got {other}",
             ))),
         }
     }
@@ -306,6 +412,131 @@ impl CtfRelayerClient {
             transaction_id: None,
             state: Some("MINED".to_string()),
             transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
+        })
+    }
+
+    async fn submit_wallet_merge(
+        &self,
+        request: &CtfMergeRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let calldata = self.merge_positions_calldata(&request.condition_id, request.quantity)?;
+        let body = self
+            .build_wallet_transaction_request(
+                &request.signer,
+                vec![wallet_call_request(
+                    &self.config.ctf_contract_address,
+                    Bytes::from(calldata),
+                )?],
+                request.metadata.clone(),
+            )
+            .await?;
+        self.submit(body).await
+    }
+
+    async fn submit_wallet_redeem(
+        &self,
+        request: &CtfRedeemRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let calldata = self.redeem_positions_calldata(
+            request.collateral_token_address.as_deref(),
+            &request.condition_id,
+            &request.index_sets,
+        )?;
+        let body = self
+            .build_wallet_transaction_request(
+                &request.signer,
+                vec![wallet_call_request(
+                    &self.config.ctf_contract_address,
+                    Bytes::from(calldata),
+                )?],
+                request.metadata.clone(),
+            )
+            .await?;
+        self.submit(body).await
+    }
+
+    async fn build_wallet_transaction_request(
+        &self,
+        signer: &PrivateKeySigner,
+        calls: Vec<DepositWalletCallRequest>,
+        metadata: String,
+    ) -> Result<WalletTransactionRequest, ExecutionError> {
+        let owner = signer.address();
+        let nonce = self.wallet_nonce(owner).await?;
+        let deadline = now_unix_secs()?.saturating_add(DEFAULT_WALLET_BATCH_DEADLINE_SECS);
+        self.build_wallet_transaction_request_with_nonce_deadline(
+            signer, calls, nonce, deadline, metadata,
+        )
+        .await
+    }
+
+    async fn build_wallet_transaction_request_with_nonce_deadline(
+        &self,
+        signer: &PrivateKeySigner,
+        calls: Vec<DepositWalletCallRequest>,
+        nonce: String,
+        deadline: u64,
+        metadata: String,
+    ) -> Result<WalletTransactionRequest, ExecutionError> {
+        let owner = signer.address();
+        let deposit_wallet = self.deposit_wallet()?;
+        let typed_calls = calls
+            .iter()
+            .map(|call| {
+                Ok(Call {
+                    target: parse_address(&call.target, "deposit wallet call target")?,
+                    value: U256::from_str(&call.value).map_err(|error| {
+                        ExecutionError::BadRequest(format!(
+                            "invalid deposit wallet call value `{}`: {error}",
+                            call.value
+                        ))
+                    })?,
+                    data: Bytes::from_str(&call.data).map_err(|error| {
+                        ExecutionError::BadRequest(format!(
+                            "invalid deposit wallet call data `{}`: {error}",
+                            call.data
+                        ))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        let batch = Batch {
+            wallet: deposit_wallet,
+            nonce: U256::from_str(&nonce).map_err(|error| {
+                ExecutionError::BadRequest(format!(
+                    "invalid WALLET relayer nonce `{nonce}`: {error}"
+                ))
+            })?,
+            deadline: U256::from(deadline),
+            calls: typed_calls,
+        };
+        let domain = Eip712Domain {
+            name: Some(std::borrow::Cow::Borrowed("DepositWallet")),
+            version: Some(std::borrow::Cow::Borrowed("1")),
+            chain_id: Some(U256::from(137_u64)),
+            verifying_contract: Some(deposit_wallet),
+            ..Eip712Domain::default()
+        };
+        let signature = signer
+            .sign_hash(&batch.eip712_signing_hash(&domain))
+            .await
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("failed to sign deposit wallet batch: {error}"))
+            })?
+            .to_string();
+
+        Ok(WalletTransactionRequest {
+            tx_type: "WALLET".to_string(),
+            from: owner.to_string(),
+            to: POLYMARKET_DEPOSIT_WALLET_FACTORY.to_string(),
+            nonce,
+            signature,
+            deposit_wallet_params: DepositWalletParams {
+                deposit_wallet: deposit_wallet.to_string(),
+                deadline: deadline.to_string(),
+                calls,
+            },
+            metadata,
         })
     }
 
@@ -489,7 +720,24 @@ impl CtfRelayerClient {
         decode_response(response, "relayer relay-payload").await
     }
 
-    async fn submit(&self, body: TransactionRequest) -> Result<RelayerSubmitAck, ExecutionError> {
+    async fn wallet_nonce(&self, signer: Address) -> Result<String, ExecutionError> {
+        let url = format!("{}/nonce", self.config.relayer_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(&url)
+            .query(&[
+                ("address", signer.to_string()),
+                ("type", "WALLET".to_string()),
+            ])
+            .headers(self.builder_headers()?)
+            .send()
+            .await
+            .map_err(|error| ExecutionError::TransientNetwork(error.to_string()))?;
+        let payload: NoncePayload = decode_response(response, "relayer wallet nonce").await?;
+        Ok(payload.nonce)
+    }
+
+    async fn submit<T: Serialize>(&self, body: T) -> Result<RelayerSubmitAck, ExecutionError> {
         let url = format!("{}/submit", self.config.relayer_url.trim_end_matches('/'));
         let body = serde_json::to_string(&body).map_err(|error| {
             ExecutionError::BadRequest(format!("failed to serialize relayer submit body: {error}"))
@@ -556,6 +804,20 @@ impl CtfRelayerClient {
             .map(|value| parse_address(value, "proxy wallet"))
             .transpose()
             .map(|value| value.unwrap_or_else(|| derive_proxy_wallet(from)))
+    }
+
+    fn deposit_wallet(&self) -> Result<Address, ExecutionError> {
+        self.config
+            .proxy_wallet_address
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_address(value, "deposit wallet"))
+            .transpose()?
+            .ok_or_else(|| {
+                ExecutionError::BadRequest(
+                    "POLY_1271 CTF relayer actions require POLYMARKET_PROXY_WALLET_ADDRESS/POLYMARKET_FUNDER_ADDRESS to be the deposit wallet address".to_string(),
+                )
+            })
     }
 }
 
@@ -647,6 +909,40 @@ fn create2_address(factory: Address, salt: B256, init_code_hash: B256) -> Addres
 
 fn u256_be_bytes(value: U256) -> [u8; 32] {
     value.to_be_bytes::<32>()
+}
+
+fn wallet_call_request(
+    target: &str,
+    data: Bytes,
+) -> Result<DepositWalletCallRequest, ExecutionError> {
+    let target = parse_address(target, "deposit wallet call target")?;
+    Ok(DepositWalletCallRequest {
+        target: target.to_string(),
+        value: "0".to_string(),
+        data: data.encode_hex_with_prefix(),
+    })
+}
+
+fn now_unix_secs() -> Result<u64, ExecutionError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| {
+            ExecutionError::BadRequest(format!("system clock before UNIX_EPOCH: {error}"))
+        })
+}
+
+fn signature_hex_len_bytes(signature: &str) -> Result<usize, ExecutionError> {
+    let value = signature
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or(signature.trim());
+    if value.len() % 2 != 0 {
+        return Err(ExecutionError::BadRequest(
+            "signature hex has odd length".to_string(),
+        ));
+    }
+    Ok(value.len() / 2)
 }
 
 #[cfg(test)]
@@ -850,5 +1146,52 @@ mod tests {
         assert_eq!(body.metadata, "{\"test\":true}");
         assert!(body.data.starts_with("0x"));
         assert!(body.signature.starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn wallet_merge_builds_poly1271_wallet_batch_request() {
+        let mut config = test_config();
+        config.signature_type_code = 3;
+        config.proxy_wallet_address =
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string());
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+        let calldata = client
+            .merge_positions_calldata(
+                "0xf3eb9227564ea848dc5d95a577c06e11b67d3223046ff2decf53c63144d14908",
+                5.0,
+            )
+            .expect("merge calldata");
+
+        let body = client
+            .build_wallet_transaction_request_with_nonce_deadline(
+                &signer,
+                vec![wallet_call_request(DEFAULT_CTF_ADDRESS, Bytes::from(calldata)).unwrap()],
+                "7".to_string(),
+                1_760_000_000,
+                "{\"wallet\":true}".to_string(),
+            )
+            .await
+            .expect("wallet transaction request");
+
+        assert_eq!(body.tx_type, "WALLET");
+        assert_eq!(body.to, POLYMARKET_DEPOSIT_WALLET_FACTORY.to_string());
+        assert_eq!(
+            body.deposit_wallet_params.deposit_wallet,
+            "0xa57189d5b2285A5E64083d3925687bDFCE01fC83"
+        );
+        assert_eq!(body.nonce, "7");
+        assert_eq!(body.deposit_wallet_params.deadline, "1760000000");
+        assert_eq!(body.deposit_wallet_params.calls.len(), 1);
+        assert_eq!(
+            body.deposit_wallet_params.calls[0].target,
+            DEFAULT_CTF_ADDRESS
+        );
+        assert_eq!(body.deposit_wallet_params.calls[0].value, "0");
+        assert_eq!(body.metadata, "{\"wallet\":true}");
+        assert_eq!(signature_hex_len_bytes(&body.signature).unwrap(), 65);
     }
 }

@@ -119,10 +119,10 @@ impl PolymarketSignatureType {
 
     pub fn as_ctf_relayer_code(self) -> u8 {
         match self {
-            // POLY1271 is only a CLOB order-signing mode. The CTF relayer
-            // accepts EOA/proxy/safe transaction envelopes, so deposit-wallet
-            // sessions must recycle through the configured proxy wallet.
-            Self::Poly1271 => 1,
+            // POLY1271 deposit wallets use the relayer WALLET batch flow for
+            // CTF wallet actions. It is distinct from the CLOB order
+            // signature type and from the legacy proxy envelope.
+            Self::Poly1271 => 3,
             other => other.as_polymarket_code(),
         }
     }
@@ -424,6 +424,7 @@ impl PolymarketExecutionAdapter {
             proxy_wallet_address: relayer_proxy_wallet_address(
                 &config,
                 &credentials.funder_address,
+                credentials.signature_type,
             ),
             signature_type_code: credentials.signature_type.as_ctf_relayer_code(),
             polygon_rpc_url: config.polygon_rpc_url.clone(),
@@ -514,6 +515,7 @@ impl PolymarketExecutionAdapter {
             proxy_wallet_address: relayer_proxy_wallet_address(
                 &config,
                 &credentials.funder_address,
+                credentials.signature_type,
             ),
             signature_type_code: credentials.signature_type.as_ctf_relayer_code(),
             polygon_rpc_url: config.polygon_rpc_url.clone(),
@@ -1569,11 +1571,15 @@ impl PolymarketExecutionAdapter {
 fn relayer_proxy_wallet_address(
     config: &PolymarketConfig,
     funder_address: &Option<String>,
+    signature_type: PolymarketSignatureType,
 ) -> Option<String> {
-    config
-        .proxy_wallet_address
-        .clone()
-        .or_else(|| funder_address.clone())
+    config.proxy_wallet_address.clone().or_else(|| {
+        if signature_type == PolymarketSignatureType::Poly1271 {
+            funder_address.clone()
+        } else {
+            None
+        }
+    })
 }
 
 #[async_trait]
