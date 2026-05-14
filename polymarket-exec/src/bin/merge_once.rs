@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         std::env::var("POLYMARKET_SIGNATURE_TYPE").unwrap_or_else(|_| "eoa".to_string());
     let signature_type = PolymarketSignatureType::parse(&signature_type_raw)
         .map_err(|e| anyhow!("failed to parse signature type: {e:?}"))?;
-    let signature_type_code = signature_type.as_polymarket_code();
+    let signature_type_code = signature_type.as_ctf_relayer_code();
 
     let polygon_rpc_url = std::env::var("POLYGON_RPC_URL").ok();
     let config = CtfRelayerConfig {

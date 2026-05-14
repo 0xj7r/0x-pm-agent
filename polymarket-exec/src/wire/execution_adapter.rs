@@ -117,7 +117,7 @@ impl PolymarketSignatureType {
         }
     }
 
-    fn as_ctf_relayer_code(self) -> u8 {
+    pub fn as_ctf_relayer_code(self) -> u8 {
         match self {
             // POLY1271 is only a CLOB order-signing mode. The CTF relayer
             // accepts EOA/proxy/safe transaction envelopes, so deposit-wallet
@@ -817,8 +817,10 @@ impl PolymarketExecutionAdapter {
         })?;
 
         // V2 keeps expiration outside the signed order. GTC uses epoch
-        // expiration (0), matching the public migration docs; GTD uses
-        // the requested future expiry or defaults to 1h ahead.
+        // expiration (0), matching the public migration docs. For GTD,
+        // Polymarket requires a one minute security threshold, so submit
+        // the venue-padded expiry instead of falling back to the SDK's
+        // one-hour default for short-lived 5m-market quotes.
         // V2 SDK validates: "Only GTD orders may have a non-zero expiration".
         // Both GTC and IOC must pass expiration=0 (epoch). Previously this
         // only zeroed for GTC; IOC fell through to the 1h default and the
@@ -1180,8 +1182,9 @@ impl PolymarketExecutionAdapter {
             TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok => 0,
             TimeInForce::Gtd => req
                 .expires_at_ms
+                .map(Self::venue_gtd_expiration_ms)
                 .filter(|ms| *ms > now_ms + 60_000)
-                .unwrap_or_else(|| now_ms + 3_600_000),
+                .unwrap_or_else(|| now_ms + 65_000),
         };
         Utc.timestamp_millis_opt(expiration_ms as i64)
             .single()

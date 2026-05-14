@@ -347,7 +347,19 @@ fn v2_sdk_expiration_uses_valid_gtd_expiration() {
 
     assert_eq!(
         PolymarketExecutionAdapter::v2_sdk_expiration_dt(&req, now_ms).timestamp_millis(),
-        future_expiration_ms as i64
+        PolymarketExecutionAdapter::venue_gtd_expiration_ms(future_expiration_ms) as i64
+    );
+}
+
+#[test]
+fn v2_sdk_expiration_pads_short_live_gtd_ttl_instead_of_defaulting_to_one_hour() {
+    let now_ms = 1_800_000_000_000;
+    let mut req = submit_req(TimeInForce::Gtd, true);
+    req.expires_at_ms = Some(now_ms + 20_000);
+
+    assert_eq!(
+        PolymarketExecutionAdapter::v2_sdk_expiration_dt(&req, now_ms).timestamp_millis(),
+        (now_ms + 80_000) as i64
     );
 }
 
