@@ -14,6 +14,8 @@ use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyC
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, MarketId, RuntimeCommand, StrategyDecision, SuppressionScope};
 
+const BINARY_MARKET_TICK_SIZE: f64 = 0.01;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
     pub enabled: bool,
@@ -576,7 +578,8 @@ fn reactive_climb_clip_usd(
     } else {
         250.0
     };
-    let price_scale = favorite_load_price_scale(favorite_ask, cfg.min_favorite_ask);
+    let price_scale =
+        favorite_load_price_scale(favorite_ask, cfg.min_favorite_ask, cfg.taker_min_favorite_ask);
     let ramp = raw_ramp * price_scale;
     ramp.max(cfg.min_order_usd)
 }
@@ -625,10 +628,14 @@ fn late_favorite_regime_multiplier(
     regime: &crate::signals::BtcRegimeSnapshot,
     favorite_leg: LadderLeg,
     cfg: &FavoriteClimbConfig,
+    favorite_ask: f64,
 ) -> f64 {
     let base = match regime.regime() {
         Some(BtcRegime::DirectionalSmooth) => 1.0,
         Some(BtcRegime::TrendingVolatile) => cfg.regime_trending_volatile_multiplier,
+        Some(BtcRegime::Whipsaw) if favorite_ask >= cfg.taker_min_favorite_ask => {
+            cfg.whipsaw_true_favorite_multiplier
+        }
         Some(BtcRegime::Whipsaw) => cfg.regime_whipsaw_multiplier,
         Some(BtcRegime::Flat) => cfg.regime_flat_multiplier,
         None => cfg.regime_unknown_multiplier,
@@ -655,12 +662,16 @@ fn late_favorite_regime_multiplier(
     (base * reversal_multiplier).clamp(0.05, 1.0)
 }
 
-fn favorite_load_price_scale(favorite_ask: f64, min_favorite_ask: f64) -> f64 {
-    if favorite_ask >= 0.90 {
+fn favorite_load_price_scale(
+    favorite_ask: f64,
+    min_favorite_ask: f64,
+    true_favorite_min_ask: f64,
+) -> f64 {
+    if favorite_ask >= true_favorite_min_ask {
         return 1.0;
     }
-    let floor = min_favorite_ask.clamp(0.01, 0.89);
-    let span = (0.90 - floor).max(0.01);
+    let floor = min_favorite_ask.clamp(0.01, true_favorite_min_ask - 0.01);
+    let span = (true_favorite_min_ask - floor).max(0.01);
     let progress = ((favorite_ask - floor) / span).clamp(0.0, 1.0);
     0.15 + 0.85 * progress
 }
@@ -774,10 +785,10 @@ fn favorite_direction_signal<M: MarketDescriptor>(
     )
 }
 
-fn favorite_load_levels(favorite_ask: f64, remaining_ms: u64) -> usize {
-    if favorite_ask >= 0.90 && remaining_ms <= 120_000 {
+fn favorite_load_levels(cfg: &FavoriteClimbConfig, favorite_ask: f64, remaining_ms: u64) -> usize {
+    if favorite_ask >= cfg.taker_min_favorite_ask && remaining_ms <= 120_000 {
         5
-    } else if favorite_ask >= 0.90 {
+    } else if favorite_ask >= cfg.taker_min_favorite_ask {
         4
     } else if favorite_ask >= 0.80 {
         3
@@ -788,14 +799,81 @@ fn favorite_load_levels(favorite_ask: f64, remaining_ms: u64) -> usize {
     }
 }
 
+fn is_pre_standard_late_favorite_window(cfg: &FavoriteClimbConfig, remaining_ms: u64) -> bool {
+    remaining_ms > cfg.taker_window_sec.saturating_mul(1_000)
+}
+
+fn is_directional_barbell_favorite(
+    cfg: &FavoriteClimbConfig,
+    favorite_ask: f64,
+    cheap_ask: f64,
+) -> bool {
+    favorite_ask >= cfg.taker_min_favorite_ask
+        && favorite_ask + cheap_ask <= 1.0 + 2.0 * BINARY_MARKET_TICK_SIZE + 1e-9
+}
+
+fn early_barbell_late_favorite_blocked(
+    cfg: &FavoriteClimbConfig,
+    whipsaw: bool,
+    path_reversal_risk: f64,
+    favorite_ask: f64,
+    strongest: f64,
+    threshold: f64,
+    model_favorite: f64,
+) -> bool {
+    let whipsaw_reversal_limit = (1.0 - cfg.regime_whipsaw_multiplier).clamp(0.35, 0.75);
+    if whipsaw
+        && path_reversal_risk >= whipsaw_reversal_limit
+        && favorite_ask < cfg.taker_min_favorite_ask + 3.0 * BINARY_MARKET_TICK_SIZE
+    {
+        return true;
+    }
+
+    strongest < threshold * cfg.regime_unknown_multiplier.clamp(0.35, 1.0)
+        && model_favorite < cfg.taker_min_favorite_ask
+}
+
+fn late_favorite_timing_scale(
+    cfg: &FavoriteClimbConfig,
+    pre_standard_late_window: bool,
+    early_late: bool,
+) -> f64 {
+    if pre_standard_late_window {
+        cfg.regime_unknown_multiplier.clamp(0.35, 1.0)
+    } else if early_late {
+        cfg.regime_trending_volatile_multiplier.clamp(0.35, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn late_favorite_max_levels(
+    pre_standard_late_window: bool,
+    early_late: bool,
+    whipsaw: bool,
+) -> usize {
+    if pre_standard_late_window && whipsaw {
+        1
+    } else if pre_standard_late_window {
+        2
+    } else if early_late && whipsaw {
+        2
+    } else if early_late {
+        3
+    } else {
+        5
+    }
+}
+
 fn favorite_entry_policy<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     legs: &LegQuotes,
     cfg: &FavoriteClimbConfig,
     elapsed_ms: u64,
+    remaining_ms: u64,
 ) -> Option<FavoriteEntryPolicy> {
     let elapsed_sec = elapsed_ms / 1_000;
-    if legs.favorite_ask < 0.70 || legs.favorite_ask > cfg.max_favorite_ask {
+    if legs.favorite_ask < cfg.min_favorite_ask || legs.favorite_ask > cfg.max_favorite_ask {
         return None;
     }
 
@@ -834,8 +912,9 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         input.fair_value.p_down,
     );
     let path_reversal_risk = path_reversal_risk_score(input, legs);
-    let pre_standard_late_window = elapsed_sec < 180;
-    let directional_barbell = legs.favorite_ask >= 0.90 && legs.cheap_ask <= 0.12;
+    let pre_standard_late_window = is_pre_standard_late_favorite_window(cfg, remaining_ms);
+    let directional_barbell =
+        is_directional_barbell_favorite(cfg, legs.favorite_ask, legs.cheap_ask);
 
     if pre_standard_late_window && !directional_barbell {
         return None;
@@ -844,19 +923,24 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     if recent < -threshold * 0.35 {
         return None;
     }
-    if legs.favorite_ask < 0.90 && path_reversal_risk >= 0.50 {
+    if legs.favorite_ask < cfg.taker_min_favorite_ask && path_reversal_risk >= 0.50 {
         return None;
     }
     if early_late && path_reversal_risk >= 0.75 {
         return None;
     }
-    if pre_standard_late_window {
-        if whipsaw && path_reversal_risk >= 0.45 && legs.favorite_ask < 0.93 {
-            return None;
-        }
-        if strongest < threshold * 0.50 && model_favorite < 0.90 {
-            return None;
-        }
+    if pre_standard_late_window
+        && early_barbell_late_favorite_blocked(
+            cfg,
+            whipsaw,
+            path_reversal_risk,
+            legs.favorite_ask,
+            strongest,
+            threshold,
+            model_favorite,
+        )
+    {
+        return None;
     }
 
     if legs.favorite_ask < 0.80 {
@@ -868,7 +952,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             return None;
         }
         return Some(FavoriteEntryPolicy {
-            min_price: 0.70,
+            min_price: cfg.min_favorite_ask,
             max_levels: 1,
             clip_multiplier: if early_late { 0.20 } else { 0.35 },
             cap_multiplier: if early_late { 0.20 } else { 0.35 },
@@ -883,7 +967,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         });
     }
 
-    if legs.favorite_ask < 0.90 {
+    if legs.favorite_ask < cfg.taker_min_favorite_ask {
         if early_late
             && if flat_regime {
                 strongest < threshold * 1.15 || model_favorite < 0.86
@@ -904,7 +988,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             && strongest >= threshold * 1.50
             && recent >= threshold * 0.25
             && model_favorite >= 0.88;
-        let near_touch_maker = legs.favorite_ask >= 0.85
+        let near_touch_maker = legs.favorite_ask >= cfg.near_touch_min_favorite_ask
             && !whipsaw
             && path_reversal_risk <= 0.35
             && (clean_directional_persistence || strongest >= threshold * 1.15);
@@ -926,11 +1010,13 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 * whipsaw_scale
                 * flat_scale,
             allow_taker: clean_directional_persistence
-                && legs.favorite_ask >= 0.85
+                && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
                 && elapsed_sec >= 210,
             near_touch_maker,
             path_reversal_risk,
-            label: if clean_directional_persistence && legs.favorite_ask >= 0.85 {
+            label: if clean_directional_persistence
+                && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
+            {
                 "maker_ladder_80_89_clean_persistent"
             } else if whipsaw {
                 "maker_ladder_80_89_whipsaw"
@@ -944,34 +1030,17 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         });
     }
 
-    let whipsaw_scale = if whipsaw {
-        cfg.whipsaw_true_favorite_multiplier.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
     let reversal_scale = (1.0 - 0.55 * path_reversal_risk).clamp(0.35, 1.0);
-    let timing_scale = if pre_standard_late_window {
-        0.35
-    } else if early_late {
-        0.60
-    } else {
-        1.0
-    };
+    let timing_scale = late_favorite_timing_scale(cfg, pre_standard_late_window, early_late);
     Some(FavoriteEntryPolicy {
-        min_price: if early_late { 0.90 } else { 0.85 },
-        max_levels: if pre_standard_late_window && whipsaw {
-            1
-        } else if pre_standard_late_window {
-            2
-        } else if early_late && whipsaw {
-            2
-        } else if early_late {
-            3
+        min_price: if early_late {
+            cfg.taker_min_favorite_ask
         } else {
-            5
+            cfg.near_touch_min_favorite_ask
         },
-        clip_multiplier: timing_scale * reversal_scale * whipsaw_scale,
-        cap_multiplier: timing_scale * reversal_scale * whipsaw_scale,
+        max_levels: late_favorite_max_levels(pre_standard_late_window, early_late, whipsaw),
+        clip_multiplier: timing_scale * reversal_scale,
+        cap_multiplier: timing_scale * reversal_scale,
         allow_taker: true,
         near_touch_maker: true,
         path_reversal_risk,
@@ -1269,8 +1338,12 @@ where
 
         let climb_window_ms =
             phase_window_ms(climb_cfg.window_sec, climb_cfg.start_frac, bar_window_ms);
-        let regime_multiplier =
-            late_favorite_regime_multiplier(&input.btc_regime, legs.favorite_leg, &climb_cfg);
+        let regime_multiplier = late_favorite_regime_multiplier(
+            &input.btc_regime,
+            legs.favorite_leg,
+            &climb_cfg,
+            legs.favorite_ask,
+        );
         if climb_cfg.enabled
             && climb_enabled
             && remaining_ms <= climb_window_ms
@@ -1286,7 +1359,7 @@ where
                 ));
                 None
             } else if let Some(entry_policy) =
-                favorite_entry_policy(&input, &legs, &climb_cfg, elapsed_ms)
+                favorite_entry_policy(&input, &legs, &climb_cfg, elapsed_ms, remaining_ms)
             {
                 notes.push(signal_note);
                 notes.push(format!(
@@ -1363,11 +1436,12 @@ where
                                 remaining_ms,
                             ) || use_sub90_fak);
                         let level_count = (if use_aggressive_taker {
-                            favorite_load_levels(legs.favorite_ask, remaining_ms)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms)
                         } else if legs.favorite_ask < climb_cfg.taker_min_favorite_ask {
-                            favorite_load_levels(legs.favorite_ask, remaining_ms).max(3)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms)
+                                .max(3)
                         } else {
-                            favorite_load_levels(legs.favorite_ask, remaining_ms)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms)
                         })
                         .min(entry_policy.max_levels);
                         for level in 0..level_count {
@@ -1402,7 +1476,11 @@ where
                                 px,
                                 legs.favorite_ask,
                                 entry_policy.label,
-                                favorite_load_price_scale(legs.favorite_ask, climb_cfg.min_favorite_ask),
+                                favorite_load_price_scale(
+                                    legs.favorite_ask,
+                                    climb_cfg.min_favorite_ask,
+                                    climb_cfg.taker_min_favorite_ask,
+                                ),
                                 confidence_multiplier,
                                 regime_multiplier,
                                 clip,
@@ -1899,9 +1977,51 @@ mod tests {
 
     #[test]
     fn favorite_load_price_scale_keeps_sub_90c_loads_smaller() {
-        assert!(favorite_load_price_scale(0.70, 0.70) < favorite_load_price_scale(0.80, 0.70));
-        assert!(favorite_load_price_scale(0.80, 0.70) < favorite_load_price_scale(0.90, 0.70));
-        assert_eq!(favorite_load_price_scale(0.90, 0.70), 1.0);
+        assert!(
+            favorite_load_price_scale(0.70, 0.70, 0.90)
+                < favorite_load_price_scale(0.80, 0.70, 0.90)
+        );
+        assert!(
+            favorite_load_price_scale(0.80, 0.70, 0.90)
+                < favorite_load_price_scale(0.90, 0.70, 0.90)
+        );
+        assert_eq!(favorite_load_price_scale(0.90, 0.70, 0.90), 1.0);
+    }
+
+    #[test]
+    fn early_barbell_late_favorite_uses_existing_policy_inputs() {
+        let cfg = FavoriteClimbConfig {
+            taker_min_favorite_ask: 0.90,
+            taker_window_sec: 120,
+            regime_whipsaw_multiplier: 0.45,
+            regime_unknown_multiplier: 0.80,
+            ..FavoriteClimbConfig::default()
+        };
+
+        assert!(is_pre_standard_late_favorite_window(&cfg, 121_000));
+        assert!(!is_pre_standard_late_favorite_window(&cfg, 120_000));
+        assert!(is_directional_barbell_favorite(&cfg, 0.90, 0.12));
+        assert!(!is_directional_barbell_favorite(&cfg, 0.89, 0.12));
+        assert!(!is_directional_barbell_favorite(&cfg, 0.90, 0.13));
+        assert!(early_barbell_late_favorite_blocked(
+            &cfg, true, 0.55, 0.92, 10.0, 10.0, 0.95
+        ));
+        assert!(!early_barbell_late_favorite_blocked(
+            &cfg, true, 0.55, 0.93, 10.0, 10.0, 0.95
+        ));
+    }
+
+    #[test]
+    fn true_favorite_timing_scale_is_regime_posture_driven() {
+        let cfg = FavoriteClimbConfig {
+            regime_unknown_multiplier: 0.31,
+            regime_trending_volatile_multiplier: 0.62,
+            ..FavoriteClimbConfig::default()
+        };
+
+        assert_eq!(late_favorite_timing_scale(&cfg, true, true), 0.31);
+        assert_eq!(late_favorite_timing_scale(&cfg, false, true), 0.62);
+        assert_eq!(late_favorite_timing_scale(&cfg, false, false), 1.0);
     }
 
     #[test]
@@ -1988,13 +2108,19 @@ mod tests {
             "config/strategies/whale_bonereaper_strategy.live.yaml",
         ))
         .expect("load live bonereaper profile");
-        let cfg = profile.bonereaper_mm_config().late_favorite.convex_tail;
+        let late_favorite = profile.bonereaper_mm_config().late_favorite;
+        let cfg = late_favorite.convex_tail;
+        let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
         assert_eq!(cfg.max_cheap_ask, 0.20);
         assert_eq!(cfg.max_load_usd, 14.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.50);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.80);
+        assert_eq!(climb.clip_usd, 50.0);
+        assert_eq!(climb.max_load_usd, 300.0);
+        assert_eq!(climb.min_order_usd, 8.0);
+        assert_eq!(climb.taker_min_favorite_ask, 0.90);
         assert!(
             cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
                 < cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::Whipsaw))
@@ -2006,6 +2132,7 @@ mod tests {
         let cfg = FavoriteClimbConfig {
             spot_filter_bps: 10.0,
             regime_whipsaw_multiplier: 0.25,
+            whipsaw_true_favorite_multiplier: 0.75,
             reversal_multiplier: 0.50,
             ..FavoriteClimbConfig::default()
         };
@@ -2018,7 +2145,12 @@ mod tests {
         };
 
         assert!(
-            (late_favorite_regime_multiplier(&regime, LadderLeg::Yes, &cfg) - 0.125).abs() < 1e-9
+            (late_favorite_regime_multiplier(&regime, LadderLeg::Yes, &cfg, 0.85) - 0.125).abs()
+                < 1e-9
+        );
+        assert!(
+            (late_favorite_regime_multiplier(&regime, LadderLeg::Yes, &cfg, 0.95) - 0.375).abs()
+                < 1e-9
         );
     }
 }

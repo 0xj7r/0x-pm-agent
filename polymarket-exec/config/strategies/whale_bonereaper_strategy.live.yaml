@@ -24,10 +24,10 @@ quote:
 inventory:
   max_open_orders_total: 120
   max_open_orders_per_market: 48
-  max_order_notional_usd: 18.0
-  max_gross_notional_usd: 250.0
-  max_net_notional_per_market_usd: 120.0
-  max_position_quantity_per_instrument: 250.0
+  max_order_notional_usd: 60.0
+  max_gross_notional_usd: 600.0
+  max_net_notional_per_market_usd: 350.0
+  max_position_quantity_per_instrument: 600.0
   min_free_cash_usd: 25.0
   min_free_cash_bps: 500.0
   max_session_loss_bps: 2500.0
@@ -76,15 +76,15 @@ late_favorite:
     window_sec: 300
     start_frac: 0.10
     min_elapsed_sec: 75
-    clip_usd: 25.0
-    max_load_usd: 150.0
+    clip_usd: 50.0
+    max_load_usd: 300.0
     maker_improve_ticks: 1.0
     near_touch_min_favorite_ask: 0.85
     near_touch_maker_improve_ticks: 3.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
-    min_order_usd: 4.0
+    min_order_usd: 8.0
     spot_filter_bps: 10.0
     require_spot_match: true
     # These remain defensive, but not so punitive that valid favourite signals
