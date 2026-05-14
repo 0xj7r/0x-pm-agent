@@ -3387,6 +3387,24 @@ async fn apply_sync_report(
                 continue;
             }
         }
+        if can_finalize_missing_passive_entry_from_authoritative_absence(&report, managed) {
+            info!(
+                mode = "live",
+                client_order_id = %client_order_id,
+                market_id = %managed.intent.market_id,
+                instrument_id = %managed.intent.instrument_id,
+                "passive live entry absent from open orders and authoritative positions; treating unfilled remainder as terminal"
+            );
+            live_safety
+                .suspect_missing_local_orders
+                .remove(&client_order_id);
+            outcome.extend(runtime.on_order_cancelled(
+                &client_order_id,
+                "venue open-order sync and authoritative position snapshot show passive entry is terminal",
+                now_ms,
+            ));
+            continue;
+        }
         debug!(
             mode = "live",
             client_order_id = %client_order_id,
@@ -3638,6 +3656,27 @@ fn can_defer_missing_local_order_escalation(managed: &ManagedOrder) -> bool {
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("late-fav-taker"))
+}
+
+fn can_finalize_missing_passive_entry_from_authoritative_absence(
+    report: &ExecutionSyncReport,
+    managed: &ManagedOrder,
+) -> bool {
+    if !report.balance_synced || !report.venue_positions_authoritative {
+        return false;
+    }
+    if managed.intent.kind != crate::types::IntentKind::Entry
+        || managed.intent.reduce_only
+        || managed.intent.side != TradeSide::Buy
+    {
+        return false;
+    }
+
+    !report.venue_positions.iter().any(|position| {
+        position.market_id == managed.intent.market_id
+            && position.instrument_id == managed.intent.instrument_id
+            && position.quantity > 1e-9
+    })
 }
 
 fn submit_rejection_counts_against_live_budget(reason: &str, post_only: bool) -> bool {

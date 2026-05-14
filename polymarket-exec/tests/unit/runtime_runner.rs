@@ -415,6 +415,54 @@ async fn live_execution_ignores_stale_submit_after_order_left_memory() {
 }
 
 #[tokio::test]
+async fn missing_passive_entry_absent_from_authoritative_positions_is_terminal_not_riskoff() {
+    let client_order_id = ClientOrderId::from("client-missing-terminal");
+    let mut runtime = runtime_with_recovered_order_status(
+        client_order_id.clone(),
+        ManagedOrderStatus::Working,
+        1,
+        "polymarket-exec-live-missing-terminal",
+        RuntimeStatus::Running,
+    );
+    let metrics = AppMetrics::new().expect("metrics");
+    let mut live_safety = LiveSafetyState::default();
+    live_safety.suspect_missing_local_orders.insert(
+        client_order_id.clone(),
+        crate::runtime::execution_policy::MissingLocalOrderSuspect {
+            first_seen_ms: 1_000,
+            observed_count: 3,
+        },
+    );
+    let report = ExecutionSyncReport {
+        balance_synced: true,
+        venue_cash_usd: Some(100.0),
+        venue_position_count: 0,
+        venue_positions_authoritative: true,
+        venue_balance_observed_at_ms: Some(10_000),
+        missing_local_orders: vec![client_order_id.clone()],
+        ..ExecutionSyncReport::default()
+    };
+    let adapter = RecordingAdapter::default();
+    let outcome = apply_sync_report(
+        &mut runtime,
+        &metrics,
+        &mut live_safety,
+        &live_test_policy(),
+        &[],
+        report,
+        10_000,
+        &adapter,
+    )
+    .await;
+
+    assert!(outcome.commands.is_empty());
+    assert_eq!(runtime.status(), RuntimeStatus::Running);
+    assert!(runtime.open_order_snapshots().is_empty());
+    assert_eq!(live_safety.consecutive_reconcile_mismatches, 0);
+    assert_eq!(metrics.snapshot().runtime_riskoff_transitions_total, 0);
+}
+
+#[tokio::test]
 async fn live_execution_blocks_submit_when_kill_switch_active() {
     let client_order_id = ClientOrderId::from("client-kill-switch");
     let mut runtime = runtime_with_recovered_order(
@@ -860,6 +908,89 @@ async fn live_sync_blocks_failed_merge_without_global_riskoff() {
         1,
         "non-retryable merge failure must not resubmit identical CTF recycle tx"
     );
+}
+
+#[tokio::test]
+async fn live_sync_merges_authoritative_paired_positions_without_durable_fill_rows() {
+    let mut runtime = runtime_with_empty_order_store(
+        "polymarket-exec-live-venue-paired-merge",
+        RuntimeStatus::Running,
+    );
+
+    let now_ms = now_unix_ms();
+    let adapter = Arc::new(RecordingAdapter {
+        merge_accept: true,
+        balances: Some(VenueBalances {
+            cash_usd: 80.0,
+            positions: vec![
+                VenuePosition {
+                    market_id: MarketId::from("market-mm"),
+                    condition_id: Some(
+                        "0x1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_string(),
+                    ),
+                    instrument_id: InstrumentId::from("up"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.20,
+                    redeemable: false,
+                    mergeable: true,
+                    current_value_usd: 1.30,
+                },
+                VenuePosition {
+                    market_id: MarketId::from("market-mm"),
+                    condition_id: Some(
+                        "0x1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_string(),
+                    ),
+                    instrument_id: InstrumentId::from("down"),
+                    quantity: 6.5,
+                    average_cost_usd: 0.79,
+                    redeemable: false,
+                    mergeable: true,
+                    current_value_usd: 5.13,
+                },
+            ],
+            positions_authoritative: true,
+            observed_at_ms: now_ms,
+        }),
+        ..RecordingAdapter::default()
+    });
+    let metrics = AppMetrics::new().expect("metrics");
+    let assets = vec!["up".to_string(), "down".to_string()];
+    let books = Arc::new(BookStore::new(&assets));
+    let mut paper_order_ctx = HashMap::new();
+    let mut execution_venue_map = HashMap::new();
+    let mut live_safety = LiveSafetyState::default();
+    let execution_policy = live_test_policy();
+    let mut seen_venue_fill_keys = HashSet::new();
+
+    let outcome = execute_execution_adapter(
+        &mut runtime,
+        &books,
+        &assets,
+        0.0,
+        &metrics,
+        &runner_test_config(),
+        RuntimeOutcome::default(),
+        &mut paper_order_ctx,
+        &mut execution_venue_map,
+        &mut live_safety,
+        adapter.clone(),
+        &execution_policy,
+        &mut seen_venue_fill_keys,
+        None,
+        None,
+    )
+    .await
+    .expect("execute");
+
+    assert!(outcome
+        .commands
+        .iter()
+        .any(|command| matches!(command, RuntimeCommand::Merge(_))));
+    let merges = adapter.merged.lock().expect("merged lock");
+    assert_eq!(merges.len(), 1);
+    assert_eq!(merges[0].quantity, 6.5);
 }
 
 #[tokio::test]
@@ -2210,6 +2341,22 @@ fn runtime_with_recovered_order(
     last_update_ms: u64,
     path_prefix: &str,
 ) -> Runtime<StrategyMode> {
+    runtime_with_recovered_order_status(
+        client_order_id,
+        status,
+        last_update_ms,
+        path_prefix,
+        RuntimeStatus::Starting,
+    )
+}
+
+fn runtime_with_recovered_order_status(
+    client_order_id: ClientOrderId,
+    status: ManagedOrderStatus,
+    last_update_ms: u64,
+    path_prefix: &str,
+    initial_status: RuntimeStatus,
+) -> Runtime<StrategyMode> {
     static SQLITE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let ts = SystemTime::now()
@@ -2245,7 +2392,7 @@ fn runtime_with_recovered_order(
         RuntimeConfig {
             starting_cash_usd: 100.0,
             event_log_capacity: 128,
-            initial_status: RuntimeStatus::Starting,
+            initial_status,
             ..RuntimeConfig::default()
         },
         RiskLimits::default(),
@@ -2255,6 +2402,36 @@ fn runtime_with_recovered_order(
         "run-test".to_string(),
     );
     runtime.recover_from_store(10_000, 100);
+    let _ = std::fs::remove_file(path);
+    runtime
+}
+
+fn runtime_with_empty_order_store(
+    path_prefix: &str,
+    initial_status: RuntimeStatus,
+) -> Runtime<StrategyMode> {
+    static SQLITE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let suffix = SQLITE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("{path_prefix}-{ts}-{suffix}.sqlite"));
+    let store = SqliteOrderStore::open(&path).expect("store");
+    let runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        StrategyMode::Noop(NoopStrategy),
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-test".to_string(),
+    );
     let _ = std::fs::remove_file(path);
     runtime
 }

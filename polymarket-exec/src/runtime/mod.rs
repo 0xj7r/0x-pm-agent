@@ -1076,17 +1076,24 @@ impl<S: Strategy> Runtime<S> {
             .min(no_position_qty - protected_no_qty)
             .max(0.0);
         let durable_mergeable_quantity = if self.order_store.is_some() {
-            let (yes_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+            let (yes_durable_paired_qty, _) = self.durable_lane_qty_cost(
                 market_id,
                 &intent.yes_instrument_id,
                 AccountingLane::PairedCore,
             );
-            let (no_durable_mergeable_qty, _) = self.durable_lane_qty_cost(
+            let (no_durable_paired_qty, _) = self.durable_lane_qty_cost(
                 market_id,
                 &intent.no_instrument_id,
                 AccountingLane::PairedCore,
             );
-            yes_durable_mergeable_qty.min(no_durable_mergeable_qty)
+            self.mergeable_qty_from_durable_or_reconciled_inventory(
+                inventory_mergeable_quantity,
+                yes_durable_paired_qty,
+            )
+            .min(self.mergeable_qty_from_durable_or_reconciled_inventory(
+                inventory_mergeable_quantity,
+                no_durable_paired_qty,
+            ))
         } else {
             f64::INFINITY
         };
@@ -1428,12 +1435,18 @@ impl<S: Strategy> Runtime<S> {
             AccountingLane::PairedCore,
         );
         let yes_mergeable_qty = if self.order_store.is_some() {
-            yes_inventory_mergeable_qty.min(yes_durable_mergeable_qty)
+            self.mergeable_qty_from_durable_or_reconciled_inventory(
+                yes_inventory_mergeable_qty,
+                yes_durable_mergeable_qty,
+            )
         } else {
             yes_inventory_mergeable_qty
         };
         let no_mergeable_qty = if self.order_store.is_some() {
-            no_inventory_mergeable_qty.min(no_durable_mergeable_qty)
+            self.mergeable_qty_from_durable_or_reconciled_inventory(
+                no_inventory_mergeable_qty,
+                no_durable_mergeable_qty,
+            )
         } else {
             no_inventory_mergeable_qty
         };
@@ -3660,6 +3673,17 @@ impl<S: Strategy> Runtime<S> {
                     cost + filled_qty * record.limit_price.max(0.0),
                 )
             })
+    }
+
+    fn mergeable_qty_from_durable_or_reconciled_inventory(
+        &self,
+        inventory_mergeable_qty: f64,
+        durable_paired_qty: f64,
+    ) -> f64 {
+        if durable_paired_qty > ACCOUNTING_QTY_EPSILON {
+            return inventory_mergeable_qty.min(durable_paired_qty);
+        }
+        inventory_mergeable_qty
     }
 
     fn plan_durable_paired_core_merge_sweep(
