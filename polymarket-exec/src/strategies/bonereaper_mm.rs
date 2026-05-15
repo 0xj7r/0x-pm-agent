@@ -2774,7 +2774,11 @@ fn observe_market_posture<M: MarketDescriptor>(
         .map(|remaining_ms| elapsed_ms(&input.market, input.now_ms, remaining_ms))
         .unwrap_or(0);
     let path_reversal_risk = conviction.path_reversal_risk;
-    let favorite_is_separating = legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25;
+    let market_price_path_separating = legs.favorite_ask
+        >= (climb_cfg.near_touch_min_favorite_ask - 0.10).max(climb_cfg.min_favorite_ask)
+        && legs.cheap_ask <= (cfg.convex_tail.max_cheap_ask + 0.05).min(0.35);
+    let favorite_is_separating =
+        market_price_path_separating || legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25;
     let broad_mid_market = legs.favorite_ask <= 0.70 && legs.cheap_ask >= 0.30;
     let momentum_persistent = input.momentum.strength >= 0.50
         && input
@@ -2782,6 +2786,14 @@ fn observe_market_posture<M: MarketDescriptor>(
             .latest_window_return_bps
             .map(|ret| signed_for_favorite(legs.favorite_leg, ret) > 0.0)
             .unwrap_or(false);
+
+    if market_price_path_separating {
+        return if path_reversal_risk >= 0.45 {
+            MarketPosture::WhipsawHedge
+        } else {
+            MarketPosture::NoFreshCore
+        };
+    }
 
     match input.btc_regime.regime() {
         Some(BtcRegime::Whipsaw) if path_reversal_risk >= 0.55 => MarketPosture::WhipsawHedge,
@@ -2978,6 +2990,36 @@ mod tests {
         assert_eq!(
             observe_market_posture(&input, &LateFavoriteStrategyConfig::default()),
             MarketPosture::CenterOnly
+        );
+    }
+
+    #[test]
+    fn observe_market_posture_suppresses_core_on_market_price_path_separation() {
+        let input = strategy_input(
+            snap(0.76, 0.78, 0.21, 0.23),
+            crate::signals::BtcRegimeSnapshot {
+                last_price: Some(101.0),
+                realized_vol_5m_bps: Some(2.0),
+                return_30s_bps: Some(-2.0),
+                return_60s_bps: Some(1.0),
+                return_120s_bps: Some(1.0),
+                return_180s_bps: Some(1.0),
+                observed_at_ms: 120_000,
+                ..Default::default()
+            },
+            MomentumSignal {
+                direction: SignalDirection::Neutral,
+                strength: 0.05,
+                latest_window_return_bps: Some(0.0),
+                ..Default::default()
+            },
+            0.95,
+            120_000,
+        );
+
+        assert_eq!(
+            observe_market_posture(&input, &LateFavoriteStrategyConfig::default()),
+            MarketPosture::WhipsawHedge
         );
     }
 
