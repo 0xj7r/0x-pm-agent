@@ -691,13 +691,29 @@ fn build_late_favorite_intent<M: MarketDescriptor>(
         LadderLeg::Yes => market.yes_instrument_id().clone(),
         LadderLeg::No => market.no_instrument_id().clone(),
     };
-    let coid = ClientOrderId::from(format!(
-        "late-fav:{}:{}:{:?}:{}",
-        tag,
-        market.market_id(),
-        leg,
-        now_ms,
-    ));
+    let coid = if aggressive_taker {
+        // Aggressive FAK/IOC attempts are one-shot liquidity takes. Keep them
+        // unique so a later attempt cannot be mistaken for the same venue
+        // order after the previous one filled, killed, or no-matched.
+        ClientOrderId::from(format!(
+            "late-fav:{}:{}:{:?}:{}",
+            tag,
+            market.market_id(),
+            leg,
+            now_ms,
+        ))
+    } else {
+        // Passive late-favorite probes need to rest. Do not include now_ms here:
+        // otherwise every strategy tick creates a new desired id and the runtime
+        // cancels the previous maker quote as a mixed-strategy reaction before it
+        // has had a fair chance to fill.
+        ClientOrderId::from(format!(
+            "late-fav:{}:{}:{:?}:maker",
+            tag,
+            market.market_id(),
+            leg,
+        ))
+    };
     let mut intent = OrderIntent::new_buy(
         coid,
         market.market_id().clone(),
@@ -968,7 +984,9 @@ fn favorite_momentum_clip_multiplier<M: MarketDescriptor>(
     if recent < 0.0 {
         multiplier *= 0.50;
     }
-    if legs.favorite_ask < 0.80 {
+    let lower_probe_upper_ask = cfg.min_favorite_ask
+        + (cfg.near_touch_min_favorite_ask - cfg.min_favorite_ask) * (2.0 / 3.0);
+    if legs.favorite_ask < lower_probe_upper_ask {
         multiplier *= 0.75;
     }
     multiplier.clamp(0.20, 1.0)
@@ -2180,11 +2198,8 @@ where
                 LadderLeg::Yes => input.inventory.yes_qty,
                 LadderLeg::No => input.inventory.no_qty,
             };
-            let favorite_avg_price = inventory_avg_cost_or(
-                input.inventory,
-                legs.favorite_leg,
-                legs.favorite_ask,
-            );
+            let favorite_avg_price =
+                inventory_avg_cost_or(input.inventory, legs.favorite_leg, legs.favorite_ask);
             let (favorite_total_qty, other_total_qty) = match legs.favorite_leg {
                 LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                 LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
@@ -2330,11 +2345,8 @@ where
                 LadderLeg::Yes => input.inventory.yes_qty,
                 LadderLeg::No => input.inventory.no_qty,
             };
-            let favorite_avg_price = inventory_avg_cost_or(
-                input.inventory,
-                legs.favorite_leg,
-                legs.favorite_ask,
-            );
+            let favorite_avg_price =
+                inventory_avg_cost_or(input.inventory, legs.favorite_leg, legs.favorite_ask);
             let (favorite_total_qty, other_total_qty) = match legs.favorite_leg {
                 LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                 LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
