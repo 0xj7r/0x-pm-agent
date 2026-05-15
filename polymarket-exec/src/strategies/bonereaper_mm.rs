@@ -76,23 +76,23 @@ impl Default for FavoriteClimbConfig {
             enabled: true,
             min_favorite_ask: 0.70,
             max_favorite_ask: 0.99,
-            window_sec: 120,
-            start_frac: 0.0,
-            min_elapsed_sec: 10,
+            window_sec: 300,
+            start_frac: 0.10,
+            min_elapsed_sec: 75,
             clip_usd: 20.0,
             max_load_usd: 200.0,
-            maker_improve_ticks: 0.0,
+            maker_improve_ticks: 1.0,
             min_order_usd: 1.0,
             spot_filter_bps: 10.0,
             require_spot_match: true,
-            regime_whipsaw_multiplier: 0.25,
+            regime_whipsaw_multiplier: 0.40,
             whipsaw_true_favorite_multiplier: 0.70,
             near_touch_min_favorite_ask: 0.85,
             near_touch_maker_improve_ticks: 3.0,
-            regime_flat_multiplier: 0.50,
-            regime_trending_volatile_multiplier: 0.60,
+            regime_flat_multiplier: 0.70,
+            regime_trending_volatile_multiplier: 0.75,
             regime_unknown_multiplier: 0.70,
-            reversal_multiplier: 0.50,
+            reversal_multiplier: 0.55,
             taker_min_favorite_ask: 0.90,
             taker_window_sec: 120,
             disable_after_ms: None,
@@ -148,19 +148,19 @@ impl Default for ConvexTailConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_cheap_ask: 0.20,
+            max_cheap_ask: 0.10,
             window_sec: 60,
             start_frac: 0.0,
             clip_usd: 1.25,
             max_load_usd: 8.0,
-            max_favorite_exposure_fraction: 0.25,
-            max_win_edge_spend_fraction: 0.50,
-            max_late_fav_spend_fraction: 0.03,
+            max_favorite_exposure_fraction: 0.55,
+            max_win_edge_spend_fraction: 0.45,
+            max_late_fav_spend_fraction: 0.025,
             ultra_cheap_max_ask: 0.03,
             ultra_cheap_min_favorite_ask: 0.90,
             ultra_cheap_max_late_fav_spend_fraction: 0.075,
-            maker_improve_ticks: 0.0,
-            min_order_usd: 0.5,
+            maker_improve_ticks: 1.0,
+            min_order_usd: 1.0,
             disable_after_ms: None,
         }
     }
@@ -1945,6 +1945,42 @@ fn cheap_tail_ladder_levels(cheap_ask: f64, budget_usd: f64, min_order_usd: f64)
     desired.min(budget_limited).max(1)
 }
 
+fn cheap_tail_ladder_load_usd(
+    cfg: &ConvexTailConfig,
+    favorite_ask: f64,
+    cheap_ask: f64,
+    remaining_load_usd: f64,
+) -> f64 {
+    if remaining_load_usd < cfg.min_order_usd {
+        return 0.0;
+    }
+
+    let clip_multiple = if cheap_ask <= cfg.ultra_cheap_max_ask
+        && favorite_ask >= cfg.ultra_cheap_min_favorite_ask
+    {
+        6.0
+    } else if cheap_ask <= cfg.max_cheap_ask {
+        3.0
+    } else {
+        1.0
+    };
+
+    remaining_load_usd
+        .min(cfg.max_load_usd)
+        .min(cfg.clip_usd * clip_multiple)
+        .max(cfg.min_order_usd)
+}
+
+fn cheap_tail_ladder_step_ticks(cfg: &ConvexTailConfig, cheap_ask: f64) -> f64 {
+    if cheap_ask <= cfg.ultra_cheap_max_ask {
+        1.0
+    } else if cheap_ask <= cfg.max_cheap_ask {
+        2.0
+    } else {
+        1.0
+    }
+}
+
 fn should_use_aggressive_cheap_tail(
     cfg: &ConvexTailConfig,
     favorite_ask: f64,
@@ -2385,10 +2421,12 @@ where
                     tick,
                     tail_cfg.maker_improve_ticks,
                 ) {
-                    let total_clip = tail_cfg
-                        .clip_usd
-                        .min(remaining_load)
-                        .max(tail_cfg.min_order_usd);
+                    let total_clip = cheap_tail_ladder_load_usd(
+                        &tail_cfg,
+                        legs.favorite_ask,
+                        legs.cheap_ask,
+                        remaining_load,
+                    );
                     let level_count = cheap_tail_ladder_levels(
                         legs.cheap_ask,
                         total_clip,
@@ -2415,8 +2453,10 @@ where
                             input.btc_regime.regime(),
                             path_reversal_risk,
                         );
-                    let aggressive_all_levels =
-                        use_aggressive_taker && directional_conviction.barbell;
+                    let aggressive_all_levels = use_aggressive_taker
+                        && directional_conviction.barbell
+                        && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
+                    let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
                     for level in 0..level_count {
                         if load_left < tail_cfg.min_order_usd {
                             break;
@@ -2430,7 +2470,7 @@ where
                         let px = if aggressive_taker {
                             legs.cheap_ask
                         } else {
-                            base_px - tick * level as f64
+                            base_px - tick * ladder_step_ticks * level as f64
                         };
                         if px <= 0.0 || px > legs.cheap_ask {
                             continue;
@@ -3401,6 +3441,7 @@ mod tests {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 0.50,
+            max_late_fav_spend_fraction: 1.0,
             ..ConvexTailConfig::default()
         };
 
@@ -3429,6 +3470,7 @@ mod tests {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 0.50,
+            max_late_fav_spend_fraction: 1.0,
             ..ConvexTailConfig::default()
         };
 
@@ -3473,6 +3515,7 @@ mod tests {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 0.50,
+            max_late_fav_spend_fraction: 1.0,
             ..ConvexTailConfig::default()
         };
 
@@ -3610,6 +3653,35 @@ mod tests {
         );
 
         assert!(uncertain > confident);
+    }
+
+    #[test]
+    fn cheap_tail_ladder_load_spends_multiple_clips_when_cap_allows() {
+        let cfg = ConvexTailConfig {
+            clip_usd: 3.0,
+            max_load_usd: 30.0,
+            min_order_usd: 1.0,
+            max_cheap_ask: 0.10,
+            ultra_cheap_max_ask: 0.03,
+            ultra_cheap_min_favorite_ask: 0.90,
+            ..ConvexTailConfig::default()
+        };
+
+        assert_eq!(cheap_tail_ladder_load_usd(&cfg, 0.91, 0.08, 20.0), 9.0);
+        assert_eq!(cheap_tail_ladder_load_usd(&cfg, 0.91, 0.02, 20.0), 18.0);
+        assert_eq!(cheap_tail_ladder_load_usd(&cfg, 0.91, 0.08, 0.50), 0.0);
+    }
+
+    #[test]
+    fn cheap_tail_ladder_down_is_wider_for_non_ultra_tail() {
+        let cfg = ConvexTailConfig {
+            max_cheap_ask: 0.10,
+            ultra_cheap_max_ask: 0.03,
+            ..ConvexTailConfig::default()
+        };
+
+        assert_eq!(cheap_tail_ladder_step_ticks(&cfg, 0.02), 1.0);
+        assert_eq!(cheap_tail_ladder_step_ticks(&cfg, 0.08), 2.0);
     }
 
     #[test]

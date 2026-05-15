@@ -84,69 +84,16 @@ late_favorite:
     enabled: true
     min_favorite_ask: 0.70
     max_favorite_ask: 0.99
-    window_sec: 300
-    start_frac: 0.10
-    min_elapsed_sec: 75
     clip_usd: 45.0
     max_load_usd: 450.0
-    maker_improve_ticks: 1.0
-    near_touch_min_favorite_ask: 0.85
-    near_touch_maker_improve_ticks: 3.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
     min_order_usd: 10.0
-    spot_filter_bps: 10.0
-    require_spot_match: true
-    # These remain defensive, but not so punitive that valid favourite signals
-    # only place nominal size. Reversal protection is handled by cheap-tail /
-    # future reversal-hedge accounting, not by suppressing the main lane to zero.
-    regime_whipsaw_multiplier: 0.40
-    whipsaw_true_favorite_multiplier: 0.70
-    regime_flat_multiplier: 0.70
-    regime_trending_volatile_multiplier: 0.75
-    regime_unknown_multiplier: 0.70
-    reversal_multiplier: 0.55
-    taker_min_favorite_ask: 0.90
-    taker_window_sec: 120
   convex_tail:
     enabled: true
-    # Pure convexity hedge only. 10c+ belongs to pairable core/reversal
-    # inventory, not cheap-tail insurance, because payoff multiple is too low
-    # to hedge late-favorite reversals without eroding too much edge.
-    max_cheap_ask: 0.10
-    # Legacy compatibility only: cheap tail is not time-gated. It is allowed
-    # whenever late-favorite exposure exists and payoff caps permit it.
-    window_sec: 60
-    start_frac: 0.0
     clip_usd: 3.0
     max_load_usd: 30.0
-    max_favorite_exposure_fraction: 0.55
-    max_win_edge_spend_fraction: 0.45
-    max_late_fav_spend_fraction: 0.025
-    ultra_cheap_max_ask: 0.03
-    ultra_cheap_min_favorite_ask: 0.90
-    ultra_cheap_max_late_fav_spend_fraction: 0.075
-    maker_improve_ticks: 1.0
     min_order_usd: 1.0
   reversal_hedge:
     enabled: false
-    # Separate from pure cheap-tail insurance. This lane only buys the
-    # opposite leg when filled late-favorite exposure exists and the live
-    # tape shows reversal/whipsaw risk. It shares the same hedge inventory
-    # accounting as cheap-tail so both lanes cannot over-hedge the favorite.
-    min_hedge_ask: 0.20
-    max_hedge_ask: 0.45
-    window_sec: 120
-    start_frac: 0.0
-    clip_usd: 25.0
-    max_load_usd: 130.0
-    max_favorite_exposure_fraction: 0.45
-    max_win_edge_spend_fraction: 1.0
-    maker_improve_ticks: 1.0
-    min_order_usd: 5.0
-    min_reversal_score: 0.40
-    whipsaw_score_bonus: 0.25
-    flat_score_bonus: 0.15
-    trending_volatile_score_bonus: 0.10
-    directional_smooth_score_penalty: 0.20
