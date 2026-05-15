@@ -602,8 +602,18 @@ impl LateFavBundleState {
 fn read_legs(snapshot: &PairedMarketSnapshot) -> Option<LegQuotes> {
     let yes_ask = snapshot.yes_quote.best_ask.as_ref()?.price;
     let no_ask = snapshot.no_quote.best_ask.as_ref()?.price;
-    let yes_bid = snapshot.yes_quote.best_bid.as_ref()?.price;
-    let no_bid = snapshot.no_quote.best_bid.as_ref()?.price;
+    let yes_bid = snapshot
+        .yes_quote
+        .best_bid
+        .as_ref()
+        .map(|bid| bid.price)
+        .unwrap_or(0.0);
+    let no_bid = snapshot
+        .no_quote
+        .best_bid
+        .as_ref()
+        .map(|bid| bid.price)
+        .unwrap_or(0.0);
 
     let (favorite_leg, cheap_leg, favorite_ask, favorite_bid, cheap_ask, cheap_bid) =
         if yes_ask >= no_ask {
@@ -3483,7 +3493,7 @@ mod tests {
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(climb.clip_usd, 45.0);
-        assert_eq!(climb.max_load_usd, 300.0);
+        assert_eq!(climb.max_load_usd, 450.0);
         assert_eq!(climb.min_order_usd, 10.0);
         assert_eq!(climb.taker_min_favorite_ask, 0.90);
         assert!(
