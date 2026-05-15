@@ -1824,11 +1824,15 @@ fn cheap_tail_cap_usd(
 
 fn unbundled_ultra_cheap_tail_cap_usd(
     cfg: &ConvexTailConfig,
-    effective_late_fav_qty: f64,
+    late_fav_filled_qty: f64,
     favorite_ask: f64,
     cheap_ask: f64,
 ) -> f64 {
-    if effective_late_fav_qty > 0.0
+    // Gate on *filled* late-fav qty, not working/reserved. Bonereaper fires
+    // standalone ultra-cheap convexity interleaved with late-fav loading;
+    // suppressing the moment a maker is posted (rather than filled) defeats
+    // the lottery shape commit 69bb3ce was meant to restore.
+    if late_fav_filled_qty > 0.0
         || cheap_ask <= 0.0
         || cheap_ask > cfg.ultra_cheap_max_ask
         || favorite_ask < cfg.ultra_cheap_min_favorite_ask
@@ -2452,7 +2456,7 @@ where
             );
             let unbundled_tail_cap_usd = unbundled_ultra_cheap_tail_cap_usd(
                 &tail_cfg,
-                effective_late_fav_qty,
+                late_fav_filled_qty,
                 legs.favorite_ask,
                 legs.cheap_ask,
             );
@@ -2497,8 +2501,13 @@ where
                             input.btc_regime.regime(),
                             path_reversal_risk,
                         );
+                    // Bonereaper's "tiny dollars, huge shares" shape needs every
+                    // ultra-cheap level at touch — not stepping down toward zero.
+                    // Allow all-levels-at-touch for ultra-cheap whenever the
+                    // aggressive-taker path is engaged, regardless of the
+                    // directional barbell flag (the unbundled standalone overlay
+                    // fires before any late-fav fill arrives).
                     let aggressive_all_levels = use_aggressive_taker
-                        && directional_conviction.barbell
                         && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
                     let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
                     for level in 0..level_count {
@@ -3680,6 +3689,9 @@ mod tests {
             unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.02),
             3.0
         );
+        // Standalone overlay must still fire when only working/reserved late-fav
+        // exists. Suppression only kicks in once we have an actual *filled*
+        // late-fav share (the bundled cap takes over from there).
         assert_eq!(
             unbundled_ultra_cheap_tail_cap_usd(&cfg, 10.0, 0.92, 0.02),
             0.0
@@ -4056,13 +4068,14 @@ mod tests {
         let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_cheap_ask, 0.10);
+        assert_eq!(cfg.max_cheap_ask, 0.15);
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.45);
-        assert_eq!(cfg.max_late_fav_spend_fraction, 0.025);
-        assert_eq!(cfg.ultra_cheap_max_ask, 0.03);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.06);
+        assert_eq!(cfg.ultra_cheap_max_ask, 0.04);
+        assert_eq!(cfg.maker_improve_ticks, 0.0);
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(climb.clip_usd, 45.0);

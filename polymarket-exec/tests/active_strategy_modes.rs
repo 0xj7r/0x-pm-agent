@@ -295,7 +295,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(bonereaper_inventory.max_session_loss_bps, 2500.0);
     assert_eq!(bonereaper_inventory.max_open_orders_total, 120);
     assert_eq!(bonereaper_inventory.max_open_orders_per_market, 48);
-    assert!(!bonereaper_paired.core_hedge.enabled);
+    assert!(bonereaper_paired.core_hedge.enabled);
     // Live invariant: paired-core is only a tiny center probe plus mate-only
     // repair. The old broad 17-level ladder must not return.
     assert!(bonereaper_paired.core_hedge.center_probe_only);
@@ -335,9 +335,9 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     );
     assert_eq!(
         bonereaper_late.convex_tail.max_late_fav_spend_fraction,
-        0.025
+        0.06
     );
-    assert_eq!(bonereaper_late.convex_tail.ultra_cheap_max_ask, 0.03);
+    assert_eq!(bonereaper_late.convex_tail.ultra_cheap_max_ask, 0.04);
     assert_eq!(
         bonereaper_late.convex_tail.ultra_cheap_min_favorite_ask,
         0.90
