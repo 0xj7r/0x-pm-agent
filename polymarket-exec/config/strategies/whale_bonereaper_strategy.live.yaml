@@ -58,13 +58,13 @@ paired_core:
   ladder_levels: 3
   ladder_span: 0.16
   center_price: 0.50
-  # Polymarket BTC 5m venue minimum is 5 shares. Sub-5 clips are coerced to
-  # 5 by runtime sizing, so keep each probe at venue minimum.
-  clip_shares: 5.0
-  # Keep fresh paired-core from becoming a real directional position. One
-  # venue-min clip can be stranded while the mate fills; beyond that, only
-  # repair/pair-completion should add exposure.
-  max_unpaired_core_qty: 5.0
+  # Controlled size-up from venue-min probing. Keep the same center-only band
+  # and pair-cost repair guard, but make flat/mid fills meaningful enough to
+  # matter without restoring the old broad ladder.
+  clip_shares: 20.0
+  # One 20-share center clip can be stranded while the mate fills; beyond that,
+  # fresh paired-core is blocked and only mate repair/bundle salvage may add.
+  max_unpaired_core_qty: 20.0
   ladder_min_price: 0.42
   ladder_max_price: 0.58
   repair_pair_cost_limit: 0.99

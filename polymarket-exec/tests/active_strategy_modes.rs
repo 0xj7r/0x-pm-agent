@@ -301,7 +301,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert!(bonereaper_paired.core_hedge.center_probe_only);
     assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 3);
     assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.16);
-    assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
+    assert_eq!(bonereaper_paired.core_hedge.clip_shares, 20.0);
     assert_eq!(bonereaper_paired.core_hedge.ladder_min_price, 0.42);
     assert_eq!(bonereaper_paired.core_hedge.ladder_max_price, 0.58);
     assert_eq!(bonereaper_paired.core_hedge.repair_pair_cost_limit, 0.99);
@@ -314,7 +314,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
         bonereaper_paired.core_hedge.max_unpaired_core_qty
             <= bonereaper_paired.core_hedge.clip_shares
     );
-    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 5.0);
+    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 20.0);
     let bonereaper_late = bonereaper_profile.late_favorite_config();
     assert!(bonereaper_late.favorite_climb.enabled);
     assert!(bonereaper_late.convex_tail.enabled);
