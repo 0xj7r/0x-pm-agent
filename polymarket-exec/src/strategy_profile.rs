@@ -141,6 +141,9 @@ pub struct CoreHedgeSection {
     pub max_unpaired_core_qty: Option<f64>,
     pub ladder_min_price: Option<f64>,
     pub ladder_max_price: Option<f64>,
+    pub center_probe_only: Option<bool>,
+    pub repair_pair_cost_limit: Option<f64>,
+    pub repair_fee_buffer: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub merge_min_qty: Option<f64>,
     pub merge_batch_cap: Option<f64>,
@@ -223,6 +226,11 @@ impl StrategyProfile {
                     .unwrap_or(defaults.max_unpaired_core_qty),
                 ladder_min_price: s.ladder_min_price.unwrap_or(defaults.ladder_min_price),
                 ladder_max_price: s.ladder_max_price.unwrap_or(defaults.ladder_max_price),
+                center_probe_only: s.center_probe_only.unwrap_or(defaults.center_probe_only),
+                repair_pair_cost_limit: s
+                    .repair_pair_cost_limit
+                    .unwrap_or(defaults.repair_pair_cost_limit),
+                repair_fee_buffer: s.repair_fee_buffer.unwrap_or(defaults.repair_fee_buffer),
                 maker_improve_ticks: s
                     .maker_improve_ticks
                     .unwrap_or(defaults.maker_improve_ticks),
@@ -572,6 +580,9 @@ fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
         || s.clip_shares.is_some()
         || s.ladder_min_price.is_some()
         || s.ladder_max_price.is_some()
+        || s.center_probe_only.is_some()
+        || s.repair_pair_cost_limit.is_some()
+        || s.repair_fee_buffer.is_some()
         || s.maker_improve_ticks.is_some()
         || s.merge_min_qty.is_some()
         || s.merge_batch_cap.is_some()
