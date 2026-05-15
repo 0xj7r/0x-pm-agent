@@ -1960,7 +1960,7 @@ fn should_use_aggressive_cheap_tail(
         favorite_avg_price > 0.0 && favorite_avg_price + cheap_ask <= 1.0 + 1e-9;
     let high_cert_favorite = favorite_ask >= cfg.ultra_cheap_min_favorite_ask
         || favorite_avg_price >= cfg.ultra_cheap_min_favorite_ask;
-    if high_cert_favorite && cheap_ask <= cfg.max_cheap_ask.min(0.10) {
+    if high_cert_favorite && cheap_ask <= cfg.ultra_cheap_max_ask {
         return true;
     }
     pair_cost_is_positive_ev
@@ -2403,7 +2403,9 @@ where
                     let coverage_deficit_forces_taker = bundle_state.fav_committed_spend_usd()
                         >= tail_cfg.max_load_usd.min(30.0)
                         && bundle_state.tail_coverage_ratio() < coverage_target
-                        && legs.cheap_ask <= tail_cfg.max_cheap_ask;
+                        && legs.cheap_ask <= tail_cfg.max_cheap_ask
+                        && (legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask
+                            || favorite_avg_price + legs.cheap_ask <= 1.0 + 1e-9);
                     let use_aggressive_taker = coverage_deficit_forces_taker
                         || should_use_aggressive_cheap_tail(
                             &tail_cfg,
@@ -3662,18 +3664,27 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_tail_uses_taker_for_high_cert_favorite_even_when_pair_cost_negative() {
+    fn aggressive_tail_only_takes_negative_pair_cost_when_tail_is_ultra_cheap() {
         let cfg = ConvexTailConfig {
             max_cheap_ask: 0.10,
+            ultra_cheap_max_ask: 0.03,
             ultra_cheap_min_favorite_ask: 0.90,
             ..ConvexTailConfig::default()
         };
 
-        assert!(should_use_aggressive_cheap_tail(
+        assert!(!should_use_aggressive_cheap_tail(
             &cfg,
             0.95,
             0.95,
             0.08,
+            Some(BtcRegime::DirectionalSmooth),
+            0.0,
+        ));
+        assert!(should_use_aggressive_cheap_tail(
+            &cfg,
+            0.95,
+            0.95,
+            0.03,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
