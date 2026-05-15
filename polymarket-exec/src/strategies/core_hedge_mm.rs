@@ -543,13 +543,17 @@ fn ladder_candidate<M: MarketDescriptor>(
     max_price: f64,
     clip_shares: f64,
     min_order_usd: f64,
+    maker_improve_ticks: f64,
     now_ms: EpochMillis,
 ) -> Option<OrderIntent> {
+    let tick = market.tick_size().max(0.0001);
     let mid = quote_mid(best_bid, best_ask, center_price).clamp(0.01, 0.99);
     let low = (mid - half_span).clamp(0.01, 0.99);
     let high = (mid + half_span).clamp(0.01, 0.99);
     let denom = (levels - 1) as f64;
-    let raw_price = low + (high - low) * (idx as f64 / denom);
+    let grid_price = low + (high - low) * (idx as f64 / denom);
+    let raw_price =
+        improved_ladder_price(grid_price, best_bid, best_ask, tick, maker_improve_ticks);
     if raw_price < min_price || raw_price > max_price {
         return None;
     }
@@ -564,6 +568,30 @@ fn ladder_candidate<M: MarketDescriptor>(
         min_order_usd,
         now_ms,
     )
+}
+
+fn improved_ladder_price(
+    grid_price: f64,
+    best_bid: f64,
+    best_ask: f64,
+    tick: f64,
+    maker_improve_ticks: f64,
+) -> f64 {
+    let improve_ticks = maker_improve_ticks.max(0.0);
+    if improve_ticks <= 0.0 || tick <= 0.0 {
+        return grid_price;
+    }
+    let max_passive = best_ask - tick;
+    if max_passive <= 0.0 {
+        return grid_price;
+    }
+    let improved = (best_bid + tick * improve_ticks).min(max_passive);
+    let near_touch_window = tick * (improve_ticks + 1.0);
+    if grid_price >= best_bid - near_touch_window && improved > grid_price {
+        improved
+    } else {
+        grid_price
+    }
 }
 
 fn build_ladder_level<M: MarketDescriptor>(
@@ -820,6 +848,7 @@ where
                         cfg.ladder_max_price,
                         cfg.clip_shares,
                         cfg.min_order_usd,
+                        cfg.maker_improve_ticks,
                         input.now_ms,
                     ) else {
                         continue;
@@ -1007,6 +1036,7 @@ where
                     cfg.ladder_max_price,
                     cfg.clip_shares,
                     cfg.min_order_usd,
+                    cfg.maker_improve_ticks,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1024,6 +1054,7 @@ where
                     cfg.ladder_max_price,
                     cfg.clip_shares,
                     cfg.min_order_usd,
+                    cfg.maker_improve_ticks,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1305,6 +1336,15 @@ mod tests {
         assert_eq!(paired_core_center_accumulator_band(17, 0.62, 0.42), 3);
         assert_eq!(paired_core_center_accumulator_band(17, 0.74, 0.26), 2);
         assert_eq!(paired_core_center_accumulator_band(17, 0.86, 0.16), 0);
+    }
+
+    #[test]
+    fn broad_ladder_maker_improve_only_moves_near_touch_prices() {
+        assert!((improved_ladder_price(0.4900, 0.5000, 0.5300, 0.0100, 2.0) - 0.5200).abs() < 1e-9);
+        assert!((improved_ladder_price(0.4500, 0.5000, 0.5300, 0.0100, 2.0) - 0.4500).abs() < 1e-9);
+        assert!((improved_ladder_price(0.5200, 0.5000, 0.5300, 0.0100, 2.0) - 0.5200).abs() < 1e-9);
+        assert!((improved_ladder_price(0.4900, 0.5000, 0.5100, 0.0100, 2.0) - 0.5000).abs() < 1e-9);
+        assert!((improved_ladder_price(0.4900, 0.5000, 0.5300, 0.0100, 0.0) - 0.4900).abs() < 1e-9);
     }
 
     #[test]
