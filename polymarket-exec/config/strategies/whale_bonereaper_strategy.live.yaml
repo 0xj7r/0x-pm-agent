@@ -111,6 +111,9 @@ late_favorite:
     max_favorite_exposure_fraction: 0.55
     max_win_edge_spend_fraction: 0.45
     max_late_fav_spend_fraction: 0.025
+    ultra_cheap_max_ask: 0.03
+    ultra_cheap_min_favorite_ask: 0.90
+    ultra_cheap_max_late_fav_spend_fraction: 0.075
     maker_improve_ticks: 1.0
     min_order_usd: 1.0
   reversal_hedge:

@@ -100,6 +100,9 @@ pub struct ConvexTailSubsection {
     pub max_favorite_exposure_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
     pub max_late_fav_spend_fraction: Option<f64>,
+    pub ultra_cheap_max_ask: Option<f64>,
+    pub ultra_cheap_min_favorite_ask: Option<f64>,
+    pub ultra_cheap_max_late_fav_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
     pub disable_after_ms: Option<u64>,
@@ -301,6 +304,15 @@ impl StrategyProfile {
                 max_late_fav_spend_fraction: t
                     .max_late_fav_spend_fraction
                     .unwrap_or(tail_def.max_late_fav_spend_fraction),
+                ultra_cheap_max_ask: t
+                    .ultra_cheap_max_ask
+                    .unwrap_or(tail_def.ultra_cheap_max_ask),
+                ultra_cheap_min_favorite_ask: t
+                    .ultra_cheap_min_favorite_ask
+                    .unwrap_or(tail_def.ultra_cheap_min_favorite_ask),
+                ultra_cheap_max_late_fav_spend_fraction: t
+                    .ultra_cheap_max_late_fav_spend_fraction
+                    .unwrap_or(tail_def.ultra_cheap_max_late_fav_spend_fraction),
                 maker_improve_ticks: t
                     .maker_improve_ticks
                     .unwrap_or(tail_def.maker_improve_ticks),
