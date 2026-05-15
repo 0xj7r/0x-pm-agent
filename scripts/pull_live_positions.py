@@ -50,6 +50,28 @@ ORDER_COLUMNS = [
     "accounting_lane",
 ]
 
+POSITION_EVENT_COLUMNS = [
+    "observed_at_ms",
+    "event_id",
+    "client_order_id",
+    "run_id",
+    "venue_order_id",
+    "market_id",
+    "instrument_id",
+    "side",
+    "limit_price",
+    "fill_delta_qty",
+    "fill_delta_notional_usd",
+    "cumulative_filled_qty",
+    "status",
+    "submitted_at_ms",
+    "last_update_ms",
+    "reason",
+    "strategy_tag",
+    "quote_level_tag",
+    "accounting_lane",
+]
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -122,23 +144,38 @@ def event_id(row: dict[str, Any]) -> str:
     )
 
 
-def load_seen(path: Path) -> set[str]:
+def load_seen(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return set()
+        return {"seen_event_ids": set(), "last_filled_qty_by_order": {}}
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return set()
-    return set(data.get("seen_event_ids", []))
+        return {"seen_event_ids": set(), "last_filled_qty_by_order": {}}
+    return {
+        "seen_event_ids": set(data.get("seen_event_ids", [])),
+        "last_filled_qty_by_order": {
+            str(key): float(value)
+            for key, value in data.get("last_filled_qty_by_order", {}).items()
+        },
+    }
 
 
-def save_seen(path: Path, seen: set[str]) -> None:
+def save_seen(path: Path, seen: set[str], last_filled_qty_by_order: dict[str, float]) -> None:
     # Keep the state bounded. The append-only JSONL/CSV files remain the audit
     # source; this file is only a de-dupe cache for polling.
     ordered = sorted(seen)
     if len(ordered) > 200_000:
         ordered = ordered[-200_000:]
-    path.write_text(json.dumps({"seen_event_ids": ordered}, indent=2, sort_keys=True))
+    path.write_text(
+        json.dumps(
+            {
+                "seen_event_ids": ordered,
+                "last_filled_qty_by_order": last_filled_qty_by_order,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def append_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
@@ -159,6 +196,54 @@ def append_csv(path: Path, records: list[dict[str, Any]]) -> None:
             writer.writeheader()
         for record in records:
             writer.writerow({key: record.get(key) for key in writer.fieldnames})
+
+
+def append_position_events_csv(path: Path, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=POSITION_EVENT_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        for record in records:
+            writer.writerow({key: record.get(key) for key in writer.fieldnames})
+
+
+def write_latest_positions_csv(path: Path, snapshot: dict[str, Any]) -> None:
+    positions = snapshot.get("positions", [])
+    fieldnames = [
+        "observed_at_ms",
+        "market_id",
+        "instrument_id",
+        "accounting_lane",
+        "filled_qty",
+        "filled_notional_usd",
+        "avg_price",
+        "order_count",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for position in positions:
+            row = dict(position)
+            row["observed_at_ms"] = snapshot.get("observed_at_ms")
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def build_position_event(
+    row: dict[str, Any],
+    observed_at_ms: int,
+    fill_delta_qty: float,
+) -> dict[str, Any]:
+    limit_price = float(row["limit_price"] or 0.0)
+    event = {key: row.get(key) for key in POSITION_EVENT_COLUMNS}
+    event["observed_at_ms"] = observed_at_ms
+    event["event_id"] = event_id(row)
+    event["fill_delta_qty"] = fill_delta_qty
+    event["fill_delta_notional_usd"] = fill_delta_qty * limit_price
+    event["cumulative_filled_qty"] = float(row["filled_qty"] or 0.0)
+    return event
 
 
 def build_position_snapshot(rows: list[dict[str, Any]], observed_at_ms: int) -> dict[str, Any]:
@@ -216,6 +301,9 @@ def sync_once(args: argparse.Namespace) -> int:
     orders_jsonl = out_dir / "orders.jsonl"
     fills_jsonl = out_dir / "fills.jsonl"
     orders_csv = out_dir / "orders.csv"
+    position_events_jsonl = out_dir / "position_events.jsonl"
+    position_events_csv = out_dir / "position_events.csv"
+    latest_positions_csv = out_dir / "latest_positions.csv"
     snapshots_jsonl = out_dir / "positions_snapshot.jsonl"
 
     observed_at_ms = now_ms()
@@ -224,25 +312,40 @@ def sync_once(args: argparse.Namespace) -> int:
         pull_remote_db(args, local_db)
         rows = load_rows(local_db)
 
-    seen = load_seen(state_path)
+    state = load_seen(state_path)
+    seen = state["seen_event_ids"]
+    last_filled_qty_by_order = state["last_filled_qty_by_order"]
     new_records = []
     new_fills = []
+    position_events = []
     for row in rows:
         eid = event_id(row)
+        client_order_id = str(row["client_order_id"])
+        filled_qty = float(row["filled_qty"] or 0.0)
+        previous_filled_qty = float(last_filled_qty_by_order.get(client_order_id, 0.0))
+        fill_delta_qty = max(0.0, filled_qty - previous_filled_qty)
+        if fill_delta_qty > 0.0:
+            position_events.append(build_position_event(row, observed_at_ms, fill_delta_qty))
+        last_filled_qty_by_order[client_order_id] = max(previous_filled_qty, filled_qty)
+
         if eid in seen:
             continue
         seen.add(eid)
         record = dict(row)
         record["observed_at_ms"] = observed_at_ms
         new_records.append(record)
-        if float(row["filled_qty"] or 0.0) > 0.0:
+        if filled_qty > 0.0:
             new_fills.append(record)
 
     append_jsonl(orders_jsonl, new_records)
     append_jsonl(fills_jsonl, new_fills)
+    append_jsonl(position_events_jsonl, position_events)
     append_csv(orders_csv, new_records)
-    append_jsonl(snapshots_jsonl, [build_position_snapshot(rows, observed_at_ms)])
-    save_seen(state_path, seen)
+    append_position_events_csv(position_events_csv, position_events)
+    snapshot = build_position_snapshot(rows, observed_at_ms)
+    append_jsonl(snapshots_jsonl, [snapshot])
+    write_latest_positions_csv(latest_positions_csv, snapshot)
+    save_seen(state_path, seen, last_filled_qty_by_order)
     return len(new_records)
 
 
