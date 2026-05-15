@@ -77,7 +77,7 @@ late_favorite:
     start_frac: 0.10
     min_elapsed_sec: 75
     clip_usd: 45.0
-    max_load_usd: 300.0
+    max_load_usd: 450.0
     maker_improve_ticks: 1.0
     near_touch_min_favorite_ask: 0.85
     near_touch_maker_improve_ticks: 3.0
