@@ -51,7 +51,7 @@ paired_core:
   # 0.20-0.70 ladder is intentionally not restored here. center_probe_only +
   # ladder_levels=3 + 0.42-0.58 band keep stranded exposure to one venue-min
   # clip per side, which the post-mate-rejection guards already tolerate.
-  enabled: true
+  enabled: false
   center_probe_only: true
   # Tiny center probe only. Do not restore the old 17-level 0.20-0.70 live
   # ladder here; paired-core repair is mate-only after a one-sided fill.
