@@ -141,6 +141,20 @@ pub struct CoreHedgeMmStrategy {
     last_emit: HashMap<LastEmitKey, (f64, f64)>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PairedCoreChopGate {
+    note: String,
+    suppress_outer_bundle: bool,
+    suppress_repair: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PairedCoreBroadPosture {
+    Full,
+    CenterOnly { reason: String, center_band: usize },
+    Suppressed { reason: String },
+}
+
 impl CoreHedgeMmStrategy {
     pub fn new(config: CoreHedgeMmStrategyConfig) -> Self {
         Self {
@@ -368,7 +382,7 @@ fn signed_pair_cost_for_repair<M: MarketDescriptor>(
 fn paired_core_chop_gate<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     max_opening_ms: u64,
-) -> Option<String> {
+) -> Option<PairedCoreChopGate> {
     let elapsed_ms = input
         .market
         .event_start_ms()
@@ -384,68 +398,124 @@ fn paired_core_chop_gate<M: MarketDescriptor>(
         || (r60 > 1.0 && r180 < -1.0)
         || (r60 < -1.0 && r180 > 1.0);
     if matches!(input.btc_regime.regime(), Some(BtcRegime::Whipsaw)) {
-        return Some(format!(
-            "paired_core paused: whipsaw regime vol_5m_bps={vol:.2} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
-        ));
+        return Some(PairedCoreChopGate {
+            note: format!(
+                "paired_core center-only: whipsaw regime vol_5m_bps={vol:.2} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
+            ),
+            suppress_outer_bundle: true,
+            suppress_repair: false,
+        });
     }
     if elapsed_ms <= max_opening_ms && (vol >= BtcRegime::VOL_LOW_HIGH_BPS || sign_flip) {
-        return Some(format!(
-            "paired_core paused: opening chop elapsed_ms={elapsed_ms} vol_5m_bps={vol:.2} sign_flip={sign_flip} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
-        ));
+        return Some(PairedCoreChopGate {
+            note: format!(
+                "paired_core center-only: opening chop elapsed_ms={elapsed_ms} vol_5m_bps={vol:.2} sign_flip={sign_flip} r30={r30:.2} r60={r60:.2} r120={r120:.2} r180={r180:.2}"
+            ),
+            suppress_outer_bundle: true,
+            suppress_repair: true,
+        });
     }
     None
 }
 
-fn paired_core_broad_suppression_note<M: MarketDescriptor>(
+fn paired_core_broad_posture<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     elapsed_ms: u64,
     hard_cutoff_ms: Option<u64>,
     yes_ask: f64,
     no_ask: f64,
-) -> Option<String> {
+    levels: usize,
+) -> PairedCoreBroadPosture {
+    paired_core_broad_posture_for_regime(
+        input.btc_regime.regime(),
+        elapsed_ms,
+        hard_cutoff_ms,
+        yes_ask,
+        no_ask,
+        levels,
+    )
+}
+
+fn paired_core_broad_posture_for_regime(
+    regime: Option<BtcRegime>,
+    elapsed_ms: u64,
+    hard_cutoff_ms: Option<u64>,
+    yes_ask: f64,
+    no_ask: f64,
+    levels: usize,
+) -> PairedCoreBroadPosture {
     let favorite_ask = yes_ask.max(no_ask);
     let cheap_ask = yes_ask.min(no_ask);
     if paired_core_directional_barbell_book(yes_ask, no_ask) {
-        return Some(format!(
-            "paired_core broad stopped: directional barbell book favorite_ask={favorite_ask:.4} cheap_ask={cheap_ask:.4} elapsed_ms={elapsed_ms}; route fresh risk exclusively to late-fav/cheap-tail"
-        ));
+        return PairedCoreBroadPosture::Suppressed {
+            reason: format!(
+                "paired_core broad stopped: directional barbell book favorite_ask={favorite_ask:.4} cheap_ask={cheap_ask:.4} elapsed_ms={elapsed_ms}; route fresh risk exclusively to late-fav/cheap-tail"
+            ),
+        };
     }
     if let Some(cutoff_ms) = hard_cutoff_ms {
         if elapsed_ms >= cutoff_ms {
-            return Some(format!(
-                "paired_core broad suppressed: late-window cutoff elapsed_ms={elapsed_ms} cutoff_ms={cutoff_ms}; late-fav/cheap-tail lanes own fresh risk"
-            ));
+            return PairedCoreBroadPosture::Suppressed {
+                reason: format!(
+                    "paired_core broad suppressed: late-window cutoff elapsed_ms={elapsed_ms} cutoff_ms={cutoff_ms}; late-fav/cheap-tail lanes own fresh risk"
+                ),
+            };
         }
     }
-    match input.btc_regime.regime() {
-        Some(BtcRegime::Whipsaw) if elapsed_ms >= 90_000 => Some(format!(
-            "paired_core broad suppressed: whipsaw path elapsed_ms={elapsed_ms}; avoid adding inventory whose mate side may not return"
-        )),
+    let center_band = paired_core_center_accumulator_band(levels, yes_ask, no_ask);
+    match regime {
+        Some(BtcRegime::Whipsaw) if elapsed_ms >= 90_000 && center_band > 0 => {
+            PairedCoreBroadPosture::CenterOnly {
+                reason: format!(
+                    "paired_core center-only: whipsaw mid accumulator elapsed_ms={elapsed_ms}; keep controlled mid rungs while avoiding runaway outer ladder"
+                ),
+                center_band,
+            }
+        }
+        Some(BtcRegime::Whipsaw) if elapsed_ms >= 90_000 => {
+            PairedCoreBroadPosture::Suppressed {
+                reason: format!(
+                    "paired_core broad suppressed: whipsaw non-mid book elapsed_ms={elapsed_ms}; avoid adding inventory whose mate side may not return"
+                ),
+            }
+        }
+        Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
+            if elapsed_ms >= 120_000 && center_band > 0 =>
+        {
+            PairedCoreBroadPosture::CenterOnly {
+                reason: format!(
+                    "paired_core center-only: directional mid accumulator regime={:?} elapsed_ms={elapsed_ms}; keep center rungs before favorite load resolves",
+                    regime
+                ),
+                center_band,
+            }
+        }
         Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile)
             if elapsed_ms >= 120_000 =>
         {
-            Some(format!(
-                "paired_core broad suppressed: directional late path regime={:?} elapsed_ms={elapsed_ms}; route fresh risk to late-fav/cheap-tail",
-                input.btc_regime.regime()
-            ))
+            PairedCoreBroadPosture::Suppressed {
+                reason: format!(
+                    "paired_core broad suppressed: directional late non-mid path regime={:?} elapsed_ms={elapsed_ms}; route fresh risk to late-fav/cheap-tail",
+                    regime
+                ),
+            }
         }
-        _ => None,
+        _ => PairedCoreBroadPosture::Full,
     }
 }
 
 fn paired_core_directional_barbell_book(yes_ask: f64, no_ask: f64) -> bool {
     let favorite_ask = yes_ask.max(no_ask);
     let cheap_ask = yes_ask.min(no_ask);
-    (favorite_ask >= 0.80 && cheap_ask <= 0.20)
-        || (favorite_ask >= 0.90 && cheap_ask <= 0.10)
+    (favorite_ask >= 0.80 && cheap_ask <= 0.20) || (favorite_ask >= 0.90 && cheap_ask <= 0.10)
 }
 
-fn opening_chop_center_band(levels: usize, yes_ask: f64, no_ask: f64) -> usize {
+fn paired_core_center_accumulator_band(levels: usize, yes_ask: f64, no_ask: f64) -> usize {
     let favorite_ask = yes_ask.max(no_ask);
     let cheap_ask = yes_ask.min(no_ask);
     if favorite_ask <= 0.65 && cheap_ask >= 0.35 {
         3.min(levels / 2)
-    } else if favorite_ask <= 0.75 && cheap_ask >= 0.25 {
+    } else if favorite_ask <= 0.78 && cheap_ask >= 0.22 {
         2.min(levels / 2)
     } else {
         0
@@ -644,7 +714,7 @@ where
             let mut notes = Vec::new();
             let chop_note = paired_core_chop_gate(&input, 90_000);
             if let Some(note) = &chop_note {
-                notes.push(note.clone());
+                notes.push(note.note.clone());
             }
             let elapsed_ms = market_elapsed_ms(&input);
             let levels = cfg.ladder_levels.max(2);
@@ -688,14 +758,15 @@ where
             ));
 
             if paired_core_directional_barbell_book(yes_ask, no_ask) {
-                if let Some(note) = paired_core_broad_suppression_note(
+                if let PairedCoreBroadPosture::Suppressed { reason } = paired_core_broad_posture(
                     &input,
                     elapsed_ms,
                     cfg.disable_after_elapsed_ms,
                     yes_ask,
                     no_ask,
+                    levels,
                 ) {
-                    notes.push(note);
+                    notes.push(reason);
                 }
                 notes.push(
                     "paired_core repair suppressed in directional barbell; avoid quote/cancel churn and route fresh risk to late-fav/cheap-tail".to_string(),
@@ -720,10 +791,11 @@ where
 
             let in_repair_mode = repair_leg.is_some();
             if let Some(leg) = repair_leg {
-                if let Some(note) = chop_note.as_deref() {
+                if let Some(note) = chop_note.as_ref().filter(|note| note.suppress_repair) {
                     return StrategyDecision::Noop {
                         notes: vec![format!(
-                            "{note}; paired_core repair suppressed until market is stable"
+                            "{}; paired_core repair suppressed until market is stable",
+                            note.note
                         )],
                     };
                 }
@@ -824,30 +896,41 @@ where
                 ));
             }
 
-            if let Some(note) = paired_core_broad_suppression_note(
+            let broad_posture = paired_core_broad_posture(
                 &input,
                 elapsed_ms,
                 cfg.disable_after_elapsed_ms,
                 yes_ask,
                 no_ask,
-            )
-            {
-                notes.push(note);
-                notes.push(format!(
-                    "paired_core broad suppressed with mate-repair preserved repair_mode={in_repair_mode} repair_intents={}",
-                    intents.len()
-                ));
-                return if intents.is_empty() {
-                    StrategyDecision::Suppress {
-                        scope: SuppressionScope::PairedOnly,
-                        reason: CoolingReason::BtcTrending,
-                        preserve_quotes: false,
-                        notes,
-                    }
-                } else {
-                    StrategyDecision::QuoteSet { intents, notes }
-                };
-            }
+                levels,
+            );
+            let center_only_band = match broad_posture {
+                PairedCoreBroadPosture::Full => None,
+                PairedCoreBroadPosture::CenterOnly {
+                    reason,
+                    center_band,
+                } => {
+                    notes.push(reason);
+                    Some(center_band)
+                }
+                PairedCoreBroadPosture::Suppressed { reason } => {
+                    notes.push(reason);
+                    notes.push(format!(
+                        "paired_core broad suppressed with mate-repair preserved repair_mode={in_repair_mode} repair_intents={}",
+                        intents.len()
+                    ));
+                    return if intents.is_empty() {
+                        StrategyDecision::Suppress {
+                            scope: SuppressionScope::PairedOnly,
+                            reason: CoolingReason::BtcTrending,
+                            preserve_quotes: false,
+                            notes,
+                        }
+                    } else {
+                        StrategyDecision::QuoteSet { intents, notes }
+                    };
+                }
+            };
 
             let late_fav_yes_qty = input.late_fav_inventory.yes_qty.max(0.0);
             let late_fav_no_qty = input.late_fav_inventory.no_qty.max(0.0);
@@ -889,15 +972,26 @@ where
                         break;
                     }
                 }
-                if chop_note.is_some() && elapsed_ms <= 90_000 {
+                let mut active_center_band = center_only_band;
+                if let Some(note) = &chop_note {
+                    if note.suppress_outer_bundle && elapsed_ms <= 90_000 {
+                        let opening_band =
+                            paired_core_center_accumulator_band(levels, yes_ask, no_ask);
+                        active_center_band = Some(
+                            active_center_band
+                                .map(|band| band.min(opening_band))
+                                .unwrap_or(opening_band),
+                        );
+                    }
+                }
+                if let Some(center_band) = active_center_band {
                     let center_idx = levels / 2;
-                    let center_band = opening_chop_center_band(levels, yes_ask, no_ask);
                     let distance_from_center = idx.abs_diff(center_idx);
                     if distance_from_center > center_band {
-                    notes.push(format!(
-                        "paired_core opening presence band: suppressing outer bundle idx={idx} center_idx={center_idx} center_band={center_band} elapsed_ms={elapsed_ms} yes_ask={yes_ask:.4} no_ask={no_ask:.4}",
+                        notes.push(format!(
+                        "paired_core center accumulator: suppressing outer bundle idx={idx} center_idx={center_idx} center_band={center_band} elapsed_ms={elapsed_ms} yes_ask={yes_ask:.4} no_ask={no_ask:.4}",
                     ));
-                    continue;
+                        continue;
                     }
                 }
                 let Some(yes_intent) = ladder_candidate(
@@ -1196,5 +1290,58 @@ mod tests {
         let cfg = CoreHedgeMmConfig::default();
         let snap = snap_with_quotes(0.59, 0.60, 0.39, 0.40);
         assert!(classify_legs(&snap, &cfg).is_none());
+    }
+
+    #[test]
+    fn barbell_suppression_does_not_kill_mid_whipsaw_presence() {
+        assert!(paired_core_directional_barbell_book(0.86, 0.16));
+        assert!(paired_core_directional_barbell_book(0.96, 0.04));
+        assert!(!paired_core_directional_barbell_book(0.62, 0.42));
+        assert!(!paired_core_directional_barbell_book(0.58, 0.46));
+    }
+
+    #[test]
+    fn opening_chop_keeps_center_band_for_mid_markets() {
+        assert_eq!(paired_core_center_accumulator_band(17, 0.62, 0.42), 3);
+        assert_eq!(paired_core_center_accumulator_band(17, 0.74, 0.26), 2);
+        assert_eq!(paired_core_center_accumulator_band(17, 0.86, 0.16), 0);
+    }
+
+    #[test]
+    fn whipsaw_mid_book_uses_center_only_not_full_suppression() {
+        let posture = paired_core_broad_posture_for_regime(
+            Some(BtcRegime::Whipsaw),
+            180_000,
+            None,
+            0.62,
+            0.42,
+            17,
+        );
+        assert!(matches!(
+            posture,
+            PairedCoreBroadPosture::CenterOnly { center_band: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn directional_mid_book_uses_center_only_before_favorite_takeover() {
+        let posture = paired_core_broad_posture_for_regime(
+            Some(BtcRegime::DirectionalSmooth),
+            130_000,
+            None,
+            0.74,
+            0.26,
+            17,
+        );
+        assert!(matches!(
+            posture,
+            PairedCoreBroadPosture::CenterOnly { center_band: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn barbell_book_still_suppresses_paired_core() {
+        let posture = paired_core_broad_posture_for_regime(None, 60_000, None, 0.96, 0.04, 17);
+        assert!(matches!(posture, PairedCoreBroadPosture::Suppressed { .. }));
     }
 }

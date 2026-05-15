@@ -811,13 +811,13 @@ mod tests {
     }
 
     #[test]
-    fn profile_owned_float_caps_take_precedence_over_env_overrides() {
+    fn profile_owned_float_caps_reject_env_overrides() {
         std::env::set_var("TEST_PROFILE_OWNED_FLOAT_CAP", "7");
-        let value = parse_f64_or_profile("TEST_PROFILE_OWNED_FLOAT_CAP", Some(18.0), 250.0)
-            .expect("parse profile-owned cap");
+        let err = parse_f64_or_profile("TEST_PROFILE_OWNED_FLOAT_CAP", Some(18.0), 250.0)
+            .expect_err("profile-owned cap must reject env override");
         std::env::remove_var("TEST_PROFILE_OWNED_FLOAT_CAP");
 
-        assert_eq!(value, 18.0);
+        assert!(err.to_string().contains("ambiguous config"));
     }
 
     #[test]
