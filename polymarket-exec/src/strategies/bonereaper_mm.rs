@@ -445,12 +445,16 @@ impl LateFavoriteStrategy {
             LadderLeg::No
         };
         let tail_leg = opposite_leg(dominant_fav_leg);
-        let fav_filled_qty = inventory_qty_for_leg(input.late_fav_inventory, dominant_fav_leg);
+        let fav_filled_qty = inventory_qty_for_leg(input.late_fav_inventory, dominant_fav_leg)
+            + stranded_paired_core_qty_for_leg(input.paired_core_inventory, dominant_fav_leg);
         let fav_filled_spend_usd =
-            filled_inventory_spend_usd(input.late_fav_inventory, dominant_fav_leg);
-        let tail_filled_qty = inventory_qty_for_leg(input.cheap_tail_inventory, tail_leg);
+            filled_inventory_spend_usd(input.late_fav_inventory, dominant_fav_leg)
+                + stranded_paired_core_spend_usd(input.paired_core_inventory, dominant_fav_leg);
+        let tail_filled_qty = inventory_qty_for_leg(input.cheap_tail_inventory, tail_leg)
+            + stranded_paired_core_qty_for_leg(input.paired_core_inventory, tail_leg);
         let tail_filled_spend_usd =
-            filled_inventory_spend_usd(input.cheap_tail_inventory, tail_leg);
+            filled_inventory_spend_usd(input.cheap_tail_inventory, tail_leg)
+                + stranded_paired_core_spend_usd(input.paired_core_inventory, tail_leg);
         let working_fav_spend_usd =
             directional_favorite_working_spend_usd(self, input, dominant_fav_leg);
         let working_tail_spend_usd = directional_tail_working_spend_usd(input, tail_leg);
@@ -477,6 +481,7 @@ fn directional_favorite_leg_spend_usd<M: MarketDescriptor>(
     leg: LadderLeg,
 ) -> f64 {
     filled_inventory_spend_usd(input.late_fav_inventory, leg)
+        + stranded_paired_core_spend_usd(input.paired_core_inventory, leg)
         + directional_favorite_working_spend_usd(strategy, input, leg)
 }
 
@@ -921,6 +926,23 @@ fn filled_inventory_spend_usd(
     leg: LadderLeg,
 ) -> f64 {
     inventory_qty_for_leg(inventory, leg) * inventory_avg_cost_for_leg(inventory, leg)
+}
+
+fn stranded_paired_core_qty_for_leg(
+    inventory: crate::market_making::pairing::types::PairedInventorySnapshot,
+    leg: LadderLeg,
+) -> f64 {
+    match leg {
+        LadderLeg::Yes => (inventory.yes_qty - inventory.no_qty).max(0.0),
+        LadderLeg::No => (inventory.no_qty - inventory.yes_qty).max(0.0),
+    }
+}
+
+fn stranded_paired_core_spend_usd(
+    inventory: crate::market_making::pairing::types::PairedInventorySnapshot,
+    leg: LadderLeg,
+) -> f64 {
+    stranded_paired_core_qty_for_leg(inventory, leg) * inventory_avg_cost_for_leg(inventory, leg)
 }
 
 fn inventory_avg_cost_or(
@@ -2297,15 +2319,29 @@ where
 
         if tail_cfg.enabled && tail_enabled && legs.cheap_ask <= tail_cfg.max_cheap_ask {
             let late_fav_filled_qty =
-                inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg);
-            let favorite_avg_price = inventory_avg_cost_or(
-                input.late_fav_inventory,
-                legs.favorite_leg,
-                legs.favorite_ask,
-            );
-            let favorite_total_qty =
-                inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg);
-            let other_total_qty = inventory_qty_for_leg(input.cheap_tail_inventory, legs.cheap_leg);
+                inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg)
+                    + stranded_paired_core_qty_for_leg(
+                        input.paired_core_inventory,
+                        legs.favorite_leg,
+                    );
+            let favorite_filled_spend_usd =
+                filled_inventory_spend_usd(input.late_fav_inventory, legs.favorite_leg)
+                    + stranded_paired_core_spend_usd(
+                        input.paired_core_inventory,
+                        legs.favorite_leg,
+                    );
+            let favorite_avg_price = if late_fav_filled_qty > 0.0 {
+                favorite_filled_spend_usd / late_fav_filled_qty
+            } else {
+                inventory_avg_cost_or(
+                    input.late_fav_inventory,
+                    legs.favorite_leg,
+                    legs.favorite_ask,
+                )
+            };
+            let favorite_total_qty = late_fav_filled_qty;
+            let other_total_qty = inventory_qty_for_leg(input.cheap_tail_inventory, legs.cheap_leg)
+                + stranded_paired_core_qty_for_leg(input.paired_core_inventory, legs.cheap_leg);
             let working_late_fav_usd =
                 open_order_notional_for_leg(input.open_late_fav_order_exposure, legs.favorite_leg);
             let reserved_late_fav_usd =
@@ -2319,10 +2355,15 @@ where
                 reserved_late_fav_usd,
             );
             let favorite_exposure_usd = effective_late_fav_qty * favorite_avg_price;
-            let cheap_tail_filled_qty =
-                inventory_qty_for_leg(input.cheap_tail_inventory, legs.cheap_leg);
-            let cheap_tail_avg_price =
-                inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask);
+            let cheap_tail_filled_qty = other_total_qty;
+            let cheap_tail_filled_spend_usd =
+                filled_inventory_spend_usd(input.cheap_tail_inventory, legs.cheap_leg)
+                    + stranded_paired_core_spend_usd(input.paired_core_inventory, legs.cheap_leg);
+            let cheap_tail_avg_price = if cheap_tail_filled_qty > 0.0 {
+                cheap_tail_filled_spend_usd / cheap_tail_filled_qty
+            } else {
+                inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask)
+            };
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
                 + directional_tail_working_spend_usd(&input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
@@ -3059,6 +3100,62 @@ mod tests {
         assert!((bundle.fav_filled_spend_usd - 90.0).abs() < 1e-9);
         assert!((bundle.tail_filled_qty - 25.0).abs() < 1e-9);
         assert!((bundle.tail_filled_spend_usd - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn late_fav_bundle_reclassifies_unmatched_paired_core_inventory() {
+        let strategy = LateFavoriteStrategy::new(LateFavoriteStrategyConfig::default());
+        let snapshot = snap(0.92, 0.93, 0.06, 0.07);
+        let legs = read_legs(&snapshot).unwrap();
+        let mut input = strategy_input(
+            snapshot,
+            crate::signals::BtcRegimeSnapshot::default(),
+            MomentumSignal::default(),
+            0.93,
+            120_000,
+        );
+
+        input.late_fav_inventory = crate::market_making::pairing::types::PairedInventorySnapshot {
+            yes_qty: 100.0,
+            yes_avg_cost: 0.90,
+            no_qty: 0.0,
+            no_avg_cost: 0.0,
+            free_cash_usd: 0.0,
+            equity_usd: 0.0,
+        };
+        input.paired_core_inventory =
+            crate::market_making::pairing::types::PairedInventorySnapshot {
+                yes_qty: 170.0,
+                yes_avg_cost: 0.40,
+                no_qty: 120.0,
+                no_avg_cost: 0.38,
+                free_cash_usd: 0.0,
+                equity_usd: 0.0,
+            };
+
+        let bundle = strategy.bundle_state(&input, &legs);
+        assert_eq!(bundle.dominant_fav_leg, LadderLeg::Yes);
+        assert!((bundle.fav_filled_qty - 150.0).abs() < 1e-9);
+        assert!((bundle.fav_filled_spend_usd - 110.0).abs() < 1e-9);
+        assert!((bundle.tail_filled_qty - 0.0).abs() < 1e-9);
+        assert!((bundle.tail_filled_spend_usd - 0.0).abs() < 1e-9);
+
+        input.paired_core_inventory =
+            crate::market_making::pairing::types::PairedInventorySnapshot {
+                yes_qty: 120.0,
+                yes_avg_cost: 0.40,
+                no_qty: 170.0,
+                no_avg_cost: 0.08,
+                free_cash_usd: 0.0,
+                equity_usd: 0.0,
+            };
+
+        let bundle = strategy.bundle_state(&input, &legs);
+        assert_eq!(bundle.dominant_fav_leg, LadderLeg::Yes);
+        assert!((bundle.fav_filled_qty - 100.0).abs() < 1e-9);
+        assert!((bundle.fav_filled_spend_usd - 90.0).abs() < 1e-9);
+        assert!((bundle.tail_filled_qty - 50.0).abs() < 1e-9);
+        assert!((bundle.tail_filled_spend_usd - 4.0).abs() < 1e-9);
     }
 
     #[test]
