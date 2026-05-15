@@ -298,7 +298,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
     assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.60);
     assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
-    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 12.0);
+    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 5.0);
     let bonereaper_late = bonereaper_profile.late_favorite_config();
     assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
     assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
