@@ -117,7 +117,7 @@ late_favorite:
     maker_improve_ticks: 1.0
     min_order_usd: 1.0
   reversal_hedge:
-    enabled: true
+    enabled: false
     # Separate from pure cheap-tail insurance. This lane only buys the
     # opposite leg when filled late-favorite exposure exists and the live
     # tape shows reversal/whipsaw risk. It shares the same hedge inventory
