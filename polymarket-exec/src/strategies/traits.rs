@@ -24,6 +24,7 @@ pub struct StrategyDirectionalInventorySnapshot {
     pub market_id: MarketId,
     pub instrument_id: InstrumentId,
     pub quantity: f64,
+    pub avg_cost: f64,
     pub quote_level_tag: Option<String>,
 }
 

@@ -929,12 +929,37 @@ fn paired_inventory_from_directional_snapshots(
         .filter(|position| &position.market_id == market_id)
     {
         if &position.instrument_id == yes_id {
-            paired.yes_qty += position.quantity.max(0.0);
+            let next_qty = paired.yes_qty + position.quantity.max(0.0);
+            paired.yes_avg_cost = weighted_avg_cost(
+                paired.yes_qty,
+                paired.yes_avg_cost,
+                position.quantity.max(0.0),
+                position.avg_cost,
+            );
+            paired.yes_qty = next_qty;
         } else if &position.instrument_id == no_id {
-            paired.no_qty += position.quantity.max(0.0);
+            let next_qty = paired.no_qty + position.quantity.max(0.0);
+            paired.no_avg_cost = weighted_avg_cost(
+                paired.no_qty,
+                paired.no_avg_cost,
+                position.quantity.max(0.0),
+                position.avg_cost,
+            );
+            paired.no_qty = next_qty;
         }
     }
     paired
+}
+
+fn weighted_avg_cost(existing_qty: f64, existing_avg: f64, add_qty: f64, add_avg: f64) -> f64 {
+    let existing_qty = existing_qty.max(0.0);
+    let add_qty = add_qty.max(0.0);
+    let next_qty = existing_qty + add_qty;
+    if next_qty <= f64::EPSILON {
+        0.0
+    } else {
+        ((existing_qty * existing_avg.max(0.0)) + (add_qty * add_avg.max(0.0))) / next_qty
+    }
 }
 
 fn paired_tagged_open_order_exposure(
@@ -1039,4 +1064,47 @@ fn fair_value_from_context(
 #[allow(dead_code)]
 fn _underlying_for_context(_record: Option<&MarketContextRecord>) -> UnderlyingAsset {
     UnderlyingAsset::Btc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directional_lane_snapshots_preserve_average_cost() {
+        let market_id = MarketId::from("m1");
+        let yes_id = InstrumentId::from("yes");
+        let no_id = InstrumentId::from("no");
+        let snapshots = vec![
+            StrategyDirectionalInventorySnapshot {
+                market_id: market_id.clone(),
+                instrument_id: yes_id.clone(),
+                quantity: 10.0,
+                avg_cost: 0.80,
+                quote_level_tag: Some("late-fav".to_string()),
+            },
+            StrategyDirectionalInventorySnapshot {
+                market_id: market_id.clone(),
+                instrument_id: yes_id.clone(),
+                quantity: 5.0,
+                avg_cost: 0.90,
+                quote_level_tag: Some("late-fav".to_string()),
+            },
+            StrategyDirectionalInventorySnapshot {
+                market_id: market_id.clone(),
+                instrument_id: no_id.clone(),
+                quantity: 20.0,
+                avg_cost: 0.05,
+                quote_level_tag: Some("cheap-tail".to_string()),
+            },
+        ];
+
+        let paired =
+            paired_inventory_from_directional_snapshots(&snapshots, &market_id, &yes_id, &no_id);
+
+        assert!((paired.yes_qty - 15.0).abs() < 1e-9);
+        assert!((paired.yes_avg_cost - ((10.0 * 0.80 + 5.0 * 0.90) / 15.0)).abs() < 1e-9);
+        assert!((paired.no_qty - 20.0).abs() < 1e-9);
+        assert!((paired.no_avg_cost - 0.05).abs() < 1e-9);
+    }
 }

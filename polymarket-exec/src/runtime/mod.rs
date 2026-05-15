@@ -3881,20 +3881,25 @@ impl<S: Strategy> Runtime<S> {
                     return Vec::new();
                 }
             };
-            let mut qty_by_instrument: HashMap<InstrumentId, f64> = HashMap::new();
+            let mut exposure_by_instrument: HashMap<InstrumentId, (f64, f64)> = HashMap::new();
             for record in records {
                 if record.side == TradeSide::Buy
                     && !record.reduce_only
                     && record.filled_qty > ACCOUNTING_QTY_EPSILON
                     && lanes.contains(&record.accounting_lane)
                 {
-                    *qty_by_instrument.entry(record.instrument_id).or_insert(0.0) +=
-                        record.filled_qty.max(0.0);
+                    let qty = record.filled_qty.max(0.0);
+                    let notional = qty * record.limit_price.max(0.0);
+                    let entry = exposure_by_instrument
+                        .entry(record.instrument_id)
+                        .or_insert((0.0, 0.0));
+                    entry.0 += qty;
+                    entry.1 += notional;
                 }
             }
-            return qty_by_instrument
+            return exposure_by_instrument
                 .into_iter()
-                .filter_map(|(instrument_id, tracked_qty)| {
+                .filter_map(|(instrument_id, (tracked_qty, tracked_notional))| {
                     let current_qty = self
                         .inventory
                         .positions()
@@ -3905,11 +3910,17 @@ impl<S: Strategy> Runtime<S> {
                         .map(|position| position.quantity.max(0.0))
                         .unwrap_or(0.0);
                     let quantity = tracked_qty.min(current_qty).max(0.0);
+                    let avg_cost = if tracked_qty > ACCOUNTING_QTY_EPSILON {
+                        (tracked_notional / tracked_qty).max(0.0)
+                    } else {
+                        0.0
+                    };
                     (quantity > ACCOUNTING_QTY_EPSILON).then(|| {
                         crate::strategies::traits::StrategyDirectionalInventorySnapshot {
                             market_id: market_id.clone(),
                             instrument_id,
                             quantity,
+                            avg_cost,
                             quote_level_tag: quote_level_tag.map(str::to_string),
                         }
                     })
@@ -3935,10 +3946,20 @@ impl<S: Strategy> Runtime<S> {
                 **qty > ACCOUNTING_QTY_EPSILON && market_id.is_none_or(|id| tracked_market_id == id)
             })
             .map(|((tracked_market_id, instrument_id), qty)| {
+                let avg_cost = self
+                    .inventory
+                    .positions()
+                    .find(|position| {
+                        position.market_id == *tracked_market_id
+                            && position.instrument_id == *instrument_id
+                    })
+                    .map(|position| position.avg_price.max(0.0))
+                    .unwrap_or(0.0);
                 crate::strategies::traits::StrategyDirectionalInventorySnapshot {
                     market_id: tracked_market_id.clone(),
                     instrument_id: instrument_id.clone(),
                     quantity: (*qty).max(0.0),
+                    avg_cost,
                     quote_level_tag: quote_level_tag.map(str::to_string),
                 }
             })

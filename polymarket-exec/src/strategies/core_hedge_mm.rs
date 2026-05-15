@@ -25,6 +25,12 @@ use crate::signals::BtcRegime;
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, MarketId, MergeIntent, StrategyDecision, SuppressionScope};
 
+const PAIRED_CORE_CENTER_PROBE_MAX_LEVELS: usize = 3;
+const PAIRED_CORE_CENTER_PROBE_SPAN: f64 = 0.16;
+const PAIRED_CORE_CENTER_PROBE_MIN_PRICE: f64 = 0.42;
+const PAIRED_CORE_CENTER_PROBE_MAX_PRICE: f64 = 0.58;
+const PAIRED_CORE_REPAIR_PAIR_COST_LIMIT: f64 = 0.99;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
     pub enabled: bool,
@@ -60,6 +66,14 @@ pub struct CoreHedgeMmConfig {
     /// belong to explicit directional lanes, not mergeable paired-core.
     pub ladder_min_price: f64,
     pub ladder_max_price: f64,
+    /// Safety mode for live paired-core: clamp any configured ladder to a tiny
+    /// center probe instead of broad resting levels.
+    pub center_probe_only: bool,
+    /// Hard per-share pair-cost ceiling for one-sided mate repair. The
+    /// implementation also caps this at 0.99 so config cannot loosen it.
+    pub repair_pair_cost_limit: f64,
+    /// Conservative per-share fee/slippage buffer added to filled_avg + mate ask.
+    pub repair_fee_buffer: f64,
     /// Per-clip size by leg.
     pub core_clip_usd: f64,
     pub hedge_clip_usd: f64,
@@ -100,6 +114,9 @@ impl Default for CoreHedgeMmConfig {
             max_unpaired_core_qty: 10.0,
             ladder_min_price: 0.0,
             ladder_max_price: 1.0,
+            center_probe_only: false,
+            repair_pair_cost_limit: PAIRED_CORE_REPAIR_PAIR_COST_LIMIT,
+            repair_fee_buffer: 0.0,
             core_clip_usd: 13.0,
             hedge_clip_usd: 5.0,
             maker_improve_ticks: 0.0,
@@ -153,6 +170,15 @@ enum PairedCoreBroadPosture {
     Full,
     CenterOnly { reason: String, center_band: usize },
     Suppressed { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EffectivePairedCoreLadder {
+    levels: usize,
+    half_span: f64,
+    min_price: f64,
+    max_price: f64,
+    center_probe_only: bool,
 }
 
 impl CoreHedgeMmStrategy {
@@ -326,6 +352,41 @@ fn quote_mid(best_bid: f64, best_ask: f64, fallback: f64) -> f64 {
     }
 }
 
+fn effective_paired_core_ladder(config: &CoreHedgeMmConfig) -> Option<EffectivePairedCoreLadder> {
+    if config.ladder_levels == 0 {
+        return None;
+    }
+    let mut levels = config.ladder_levels.max(1);
+    let mut span = config.ladder_span.max(0.0);
+    let mut min_price = config.ladder_min_price;
+    let mut max_price = config.ladder_max_price;
+
+    if config.center_probe_only {
+        levels = levels.min(PAIRED_CORE_CENTER_PROBE_MAX_LEVELS).max(1);
+        span = span.min(PAIRED_CORE_CENTER_PROBE_SPAN);
+        min_price = min_price.max(PAIRED_CORE_CENTER_PROBE_MIN_PRICE);
+        max_price = max_price.min(PAIRED_CORE_CENTER_PROBE_MAX_PRICE);
+    }
+
+    if min_price > max_price {
+        return None;
+    }
+
+    Some(EffectivePairedCoreLadder {
+        levels,
+        half_span: span / 2.0,
+        min_price,
+        max_price,
+        center_probe_only: config.center_probe_only,
+    })
+}
+
+fn effective_repair_pair_cost_limit(config: &CoreHedgeMmConfig) -> f64 {
+    config
+        .repair_pair_cost_limit
+        .min(PAIRED_CORE_REPAIR_PAIR_COST_LIMIT)
+}
+
 fn canonical_clip_shares(price: f64, base_clip: f64) -> f64 {
     let d = (price - 0.5).abs();
     let scale = if d <= 0.05 {
@@ -363,17 +424,19 @@ fn paired_core_projected_qty<M: MarketDescriptor>(input: &StrategyInput<M>, leg:
     .max(0.0)
 }
 
-fn signed_pair_cost_for_repair<M: MarketDescriptor>(
+fn paired_core_repair_pair_cost<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     leg: LadderLeg,
-    repair_price: f64,
+    opposite_ask: f64,
+    fee_buffer: f64,
 ) -> Option<f64> {
     let other_avg = match leg {
         LadderLeg::Yes => input.paired_core_inventory.no_avg_cost,
         LadderLeg::No => input.paired_core_inventory.yes_avg_cost,
     };
-    if other_avg.is_finite() && other_avg > 0.0 {
-        Some(repair_price + other_avg)
+    if other_avg.is_finite() && other_avg > 0.0 && opposite_ask.is_finite() && opposite_ask > 0.0
+    {
+        Some(other_avg + opposite_ask + fee_buffer.max(0.0))
     } else {
         None
     }
@@ -550,8 +613,12 @@ fn ladder_candidate<M: MarketDescriptor>(
     let mid = quote_mid(best_bid, best_ask, center_price).clamp(0.01, 0.99);
     let low = (mid - half_span).clamp(0.01, 0.99);
     let high = (mid + half_span).clamp(0.01, 0.99);
-    let denom = (levels - 1) as f64;
-    let grid_price = low + (high - low) * (idx as f64 / denom);
+    let grid_price = if levels <= 1 {
+        mid
+    } else {
+        let denom = (levels - 1) as f64;
+        low + (high - low) * (idx as f64 / denom)
+    };
     let raw_price =
         improved_ladder_price(grid_price, best_bid, best_ask, tick, maker_improve_ticks);
     if raw_price < min_price || raw_price > max_price {
@@ -645,6 +712,48 @@ fn build_ladder_level<M: MarketDescriptor>(
     Some(intent)
 }
 
+fn build_mate_repair_order<M: MarketDescriptor>(
+    market: &M,
+    leg: LadderLeg,
+    best_bid: f64,
+    best_ask: f64,
+    quantity: f64,
+    min_order_usd: f64,
+    maker_improve_ticks: f64,
+    now_ms: EpochMillis,
+) -> Option<OrderIntent> {
+    let tick = market.tick_size().max(0.0001);
+    let max_passive = (best_ask - tick).max(tick);
+    let limit_price = (best_bid.max(tick) + maker_improve_ticks.max(0.0) * tick)
+        .min(max_passive)
+        .clamp(tick, 0.99);
+    if limit_price <= 0.0 || limit_price >= best_ask {
+        return None;
+    }
+
+    let min_qty = market.min_order_size().max(0.0);
+    let min_notional_qty = if min_order_usd > 0.0 {
+        min_order_usd / limit_price
+    } else {
+        0.0
+    };
+    let qty = quantity.max(min_qty).max(min_notional_qty);
+    if qty > quantity + 1e-9 {
+        return None;
+    }
+
+    build_ladder_level(
+        market,
+        leg,
+        best_ask,
+        limit_price,
+        qty,
+        "repair:mate",
+        min_order_usd,
+        now_ms,
+    )
+}
+
 impl<M> TradingStrategy<M> for CoreHedgeMmStrategy
 where
     M: MarketDescriptor,
@@ -723,7 +832,7 @@ where
             }
         }
 
-        if cfg.ladder_levels > 1 {
+        if let Some(ladder) = effective_paired_core_ladder(&cfg) {
             let yes_bid = input.snapshot.yes_quote.best_bid.as_ref().map(|l| l.price);
             let yes_ask = input.snapshot.yes_quote.best_ask.as_ref().map(|l| l.price);
             let no_bid = input.snapshot.no_quote.best_bid.as_ref().map(|l| l.price);
@@ -745,21 +854,30 @@ where
                 notes.push(note.note.clone());
             }
             let elapsed_ms = market_elapsed_ms(&input);
-            let levels = cfg.ladder_levels.max(2);
-            let half_span = (cfg.ladder_span / 2.0).max(0.0);
+            let levels = ladder.levels;
+            let half_span = ladder.half_span;
             let market_id = input.market.market_id().clone();
             let yes_mid = quote_mid(yes_bid, yes_ask, cfg.center_price).clamp(0.01, 0.99);
             let no_mid = quote_mid(no_bid, no_ask, cfg.center_price).clamp(0.01, 0.99);
-            if yes_mid < cfg.ladder_min_price
-                || yes_mid > cfg.ladder_max_price
-                || no_mid < cfg.ladder_min_price
-                || no_mid > cfg.ladder_max_price
-                || yes_ask > cfg.ladder_max_price
-                || no_ask > cfg.ladder_max_price
+            if ladder.center_probe_only {
+                notes.push(format!(
+                    "paired_core center probe active: configured_levels={} effective_levels={levels} band={:.4}-{:.4} span={:.4}",
+                    cfg.ladder_levels,
+                    ladder.min_price,
+                    ladder.max_price,
+                    half_span * 2.0,
+                ));
+            }
+            if yes_mid < ladder.min_price
+                || yes_mid > ladder.max_price
+                || no_mid < ladder.min_price
+                || no_mid > ladder.max_price
+                || yes_ask > ladder.max_price
+                || no_ask > ladder.max_price
             {
                 notes.push(format!(
                     "paired_core broad ladder: book center/ask outside mergeable band but eligible rungs may remain yes_mid={yes_mid:.4} no_mid={no_mid:.4} yes_ask={yes_ask:.4} no_ask={no_ask:.4} band={:.4}-{:.4}",
-                    cfg.ladder_min_price, cfg.ladder_max_price,
+                    ladder.min_price, ladder.max_price,
                 ));
             }
             let imbalance_tolerance =
@@ -831,98 +949,77 @@ where
                     LadderLeg::Yes => (yes_bid, yes_ask),
                     LadderLeg::No => (no_bid, no_ask),
                 };
-                notes.push(format!(
-                    "paired_core repair mode leg={leg:?} projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
-                ));
-                for idx in 0..levels {
-                    let Some(intent) = ladder_candidate(
-                        &input.market,
-                        leg,
-                        best_bid,
-                        best_ask,
-                        levels,
-                        half_span,
-                        cfg.center_price,
-                        idx,
-                        cfg.ladder_min_price,
-                        cfg.ladder_max_price,
-                        cfg.clip_shares,
-                        cfg.min_order_usd,
-                        cfg.maker_improve_ticks,
-                        input.now_ms,
-                    ) else {
-                        continue;
-                    };
-                    let tag = format!("ladder:{idx}");
-                    match leg {
-                        LadderLeg::Yes => {
-                            if let Some(pair_cost) =
-                                signed_pair_cost_for_repair(&input, leg, intent.limit_price)
-                            {
-                                if pair_cost > 1.0 + 1e-9 {
-                                    notes.push(format!(
-                                        "paired_core repair level blocked negative_ev leg=Yes idx={idx} repair_px={:.4} pair_cost={pair_cost:.4}",
-                                        intent.limit_price,
-                                    ));
-                                    continue;
-                                }
-                            }
-                            if projected_yes_qty + intent.quantity > filled_no_qty + 1e-9 {
-                                notes.push(format!(
-                                    "paired_core repair level blocked leg=Yes idx={idx} qty={:.4} projected_after={:.4} target_filled_no={filled_no_qty:.4}",
-                                    intent.quantity,
-                                    projected_yes_qty + intent.quantity,
-                                ));
-                                continue;
-                            }
-                            if self.should_emit(
-                                &market_id,
-                                leg,
-                                &tag,
-                                intent.limit_price,
-                                intent.quantity,
-                            ) {
-                                projected_yes_qty += intent.quantity;
-                                intents.push(intent);
-                            }
-                        }
-                        LadderLeg::No => {
-                            if let Some(pair_cost) =
-                                signed_pair_cost_for_repair(&input, leg, intent.limit_price)
-                            {
-                                if pair_cost > 1.0 + 1e-9 {
-                                    notes.push(format!(
-                                        "paired_core repair level blocked negative_ev leg=No idx={idx} repair_px={:.4} pair_cost={pair_cost:.4}",
-                                        intent.limit_price,
-                                    ));
-                                    continue;
-                                }
-                            }
-                            if projected_no_qty + intent.quantity > filled_yes_qty + 1e-9 {
-                                notes.push(format!(
-                                    "paired_core repair level blocked leg=No idx={idx} qty={:.4} projected_after={:.4} target_filled_yes={filled_yes_qty:.4}",
-                                    intent.quantity,
-                                    projected_no_qty + intent.quantity,
-                                ));
-                                continue;
-                            }
-                            if self.should_emit(
-                                &market_id,
-                                leg,
-                                &tag,
-                                intent.limit_price,
-                                intent.quantity,
-                            ) {
-                                projected_no_qty += intent.quantity;
-                                intents.push(intent);
-                            }
-                        }
-                    }
+                let repair_limit = effective_repair_pair_cost_limit(&cfg);
+                let fee_buffer = cfg.repair_fee_buffer.max(0.0);
+                let Some(pair_cost) =
+                    paired_core_repair_pair_cost(&input, leg, best_ask, fee_buffer)
+                else {
+                    notes.push(format!(
+                        "paired_core mate repair skipped leg={leg:?}: missing filled average cost; leave inventory for bundle salvage",
+                    ));
+                    return StrategyDecision::Noop { notes };
+                };
+                if pair_cost >= repair_limit {
+                    notes.push(format!(
+                        "paired_core mate repair skipped leg={leg:?}: pair_cost={pair_cost:.4} limit={repair_limit:.4} fee_buffer={fee_buffer:.4}; leave inventory for bundle salvage",
+                    ));
+                    return StrategyDecision::Noop { notes };
                 }
-                let residual_abs_imbalance = (projected_yes_qty - projected_no_qty).abs();
+
+                let (target_filled_qty, projected_repair_qty) = match leg {
+                    LadderLeg::Yes => (filled_no_qty, projected_yes_qty),
+                    LadderLeg::No => (filled_yes_qty, projected_no_qty),
+                };
+                let repair_qty = (target_filled_qty - projected_repair_qty)
+                    .min(cfg.clip_shares.max(min_repair_qty))
+                    .max(0.0);
                 notes.push(format!(
-                    "paired_core repair mode mate-only leg={leg:?} residual_abs_imbalance={residual_abs_imbalance:.4} max_unpaired={max_unpaired_core_qty:.4}; balanced continuation allowed if it does not worsen imbalance",
+                    "paired_core repair mode mate-only leg={leg:?} pair_cost={pair_cost:.4} limit={repair_limit:.4} projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4} repair_qty={repair_qty:.4}",
                 ));
+                if repair_qty + 1e-9 < min_repair_qty {
+                    notes.push(format!(
+                        "paired_core mate repair skipped leg={leg:?}: repair_qty={repair_qty:.4} below min_repair_qty={min_repair_qty:.4}; leave inventory for bundle salvage",
+                    ));
+                    return StrategyDecision::Noop { notes };
+                }
+
+                let Some(intent) = build_mate_repair_order(
+                    &input.market,
+                    leg,
+                    best_bid,
+                    best_ask,
+                    repair_qty,
+                    cfg.min_order_usd,
+                    cfg.maker_improve_ticks,
+                    input.now_ms,
+                ) else {
+                    notes.push(format!(
+                        "paired_core mate repair skipped leg={leg:?}: no passive mate quote fit repair_qty={repair_qty:.4}; leave inventory for bundle salvage",
+                    ));
+                    return StrategyDecision::Noop { notes };
+                };
+
+                if self.should_emit(
+                    &market_id,
+                    leg,
+                    "repair:mate",
+                    intent.limit_price,
+                    intent.quantity,
+                ) {
+                    notes.push(format!(
+                        "paired_core mate repair emitted leg={leg:?} qty={:.4} px={:.4}; no broad continuation after fill",
+                        intent.quantity, intent.limit_price,
+                    ));
+                    return StrategyDecision::QuoteSet {
+                        intents: vec![intent],
+                        notes,
+                    };
+                }
+
+                notes.push(format!(
+                    "paired_core mate repair unchanged leg={leg:?}; no broad continuation after fill",
+                ));
+                return StrategyDecision::Noop { notes };
             }
 
             let broad_posture = paired_core_broad_posture(
@@ -1024,19 +1121,19 @@ where
                     }
                 }
                 let Some(yes_intent) = ladder_candidate(
-                    &input.market,
-                    LadderLeg::Yes,
-                    yes_bid,
-                    yes_ask,
-                    levels,
-                    half_span,
-                    cfg.center_price,
-                    idx,
-                    cfg.ladder_min_price,
-                    cfg.ladder_max_price,
-                    cfg.clip_shares,
-                    cfg.min_order_usd,
-                    cfg.maker_improve_ticks,
+                        &input.market,
+                        LadderLeg::Yes,
+                        yes_bid,
+                        yes_ask,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        ladder.min_price,
+                        ladder.max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        cfg.maker_improve_ticks,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1046,15 +1143,15 @@ where
                     LadderLeg::No,
                     no_bid,
                     no_ask,
-                    levels,
-                    half_span,
-                    cfg.center_price,
-                    idx,
-                    cfg.ladder_min_price,
-                    cfg.ladder_max_price,
-                    cfg.clip_shares,
-                    cfg.min_order_usd,
-                    cfg.maker_improve_ticks,
+                        levels,
+                        half_span,
+                        cfg.center_price,
+                        idx,
+                        ladder.min_price,
+                        ladder.max_price,
+                        cfg.clip_shares,
+                        cfg.min_order_usd,
+                        cfg.maker_improve_ticks,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1106,7 +1203,7 @@ where
             }
             notes.push(format!(
                 "paired_core ladder levels={levels} span={:.4} yes_mid={yes_mid:.4} no_mid={no_mid:.4} projected_yes_final={projected_yes_qty:.4} projected_no_final={projected_no_qty:.4}",
-                cfg.ladder_span,
+                half_span * 2.0,
             ));
 
             return if intents.is_empty() {
@@ -1271,7 +1368,15 @@ where
 mod tests {
     use super::*;
     use crate::core::types::BookLevel;
-    use crate::types::QuoteSnapshot;
+    use crate::market_making::pairing::pair_cost_tracker::PairCostTracker;
+    use crate::market_making::pairing::types::PairedInventorySnapshot;
+    use crate::markets::BinaryOutcomeMarket;
+    use crate::signals::{
+        BtcRegimeSnapshot, FairValueEstimate, FairValueModel, MomentumSignal,
+        OrderBookPressureSignal,
+    };
+    use crate::strategies::traits::PairedOpenOrderExposure;
+    use crate::types::{QuoteSnapshot, StrategyDecision};
 
     fn snap_with_quotes(
         yes_bid: f64,
@@ -1295,6 +1400,64 @@ mod tests {
             no_instrument_id: "no".into(),
             yes_quote,
             no_quote,
+        }
+    }
+
+    fn test_market(snapshot: &PairedMarketSnapshot) -> BinaryOutcomeMarket {
+        let mut market = BinaryOutcomeMarket::btc_5m(
+            snapshot.market_id.clone(),
+            snapshot.yes_instrument_id.clone(),
+            snapshot.no_instrument_id.clone(),
+        );
+        market.event_start_ms = Some(0);
+        market.event_end_ms = Some(300_000);
+        market
+    }
+
+    fn neutral_fair_value() -> FairValueEstimate {
+        FairValueEstimate {
+            p_up: 0.5,
+            p_down: 0.5,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.0,
+            time_remaining_s: 300.0,
+            model: FairValueModel::BsmBinary,
+        }
+    }
+
+    fn strategy_input(snapshot: PairedMarketSnapshot) -> StrategyInput<BinaryOutcomeMarket> {
+        let market = test_market(&snapshot);
+        StrategyInput {
+            market,
+            snapshot,
+            inventory: PairedInventorySnapshot::default(),
+            paired_core_inventory: PairedInventorySnapshot::default(),
+            late_fav_inventory: PairedInventorySnapshot::default(),
+            cheap_tail_inventory: PairedInventorySnapshot::default(),
+            open_convex_order_exposure: PairedOpenOrderExposure::default(),
+            open_late_fav_order_exposure: PairedOpenOrderExposure::default(),
+            open_paired_core_order_exposure: PairedOpenOrderExposure::default(),
+            pair_cost: PairCostTracker::default(),
+            fair_value: neutral_fair_value(),
+            btc_regime: BtcRegimeSnapshot::default(),
+            momentum: MomentumSignal::default(),
+            order_book_pressure: OrderBookPressureSignal::default(),
+            now_ms: 60_000,
+        }
+    }
+
+    fn live_like_paired_core_config() -> CoreHedgeMmConfig {
+        CoreHedgeMmConfig {
+            enabled: true,
+            ladder_levels: 17,
+            ladder_span: 0.60,
+            center_probe_only: true,
+            clip_shares: 5.0,
+            max_unpaired_core_qty: 5.0,
+            ladder_min_price: 0.20,
+            ladder_max_price: 0.70,
+            min_order_usd: 1.0,
+            ..CoreHedgeMmConfig::default()
         }
     }
 
@@ -1383,5 +1546,92 @@ mod tests {
     fn barbell_book_still_suppresses_paired_core() {
         let posture = paired_core_broad_posture_for_regime(None, 60_000, None, 0.96, 0.04, 17);
         assert!(matches!(posture, PairedCoreBroadPosture::Suppressed { .. }));
+    }
+
+    #[test]
+    fn live_like_center_probe_does_not_emit_broad_ladder() {
+        let config = live_like_paired_core_config();
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
+            core_hedge: config,
+        });
+        let input = strategy_input(snap_with_quotes(0.48, 0.62, 0.48, 0.62));
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::QuoteSet { intents, notes } => {
+                assert!(intents.len() <= PAIRED_CORE_CENTER_PROBE_MAX_LEVELS * 2);
+                assert!(intents.iter().all(|intent| {
+                    intent.limit_price >= PAIRED_CORE_CENTER_PROBE_MIN_PRICE - 1e-9
+                        && intent.limit_price <= PAIRED_CORE_CENTER_PROBE_MAX_PRICE + 1e-9
+                }));
+                assert!(notes.iter().any(|note| note.contains("center probe active")));
+            }
+            other => panic!("expected constrained center-probe quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mate_repair_emits_only_when_pair_cost_is_positive() {
+        let mut config = live_like_paired_core_config();
+        config.repair_fee_buffer = 0.01;
+        let mut positive_input = strategy_input(snap_with_quotes(0.58, 0.62, 0.38, 0.40));
+        positive_input.paired_core_inventory = PairedInventorySnapshot {
+            yes_qty: 5.0,
+            yes_avg_cost: 0.50,
+            no_qty: 0.0,
+            no_avg_cost: 0.0,
+            ..PairedInventorySnapshot::default()
+        };
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
+            core_hedge: config,
+        });
+
+        let positive_decision = strategy.on_tick(positive_input);
+
+        match positive_decision {
+            StrategyDecision::QuoteSet { intents, notes } => {
+                assert_eq!(intents.len(), 1);
+                assert_eq!(
+                    intents[0].quote_level_tag.as_deref(),
+                    Some("paired-core:repair:mate")
+                );
+                assert!(notes.iter().any(|note| note.contains("mate repair emitted")));
+                assert!(
+                    !notes
+                        .iter()
+                        .any(|note| note.contains("balanced bundle mode"))
+                );
+            }
+            other => panic!("expected positive pair-cost mate repair, got {other:?}"),
+        }
+
+        let mut negative_input = strategy_input(snap_with_quotes(0.58, 0.62, 0.38, 0.40));
+        negative_input.paired_core_inventory = PairedInventorySnapshot {
+            yes_qty: 5.0,
+            yes_avg_cost: 0.58,
+            no_qty: 0.0,
+            no_avg_cost: 0.0,
+            ..PairedInventorySnapshot::default()
+        };
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
+            core_hedge: config,
+        });
+
+        let negative_decision = strategy.on_tick(negative_input);
+
+        match negative_decision {
+            StrategyDecision::Noop { notes } => {
+                assert!(notes.iter().any(|note| {
+                    note.contains("mate repair skipped") && note.contains("bundle salvage")
+                }));
+                assert!(
+                    !notes
+                        .iter()
+                        .any(|note| note.contains("balanced bundle mode"))
+                );
+            }
+            other => panic!("expected negative pair-cost repair skip, got {other:?}"),
+        }
     }
 }

@@ -47,26 +47,27 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # Temporarily disabled for live: recent evidence showed paired-core maker
-  # fills becoming accidental one-sided mid-price exposure. Keep live focused
-  # on explicit late-favorite and cheap-tail lanes until paired-core has a
-  # stricter bundle-first design.
-  enabled: false
-  # Broad mergeable maker ladder. This is intentionally not a strict
-  # pre-paired package: fills become mergeable inventory and can later recycle
-  # with any opposite-side mergeable fill if realised pair cost is positive.
-  ladder_levels: 17
-  ladder_span: 0.60
+  # Disabled for live by default: recent evidence showed broad paired-core
+  # maker fills becoming accidental one-sided mid-price exposure. If this lane
+  # is enabled, keep it as a tiny center probe plus mate-only repair.
+  enabled: true
+  center_probe_only: true
+  # Tiny center probe only. Do not restore the old 17-level 0.20-0.70 live
+  # ladder here; paired-core repair is mate-only after a one-sided fill.
+  ladder_levels: 3
+  ladder_span: 0.16
   center_price: 0.50
   # Polymarket BTC 5m venue minimum is 5 shares. Sub-5 clips are coerced to
-  # 5 by runtime sizing, so keep the profile explicit and broaden via levels.
+  # 5 by runtime sizing, so keep each probe at venue minimum.
   clip_shares: 5.0
   # Keep fresh paired-core from becoming a real directional position. One
   # venue-min clip can be stranded while the mate fills; beyond that, only
   # repair/pair-completion should add exposure.
   max_unpaired_core_qty: 5.0
-  ladder_min_price: 0.20
-  ladder_max_price: 0.70
+  ladder_min_price: 0.42
+  ladder_max_price: 0.58
+  repair_pair_cost_limit: 0.99
+  repair_fee_buffer: 0.0
   # Stop fresh paired-core in the late window. After 180s elapsed, the bar
   # should allocate new risk to explicit late-favorite and cheap-tail/reversal
   # lanes; any existing paired-core inventory can still merge or redeem.

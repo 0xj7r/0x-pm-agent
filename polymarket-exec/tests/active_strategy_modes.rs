@@ -295,15 +295,17 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(bonereaper_inventory.max_session_loss_bps, 2500.0);
     assert_eq!(bonereaper_inventory.max_open_orders_total, 120);
     assert_eq!(bonereaper_inventory.max_open_orders_per_market, 48);
-    assert!(!bonereaper_paired.core_hedge.enabled);
-    // Emergency live invariant: broad paired-core is disabled because it was
-    // acquiring one-sided mid-price inventory. If this lane is re-enabled, keep
-    // it explicitly constrained until a bundle-first replacement exists.
-    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.60);
+    assert!(bonereaper_paired.core_hedge.enabled);
+    // Live invariant: paired-core is only a tiny center probe plus mate-only
+    // repair. The old broad 17-level ladder must not return.
+    assert!(bonereaper_paired.core_hedge.center_probe_only);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 3);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.16);
     assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_min_price, 0.20);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_max_price, 0.70);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_min_price, 0.42);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_max_price, 0.58);
+    assert_eq!(bonereaper_paired.core_hedge.repair_pair_cost_limit, 0.99);
+    assert_eq!(bonereaper_paired.core_hedge.repair_fee_buffer, 0.0);
     assert_eq!(
         bonereaper_paired.core_hedge.disable_after_elapsed_ms,
         Some(180_000)
