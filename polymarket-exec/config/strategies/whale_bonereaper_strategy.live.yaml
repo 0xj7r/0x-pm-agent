@@ -47,7 +47,11 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  enabled: true
+  # Temporarily disabled for live: recent evidence showed paired-core maker
+  # fills becoming accidental one-sided mid-price exposure. Keep live focused
+  # on explicit late-favorite and cheap-tail lanes until paired-core has a
+  # stricter bundle-first design.
+  enabled: false
   # Broad mergeable maker ladder. This is intentionally not a strict
   # pre-paired package: fills become mergeable inventory and can later recycle
   # with any opposite-side mergeable fill if realised pair cost is positive.
