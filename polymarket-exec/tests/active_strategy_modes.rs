@@ -337,6 +337,7 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
         bonereaper_late.convex_tail.max_late_fav_spend_fraction,
         0.06
     );
+    assert_eq!(bonereaper_late.convex_tail.max_cheap_ask, 0.10);
     assert_eq!(bonereaper_late.convex_tail.ultra_cheap_max_ask, 0.04);
     assert_eq!(
         bonereaper_late.convex_tail.ultra_cheap_min_favorite_ask,

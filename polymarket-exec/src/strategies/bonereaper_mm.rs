@@ -1767,6 +1767,8 @@ fn cheap_tail_cap_usd(
     regime: Option<BtcRegime>,
     path_reversal_risk: f64,
     directional_uncertainty_boost: f64,
+    late_fav_filled_qty: f64,
+    favorite_avg_filled_price: f64,
 ) -> f64 {
     if late_fav_qty <= 0.0
         || favorite_avg_price <= 0.0
@@ -1777,7 +1779,18 @@ fn cheap_tail_cap_usd(
         return 0.0;
     }
     let favorite_loss_at_risk = late_fav_qty * favorite_avg_price;
-    let favorite_win_upside = late_fav_qty * (1.0 - favorite_avg_price);
+    // Edge-erosion cap must be funded by *realized* favorite-win upside, not
+    // upside implied by working/reserved notional. Otherwise the bundled cap
+    // stays inflated while makers are resting, and repeated tail emissions
+    // accumulate well past the win-edge fraction once fills land.
+    let favorite_win_upside = if late_fav_filled_qty > 0.0
+        && favorite_avg_filled_price > 0.0
+        && favorite_avg_filled_price < 1.0
+    {
+        late_fav_filled_qty * (1.0 - favorite_avg_filled_price)
+    } else {
+        0.0
+    };
     let coverage_fraction = (cheap_tail_coverage_fraction(cfg, regime)
         * (1.0
             + path_reversal_risk.clamp(0.0, 1.0)
@@ -2032,6 +2045,14 @@ fn should_use_aggressive_cheap_tail(
 ) -> bool {
     if cheap_ask <= 0.0 || cheap_ask > cfg.max_cheap_ask {
         return false;
+    }
+    // Cheap and ultra-cheap convex tails are always taker. Maker rungs at 1-7c
+    // sit unfilled because the resting book at those prices is thin and the
+    // touch moves on us before queue position pays off. We want the "tiny
+    // dollars, huge shares" Bonereaper shape, which only materializes when
+    // we actually cross the spread.
+    if cheap_ask <= cfg.max_cheap_ask {
+        return true;
     }
     let pair_cost_is_positive_ev =
         favorite_avg_price > 0.0 && favorite_avg_price + cheap_ask <= 1.0 + 1e-9;
@@ -2444,6 +2465,11 @@ where
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
                 + directional_tail_working_spend_usd(&input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
+            let favorite_avg_filled_price = if late_fav_filled_qty > 0.0 {
+                favorite_filled_spend_usd / late_fav_filled_qty
+            } else {
+                0.0
+            };
             let bundled_tail_cap_usd = cheap_tail_cap_usd(
                 &tail_cfg,
                 effective_late_fav_qty,
@@ -2453,6 +2479,8 @@ where
                 input.btc_regime.regime(),
                 path_reversal_risk,
                 directional_conviction.hedge_uncertainty_boost(),
+                late_fav_filled_qty,
+                favorite_avg_filled_price,
             );
             let unbundled_tail_cap_usd = unbundled_ultra_cheap_tail_cap_usd(
                 &tail_cfg,
@@ -2507,8 +2535,7 @@ where
                     // aggressive-taker path is engaged, regardless of the
                     // directional barbell flag (the unbundled standalone overlay
                     // fires before any late-fav fill arrives).
-                    let aggressive_all_levels = use_aggressive_taker
-                        && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
+                    let aggressive_all_levels = use_aggressive_taker;
                     let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
                     for level in 0..level_count {
                         if load_left < tail_cfg.min_order_usd {
@@ -3514,6 +3541,8 @@ mod tests {
                 Some(BtcRegime::Whipsaw),
                 0.0,
                 0.0,
+                100.0,
+                0.95,
             ) - cfg.min_order_usd)
                 .abs()
                 < 1e-9
@@ -3542,6 +3571,8 @@ mod tests {
                 Some(BtcRegime::Whipsaw),
                 0.0,
                 0.0,
+                100.0,
+                0.95,
             ) - 2.5)
                 .abs()
                 < 1e-9
@@ -3559,6 +3590,8 @@ mod tests {
                 Some(BtcRegime::Whipsaw),
                 0.0,
                 0.0,
+                100.0,
+                0.95,
             ) - 2.5)
                 .abs()
                 < 1e-9
@@ -3588,7 +3621,9 @@ mod tests {
                 0.20,
                 Some(BtcRegime::Whipsaw),
                 0.75,
-                0.0
+                0.0,
+                100.0,
+                0.95,
             ) - 2.5)
                 .abs()
                 < 1e-9
@@ -3619,6 +3654,8 @@ mod tests {
                 Some(BtcRegime::DirectionalSmooth),
                 0.0,
                 0.0,
+                31.9148936170213,
+                0.94,
             ) - cfg.min_order_usd)
                 .abs()
                 < 1e-9
@@ -3647,6 +3684,8 @@ mod tests {
             Some(BtcRegime::Whipsaw),
             0.0,
             0.0,
+            100.0,
+            0.85,
         );
         let high_cert_ultra_cheap = cheap_tail_cap_usd(
             &cfg,
@@ -3657,6 +3696,8 @@ mod tests {
             Some(BtcRegime::Whipsaw),
             0.0,
             0.0,
+            100.0,
+            0.85,
         );
         let high_cert_not_ultra_cheap = cheap_tail_cap_usd(
             &cfg,
@@ -3667,6 +3708,8 @@ mod tests {
             Some(BtcRegime::Whipsaw),
             0.0,
             0.0,
+            100.0,
+            0.85,
         );
 
         assert!(high_cert_ultra_cheap > below_high_cert);
@@ -3726,6 +3769,8 @@ mod tests {
                 Some(BtcRegime::DirectionalSmooth),
                 0.0,
                 0.0,
+                100.0,
+                0.95,
             ) < cheap_tail_cap_usd(
                 &cfg,
                 100.0,
@@ -3735,6 +3780,8 @@ mod tests {
                 Some(BtcRegime::Whipsaw),
                 0.0,
                 0.0,
+                100.0,
+                0.95,
             )
         );
     }
@@ -3758,6 +3805,8 @@ mod tests {
             Some(BtcRegime::TrendingVolatile),
             0.0,
             0.0,
+            100.0,
+            0.90,
         );
         let uncertain = cheap_tail_cap_usd(
             &cfg,
@@ -3768,6 +3817,8 @@ mod tests {
             Some(BtcRegime::TrendingVolatile),
             0.0,
             0.50,
+            100.0,
+            0.90,
         );
 
         assert!(uncertain > confident);
@@ -3828,13 +3879,17 @@ mod tests {
     }
 
     #[test]
-    fn aggressive_tail_uses_taker_when_pair_cost_is_positive_ev() {
+    fn cheap_tail_is_taker_inside_classification_band() {
+        // New structural rule: cheap-tail in the convex band (<= max_cheap_ask)
+        // is always taker. Maker rungs at 1-7c sat unfilled because the resting
+        // book is too thin and the touch moves before queue position pays off.
         let cfg = ConvexTailConfig {
-            max_cheap_ask: 0.20,
+            max_cheap_ask: 0.10,
             max_favorite_exposure_fraction: 0.50,
             ..ConvexTailConfig::default()
         };
 
+        // In-band: taker.
         assert!(should_use_aggressive_cheap_tail(
             &cfg,
             0.93,
@@ -3843,18 +3898,22 @@ mod tests {
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
-        assert!(!should_use_aggressive_cheap_tail(
+        // In-band at the band edge: still taker.
+        assert!(should_use_aggressive_cheap_tail(
             &cfg,
             0.93,
             0.93,
-            0.18,
+            0.10,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
     }
 
     #[test]
-    fn aggressive_tail_only_takes_negative_pair_cost_when_tail_is_ultra_cheap() {
+    fn cheap_tail_outside_band_is_not_treated_as_convex() {
+        // Above max_cheap_ask the price band is no longer convex tail; it is
+        // either reversal hedge or skipped entirely. Aggressive-taker must not
+        // engage there, regardless of regime or favorite certainty.
         let cfg = ConvexTailConfig {
             max_cheap_ask: 0.10,
             ultra_cheap_max_ask: 0.03,
@@ -3864,25 +3923,18 @@ mod tests {
 
         assert!(!should_use_aggressive_cheap_tail(
             &cfg,
-            0.95,
-            0.95,
-            0.08,
+            0.86,
+            0.86,
+            0.16,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
+        // Ultra-cheap edge: in-band, taker.
         assert!(should_use_aggressive_cheap_tail(
             &cfg,
             0.95,
             0.95,
             0.03,
-            Some(BtcRegime::DirectionalSmooth),
-            0.0,
-        ));
-        assert!(!should_use_aggressive_cheap_tail(
-            &cfg,
-            0.86,
-            0.86,
-            0.16,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
@@ -4068,7 +4120,7 @@ mod tests {
         let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_cheap_ask, 0.15);
+        assert_eq!(cfg.max_cheap_ask, 0.10);
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);

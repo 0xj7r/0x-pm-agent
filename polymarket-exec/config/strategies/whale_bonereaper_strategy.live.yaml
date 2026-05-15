@@ -99,9 +99,13 @@ late_favorite:
     min_order_usd: 1.0
     # Aligned to observed Bonereaper tape (May 2026 48h pull): 66% of buy spend
     # is >=90c favorite, ~1.4% is <=10c tail, ~0.3% is <=3c ultra. Median
-    # opposing-tail / high-fav ratio is 3.6% with p75 ~6%. Defaults gated us
-    # at 2.5% and max_cheap_ask=0.10, killing the 85-89c-fav lottery window.
-    max_cheap_ask: 0.15
+    # opposing-tail / high-fav ratio is 3.6%, p75 ~6%.
+    #
+    # 10-15c is intentionally excluded from cheap-tail: too expensive to be
+    # convex, too cheap to be a real reversal hedge. If we want that band,
+    # it belongs in reversal_hedge with its own sizing. This is a payoff
+    # *classification* boundary, not a tunable knob.
+    max_cheap_ask: 0.10
     max_late_fav_spend_fraction: 0.06
     ultra_cheap_max_ask: 0.04
     # Ultra-cheap maker rungs at 1c collapse the ladder to a single level once
