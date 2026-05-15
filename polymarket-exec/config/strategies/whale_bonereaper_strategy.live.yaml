@@ -64,7 +64,11 @@ paired_core:
   # should allocate new risk to explicit late-favorite and cheap-tail/reversal
   # lanes; any existing paired-core inventory can still merge or redeem.
   disable_after_elapsed_ms: 180000
-  maker_improve_ticks: 0.0
+  # Improve only near-touch ladder rungs by one tick. The strategy code still
+  # keeps orders post-only and suppresses broad paired-core outside eligible
+  # flat/center regimes; this improves queue/fill probability without pulling
+  # the whole ladder to touch.
+  maker_improve_ticks: 1.0
   merge_min_qty: 15.0
   merge_batch_cap: 100.0
 
