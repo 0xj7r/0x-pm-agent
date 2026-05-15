@@ -346,6 +346,26 @@ struct LegQuotes {
     cheap_bid: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LateFavBundleState {
+    dominant_fav_leg: LadderLeg,
+    current_fav_leg: LadderLeg,
+    tail_leg: LadderLeg,
+    side_flip: bool,
+    fav_filled_qty: f64,
+    fav_filled_spend_usd: f64,
+    tail_filled_qty: f64,
+    tail_filled_spend_usd: f64,
+    working_fav_spend_usd: f64,
+    working_tail_spend_usd: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BundleOrderGate {
+    allowed: bool,
+    reason: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct LateFavoriteStrategy {
     config: LateFavoriteStrategyConfig,
@@ -405,6 +425,155 @@ impl LateFavoriteStrategy {
         entry.notional_usd += notional_usd;
         entry.updated_at_ms = now_ms;
     }
+
+    fn bundle_state<M: MarketDescriptor>(
+        &self,
+        input: &StrategyInput<M>,
+        legs: &LegQuotes,
+    ) -> LateFavBundleState {
+        let yes_fav_qty = input.late_fav_inventory.yes_qty.max(0.0);
+        let no_fav_qty = input.late_fav_inventory.no_qty.max(0.0);
+        let yes_fav_spend = yes_fav_qty * input.late_fav_inventory.yes_avg_cost.max(0.0)
+            + open_order_notional_for_leg(input.open_late_fav_order_exposure, LadderLeg::Yes)
+            + self.reserved_notional(input.market.market_id(), LadderLeg::Yes);
+        let no_fav_spend = no_fav_qty * input.late_fav_inventory.no_avg_cost.max(0.0)
+            + open_order_notional_for_leg(input.open_late_fav_order_exposure, LadderLeg::No)
+            + self.reserved_notional(input.market.market_id(), LadderLeg::No);
+
+        let dominant_fav_leg = if yes_fav_spend <= 1e-9 && no_fav_spend <= 1e-9 {
+            legs.favorite_leg
+        } else if yes_fav_spend >= no_fav_spend {
+            LadderLeg::Yes
+        } else {
+            LadderLeg::No
+        };
+        let tail_leg = opposite_leg(dominant_fav_leg);
+        let fav_filled_qty = inventory_qty_for_leg(input.late_fav_inventory, dominant_fav_leg);
+        let fav_filled_spend_usd = fav_filled_qty
+            * inventory_avg_cost_for_leg(input.late_fav_inventory, dominant_fav_leg);
+        let tail_filled_qty = inventory_qty_for_leg(input.cheap_tail_inventory, tail_leg);
+        let tail_filled_spend_usd = tail_filled_qty
+            * inventory_avg_cost_for_leg(input.cheap_tail_inventory, tail_leg);
+        let working_fav_spend_usd =
+            open_order_notional_for_leg(input.open_late_fav_order_exposure, dominant_fav_leg)
+                + self.reserved_notional(input.market.market_id(), dominant_fav_leg);
+        let working_tail_spend_usd =
+            open_order_notional_for_leg(input.open_convex_order_exposure, tail_leg)
+                + self.reserved_notional(input.market.market_id(), tail_leg);
+
+        LateFavBundleState {
+            dominant_fav_leg,
+            current_fav_leg: legs.favorite_leg,
+            tail_leg,
+            side_flip: dominant_fav_leg != legs.favorite_leg
+                && (fav_filled_spend_usd + working_fav_spend_usd) >= 10.0,
+            fav_filled_qty,
+            fav_filled_spend_usd,
+            tail_filled_qty,
+            tail_filled_spend_usd,
+            working_fav_spend_usd,
+            working_tail_spend_usd,
+        }
+    }
+}
+
+impl LateFavBundleState {
+    fn fav_total_spend_usd(self) -> f64 {
+        self.fav_filled_spend_usd + self.working_fav_spend_usd
+    }
+
+    fn tail_coverage_ratio(self) -> f64 {
+        let loss_at_risk = self.fav_total_spend_usd();
+        if loss_at_risk <= 0.0 {
+            return 1.0;
+        }
+        (self.tail_filled_qty / loss_at_risk).clamp(0.0, 10.0)
+    }
+
+    fn payoff_if_fav_wins_after(self, proposed_fav_qty: f64, proposed_fav_spend: f64) -> f64 {
+        self.fav_filled_qty + proposed_fav_qty
+            - self.fav_filled_spend_usd
+            - self.tail_filled_spend_usd
+            - proposed_fav_spend
+    }
+
+    fn gate_favorite_add(
+        self,
+        cfg: &ConvexTailConfig,
+        proposed_leg: LadderLeg,
+        proposed_price: f64,
+        proposed_qty: f64,
+        proposed_spend_usd: f64,
+        regime: Option<BtcRegime>,
+        path_reversal_risk: f64,
+    ) -> BundleOrderGate {
+        if self.side_flip
+            && proposed_leg != self.dominant_fav_leg
+            && proposed_price > cfg.max_cheap_ask
+        {
+            return BundleOrderGate {
+                allowed: false,
+                reason: format!(
+                    "bundle blocks side-flip favorite loading dominant={:?} current={:?} px={:.4} max_tail_px={:.4} fav_spend={:.2} tail_coverage={:.2}",
+                    self.dominant_fav_leg,
+                    self.current_fav_leg,
+                    proposed_price,
+                    cfg.max_cheap_ask,
+                    self.fav_total_spend_usd(),
+                    self.tail_coverage_ratio(),
+                ),
+            };
+        }
+
+        if proposed_leg == self.dominant_fav_leg {
+            let payoff_if_fav_wins =
+                self.payoff_if_fav_wins_after(proposed_qty, proposed_spend_usd);
+            if self.fav_total_spend_usd() > 0.0 && payoff_if_fav_wins < -1e-9 {
+                return BundleOrderGate {
+                    allowed: false,
+                    reason: format!(
+                        "bundle blocks favorite add: favorite-win payoff would be negative payoff={payoff_if_fav_wins:.2} fav_spend={:.2} tail_spend={:.2} proposed_spend={proposed_spend_usd:.2}",
+                        self.fav_total_spend_usd(),
+                        self.tail_filled_spend_usd,
+                    ),
+                };
+            }
+
+            let coverage_target = bundle_tail_coverage_target(cfg, regime, path_reversal_risk);
+            let reversal_prone = matches!(
+                regime,
+                Some(BtcRegime::Whipsaw | BtcRegime::TrendingVolatile)
+            ) || path_reversal_risk >= 0.35;
+            if reversal_prone
+                && self.fav_total_spend_usd() >= cfg.clip_usd.max(cfg.min_order_usd)
+                && self.tail_coverage_ratio() < coverage_target * 0.50
+            {
+                return BundleOrderGate {
+                    allowed: false,
+                    reason: format!(
+                        "bundle blocks favorite add: tail coverage {:.2} below required {:.2} in reversal-prone regime={:?} path_reversal={:.2}",
+                        self.tail_coverage_ratio(),
+                        coverage_target,
+                        regime,
+                        path_reversal_risk,
+                    ),
+                };
+            }
+        }
+
+        BundleOrderGate {
+            allowed: true,
+            reason: format!(
+                "bundle allows favorite add fav_leg={:?} tail_leg={:?} side_flip={} fav_spend={:.2} tail_spend={:.2} tail_coverage={:.2}",
+                self.dominant_fav_leg,
+                self.tail_leg,
+                self.side_flip,
+                self.fav_total_spend_usd(),
+                self.tail_filled_spend_usd,
+                self.tail_coverage_ratio(),
+            ),
+        }
+    }
 }
 
 fn read_legs(snapshot: &PairedMarketSnapshot) -> Option<LegQuotes> {
@@ -442,6 +611,13 @@ fn read_legs(snapshot: &PairedMarketSnapshot) -> Option<LegQuotes> {
         cheap_ask,
         cheap_bid,
     })
+}
+
+fn opposite_leg(leg: LadderLeg) -> LadderLeg {
+    match leg {
+        LadderLeg::Yes => LadderLeg::No,
+        LadderLeg::No => LadderLeg::Yes,
+    }
 }
 
 fn maker_limit_price(bid: f64, ask: f64, tick: f64, improve_ticks: f64) -> Option<f64> {
@@ -1514,6 +1690,15 @@ fn cheap_tail_coverage_fraction(cfg: &ConvexTailConfig, regime: Option<BtcRegime
     (base * regime_multiplier).clamp(0.0, 1.0)
 }
 
+fn bundle_tail_coverage_target(
+    cfg: &ConvexTailConfig,
+    regime: Option<BtcRegime>,
+    path_reversal_risk: f64,
+) -> f64 {
+    (cheap_tail_coverage_fraction(cfg, regime) * (1.0 + path_reversal_risk.clamp(0.0, 0.75)))
+        .clamp(0.20, 1.0)
+}
+
 fn reversal_hedge_score<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     legs: &LegQuotes,
@@ -1597,6 +1782,7 @@ fn cheap_tail_ladder_levels(cheap_ask: f64, budget_usd: f64, min_order_usd: f64)
 
 fn should_use_aggressive_cheap_tail(
     cfg: &ConvexTailConfig,
+    favorite_ask: f64,
     favorite_avg_price: f64,
     cheap_ask: f64,
     regime: Option<BtcRegime>,
@@ -1607,6 +1793,11 @@ fn should_use_aggressive_cheap_tail(
     }
     let pair_cost_is_positive_ev =
         favorite_avg_price > 0.0 && favorite_avg_price + cheap_ask <= 1.0 + 1e-9;
+    let high_cert_favorite = favorite_ask >= cfg.ultra_cheap_min_favorite_ask
+        || favorite_avg_price >= cfg.ultra_cheap_min_favorite_ask;
+    if high_cert_favorite && cheap_ask <= cfg.max_cheap_ask.min(0.10) {
+        return true;
+    }
     pair_cost_is_positive_ev
         || matches!(
             regime,
@@ -1683,6 +1874,21 @@ where
             directional_conviction.spot_vs_strike_bps,
             directional_conviction.model_favorite,
             directional_conviction.path_reversal_risk,
+        ));
+        let bundle_state = self.bundle_state(&input, &legs);
+        notes.push(format!(
+            "late_fav_bundle dominant={:?} current={:?} tail={:?} side_flip={} fav_spend={:.2} fav_qty={:.2} tail_spend={:.2} tail_qty={:.2} working_fav={:.2} working_tail={:.2} tail_coverage={:.2}",
+            bundle_state.dominant_fav_leg,
+            bundle_state.current_fav_leg,
+            bundle_state.tail_leg,
+            bundle_state.side_flip,
+            bundle_state.fav_total_spend_usd(),
+            bundle_state.fav_filled_qty,
+            bundle_state.tail_filled_spend_usd,
+            bundle_state.tail_filled_qty,
+            bundle_state.working_fav_spend_usd,
+            bundle_state.working_tail_spend_usd,
+            bundle_state.tail_coverage_ratio(),
         ));
         let climb_enabled = climb_cfg
             .disable_after_ms
@@ -1853,8 +2059,21 @@ where
                                 .min(load_left)
                                 .max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
+                            let bundle_gate = bundle_state.gate_favorite_add(
+                                &tail_cfg,
+                                legs.favorite_leg,
+                                px,
+                                qty,
+                                clip,
+                                input.btc_regime.regime(),
+                                entry_policy.path_reversal_risk,
+                            );
+                            if !bundle_gate.allowed {
+                                notes.push(bundle_gate.reason);
+                                break;
+                            }
                             let reason = format!(
-                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} price_scale={:.2} confidence_multiplier={:.2} regime_multiplier={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
+                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} price_scale={:.2} confidence_multiplier={:.2} regime_multiplier={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
                                 legs.favorite_leg,
                                 level,
                                 if aggressive_taker { "taker_fak" } else { "maker_post_only" },
@@ -1871,6 +2090,7 @@ where
                                 clip,
                                 current_exposure_usd + (remaining_load - load_left),
                                 adjusted_max_load_usd,
+                                bundle_gate.reason,
                             );
                             notes.push(reason.clone());
                             intents.push(build_late_favorite_intent(
@@ -1972,6 +2192,7 @@ where
                     let mut load_left = total_clip;
                     let use_aggressive_taker = should_use_aggressive_cheap_tail(
                         &tail_cfg,
+                        legs.favorite_ask,
                         favorite_avg_price,
                         legs.cheap_ask,
                         input.btc_regime.regime(),
@@ -3012,6 +3233,7 @@ mod tests {
         assert!(should_use_aggressive_cheap_tail(
             &cfg,
             0.93,
+            0.93,
             0.06,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
@@ -3019,10 +3241,137 @@ mod tests {
         assert!(!should_use_aggressive_cheap_tail(
             &cfg,
             0.93,
+            0.93,
             0.18,
             Some(BtcRegime::DirectionalSmooth),
             0.0,
         ));
+    }
+
+    #[test]
+    fn aggressive_tail_uses_taker_for_high_cert_favorite_even_when_pair_cost_negative() {
+        let cfg = ConvexTailConfig {
+            max_cheap_ask: 0.10,
+            ultra_cheap_min_favorite_ask: 0.90,
+            ..ConvexTailConfig::default()
+        };
+
+        assert!(should_use_aggressive_cheap_tail(
+            &cfg,
+            0.95,
+            0.95,
+            0.08,
+            Some(BtcRegime::DirectionalSmooth),
+            0.0,
+        ));
+        assert!(!should_use_aggressive_cheap_tail(
+            &cfg,
+            0.86,
+            0.86,
+            0.16,
+            Some(BtcRegime::DirectionalSmooth),
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn bundle_gate_blocks_expensive_side_flip_repair() {
+        let cfg = ConvexTailConfig {
+            max_cheap_ask: 0.10,
+            ..ConvexTailConfig::default()
+        };
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::No,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::Yes,
+            side_flip: true,
+            fav_filled_qty: 100.0,
+            fav_filled_spend_usd: 92.0,
+            tail_filled_qty: 0.0,
+            tail_filled_spend_usd: 0.0,
+            working_fav_spend_usd: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let gate = bundle.gate_favorite_add(
+            &cfg,
+            LadderLeg::Yes,
+            0.81,
+            12.0,
+            9.72,
+            Some(BtcRegime::Whipsaw),
+            0.60,
+        );
+
+        assert!(!gate.allowed);
+        assert!(gate.reason.contains("side-flip"));
+    }
+
+    #[test]
+    fn bundle_gate_allows_cheap_tail_like_side_flip_repair() {
+        let cfg = ConvexTailConfig {
+            max_cheap_ask: 0.10,
+            ..ConvexTailConfig::default()
+        };
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::No,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::Yes,
+            side_flip: true,
+            fav_filled_qty: 100.0,
+            fav_filled_spend_usd: 92.0,
+            tail_filled_qty: 0.0,
+            tail_filled_spend_usd: 0.0,
+            working_fav_spend_usd: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let gate = bundle.gate_favorite_add(
+            &cfg,
+            LadderLeg::Yes,
+            0.04,
+            100.0,
+            4.0,
+            Some(BtcRegime::Whipsaw),
+            0.60,
+        );
+
+        assert!(gate.allowed);
+    }
+
+    #[test]
+    fn bundle_gate_blocks_same_side_favorite_when_tail_coverage_is_missing_in_whipsaw() {
+        let cfg = ConvexTailConfig {
+            clip_usd: 3.0,
+            min_order_usd: 1.0,
+            max_favorite_exposure_fraction: 0.55,
+            ..ConvexTailConfig::default()
+        };
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::Yes,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::No,
+            side_flip: false,
+            fav_filled_qty: 100.0,
+            fav_filled_spend_usd: 90.0,
+            tail_filled_qty: 5.0,
+            tail_filled_spend_usd: 0.25,
+            working_fav_spend_usd: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let gate = bundle.gate_favorite_add(
+            &cfg,
+            LadderLeg::Yes,
+            0.92,
+            30.0,
+            27.60,
+            Some(BtcRegime::Whipsaw),
+            0.55,
+        );
+
+        assert!(!gate.allowed);
+        assert!(gate.reason.contains("tail coverage"));
     }
 
     #[test]
