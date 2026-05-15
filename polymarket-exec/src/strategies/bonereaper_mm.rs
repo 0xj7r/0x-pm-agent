@@ -1366,6 +1366,29 @@ fn late_favorite_clip_ceiling_multiplier(
     }
 }
 
+fn late_favorite_high_cert_price_taper(favorite_ask: f64) -> f64 {
+    if favorite_ask < 0.95 {
+        return 1.0;
+    }
+    if favorite_ask >= 0.99 {
+        return 0.18;
+    }
+    let progress = ((favorite_ask - 0.95) / 0.04).clamp(0.0, 1.0);
+    1.0 - progress * 0.82
+}
+
+fn late_favorite_high_cert_max_levels(favorite_ask: f64, base_levels: usize) -> usize {
+    if favorite_ask >= 0.99 {
+        base_levels.min(1)
+    } else if favorite_ask >= 0.97 {
+        base_levels.min(2)
+    } else if favorite_ask >= 0.95 {
+        base_levels.min(3)
+    } else {
+        base_levels
+    }
+}
+
 fn favorite_entry_policy<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     legs: &LegQuotes,
@@ -1600,15 +1623,20 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     let reversal_scale = (1.0 - 0.55 * path_reversal_risk).clamp(0.35, 1.0);
     let timing_scale = late_favorite_timing_scale(cfg, pre_standard_late_window, early_late);
     let conviction_scale = conviction.late_favorite_multiplier();
+    let high_cert_taper = late_favorite_high_cert_price_taper(legs.favorite_ask);
+    let max_levels = late_favorite_high_cert_max_levels(
+        legs.favorite_ask,
+        late_favorite_max_levels(pre_standard_late_window, early_late, whipsaw),
+    );
     Some(FavoriteEntryPolicy {
         min_price: if early_late {
             cfg.taker_min_favorite_ask
         } else {
             cfg.near_touch_min_favorite_ask
         },
-        max_levels: late_favorite_max_levels(pre_standard_late_window, early_late, whipsaw),
-        clip_multiplier: timing_scale * reversal_scale * conviction_scale,
-        cap_multiplier: timing_scale * reversal_scale * conviction_scale,
+        max_levels,
+        clip_multiplier: timing_scale * reversal_scale * conviction_scale * high_cert_taper,
+        cap_multiplier: timing_scale * reversal_scale * conviction_scale * high_cert_taper,
         allow_taker: true,
         near_touch_maker: true,
         path_reversal_risk,
@@ -2183,7 +2211,8 @@ where
                             * late_favorite_clip_ceiling_multiplier(
                                 directional_conviction,
                                 &entry_policy,
-                            );
+                            )
+                            * late_favorite_high_cert_price_taper(legs.favorite_ask);
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -3240,6 +3269,19 @@ mod tests {
         assert_eq!(late_favorite_timing_scale(&cfg, true, true), 0.35);
         assert_eq!(late_favorite_timing_scale(&cfg, false, true), 0.62);
         assert_eq!(late_favorite_timing_scale(&cfg, false, false), 1.0);
+    }
+
+    #[test]
+    fn high_cert_late_favorite_tapers_size_as_upside_collapses() {
+        assert_eq!(late_favorite_high_cert_price_taper(0.94), 1.0);
+        assert_eq!(late_favorite_high_cert_price_taper(0.95), 1.0);
+        assert!((late_favorite_high_cert_price_taper(0.97) - 0.59).abs() < 1e-9);
+        assert_eq!(late_favorite_high_cert_price_taper(0.99), 0.18);
+
+        assert_eq!(late_favorite_high_cert_max_levels(0.94, 5), 5);
+        assert_eq!(late_favorite_high_cert_max_levels(0.95, 5), 3);
+        assert_eq!(late_favorite_high_cert_max_levels(0.97, 5), 2);
+        assert_eq!(late_favorite_high_cert_max_levels(0.99, 5), 1);
     }
 
     #[test]
