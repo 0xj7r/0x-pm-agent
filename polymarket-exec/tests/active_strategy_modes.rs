@@ -296,11 +296,26 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     assert_eq!(bonereaper_inventory.max_open_orders_total, 120);
     assert_eq!(bonereaper_inventory.max_open_orders_per_market, 48);
     assert!(!bonereaper_paired.core_hedge.enabled);
+    // Emergency live invariant: broad paired-core is disabled because it was
+    // acquiring one-sided mid-price inventory. If this lane is re-enabled, keep
+    // it explicitly constrained until a bundle-first replacement exists.
     assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
     assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.60);
     assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_min_price, 0.20);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_max_price, 0.70);
+    assert_eq!(
+        bonereaper_paired.core_hedge.disable_after_elapsed_ms,
+        Some(180_000)
+    );
+    assert!(
+        bonereaper_paired.core_hedge.max_unpaired_core_qty
+            <= bonereaper_paired.core_hedge.clip_shares
+    );
     assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 5.0);
     let bonereaper_late = bonereaper_profile.late_favorite_config();
+    assert!(bonereaper_late.favorite_climb.enabled);
+    assert!(bonereaper_late.convex_tail.enabled);
     assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
     assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
     assert_eq!(bonereaper_late.favorite_climb.clip_usd, 45.0);
