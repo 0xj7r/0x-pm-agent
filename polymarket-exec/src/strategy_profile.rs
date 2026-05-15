@@ -99,6 +99,7 @@ pub struct ConvexTailSubsection {
     pub max_load_usd: Option<f64>,
     pub max_favorite_exposure_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
+    pub max_late_fav_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
     pub disable_after_ms: Option<u64>,
@@ -297,6 +298,9 @@ impl StrategyProfile {
                 max_win_edge_spend_fraction: t
                     .max_win_edge_spend_fraction
                     .unwrap_or(tail_def.max_win_edge_spend_fraction),
+                max_late_fav_spend_fraction: t
+                    .max_late_fav_spend_fraction
+                    .unwrap_or(tail_def.max_late_fav_spend_fraction),
                 maker_improve_ticks: t
                     .maker_improve_ticks
                     .unwrap_or(tail_def.maker_improve_ticks),

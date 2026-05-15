@@ -309,6 +309,14 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
         0.40
     );
     assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.55);
-    assert_eq!(bonereaper_late.convex_tail.clip_usd, 30.0);
-    assert_eq!(bonereaper_late.convex_tail.max_win_edge_spend_fraction, 2.0);
+    assert_eq!(bonereaper_late.convex_tail.clip_usd, 3.0);
+    assert_eq!(bonereaper_late.convex_tail.max_load_usd, 30.0);
+    assert_eq!(
+        bonereaper_late.convex_tail.max_win_edge_spend_fraction,
+        0.45
+    );
+    assert_eq!(
+        bonereaper_late.convex_tail.max_late_fav_spend_fraction,
+        0.025
+    );
 }
