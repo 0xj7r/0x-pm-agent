@@ -625,7 +625,7 @@ fn ladder_candidate<M: MarketDescriptor>(
         return None;
     }
     let qty = canonical_clip_shares(raw_price, clip_shares);
-    build_ladder_level(
+    let mut intent = build_ladder_level(
         market,
         leg,
         best_ask,
@@ -634,7 +634,12 @@ fn ladder_candidate<M: MarketDescriptor>(
         &format!("ladder:{idx}"),
         min_order_usd,
         now_ms,
-    )
+    )?;
+    intent.pair_id = Some(format!(
+        "paired-core:{}:ladder:{idx}:{now_ms}",
+        market.market_id()
+    ));
+    Some(intent)
 }
 
 fn improved_ladder_price(
@@ -1561,6 +1566,13 @@ mod tests {
         match decision {
             StrategyDecision::QuoteSet { intents, notes } => {
                 assert!(intents.len() <= PAIRED_CORE_CENTER_PROBE_MAX_LEVELS * 2);
+                for pair in intents.chunks_exact(2) {
+                    assert_eq!(pair[0].pair_id, pair[1].pair_id);
+                    assert!(pair[0]
+                        .pair_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("paired-core:")));
+                }
                 assert!(intents.iter().all(|intent| {
                     intent.limit_price >= PAIRED_CORE_CENTER_PROBE_MIN_PRICE - 1e-9
                         && intent.limit_price <= PAIRED_CORE_CENTER_PROBE_MAX_PRICE + 1e-9
