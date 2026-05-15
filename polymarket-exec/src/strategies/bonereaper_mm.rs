@@ -125,6 +125,16 @@ pub struct ConvexTailConfig {
     /// cheap-tail as a small dollar-budget insurance sleeve instead of a
     /// share-count hedge that competes with the late-favorite edge.
     pub max_late_fav_spend_fraction: f64,
+    /// Ultra-cheap tail threshold where a small dollar budget buys materially
+    /// different convexity than ordinary 5-10c tail.
+    pub ultra_cheap_max_ask: f64,
+    /// Minimum favorite ask required before the ultra-cheap tail budget can
+    /// expand. This avoids sizing tail early when the book has not actually
+    /// become high-cert/barbell.
+    pub ultra_cheap_min_favorite_ask: f64,
+    /// Expanded spend cap for ultra-cheap tail, still expressed as a fraction
+    /// of late-favorite spend so dollar budget remains bounded.
+    pub ultra_cheap_max_late_fav_spend_fraction: f64,
     pub maker_improve_ticks: f64,
     pub min_order_usd: f64,
     /// Optional hard cutoff after which this phase is disabled.
@@ -143,6 +153,9 @@ impl Default for ConvexTailConfig {
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 0.50,
             max_late_fav_spend_fraction: 0.03,
+            ultra_cheap_max_ask: 0.03,
+            ultra_cheap_min_favorite_ask: 0.90,
+            ultra_cheap_max_late_fav_spend_fraction: 0.075,
             maker_improve_ticks: 0.0,
             min_order_usd: 0.5,
             disable_after_ms: None,
@@ -1408,6 +1421,7 @@ fn cheap_tail_cap_usd(
     cfg: &ConvexTailConfig,
     late_fav_qty: f64,
     favorite_avg_price: f64,
+    favorite_ask: f64,
     cheap_ask: f64,
     regime: Option<BtcRegime>,
     path_reversal_risk: f64,
@@ -1437,7 +1451,14 @@ fn cheap_tail_cap_usd(
     // regime; hard-reversal sizing can increase desired coverage, not erase the
     // favorite payoff.
     let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
-    let late_fav_budget_cap = favorite_loss_at_risk * cfg.max_late_fav_spend_fraction.max(0.0);
+    let high_cert_favorite = favorite_ask >= cfg.ultra_cheap_min_favorite_ask
+        || favorite_avg_price >= cfg.ultra_cheap_min_favorite_ask;
+    let late_fav_spend_fraction = if cheap_ask <= cfg.ultra_cheap_max_ask && high_cert_favorite {
+        cfg.ultra_cheap_max_late_fav_spend_fraction
+    } else {
+        cfg.max_late_fav_spend_fraction
+    };
+    let late_fav_budget_cap = favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
 
     cfg.max_load_usd
         .min(hedge_notional)
@@ -1925,6 +1946,7 @@ where
                 &tail_cfg,
                 effective_late_fav_qty,
                 favorite_avg_price,
+                legs.favorite_ask,
                 legs.cheap_ask,
                 input.btc_regime.regime(),
                 path_reversal_risk,
@@ -2750,8 +2772,16 @@ mod tests {
         // hedge only needs roughly 48 tail shares, so spend is below $0.50.
         // Positive-EV pair cost means the win-upside cap does not bind.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.01, Some(BtcRegime::Whipsaw), 0.0, 0.0,)
-                - (95.0 * 0.50 / 0.99) * 0.01)
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.95,
+                0.01,
+                Some(BtcRegime::Whipsaw),
+                0.0,
+                0.0,
+            ) - (95.0 * 0.50 / 0.99) * 0.01)
                 .abs()
                 < 1e-9
         );
@@ -2769,8 +2799,16 @@ mod tests {
         // 100 shares at 95c risks $95. In whipsaw, coverage target is doubled
         // from 25% to 50%. At 5c tail, 50 shares offsets half the loss.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw), 0.0, 0.0,)
-                - 2.5)
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.95,
+                0.05,
+                Some(BtcRegime::Whipsaw),
+                0.0,
+                0.0,
+            ) - 2.5)
                 .abs()
                 < 1e-9
         );
@@ -2778,8 +2816,16 @@ mod tests {
         // At 25c the same hedge requires much more spend, and because pair
         // cost is no longer positive-EV the favorite-upside erosion cap binds.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.25, Some(BtcRegime::Whipsaw), 0.0, 0.0,)
-                - 2.5)
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.95,
+                0.25,
+                Some(BtcRegime::Whipsaw),
+                0.0,
+                0.0,
+            ) - 2.5)
                 .abs()
                 < 1e-9
         );
@@ -2799,11 +2845,68 @@ mod tests {
         // favorite-win upside, otherwise the bundle becomes structurally
         // negative when the favorite wins.
         assert!(
-            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.20, Some(BtcRegime::Whipsaw), 0.75, 0.0)
-                - 2.5)
+            (cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.95,
+                0.20,
+                Some(BtcRegime::Whipsaw),
+                0.75,
+                0.0
+            ) - 2.5)
                 .abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn ultra_cheap_tail_budget_expands_only_when_favorite_is_high_cert() {
+        let cfg = ConvexTailConfig {
+            max_load_usd: 100.0,
+            max_favorite_exposure_fraction: 1.0,
+            max_win_edge_spend_fraction: 10.0,
+            max_late_fav_spend_fraction: 0.025,
+            ultra_cheap_max_ask: 0.03,
+            ultra_cheap_min_favorite_ask: 0.90,
+            ultra_cheap_max_late_fav_spend_fraction: 0.075,
+            ..ConvexTailConfig::default()
+        };
+
+        let below_high_cert = cheap_tail_cap_usd(
+            &cfg,
+            100.0,
+            0.85,
+            0.89,
+            0.03,
+            Some(BtcRegime::Whipsaw),
+            0.0,
+            0.0,
+        );
+        let high_cert_ultra_cheap = cheap_tail_cap_usd(
+            &cfg,
+            100.0,
+            0.85,
+            0.90,
+            0.03,
+            Some(BtcRegime::Whipsaw),
+            0.0,
+            0.0,
+        );
+        let high_cert_not_ultra_cheap = cheap_tail_cap_usd(
+            &cfg,
+            100.0,
+            0.85,
+            0.90,
+            0.05,
+            Some(BtcRegime::Whipsaw),
+            0.0,
+            0.0,
+        );
+
+        assert!(high_cert_ultra_cheap > below_high_cert);
+        assert!((below_high_cert - 85.0 * 0.025).abs() < 1e-9);
+        assert!((high_cert_not_ultra_cheap - 85.0 * 0.025).abs() < 1e-9);
     }
 
     #[test]
@@ -2821,11 +2924,21 @@ mod tests {
                 &cfg,
                 100.0,
                 0.95,
+                0.95,
                 0.05,
                 Some(BtcRegime::DirectionalSmooth),
                 0.0,
                 0.0,
-            ) < cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.05, Some(BtcRegime::Whipsaw), 0.0, 0.0,)
+            ) < cheap_tail_cap_usd(
+                &cfg,
+                100.0,
+                0.95,
+                0.95,
+                0.05,
+                Some(BtcRegime::Whipsaw),
+                0.0,
+                0.0,
+            )
         );
     }
 
@@ -2843,6 +2956,7 @@ mod tests {
             &cfg,
             100.0,
             0.90,
+            0.90,
             0.05,
             Some(BtcRegime::TrendingVolatile),
             0.0,
@@ -2851,6 +2965,7 @@ mod tests {
         let uncertain = cheap_tail_cap_usd(
             &cfg,
             100.0,
+            0.90,
             0.90,
             0.05,
             Some(BtcRegime::TrendingVolatile),
@@ -2927,6 +3042,9 @@ mod tests {
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.45);
         assert_eq!(cfg.max_late_fav_spend_fraction, 0.025);
+        assert_eq!(cfg.ultra_cheap_max_ask, 0.03);
+        assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
+        assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(climb.clip_usd, 45.0);
         assert_eq!(climb.max_load_usd, 300.0);
         assert_eq!(climb.min_order_usd, 10.0);
