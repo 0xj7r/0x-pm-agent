@@ -3779,6 +3779,8 @@ fn submit_rejection_requires_immediate_live_stop(reason: &str) -> bool {
     lower.contains("invalid amounts")
         || lower.contains("maker amount supports a max accuracy")
         || lower.contains("taker amount a max")
+        || lower.contains("trading is currently cancel-only")
+        || lower.contains("cancel-only")
         || (lower.contains("unable to build order")
             && (lower.contains("decimal") || lower.contains("precision")))
 }

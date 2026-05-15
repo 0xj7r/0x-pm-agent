@@ -235,6 +235,13 @@ impl ExecutionAdapter for RecordingAdapter {
     }
 }
 
+#[test]
+fn cancel_only_submit_rejection_requires_immediate_live_stop() {
+    assert!(submit_rejection_requires_immediate_live_stop(
+        "503 Service Unavailable: Trading is currently cancel-only. New orders are not accepted, but cancels are allowed."
+    ));
+}
+
 #[tokio::test]
 async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
     let mut config = runner_test_config();
