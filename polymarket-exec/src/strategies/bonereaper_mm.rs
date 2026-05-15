@@ -1822,6 +1822,28 @@ fn cheap_tail_cap_usd(
         .min(late_fav_budget_cap)
 }
 
+fn unbundled_ultra_cheap_tail_cap_usd(
+    cfg: &ConvexTailConfig,
+    effective_late_fav_qty: f64,
+    favorite_ask: f64,
+    cheap_ask: f64,
+) -> f64 {
+    if effective_late_fav_qty > 0.0
+        || cheap_ask <= 0.0
+        || cheap_ask > cfg.ultra_cheap_max_ask
+        || favorite_ask < cfg.ultra_cheap_min_favorite_ask
+    {
+        return 0.0;
+    }
+
+    let cap = cfg.clip_usd.min(cfg.max_load_usd);
+    if cap >= cfg.min_order_usd {
+        cap
+    } else {
+        0.0
+    }
+}
+
 fn reversal_hedge_cap_usd(
     cfg: &ReversalHedgeConfig,
     late_fav_qty: f64,
@@ -2418,7 +2440,7 @@ where
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
                 + directional_tail_working_spend_usd(&input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
-            let tail_cap_usd = cheap_tail_cap_usd(
+            let bundled_tail_cap_usd = cheap_tail_cap_usd(
                 &tail_cfg,
                 effective_late_fav_qty,
                 favorite_avg_price,
@@ -2428,6 +2450,13 @@ where
                 path_reversal_risk,
                 directional_conviction.hedge_uncertainty_boost(),
             );
+            let unbundled_tail_cap_usd = unbundled_ultra_cheap_tail_cap_usd(
+                &tail_cfg,
+                effective_late_fav_qty,
+                legs.favorite_ask,
+                legs.cheap_ask,
+            );
+            let tail_cap_usd = bundled_tail_cap_usd.max(unbundled_tail_cap_usd);
             let remaining_load = (tail_cap_usd - current_exposure_usd).max(0.0);
             if remaining_load >= tail_cfg.min_order_usd {
                 if let Some(base_px) = maker_limit_price(
@@ -2492,7 +2521,7 @@ where
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
+                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             if aggressive_taker { "taker_ioc" } else { "maker_post_only" },
@@ -2501,6 +2530,8 @@ where
                             clip,
                             current_exposure_usd + (total_clip - load_left),
                             tail_cap_usd,
+                            bundled_tail_cap_usd,
+                            unbundled_tail_cap_usd,
                             favorite_exposure_usd,
                             favorite_avg_price,
                             cheap_tail_coverage_fraction(&tail_cfg, input.btc_regime.regime()),
@@ -3632,6 +3663,35 @@ mod tests {
         assert!(high_cert_ultra_cheap > below_high_cert);
         assert!((below_high_cert - 85.0 * 0.025).abs() < 1e-9);
         assert!((high_cert_not_ultra_cheap - 85.0 * 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unbundled_ultra_cheap_tail_allows_tiny_lottery_without_late_fav() {
+        let cfg = ConvexTailConfig {
+            clip_usd: 3.0,
+            max_load_usd: 30.0,
+            min_order_usd: 1.0,
+            ultra_cheap_max_ask: 0.03,
+            ultra_cheap_min_favorite_ask: 0.90,
+            ..ConvexTailConfig::default()
+        };
+
+        assert_eq!(
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.02),
+            3.0
+        );
+        assert_eq!(
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 10.0, 0.92, 0.02),
+            0.0
+        );
+        assert_eq!(
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.89, 0.02),
+            0.0
+        );
+        assert_eq!(
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.04),
+            0.0
+        );
     }
 
     #[test]
