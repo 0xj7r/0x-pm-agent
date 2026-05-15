@@ -39,7 +39,7 @@ risk:
   book_stale_ms: 5000
 
 pair:
-  merge_enabled: true
+  merge_enabled: false
   pressure_merge_enabled: false
   min_merge_notional_usd: 15.0
   merge_pressure_free_cash_ratio: 0.0
