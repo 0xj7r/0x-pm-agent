@@ -57,7 +57,10 @@ paired_core:
   # Polymarket BTC 5m venue minimum is 5 shares. Sub-5 clips are coerced to
   # 5 by runtime sizing, so keep the profile explicit and broaden via levels.
   clip_shares: 5.0
-  max_unpaired_core_qty: 12.0
+  # Keep fresh paired-core from becoming a real directional position. One
+  # venue-min clip can be stranded while the mate fills; beyond that, only
+  # repair/pair-completion should add exposure.
+  max_unpaired_core_qty: 5.0
   ladder_min_price: 0.20
   ladder_max_price: 0.70
   # Stop fresh paired-core in the late window. After 180s elapsed, the bar
