@@ -105,7 +105,10 @@ pub struct ConvexTailConfig {
     pub enabled: bool,
     /// Maximum cheap-leg ask that qualifies.
     pub max_cheap_ask: f64,
-    /// Only fire in the final `window_sec` of the bar.
+    /// Deprecated live-tuning field kept for profile compatibility. Convex
+    /// tail timing is intentionally exposure-gated, not time-gated: once the
+    /// late-favorite sleeve is being loaded and the cheap leg is eligible, the
+    /// tail can fire immediately.
     pub window_sec: u64,
     /// Optional bar-relative start fraction.
     pub start_frac: f64,
@@ -2224,12 +2227,6 @@ where
 
         if tail_cfg.enabled
             && tail_enabled
-            && remaining_ms
-                <= phase_window_ms(
-                    tail_cfg.window_sec,
-                    tail_cfg.start_frac,
-                    input.market.window_ms(),
-                )
             && legs.cheap_ask <= tail_cfg.max_cheap_ask
         {
             let late_fav_filled_qty = match legs.favorite_leg {
