@@ -3173,7 +3173,11 @@ fn submit_request_from_intent(
     let is_aggressive_late_fav = intent
         .quote_level_tag
         .as_deref()
-        .is_some_and(|tag| tag.starts_with("late-fav-taker"));
+        .is_some_and(|tag| {
+            tag.starts_with("late-fav-taker")
+                || tag.starts_with("cheap-tail-taker")
+                || tag.starts_with("reversal-hedge-taker")
+        });
     let is_late_fav_maker = intent
         .quote_level_tag
         .as_deref()
@@ -3733,7 +3737,11 @@ fn can_defer_missing_local_order_escalation(managed: &ManagedOrder) -> bool {
         .intent
         .quote_level_tag
         .as_deref()
-        .is_some_and(|tag| tag.starts_with("late-fav-taker"))
+        .is_some_and(|tag| {
+            tag.starts_with("late-fav-taker")
+                || tag.starts_with("cheap-tail-taker")
+                || tag.starts_with("reversal-hedge-taker")
+        })
 }
 
 fn can_finalize_missing_passive_entry_from_authoritative_absence(

@@ -1735,6 +1735,8 @@ impl<S: Strategy> Runtime<S> {
             .as_deref()
             .unwrap_or_default();
         let non_resting_partial = quote_level_tag.starts_with("late-fav-taker")
+            || quote_level_tag.starts_with("cheap-tail-taker")
+            || quote_level_tag.starts_with("reversal-hedge-taker")
             || quote_level_tag.starts_with("mm-hedge-rescue")
             || managed.intent.kind == crate::types::IntentKind::Close;
         if !non_resting_partial {
@@ -3318,7 +3320,11 @@ impl<S: Strategy> Runtime<S> {
             && !intent
                 .quote_level_tag
                 .as_deref()
-                .is_some_and(|tag| tag.starts_with("late-fav-taker"))
+                .is_some_and(|tag| {
+                    tag.starts_with("late-fav-taker")
+                        || tag.starts_with("cheap-tail-taker")
+                        || tag.starts_with("reversal-hedge-taker")
+                })
             && self
                 .last_quotes
                 .get(&intent.instrument_id)
