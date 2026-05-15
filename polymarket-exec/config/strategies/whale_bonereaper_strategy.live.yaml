@@ -104,6 +104,8 @@ late_favorite:
     # inventory, not cheap-tail insurance, because payoff multiple is too low
     # to hedge late-favorite reversals without eroding too much edge.
     max_cheap_ask: 0.10
+    # Legacy compatibility only: cheap tail is not time-gated. It is allowed
+    # whenever late-favorite exposure exists and payoff caps permit it.
     window_sec: 60
     start_frac: 0.0
     clip_usd: 3.0
