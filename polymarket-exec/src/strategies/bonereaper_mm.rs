@@ -1403,7 +1403,10 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     if legs.favorite_ask < cfg.taker_min_favorite_ask && path_reversal_risk >= 0.50 {
         return None;
     }
-    if early_late && path_reversal_risk >= 0.75 {
+    if early_late
+        && path_reversal_risk >= 0.75
+        && !(directional_barbell && legs.favorite_ask >= cfg.taker_min_favorite_ask)
+    {
         return None;
     }
     if pre_standard_late_window
@@ -1594,6 +1597,18 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             "true_late_fav_90_plus"
         },
     })
+}
+
+fn should_override_favorite_signal_for_barbell(
+    legs: &LegQuotes,
+    climb_cfg: &FavoriteClimbConfig,
+    tail_cfg: &ConvexTailConfig,
+    conviction: DirectionalConviction,
+) -> bool {
+    conviction.barbell
+        && legs.favorite_ask >= climb_cfg.taker_min_favorite_ask
+        && legs.cheap_ask <= tail_cfg.max_cheap_ask
+        && conviction.model_favorite >= climb_cfg.near_touch_min_favorite_ask
 }
 
 fn path_reversal_risk_score<M: MarketDescriptor>(
@@ -2007,7 +2022,14 @@ where
         {
             let (direction_ok, signal_note) = favorite_direction_signal(&input, &legs, &climb_cfg);
 
-            let entry_policy = if !direction_ok {
+            let market_structure_override = should_override_favorite_signal_for_barbell(
+                &legs,
+                &climb_cfg,
+                &tail_cfg,
+                directional_conviction,
+            );
+
+            let entry_policy = if !direction_ok && !market_structure_override {
                 notes.push(format!(
                     "late_favorite blocked by favorite signal {signal_note}",
                 ));
@@ -2015,7 +2037,13 @@ where
             } else if let Some(entry_policy) =
                 favorite_entry_policy(&input, &legs, &climb_cfg, elapsed_ms, remaining_ms)
             {
-                notes.push(signal_note);
+                if market_structure_override && !direction_ok {
+                    notes.push(format!(
+                        "late_favorite using barbell market-structure override despite signal miss {signal_note}",
+                    ));
+                } else {
+                    notes.push(signal_note);
+                }
                 notes.push(format!(
                     "late_favorite entry_policy={} min_price={:.2} max_levels={} clip_mult={:.2} cap_mult={:.2} path_reversal_risk={:.2}",
                     entry_policy.label,
