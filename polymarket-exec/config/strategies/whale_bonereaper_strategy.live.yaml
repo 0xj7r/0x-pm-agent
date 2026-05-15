@@ -50,7 +50,7 @@ paired_core:
   # Disabled for live by default: recent evidence showed broad paired-core
   # maker fills becoming accidental one-sided mid-price exposure. If this lane
   # is enabled, keep it as a tiny center probe plus mate-only repair.
-  enabled: true
+  enabled: false
   center_probe_only: true
   # Tiny center probe only. Do not restore the old 17-level 0.20-0.70 live
   # ladder here; paired-core repair is mate-only after a one-sided fill.
