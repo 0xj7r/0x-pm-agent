@@ -1791,7 +1791,13 @@ fn cheap_tail_cap_usd(
     // by a configured fraction of the favorite-side remaining upside in every
     // regime; hard-reversal sizing can increase desired coverage, not erase the
     // favorite payoff.
-    let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
+    let fractional_edge_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
+    let min_positive_payoff_tail_cap = if favorite_win_upside >= cfg.min_order_usd {
+        cfg.min_order_usd
+    } else {
+        0.0
+    };
+    let edge_erosion_cap = fractional_edge_cap.max(min_positive_payoff_tail_cap);
     let high_cert_favorite = favorite_ask >= cfg.ultra_cheap_min_favorite_ask
         || favorite_avg_price >= cfg.ultra_cheap_min_favorite_ask;
     let late_fav_spend_fraction = if cheap_ask <= cfg.ultra_cheap_max_ask && high_cert_favorite {
@@ -1799,10 +1805,19 @@ fn cheap_tail_cap_usd(
     } else {
         cfg.max_late_fav_spend_fraction
     };
-    let late_fav_budget_cap = favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
+    let fractional_late_fav_budget_cap =
+        favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
+    let late_fav_budget_cap = fractional_late_fav_budget_cap.max(min_positive_payoff_tail_cap);
+
+    let desired_tail_notional =
+        if hedge_notional > 0.0 && min_positive_payoff_tail_cap >= cfg.min_order_usd {
+            hedge_notional.max(cfg.min_order_usd)
+        } else {
+            hedge_notional
+        };
 
     cfg.max_load_usd
-        .min(hedge_notional)
+        .min(desired_tail_notional)
         .min(edge_erosion_cap)
         .min(late_fav_budget_cap)
 }
@@ -3446,8 +3461,9 @@ mod tests {
         };
 
         // 100 shares loaded at 95c has $95 loss-at-risk. At 1c tail, a 50%
-        // hedge only needs roughly 48 tail shares, so spend is below $0.50.
-        // Positive-EV pair cost means the win-upside cap does not bind.
+        // hedge only needs roughly 48 tail shares, below venue min. If the
+        // favorite-win path can afford it, the bundle planner promotes this
+        // to one venue-min convex-tail order.
         assert!(
             (cheap_tail_cap_usd(
                 &cfg,
@@ -3458,7 +3474,7 @@ mod tests {
                 Some(BtcRegime::Whipsaw),
                 0.0,
                 0.0,
-            ) - (95.0 * 0.50 / 0.99) * 0.01)
+            ) - cfg.min_order_usd)
                 .abs()
                 < 1e-9
         );
@@ -3534,6 +3550,36 @@ mod tests {
                 0.75,
                 0.0
             ) - 2.5)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn cheap_tail_cap_allows_min_order_when_favorite_win_payoff_survives() {
+        let cfg = ConvexTailConfig {
+            min_order_usd: 1.0,
+            max_load_usd: 30.0,
+            max_favorite_exposure_fraction: 0.55,
+            max_win_edge_spend_fraction: 0.45,
+            max_late_fav_spend_fraction: 0.025,
+            ..ConvexTailConfig::default()
+        };
+
+        // A 95c $30 late-fav clip only has about $1.58 favorite-win upside.
+        // The old fractional edge cap blocked the venue-min tail order, even
+        // though a $1 tail still leaves the favorite-win path positive.
+        assert!(
+            (cheap_tail_cap_usd(
+                &cfg,
+                31.9148936170213,
+                0.94,
+                0.95,
+                0.06,
+                Some(BtcRegime::DirectionalSmooth),
+                0.0,
+                0.0,
+            ) - cfg.min_order_usd)
                 .abs()
                 < 1e-9
         );
