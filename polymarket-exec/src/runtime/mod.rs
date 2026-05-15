@@ -2843,8 +2843,7 @@ impl<S: Strategy> Runtime<S> {
     ) -> RuntimeOutcome {
         let mut outcome = RuntimeOutcome::default();
         let decision_notes = decision.notes();
-        let soft_pause_paired_only =
-            Self::soft_pause_cancels_paired_core_only(&decision_notes);
+        let soft_pause_paired_only = Self::soft_pause_cancels_paired_core_only(&decision_notes);
         for note in decision_notes {
             outcome.push_event(self.event_log.push(EventRecord::new(
                 EventCategory::Strategy,
@@ -3317,14 +3316,11 @@ impl<S: Strategy> Runtime<S> {
         if intent.kind == crate::types::IntentKind::Entry
             && intent.side == TradeSide::Buy
             && !is_rescue_intent
-            && !intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| {
-                    tag.starts_with("late-fav-taker")
-                        || tag.starts_with("cheap-tail-taker")
-                        || tag.starts_with("reversal-hedge-taker")
-                })
+            && !intent.quote_level_tag.as_deref().is_some_and(|tag| {
+                tag.starts_with("late-fav-taker")
+                    || tag.starts_with("cheap-tail-taker")
+                    || tag.starts_with("reversal-hedge-taker")
+            })
             && self
                 .last_quotes
                 .get(&intent.instrument_id)

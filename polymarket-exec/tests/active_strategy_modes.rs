@@ -283,35 +283,32 @@ fn active_strategy_yaml_profiles_drive_strategy_configs() {
     .expect("bonereaper whale profile");
     let bonereaper_paired = bonereaper_profile.core_hedge_mm_config();
     let bonereaper_inventory = bonereaper_profile.risk_limits();
-    assert_eq!(bonereaper_inventory.max_order_notional_usd, 18.0);
-    assert_eq!(bonereaper_inventory.max_gross_notional_usd, 250.0);
-    assert_eq!(bonereaper_inventory.max_net_notional_per_market_usd, 120.0);
+    assert_eq!(bonereaper_inventory.max_order_notional_usd, 250.0);
+    assert_eq!(bonereaper_inventory.max_gross_notional_usd, 1200.0);
+    assert_eq!(bonereaper_inventory.max_net_notional_per_market_usd, 900.0);
     assert_eq!(
         bonereaper_inventory.max_position_quantity_per_instrument,
-        250.0
+        1500.0
     );
     assert_eq!(bonereaper_inventory.min_free_cash_usd, 25.0);
     assert_eq!(bonereaper_inventory.min_free_cash_bps, 500.0);
     assert_eq!(bonereaper_inventory.max_session_loss_bps, 2500.0);
-    assert_eq!(bonereaper_inventory.max_open_orders_total, 80);
-    assert_eq!(bonereaper_inventory.max_open_orders_per_market, 32);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 13);
-    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.58);
+    assert_eq!(bonereaper_inventory.max_open_orders_total, 120);
+    assert_eq!(bonereaper_inventory.max_open_orders_per_market, 48);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_levels, 17);
+    assert_eq!(bonereaper_paired.core_hedge.ladder_span, 0.60);
     assert_eq!(bonereaper_paired.core_hedge.clip_shares, 5.0);
-    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 25.0);
+    assert_eq!(bonereaper_paired.core_hedge.max_unpaired_core_qty, 12.0);
     let bonereaper_late = bonereaper_profile.late_favorite_config();
     assert_eq!(bonereaper_late.favorite_climb.window_sec, 300);
     assert_eq!(bonereaper_late.favorite_climb.min_favorite_ask, 0.70);
-    assert_eq!(bonereaper_late.favorite_climb.clip_usd, 15.0);
-    assert_eq!(bonereaper_late.favorite_climb.max_load_usd, 85.0);
+    assert_eq!(bonereaper_late.favorite_climb.clip_usd, 125.0);
+    assert_eq!(bonereaper_late.favorite_climb.max_load_usd, 850.0);
     assert_eq!(
         bonereaper_late.favorite_climb.regime_whipsaw_multiplier,
-        0.45
+        0.50
     );
-    assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.70);
-    assert_eq!(bonereaper_late.convex_tail.clip_usd, 3.0);
-    assert_eq!(
-        bonereaper_late.convex_tail.max_win_edge_spend_fraction,
-        0.80
-    );
+    assert_eq!(bonereaper_late.favorite_climb.reversal_multiplier, 0.75);
+    assert_eq!(bonereaper_late.convex_tail.clip_usd, 40.0);
+    assert_eq!(bonereaper_late.convex_tail.max_win_edge_spend_fraction, 1.0);
 }

@@ -3170,26 +3170,22 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("mm-late-bar-core"));
-    let is_aggressive_late_fav = intent
-        .quote_level_tag
-        .as_deref()
-        .is_some_and(|tag| {
-            tag.starts_with("late-fav-taker")
-                || tag.starts_with("cheap-tail-taker")
-                || tag.starts_with("reversal-hedge-taker")
-        });
+    let is_aggressive_late_fav = intent.quote_level_tag.as_deref().is_some_and(|tag| {
+        tag.starts_with("late-fav-taker")
+            || tag.starts_with("cheap-tail-taker")
+            || tag.starts_with("reversal-hedge-taker")
+    });
     let is_late_fav_maker = intent
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("late-fav-") && !tag.starts_with("late-fav-taker"));
-    let live_expires_at_ms = (!execution_policy.paper_mode
-        && is_late_fav_maker)
+    let live_expires_at_ms = (!execution_policy.paper_mode && is_late_fav_maker)
         .then_some(observed_at_ms.saturating_add(LATE_FAV_MAKER_TTL_MS))
         .or_else(|| {
             (!execution_policy.paper_mode
-        && execution_policy.live_order_ttl_ms > 0
-        && !is_hedge_rescue
-        && !is_aggressive_late_fav
+                && execution_policy.live_order_ttl_ms > 0
+                && !is_hedge_rescue
+                && !is_aggressive_late_fav
                 && !is_late_bar_core
                 && !is_late_fav_maker)
                 .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
