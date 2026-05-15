@@ -121,6 +121,10 @@ pub struct ConvexTailConfig {
     /// positive-EV, this cap does not bind; the hedge is then useful paired
     /// inventory, not pure insurance drag.
     pub max_win_edge_spend_fraction: f64,
+    /// Hard upper bound as a fraction of late-favorite spend. This keeps
+    /// cheap-tail as a small dollar-budget insurance sleeve instead of a
+    /// share-count hedge that competes with the late-favorite edge.
+    pub max_late_fav_spend_fraction: f64,
     pub maker_improve_ticks: f64,
     pub min_order_usd: f64,
     /// Optional hard cutoff after which this phase is disabled.
@@ -138,6 +142,7 @@ impl Default for ConvexTailConfig {
             max_load_usd: 8.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 0.50,
+            max_late_fav_spend_fraction: 0.03,
             maker_improve_ticks: 0.0,
             min_order_usd: 0.5,
             disable_after_ms: None,
@@ -1426,15 +1431,18 @@ fn cheap_tail_cap_usd(
     let target_tail_shares =
         (favorite_loss_at_risk * coverage_fraction) / (1.0 - cheap_ask).max(0.01);
     let hedge_notional = target_tail_shares * cheap_ask;
-    let pair_cost_is_positive_ev = favorite_avg_price + cheap_ask <= 1.0 + 1e-9;
-    let protect_hard_reversal = path_reversal_risk >= 0.70;
-    let edge_erosion_cap = if pair_cost_is_positive_ev || protect_hard_reversal {
-        cfg.max_load_usd
-    } else {
-        favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0)
-    };
+    // Cheap-tail protects the favorite sleeve, but it must not convert the
+    // bundle into a position that loses when the favorite wins. Cap tail spend
+    // by a configured fraction of the favorite-side remaining upside in every
+    // regime; hard-reversal sizing can increase desired coverage, not erase the
+    // favorite payoff.
+    let edge_erosion_cap = favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
+    let late_fav_budget_cap = favorite_loss_at_risk * cfg.max_late_fav_spend_fraction.max(0.0);
 
-    cfg.max_load_usd.min(hedge_notional).min(edge_erosion_cap)
+    cfg.max_load_usd
+        .min(hedge_notional)
+        .min(edge_erosion_cap)
+        .min(late_fav_budget_cap)
 }
 
 fn reversal_hedge_cap_usd(
@@ -2778,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_tail_cap_can_protect_hard_reversal_above_pair_cost_one() {
+    fn cheap_tail_cap_preserves_favorite_win_payoff_in_hard_reversal() {
         let cfg = ConvexTailConfig {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
@@ -2786,13 +2794,13 @@ mod tests {
             ..ConvexTailConfig::default()
         };
 
-        // In hard reversal, cheap-tail is insurance against the
-        // favorite loss-at-risk, not just a spend capped by the small favorite
-        // winner-side upside. This lets 20c tail hedge part of a 95c favorite
-        // without being pinned to the $2.50 upside erosion cap.
+        // Even in hard reversal, cheap-tail is insurance around a favorite
+        // sleeve. It cannot spend more than the configured fraction of the
+        // favorite-win upside, otherwise the bundle becomes structurally
+        // negative when the favorite wins.
         assert!(
             (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.20, Some(BtcRegime::Whipsaw), 0.75, 0.0)
-                - 20.78125)
+                - 2.5)
                 .abs()
                 < 1e-9
         );
@@ -2804,6 +2812,7 @@ mod tests {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 10.0,
+            max_late_fav_spend_fraction: 1.0,
             ..ConvexTailConfig::default()
         };
 
@@ -2826,6 +2835,7 @@ mod tests {
             max_load_usd: 100.0,
             max_favorite_exposure_fraction: 0.25,
             max_win_edge_spend_fraction: 10.0,
+            max_late_fav_spend_fraction: 1.0,
             ..ConvexTailConfig::default()
         };
 
@@ -2911,11 +2921,12 @@ mod tests {
         let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_cheap_ask, 0.20);
-        assert_eq!(cfg.clip_usd, 30.0);
-        assert_eq!(cfg.max_load_usd, 240.0);
+        assert_eq!(cfg.max_cheap_ask, 0.10);
+        assert_eq!(cfg.clip_usd, 3.0);
+        assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
-        assert_eq!(cfg.max_win_edge_spend_fraction, 2.0);
+        assert_eq!(cfg.max_win_edge_spend_fraction, 0.45);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.025);
         assert_eq!(climb.clip_usd, 45.0);
         assert_eq!(climb.max_load_usd, 300.0);
         assert_eq!(climb.min_order_usd, 10.0);

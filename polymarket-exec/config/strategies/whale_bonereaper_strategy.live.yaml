@@ -100,18 +100,19 @@ late_favorite:
     taker_window_sec: 120
   convex_tail:
     enabled: true
-    # Pure convexity hedge only. 20c-35c belongs to pairable core/reversal
+    # Pure convexity hedge only. 10c+ belongs to pairable core/reversal
     # inventory, not cheap-tail insurance, because payoff multiple is too low
     # to hedge late-favorite reversals without eroding too much edge.
-    max_cheap_ask: 0.20
+    max_cheap_ask: 0.10
     window_sec: 60
     start_frac: 0.0
-    clip_usd: 30.0
-    max_load_usd: 240.0
+    clip_usd: 3.0
+    max_load_usd: 30.0
     max_favorite_exposure_fraction: 0.55
-    max_win_edge_spend_fraction: 2.0
+    max_win_edge_spend_fraction: 0.45
+    max_late_fav_spend_fraction: 0.025
     maker_improve_ticks: 1.0
-    min_order_usd: 5.0
+    min_order_usd: 1.0
   reversal_hedge:
     enabled: true
     # Separate from pure cheap-tail insurance. This lane only buys the
