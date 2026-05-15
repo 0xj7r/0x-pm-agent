@@ -1427,7 +1427,8 @@ fn cheap_tail_cap_usd(
         (favorite_loss_at_risk * coverage_fraction) / (1.0 - cheap_ask).max(0.01);
     let hedge_notional = target_tail_shares * cheap_ask;
     let pair_cost_is_positive_ev = favorite_avg_price + cheap_ask <= 1.0 + 1e-9;
-    let edge_erosion_cap = if pair_cost_is_positive_ev {
+    let protect_hard_reversal = path_reversal_risk >= 0.70;
+    let edge_erosion_cap = if pair_cost_is_positive_ev || protect_hard_reversal {
         cfg.max_load_usd
     } else {
         favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0)
@@ -2777,6 +2778,27 @@ mod tests {
     }
 
     #[test]
+    fn cheap_tail_cap_can_protect_hard_reversal_above_pair_cost_one() {
+        let cfg = ConvexTailConfig {
+            max_load_usd: 100.0,
+            max_favorite_exposure_fraction: 0.25,
+            max_win_edge_spend_fraction: 0.50,
+            ..ConvexTailConfig::default()
+        };
+
+        // In hard reversal, cheap-tail is insurance against the
+        // favorite loss-at-risk, not just a spend capped by the small favorite
+        // winner-side upside. This lets 20c tail hedge part of a 95c favorite
+        // without being pinned to the $2.50 upside erosion cap.
+        assert!(
+            (cheap_tail_cap_usd(&cfg, 100.0, 0.95, 0.20, Some(BtcRegime::Whipsaw), 0.75, 0.0)
+                - 20.78125)
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
     fn cheap_tail_cap_is_lower_in_directional_smooth_regime() {
         let cfg = ConvexTailConfig {
             max_load_usd: 100.0,
@@ -2893,10 +2915,10 @@ mod tests {
         assert_eq!(cfg.clip_usd, 30.0);
         assert_eq!(cfg.max_load_usd, 240.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
-        assert_eq!(cfg.max_win_edge_spend_fraction, 1.0);
-        assert_eq!(climb.clip_usd, 75.0);
-        assert_eq!(climb.max_load_usd, 525.0);
-        assert_eq!(climb.min_order_usd, 15.0);
+        assert_eq!(cfg.max_win_edge_spend_fraction, 2.0);
+        assert_eq!(climb.clip_usd, 45.0);
+        assert_eq!(climb.max_load_usd, 300.0);
+        assert_eq!(climb.min_order_usd, 10.0);
         assert_eq!(climb.taker_min_favorite_ask, 0.90);
         assert!(
             cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
