@@ -229,6 +229,35 @@ struct DirectionalConviction {
     model_favorite: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarketPosture {
+    PairedCore,
+    CenterOnly,
+    BarbellDirectional,
+    WhipsawHedge,
+    NoFreshCore,
+}
+
+impl MarketPosture {
+    fn suppresses_broad_paired_core(self) -> bool {
+        matches!(
+            self,
+            Self::BarbellDirectional | Self::WhipsawHedge | Self::NoFreshCore
+        )
+    }
+
+    fn merge(self, observed: Self) -> Self {
+        use MarketPosture::*;
+        match (self, observed) {
+            (BarbellDirectional, _) | (_, BarbellDirectional) => BarbellDirectional,
+            (NoFreshCore, _) | (_, NoFreshCore) => NoFreshCore,
+            (WhipsawHedge, _) | (_, WhipsawHedge) => WhipsawHedge,
+            (CenterOnly, _) | (_, CenterOnly) => CenterOnly,
+            (PairedCore, PairedCore) => PairedCore,
+        }
+    }
+}
+
 impl DirectionalConviction {
     fn late_favorite_multiplier(self) -> f64 {
         if self.barbell && self.btc_confirms {
@@ -277,6 +306,7 @@ pub struct BonereaperMmStrategy {
     paired_core: CoreHedgeMmStrategy,
     late_favorite: LateFavoriteStrategy,
     config: BonereaperMmStrategyConfig,
+    market_postures: HashMap<MarketId, MarketPosture>,
 }
 
 impl Default for BonereaperMmStrategyConfig {
@@ -581,9 +611,7 @@ fn effective_favorite_hedge_basis_qty(
         return filled_late_fav_qty.max(0.0);
     }
     let filled_late_fav_usd = filled_late_fav_qty.max(0.0) * favorite_avg_price;
-    let working_favorite_usd = working_late_fav_usd
-        .max(reserved_late_fav_usd)
-        .max(0.0);
+    let working_favorite_usd = working_late_fav_usd.max(reserved_late_fav_usd).max(0.0);
     let net_directional_usd = directional_exposure_usd(
         favorite_total_qty.max(0.0),
         other_total_qty.max(0.0),
@@ -1215,7 +1243,11 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             && path_reversal_risk <= 0.35
             && (barbell_sub90 || clean_directional_persistence || strongest >= threshold * 1.15);
         let base_scale = if barbell_sub90 {
-            if early_late { 0.75 } else { 1.0 }
+            if early_late {
+                0.75
+            } else {
+                1.0
+            }
         } else if early_late {
             0.45
         } else {
@@ -1857,10 +1889,8 @@ where
                 LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                 LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
             };
-            let working_late_fav_usd = open_order_notional_for_leg(
-                input.open_late_fav_order_exposure,
-                legs.favorite_leg,
-            );
+            let working_late_fav_usd =
+                open_order_notional_for_leg(input.open_late_fav_order_exposure, legs.favorite_leg);
             let reserved_late_fav_usd =
                 self.reserved_notional(input.market.market_id(), legs.favorite_leg);
             let effective_late_fav_qty = effective_favorite_hedge_basis_qty(
@@ -2008,10 +2038,8 @@ where
                 LadderLeg::Yes => (input.inventory.yes_qty, input.inventory.no_qty),
                 LadderLeg::No => (input.inventory.no_qty, input.inventory.yes_qty),
             };
-            let working_late_fav_usd = open_order_notional_for_leg(
-                input.open_late_fav_order_exposure,
-                legs.favorite_leg,
-            );
+            let working_late_fav_usd =
+                open_order_notional_for_leg(input.open_late_fav_order_exposure, legs.favorite_leg);
             let reserved_late_fav_usd =
                 self.reserved_notional(input.market.market_id(), legs.favorite_leg);
             let effective_late_fav_qty = effective_favorite_hedge_basis_qty(
@@ -2167,6 +2195,7 @@ impl BonereaperMmStrategy {
             paired_core: CoreHedgeMmStrategy::new(config.core_hedge),
             late_favorite: LateFavoriteStrategy::new(config.late_favorite),
             config,
+            market_postures: HashMap::new(),
         }
     }
 
@@ -2174,7 +2203,11 @@ impl BonereaperMmStrategy {
         &self.config
     }
 
-    fn combine(a: StrategyDecision, b: StrategyDecision) -> StrategyDecision {
+    fn combine(
+        a: StrategyDecision,
+        b: StrategyDecision,
+        suppress_broad_paired_core: bool,
+    ) -> StrategyDecision {
         use StrategyDecision::*;
         let mut notes = Vec::new();
         let mut quote_intents = Vec::new();
@@ -2268,24 +2301,13 @@ impl BonereaperMmStrategy {
             };
         }
         if !reactive_intents.is_empty() {
-            let mut dropped_broad_paired = 0usize;
-            for intent in quote_intents {
-                if intent
-                    .quote_level_tag
-                    .as_deref()
-                    .is_some_and(|tag| tag.starts_with("paired-core:"))
-                    && !is_repair_like_paired_core_intent(&intent)
-                {
-                    dropped_broad_paired += 1;
-                    continue;
-                }
-                reactive_intents.push(intent);
-            }
-            if dropped_broad_paired > 0 {
-                notes.push(format!(
-                    "bonereaper dropped {dropped_broad_paired} broad paired-core intents while directional sleeves are active"
-                ));
-            }
+            let dropped_broad_paired =
+                push_allowed_quote_intents(&mut reactive_intents, quote_intents);
+            note_dropped_broad_paired(
+                &mut notes,
+                dropped_broad_paired,
+                "directional sleeves active",
+            );
             return if runtime_commands.is_empty() {
                 StrategyDecision::Rescue {
                     intents: reactive_intents,
@@ -2300,6 +2322,26 @@ impl BonereaperMmStrategy {
             };
         }
         if !quote_intents.is_empty() {
+            if suppress_broad_paired_core {
+                let original_len = quote_intents.len();
+                quote_intents.retain(|intent| !is_broad_paired_core_intent(intent));
+                note_dropped_broad_paired(
+                    &mut notes,
+                    original_len.saturating_sub(quote_intents.len()),
+                    "latched market posture suppresses fresh broad paired-core",
+                );
+            }
+            if quote_intents.is_empty() {
+                return if runtime_commands.is_empty() {
+                    StrategyDecision::Noop { notes }
+                } else {
+                    StrategyDecision::Mixed {
+                        intents: Vec::new(),
+                        commands: runtime_commands,
+                        notes,
+                    }
+                };
+            }
             return if runtime_commands.is_empty() {
                 StrategyDecision::QuoteSet {
                     intents: quote_intents,
@@ -2332,6 +2374,106 @@ impl BonereaperMmStrategy {
     }
 }
 
+fn push_allowed_quote_intents(
+    reactive_intents: &mut Vec<OrderIntent>,
+    quote_intents: Vec<OrderIntent>,
+) -> usize {
+    let mut dropped_broad_paired = 0usize;
+    for intent in quote_intents {
+        if is_broad_paired_core_intent(&intent) {
+            dropped_broad_paired += 1;
+            continue;
+        }
+        reactive_intents.push(intent);
+    }
+    dropped_broad_paired
+}
+
+fn is_broad_paired_core_intent(intent: &OrderIntent) -> bool {
+    intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("paired-core:"))
+        && !is_repair_like_paired_core_intent(intent)
+}
+
+fn note_dropped_broad_paired(notes: &mut Vec<String>, dropped_broad_paired: usize, reason: &str) {
+    if dropped_broad_paired > 0 {
+        notes.push(format!(
+            "bonereaper dropped {dropped_broad_paired} broad paired-core intents: {reason}"
+        ));
+    }
+}
+
+fn observe_market_posture<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    cfg: &LateFavoriteStrategyConfig,
+) -> MarketPosture {
+    let Some(legs) = read_legs(&input.snapshot) else {
+        return MarketPosture::PairedCore;
+    };
+    let climb_cfg = cfg.favorite_climb;
+    let conviction = directional_conviction(input, &legs, &climb_cfg);
+    if conviction.barbell {
+        return MarketPosture::BarbellDirectional;
+    }
+
+    let elapsed = input
+        .market
+        .time_remaining_ms(input.now_ms)
+        .map(|remaining_ms| elapsed_ms(&input.market, input.now_ms, remaining_ms))
+        .unwrap_or(0);
+    let path_reversal_risk = conviction.path_reversal_risk;
+    let favorite_is_separating = legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25;
+    let broad_mid_market = legs.favorite_ask <= 0.70 && legs.cheap_ask >= 0.30;
+    let momentum_persistent = input.momentum.strength >= 0.50
+        && input
+            .momentum
+            .latest_window_return_bps
+            .map(|ret| signed_for_favorite(legs.favorite_leg, ret) > 0.0)
+            .unwrap_or(false);
+
+    match input.btc_regime.regime() {
+        Some(BtcRegime::Whipsaw) if path_reversal_risk >= 0.55 => MarketPosture::WhipsawHedge,
+        Some(BtcRegime::Whipsaw) if elapsed >= 90_000 && !broad_mid_market => {
+            MarketPosture::WhipsawHedge
+        }
+        Some(BtcRegime::Whipsaw) => MarketPosture::CenterOnly,
+        Some(BtcRegime::TrendingVolatile)
+            if favorite_is_separating || path_reversal_risk >= 0.30 =>
+        {
+            MarketPosture::NoFreshCore
+        }
+        Some(BtcRegime::DirectionalSmooth) if favorite_is_separating && momentum_persistent => {
+            MarketPosture::NoFreshCore
+        }
+        Some(BtcRegime::DirectionalSmooth | BtcRegime::TrendingVolatile) if !broad_mid_market => {
+            MarketPosture::CenterOnly
+        }
+        _ => MarketPosture::PairedCore,
+    }
+}
+
+fn add_posture_note(
+    decision: &mut StrategyDecision,
+    latched_posture: MarketPosture,
+    observed_posture: MarketPosture,
+) {
+    let note = format!(
+        "bonereaper market_posture observed={observed_posture:?} latched={latched_posture:?} suppress_broad_paired_core={}",
+        latched_posture.suppresses_broad_paired_core()
+    );
+    match decision {
+        StrategyDecision::Noop { notes }
+        | StrategyDecision::QuoteSet { notes, .. }
+        | StrategyDecision::CapitalRecycle { notes, .. }
+        | StrategyDecision::Rescue { notes, .. }
+        | StrategyDecision::Merge { notes, .. }
+        | StrategyDecision::Mixed { notes, .. }
+        | StrategyDecision::Suppress { notes, .. } => notes.push(note),
+    }
+}
+
 fn is_merge_planner_note(note: &str) -> bool {
     note.contains("paired_core merging")
         || note.contains("paired_core merge skipped")
@@ -2342,6 +2484,8 @@ fn is_merge_planner_note(note: &str) -> bool {
 mod tests {
     use super::*;
     use crate::core::types::BookLevel;
+    use crate::markets::BinaryOutcomeMarket;
+    use crate::signals::{FairValueEstimate, FairValueModel, MomentumSignal, SignalDirection};
     use crate::types::QuoteSnapshot;
 
     fn snap(yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64) -> PairedMarketSnapshot {
@@ -2362,6 +2506,51 @@ mod tests {
         }
     }
 
+    fn test_market() -> BinaryOutcomeMarket {
+        let mut market = BinaryOutcomeMarket::btc_5m("m".into(), "yes".into(), "no".into());
+        market.price_to_beat = Some(100.0);
+        market.event_start_ms = Some(0);
+        market.event_end_ms = Some(300_000);
+        market
+    }
+
+    fn fair_value(p_up: f64) -> FairValueEstimate {
+        FairValueEstimate {
+            p_up,
+            p_down: 1.0 - p_up,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.01,
+            time_remaining_s: 120.0,
+            model: FairValueModel::BsmBinary,
+        }
+    }
+
+    fn strategy_input(
+        snapshot: PairedMarketSnapshot,
+        btc_regime: crate::signals::BtcRegimeSnapshot,
+        momentum: MomentumSignal,
+        p_up: f64,
+        now_ms: EpochMillis,
+    ) -> StrategyInput<BinaryOutcomeMarket> {
+        StrategyInput {
+            market: test_market(),
+            snapshot,
+            inventory: Default::default(),
+            paired_core_inventory: Default::default(),
+            late_fav_inventory: Default::default(),
+            cheap_tail_inventory: Default::default(),
+            open_convex_order_exposure: Default::default(),
+            open_late_fav_order_exposure: Default::default(),
+            open_paired_core_order_exposure: Default::default(),
+            pair_cost: Default::default(),
+            fair_value: fair_value(p_up),
+            btc_regime,
+            momentum,
+            order_book_pressure: Default::default(),
+            now_ms,
+        }
+    }
+
     #[test]
     fn read_legs_picks_higher_ask_as_favorite() {
         let s = snap(0.96, 0.97, 0.02, 0.03);
@@ -2370,6 +2559,76 @@ mod tests {
         assert_eq!(l.cheap_leg, LadderLeg::No);
         assert!((l.favorite_ask - 0.97).abs() < 1e-9);
         assert!((l.cheap_ask - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn market_posture_latches_escalation_and_does_not_deescalate_intrabar() {
+        assert_eq!(
+            MarketPosture::BarbellDirectional.merge(MarketPosture::PairedCore),
+            MarketPosture::BarbellDirectional
+        );
+        assert_eq!(
+            MarketPosture::WhipsawHedge.merge(MarketPosture::CenterOnly),
+            MarketPosture::WhipsawHedge
+        );
+        assert_eq!(
+            MarketPosture::CenterOnly.merge(MarketPosture::PairedCore),
+            MarketPosture::CenterOnly
+        );
+    }
+
+    #[test]
+    fn observe_market_posture_identifies_barbell_directional_before_late_window() {
+        let input = strategy_input(
+            snap(0.95, 0.96, 0.03, 0.04),
+            crate::signals::BtcRegimeSnapshot {
+                last_price: Some(101.0),
+                realized_vol_5m_bps: Some(12.0),
+                return_30s_bps: Some(4.0),
+                return_60s_bps: Some(12.0),
+                return_120s_bps: Some(18.0),
+                return_180s_bps: Some(24.0),
+                observed_at_ms: 60_000,
+                ..Default::default()
+            },
+            MomentumSignal {
+                direction: SignalDirection::Up,
+                strength: 1.0,
+                latest_window_return_bps: Some(20.0),
+                ..Default::default()
+            },
+            0.97,
+            60_000,
+        );
+
+        assert_eq!(
+            observe_market_posture(&input, &LateFavoriteStrategyConfig::default()),
+            MarketPosture::BarbellDirectional
+        );
+    }
+
+    #[test]
+    fn observe_market_posture_keeps_whipsaw_mid_as_center_only() {
+        let input = strategy_input(
+            snap(0.46, 0.51, 0.49, 0.54),
+            crate::signals::BtcRegimeSnapshot {
+                realized_vol_5m_bps: Some(12.0),
+                return_30s_bps: Some(-1.0),
+                return_60s_bps: Some(-2.0),
+                return_120s_bps: Some(-3.0),
+                return_180s_bps: Some(-4.0),
+                observed_at_ms: 60_000,
+                ..Default::default()
+            },
+            MomentumSignal::default(),
+            0.50,
+            60_000,
+        );
+
+        assert_eq!(
+            observe_market_posture(&input, &LateFavoriteStrategyConfig::default()),
+            MarketPosture::CenterOnly
+        );
     }
 
     #[test]
@@ -2631,12 +2890,13 @@ mod tests {
 
         assert!(cfg.enabled);
         assert_eq!(cfg.max_cheap_ask, 0.20);
-        assert_eq!(cfg.max_load_usd, 220.0);
+        assert_eq!(cfg.clip_usd, 30.0);
+        assert_eq!(cfg.max_load_usd, 240.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
         assert_eq!(cfg.max_win_edge_spend_fraction, 1.0);
-        assert_eq!(climb.clip_usd, 125.0);
-        assert_eq!(climb.max_load_usd, 850.0);
-        assert_eq!(climb.min_order_usd, 25.0);
+        assert_eq!(climb.clip_usd, 75.0);
+        assert_eq!(climb.max_load_usd, 525.0);
+        assert_eq!(climb.min_order_usd, 15.0);
         assert_eq!(climb.taker_min_favorite_ask, 0.90);
         assert!(
             cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
@@ -2678,14 +2938,27 @@ impl<M: MarketDescriptor + Clone> TradingStrategy<M> for BonereaperMmStrategy {
     }
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
+        let market_id = input.market.market_id().clone();
+        let observed_posture = observe_market_posture(&input, &self.config.late_favorite);
+        let posture = self
+            .market_postures
+            .entry(market_id)
+            .and_modify(|latched| *latched = latched.merge(observed_posture))
+            .or_insert(observed_posture);
         let core_decision = self.paired_core.on_tick(input.clone());
         let late_decision = self.late_favorite.on_tick(input);
-        Self::combine(core_decision, late_decision)
+        let mut decision = Self::combine(
+            core_decision,
+            late_decision,
+            posture.suppresses_broad_paired_core(),
+        );
+        add_posture_note(&mut decision, *posture, observed_posture);
+        decision
     }
 
     fn on_fill(&mut self, input: StrategyFillInput<M>) -> StrategyDecision {
         let core_decision = self.paired_core.on_fill(input.clone());
         let late_decision = self.late_favorite.on_fill(input);
-        Self::combine(core_decision, late_decision)
+        Self::combine(core_decision, late_decision, false)
     }
 }

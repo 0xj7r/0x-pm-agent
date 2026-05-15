@@ -76,15 +76,15 @@ late_favorite:
     window_sec: 300
     start_frac: 0.10
     min_elapsed_sec: 75
-    clip_usd: 125.0
-    max_load_usd: 850.0
+    clip_usd: 75.0
+    max_load_usd: 525.0
     maker_improve_ticks: 1.0
     near_touch_min_favorite_ask: 0.85
     near_touch_maker_improve_ticks: 3.0
     # Keep accepted late-favorite signals economically meaningful. Smaller
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
-    min_order_usd: 25.0
+    min_order_usd: 15.0
     spot_filter_bps: 10.0
     require_spot_match: true
     # These remain defensive, but not so punitive that valid favourite signals
@@ -106,8 +106,8 @@ late_favorite:
     max_cheap_ask: 0.20
     window_sec: 60
     start_frac: 0.0
-    clip_usd: 40.0
-    max_load_usd: 220.0
+    clip_usd: 30.0
+    max_load_usd: 240.0
     max_favorite_exposure_fraction: 0.55
     max_win_edge_spend_fraction: 1.0
     maker_improve_ticks: 1.0
@@ -122,8 +122,8 @@ late_favorite:
     max_hedge_ask: 0.45
     window_sec: 120
     start_frac: 0.0
-    clip_usd: 35.0
-    max_load_usd: 160.0
+    clip_usd: 25.0
+    max_load_usd: 130.0
     max_favorite_exposure_fraction: 0.45
     max_win_edge_spend_fraction: 1.0
     maker_improve_ticks: 1.0
