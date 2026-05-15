@@ -2041,15 +2041,32 @@ where
                 &tail_cfg,
                 directional_conviction,
             );
+            let hard_barbell_favorite_entry = market_structure_override
+                && legs.favorite_ask >= climb_cfg.taker_min_favorite_ask
+                && is_directional_barbell_favorite(&climb_cfg, legs.favorite_ask, legs.cheap_ask);
+            let policy_elapsed_ms = if hard_barbell_favorite_entry {
+                elapsed_ms.max(climb_cfg.min_elapsed_sec.saturating_mul(1_000))
+            } else {
+                elapsed_ms
+            };
+            let policy_remaining_ms = if hard_barbell_favorite_entry {
+                remaining_ms.min(climb_cfg.taker_window_sec.saturating_mul(1_000))
+            } else {
+                remaining_ms
+            };
 
             let entry_policy = if !direction_ok && !market_structure_override {
                 notes.push(format!(
                     "late_favorite blocked by favorite signal {signal_note}",
                 ));
                 None
-            } else if let Some(entry_policy) =
-                favorite_entry_policy(&input, &legs, &climb_cfg, elapsed_ms, remaining_ms)
-            {
+            } else if let Some(entry_policy) = favorite_entry_policy(
+                &input,
+                &legs,
+                &climb_cfg,
+                policy_elapsed_ms,
+                policy_remaining_ms,
+            ) {
                 if market_structure_override && !direction_ok {
                     notes.push(format!(
                         "late_favorite using barbell market-structure override despite signal miss {signal_note}",
@@ -2069,9 +2086,10 @@ where
                 Some(entry_policy)
             } else {
                 notes.push(format!(
-                    "late_favorite blocked by entry tier ask={:.4} elapsed_ms={} regime={:?}",
+                    "late_favorite blocked by entry tier ask={:.4} elapsed_ms={} policy_elapsed_ms={} regime={:?}",
                     legs.favorite_ask,
                     elapsed_ms,
+                    policy_elapsed_ms,
                     input.btc_regime.regime()
                 ));
                 None
@@ -2097,11 +2115,16 @@ where
                         &climb_cfg,
                         &entry_policy,
                     ) {
+                        let sizing_remaining_ms = if hard_barbell_favorite_entry {
+                            policy_remaining_ms
+                        } else {
+                            remaining_ms
+                        };
                         let raw_clip = reactive_climb_clip_usd(
                             &climb_cfg,
                             legs.favorite_ask,
                             elapsed_ms,
-                            remaining_ms,
+                            sizing_remaining_ms,
                             bar_window_ms,
                         );
                         let confidence_multiplier =
@@ -2125,15 +2148,16 @@ where
                             && (should_use_aggressive_favorite_taker(
                                 &climb_cfg,
                                 legs.favorite_ask,
-                                remaining_ms,
+                                sizing_remaining_ms,
                             ) || use_sub90_fak
                                 || directional_conviction.barbell);
                         let level_count = (if use_aggressive_taker {
-                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, sizing_remaining_ms)
                         } else if legs.favorite_ask < climb_cfg.taker_min_favorite_ask {
-                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms).max(3)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, sizing_remaining_ms)
+                                .max(3)
                         } else {
-                            favorite_load_levels(&climb_cfg, legs.favorite_ask, remaining_ms)
+                            favorite_load_levels(&climb_cfg, legs.favorite_ask, sizing_remaining_ms)
                         })
                         .min(entry_policy.max_levels);
                         let aggressive_all_levels =
@@ -2225,10 +2249,7 @@ where
             }
         }
 
-        if tail_cfg.enabled
-            && tail_enabled
-            && legs.cheap_ask <= tail_cfg.max_cheap_ask
-        {
+        if tail_cfg.enabled && tail_enabled && legs.cheap_ask <= tail_cfg.max_cheap_ask {
             let late_fav_filled_qty = match legs.favorite_leg {
                 LadderLeg::Yes => input.inventory.yes_qty,
                 LadderLeg::No => input.inventory.no_qty,
