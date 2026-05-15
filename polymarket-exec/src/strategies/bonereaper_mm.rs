@@ -431,14 +431,8 @@ impl LateFavoriteStrategy {
         input: &StrategyInput<M>,
         legs: &LegQuotes,
     ) -> LateFavBundleState {
-        let yes_fav_qty = input.late_fav_inventory.yes_qty.max(0.0);
-        let no_fav_qty = input.late_fav_inventory.no_qty.max(0.0);
-        let yes_fav_spend = yes_fav_qty * input.late_fav_inventory.yes_avg_cost.max(0.0)
-            + open_order_notional_for_leg(input.open_late_fav_order_exposure, LadderLeg::Yes)
-            + self.reserved_notional(input.market.market_id(), LadderLeg::Yes);
-        let no_fav_spend = no_fav_qty * input.late_fav_inventory.no_avg_cost.max(0.0)
-            + open_order_notional_for_leg(input.open_late_fav_order_exposure, LadderLeg::No)
-            + self.reserved_notional(input.market.market_id(), LadderLeg::No);
+        let yes_fav_spend = market_wide_leg_spend_usd(self, input, LadderLeg::Yes);
+        let no_fav_spend = market_wide_leg_spend_usd(self, input, LadderLeg::No);
 
         let dominant_fav_leg = if yes_fav_spend <= 1e-9 && no_fav_spend <= 1e-9 {
             legs.favorite_leg
@@ -448,18 +442,12 @@ impl LateFavoriteStrategy {
             LadderLeg::No
         };
         let tail_leg = opposite_leg(dominant_fav_leg);
-        let fav_filled_qty = inventory_qty_for_leg(input.late_fav_inventory, dominant_fav_leg);
-        let fav_filled_spend_usd = fav_filled_qty
-            * inventory_avg_cost_for_leg(input.late_fav_inventory, dominant_fav_leg);
-        let tail_filled_qty = inventory_qty_for_leg(input.cheap_tail_inventory, tail_leg);
-        let tail_filled_spend_usd = tail_filled_qty
-            * inventory_avg_cost_for_leg(input.cheap_tail_inventory, tail_leg);
-        let working_fav_spend_usd =
-            open_order_notional_for_leg(input.open_late_fav_order_exposure, dominant_fav_leg)
-                + self.reserved_notional(input.market.market_id(), dominant_fav_leg);
-        let working_tail_spend_usd =
-            open_order_notional_for_leg(input.open_convex_order_exposure, tail_leg)
-                + self.reserved_notional(input.market.market_id(), tail_leg);
+        let fav_filled_qty = inventory_qty_for_leg(input.inventory, dominant_fav_leg);
+        let fav_filled_spend_usd = filled_inventory_spend_usd(input.inventory, dominant_fav_leg);
+        let tail_filled_qty = inventory_qty_for_leg(input.inventory, tail_leg);
+        let tail_filled_spend_usd = filled_inventory_spend_usd(input.inventory, tail_leg);
+        let working_fav_spend_usd = market_wide_working_spend_usd(self, input, dominant_fav_leg);
+        let working_tail_spend_usd = market_wide_working_spend_usd(self, input, tail_leg);
 
         LateFavBundleState {
             dominant_fav_leg,
@@ -477,13 +465,41 @@ impl LateFavoriteStrategy {
     }
 }
 
+fn market_wide_leg_spend_usd<M: MarketDescriptor>(
+    strategy: &LateFavoriteStrategy,
+    input: &StrategyInput<M>,
+    leg: LadderLeg,
+) -> f64 {
+    filled_inventory_spend_usd(input.inventory, leg)
+        + market_wide_working_spend_usd(strategy, input, leg)
+}
+
+fn market_wide_working_spend_usd<M: MarketDescriptor>(
+    strategy: &LateFavoriteStrategy,
+    input: &StrategyInput<M>,
+    leg: LadderLeg,
+) -> f64 {
+    open_order_notional_for_leg(input.open_paired_core_order_exposure, leg)
+        + open_order_notional_for_leg(input.open_late_fav_order_exposure, leg)
+        + open_order_notional_for_leg(input.open_convex_order_exposure, leg)
+        + strategy.reserved_notional(input.market.market_id(), leg)
+}
+
 impl LateFavBundleState {
-    fn fav_total_spend_usd(self) -> f64 {
+    fn fav_committed_spend_usd(self) -> f64 {
         self.fav_filled_spend_usd + self.working_fav_spend_usd
     }
 
     fn tail_coverage_ratio(self) -> f64 {
-        let loss_at_risk = self.fav_total_spend_usd();
+        let loss_at_risk = self.fav_filled_spend_usd;
+        if loss_at_risk <= 0.0 {
+            return 1.0;
+        }
+        (self.tail_filled_qty / loss_at_risk).clamp(0.0, 10.0)
+    }
+
+    fn tail_coverage_ratio_after_favorite_add(self, proposed_fav_spend: f64) -> f64 {
+        let loss_at_risk = self.fav_filled_spend_usd + proposed_fav_spend.max(0.0);
         if loss_at_risk <= 0.0 {
             return 1.0;
         }
@@ -495,6 +511,10 @@ impl LateFavBundleState {
             - self.fav_filled_spend_usd
             - self.tail_filled_spend_usd
             - proposed_fav_spend
+    }
+
+    fn payoff_if_tail_wins(self) -> f64 {
+        self.tail_filled_qty - self.fav_filled_spend_usd - self.tail_filled_spend_usd
     }
 
     fn gate_favorite_add(
@@ -519,7 +539,7 @@ impl LateFavBundleState {
                     self.current_fav_leg,
                     proposed_price,
                     cfg.max_cheap_ask,
-                    self.fav_total_spend_usd(),
+                    self.fav_committed_spend_usd(),
                     self.tail_coverage_ratio(),
                 ),
             };
@@ -528,12 +548,13 @@ impl LateFavBundleState {
         if proposed_leg == self.dominant_fav_leg {
             let payoff_if_fav_wins =
                 self.payoff_if_fav_wins_after(proposed_qty, proposed_spend_usd);
-            if self.fav_total_spend_usd() > 0.0 && payoff_if_fav_wins < -1e-9 {
+            if self.fav_filled_spend_usd > 0.0 && payoff_if_fav_wins < -1e-9 {
                 return BundleOrderGate {
                     allowed: false,
                     reason: format!(
-                        "bundle blocks favorite add: favorite-win payoff would be negative payoff={payoff_if_fav_wins:.2} fav_spend={:.2} tail_spend={:.2} proposed_spend={proposed_spend_usd:.2}",
-                        self.fav_total_spend_usd(),
+                        "bundle blocks favorite add: favorite-win payoff would be negative payoff={payoff_if_fav_wins:.2} fav_committed={:.2} fav_filled={:.2} tail_spend={:.2} proposed_spend={proposed_spend_usd:.2}",
+                        self.fav_committed_spend_usd(),
+                        self.fav_filled_spend_usd,
                         self.tail_filled_spend_usd,
                     ),
                 };
@@ -545,14 +566,16 @@ impl LateFavBundleState {
                 Some(BtcRegime::Whipsaw | BtcRegime::TrendingVolatile)
             ) || path_reversal_risk >= 0.35;
             if reversal_prone
-                && self.fav_total_spend_usd() >= cfg.clip_usd.max(cfg.min_order_usd)
-                && self.tail_coverage_ratio() < coverage_target * 0.50
+                && self.fav_filled_spend_usd >= cfg.clip_usd.max(cfg.min_order_usd)
+                && self.tail_coverage_ratio_after_favorite_add(proposed_spend_usd)
+                    < coverage_target * 0.50
             {
                 return BundleOrderGate {
                     allowed: false,
                     reason: format!(
-                        "bundle blocks favorite add: tail coverage {:.2} below required {:.2} in reversal-prone regime={:?} path_reversal={:.2}",
+                        "bundle blocks favorite add: filled tail coverage {:.2} after proposed {:.2} below required {:.2} in reversal-prone regime={:?} path_reversal={:.2}",
                         self.tail_coverage_ratio(),
+                        self.tail_coverage_ratio_after_favorite_add(proposed_spend_usd),
                         coverage_target,
                         regime,
                         path_reversal_risk,
@@ -568,7 +591,7 @@ impl LateFavBundleState {
                 self.dominant_fav_leg,
                 self.tail_leg,
                 self.side_flip,
-                self.fav_total_spend_usd(),
+                self.fav_committed_spend_usd(),
                 self.tail_filled_spend_usd,
                 self.tail_coverage_ratio(),
             ),
@@ -848,6 +871,13 @@ fn inventory_avg_cost_for_leg(
         LadderLeg::No => inventory.no_avg_cost,
     }
     .max(0.0)
+}
+
+fn filled_inventory_spend_usd(
+    inventory: crate::market_making::pairing::types::PairedInventorySnapshot,
+    leg: LadderLeg,
+) -> f64 {
+    inventory_qty_for_leg(inventory, leg) * inventory_avg_cost_for_leg(inventory, leg)
 }
 
 fn inventory_avg_cost_or(
@@ -1397,9 +1427,18 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
 
     if legs.favorite_ask < cfg.taker_min_favorite_ask {
+        let clean_directional_persistence = !whipsaw
+            && path_reversal_risk <= 0.20
+            && strongest >= threshold * 1.50
+            && recent >= threshold * 0.25
+            && model_favorite >= 0.88;
+        let directional_probe_below_near_touch = directional_barbell
+            && legs.favorite_ask >= cfg.min_favorite_ask
+            && legs.favorite_ask < cfg.near_touch_min_favorite_ask
+            && clean_directional_persistence;
         let barbell_sub90 = directional_barbell
-            && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
-            && conviction.score >= 0.35;
+            && ((legs.favorite_ask >= cfg.near_touch_min_favorite_ask && conviction.score >= 0.35)
+                || directional_probe_below_near_touch);
         if early_late
             && !barbell_sub90
             && if flat_regime {
@@ -1428,14 +1467,13 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             1.0
         };
         let flat_scale = if flat_regime && early_late { 0.80 } else { 1.0 };
-        let clean_directional_persistence = !whipsaw
-            && path_reversal_risk <= 0.20
-            && strongest >= threshold * 1.50
-            && recent >= threshold * 0.25
-            && model_favorite >= 0.88;
-        let near_touch_maker = legs.favorite_ask >= cfg.near_touch_min_favorite_ask
-            && path_reversal_risk <= 0.35
-            && (barbell_sub90 || clean_directional_persistence || strongest >= threshold * 1.15);
+        let near_touch_maker = legs.favorite_ask >= cfg.min_favorite_ask
+            && path_reversal_risk <= 0.40
+            && (directional_probe_below_near_touch
+                || (legs.favorite_ask >= cfg.near_touch_min_favorite_ask
+                    && (barbell_sub90
+                        || clean_directional_persistence
+                        || strongest >= threshold * 1.15)));
         let base_scale = if barbell_sub90 {
             if early_late {
                 0.75
@@ -1452,9 +1490,22 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         } else {
             1.0
         };
+        let probe_scale = if directional_probe_below_near_touch {
+            0.50
+        } else {
+            1.0
+        };
         return Some(FavoriteEntryPolicy {
-            min_price: 0.80,
-            max_levels: if barbell_sub90 {
+            min_price: if directional_probe_below_near_touch {
+                cfg.min_favorite_ask
+            } else {
+                cfg.near_touch_min_favorite_ask
+            },
+            max_levels: if directional_probe_below_near_touch {
+                2
+            } else if barbell_sub90 && !whipsaw {
+                4
+            } else if barbell_sub90 {
                 3
             } else if whipsaw {
                 1
@@ -1467,18 +1518,22 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 * conviction_scale
                 * reversal_scale
                 * whipsaw_scale
-                * flat_scale,
+                * flat_scale
+                * probe_scale,
             cap_multiplier: base_scale
                 * conviction_scale
                 * reversal_scale
                 * whipsaw_scale
-                * flat_scale,
+                * flat_scale
+                * probe_scale,
             allow_taker: (clean_directional_persistence || barbell_sub90)
                 && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
-                && (elapsed_sec >= 210 || barbell_sub90),
+                && (elapsed_sec >= 180 || barbell_sub90),
             near_touch_maker,
             path_reversal_risk,
-            label: if clean_directional_persistence
+            label: if directional_probe_below_near_touch {
+                "maker_probe_below_near_touch_directional_barbell"
+            } else if clean_directional_persistence
                 && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
             {
                 "maker_ladder_80_89_clean_persistent"
@@ -1877,18 +1932,21 @@ where
         ));
         let bundle_state = self.bundle_state(&input, &legs);
         notes.push(format!(
-            "late_fav_bundle dominant={:?} current={:?} tail={:?} side_flip={} fav_spend={:.2} fav_qty={:.2} tail_spend={:.2} tail_qty={:.2} working_fav={:.2} working_tail={:.2} tail_coverage={:.2}",
+            "late_fav_bundle dominant={:?} current={:?} tail={:?} side_flip={} fav_committed={:.2} fav_filled={:.2} fav_qty={:.2} tail_spend={:.2} tail_qty={:.2} working_fav={:.2} working_tail={:.2} tail_coverage={:.2} fav_win_payoff_now={:.2} tail_win_payoff_now={:.2}",
             bundle_state.dominant_fav_leg,
             bundle_state.current_fav_leg,
             bundle_state.tail_leg,
             bundle_state.side_flip,
-            bundle_state.fav_total_spend_usd(),
+            bundle_state.fav_committed_spend_usd(),
+            bundle_state.fav_filled_spend_usd,
             bundle_state.fav_filled_qty,
             bundle_state.tail_filled_spend_usd,
             bundle_state.tail_filled_qty,
             bundle_state.working_fav_spend_usd,
             bundle_state.working_tail_spend_usd,
             bundle_state.tail_coverage_ratio(),
+            bundle_state.payoff_if_fav_wins_after(0.0, 0.0),
+            bundle_state.payoff_if_tail_wins(),
         ));
         let climb_enabled = climb_cfg
             .disable_after_ms
@@ -1966,17 +2024,9 @@ where
                 };
                 let net_directional_exposure_usd =
                     directional_exposure_usd(favorite_qty, other_qty, legs.favorite_ask);
-                let filled_late_fav_usd =
-                    inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg)
-                        * legs.favorite_ask;
-                let working_late_fav_usd = open_order_notional_for_leg(
-                    input.open_late_fav_order_exposure,
-                    legs.favorite_leg,
-                );
-                let reserved_late_fav_usd =
-                    self.reserved_notional(input.market.market_id(), legs.favorite_leg);
-                let current_exposure_usd = filled_late_fav_usd.max(net_directional_exposure_usd)
-                    + working_late_fav_usd.max(reserved_late_fav_usd);
+                let current_exposure_usd =
+                    market_wide_leg_spend_usd(self, &input, legs.favorite_leg)
+                        .max(net_directional_exposure_usd);
                 let adjusted_max_load_usd =
                     climb_cfg.max_load_usd * regime_multiplier * entry_policy.cap_multiplier;
                 let remaining_load = (adjusted_max_load_usd - current_exposure_usd).max(0.0);
@@ -2004,7 +2054,7 @@ where
                             .max(climb_cfg.min_order_usd);
                         let mut load_left = remaining_load;
                         let use_sub90_fak = entry_policy.allow_taker
-                            && legs.favorite_ask >= 0.80
+                            && legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
                             && legs.favorite_ask < climb_cfg.taker_min_favorite_ask
                             && (remaining_ms <= climb_cfg.taker_window_sec.saturating_mul(1_000)
                                 || is_directional_barbell_favorite(
@@ -2127,11 +2177,11 @@ where
             && legs.cheap_ask <= tail_cfg.max_cheap_ask
         {
             let late_fav_filled_qty = match legs.favorite_leg {
-                LadderLeg::Yes => input.late_fav_inventory.yes_qty,
-                LadderLeg::No => input.late_fav_inventory.no_qty,
+                LadderLeg::Yes => input.inventory.yes_qty,
+                LadderLeg::No => input.inventory.no_qty,
             };
             let favorite_avg_price = inventory_avg_cost_or(
-                input.late_fav_inventory,
+                input.inventory,
                 legs.favorite_leg,
                 legs.favorite_ask,
             );
@@ -2153,14 +2203,13 @@ where
             );
             let favorite_exposure_usd = effective_late_fav_qty * favorite_avg_price;
             let cheap_tail_filled_qty = match legs.cheap_leg {
-                LadderLeg::Yes => input.cheap_tail_inventory.yes_qty,
-                LadderLeg::No => input.cheap_tail_inventory.no_qty,
+                LadderLeg::Yes => input.inventory.yes_qty,
+                LadderLeg::No => input.inventory.no_qty,
             };
             let cheap_tail_avg_price =
-                inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask);
+                inventory_avg_cost_or(input.inventory, legs.cheap_leg, legs.cheap_ask);
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
-                + open_order_notional_for_leg(input.open_convex_order_exposure, legs.cheap_leg)
-                + self.reserved_notional(input.market.market_id(), legs.cheap_leg);
+                + market_wide_working_spend_usd(self, &input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
             let tail_cap_usd = cheap_tail_cap_usd(
                 &tail_cfg,
@@ -2278,11 +2327,11 @@ where
             && legs.cheap_ask <= reversal_cfg.max_hedge_ask
         {
             let late_fav_filled_qty = match legs.favorite_leg {
-                LadderLeg::Yes => input.late_fav_inventory.yes_qty,
-                LadderLeg::No => input.late_fav_inventory.no_qty,
+                LadderLeg::Yes => input.inventory.yes_qty,
+                LadderLeg::No => input.inventory.no_qty,
             };
             let favorite_avg_price = inventory_avg_cost_or(
-                input.late_fav_inventory,
+                input.inventory,
                 legs.favorite_leg,
                 legs.favorite_ask,
             );
@@ -2304,14 +2353,13 @@ where
             );
             let favorite_exposure_usd = effective_late_fav_qty * favorite_avg_price;
             let hedge_filled_qty = match legs.cheap_leg {
-                LadderLeg::Yes => input.cheap_tail_inventory.yes_qty,
-                LadderLeg::No => input.cheap_tail_inventory.no_qty,
+                LadderLeg::Yes => input.inventory.yes_qty,
+                LadderLeg::No => input.inventory.no_qty,
             };
             let hedge_avg_price =
-                inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask);
+                inventory_avg_cost_or(input.inventory, legs.cheap_leg, legs.cheap_ask);
             let current_hedge_usd = (hedge_filled_qty * hedge_avg_price)
-                + open_order_notional_for_leg(input.open_convex_order_exposure, legs.cheap_leg)
-                + self.reserved_notional(input.market.market_id(), legs.cheap_leg);
+                + market_wide_working_spend_usd(self, &input, legs.cheap_leg);
             let reversal_score = reversal_hedge_score(&input, &legs, &reversal_cfg);
             let hedge_cap_usd = reversal_hedge_cap_usd(
                 &reversal_cfg,
