@@ -3637,6 +3637,7 @@ impl<S: Strategy> Runtime<S> {
                         remaining_qty: managed.remaining_qty(),
                         reduce_only: managed.intent.reduce_only,
                         quote_level_tag: managed.intent.quote_level_tag.clone(),
+                        created_at_ms: managed.intent.created_at_ms,
                     },
                 )
                 .collect(),

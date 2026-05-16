@@ -17,6 +17,10 @@ pub struct StrategyOpenOrderSnapshot {
     pub remaining_qty: f64,
     pub reduce_only: bool,
     pub quote_level_tag: Option<String>,
+    /// When the order's underlying intent was created. Lanes that escalate
+    /// stale makers (e.g. late-fav climb FAK escalation) read this to
+    /// compute age. Defaults to 0 in non-live adapters and is best-effort.
+    pub created_at_ms: EpochMillis,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +65,10 @@ pub struct StrategyInput<M> {
     pub open_convex_order_exposure: PairedOpenOrderExposure,
     pub open_late_fav_order_exposure: PairedOpenOrderExposure,
     pub open_paired_core_order_exposure: PairedOpenOrderExposure,
+    /// Per-order snapshot of the strategy's currently-open orders on this
+    /// market. Used by lanes that need to reason about individual orders
+    /// (e.g. stale-maker -> FAK escalation in late-fav climb).
+    pub open_orders: Vec<StrategyOpenOrderSnapshot>,
     pub pair_cost: PairCostTracker,
     pub fair_value: FairValueEstimate,
     pub btc_regime: BtcRegimeSnapshot,

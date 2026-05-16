@@ -475,6 +475,12 @@ impl HybridStrategy {
         let fair_value = fair_value_from_context(context, &market, self.momentum_weight);
         let order_book_pressure =
             crate::signals::OrderBookPressureEngine::default().compute(&snapshot);
+        let open_orders_for_market: Vec<StrategyOpenOrderSnapshot> = context
+            .open_orders
+            .iter()
+            .filter(|o| &o.market_id == market_id)
+            .cloned()
+            .collect();
         Some(StrategyInput {
             market,
             snapshot,
@@ -485,6 +491,7 @@ impl HybridStrategy {
             open_convex_order_exposure,
             open_late_fav_order_exposure,
             open_paired_core_order_exposure,
+            open_orders: open_orders_for_market,
             pair_cost,
             fair_value,
             btc_regime: context.btc_regime.clone(),

@@ -1621,6 +1621,7 @@ mod tests {
             open_convex_order_exposure: PairedOpenOrderExposure::default(),
             open_late_fav_order_exposure: PairedOpenOrderExposure::default(),
             open_paired_core_order_exposure: PairedOpenOrderExposure::default(),
+            open_orders: Vec::new(),
             pair_cost: PairCostTracker::default(),
             fair_value: neutral_fair_value(),
             btc_regime: BtcRegimeSnapshot::default(),

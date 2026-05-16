@@ -97,6 +97,17 @@ pub struct FavoriteClimbConfig {
     pub taker_window_sec: u64,
     /// Optional hard cutoff after which this phase is disabled.
     pub disable_after_ms: Option<EpochMillis>,
+    /// Stale-maker -> FAK escalation. When a `late-fav:climb:N:*:maker`
+    /// order has aged past `escalation_age_ms` AND the current favorite
+    /// ask has moved up by at least `escalation_drift_ticks` from the
+    /// resting bid, emit a small FAK at `favorite_ask` to capture the
+    /// move the maker couldn't catch. Maker stays in place (cancelled
+    /// by the standard stale-cancel path); escalation is at most one
+    /// fresh FAK per qualifying order per evaluation.
+    pub escalation_enabled: bool,
+    pub escalation_age_ms: u64,
+    pub escalation_drift_ticks: u32,
+    pub escalation_max_clip_usd: f64,
 }
 
 impl Default for FavoriteClimbConfig {
@@ -122,9 +133,13 @@ impl Default for FavoriteClimbConfig {
             regime_trending_volatile_multiplier: 0.75,
             regime_unknown_multiplier: 0.70,
             reversal_multiplier: 0.55,
-            taker_min_favorite_ask: 0.90,
+            taker_min_favorite_ask: 0.87,
             taker_window_sec: 120,
             disable_after_ms: None,
+            escalation_enabled: true,
+            escalation_age_ms: 25_000,
+            escalation_drift_ticks: 3,
+            escalation_max_clip_usd: 5.0,
         }
     }
 }
@@ -3099,6 +3114,89 @@ where
             }
         }
 
+        // Stale-maker -> FAK escalation. When a late-fav climb maker has
+        // aged out and the favorite has moved up past its resting bid by
+        // several ticks, the maker missed its window — convert a small
+        // residual to a FAK at the current ask. Keeps maker-first economics
+        // for the common case while closing the "favorite climbed past my
+        // resting bid, never crossed back" gap. One escalation per qualifying
+        // open maker per evaluation.
+        if climb_cfg.enabled
+            && climb_cfg.escalation_enabled
+            && tick > 0.0
+            && legs.favorite_ask > 0.0
+            && climb_cfg.escalation_max_clip_usd >= climb_cfg.min_order_usd
+        {
+            let mut escalated_in_market = false;
+            for open in &input.open_orders {
+                if open.market_id != *input.market.market_id() {
+                    continue;
+                }
+                let leg_match = match legs.favorite_leg {
+                    LadderLeg::Yes => &open.instrument_id == input.market.yes_instrument_id(),
+                    LadderLeg::No => &open.instrument_id == input.market.no_instrument_id(),
+                };
+                if !leg_match {
+                    continue;
+                }
+                let is_climb_maker = open
+                    .quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.starts_with("late-fav-climb:"));
+                if !is_climb_maker {
+                    continue;
+                }
+                if open.remaining_qty < input.market.min_order_size() {
+                    continue;
+                }
+                let age_ms = input.now_ms.saturating_sub(open.created_at_ms);
+                if age_ms < climb_cfg.escalation_age_ms {
+                    continue;
+                }
+                let drift_ticks = ((legs.favorite_ask - open.limit_price) / tick).round();
+                if drift_ticks < climb_cfg.escalation_drift_ticks as f64 {
+                    continue;
+                }
+                // Clip the escalation to a small residual to avoid sweeping
+                // the venue if the maker was big. Convert USD cap into
+                // shares at the current ask.
+                let clip_usd = climb_cfg.escalation_max_clip_usd.min(
+                    open.remaining_qty * open.limit_price,
+                );
+                let qty = (clip_usd / legs.favorite_ask).max(input.market.min_order_size());
+                let reason = format!(
+                    "late_favorite climb-escalate leg={:?} stale_age_ms={} drift_ticks={} resting_px={:.4} now_ask={:.4} residual_qty={:.4} escalation_clip_usd={:.2}",
+                    legs.favorite_leg,
+                    age_ms,
+                    drift_ticks as i64,
+                    open.limit_price,
+                    legs.favorite_ask,
+                    open.remaining_qty,
+                    clip_usd,
+                );
+                notes.push(reason.clone());
+                intents.push(build_late_favorite_intent(
+                    &input.market,
+                    legs.favorite_leg,
+                    legs.favorite_ask,
+                    qty,
+                    "climb-escalate",
+                    true, // aggressive_taker = FAK
+                    reason,
+                    input.now_ms,
+                ));
+                self.reserve_notional(
+                    input.market.market_id(),
+                    legs.favorite_leg,
+                    clip_usd,
+                    input.now_ms,
+                );
+                escalated_in_market = true;
+                break; // one escalation per market per tick
+            }
+            let _ = escalated_in_market;
+        }
+
         let anticipate_cfg = self.config.favorite_anticipate;
         // Regime, btc_confirms, and reversal-risk are now continuous penalties
         // inside `anticipate_size_multiplier` rather than binary gates. Only
@@ -4178,6 +4276,7 @@ mod tests {
             open_convex_order_exposure: Default::default(),
             open_late_fav_order_exposure: Default::default(),
             open_paired_core_order_exposure: Default::default(),
+            open_orders: Vec::new(),
             pair_cost: Default::default(),
             fair_value: fair_value(p_up),
             btc_regime,

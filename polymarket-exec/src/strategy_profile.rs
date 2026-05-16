@@ -108,6 +108,10 @@ pub struct FavoriteClimbSubsection {
     pub taker_window_sec: Option<u64>,
     pub disable_after_ms: Option<u64>,
     pub clip_scale: Option<f64>,
+    pub escalation_enabled: Option<bool>,
+    pub escalation_age_ms: Option<u64>,
+    pub escalation_drift_ticks: Option<u32>,
+    pub escalation_max_clip_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -374,6 +378,18 @@ impl StrategyProfile {
                     .unwrap_or(climb_def.taker_min_favorite_ask),
                 taker_window_sec: c.taker_window_sec.unwrap_or(climb_def.taker_window_sec),
                 disable_after_ms: c.disable_after_ms,
+                escalation_enabled: c
+                    .escalation_enabled
+                    .unwrap_or(climb_def.escalation_enabled),
+                escalation_age_ms: c
+                    .escalation_age_ms
+                    .unwrap_or(climb_def.escalation_age_ms),
+                escalation_drift_ticks: c
+                    .escalation_drift_ticks
+                    .unwrap_or(climb_def.escalation_drift_ticks),
+                escalation_max_clip_usd: c
+                    .escalation_max_clip_usd
+                    .unwrap_or(climb_def.escalation_max_clip_usd),
             },
             favorite_anticipate: LateFavAnticipateConfig {
                 enabled: a.enabled.unwrap_or(anticipate_def.enabled),

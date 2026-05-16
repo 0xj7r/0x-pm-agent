@@ -836,6 +836,7 @@ impl ReplayStrategyAdapter {
             open_late_fav_order_exposure:
                 crate::strategies::traits::PairedOpenOrderExposure::default(),
             open_paired_core_order_exposure,
+            open_orders: Vec::new(),
             pair_cost,
             fair_value,
             btc_regime,
