@@ -17,7 +17,18 @@ use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
     LateFavAnticipateConfig, LateFavoriteStrategyConfig, ReversalHedgeConfig,
 };
-use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
+use crate::strategies::core_hedge_mm::{
+    CoreHedgeMmConfig, CoreHedgeMmStrategyConfig, PairedCoreLadderAnchor,
+};
+
+fn parse_paired_core_ladder_anchor(raw: Option<&str>) -> Option<PairedCoreLadderAnchor> {
+    let raw = raw?.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "mid" => Some(PairedCoreLadderAnchor::Mid),
+        "touch" => Some(PairedCoreLadderAnchor::Touch),
+        _ => None,
+    }
+}
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
 use crate::strategies::unlawful_mm::UnlawfulMmStrategyConfig;
 
@@ -208,6 +219,8 @@ pub struct CoreHedgeSection {
     pub book_sanity_max_queue_imbalance_ratio: Option<f64>,
     pub book_sanity_max_projected_pair_cost: Option<f64>,
     pub clip_scale: Option<f64>,
+    /// Paired-core ladder anchor: "mid" (legacy) or "touch" (new).
+    pub ladder_anchor: Option<String>,
 }
 
 impl StrategyProfile {
@@ -317,6 +330,8 @@ impl StrategyProfile {
                 book_sanity_max_projected_pair_cost: s
                     .book_sanity_max_projected_pair_cost
                     .unwrap_or(defaults.book_sanity_max_projected_pair_cost),
+                ladder_anchor: parse_paired_core_ladder_anchor(s.ladder_anchor.as_deref())
+                    .unwrap_or(defaults.ladder_anchor),
                 ..defaults
             },
         }

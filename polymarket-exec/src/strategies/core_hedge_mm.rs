@@ -32,6 +32,31 @@ const PAIRED_CORE_CENTER_PROBE_MAX_PRICE: f64 = 0.58;
 const PAIRED_CORE_REPAIR_PAIR_COST_LIMIT: f64 = 0.99;
 const PAIRED_CORE_MERGE_PAIR_COST_LIMIT: f64 = 0.99;
 
+/// Where each paired-core ladder rung is positioned relative to the book.
+///
+/// `Mid`: legacy behaviour — rungs span `[mid - half_span, mid + half_span]`
+/// regardless of where the touch actually is. In a directional market
+/// (e.g. yes_ask=0.84 / no_ask=0.17) the mid is still treated as 0.50, so
+/// rungs land 30+ ticks away from where flow actually happens and either
+/// sit unfilled or catch the losing-leg descent.
+///
+/// `Touch`: rungs anchored to `best_bid - tick * level` on each leg. Stays
+/// near where actual trades happen in all regimes. In oscillating markets
+/// the behaviour is similar to mid (yes_bid ≈ no_bid ≈ 0.49). In directional
+/// markets it correctly follows the bid down to where flow lives and
+/// preserves pair-arb math (yes_bid + no_bid < 1 by venue no-arbitrage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairedCoreLadderAnchor {
+    Mid,
+    Touch,
+}
+
+impl Default for PairedCoreLadderAnchor {
+    fn default() -> Self {
+        Self::Mid
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
     pub enabled: bool,
@@ -111,6 +136,8 @@ pub struct CoreHedgeMmConfig {
     pub book_sanity_max_queue_ahead_usd: f64,
     pub book_sanity_max_queue_imbalance_ratio: f64,
     pub book_sanity_max_projected_pair_cost: f64,
+    /// Where each ladder rung is positioned. See `PairedCoreLadderAnchor`.
+    pub ladder_anchor: PairedCoreLadderAnchor,
 }
 
 impl Default for CoreHedgeMmConfig {
@@ -148,6 +175,7 @@ impl Default for CoreHedgeMmConfig {
             book_sanity_max_queue_ahead_usd: 200.0,
             book_sanity_max_queue_imbalance_ratio: 3.0,
             book_sanity_max_projected_pair_cost: 0.995,
+            ladder_anchor: PairedCoreLadderAnchor::Mid,
         }
     }
 }
@@ -626,6 +654,7 @@ fn market_elapsed_ms<M: MarketDescriptor>(input: &StrategyInput<M>) -> u64 {
         .unwrap_or(input.market.window_ms())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ladder_candidate<M: MarketDescriptor>(
     market: &M,
     leg: LadderLeg,
@@ -640,20 +669,33 @@ fn ladder_candidate<M: MarketDescriptor>(
     clip_shares: f64,
     min_order_usd: f64,
     maker_improve_ticks: f64,
+    anchor: PairedCoreLadderAnchor,
     now_ms: EpochMillis,
 ) -> Option<OrderIntent> {
     let tick = market.tick_size().max(0.0001);
-    let mid = quote_mid(best_bid, best_ask, center_price).clamp(0.01, 0.99);
-    let low = (mid - half_span).clamp(0.01, 0.99);
-    let high = (mid + half_span).clamp(0.01, 0.99);
-    let grid_price = if levels <= 1 {
-        mid
-    } else {
-        let denom = (levels - 1) as f64;
-        low + (high - low) * (idx as f64 / denom)
+    let raw_price = match anchor {
+        PairedCoreLadderAnchor::Mid => {
+            let mid = quote_mid(best_bid, best_ask, center_price).clamp(0.01, 0.99);
+            let low = (mid - half_span).clamp(0.01, 0.99);
+            let high = (mid + half_span).clamp(0.01, 0.99);
+            let grid_price = if levels <= 1 {
+                mid
+            } else {
+                let denom = (levels - 1) as f64;
+                low + (high - low) * (idx as f64 / denom)
+            };
+            improved_ladder_price(grid_price, best_bid, best_ask, tick, maker_improve_ticks)
+        }
+        PairedCoreLadderAnchor::Touch => {
+            // Touch-anchored: each rung sits 1 tick deeper into this leg's
+            // bid stack. Pair-arb is guaranteed by Polymarket's no-arb
+            // invariant (yes_bid + no_bid <= 1.0 - tick on a sane book) so
+            // every level's bundle cost stays below $1. Maker improve is
+            // intentionally bypassed here — at idx=0 we already sit at
+            // touch, and improve-toward-ask would push us into the spread.
+            (best_bid - tick * idx as f64).max(0.01)
+        }
     };
-    let raw_price =
-        improved_ladder_price(grid_price, best_bid, best_ask, tick, maker_improve_ticks);
     if raw_price < min_price || raw_price > max_price {
         return None;
     }
@@ -1299,6 +1341,7 @@ where
                         cfg.clip_shares,
                         cfg.min_order_usd,
                         cfg.maker_improve_ticks,
+                        cfg.ladder_anchor,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1317,6 +1360,7 @@ where
                         cfg.clip_shares,
                         cfg.min_order_usd,
                         cfg.maker_improve_ticks,
+                        cfg.ladder_anchor,
                     input.now_ms,
                 ) else {
                     continue;
