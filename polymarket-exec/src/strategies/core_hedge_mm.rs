@@ -243,10 +243,20 @@ impl CoreHedgeMmStrategy {
         price: f64,
         qty: f64,
     ) -> bool {
+        // Re-emit thresholds. Each cancel+repost destroys our FIFO queue
+        // position on Polymarket, so allow micro-drift in the intent's
+        // price and qty without churning the venue order. A half-tick
+        // price tolerance (5e-3 vs 1e-2 venue tick) preserves quote
+        // stability when fair-value drifts within the tick. A half-share
+        // qty tolerance absorbs sizing-function rounding without
+        // triggering re-emits.
+        const REQUOTE_PRICE_TOLERANCE: f64 = 0.005;
+        const REQUOTE_QTY_TOLERANCE: f64 = 0.5;
         let key = (market_id.clone(), leg, tag.to_string());
         match self.last_emit.get(&key) {
             Some(&(prev_px, prev_qty)) => {
-                (price - prev_px).abs() > 1e-6 || (qty - prev_qty).abs() > 1e-6
+                (price - prev_px).abs() > REQUOTE_PRICE_TOLERANCE
+                    || (qty - prev_qty).abs() > REQUOTE_QTY_TOLERANCE
             }
             None => true,
         }
@@ -1814,5 +1824,38 @@ mod tests {
             }
             other => panic!("expected negative pair-cost repair skip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_emit_suppresses_subtick_price_drift() {
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig::default());
+        let market_id = MarketId::from("m1");
+        // First emission always allowed.
+        assert!(strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.42, 5.0));
+        // Sub-half-tick price drift (<0.005) and sub-half-share qty drift
+        // must NOT re-emit. Cancel+repost on every fair-value microchange
+        // destroys FIFO queue position; keeping the existing quote in place
+        // preserves time priority on the venue.
+        assert!(!strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.4225, 5.1));
+        assert!(!strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.4180, 4.95));
+        assert!(!strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.4205, 5.3));
+    }
+
+    #[test]
+    fn should_emit_requotes_on_full_tick_price_move() {
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig::default());
+        let market_id = MarketId::from("m1");
+        assert!(strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.42, 5.0));
+        // Full tick (0.01) crosses the half-tick threshold: re-emit.
+        assert!(strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.43, 5.0));
+    }
+
+    #[test]
+    fn should_emit_requotes_on_meaningful_qty_change() {
+        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig::default());
+        let market_id = MarketId::from("m1");
+        assert!(strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.42, 5.0));
+        // Quantity change above the half-share threshold: re-emit.
+        assert!(strategy.should_emit(&market_id, LadderLeg::Yes, "ladder:0", 0.42, 6.0));
     }
 }
