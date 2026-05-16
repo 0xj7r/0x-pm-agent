@@ -1924,11 +1924,11 @@ fn unbundled_ultra_cheap_tail_cap_usd(
     favorite_ask: f64,
     cheap_ask: f64,
 ) -> f64 {
-    // Gate on *filled* late-fav qty, not working/reserved. Bonereaper fires
-    // standalone ultra-cheap convexity interleaved with late-fav loading;
-    // suppressing the moment a maker is posted (rather than filled) defeats
-    // the lottery shape commit 69bb3ce was meant to restore.
-    if late_fav_filled_qty > 0.0
+    // Gate on *filled* late-fav qty, not working/reserved. We now require a
+    // confirmed late-favorite anchor before firing the standalone lottery lane;
+    // without a filled anchor, this lane becomes pure speculation and can
+    // materially over-index on cheap tails.
+    if late_fav_filled_qty <= 0.0
         || cheap_ask <= 0.0
         || cheap_ask > cfg.ultra_cheap_max_ask
         || favorite_ask < cfg.ultra_cheap_min_favorite_ask
@@ -2567,7 +2567,7 @@ where
                 working_late_fav_usd,
                 reserved_late_fav_usd,
             );
-            let favorite_exposure_usd = effective_late_fav_qty * favorite_avg_price;
+            let favorite_exposure_usd = late_fav_filled_qty * favorite_avg_price;
             let cheap_tail_filled_qty = other_total_qty;
             let cheap_tail_filled_spend_usd =
                 filled_inventory_spend_usd(input.cheap_tail_inventory, legs.cheap_leg)
@@ -2587,7 +2587,7 @@ where
             };
             let bundled_tail_cap_usd = cheap_tail_cap_usd(
                 &tail_cfg,
-                effective_late_fav_qty,
+                late_fav_filled_qty,
                 favorite_avg_price,
                 legs.favorite_ask,
                 legs.cheap_ask,
@@ -3929,7 +3929,7 @@ mod tests {
     }
 
     #[test]
-    fn unbundled_ultra_cheap_tail_allows_tiny_lottery_without_late_fav() {
+    fn unbundled_ultra_cheap_tail_requires_late_fav_fill() {
         let cfg = ConvexTailConfig {
             clip_usd: 3.0,
             max_load_usd: 30.0,
@@ -3941,14 +3941,11 @@ mod tests {
 
         assert_eq!(
             unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.02),
-            3.0
+            0.0
         );
-        // Standalone overlay must still fire when only working/reserved late-fav
-        // exists. Suppression only kicks in once we have an actual *filled*
-        // late-fav share (the bundled cap takes over from there).
         assert_eq!(
             unbundled_ultra_cheap_tail_cap_usd(&cfg, 10.0, 0.92, 0.02),
-            0.0
+            3.0
         );
         assert_eq!(
             unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.89, 0.02),
