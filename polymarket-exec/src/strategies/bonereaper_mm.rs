@@ -188,7 +188,13 @@ pub struct LateFavAnticipateConfig {
 impl Default for LateFavAnticipateConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // Disabled — observed firing on marginal-band entries (0.51-0.59
+            // ladder rungs) producing $25+ of asymmetric Up exposure that
+            // was structurally undersized on the cheap-tail hedge. Today's
+            // $449 daily P&L was earned with anticipate disabled / before
+            // it was deployed. Re-enable only with a price-anchored ladder
+            // and share-count-parity hedging.
+            enabled: false,
             // Regime no longer gates: ALL regimes are allowed, but the
             // size multiplier scales down in Flat (0.5x) and Whipsaw (0.3x).
             // Diagnostic showed 98.4% of ticks were in Flat regime, so the
