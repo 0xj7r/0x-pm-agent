@@ -1197,6 +1197,24 @@ async fn run_runtime_loop(
     // still pending.
     let mut auto_redeem_seen_conditions: HashSet<String> = HashSet::new();
 
+    // Auto-wrap worker — periodically converts USDC.e merge proceeds
+    // into pUSD via the CollateralOnramp so trading balance reflects
+    // the merge return. Without this, every merge leaves USDC.e
+    // stranded in the proxy wallet awaiting a manual "Activate Funds"
+    // click in the UI.
+    let auto_wrap_enabled = !config.paper_mode
+        && runtime_env("PM_BTC_5M_LIVE_AUTO_WRAP")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true);
+    let auto_wrap_period = runtime_env("PM_BTC_5M_LIVE_AUTO_WRAP_PERIOD_SEC")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    let auto_wrap_min_usd = runtime_env("PM_BTC_5M_LIVE_AUTO_WRAP_MIN_USD")
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let mut auto_wrap_ticks = interval(std::time::Duration::from_secs(auto_wrap_period));
+    auto_wrap_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     let mut spot_events_open = true;
     let mut user_events_open = true;
     let mut seen_venue_fill_keys = HashSet::<String>::new();
@@ -1756,6 +1774,37 @@ async fn run_runtime_loop(
                             target: "auto_redeem",
                             error = %error,
                             "auto-redeem: sync_balances failed (non-fatal)"
+                        );
+                    }
+                }
+            }
+            _ = auto_wrap_ticks.tick(), if auto_wrap_enabled => {
+                // Auto-wrap any USDC.e sitting in the proxy wallet into
+                // pUSD via the CollateralOnramp. Merge proceeds land as
+                // USDC.e and remain inaccessible to the trading layer
+                // until wrapped (the UI surfaces this as "Activate Funds").
+                match execution_adapter
+                    .ensure_pusd_collateral_from_usdce(auto_wrap_min_usd)
+                    .await
+                {
+                    Ok(Some(report)) if !report.wrapped_amount.is_zero() => {
+                        info!(
+                            target: "auto_wrap",
+                            wallet = %report.wallet,
+                            wrapped_amount = %report.wrapped_amount,
+                            wrap_tx_hash = ?report.wrap_tx_hash,
+                            "auto-wrap: USDC.e -> pUSD submitted"
+                        );
+                    }
+                    Ok(_) => {
+                        // Balance below threshold or adapter doesn't support
+                        // wrapping. Silent; the next tick will retry.
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "auto_wrap",
+                            error = %error,
+                            "auto-wrap: failed (will retry next tick)"
                         );
                     }
                 }

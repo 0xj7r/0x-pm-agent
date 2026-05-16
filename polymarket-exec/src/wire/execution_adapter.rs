@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -1102,26 +1103,81 @@ impl PolymarketExecutionAdapter {
         &self,
         min_wrap_usd: f64,
     ) -> Result<Option<PusdWrapReport>, ExecutionError> {
-        if self.signature_type != PolymarketSignatureType::Eoa {
-            return Ok(None);
-        }
-        let rpc_url = self
-            ._config
-            .polygon_rpc_url
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                ExecutionError::BadRequest(
-                    "pUSD auto-wrap requires POLYGON_RPC_URL in EOA mode".to_string(),
-                )
-            })?;
-        let recipient = self.trade_address.unwrap_or_else(|| self.signer.address());
         let min_wrap_amount = scaled_usdc_units(min_wrap_usd)?;
-        let submitter = EoaPolygonSubmitter::from_env(rpc_url.to_string());
-        submitter
-            .ensure_pusd_from_usdce(&self.signer, recipient, min_wrap_amount)
-            .await
-            .map(Some)
+        match self.signature_type {
+            PolymarketSignatureType::Eoa => {
+                let rpc_url = self
+                    ._config
+                    .polygon_rpc_url
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ExecutionError::BadRequest(
+                            "pUSD auto-wrap requires POLYGON_RPC_URL in EOA mode".to_string(),
+                        )
+                    })?;
+                let recipient = self.trade_address.unwrap_or_else(|| self.signer.address());
+                let submitter = EoaPolygonSubmitter::from_env(rpc_url.to_string());
+                submitter
+                    .ensure_pusd_from_usdce(&self.signer, recipient, min_wrap_amount)
+                    .await
+                    .map(Some)
+            }
+            PolymarketSignatureType::Poly1271 => {
+                // Proxy / poly_1271 wallet path: call the CollateralOnramp
+                // wrap function from the deposit wallet via the relayer's
+                // WALLET-mode batched-call envelope. Merge proceeds land
+                // as USDC.e on the proxy; this converts them to pUSD so
+                // the runtime sees the proceeds as tradable balance
+                // (otherwise the "Activate Funds" UI step is needed).
+                let balance = self
+                    .relayer_client
+                    .deposit_wallet_usdce_balance()
+                    .await?;
+                if balance < min_wrap_amount {
+                    return Ok(Some(PusdWrapReport {
+                        wallet: self
+                            ._config
+                            .proxy_wallet_address
+                            .as_ref()
+                            .and_then(|raw| Address::from_str(raw.trim()).ok())
+                            .unwrap_or_else(|| self.signer.address()),
+                        usdce_balance_before: balance,
+                        pusd_balance_before: U256::ZERO,
+                        onramp_allowance_before: U256::ZERO,
+                        wrapped_amount: U256::ZERO,
+                        approve_tx_hash: None,
+                        wrap_tx_hash: None,
+                    }));
+                }
+                let metadata = format!(
+                    "{{\"action\":\"auto_wrap_usdce_to_pusd\",\"amount\":\"{balance}\"}}"
+                );
+                let ack = self
+                    .relayer_client
+                    .wrap_usdce_to_pusd(&self.signer, balance, metadata)
+                    .await?;
+                let tx_hash = ack
+                    .transaction_hash
+                    .as_deref()
+                    .and_then(|raw| B256::from_str(raw.trim()).ok());
+                Ok(Some(PusdWrapReport {
+                    wallet: self
+                        ._config
+                        .proxy_wallet_address
+                        .as_ref()
+                        .and_then(|raw| Address::from_str(raw.trim()).ok())
+                        .unwrap_or_else(|| self.signer.address()),
+                    usdce_balance_before: balance,
+                    pusd_balance_before: U256::ZERO,
+                    onramp_allowance_before: U256::ZERO,
+                    wrapped_amount: balance,
+                    approve_tx_hash: None,
+                    wrap_tx_hash: tx_hash,
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn map_order_type(req: &SubmitOrderRequest) -> Result<SdkOrderType, ExecutionError> {
