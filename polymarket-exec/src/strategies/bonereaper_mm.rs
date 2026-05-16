@@ -564,7 +564,8 @@ impl LateFavBundleState {
         if loss_at_risk <= 0.0 {
             return 1.0;
         }
-        (self.tail_filled_qty / loss_at_risk).clamp(0.0, 10.0)
+        let tail_exposure = self.tail_filled_spend_usd + self.working_tail_spend_usd;
+        (tail_exposure / loss_at_risk).clamp(0.0, 10.0)
     }
 
     fn side_flip_exposure_debt_usd(self) -> f64 {
@@ -580,7 +581,8 @@ impl LateFavBundleState {
         if loss_at_risk <= 0.0 {
             return 1.0;
         }
-        (self.tail_filled_qty / loss_at_risk).clamp(0.0, 10.0)
+        let tail_exposure = self.tail_filled_spend_usd + self.working_tail_spend_usd;
+        (tail_exposure / loss_at_risk).clamp(0.0, 10.0)
     }
 
     fn payoff_if_fav_wins_after(self, proposed_fav_qty: f64, proposed_fav_spend: f64) -> f64 {
@@ -4357,7 +4359,7 @@ mod tests {
             working_tail_spend_usd: 6.0,
         };
 
-        assert!((bundle.tail_coverage_ratio() - (60.0 / 110.0)).abs() < 1e-9);
+        assert!((bundle.tail_coverage_ratio() - (9.0 / 110.0)).abs() < 1e-9);
         assert!((bundle.payoff_if_fav_wins_after(0.0, 0.0) + 19.0).abs() < 1e-9);
         assert!((bundle.payoff_if_tail_wins() + 59.0).abs() < 1e-9);
 
