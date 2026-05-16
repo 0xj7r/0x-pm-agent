@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
+use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent, QuoteSnapshot};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
 use crate::signals::BtcRegime;
@@ -30,6 +30,7 @@ const PAIRED_CORE_CENTER_PROBE_SPAN: f64 = 0.16;
 const PAIRED_CORE_CENTER_PROBE_MIN_PRICE: f64 = 0.42;
 const PAIRED_CORE_CENTER_PROBE_MAX_PRICE: f64 = 0.58;
 const PAIRED_CORE_REPAIR_PAIR_COST_LIMIT: f64 = 0.99;
+const PAIRED_CORE_MERGE_PAIR_COST_LIMIT: f64 = 0.99;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
@@ -95,6 +96,21 @@ pub struct CoreHedgeMmConfig {
     /// lanes; existing paired inventory may still merge/redeem and mate-repair
     /// can clean up pre-existing imbalance.
     pub disable_after_elapsed_ms: Option<u64>,
+    /// Once paired-core has created one-sided filled inventory, stop emitting
+    /// fresh core quotes for that market. Mate repair and merge planning still
+    /// run before this guard; this only prevents the probe ladder from
+    /// compounding adverse-selection inventory.
+    pub stop_fresh_quotes_on_unpaired_fill: bool,
+    /// Depth-aware paired-core filter. When enabled, each paired ladder level
+    /// must have symmetric visible bid-side queue/depth on both legs before it
+    /// is emitted. This avoids posting a "pair" where one side is trivially
+    /// fillable and the mate is buried behind materially more queue.
+    pub book_sanity_enabled: bool,
+    pub book_sanity_max_spread: f64,
+    pub book_sanity_min_top_depth_usd: f64,
+    pub book_sanity_max_queue_ahead_usd: f64,
+    pub book_sanity_max_queue_imbalance_ratio: f64,
+    pub book_sanity_max_projected_pair_cost: f64,
 }
 
 impl Default for CoreHedgeMmConfig {
@@ -125,6 +141,13 @@ impl Default for CoreHedgeMmConfig {
             merge_batch_cap: f64::INFINITY,
             disable_merge_after_ms: None,
             disable_after_elapsed_ms: None,
+            stop_fresh_quotes_on_unpaired_fill: false,
+            book_sanity_enabled: false,
+            book_sanity_max_spread: 0.08,
+            book_sanity_min_top_depth_usd: 3.0,
+            book_sanity_max_queue_ahead_usd: 200.0,
+            book_sanity_max_queue_imbalance_ratio: 3.0,
+            book_sanity_max_projected_pair_cost: 0.995,
         }
     }
 }
@@ -642,6 +665,90 @@ fn ladder_candidate<M: MarketDescriptor>(
     Some(intent)
 }
 
+fn top_depth_notional_usd(quote: &QuoteSnapshot, bid_side: bool) -> f64 {
+    let level = if bid_side {
+        quote.best_bid.as_ref()
+    } else {
+        quote.best_ask.as_ref()
+    };
+    level
+        .map(|level| level.price.max(0.0) * level.quantity.max(0.0))
+        .unwrap_or(0.0)
+}
+
+fn queue_ahead_bid_notional_usd(quote: &QuoteSnapshot, limit_price: f64) -> f64 {
+    quote
+        .bid_levels
+        .iter()
+        .filter(|level| level.price + 1e-9 >= limit_price)
+        .map(|level| level.price.max(0.0) * level.quantity.max(0.0))
+        .sum()
+}
+
+fn paired_core_book_sanity(
+    cfg: &CoreHedgeMmConfig,
+    yes_quote: &QuoteSnapshot,
+    no_quote: &QuoteSnapshot,
+    yes_px: f64,
+    no_px: f64,
+) -> Result<String, String> {
+    if !cfg.book_sanity_enabled {
+        return Ok("disabled".to_string());
+    }
+
+    let yes_bid = yes_quote.best_bid.as_ref().map(|level| level.price).unwrap_or(0.0);
+    let yes_ask = yes_quote.best_ask.as_ref().map(|level| level.price).unwrap_or(0.0);
+    let no_bid = no_quote.best_bid.as_ref().map(|level| level.price).unwrap_or(0.0);
+    let no_ask = no_quote.best_ask.as_ref().map(|level| level.price).unwrap_or(0.0);
+    let yes_spread = (yes_ask - yes_bid).max(0.0);
+    let no_spread = (no_ask - no_bid).max(0.0);
+    let max_spread = cfg.book_sanity_max_spread.max(0.0);
+    if yes_spread > max_spread || no_spread > max_spread {
+        return Err(format!(
+            "spread yes={yes_spread:.4} no={no_spread:.4} max={max_spread:.4}"
+        ));
+    }
+
+    let yes_top_depth = top_depth_notional_usd(yes_quote, true);
+    let no_top_depth = top_depth_notional_usd(no_quote, true);
+    let min_top_depth = cfg.book_sanity_min_top_depth_usd.max(0.0);
+    if yes_top_depth < min_top_depth || no_top_depth < min_top_depth {
+        return Err(format!(
+            "top_depth yes={yes_top_depth:.2} no={no_top_depth:.2} min={min_top_depth:.2}"
+        ));
+    }
+
+    let pair_cost = yes_px + no_px;
+    let max_pair_cost = cfg.book_sanity_max_projected_pair_cost.max(0.0);
+    if max_pair_cost > 0.0 && pair_cost > max_pair_cost + 1e-9 {
+        return Err(format!(
+            "pair_cost={pair_cost:.4} max_projected={max_pair_cost:.4}"
+        ));
+    }
+
+    let yes_queue = queue_ahead_bid_notional_usd(yes_quote, yes_px);
+    let no_queue = queue_ahead_bid_notional_usd(no_quote, no_px);
+    let max_queue = cfg.book_sanity_max_queue_ahead_usd.max(0.0);
+    if max_queue > 0.0 && (yes_queue > max_queue || no_queue > max_queue) {
+        return Err(format!(
+            "queue_ahead yes={yes_queue:.2} no={no_queue:.2} max={max_queue:.2}"
+        ));
+    }
+    let small = yes_queue.min(no_queue).max(1.0);
+    let large = yes_queue.max(no_queue);
+    let queue_ratio = large / small;
+    let max_ratio = cfg.book_sanity_max_queue_imbalance_ratio.max(1.0);
+    if queue_ratio > max_ratio {
+        return Err(format!(
+            "queue_imbalance yes={yes_queue:.2} no={no_queue:.2} ratio={queue_ratio:.2} max={max_ratio:.2}"
+        ));
+    }
+
+    Ok(format!(
+        "spread yes={yes_spread:.4} no={no_spread:.4} top_depth yes={yes_top_depth:.2} no={no_top_depth:.2} queue yes={yes_queue:.2} no={no_queue:.2} ratio={queue_ratio:.2} pair_cost={pair_cost:.4}"
+    ))
+}
+
 fn improved_ladder_price(
     grid_price: f64,
     best_bid: f64,
@@ -792,13 +899,16 @@ where
             if paired_qty >= cfg.merge_min_qty {
                 let yes_avg = input.paired_core_inventory.yes_avg_cost.max(0.0);
                 let no_avg = input.paired_core_inventory.no_avg_cost.max(0.0);
+                let pair_cost = yes_avg + no_avg;
                 let expected_cost_usd = paired_qty * (yes_avg + no_avg);
                 let expected_cash_usd = paired_qty;
-                if expected_cash_usd + 1e-9 < expected_cost_usd {
+                if pair_cost > PAIRED_CORE_MERGE_PAIR_COST_LIMIT + 1e-9 {
                     return StrategyDecision::Noop {
                         notes: vec![format!(
-                            "paired_core merge skipped negative_ev paired_qty={:.4} cost={:.2} cash={:.2} expected_net={:.4}",
+                            "paired_core merge skipped pair_cost_above_limit paired_qty={:.4} pair_cost={:.4} limit={:.4} cost={:.2} cash={:.2} expected_net={:.4}",
                             paired_qty,
+                            pair_cost,
+                            PAIRED_CORE_MERGE_PAIR_COST_LIMIT,
                             expected_cost_usd,
                             expected_cash_usd,
                             expected_cash_usd - expected_cost_usd,
@@ -962,13 +1072,23 @@ where
                     notes.push(format!(
                         "paired_core mate repair skipped leg={leg:?}: missing filled average cost; leave inventory for bundle salvage",
                     ));
-                    return StrategyDecision::Noop { notes };
+                    return StrategyDecision::Suppress {
+                        scope: SuppressionScope::PairedOnly,
+                        reason: CoolingReason::BtcTrending,
+                        preserve_quotes: false,
+                        notes,
+                    };
                 };
                 if pair_cost >= repair_limit {
                     notes.push(format!(
                         "paired_core mate repair skipped leg={leg:?}: pair_cost={pair_cost:.4} limit={repair_limit:.4} fee_buffer={fee_buffer:.4}; leave inventory for bundle salvage",
                     ));
-                    return StrategyDecision::Noop { notes };
+                    return StrategyDecision::Suppress {
+                        scope: SuppressionScope::PairedOnly,
+                        reason: CoolingReason::BtcTrending,
+                        preserve_quotes: false,
+                        notes,
+                    };
                 }
 
                 let (target_filled_qty, projected_repair_qty) = match leg {
@@ -985,7 +1105,12 @@ where
                     notes.push(format!(
                         "paired_core mate repair skipped leg={leg:?}: repair_qty={repair_qty:.4} below min_repair_qty={min_repair_qty:.4}; leave inventory for bundle salvage",
                     ));
-                    return StrategyDecision::Noop { notes };
+                    return StrategyDecision::Suppress {
+                        scope: SuppressionScope::PairedOnly,
+                        reason: CoolingReason::BtcTrending,
+                        preserve_quotes: false,
+                        notes,
+                    };
                 }
 
                 let Some(intent) = build_mate_repair_order(
@@ -1001,7 +1126,12 @@ where
                     notes.push(format!(
                         "paired_core mate repair skipped leg={leg:?}: no passive mate quote fit repair_qty={repair_qty:.4}; leave inventory for bundle salvage",
                     ));
-                    return StrategyDecision::Noop { notes };
+                    return StrategyDecision::Suppress {
+                        scope: SuppressionScope::PairedOnly,
+                        reason: CoolingReason::BtcTrending,
+                        preserve_quotes: false,
+                        notes,
+                    };
                 };
 
                 if self.should_emit(
@@ -1024,7 +1154,27 @@ where
                 notes.push(format!(
                     "paired_core mate repair unchanged leg={leg:?}; no broad continuation after fill",
                 ));
-                return StrategyDecision::Noop { notes };
+                return StrategyDecision::Suppress {
+                    scope: SuppressionScope::PairedOnly,
+                    reason: CoolingReason::BtcTrending,
+                    preserve_quotes: true,
+                    notes,
+                };
+            }
+
+            if cfg.stop_fresh_quotes_on_unpaired_fill
+                && filled_abs_imbalance > 1e-9
+                && filled_abs_imbalance < min_repair_qty
+            {
+                notes.push(format!(
+                    "paired_core fresh quotes stopped after unpaired fill: filled_abs_imbalance={filled_abs_imbalance:.4} min_repair_qty={min_repair_qty:.4}; mate repair unavailable below venue minimum",
+                ));
+                return StrategyDecision::Suppress {
+                    scope: SuppressionScope::PairedOnly,
+                    reason: CoolingReason::BtcTrending,
+                    preserve_quotes: false,
+                    notes,
+                };
             }
 
             let broad_posture = paired_core_broad_posture(
@@ -1167,6 +1317,25 @@ where
                         yes_intent.limit_price + no_intent.limit_price,
                     ));
                     continue;
+                }
+                match paired_core_book_sanity(
+                    &cfg,
+                    &input.snapshot.yes_quote,
+                    &input.snapshot.no_quote,
+                    yes_intent.limit_price,
+                    no_intent.limit_price,
+                ) {
+                    Ok(summary) => {
+                        notes.push(format!(
+                            "paired_core depth sanity passed idx={idx} {summary}"
+                        ));
+                    }
+                    Err(reason) => {
+                        notes.push(format!(
+                            "paired_core depth sanity blocked idx={idx}: {reason}",
+                        ));
+                        continue;
+                    }
                 }
                 let current_abs_imbalance = (projected_yes_qty - projected_no_qty).abs();
                 let next_yes = projected_yes_qty + yes_intent.quantity;

@@ -46,49 +46,70 @@ risk:
   book_stale_ms: 5000
 
 pair:
-  merge_enabled: false
+  merge_enabled: true
   pressure_merge_enabled: false
-  min_merge_notional_usd: 15.0
+  min_merge_notional_usd: 5.0
   merge_pressure_free_cash_ratio: 0.0
   merge_pressure_gross_exposure_ratio: 999999.0
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # Gentle re-enable: tiny center probe + mate-only repair. The broad 17-level
-  # 0.20-0.70 ladder is intentionally not restored here. center_probe_only +
-  # ladder_levels=3 + 0.42-0.58 band keep stranded exposure to one venue-min
-  # clip per side, which the post-mate-rejection guards already tolerate.
+  # Legacy paired-MM execution shape: many tiny maker probes rather than one
+  # meaningful 20-share center clip. This improves fill opportunity in flat
+  # oscillating markets while capping one-sided damage to one venue-min clip.
   enabled: true
-  center_probe_only: true
-  # Tiny center probe only. Do not restore the old 17-level 0.20-0.70 live
-  # ladder here; paired-core repair is mate-only after a one-sided fill.
-  ladder_levels: 3
-  ladder_span: 0.16
+  center_probe_only: false
+  ladder_levels: 12
+  ladder_span: 0.60
   center_price: 0.50
-  # Controlled size-up from venue-min probing. Keep the same center-only band
-  # and pair-cost repair guard, but make flat/mid fills meaningful enough to
-  # matter without restoring the old broad ladder.
-  clip_shares: 20.0
-  # One 20-share center clip can be stranded while the mate fills; beyond that,
-  # fresh paired-core is blocked and only mate repair/bundle salvage may add.
-  max_unpaired_core_qty: 20.0
-  ladder_min_price: 0.42
-  ladder_max_price: 0.58
+  clip_shares: 5.0
+  max_unpaired_core_qty: 5.0
+  ladder_min_price: 0.20
+  ladder_max_price: 0.70
   repair_pair_cost_limit: 0.99
   repair_fee_buffer: 0.0
   # Stop fresh paired-core in the late window. After 180s elapsed, the bar
   # should allocate new risk to explicit late-favorite and cheap-tail/reversal
   # lanes; any existing paired-core inventory can still merge or redeem.
   disable_after_elapsed_ms: 180000
-  # Improve only near-touch ladder rungs by one tick. The strategy code still
-  # keeps orders post-only and suppresses broad paired-core outside eligible
-  # flat/center regimes; this improves queue/fill probability without pulling
-  # the whole ladder to touch.
-  maker_improve_ticks: 1.0
-  merge_min_qty: 15.0
+  # Join rather than chase. The edge comes from tiny breadth in flat markets,
+  # not from paying up for independent one-sided fills.
+  maker_improve_ticks: 0.0
+  merge_min_qty: 5.0
   merge_batch_cap: 100.0
+  stop_fresh_quotes_on_unpaired_fill: true
+  book_sanity_enabled: true
+  book_sanity_max_spread: 0.08
+  book_sanity_min_top_depth_usd: 3.0
+  book_sanity_max_queue_ahead_usd: 200.0
+  book_sanity_max_queue_imbalance_ratio: 3.0
+  book_sanity_max_projected_pair_cost: 0.995
 
 late_favorite:
+  sizing:
+    enabled: true
+    fallback_bankroll_usd: 3200.0
+    # Current 3.2K wallet maps to roughly the prior fixed values:
+    # favorite clip ~= $45, favorite cap ~= $450, tail clip ~= $3,
+    # tail cap ~= $30, reversal clip/cap stay tiny.
+    favorite_clip_bps: 140.0
+    favorite_clip_min_usd: 25.0
+    favorite_clip_max_usd: 150.0
+    favorite_max_load_bps: 1400.0
+    favorite_max_load_min_usd: 150.0
+    favorite_max_load_max_usd: 1500.0
+    tail_clip_bps: 10.0
+    tail_clip_min_usd: 1.0
+    tail_clip_max_usd: 10.0
+    tail_max_load_bps: 100.0
+    tail_max_load_min_usd: 3.0
+    tail_max_load_max_usd: 100.0
+    reversal_clip_bps: 3.0
+    reversal_clip_min_usd: 1.0
+    reversal_clip_max_usd: 5.0
+    reversal_max_load_bps: 10.0
+    reversal_max_load_min_usd: 2.0
+    reversal_max_load_max_usd: 30.0
   favorite_climb:
     enabled: true
     min_favorite_ask: 0.70
@@ -108,10 +129,10 @@ late_favorite:
     # is >=90c favorite, ~1.4% is <=10c tail, ~0.3% is <=3c ultra. Median
     # opposing-tail / high-fav ratio is 3.6%, p75 ~6%.
     #
-    # 5-10c sits outside the true convex tail EV envelope in current sizing.
-    # Keep this lane focused on ultra-cheap convexity so it captures "tiny
-    # dollars, huge shares" upside without becoming directional drag.
-    max_cheap_ask: 0.04
+    # <=4c is true tiny convex tail. 4-10c is only allowed by the strategy code
+    # when it is attached to existing favorite/stranded exposure and remains
+    # payoff-capped; never as standalone dog speculation.
+    max_cheap_ask: 0.10
     max_late_fav_spend_fraction: 0.04
     max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.04

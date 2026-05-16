@@ -253,6 +253,57 @@ impl Default for ReversalHedgeConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectionalSizingConfig {
+    pub enabled: bool,
+    pub fallback_bankroll_usd: f64,
+    pub favorite_clip_bps: f64,
+    pub favorite_clip_min_usd: f64,
+    pub favorite_clip_max_usd: f64,
+    pub favorite_max_load_bps: f64,
+    pub favorite_max_load_min_usd: f64,
+    pub favorite_max_load_max_usd: f64,
+    pub tail_clip_bps: f64,
+    pub tail_clip_min_usd: f64,
+    pub tail_clip_max_usd: f64,
+    pub tail_max_load_bps: f64,
+    pub tail_max_load_min_usd: f64,
+    pub tail_max_load_max_usd: f64,
+    pub reversal_clip_bps: f64,
+    pub reversal_clip_min_usd: f64,
+    pub reversal_clip_max_usd: f64,
+    pub reversal_max_load_bps: f64,
+    pub reversal_max_load_min_usd: f64,
+    pub reversal_max_load_max_usd: f64,
+}
+
+impl Default for DirectionalSizingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fallback_bankroll_usd: 0.0,
+            favorite_clip_bps: 140.0,
+            favorite_clip_min_usd: 25.0,
+            favorite_clip_max_usd: 150.0,
+            favorite_max_load_bps: 1_400.0,
+            favorite_max_load_min_usd: 150.0,
+            favorite_max_load_max_usd: 1_500.0,
+            tail_clip_bps: 10.0,
+            tail_clip_min_usd: 1.0,
+            tail_clip_max_usd: 10.0,
+            tail_max_load_bps: 100.0,
+            tail_max_load_min_usd: 3.0,
+            tail_max_load_max_usd: 100.0,
+            reversal_clip_bps: 3.0,
+            reversal_clip_min_usd: 1.0,
+            reversal_clip_max_usd: 5.0,
+            reversal_max_load_bps: 10.0,
+            reversal_max_load_min_usd: 2.0,
+            reversal_max_load_max_usd: 30.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct FavoriteEntryPolicy {
     min_price: f64,
     max_levels: usize,
@@ -334,6 +385,7 @@ pub struct LateFavoriteStrategyConfig {
     pub favorite_climb: FavoriteClimbConfig,
     pub convex_tail: ConvexTailConfig,
     pub reversal_hedge: ReversalHedgeConfig,
+    pub sizing: DirectionalSizingConfig,
 }
 
 impl Default for LateFavoriteStrategyConfig {
@@ -342,6 +394,7 @@ impl Default for LateFavoriteStrategyConfig {
             favorite_climb: FavoriteClimbConfig::default(),
             convex_tail: ConvexTailConfig::default(),
             reversal_hedge: ReversalHedgeConfig::default(),
+            sizing: DirectionalSizingConfig::default(),
         }
     }
 }
@@ -553,6 +606,7 @@ impl LateFavoriteStrategy {
             working_tail_spend_usd,
         }
     }
+
 }
 
 fn directional_favorite_leg_spend_usd<M: MarketDescriptor>(
@@ -581,6 +635,98 @@ fn directional_tail_working_spend_usd<M: MarketDescriptor>(
 ) -> f64 {
     open_order_notional_for_leg(input.open_convex_order_exposure, leg)
         + strategy.reserved_notional(input.market.market_id(), leg)
+}
+
+fn clamp_bankroll_amount(bankroll_usd: f64, bps: f64, min_usd: f64, max_usd: f64) -> f64 {
+    if bankroll_usd <= 0.0 || bps <= 0.0 {
+        return 0.0;
+    }
+    (bankroll_usd * bps / 10_000.0).clamp(min_usd.max(0.0), max_usd.max(min_usd).max(0.0))
+}
+
+fn directional_bankroll_usd<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    cfg: DirectionalSizingConfig,
+) -> f64 {
+    let live_equity = input.inventory.equity_usd.max(input.inventory.free_cash_usd);
+    if live_equity > 0.0 {
+        live_equity
+    } else {
+        cfg.fallback_bankroll_usd.max(0.0)
+    }
+}
+
+fn apply_directional_bankroll_sizing(
+    mut climb_cfg: FavoriteClimbConfig,
+    mut tail_cfg: ConvexTailConfig,
+    mut reversal_cfg: ReversalHedgeConfig,
+    sizing: DirectionalSizingConfig,
+    bankroll_usd: f64,
+) -> (
+    FavoriteClimbConfig,
+    ConvexTailConfig,
+    ReversalHedgeConfig,
+    Option<String>,
+) {
+    if !sizing.enabled || bankroll_usd <= 0.0 {
+        return (climb_cfg, tail_cfg, reversal_cfg, None);
+    }
+
+    climb_cfg.clip_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.favorite_clip_bps,
+        sizing.favorite_clip_min_usd,
+        sizing.favorite_clip_max_usd,
+    )
+    .max(climb_cfg.min_order_usd);
+    climb_cfg.max_load_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.favorite_max_load_bps,
+        sizing.favorite_max_load_min_usd,
+        sizing.favorite_max_load_max_usd,
+    )
+    .max(climb_cfg.clip_usd);
+
+    tail_cfg.clip_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.tail_clip_bps,
+        sizing.tail_clip_min_usd,
+        sizing.tail_clip_max_usd,
+    )
+    .max(tail_cfg.min_order_usd);
+    tail_cfg.max_load_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.tail_max_load_bps,
+        sizing.tail_max_load_min_usd,
+        sizing.tail_max_load_max_usd,
+    )
+    .max(tail_cfg.clip_usd);
+
+    reversal_cfg.clip_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.reversal_clip_bps,
+        sizing.reversal_clip_min_usd,
+        sizing.reversal_clip_max_usd,
+    )
+    .max(reversal_cfg.min_order_usd);
+    reversal_cfg.max_load_usd = clamp_bankroll_amount(
+        bankroll_usd,
+        sizing.reversal_max_load_bps,
+        sizing.reversal_max_load_min_usd,
+        sizing.reversal_max_load_max_usd,
+    )
+    .max(reversal_cfg.clip_usd);
+
+    let note = format!(
+        "directional bankroll sizing bankroll={bankroll_usd:.2} fav_clip={:.2} fav_cap={:.2} tail_clip={:.2} tail_cap={:.2} reversal_clip={:.2} reversal_cap={:.2}",
+        climb_cfg.clip_usd,
+        climb_cfg.max_load_usd,
+        tail_cfg.clip_usd,
+        tail_cfg.max_load_usd,
+        reversal_cfg.clip_usd,
+        reversal_cfg.max_load_usd
+    );
+    (climb_cfg, tail_cfg, reversal_cfg, Some(note))
 }
 
 impl LateFavBundleState {
@@ -2435,9 +2581,13 @@ where
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
         self.prune_reservations(input.now_ms);
         self.prune_rearm_state(input.now_ms);
-        let climb_cfg = self.config.favorite_climb;
-        let tail_cfg = self.config.convex_tail;
-        let reversal_cfg = self.config.reversal_hedge;
+        let (climb_cfg, tail_cfg, reversal_cfg, sizing_note) = apply_directional_bankroll_sizing(
+            self.config.favorite_climb,
+            self.config.convex_tail,
+            self.config.reversal_hedge,
+            self.config.sizing,
+            directional_bankroll_usd(&input, self.config.sizing),
+        );
         if !climb_cfg.enabled && !tail_cfg.enabled && !reversal_cfg.enabled {
             return StrategyDecision::Noop {
                 notes: vec!["late_favorite all phases disabled".to_string()],
@@ -2460,6 +2610,9 @@ where
         let elapsed_ms = elapsed_ms(&input.market, input.now_ms, remaining_ms);
         let mut intents = Vec::new();
         let mut notes = Vec::new();
+        if let Some(note) = sizing_note {
+            notes.push(note);
+        }
         let directional_conviction = directional_conviction(&input, &legs, &climb_cfg);
         let (late_fav_rearm_ready, late_fav_stable_bars) = self.update_late_fav_rearm_state(
             input.market.market_id(),

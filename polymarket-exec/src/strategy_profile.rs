@@ -14,8 +14,8 @@ use crate::market_making::paired_mm::{
 };
 use crate::quote_engine::QuoteEngineConfig;
 use crate::strategies::bonereaper_mm::{
-    BonereaperMmStrategyConfig, ConvexTailConfig, FavoriteClimbConfig, LateFavoriteStrategyConfig,
-    ReversalHedgeConfig,
+    BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
+    LateFavoriteStrategyConfig, ReversalHedgeConfig,
 };
 use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
@@ -57,6 +57,7 @@ pub struct LateFavoriteSection {
     pub favorite_climb: FavoriteClimbSubsection,
     pub convex_tail: ConvexTailSubsection,
     pub reversal_hedge: ReversalHedgeSubsection,
+    pub sizing: DirectionalSizingSubsection,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -132,6 +133,31 @@ pub struct ReversalHedgeSubsection {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DirectionalSizingSubsection {
+    pub enabled: Option<bool>,
+    pub fallback_bankroll_usd: Option<f64>,
+    pub favorite_clip_bps: Option<f64>,
+    pub favorite_clip_min_usd: Option<f64>,
+    pub favorite_clip_max_usd: Option<f64>,
+    pub favorite_max_load_bps: Option<f64>,
+    pub favorite_max_load_min_usd: Option<f64>,
+    pub favorite_max_load_max_usd: Option<f64>,
+    pub tail_clip_bps: Option<f64>,
+    pub tail_clip_min_usd: Option<f64>,
+    pub tail_clip_max_usd: Option<f64>,
+    pub tail_max_load_bps: Option<f64>,
+    pub tail_max_load_min_usd: Option<f64>,
+    pub tail_max_load_max_usd: Option<f64>,
+    pub reversal_clip_bps: Option<f64>,
+    pub reversal_clip_min_usd: Option<f64>,
+    pub reversal_clip_max_usd: Option<f64>,
+    pub reversal_max_load_bps: Option<f64>,
+    pub reversal_max_load_min_usd: Option<f64>,
+    pub reversal_max_load_max_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CoreHedgeSection {
     pub enabled: Option<bool>,
     pub ladder_levels: Option<usize>,
@@ -149,6 +175,13 @@ pub struct CoreHedgeSection {
     pub merge_batch_cap: Option<f64>,
     pub merge_disabled_after_ms: Option<u64>,
     pub disable_after_elapsed_ms: Option<u64>,
+    pub stop_fresh_quotes_on_unpaired_fill: Option<bool>,
+    pub book_sanity_enabled: Option<bool>,
+    pub book_sanity_max_spread: Option<f64>,
+    pub book_sanity_min_top_depth_usd: Option<f64>,
+    pub book_sanity_max_queue_ahead_usd: Option<f64>,
+    pub book_sanity_max_queue_imbalance_ratio: Option<f64>,
+    pub book_sanity_max_projected_pair_cost: Option<f64>,
     pub clip_scale: Option<f64>,
 }
 
@@ -238,6 +271,27 @@ impl StrategyProfile {
                 merge_batch_cap: s.merge_batch_cap.unwrap_or(defaults.merge_batch_cap),
                 disable_merge_after_ms: s.merge_disabled_after_ms,
                 disable_after_elapsed_ms: s.disable_after_elapsed_ms,
+                stop_fresh_quotes_on_unpaired_fill: s
+                    .stop_fresh_quotes_on_unpaired_fill
+                    .unwrap_or(defaults.stop_fresh_quotes_on_unpaired_fill),
+                book_sanity_enabled: s
+                    .book_sanity_enabled
+                    .unwrap_or(defaults.book_sanity_enabled),
+                book_sanity_max_spread: s
+                    .book_sanity_max_spread
+                    .unwrap_or(defaults.book_sanity_max_spread),
+                book_sanity_min_top_depth_usd: s
+                    .book_sanity_min_top_depth_usd
+                    .unwrap_or(defaults.book_sanity_min_top_depth_usd),
+                book_sanity_max_queue_ahead_usd: s
+                    .book_sanity_max_queue_ahead_usd
+                    .unwrap_or(defaults.book_sanity_max_queue_ahead_usd),
+                book_sanity_max_queue_imbalance_ratio: s
+                    .book_sanity_max_queue_imbalance_ratio
+                    .unwrap_or(defaults.book_sanity_max_queue_imbalance_ratio),
+                book_sanity_max_projected_pair_cost: s
+                    .book_sanity_max_projected_pair_cost
+                    .unwrap_or(defaults.book_sanity_max_projected_pair_cost),
                 ..defaults
             },
         }
@@ -250,6 +304,8 @@ impl StrategyProfile {
         let c = &self.late_favorite.favorite_climb;
         let t = &self.late_favorite.convex_tail;
         let r = &self.late_favorite.reversal_hedge;
+        let s = &self.late_favorite.sizing;
+        let sizing_def = DirectionalSizingConfig::default();
         LateFavoriteStrategyConfig {
             favorite_climb: FavoriteClimbConfig {
                 enabled: c.enabled.unwrap_or(climb_def.enabled),
@@ -359,6 +415,60 @@ impl StrategyProfile {
                     .directional_smooth_score_penalty
                     .unwrap_or(reversal_def.directional_smooth_score_penalty),
                 disable_after_ms: r.disable_after_ms,
+            },
+            sizing: DirectionalSizingConfig {
+                enabled: s.enabled.unwrap_or(sizing_def.enabled),
+                fallback_bankroll_usd: s
+                    .fallback_bankroll_usd
+                    .unwrap_or(sizing_def.fallback_bankroll_usd),
+                favorite_clip_bps: s.favorite_clip_bps.unwrap_or(sizing_def.favorite_clip_bps),
+                favorite_clip_min_usd: s
+                    .favorite_clip_min_usd
+                    .unwrap_or(sizing_def.favorite_clip_min_usd),
+                favorite_clip_max_usd: s
+                    .favorite_clip_max_usd
+                    .unwrap_or(sizing_def.favorite_clip_max_usd),
+                favorite_max_load_bps: s
+                    .favorite_max_load_bps
+                    .unwrap_or(sizing_def.favorite_max_load_bps),
+                favorite_max_load_min_usd: s
+                    .favorite_max_load_min_usd
+                    .unwrap_or(sizing_def.favorite_max_load_min_usd),
+                favorite_max_load_max_usd: s
+                    .favorite_max_load_max_usd
+                    .unwrap_or(sizing_def.favorite_max_load_max_usd),
+                tail_clip_bps: s.tail_clip_bps.unwrap_or(sizing_def.tail_clip_bps),
+                tail_clip_min_usd: s
+                    .tail_clip_min_usd
+                    .unwrap_or(sizing_def.tail_clip_min_usd),
+                tail_clip_max_usd: s
+                    .tail_clip_max_usd
+                    .unwrap_or(sizing_def.tail_clip_max_usd),
+                tail_max_load_bps: s.tail_max_load_bps.unwrap_or(sizing_def.tail_max_load_bps),
+                tail_max_load_min_usd: s
+                    .tail_max_load_min_usd
+                    .unwrap_or(sizing_def.tail_max_load_min_usd),
+                tail_max_load_max_usd: s
+                    .tail_max_load_max_usd
+                    .unwrap_or(sizing_def.tail_max_load_max_usd),
+                reversal_clip_bps: s
+                    .reversal_clip_bps
+                    .unwrap_or(sizing_def.reversal_clip_bps),
+                reversal_clip_min_usd: s
+                    .reversal_clip_min_usd
+                    .unwrap_or(sizing_def.reversal_clip_min_usd),
+                reversal_clip_max_usd: s
+                    .reversal_clip_max_usd
+                    .unwrap_or(sizing_def.reversal_clip_max_usd),
+                reversal_max_load_bps: s
+                    .reversal_max_load_bps
+                    .unwrap_or(sizing_def.reversal_max_load_bps),
+                reversal_max_load_min_usd: s
+                    .reversal_max_load_min_usd
+                    .unwrap_or(sizing_def.reversal_max_load_min_usd),
+                reversal_max_load_max_usd: s
+                    .reversal_max_load_max_usd
+                    .unwrap_or(sizing_def.reversal_max_load_max_usd),
             },
         }
     }
@@ -588,6 +698,13 @@ fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
         || s.merge_batch_cap.is_some()
         || s.merge_disabled_after_ms.is_some()
         || s.disable_after_elapsed_ms.is_some()
+        || s.stop_fresh_quotes_on_unpaired_fill.is_some()
+        || s.book_sanity_enabled.is_some()
+        || s.book_sanity_max_spread.is_some()
+        || s.book_sanity_min_top_depth_usd.is_some()
+        || s.book_sanity_max_queue_ahead_usd.is_some()
+        || s.book_sanity_max_queue_imbalance_ratio.is_some()
+        || s.book_sanity_max_projected_pair_cost.is_some()
         || s.clip_scale.is_some()
 }
 
