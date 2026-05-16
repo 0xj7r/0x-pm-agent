@@ -84,12 +84,13 @@ paired_core:
   book_sanity_max_queue_ahead_usd: 1500.0
   book_sanity_max_queue_imbalance_ratio: 3.0
   book_sanity_max_projected_pair_cost: 0.995
-  # Touch-anchored: rungs sit at (best_bid - tick*level) on each leg instead
-  # of around the conceptual mid. Stays near where actual flow happens in
-  # all regimes; eliminates the "catch the losing-leg descent" trap in
-  # directional markets. Pair-arb math preserved by Polymarket's
-  # yes_bid + no_bid <= 1.0 - tick invariant.
-  ladder_anchor: touch
+  # Reverted to mid-anchored after observing posture-detection lag with
+  # touch-anchored on 2272092: 21 Yes shares filled at 0.54-0.57 in fast
+  # move before BarbellDirectional latched, leaving -$10.87 stranded. Mid
+  # is more conservative — rungs sit far enough from touch that fast
+  # directional moves don't fill them. Touch can be re-enabled with
+  # preventive gates (fast-move detection + ladder depth limiting).
+  ladder_anchor: mid
 
 late_favorite:
   sizing:
