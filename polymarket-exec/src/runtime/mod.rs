@@ -3630,6 +3630,7 @@ impl<S: Strategy> Runtime<S> {
                 })
                 .map(
                     |managed| crate::strategies::traits::StrategyOpenOrderSnapshot {
+                        client_order_id: managed.intent.client_order_id.clone(),
                         market_id: managed.intent.market_id.clone(),
                         instrument_id: managed.intent.instrument_id.clone(),
                         side: managed.intent.side,

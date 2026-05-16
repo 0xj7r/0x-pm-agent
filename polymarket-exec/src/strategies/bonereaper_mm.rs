@@ -4068,6 +4068,129 @@ fn observe_market_posture<M: MarketDescriptor>(
     }
 }
 
+/// Scan open paired-core orders on the LOSING leg (opposite of the current
+/// favorite) and emit cancel commands. Called when posture suppresses broad
+/// paired-core AND the model says the favorite is overwhelmingly likely to
+/// win — in that regime the losing-leg ask collapses fast and our resting
+/// bids catch the descent. Cancelling them removes that tail-loss exposure.
+/// Repair-mate orders are intentionally NOT cancelled: those are directional
+/// rebalancing intents that complete the bundle.
+fn signal_driven_paired_core_cancels<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+) -> Vec<RuntimeCommand> {
+    let Some(legs) = read_legs(&input.snapshot) else {
+        return Vec::new();
+    };
+    let model_favorite = favorite_probability(
+        legs.favorite_leg,
+        input.fair_value.p_up,
+        input.fair_value.p_down,
+    );
+    // Only cancel when the market has actually committed directionally.
+    // High model conviction + cheap_ask already collapsed are the signals
+    // that the losing-leg paired-core bids are about to be picked off.
+    if model_favorite < 0.95 || legs.cheap_ask > 0.15 {
+        return Vec::new();
+    }
+    let market_id = input.market.market_id().clone();
+    let losing_instrument_id = match legs.cheap_leg {
+        LadderLeg::Yes => input.market.yes_instrument_id().clone(),
+        LadderLeg::No => input.market.no_instrument_id().clone(),
+    };
+    input
+        .open_orders
+        .iter()
+        .filter(|o| o.market_id == market_id)
+        .filter(|o| o.instrument_id == losing_instrument_id)
+        .filter(|o| {
+            o.quote_level_tag.as_deref().is_some_and(|tag| {
+                tag.starts_with("paired-core:") && !tag.contains("repair")
+            })
+        })
+        .map(|o| RuntimeCommand::Cancel {
+            client_order_id: o.client_order_id.clone(),
+            reason: format!(
+                "signal-driven paired-core cancel: posture suppresses broad paired-core, model_favorite={:.4}, cheap_ask={:.4}, losing_leg={:?}",
+                model_favorite, legs.cheap_ask, legs.cheap_leg
+            ),
+        })
+        .collect()
+}
+
+/// Append runtime commands (e.g. signal-driven cancels) to an existing
+/// strategy decision, promoting to `Mixed` where needed.
+fn append_runtime_commands(
+    decision: StrategyDecision,
+    cancels: Vec<RuntimeCommand>,
+) -> StrategyDecision {
+    if cancels.is_empty() {
+        return decision;
+    }
+    use StrategyDecision::*;
+    match decision {
+        Mixed {
+            intents,
+            mut commands,
+            mut notes,
+        } => {
+            notes.push(format!(
+                "bonereaper signal-driven cancels appended: {} commands",
+                cancels.len()
+            ));
+            commands.extend(cancels);
+            Mixed {
+                intents,
+                commands,
+                notes,
+            }
+        }
+        QuoteSet { intents, mut notes } => {
+            notes.push(format!(
+                "bonereaper signal-driven cancels appended: {} commands",
+                cancels.len()
+            ));
+            Mixed {
+                intents,
+                commands: cancels,
+                notes,
+            }
+        }
+        Noop { mut notes } => {
+            notes.push(format!(
+                "bonereaper signal-driven cancels appended: {} commands",
+                cancels.len()
+            ));
+            Mixed {
+                intents: Vec::new(),
+                commands: cancels,
+                notes,
+            }
+        }
+        Suppress {
+            scope,
+            reason,
+            preserve_quotes,
+            mut notes,
+        } => {
+            notes.push(format!(
+                "bonereaper signal-driven cancels appended despite suppress: {} commands",
+                cancels.len()
+            ));
+            // Promote to Mixed so cancels are honored. Suppression reason is
+            // preserved in the notes for diagnostic continuity.
+            notes.push(format!(
+                "bonereaper original suppression reason: {reason:?} scope: {scope:?} preserve_quotes: {preserve_quotes}"
+            ));
+            Mixed {
+                intents: Vec::new(),
+                commands: cancels,
+                notes,
+            }
+        }
+        other => other,
+    }
+}
+
 fn add_posture_note(
     decision: &mut StrategyDecision,
     latched_posture: MarketPosture,
@@ -5715,23 +5838,37 @@ impl<M: MarketDescriptor + Clone> TradingStrategy<M> for BonereaperMmStrategy {
         let observed_posture = observe_market_posture(&input, &self.config.late_favorite);
         let posture = self
             .market_postures
-            .entry(market_id)
+            .entry(market_id.clone())
             .and_modify(|latched| *latched = latched.merge(observed_posture))
             .or_insert(observed_posture);
+        let posture_snapshot = *posture;
+        let suppresses_broad = posture_snapshot.suppresses_broad_paired_core();
         log_market_classification(
             &input,
             observed_posture,
-            *posture,
+            posture_snapshot,
             &self.config.late_favorite,
         );
+        // Signal-driven cancel: when posture suppresses broad paired-core and
+        // the market has become strongly directional, the resting paired-core
+        // bids on the LOSING leg are about to be filled by the price descent
+        // (the cheap_leg ask collapsing toward 0). Cancel them proactively so
+        // we don't catch the descent and end up holding stranded losing
+        // inventory. This complements the existing suppression which only
+        // blocks NEW emissions; without this cancel, already-resting orders
+        // sit armed and get caught by the directional move.
+        let cancels = if suppresses_broad {
+            signal_driven_paired_core_cancels(&input)
+        } else {
+            Vec::new()
+        };
         let core_decision = self.paired_core.on_tick(input.clone());
         let late_decision = self.late_favorite.on_tick(input);
-        let mut decision = Self::combine(
-            core_decision,
-            late_decision,
-            posture.suppresses_broad_paired_core(),
-        );
-        add_posture_note(&mut decision, *posture, observed_posture);
+        let mut decision = Self::combine(core_decision, late_decision, suppresses_broad);
+        if !cancels.is_empty() {
+            decision = append_runtime_commands(decision, cancels);
+        }
+        add_posture_note(&mut decision, posture_snapshot, observed_posture);
         decision
     }
 

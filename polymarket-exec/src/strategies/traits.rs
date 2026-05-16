@@ -5,11 +5,12 @@ use crate::market_making::pairing::types::{PairedInventorySnapshot, PairedMarket
 use crate::signals::{
     BtcRegimeSnapshot, FairValueEstimate, MomentumSignal, OrderBookPressureSignal,
 };
-use crate::types::{EpochMillis, FillReport, StrategyDecision};
+use crate::types::{ClientOrderId, EpochMillis, FillReport, StrategyDecision};
 use crate::types::{InstrumentId, MarketId, TradeSide};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrategyOpenOrderSnapshot {
+    pub client_order_id: ClientOrderId,
     pub market_id: MarketId,
     pub instrument_id: InstrumentId,
     pub side: TradeSide,
