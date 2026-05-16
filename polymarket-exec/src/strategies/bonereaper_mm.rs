@@ -189,27 +189,36 @@ impl Default for LateFavAnticipateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            // Flat/Whipsaw regimes intentionally remain off by default —
-            // maker bids in those regimes fill on adverse selection rather
-            // than profit-taker flow into the climb the lane is built for.
-            allow_flat_regime: false,
-            allow_whipsaw_regime: false,
-            // Loosened from 0.92 -> 0.90 to allow more participation while
-            // still requiring strong model conviction. At 0.90 vs 0.92 the
-            // worst-case EV per share at the top of the band drops from
-            // $0.12 to $0.10, still positive on every entry in 0.55-0.80.
-            min_model_favorite: 0.90,
-            // Loosened 0.15 -> 0.20: tolerate slightly more reversal risk
-            // since size_multiplier already discounts entry size by it.
-            max_path_reversal_risk: 0.20,
-            require_btc_confirms: true,
+            // Regime no longer gates: ALL regimes are allowed, but the
+            // size multiplier scales down in Flat (0.5x) and Whipsaw (0.3x).
+            // Diagnostic showed 98.4% of ticks were in Flat regime, so the
+            // previous binary skip suppressed anticipate to 0 emissions.
+            // These two fields are kept for back-compat but no longer
+            // control entry; the multiplier handles regime discounting.
+            allow_flat_regime: true,
+            allow_whipsaw_regime: true,
+            // Loosened 0.92 -> 0.90 -> 0.88 -> 0.85. The size multiplier
+            // self-scales by `conviction_excess`, so trades right at the
+            // threshold get ~30% size (Flat regime + no btc_confirms case
+            // = $2/level), while peak-conviction trades still emit the
+            // full $7+ ladder. At 0.85 worst-case EV at top of band is
+            // $0.05/share — slim but positive. Going below 0.80 would
+            // break EV at the top of the favorite band.
+            min_model_favorite: 0.85,
+            // Loosened 0.15 -> 0.20 -> 0.25. Reversal risk now drives
+            // the multiplier penalty rather than a hard skip.
+            max_path_reversal_risk: 0.25,
+            // No longer a hard requirement; size_multiplier downscales
+            // when btc_confirms is false (0.7x). Many late-stage climbs
+            // happen on time-decay of uncertainty rather than BTC spot.
+            require_btc_confirms: false,
             min_favorite_ask: 0.55,
             max_favorite_ask: 0.80,
-            // Loosened 120s -> 90s: enter earlier in the bar so maker bids
-            // have more time to be hit by profit-takers.
-            min_remaining_ms: 90_000,
-            // Modest size bump (5 -> 7, 25 -> 35) now that we have one
-            // resolved-favorable maker-rest fill to validate the pattern.
+            // Loosened 120s -> 90s -> 30s. Captures final-minute climbs
+            // that are driven by resolution-gambling flow even when the
+            // first 4 minutes of the bar were quiet.
+            min_remaining_ms: 30_000,
+            // Modest size bump now that gates are continuous.
             clip_usd: 7.0,
             max_load_usd: 35.0,
             min_order_usd: 1.0,
@@ -221,20 +230,18 @@ impl Default for LateFavAnticipateConfig {
 }
 
 /// Compute the anticipate sizing multiplier from current signal strength.
-/// Returns 1.0 at the gate threshold (`min_model_favorite`, no momentum,
-/// reversal risk at the cap) and up to `conviction_size_scale_max` when
-/// all signals are at peak (model_favorite=1.0, momentum.strength=1.0,
-/// path_reversal_risk=0). Linear interpolation, conviction weighted 60%
-/// and momentum 40%, scaled down by a reversal-risk penalty.
+/// Returns ~1.0 at the gate threshold and up to `conviction_size_scale_max`
+/// when all signals are at peak. Regime, btc_confirms, and reversal-risk
+/// now act as continuous size penalties rather than binary gates, so the
+/// strategy participates across the full classification space and only
+/// fully sits out when EVERY signal is weak.
 fn anticipate_size_multiplier(
     cfg: &LateFavAnticipateConfig,
     conviction: &DirectionalConviction,
     momentum: &MomentumSignal,
+    btc_regime: Option<BtcRegime>,
 ) -> f64 {
     let max_scale = cfg.conviction_size_scale_max.max(1.0);
-    if (max_scale - 1.0).abs() < 1e-9 {
-        return 1.0;
-    }
     let conviction_headroom = (1.0 - cfg.min_model_favorite).max(1e-3);
     let conviction_excess = ((conviction.model_favorite - cfg.min_model_favorite)
         / conviction_headroom)
@@ -244,8 +251,20 @@ fn anticipate_size_multiplier(
     let reversal_penalty =
         (conviction.path_reversal_risk / reversal_cap).clamp(0.0, 1.0) * 0.5;
     let reversal_factor = 1.0 - reversal_penalty;
+    let regime_factor = match btc_regime {
+        Some(BtcRegime::DirectionalSmooth) => 1.0,
+        Some(BtcRegime::TrendingVolatile) => 0.9,
+        Some(BtcRegime::Flat) => 0.5,
+        Some(BtcRegime::Whipsaw) => 0.3,
+        None => 0.4,
+    };
+    let btc_confirms_factor = if conviction.btc_confirms { 1.0 } else { 0.7 };
     let signal = (conviction_excess * 0.6 + momentum_strength * 0.4) * reversal_factor;
-    1.0 + signal.clamp(0.0, 1.0) * (max_scale - 1.0)
+    if (max_scale - 1.0).abs() < 1e-9 {
+        return regime_factor * btc_confirms_factor;
+    }
+    let base = 1.0 + signal.clamp(0.0, 1.0) * (max_scale - 1.0);
+    base * regime_factor * btc_confirms_factor
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3074,15 +3093,15 @@ where
         }
 
         let anticipate_cfg = self.config.favorite_anticipate;
-        let anticipate_regime_ok = match input.btc_regime.regime() {
-            Some(BtcRegime::DirectionalSmooth) | Some(BtcRegime::TrendingVolatile) => true,
-            Some(BtcRegime::Flat) => anticipate_cfg.allow_flat_regime,
-            Some(BtcRegime::Whipsaw) => anticipate_cfg.allow_whipsaw_regime,
-            None => false,
-        };
+        // Regime, btc_confirms, and reversal-risk are now continuous penalties
+        // inside `anticipate_size_multiplier` rather than binary gates. Only
+        // hard gates that remain: enabled flags, model-conviction floor,
+        // favorite-ask band, time-remaining floor, and a non-zero best bid
+        // (post-only would reject otherwise). Reversal-risk above the cap
+        // still hard-skips because a runaway-reversal market is unsafe to
+        // enter at any size.
         if anticipate_cfg.enabled
             && climb_cfg.enabled
-            && anticipate_regime_ok
             && directional_conviction.model_favorite >= anticipate_cfg.min_model_favorite
             && directional_conviction.path_reversal_risk <= anticipate_cfg.max_path_reversal_risk
             && (!anticipate_cfg.require_btc_confirms || directional_conviction.btc_confirms)
@@ -3097,6 +3116,7 @@ where
                 &anticipate_cfg,
                 &directional_conviction,
                 &input.momentum,
+                input.btc_regime.regime(),
             );
             let scaled_max_load = (anticipate_cfg.max_load_usd * size_multiplier)
                 .max(anticipate_cfg.min_order_usd);
@@ -5445,7 +5465,7 @@ mod tests {
         let cfg = LateFavAnticipateConfig::default();
         let conviction = conviction_for_scale_test(cfg.min_model_favorite, cfg.max_path_reversal_risk);
         let momentum = MomentumSignal::default();
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
         assert!(
             (mult - 1.0).abs() < 1e-6,
             "expected scale=1.0 at gate threshold, got {mult}"
@@ -5461,7 +5481,7 @@ mod tests {
             latest_window_return_bps: Some(20.0),
             ..MomentumSignal::default()
         };
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
         assert!(
             (mult - cfg.conviction_size_scale_max).abs() < 1e-6,
             "expected scale={} at peak signal, got {mult}",
@@ -5479,7 +5499,7 @@ mod tests {
             latest_window_return_bps: Some(20.0),
             ..MomentumSignal::default()
         };
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
         assert!(
             (mult - 1.0).abs() < 1e-9,
             "scale_max=1.0 must produce constant 1.0 multiplier, got {mult}"
@@ -5496,8 +5516,8 @@ mod tests {
         };
         let low_reversal = conviction_for_scale_test(1.0, 0.0);
         let high_reversal = conviction_for_scale_test(1.0, cfg.max_path_reversal_risk);
-        let low_mult = anticipate_size_multiplier(&cfg, &low_reversal, &momentum);
-        let high_mult = anticipate_size_multiplier(&cfg, &high_reversal, &momentum);
+        let low_mult = anticipate_size_multiplier(&cfg, &low_reversal, &momentum, Some(BtcRegime::DirectionalSmooth));
+        let high_mult = anticipate_size_multiplier(&cfg, &high_reversal, &momentum, Some(BtcRegime::DirectionalSmooth));
         assert!(
             high_mult < low_mult,
             "reversal risk must reduce size multiplier, low_reversal={low_mult} high_reversal={high_mult}"
@@ -5556,6 +5576,8 @@ mod tests {
         let cfg = anticipate_config(true);
         let mut strategy = LateFavoriteStrategy::new(cfg);
         let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        // 5-min bar starts at t=0, ends at t=300_000. To leave less than the
+        // default 30s remaining we need now_ms >= 270_000.
         let input = strategy_input(
             snapshot,
             high_conviction_regime(),
@@ -5565,12 +5587,12 @@ mod tests {
                 ..MomentumSignal::default()
             },
             0.95,
-            240_000,
+            285_000,
         );
         let decision = strategy.on_tick(input);
         assert!(
             anticipate_intents(&decision).is_empty(),
-            "expected no anticipate intents when remaining_ms < min_remaining_ms (60s left)"
+            "expected no anticipate intents when remaining_ms < min_remaining_ms (15s left)"
         );
     }
 }

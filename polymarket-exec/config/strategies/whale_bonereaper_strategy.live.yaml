@@ -128,18 +128,27 @@ late_favorite:
     # start tiny ($5/level x 3 = $15) until live observation confirms the
     # realized fill rate and entry-price improvement vs late_fav climb.
     enabled: true
-    allow_flat_regime: false
-    allow_whipsaw_regime: false
-    # Loosened from 0.92 -> 0.90 (more participation, still strong edge)
-    min_model_favorite: 0.90
-    # Loosened from 0.15 -> 0.20
-    max_path_reversal_risk: 0.20
-    require_btc_confirms: true
+    # Regime is no longer a binary gate. Both flags are true so any regime
+    # can fire anticipate; the size_multiplier scales down in Flat (0.5x)
+    # and Whipsaw (0.3x). Diagnostic showed 98.4% of ticks were in Flat
+    # regime so the previous skip suppressed anticipate to 0 emissions.
+    allow_flat_regime: true
+    allow_whipsaw_regime: true
+    # Loosened 0.92 -> 0.90 -> 0.88 -> 0.85. Size multiplier self-scales:
+    # at-threshold trades get ~30% size (small bite), peak-conviction
+    # trades get full ladder. Worst-case EV at top of band = $0.05/share.
+    min_model_favorite: 0.85
+    # Loosened 0.15 -> 0.20 -> 0.25 (reversal-risk now penalises size via multiplier)
+    max_path_reversal_risk: 0.25
+    # No longer a hard requirement; btc_confirms=false scales size by 0.7x
+    # rather than skipping. Late-stage climbs often happen on time-decay of
+    # uncertainty rather than BTC spot.
+    require_btc_confirms: false
     min_favorite_ask: 0.55
     max_favorite_ask: 0.80
-    # Loosened from 120s -> 90s (earlier entry into the bar)
-    min_remaining_ms: 90000
-    # Bumped from 5/25 -> 7/35 after first resolved-favorable maker-rest fill
+    # Loosened 120s -> 90s -> 30s. Captures final-minute climbs that
+    # accumulate in the last 60s of a bar (observed on market 1778956200).
+    min_remaining_ms: 30000
     clip_usd: 7.0
     max_load_usd: 35.0
     min_order_usd: 1.0
