@@ -15,6 +15,9 @@ use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrateg
 use crate::types::{CoolingReason, MarketId, RuntimeCommand, StrategyDecision, SuppressionScope};
 
 const BINARY_MARKET_TICK_SIZE: f64 = 0.01;
+const LATE_FAV_REARM_STABLE_BARS: u32 = 3;
+const LATE_FAV_REARM_MAX_PATH_RISK: f64 = 0.35;
+const LATE_FAV_REARM_TTL_MS: u64 = 180_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
@@ -369,10 +372,19 @@ struct BundleOrderGate {
     reason: String,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LateFavRearmState {
+    last_favorite_leg: Option<LadderLeg>,
+    stable_bars: u32,
+    rearm_ready: bool,
+    last_seen_ms: EpochMillis,
+}
+
 #[derive(Clone, Debug)]
 pub struct LateFavoriteStrategy {
     config: LateFavoriteStrategyConfig,
     reserved_directional_notional: HashMap<String, ReservedNotional>,
+    late_fav_rearm_state: HashMap<MarketId, LateFavRearmState>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -386,6 +398,7 @@ impl LateFavoriteStrategy {
         Self {
             config,
             reserved_directional_notional: HashMap::new(),
+            late_fav_rearm_state: HashMap::new(),
         }
     }
 
@@ -398,6 +411,11 @@ impl LateFavoriteStrategy {
         self.reserved_directional_notional.retain(|_, reserved| {
             now_ms.saturating_sub(reserved.updated_at_ms) <= RESERVATION_TTL_MS
         });
+    }
+
+    fn prune_rearm_state(&mut self, now_ms: EpochMillis) {
+        self.late_fav_rearm_state
+            .retain(|_, state| now_ms.saturating_sub(state.last_seen_ms) <= LATE_FAV_REARM_TTL_MS);
     }
 
     fn reserved_notional(&self, market_id: &MarketId, leg: LadderLeg) -> f64 {
@@ -427,6 +445,42 @@ impl LateFavoriteStrategy {
             });
         entry.notional_usd += notional_usd;
         entry.updated_at_ms = now_ms;
+    }
+
+    fn update_late_fav_rearm_state(
+        &mut self,
+        market_id: &MarketId,
+        favorite_leg: LadderLeg,
+        path_reversal_risk: f64,
+        now_ms: EpochMillis,
+    ) -> (bool, u32) {
+        let entry = self
+            .late_fav_rearm_state
+            .entry(market_id.clone())
+            .or_insert(LateFavRearmState::default());
+        entry.last_seen_ms = now_ms;
+
+        if !path_reversal_risk.is_finite() || path_reversal_risk > LATE_FAV_REARM_MAX_PATH_RISK {
+            entry.stable_bars = 0;
+            entry.rearm_ready = false;
+            entry.last_favorite_leg = Some(favorite_leg);
+            return (false, entry.stable_bars);
+        }
+
+        match entry.last_favorite_leg {
+            Some(previous) if previous == favorite_leg => {
+                entry.stable_bars = entry.stable_bars.saturating_add(1);
+            }
+            _ => {
+                entry.last_favorite_leg = Some(favorite_leg);
+                entry.stable_bars = 1;
+                entry.rearm_ready = false;
+            }
+        }
+
+        entry.last_favorite_leg = Some(favorite_leg);
+        entry.rearm_ready = entry.stable_bars >= LATE_FAV_REARM_STABLE_BARS;
+        (entry.rearm_ready, entry.stable_bars)
     }
 
     fn bundle_state<M: MarketDescriptor>(
@@ -463,8 +517,7 @@ impl LateFavoriteStrategy {
             dominant_fav_leg,
             current_fav_leg: legs.favorite_leg,
             tail_leg,
-            side_flip: dominant_fav_leg != legs.favorite_leg
-                && (fav_filled_spend_usd + working_fav_spend_usd) >= 10.0,
+            side_flip: dominant_fav_leg != legs.favorite_leg,
             fav_filled_qty,
             fav_filled_spend_usd,
             tail_filled_qty,
@@ -514,6 +567,14 @@ impl LateFavBundleState {
         (self.tail_filled_qty / loss_at_risk).clamp(0.0, 10.0)
     }
 
+    fn side_flip_exposure_debt_usd(self) -> f64 {
+        if self.side_flip {
+            self.fav_filled_spend_usd + self.working_fav_spend_usd
+        } else {
+            0.0
+        }
+    }
+
     fn tail_coverage_ratio_after_favorite_add(self, proposed_fav_spend: f64) -> f64 {
         let loss_at_risk = self.fav_committed_spend_usd() + proposed_fav_spend.max(0.0);
         if loss_at_risk <= 0.0 {
@@ -548,17 +609,16 @@ impl LateFavBundleState {
         proposed_spend_usd: f64,
         regime: Option<BtcRegime>,
         path_reversal_risk: f64,
+        late_fav_rearm_ready: bool,
     ) -> BundleOrderGate {
-        if self.side_flip
-            && proposed_leg != self.dominant_fav_leg
-            && proposed_price > cfg.max_cheap_ask
-        {
+        if self.side_flip && proposed_leg != self.dominant_fav_leg && !late_fav_rearm_ready {
             return BundleOrderGate {
                 allowed: false,
                 reason: format!(
-                    "bundle blocks side-flip favorite loading dominant={:?} current={:?} px={:.4} max_tail_px={:.4} fav_spend={:.2} tail_coverage={:.2}",
+                    "bundle blocks side-flip favorite loading dominant={:?} current={:?} rearm_ready={} px={:.4} max_tail_px={:.4} fav_spend={:.2} tail_coverage={:.2}",
                     self.dominant_fav_leg,
                     self.current_fav_leg,
+                    late_fav_rearm_ready,
                     proposed_price,
                     cfg.max_cheap_ask,
                     self.fav_committed_spend_usd(),
@@ -778,13 +838,27 @@ fn build_cheap_tail_intent<M: MarketDescriptor>(
         LadderLeg::Yes => market.yes_instrument_id().clone(),
         LadderLeg::No => market.no_instrument_id().clone(),
     };
-    let coid = ClientOrderId::from(format!(
-        "cheap-tail:{}:{}:{:?}:{}",
-        tag,
-        market.market_id(),
-        leg,
-        now_ms,
-    ));
+    let coid = if aggressive_taker {
+        // FAK/IOC attempts are one-shot. Keep these unique so repeated
+        // attempts after a no-match rejection are real fresh liquidity takes.
+        ClientOrderId::from(format!(
+            "cheap-tail:{}:{}:{:?}:{}",
+            tag,
+            market.market_id(),
+            leg,
+            now_ms,
+        ))
+    } else {
+        // Passive cheap-tail fallback needs time to rest. Do not include
+        // now_ms, otherwise each tick replaces the fallback quote before it
+        // can get hit.
+        ClientOrderId::from(format!(
+            "cheap-tail:{}:{}:{:?}:maker",
+            tag,
+            market.market_id(),
+            leg,
+        ))
+    };
     let mut intent = OrderIntent::new_buy(
         coid,
         market.market_id().clone(),
@@ -2098,6 +2172,7 @@ where
 
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
         self.prune_reservations(input.now_ms);
+        self.prune_rearm_state(input.now_ms);
         let climb_cfg = self.config.favorite_climb;
         let tail_cfg = self.config.convex_tail;
         let reversal_cfg = self.config.reversal_hedge;
@@ -2124,6 +2199,12 @@ where
         let mut intents = Vec::new();
         let mut notes = Vec::new();
         let directional_conviction = directional_conviction(&input, &legs, &climb_cfg);
+        let (late_fav_rearm_ready, late_fav_stable_bars) = self.update_late_fav_rearm_state(
+            input.market.market_id(),
+            legs.favorite_leg,
+            directional_conviction.path_reversal_risk,
+            input.now_ms,
+        );
         notes.push(format!(
             "directional_conviction score={:.2} barbell={} btc_confirms={} regime={:?} favorite_ask={:.4} cheap_ask={:.4} recent_bps={:.2} strongest_bps={:.2} spot_vs_strike_bps={:?} model_favorite={:.4} path_reversal_risk={:.2}",
             directional_conviction.score,
@@ -2137,6 +2218,12 @@ where
             directional_conviction.spot_vs_strike_bps,
             directional_conviction.model_favorite,
             directional_conviction.path_reversal_risk,
+        ));
+        notes.push(format!(
+            "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
+            late_fav_rearm_ready,
+            late_fav_stable_bars,
+            LATE_FAV_REARM_MAX_PATH_RISK,
         ));
         let bundle_state = self.bundle_state(&input, &legs);
         notes.push(format!(
@@ -2262,9 +2349,22 @@ where
                 let other_qty = inventory_qty_for_leg(input.cheap_tail_inventory, legs.cheap_leg);
                 let net_directional_exposure_usd =
                     directional_exposure_usd(favorite_qty, other_qty, legs.favorite_ask);
+                let side_flip_debt_usd =
+                    if bundle_state.current_fav_leg != bundle_state.dominant_fav_leg {
+                        bundle_state.side_flip_exposure_debt_usd()
+                    } else {
+                        0.0
+                    };
                 let current_exposure_usd =
                     directional_favorite_leg_spend_usd(self, &input, legs.favorite_leg)
-                        .max(net_directional_exposure_usd);
+                        .max(net_directional_exposure_usd)
+                        + side_flip_debt_usd;
+                if side_flip_debt_usd > 0.0 {
+                    notes.push(format!(
+                        "late_favorite side_flip_debt_usd {:.2} added to budget for re-arm control",
+                        side_flip_debt_usd
+                    ));
+                }
                 let adjusted_max_load_usd =
                     climb_cfg.max_load_usd * regime_multiplier * entry_policy.cap_multiplier;
                 let remaining_load = (adjusted_max_load_usd - current_exposure_usd).max(0.0);
@@ -2325,8 +2425,13 @@ where
                             favorite_load_levels(&climb_cfg, legs.favorite_ask, sizing_remaining_ms)
                         })
                         .min(entry_policy.max_levels);
-                        let aggressive_all_levels =
-                            use_aggressive_taker && directional_conviction.barbell;
+                        // Late-favorite is an active payoff sleeve, not passive
+                        // inventory discovery. Once the entry policy has opted
+                        // into taker execution, do not leave lower passive
+                        // maker rungs behind: those create tiny scrap fills
+                        // when the real trade was to consume available
+                        // high-cert liquidity now.
+                        let aggressive_all_levels = use_aggressive_taker;
                         let clip_ceiling = climb_cfg.clip_usd
                             * late_favorite_clip_ceiling_multiplier(
                                 directional_conviction,
@@ -2366,6 +2471,7 @@ where
                                 clip,
                                 input.btc_regime.regime(),
                                 entry_policy.path_reversal_risk,
+                                late_fav_rearm_ready,
                             );
                             if !bundle_gate.allowed {
                                 notes.push(bundle_gate.reason);
@@ -2529,13 +2635,16 @@ where
                             input.btc_regime.regime(),
                             path_reversal_risk,
                         );
-                    // Bonereaper's "tiny dollars, huge shares" shape needs every
-                    // ultra-cheap level at touch — not stepping down toward zero.
-                    // Allow all-levels-at-touch for ultra-cheap whenever the
-                    // aggressive-taker path is engaged, regardless of the
-                    // directional barbell flag (the unbundled standalone overlay
-                    // fires before any late-fav fill arrives).
-                    let aggressive_all_levels = use_aggressive_taker;
+                    // Bonereaper's "tiny dollars, huge shares" shape needs
+                    // ultra-cheap exposure to exist, not just a no-match FAK.
+                    // Use the front level as FAK, then leave remaining
+                    // ultra-cheap levels resting at touch as maker fallback.
+                    // If visible liquidity exists, the FAK can take it. If the
+                    // venue says no orders match, the fallback can still rest.
+                    let use_ultra_cheap_maker_fallback = use_aggressive_taker
+                        && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
+                    let aggressive_all_levels =
+                        use_aggressive_taker && !use_ultra_cheap_maker_fallback;
                     let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
                     for level in 0..level_count {
                         if load_left < tail_cfg.min_order_usd {
@@ -2548,6 +2657,8 @@ where
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
+                            legs.cheap_ask
+                        } else if use_ultra_cheap_maker_fallback {
                             legs.cheap_ask
                         } else {
                             base_px - tick * ladder_step_ticks * level as f64
@@ -3083,6 +3194,97 @@ fn add_posture_note(
         | StrategyDecision::Mixed { notes, .. }
         | StrategyDecision::Suppress { notes, .. } => notes.push(note),
     }
+}
+
+fn log_market_classification<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    observed_posture: MarketPosture,
+    latched_posture: MarketPosture,
+    cfg: &LateFavoriteStrategyConfig,
+) {
+    let Some(legs) = read_legs(&input.snapshot) else {
+        tracing::info!(
+            market_id = ?input.market.market_id(),
+            btc_regime = ?input.btc_regime.regime(),
+            observed_posture = ?observed_posture,
+            latched_posture = ?latched_posture,
+            suppress_broad_paired_core = latched_posture.suppresses_broad_paired_core(),
+            "bonereaper classification no_quotes"
+        );
+        return;
+    };
+
+    let conviction = directional_conviction(input, &legs, &cfg.favorite_climb);
+    let market_path = if legs.favorite_ask >= 0.90 && legs.cheap_ask <= 0.10 {
+        "exhausted_barbell"
+    } else if legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25 {
+        if conviction.path_reversal_risk >= 0.45 {
+            "directional_whipsaw"
+        } else {
+            "directional_separating"
+        }
+    } else if legs.favorite_ask <= 0.60 && legs.cheap_ask >= 0.40 {
+        "centered_oscillation"
+    } else {
+        "transition"
+    };
+    let late_fav_skip_reason = if legs.favorite_ask < cfg.favorite_climb.min_favorite_ask {
+        "favorite_ask_below_min"
+    } else if !conviction.btc_confirms {
+        "btc_model_not_confirming"
+    } else if !latched_posture.suppresses_broad_paired_core()
+        && !conviction.barbell
+        && legs.favorite_ask < cfg.favorite_climb.near_touch_min_favorite_ask
+    {
+        "paired_core_mid_market"
+    } else if conviction.path_reversal_risk >= 0.50
+        && legs.favorite_ask < cfg.favorite_climb.taker_min_favorite_ask
+    {
+        "reversal_risk_sub90"
+    } else {
+        "eligible_or_blocked_deeper"
+    };
+    let cheap_tail_skip_reason = if legs.cheap_ask > cfg.convex_tail.max_cheap_ask {
+        "cheap_ask_above_max"
+    } else if !latched_posture.suppresses_broad_paired_core()
+        && !conviction.barbell
+        && legs.cheap_ask > cfg.convex_tail.ultra_cheap_max_ask
+    {
+        "paired_core_not_barbell"
+    } else if legs.cheap_ask > cfg.convex_tail.ultra_cheap_max_ask
+        && legs.favorite_ask < cfg.favorite_climb.taker_min_favorite_ask
+    {
+        "not_ultra_without_high_cert_fav"
+    } else {
+        "eligible_or_blocked_deeper"
+    };
+    tracing::info!(
+        market_id = ?input.market.market_id(),
+        btc_regime = ?input.btc_regime.regime(),
+        observed_posture = ?observed_posture,
+        latched_posture = ?latched_posture,
+        suppress_broad_paired_core = latched_posture.suppresses_broad_paired_core(),
+        market_path = market_path,
+        favorite_leg = ?legs.favorite_leg,
+        favorite_ask = legs.favorite_ask,
+        cheap_leg = ?legs.cheap_leg,
+        cheap_ask = legs.cheap_ask,
+        btc_vol_5m_bps = ?input.btc_regime.realized_vol_5m_bps,
+        btc_ret_30s_bps = ?input.btc_regime.return_30s_bps,
+        btc_ret_60s_bps = ?input.btc_regime.return_60s_bps,
+        btc_ret_120s_bps = ?input.btc_regime.return_120s_bps,
+        btc_ret_180s_bps = ?input.btc_regime.return_180s_bps,
+        momentum_strength = input.momentum.strength,
+        momentum_latest_bps = ?input.momentum.latest_window_return_bps,
+        barbell = conviction.barbell,
+        btc_confirms = conviction.btc_confirms,
+        conviction_score = conviction.score,
+        model_favorite = conviction.model_favorite,
+        path_reversal_risk = conviction.path_reversal_risk,
+        late_fav_skip_reason = late_fav_skip_reason,
+        cheap_tail_skip_reason = cheap_tail_skip_reason,
+        "bonereaper classification"
+    );
 }
 
 fn is_merge_planner_note(note: &str) -> bool {
@@ -3967,6 +4169,7 @@ mod tests {
             9.72,
             Some(BtcRegime::Whipsaw),
             0.60,
+            false,
         );
 
         assert!(!gate.allowed);
@@ -4000,6 +4203,7 @@ mod tests {
             4.0,
             Some(BtcRegime::Whipsaw),
             0.60,
+            true,
         );
 
         assert!(gate.allowed);
@@ -4034,6 +4238,7 @@ mod tests {
             27.60,
             Some(BtcRegime::Whipsaw),
             0.55,
+            false,
         );
 
         assert!(!gate.allowed);
@@ -4064,6 +4269,7 @@ mod tests {
             4.50,
             Some(BtcRegime::DirectionalSmooth),
             0.10,
+            false,
         );
 
         assert!(!gate.allowed);
@@ -4103,6 +4309,7 @@ mod tests {
             9.20,
             Some(BtcRegime::Whipsaw),
             0.55,
+            false,
         );
 
         assert!(!gate.allowed);
@@ -4181,6 +4388,12 @@ impl<M: MarketDescriptor + Clone> TradingStrategy<M> for BonereaperMmStrategy {
             .entry(market_id)
             .and_modify(|latched| *latched = latched.merge(observed_posture))
             .or_insert(observed_posture);
+        log_market_classification(
+            &input,
+            observed_posture,
+            *posture,
+            &self.config.late_favorite,
+        );
         let core_decision = self.paired_core.on_tick(input.clone());
         let late_decision = self.late_favorite.on_tick(input);
         let mut decision = Self::combine(

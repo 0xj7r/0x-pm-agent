@@ -30,7 +30,10 @@ inventory:
   max_position_quantity_per_instrument: 1500.0
   min_free_cash_usd: 25.0
   min_free_cash_bps: 500.0
-  max_session_loss_bps: 2500.0
+  # Hard overnight safety rail: stop new lane risk and flatten entries once realized+open pnl
+  # pushes portfolio equity below (starting_cash_usd - 200).
+  max_session_loss_usd: 200.0
+  max_session_loss_bps: 0.0
 
 health:
   market_ws_stale_ms: 15000
