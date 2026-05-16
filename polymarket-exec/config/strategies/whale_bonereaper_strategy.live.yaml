@@ -81,7 +81,7 @@ paired_core:
   book_sanity_enabled: true
   book_sanity_max_spread: 0.08
   book_sanity_min_top_depth_usd: 3.0
-  book_sanity_max_queue_ahead_usd: 200.0
+  book_sanity_max_queue_ahead_usd: 1500.0
   book_sanity_max_queue_imbalance_ratio: 3.0
   book_sanity_max_projected_pair_cost: 0.995
 
