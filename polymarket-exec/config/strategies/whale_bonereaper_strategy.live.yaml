@@ -121,4 +121,16 @@ late_favorite:
     # "huge shares on tiny dollars" Bonereaper shape.
     maker_improve_ticks: 0.0
   reversal_hedge:
-    enabled: false
+    enabled: true
+    # Defensive hedge, not normal tail loading: when late-favorite inventory is
+    # already committed and reversal risk rises, permit a small opposite-leg
+    # hedge before the tail becomes ultra-cheap. Sizing remains payoff-capped
+    # so a favorite win still keeps at least a small positive payoff.
+    min_hedge_ask: 0.10
+    max_hedge_ask: 0.20
+    clip_usd: 1.0
+    max_load_usd: 3.0
+    max_favorite_exposure_fraction: 0.50
+    max_win_edge_spend_fraction: 0.45
+    min_order_usd: 1.0
+    min_reversal_score: 0.35

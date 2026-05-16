@@ -33,14 +33,14 @@ const MARKET_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.35;
 const MARKET_WING_MIN_MODEL_FAVORITE: f64 = 0.90;
 const MARKET_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.50;
 const MARKET_WING_MIN_STRONGEST_MULTIPLIER: f64 = 0.75;
-const WING_REVERSAL_HEDGE_MIN_ASK: f64 = 0.10;
+const WING_REVERSAL_HEDGE_MIN_ASK: f64 = 0.07;
 const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.20;
 const WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD: f64 = 10.0;
 const WING_REVERSAL_HEDGE_MIN_PATH_RISK: f64 = 0.25;
 const WING_REVERSAL_HEDGE_MODEL_EXTREME: f64 = 0.97;
-const WING_REVERSAL_HEDGE_MAX_WIN_EDGE_SPEND_FRACTION: f64 = 0.20;
-const WING_REVERSAL_HEDGE_MAX_FAV_SPEND_FRACTION: f64 = 0.025;
-const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 1.25;
+const WING_REVERSAL_HEDGE_MAX_WIN_EDGE_SPEND_FRACTION: f64 = 0.45;
+const WING_REVERSAL_HEDGE_MAX_FAV_SPEND_FRACTION: f64 = 0.075;
+const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 1.0;
 const WING_REVERSAL_HEDGE_MAX_LOAD_USD: f64 = 5.0;
 const WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD: f64 = 1.0;
 const SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER: f64 = 1.25;
@@ -231,18 +231,18 @@ pub struct ReversalHedgeConfig {
 impl Default for ReversalHedgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            min_hedge_ask: 0.20,
-            max_hedge_ask: 0.45,
+            enabled: true,
+            min_hedge_ask: 0.10,
+            max_hedge_ask: 0.20,
             window_sec: 120,
             start_frac: 0.0,
-            clip_usd: 2.0,
-            max_load_usd: 8.0,
-            max_favorite_exposure_fraction: 0.30,
-            max_win_edge_spend_fraction: 0.65,
+            clip_usd: 1.0,
+            max_load_usd: 3.0,
+            max_favorite_exposure_fraction: 0.50,
+            max_win_edge_spend_fraction: 0.45,
             maker_improve_ticks: 0.0,
             min_order_usd: 1.0,
-            min_reversal_score: 0.45,
+            min_reversal_score: 0.35,
             whipsaw_score_bonus: 0.25,
             flat_score_bonus: 0.15,
             trending_volatile_score_bonus: 0.10,
@@ -2181,8 +2181,13 @@ fn reversal_hedge_cap_usd(
     } else {
         favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0)
     };
+    let positive_payoff_cap =
+        (favorite_win_upside - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD).max(0.0);
 
-    cfg.max_load_usd.min(hedge_notional).min(edge_erosion_cap)
+    cfg.max_load_usd
+        .min(hedge_notional)
+        .min(edge_erosion_cap)
+        .min(positive_payoff_cap)
 }
 
 fn wing_reversal_hedge_cap_usd(
