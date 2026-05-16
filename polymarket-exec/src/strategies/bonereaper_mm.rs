@@ -600,6 +600,10 @@ impl LateFavBundleState {
             - self.working_tail_spend_usd
     }
 
+    fn payoff_if_tail_wins_after_favorite_add(self, proposed_fav_spend_usd: f64) -> f64 {
+        self.payoff_if_tail_wins() - proposed_fav_spend_usd
+    }
+
     fn gate_favorite_add(
         self,
         cfg: &ConvexTailConfig,
@@ -625,6 +629,20 @@ impl LateFavBundleState {
                     self.tail_coverage_ratio(),
                 ),
             };
+        }
+
+        if self.side_flip && proposed_leg != self.dominant_fav_leg && proposed_price > cfg.ultra_cheap_max_ask {
+            let tail_payoff_after = self.payoff_if_tail_wins_after_favorite_add(proposed_spend_usd);
+            if tail_payoff_after < 0.0 {
+                return BundleOrderGate {
+                    allowed: false,
+                    reason: format!(
+                        "bundle blocks side-flip favorite add: tail-win payoff would be negative payoff={tail_payoff_after:.2} fav_spend={:.2} tail_spend={:.2} proposed_spend={proposed_spend_usd:.2}",
+                        self.fav_committed_spend_usd(),
+                        self.tail_filled_spend_usd,
+                    ),
+                };
+            }
         }
 
         if proposed_leg == self.dominant_fav_leg {
@@ -4186,6 +4204,7 @@ mod tests {
     fn bundle_gate_allows_cheap_tail_like_side_flip_repair() {
         let cfg = ConvexTailConfig {
             max_cheap_ask: 0.10,
+            ultra_cheap_max_ask: 0.05,
             ..ConvexTailConfig::default()
         };
         let bundle = LateFavBundleState {
@@ -4204,7 +4223,7 @@ mod tests {
         let gate = bundle.gate_favorite_add(
             &cfg,
             LadderLeg::Yes,
-            0.04,
+            0.05,
             100.0,
             4.0,
             Some(BtcRegime::Whipsaw),
@@ -4213,6 +4232,41 @@ mod tests {
         );
 
         assert!(gate.allowed);
+    }
+
+    #[test]
+    fn bundle_gate_blocks_side_flip_fav_add_when_tail_outcome_turns_negative() {
+        let cfg = ConvexTailConfig {
+            max_cheap_ask: 0.10,
+            ultra_cheap_max_ask: 0.03,
+            ..ConvexTailConfig::default()
+        };
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::No,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::Yes,
+            side_flip: true,
+            fav_filled_qty: 100.0,
+            fav_filled_spend_usd: 92.0,
+            tail_filled_qty: 1.0,
+            tail_filled_spend_usd: 0.02,
+            working_fav_spend_usd: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let gate = bundle.gate_favorite_add(
+            &cfg,
+            LadderLeg::Yes,
+            0.10,
+            100.0,
+            4.0,
+            Some(BtcRegime::Whipsaw),
+            0.60,
+            true,
+        );
+
+        assert!(!gate.allowed);
+        assert!(gate.reason.contains("tail-win payoff would be negative"));
     }
 
     #[test]
@@ -4333,7 +4387,7 @@ mod tests {
         let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_cheap_ask, 0.10);
+        assert_eq!(cfg.max_cheap_ask, 0.04);
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
