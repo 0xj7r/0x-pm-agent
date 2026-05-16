@@ -141,6 +141,12 @@ late_favorite:
     min_order_usd: 1.0
     ladder_levels: 3
     level_step_ticks: 1
+    # Scale per-level clip and total max_load with conviction strength.
+    # Multiplier interpolates 1.0 (just past the gate threshold) -> this
+    # value (peak model_favorite + momentum, zero reversal risk). At
+    # multiplier >= 1.5 we also add a 4th rung; at >= 2.0 a 5th rung.
+    # 2.5 = up to ~$12.50/level x 5 = ~$62.50 max per market at peak signal.
+    conviction_size_scale_max: 2.5
   convex_tail:
     enabled: true
     clip_usd: 3.0

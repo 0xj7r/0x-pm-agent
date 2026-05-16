@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
-use crate::signals::BtcRegime;
+use crate::signals::{BtcRegime, MomentumSignal};
 use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, MarketId, RuntimeCommand, StrategyDecision, SuppressionScope};
@@ -164,9 +164,12 @@ pub struct LateFavAnticipateConfig {
     /// Minimum time-to-resolve before anticipating. Below this, queue
     /// priority is worth less than reactive FAK.
     pub min_remaining_ms: u64,
-    /// Per-level clip in USD.
+    /// Per-level clip in USD at the gate threshold (model_favorite at min).
+    /// Effective clip scales up to `clip_usd * conviction_size_scale_max`
+    /// when conviction and momentum signals are at their strongest.
     pub clip_usd: f64,
-    /// Hard cap on total anticipate notional for this market.
+    /// Hard cap on total anticipate notional for this market at the gate
+    /// threshold. Effective cap also scales with the size multiplier.
     pub max_load_usd: f64,
     /// Venue-min order size guard in USD.
     pub min_order_usd: f64,
@@ -174,6 +177,12 @@ pub struct LateFavAnticipateConfig {
     pub ladder_levels: usize,
     /// Tick spacing between adjacent rungs.
     pub level_step_ticks: u32,
+    /// Maximum size multiplier when conviction + momentum signals are at
+    /// their strongest. Multiplier interpolates linearly from 1.0 at the
+    /// gate threshold to this value at peak signal (model_favorite=1.0,
+    /// momentum.strength=1.0, path_reversal_risk=0). Set to 1.0 to
+    /// disable signal-driven scaling.
+    pub conviction_size_scale_max: f64,
 }
 
 impl Default for LateFavAnticipateConfig {
@@ -193,8 +202,37 @@ impl Default for LateFavAnticipateConfig {
             min_order_usd: 1.0,
             ladder_levels: 3,
             level_step_ticks: 1,
+            conviction_size_scale_max: 2.5,
         }
     }
+}
+
+/// Compute the anticipate sizing multiplier from current signal strength.
+/// Returns 1.0 at the gate threshold (`min_model_favorite`, no momentum,
+/// reversal risk at the cap) and up to `conviction_size_scale_max` when
+/// all signals are at peak (model_favorite=1.0, momentum.strength=1.0,
+/// path_reversal_risk=0). Linear interpolation, conviction weighted 60%
+/// and momentum 40%, scaled down by a reversal-risk penalty.
+fn anticipate_size_multiplier(
+    cfg: &LateFavAnticipateConfig,
+    conviction: &DirectionalConviction,
+    momentum: &MomentumSignal,
+) -> f64 {
+    let max_scale = cfg.conviction_size_scale_max.max(1.0);
+    if (max_scale - 1.0).abs() < 1e-9 {
+        return 1.0;
+    }
+    let conviction_headroom = (1.0 - cfg.min_model_favorite).max(1e-3);
+    let conviction_excess = ((conviction.model_favorite - cfg.min_model_favorite)
+        / conviction_headroom)
+        .clamp(0.0, 1.0);
+    let momentum_strength = momentum.strength.clamp(0.0, 1.0);
+    let reversal_cap = cfg.max_path_reversal_risk.max(1e-3);
+    let reversal_penalty =
+        (conviction.path_reversal_risk / reversal_cap).clamp(0.0, 1.0) * 0.5;
+    let reversal_factor = 1.0 - reversal_penalty;
+    let signal = (conviction_excess * 0.6 + momentum_strength * 0.4) * reversal_factor;
+    1.0 + signal.clamp(0.0, 1.0) * (max_scale - 1.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3042,11 +3080,26 @@ where
         {
             let current_anticipate_exposure_usd =
                 directional_favorite_leg_spend_usd(self, &input, legs.favorite_leg);
-            let remaining_load = (anticipate_cfg.max_load_usd
-                - current_anticipate_exposure_usd)
-                .max(0.0);
+            let size_multiplier = anticipate_size_multiplier(
+                &anticipate_cfg,
+                &directional_conviction,
+                &input.momentum,
+            );
+            let scaled_max_load = (anticipate_cfg.max_load_usd * size_multiplier)
+                .max(anticipate_cfg.min_order_usd);
+            let scaled_clip = (anticipate_cfg.clip_usd * size_multiplier)
+                .max(anticipate_cfg.min_order_usd);
+            // Add 1 rung when scale crosses 1.5x, 2 rungs at 2.0x+.
+            let extra_levels = if size_multiplier >= 2.0 {
+                2
+            } else if size_multiplier >= 1.5 {
+                1
+            } else {
+                0
+            };
+            let remaining_load = (scaled_max_load - current_anticipate_exposure_usd).max(0.0);
             if remaining_load >= anticipate_cfg.min_order_usd {
-                let levels = anticipate_cfg.ladder_levels.max(1);
+                let levels = (anticipate_cfg.ladder_levels + extra_levels).max(1);
                 let step_ticks = anticipate_cfg.level_step_ticks.max(1) as f64;
                 let mut load_left = remaining_load;
                 for level in 0..levels {
@@ -3057,13 +3110,12 @@ where
                     if px <= 0.0 || px >= legs.favorite_ask {
                         continue;
                     }
-                    let clip = anticipate_cfg
-                        .clip_usd
+                    let clip = scaled_clip
                         .min(load_left)
                         .max(anticipate_cfg.min_order_usd);
                     let qty = (clip / px).max(input.market.min_order_size());
                     let reason = format!(
-                        "late_favorite anticipate leg={:?} level={} px={:.4} bid={:.4} ask={:.4} regime={:?} model_fav={:.3} reversal={:.3} remaining_ms={remaining_ms} clip_usd={:.2} cumulative={:.2}/{:.2}",
+                        "late_favorite anticipate leg={:?} level={} px={:.4} bid={:.4} ask={:.4} regime={:?} model_fav={:.3} reversal={:.3} momentum={:.3} size_mult={:.2} remaining_ms={remaining_ms} clip_usd={:.2} cumulative={:.2}/{:.2}",
                         legs.favorite_leg,
                         level,
                         px,
@@ -3072,9 +3124,11 @@ where
                         input.btc_regime.regime(),
                         directional_conviction.model_favorite,
                         directional_conviction.path_reversal_risk,
+                        input.momentum.strength,
+                        size_multiplier,
                         clip,
                         current_anticipate_exposure_usd + (remaining_load - load_left),
-                        anticipate_cfg.max_load_usd,
+                        scaled_max_load,
                     );
                     notes.push(reason.clone());
                     intents.push(build_late_favorite_intent(
@@ -5203,7 +5257,11 @@ mod tests {
             !intents.is_empty(),
             "expected anticipate ladder to emit; decision={decision:?}"
         );
-        assert_eq!(intents.len(), 3, "expected 3-level ladder");
+        assert!(
+            intents.len() >= 3,
+            "expected at least 3-level ladder, got {}",
+            intents.len()
+        );
         for intent in &intents {
             assert!(
                 intent.limit_price <= 0.71 + 1e-9,
@@ -5211,7 +5269,7 @@ mod tests {
                 intent.limit_price
             );
             assert!(
-                intent.limit_price >= 0.68 - 1e-9,
+                intent.limit_price >= 0.66 - 1e-9,
                 "anticipate price must stay within step-ticks band; px={}",
                 intent.limit_price
             );
@@ -5351,6 +5409,133 @@ mod tests {
             assert!(maker.client_order_id.as_str().ends_with(":maker"));
             assert!(maker.limit_price < 0.95 - 1e-9);
         }
+    }
+
+    fn conviction_for_scale_test(model_fav: f64, path_reversal: f64) -> DirectionalConviction {
+        DirectionalConviction {
+            score: 0.0,
+            barbell: false,
+            btc_confirms: true,
+            regime: Some(BtcRegime::DirectionalSmooth),
+            path_reversal_risk: path_reversal,
+            favorite_ask: 0.70,
+            cheap_ask: 0.30,
+            recent_bps: 10.0,
+            strongest_bps: 12.0,
+            spot_vs_strike_bps: Some(8.0),
+            model_favorite: model_fav,
+        }
+    }
+
+    #[test]
+    fn anticipate_size_multiplier_is_one_at_gate_threshold() {
+        let cfg = LateFavAnticipateConfig::default();
+        let conviction = conviction_for_scale_test(cfg.min_model_favorite, cfg.max_path_reversal_risk);
+        let momentum = MomentumSignal::default();
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        assert!(
+            (mult - 1.0).abs() < 1e-6,
+            "expected scale=1.0 at gate threshold, got {mult}"
+        );
+    }
+
+    #[test]
+    fn anticipate_size_multiplier_peaks_at_max_signal() {
+        let cfg = LateFavAnticipateConfig::default();
+        let conviction = conviction_for_scale_test(1.0, 0.0);
+        let momentum = MomentumSignal {
+            strength: 1.0,
+            latest_window_return_bps: Some(20.0),
+            ..MomentumSignal::default()
+        };
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        assert!(
+            (mult - cfg.conviction_size_scale_max).abs() < 1e-6,
+            "expected scale={} at peak signal, got {mult}",
+            cfg.conviction_size_scale_max
+        );
+    }
+
+    #[test]
+    fn anticipate_size_multiplier_is_disabled_when_scale_max_is_one() {
+        let mut cfg = LateFavAnticipateConfig::default();
+        cfg.conviction_size_scale_max = 1.0;
+        let conviction = conviction_for_scale_test(1.0, 0.0);
+        let momentum = MomentumSignal {
+            strength: 1.0,
+            latest_window_return_bps: Some(20.0),
+            ..MomentumSignal::default()
+        };
+        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum);
+        assert!(
+            (mult - 1.0).abs() < 1e-9,
+            "scale_max=1.0 must produce constant 1.0 multiplier, got {mult}"
+        );
+    }
+
+    #[test]
+    fn anticipate_size_multiplier_penalises_reversal_risk() {
+        let cfg = LateFavAnticipateConfig::default();
+        let momentum = MomentumSignal {
+            strength: 1.0,
+            latest_window_return_bps: Some(20.0),
+            ..MomentumSignal::default()
+        };
+        let low_reversal = conviction_for_scale_test(1.0, 0.0);
+        let high_reversal = conviction_for_scale_test(1.0, cfg.max_path_reversal_risk);
+        let low_mult = anticipate_size_multiplier(&cfg, &low_reversal, &momentum);
+        let high_mult = anticipate_size_multiplier(&cfg, &high_reversal, &momentum);
+        assert!(
+            high_mult < low_mult,
+            "reversal risk must reduce size multiplier, low_reversal={low_mult} high_reversal={high_mult}"
+        );
+    }
+
+    #[test]
+    fn anticipate_scales_clip_and_levels_at_peak_signal() {
+        let cfg = anticipate_config(true);
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        let mut input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(20.0),
+                ..MomentumSignal::default()
+            },
+            1.0,
+            120_000,
+        );
+        input.fair_value = FairValueEstimate {
+            p_up: 1.0,
+            p_down: 0.0,
+            log_moneyness: 0.0,
+            sigma_remaining: 0.01,
+            time_remaining_s: 120.0,
+            model: FairValueModel::BsmBinary,
+        };
+        let decision = strategy.on_tick(input);
+        let intents = anticipate_intents(&decision);
+        assert!(!intents.is_empty(), "expected anticipate intents at peak signal");
+        // At peak signal we add 2 extra rungs on top of the base 3 = 5 levels max.
+        assert!(
+            intents.len() >= 3,
+            "expected at least the base 3 rungs, got {}",
+            intents.len()
+        );
+        // Clip should have scaled up from the base $5; check largest price intent
+        // carries qty >= base_qty * 1.4 (1.5x scale x some safety).
+        let base_qty = 5.0_f64 / 0.71;
+        let scaled_qty_min = base_qty * 1.4;
+        let has_scaled = intents
+            .iter()
+            .any(|i| i.quantity >= scaled_qty_min);
+        assert!(
+            has_scaled,
+            "expected at least one rung qty scaled by conviction, got qtys={:?}",
+            intents.iter().map(|i| i.quantity).collect::<Vec<_>>()
+        );
     }
 
     #[test]

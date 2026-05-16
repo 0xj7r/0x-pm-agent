@@ -78,6 +78,7 @@ pub struct LateFavAnticipateSubsection {
     pub min_order_usd: Option<f64>,
     pub ladder_levels: Option<usize>,
     pub level_step_ticks: Option<u32>,
+    pub conviction_size_scale_max: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -407,6 +408,9 @@ impl StrategyProfile {
                 level_step_ticks: a
                     .level_step_ticks
                     .unwrap_or(anticipate_def.level_step_ticks),
+                conviction_size_scale_max: a
+                    .conviction_size_scale_max
+                    .unwrap_or(anticipate_def.conviction_size_scale_max),
             },
             convex_tail: ConvexTailConfig {
                 enabled: t.enabled.unwrap_or(tail_def.enabled),
