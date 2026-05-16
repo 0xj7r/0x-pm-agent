@@ -18,6 +18,7 @@ const BINARY_MARKET_TICK_SIZE: f64 = 0.01;
 const LATE_FAV_REARM_STABLE_BARS: u32 = 3;
 const LATE_FAV_REARM_MAX_PATH_RISK: f64 = 0.35;
 const LATE_FAV_REARM_TTL_MS: u64 = 180_000;
+const SUB90_LATE_FAV_REVERSAL_BLOCK_RISK: f64 = 0.70;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
@@ -511,7 +512,7 @@ impl LateFavoriteStrategy {
                 + stranded_paired_core_spend_usd(input.paired_core_inventory, tail_leg);
         let working_fav_spend_usd =
             directional_favorite_working_spend_usd(self, input, dominant_fav_leg);
-        let working_tail_spend_usd = directional_tail_working_spend_usd(input, tail_leg);
+        let working_tail_spend_usd = directional_tail_working_spend_usd(self, input, tail_leg);
 
         LateFavBundleState {
             dominant_fav_leg,
@@ -548,10 +549,12 @@ fn directional_favorite_working_spend_usd<M: MarketDescriptor>(
 }
 
 fn directional_tail_working_spend_usd<M: MarketDescriptor>(
+    strategy: &LateFavoriteStrategy,
     input: &StrategyInput<M>,
     leg: LadderLeg,
 ) -> f64 {
     open_order_notional_for_leg(input.open_convex_order_exposure, leg)
+        + strategy.reserved_notional(input.market.market_id(), leg)
 }
 
 impl LateFavBundleState {
@@ -1950,6 +1953,7 @@ fn cheap_tail_cap_usd(
 fn unbundled_ultra_cheap_tail_cap_usd(
     cfg: &ConvexTailConfig,
     late_fav_filled_qty: f64,
+    favorite_avg_filled_price: f64,
     favorite_ask: f64,
     cheap_ask: f64,
 ) -> f64 {
@@ -1958,6 +1962,8 @@ fn unbundled_ultra_cheap_tail_cap_usd(
     // without a filled anchor, this lane becomes pure speculation and can
     // materially over-index on cheap tails.
     if late_fav_filled_qty <= 0.0
+        || favorite_avg_filled_price <= 0.0
+        || favorite_avg_filled_price >= 1.0
         || cheap_ask <= 0.0
         || cheap_ask > cfg.ultra_cheap_max_ask
         || favorite_ask < cfg.ultra_cheap_min_favorite_ask
@@ -1965,7 +1971,10 @@ fn unbundled_ultra_cheap_tail_cap_usd(
         return 0.0;
     }
 
-    let cap = cfg.clip_usd.min(cfg.max_load_usd);
+    let realized_favorite_win_upside =
+        late_fav_filled_qty * (1.0 - favorite_avg_filled_price);
+    let edge_cap = realized_favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
+    let cap = cfg.clip_usd.min(cfg.max_load_usd).min(edge_cap);
     if cap >= cfg.min_order_usd {
         cap
     } else {
@@ -2607,7 +2616,7 @@ where
                 inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask)
             };
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
-                + directional_tail_working_spend_usd(&input, legs.cheap_leg);
+                + directional_tail_working_spend_usd(self, &input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
             let favorite_avg_filled_price = if late_fav_filled_qty > 0.0 {
                 favorite_filled_spend_usd / late_fav_filled_qty
@@ -2629,6 +2638,7 @@ where
             let unbundled_tail_cap_usd = unbundled_ultra_cheap_tail_cap_usd(
                 &tail_cfg,
                 late_fav_filled_qty,
+                favorite_avg_filled_price,
                 legs.favorite_ask,
                 legs.cheap_ask,
             );
@@ -2795,7 +2805,7 @@ where
             let hedge_avg_price =
                 inventory_avg_cost_or(input.cheap_tail_inventory, legs.cheap_leg, legs.cheap_ask);
             let current_hedge_usd = (hedge_filled_qty * hedge_avg_price)
-                + directional_tail_working_spend_usd(&input, legs.cheap_leg);
+                + directional_tail_working_spend_usd(self, &input, legs.cheap_leg);
             let reversal_score = reversal_hedge_score(&input, &legs, &reversal_cfg);
             let hedge_cap_usd = reversal_hedge_cap_usd(
                 &reversal_cfg,
@@ -3275,7 +3285,7 @@ fn log_market_classification<M: MarketDescriptor>(
         && legs.favorite_ask < cfg.favorite_climb.near_touch_min_favorite_ask
     {
         "paired_core_mid_market"
-    } else if conviction.path_reversal_risk >= 0.50
+    } else if conviction.path_reversal_risk >= SUB90_LATE_FAV_REVERSAL_BLOCK_RISK
         && legs.favorite_ask < cfg.favorite_climb.taker_min_favorite_ask
     {
         "reversal_risk_sub90"
@@ -3969,19 +3979,23 @@ mod tests {
         };
 
         assert_eq!(
-            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.02),
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.92, 0.02),
             0.0
         );
         assert_eq!(
-            unbundled_ultra_cheap_tail_cap_usd(&cfg, 10.0, 0.92, 0.02),
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 100.0, 0.92, 0.92, 0.02),
             3.0
         );
         assert_eq!(
-            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.89, 0.02),
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 10.0, 0.92, 0.92, 0.02),
             0.0
         );
         assert_eq!(
-            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.04),
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.89, 0.02),
+            0.0
+        );
+        assert_eq!(
+            unbundled_ultra_cheap_tail_cap_usd(&cfg, 0.0, 0.92, 0.92, 0.04),
             0.0
         );
     }
