@@ -40,8 +40,12 @@ inventory:
   max_net_notional_per_market_usd: 35.0
   max_order_notional_usd: 8.0
   max_position_quantity_per_instrument: 150.0
-  min_free_cash_usd: 5.0
-  min_free_cash_bps: 1000.0
+  # Tinylive can be manually de-risked from the UI, leaving only a small USDC
+  # float for bot entries. Keep drawdown/session rails as the primary safety
+  # guard; do not pin runtime in RiskOff purely because UI activity reduced
+  # cash below the old absolute/bps floors.
+  min_free_cash_usd: 1.0
+  min_free_cash_bps: 0.0
   max_session_loss_bps: 2500.0
   max_open_orders_total: 40
   max_open_orders_per_market: 24

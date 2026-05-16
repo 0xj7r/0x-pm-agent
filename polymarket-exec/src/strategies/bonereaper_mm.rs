@@ -19,6 +19,14 @@ const LATE_FAV_REARM_STABLE_BARS: u32 = 3;
 const LATE_FAV_REARM_MAX_PATH_RISK: f64 = 0.35;
 const LATE_FAV_REARM_TTL_MS: u64 = 180_000;
 const SUB90_LATE_FAV_REVERSAL_BLOCK_RISK: f64 = 0.70;
+const MODEL_WING_MIN_FAVORITE_ASK: f64 = 0.65;
+const MODEL_WING_MAX_FAVORITE_ASK: f64 = 0.85;
+const MODEL_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.25;
+const MODEL_WING_MIN_MODEL_FAVORITE: f64 = 0.94;
+const MODEL_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.85;
+const MODEL_WING_MIN_STRONGEST_MULTIPLIER: f64 = 1.25;
+const MODEL_WING_CLIP_MULTIPLIER: f64 = 0.30;
+const MODEL_WING_CAP_MULTIPLIER: f64 = 0.25;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
@@ -234,6 +242,7 @@ struct FavoriteEntryPolicy {
     clip_multiplier: f64,
     cap_multiplier: f64,
     allow_taker: bool,
+    force_taker: bool,
     near_touch_maker: bool,
     path_reversal_risk: f64,
     label: &'static str,
@@ -1444,6 +1453,24 @@ fn early_barbell_late_favorite_blocked(
         && model_favorite < cfg.taker_min_favorite_ask
 }
 
+fn model_confirmed_wing_accumulation<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    cfg: &FavoriteClimbConfig,
+    path_reversal_risk: f64,
+    strongest: f64,
+    threshold: f64,
+    model_favorite: f64,
+) -> bool {
+    legs.favorite_ask >= MODEL_WING_MIN_FAVORITE_ASK
+        && legs.favorite_ask < MODEL_WING_MAX_FAVORITE_ASK
+        && path_reversal_risk <= MODEL_WING_MAX_PATH_REVERSAL_RISK
+        && model_favorite >= MODEL_WING_MIN_MODEL_FAVORITE
+        && input.momentum.strength >= MODEL_WING_MIN_MOMENTUM_STRENGTH
+        && strongest >= threshold * MODEL_WING_MIN_STRONGEST_MULTIPLIER
+        && favorite_direction_signal(input, legs, cfg).0
+}
+
 fn late_favorite_timing_scale(
     cfg: &FavoriteClimbConfig,
     pre_standard_late_window: bool,
@@ -1567,11 +1594,24 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     let conviction = directional_conviction(input, legs, cfg);
     let pre_standard_late_window = is_pre_standard_late_favorite_window(cfg, remaining_ms);
     let directional_barbell = conviction.barbell;
+    let model_confirmed_wing = model_confirmed_wing_accumulation(
+        input,
+        legs,
+        cfg,
+        path_reversal_risk,
+        strongest,
+        threshold,
+        model_favorite,
+    );
 
-    if pre_standard_late_window && !directional_barbell {
+    if pre_standard_late_window && !directional_barbell && !model_confirmed_wing {
         return None;
     }
-    if pre_standard_late_window && directional_barbell && conviction.score < 0.35 {
+    if pre_standard_late_window
+        && directional_barbell
+        && !model_confirmed_wing
+        && conviction.score < 0.35
+    {
         return None;
     }
 
@@ -1602,22 +1642,50 @@ fn favorite_entry_policy<M: MarketDescriptor>(
     }
 
     if legs.favorite_ask < 0.80 {
-        if whipsaw
-            || path_reversal_risk >= 0.35
-            || strongest < threshold * 1.25
-            || model_favorite < 0.86
+        if !model_confirmed_wing
+            && (whipsaw
+                || path_reversal_risk >= 0.35
+                || strongest < threshold * 1.25
+                || model_favorite < 0.86)
         {
             return None;
         }
+        let wing_scale = if model_confirmed_wing {
+            (0.80 + 0.60 * (model_favorite - MODEL_WING_MIN_MODEL_FAVORITE) / 0.06)
+                .clamp(0.80, 1.20)
+        } else {
+            1.0
+        };
         return Some(FavoriteEntryPolicy {
-            min_price: cfg.min_favorite_ask,
-            max_levels: 1,
-            clip_multiplier: if early_late { 0.20 } else { 0.35 },
-            cap_multiplier: if early_late { 0.20 } else { 0.35 },
-            allow_taker: false,
-            near_touch_maker: false,
+            min_price: if model_confirmed_wing {
+                MODEL_WING_MIN_FAVORITE_ASK
+            } else {
+                cfg.min_favorite_ask
+            },
+            max_levels: if model_confirmed_wing { 2 } else { 1 },
+            clip_multiplier: if model_confirmed_wing {
+                MODEL_WING_CLIP_MULTIPLIER * wing_scale
+            } else if early_late {
+                0.20
+            } else {
+                0.35
+            },
+            cap_multiplier: if model_confirmed_wing {
+                MODEL_WING_CAP_MULTIPLIER * wing_scale
+            } else if early_late {
+                0.20
+            } else {
+                0.35
+            },
+            allow_taker: model_confirmed_wing,
+            force_taker: model_confirmed_wing,
+            near_touch_maker: !model_confirmed_wing,
             path_reversal_risk,
-            label: if early_late {
+            label: if model_confirmed_wing && early_late {
+                "model_confirmed_wing_65_79_early"
+            } else if model_confirmed_wing {
+                "model_confirmed_wing_65_79"
+            } else if early_late {
                 "probe_70_79_early"
             } else {
                 "probe_70_79_late"
@@ -1640,6 +1708,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 || directional_probe_below_near_touch);
         if early_late
             && !barbell_sub90
+            && !model_confirmed_wing
             && if flat_regime {
                 strongest < threshold * 1.15 || model_favorite < 0.86
             } else {
@@ -1671,9 +1740,12 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             && (directional_probe_below_near_touch
                 || (legs.favorite_ask >= cfg.near_touch_min_favorite_ask
                     && (barbell_sub90
+                        || model_confirmed_wing
                         || clean_directional_persistence
                         || strongest >= threshold * 1.15)));
-        let base_scale = if barbell_sub90 {
+        let base_scale = if model_confirmed_wing {
+            MODEL_WING_CLIP_MULTIPLIER
+        } else if barbell_sub90 {
             if early_late {
                 0.75
             } else {
@@ -1689,7 +1761,9 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         } else {
             1.0
         };
-        let probe_scale = if directional_probe_below_near_touch {
+        let probe_scale = if model_confirmed_wing {
+            1.0
+        } else if directional_probe_below_near_touch {
             0.50
         } else {
             1.0
@@ -1700,7 +1774,9 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             } else {
                 cfg.near_touch_min_favorite_ask
             },
-            max_levels: if directional_probe_below_near_touch {
+            max_levels: if model_confirmed_wing {
+                2
+            } else if directional_probe_below_near_touch {
                 2
             } else if barbell_sub90 && !whipsaw {
                 4
@@ -1725,12 +1801,17 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 * whipsaw_scale
                 * flat_scale
                 * probe_scale,
-            allow_taker: (clean_directional_persistence || barbell_sub90)
+            allow_taker: (model_confirmed_wing || clean_directional_persistence || barbell_sub90)
                 && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
-                && (elapsed_sec >= 180 || barbell_sub90),
+                && (elapsed_sec >= 180 || barbell_sub90 || model_confirmed_wing),
+            force_taker: model_confirmed_wing,
             near_touch_maker,
             path_reversal_risk,
-            label: if directional_probe_below_near_touch {
+            label: if model_confirmed_wing && early_late {
+                "model_confirmed_wing_80_84_early"
+            } else if model_confirmed_wing {
+                "model_confirmed_wing_80_84"
+            } else if directional_probe_below_near_touch {
                 "maker_probe_below_near_touch_directional_barbell"
             } else if clean_directional_persistence
                 && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
@@ -1766,6 +1847,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         clip_multiplier: timing_scale * reversal_scale * conviction_scale * high_cert_taper,
         cap_multiplier: timing_scale * reversal_scale * conviction_scale * high_cert_taper,
         allow_taker: true,
+        force_taker: false,
         near_touch_maker: true,
         path_reversal_risk,
         label: if pre_standard_late_window && whipsaw {
@@ -2456,6 +2538,7 @@ where
                             legs.favorite_ask >= climb_cfg.taker_min_favorite_ask;
                         let use_aggressive_taker = entry_policy.allow_taker
                             && (high_cert_favorite
+                                || entry_policy.force_taker
                                 || should_use_aggressive_favorite_taker(
                                     &climb_cfg,
                                     legs.favorite_ask,
@@ -2618,6 +2701,33 @@ where
             let current_exposure_usd = (cheap_tail_filled_qty * cheap_tail_avg_price)
                 + directional_tail_working_spend_usd(self, &input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
+            let threshold = climb_cfg.spot_filter_bps.abs().max(1.0);
+            let strongest_for_favorite = [
+                input
+                    .btc_regime
+                    .return_60s_bps
+                    .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+                input
+                    .btc_regime
+                    .return_120s_bps
+                    .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+                input
+                    .btc_regime
+                    .return_180s_bps
+                    .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(0.0_f64, f64::max);
+            let model_confirmed_wing = model_confirmed_wing_accumulation(
+                &input,
+                &legs,
+                &climb_cfg,
+                path_reversal_risk,
+                strongest_for_favorite,
+                threshold,
+                directional_conviction.model_favorite,
+            );
             let favorite_avg_filled_price = if late_fav_filled_qty > 0.0 {
                 favorite_filled_spend_usd / late_fav_filled_qty
             } else {
@@ -2674,7 +2784,13 @@ where
                         && legs.cheap_ask <= tail_cfg.max_cheap_ask
                         && (legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask
                             || favorite_avg_price + legs.cheap_ask <= 1.0 + 1e-9);
+                    let model_wing_forces_taker = model_confirmed_wing
+                        && late_fav_filled_qty > 0.0
+                        && legs.cheap_ask <= tail_cfg.max_cheap_ask
+                        && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask
+                        && favorite_avg_price + legs.cheap_ask <= 1.0 + 1e-9;
                     let use_aggressive_taker = coverage_deficit_forces_taker
+                        || model_wing_forces_taker
                         || should_use_aggressive_cheap_tail(
                             &tail_cfg,
                             legs.favorite_ask,
@@ -2716,7 +2832,7 @@ where
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
+                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} model_wing_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             if aggressive_taker { "taker_ioc" } else { "maker_post_only" },
@@ -2735,6 +2851,7 @@ where
                             path_reversal_risk,
                             coverage_target,
                             coverage_deficit_forces_taker,
+                            model_wing_forces_taker,
                             working_late_fav_usd,
                             reserved_late_fav_usd,
                         );
@@ -3276,10 +3393,39 @@ fn log_market_classification<M: MarketDescriptor>(
     } else {
         "transition"
     };
+    let threshold = cfg.favorite_climb.spot_filter_bps.abs().max(1.0);
+    let strongest_for_favorite = [
+        input
+            .btc_regime
+            .return_60s_bps
+            .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+        input
+            .btc_regime
+            .return_120s_bps
+            .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+        input
+            .btc_regime
+            .return_180s_bps
+            .map(|ret| signed_for_favorite(legs.favorite_leg, ret)),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0.0_f64, f64::max);
+    let model_confirmed_wing = model_confirmed_wing_accumulation(
+        input,
+        &legs,
+        &cfg.favorite_climb,
+        conviction.path_reversal_risk,
+        strongest_for_favorite,
+        threshold,
+        conviction.model_favorite,
+    );
     let late_fav_skip_reason = if legs.favorite_ask < cfg.favorite_climb.min_favorite_ask {
         "favorite_ask_below_min"
     } else if !conviction.btc_confirms {
         "btc_model_not_confirming"
+    } else if model_confirmed_wing {
+        "model_confirmed_wing_eligible"
     } else if !latched_posture.suppresses_broad_paired_core()
         && !conviction.barbell
         && legs.favorite_ask < cfg.favorite_climb.near_touch_min_favorite_ask

@@ -28,8 +28,12 @@ inventory:
   max_gross_notional_usd: 1200.0
   max_net_notional_per_market_usd: 900.0
   max_position_quantity_per_instrument: 1500.0
-  min_free_cash_usd: 25.0
-  min_free_cash_bps: 500.0
+  # Tinylive may be manually de-risked from the UI, leaving only a small USDC
+  # float for bot entries. Keep the hard drawdown rail below as the primary
+  # overnight safety guard; do not let a stale absolute cash floor pin runtime
+  # in sticky RiskOff after manual UI activity.
+  min_free_cash_usd: 1.0
+  min_free_cash_bps: 0.0
   # Hard overnight safety rail: stop new lane risk and flatten entries once realized+open pnl
   # pushes portfolio equity below (starting_cash_usd - 200).
   max_session_loss_usd: 200.0
