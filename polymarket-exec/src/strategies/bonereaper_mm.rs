@@ -27,6 +27,23 @@ const MODEL_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.85;
 const MODEL_WING_MIN_STRONGEST_MULTIPLIER: f64 = 1.25;
 const MODEL_WING_CLIP_MULTIPLIER: f64 = 0.30;
 const MODEL_WING_CAP_MULTIPLIER: f64 = 0.25;
+const MARKET_WING_MIN_FAVORITE_ASK: f64 = 0.75;
+const MARKET_WING_MAX_CHEAP_ASK: f64 = 0.25;
+const MARKET_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.35;
+const MARKET_WING_MIN_MODEL_FAVORITE: f64 = 0.90;
+const MARKET_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.50;
+const MARKET_WING_MIN_STRONGEST_MULTIPLIER: f64 = 0.75;
+const WING_REVERSAL_HEDGE_MIN_ASK: f64 = 0.10;
+const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.20;
+const WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD: f64 = 10.0;
+const WING_REVERSAL_HEDGE_MIN_PATH_RISK: f64 = 0.25;
+const WING_REVERSAL_HEDGE_MODEL_EXTREME: f64 = 0.97;
+const WING_REVERSAL_HEDGE_MAX_WIN_EDGE_SPEND_FRACTION: f64 = 0.20;
+const WING_REVERSAL_HEDGE_MAX_FAV_SPEND_FRACTION: f64 = 0.025;
+const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 1.25;
+const WING_REVERSAL_HEDGE_MAX_LOAD_USD: f64 = 5.0;
+const WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD: f64 = 1.0;
+const SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER: f64 = 1.25;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
@@ -1196,7 +1213,14 @@ fn favorite_load_price_scale(
     let floor = min_favorite_ask.clamp(0.01, true_favorite_min_ask - 0.01);
     let span = (true_favorite_min_ask - floor).max(0.01);
     let progress = ((favorite_ask - floor) / span).clamp(0.0, 1.0);
-    0.15 + 0.85 * progress
+    let base = 0.15 + 0.85 * progress;
+    if favorite_ask >= 0.80 {
+        let upper_wing_span = (true_favorite_min_ask - 0.80).max(0.01);
+        let upper_wing_progress = ((favorite_ask - 0.80) / upper_wing_span).clamp(0.0, 1.0);
+        base.max(0.68 + 0.32 * upper_wing_progress)
+    } else {
+        base
+    }
 }
 
 fn signed_for_favorite(leg: LadderLeg, value_bps: f64) -> f64 {
@@ -1462,12 +1486,75 @@ fn model_confirmed_wing_accumulation<M: MarketDescriptor>(
     threshold: f64,
     model_favorite: f64,
 ) -> bool {
-    legs.favorite_ask >= MODEL_WING_MIN_FAVORITE_ASK
-        && legs.favorite_ask < MODEL_WING_MAX_FAVORITE_ASK
-        && path_reversal_risk <= MODEL_WING_MAX_PATH_REVERSAL_RISK
+    if legs.favorite_ask < MODEL_WING_MIN_FAVORITE_ASK
+        || legs.favorite_ask >= MODEL_WING_MAX_FAVORITE_ASK
+    {
+        return false;
+    }
+
+    let btc_confirms = favorite_direction_signal(input, legs, cfg).0;
+    let strict_model_confirmed = path_reversal_risk <= MODEL_WING_MAX_PATH_REVERSAL_RISK
         && model_favorite >= MODEL_WING_MIN_MODEL_FAVORITE
         && input.momentum.strength >= MODEL_WING_MIN_MOMENTUM_STRENGTH
         && strongest >= threshold * MODEL_WING_MIN_STRONGEST_MULTIPLIER
+        && btc_confirms;
+    if strict_model_confirmed {
+        return true;
+    }
+
+    let market_path_separating =
+        legs.favorite_ask >= MARKET_WING_MIN_FAVORITE_ASK || legs.cheap_ask <= MARKET_WING_MAX_CHEAP_ASK;
+    market_path_separating
+        && path_reversal_risk <= MARKET_WING_MAX_PATH_REVERSAL_RISK
+        && model_favorite >= MARKET_WING_MIN_MODEL_FAVORITE
+        && input.momentum.strength >= MARKET_WING_MIN_MOMENTUM_STRENGTH
+        && strongest >= threshold * MARKET_WING_MIN_STRONGEST_MULTIPLIER
+        && btc_confirms
+}
+
+fn market_price_path_separating_for_core_suppression(
+    legs: &LegQuotes,
+    climb_cfg: &FavoriteClimbConfig,
+    tail_cfg: &ConvexTailConfig,
+) -> bool {
+    legs.favorite_ask
+        >= (climb_cfg.near_touch_min_favorite_ask - 0.10).max(climb_cfg.min_favorite_ask)
+        && legs.cheap_ask <= (tail_cfg.max_cheap_ask + 0.05).min(0.35)
+}
+
+fn market_path_label(legs: &LegQuotes, path_reversal_risk: f64) -> &'static str {
+    if legs.favorite_ask >= 0.90 && legs.cheap_ask <= 0.10 {
+        "exhausted_barbell"
+    } else if legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25 {
+        if path_reversal_risk >= 0.45 {
+            "directional_whipsaw"
+        } else {
+            "directional_separating"
+        }
+    } else if legs.favorite_ask <= 0.60 && legs.cheap_ask >= 0.40 {
+        "centered_oscillation"
+    } else {
+        "transition"
+    }
+}
+
+fn market_path_wing_eligible<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    cfg: &FavoriteClimbConfig,
+    path_reversal_risk: f64,
+    strongest: f64,
+    threshold: f64,
+    model_favorite: f64,
+) -> bool {
+    legs.favorite_ask >= MODEL_WING_MIN_FAVORITE_ASK
+        && legs.favorite_ask < MODEL_WING_MAX_FAVORITE_ASK
+        && (legs.favorite_ask >= MARKET_WING_MIN_FAVORITE_ASK
+            || legs.cheap_ask <= MARKET_WING_MAX_CHEAP_ASK)
+        && path_reversal_risk <= MARKET_WING_MAX_PATH_REVERSAL_RISK
+        && model_favorite >= MARKET_WING_MIN_MODEL_FAVORITE
+        && input.momentum.strength >= MARKET_WING_MIN_MOMENTUM_STRENGTH
+        && strongest >= threshold * MARKET_WING_MIN_STRONGEST_MULTIPLIER
         && favorite_direction_signal(input, legs, cfg).0
 }
 
@@ -2098,6 +2185,47 @@ fn reversal_hedge_cap_usd(
     cfg.max_load_usd.min(hedge_notional).min(edge_erosion_cap)
 }
 
+fn wing_reversal_hedge_cap_usd(
+    favorite_filled_qty: f64,
+    favorite_filled_spend_usd: f64,
+    existing_hedge_spend_usd: f64,
+) -> f64 {
+    if favorite_filled_qty <= 0.0 || favorite_filled_spend_usd <= 0.0 {
+        return 0.0;
+    }
+
+    let favorite_avg_price = favorite_filled_spend_usd / favorite_filled_qty;
+    if favorite_avg_price <= 0.0 || favorite_avg_price >= 1.0 {
+        return 0.0;
+    }
+
+    let favorite_win_upside = favorite_filled_qty * (1.0 - favorite_avg_price);
+    let fav_win_payoff_now =
+        favorite_win_upside - existing_hedge_spend_usd.max(0.0);
+    let positive_payoff_cap =
+        (fav_win_payoff_now - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD).max(0.0);
+    let hard_cap = WING_REVERSAL_HEDGE_MAX_LOAD_USD
+        .min(favorite_filled_spend_usd * WING_REVERSAL_HEDGE_MAX_FAV_SPEND_FRACTION)
+        .min(favorite_win_upside * WING_REVERSAL_HEDGE_MAX_WIN_EDGE_SPEND_FRACTION)
+        .min(positive_payoff_cap);
+    (hard_cap - existing_hedge_spend_usd.max(0.0)).max(0.0)
+}
+
+fn should_fire_wing_reversal_hedge(
+    regime: Option<BtcRegime>,
+    model_favorite: f64,
+    path_reversal_risk: f64,
+) -> bool {
+    if model_favorite >= WING_REVERSAL_HEDGE_MODEL_EXTREME {
+        return false;
+    }
+    path_reversal_risk >= WING_REVERSAL_HEDGE_MIN_PATH_RISK
+        || matches!(
+            regime,
+            Some(BtcRegime::Whipsaw | BtcRegime::TrendingVolatile)
+        )
+}
+
 fn cheap_tail_coverage_fraction(cfg: &ConvexTailConfig, regime: Option<BtcRegime>) -> f64 {
     let base = cfg.max_favorite_exposure_fraction.max(0.0);
     let regime_multiplier = match regime {
@@ -2519,10 +2647,25 @@ where
                         );
                         let confidence_multiplier =
                             favorite_momentum_clip_multiplier(&input, &legs, &climb_cfg);
+                        let clip_ceiling = climb_cfg.clip_usd
+                            * late_favorite_clip_ceiling_multiplier(
+                                directional_conviction,
+                                &entry_policy,
+                            )
+                            * late_favorite_high_cert_price_taper(legs.favorite_ask);
+                        let sub90_entry_policy_multiplier =
+                            if legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
+                                && legs.favorite_ask < climb_cfg.taker_min_favorite_ask
+                            {
+                                SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER
+                            } else {
+                                1.0
+                            };
                         let per_level_clip = (raw_clip
                             * confidence_multiplier
                             * regime_multiplier
-                            * entry_policy.clip_multiplier)
+                            * entry_policy.clip_multiplier
+                            * sub90_entry_policy_multiplier)
                             .max(climb_cfg.min_order_usd);
                         let mut load_left = remaining_load;
                         let use_sub90_fak = entry_policy.allow_taker
@@ -2562,12 +2705,6 @@ where
                         // when the real trade was to consume available
                         // high-cert liquidity now.
                         let aggressive_all_levels = use_aggressive_taker;
-                        let clip_ceiling = climb_cfg.clip_usd
-                            * late_favorite_clip_ceiling_multiplier(
-                                directional_conviction,
-                                &entry_policy,
-                            )
-                            * late_favorite_high_cert_price_taper(legs.favorite_ask);
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -2879,6 +3016,91 @@ where
                 notes.push(format!(
                     "cheap_tail blocked: favorite exposure {:.2} below min {:.2}",
                     favorite_exposure_usd, tail_cfg.min_order_usd
+                ));
+            }
+        }
+
+        if legs.cheap_ask >= WING_REVERSAL_HEDGE_MIN_ASK
+            && legs.cheap_ask <= WING_REVERSAL_HEDGE_MAX_ASK
+        {
+            let favorite_filled_qty =
+                inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg)
+                    + stranded_paired_core_qty_for_leg(
+                        input.paired_core_inventory,
+                        legs.favorite_leg,
+                    );
+            let favorite_filled_spend_usd =
+                filled_inventory_spend_usd(input.late_fav_inventory, legs.favorite_leg)
+                    + stranded_paired_core_spend_usd(
+                        input.paired_core_inventory,
+                        legs.favorite_leg,
+                    );
+            let current_hedge_spend_usd =
+                filled_inventory_spend_usd(input.cheap_tail_inventory, legs.cheap_leg)
+                    + stranded_paired_core_spend_usd(input.paired_core_inventory, legs.cheap_leg)
+                    + directional_tail_working_spend_usd(self, &input, legs.cheap_leg);
+            let path_reversal_risk = path_reversal_risk_score(&input, &legs);
+            let remaining_load = wing_reversal_hedge_cap_usd(
+                favorite_filled_qty,
+                favorite_filled_spend_usd,
+                current_hedge_spend_usd,
+            );
+            let should_fire = favorite_filled_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD
+                && should_fire_wing_reversal_hedge(
+                    input.btc_regime.regime(),
+                    directional_conviction.model_favorite,
+                    path_reversal_risk,
+                );
+            if should_fire && remaining_load >= tail_cfg.min_order_usd {
+                if let Some(px) = maker_limit_price(legs.cheap_bid, legs.cheap_ask, tick, 0.0) {
+                    let clip = WING_REVERSAL_HEDGE_CLIP_USD
+                        .min(remaining_load)
+                        .max(tail_cfg.min_order_usd);
+                    let qty = (clip / px).max(input.market.min_order_size());
+                    let reason = format!(
+                        "wing_reversal_hedge leg={:?} mode=maker_post_only px={:.4} bid={:.4} ask={:.4} clip_usd={:.2} remaining_cap={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
+                        legs.cheap_leg,
+                        px,
+                        legs.cheap_bid,
+                        legs.cheap_ask,
+                        clip,
+                        remaining_load,
+                        favorite_filled_spend_usd,
+                        favorite_filled_qty,
+                        current_hedge_spend_usd,
+                        directional_conviction.model_favorite,
+                        path_reversal_risk,
+                        input.btc_regime.regime(),
+                    );
+                    notes.push(reason.clone());
+                    intents.push(build_reversal_hedge_intent(
+                        &input.market,
+                        legs.cheap_leg,
+                        px,
+                        qty,
+                        "wing:0",
+                        false,
+                        reason,
+                        input.now_ms,
+                    ));
+                    self.reserve_notional(
+                        input.market.market_id(),
+                        legs.cheap_leg,
+                        clip,
+                        input.now_ms,
+                    );
+                }
+            } else if favorite_filled_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD {
+                notes.push(format!(
+                    "wing_reversal_hedge blocked ask={:.4} should_fire={} remaining_cap={:.2} min_order={:.2} favorite_filled_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
+                    legs.cheap_ask,
+                    should_fire,
+                    remaining_load,
+                    tail_cfg.min_order_usd,
+                    favorite_filled_spend_usd,
+                    directional_conviction.model_favorite,
+                    path_reversal_risk,
+                    input.btc_regime.regime(),
                 ));
             }
         }
@@ -3299,9 +3521,8 @@ fn observe_market_posture<M: MarketDescriptor>(
         .map(|remaining_ms| elapsed_ms(&input.market, input.now_ms, remaining_ms))
         .unwrap_or(0);
     let path_reversal_risk = conviction.path_reversal_risk;
-    let market_price_path_separating = legs.favorite_ask
-        >= (climb_cfg.near_touch_min_favorite_ask - 0.10).max(climb_cfg.min_favorite_ask)
-        && legs.cheap_ask <= (cfg.convex_tail.max_cheap_ask + 0.05).min(0.35);
+    let market_price_path_separating =
+        market_price_path_separating_for_core_suppression(&legs, &climb_cfg, &cfg.convex_tail);
     let favorite_is_separating =
         market_price_path_separating || legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25;
     let broad_mid_market = legs.favorite_ask <= 0.70 && legs.cheap_ask >= 0.30;
@@ -3380,19 +3601,7 @@ fn log_market_classification<M: MarketDescriptor>(
     };
 
     let conviction = directional_conviction(input, &legs, &cfg.favorite_climb);
-    let market_path = if legs.favorite_ask >= 0.90 && legs.cheap_ask <= 0.10 {
-        "exhausted_barbell"
-    } else if legs.favorite_ask >= 0.75 || legs.cheap_ask <= 0.25 {
-        if conviction.path_reversal_risk >= 0.45 {
-            "directional_whipsaw"
-        } else {
-            "directional_separating"
-        }
-    } else if legs.favorite_ask <= 0.60 && legs.cheap_ask >= 0.40 {
-        "centered_oscillation"
-    } else {
-        "transition"
-    };
+    let market_path = market_path_label(&legs, conviction.path_reversal_risk);
     let threshold = cfg.favorite_climb.spot_filter_bps.abs().max(1.0);
     let strongest_for_favorite = [
         input
@@ -3420,12 +3629,23 @@ fn log_market_classification<M: MarketDescriptor>(
         threshold,
         conviction.model_favorite,
     );
+    let market_path_wing = market_path_wing_eligible(
+        input,
+        &legs,
+        &cfg.favorite_climb,
+        conviction.path_reversal_risk,
+        strongest_for_favorite,
+        threshold,
+        conviction.model_favorite,
+    );
     let late_fav_skip_reason = if legs.favorite_ask < cfg.favorite_climb.min_favorite_ask {
         "favorite_ask_below_min"
     } else if !conviction.btc_confirms {
         "btc_model_not_confirming"
     } else if model_confirmed_wing {
         "model_confirmed_wing_eligible"
+    } else if market_path_wing {
+        "market_path_wing_eligible"
     } else if !latched_posture.suppresses_broad_paired_core()
         && !conviction.barbell
         && legs.favorite_ask < cfg.favorite_climb.near_touch_min_favorite_ask
@@ -3474,6 +3694,7 @@ fn log_market_classification<M: MarketDescriptor>(
         btc_confirms = conviction.btc_confirms,
         conviction_score = conviction.score,
         model_favorite = conviction.model_favorite,
+        market_path_wing = market_path_wing,
         path_reversal_risk = conviction.path_reversal_risk,
         late_fav_skip_reason = late_fav_skip_reason,
         cheap_tail_skip_reason = cheap_tail_skip_reason,
