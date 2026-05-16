@@ -143,7 +143,11 @@ impl EoaPolygonSubmitter {
         })
     }
 
-    async fn erc20_balance(&self, token: Address, owner: Address) -> Result<U256, ExecutionError> {
+    pub async fn erc20_balance(
+        &self,
+        token: Address,
+        owner: Address,
+    ) -> Result<U256, ExecutionError> {
         let calldata = balanceOfCall { account: owner }.abi_encode();
         let bytes = self.eth_call(token, Bytes::from(calldata)).await?;
         balanceOfCall::abi_decode_returns(&bytes).map_err(|error| {

@@ -20,6 +20,7 @@ pub const DEFAULT_RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
 pub const DEFAULT_CTF_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 pub const DEFAULT_USDCE_ADDRESS: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 pub const DEFAULT_PUSD_ADDRESS: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+pub const COLLATERAL_ONRAMP_ADDRESS: &str = "0x93070a847efEf7F70739046A929D47a521F5B8ee";
 
 const POLYMARKET_PROXY_FACTORY: Address = address!("aB45c5A4B0c941a2F231C04C3f49182e1A254052");
 const POLYMARKET_RELAY_HUB: Address = address!("D216153c06E857cD7f72665E0aF1d7D82172F494");
@@ -73,6 +74,12 @@ sol! {
         uint256 deadline;
         Call[] calls;
     }
+
+    #[derive(Debug, PartialEq)]
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    #[derive(Debug, PartialEq)]
+    function wrap(address _asset, address _to, uint256 _amount) external;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -431,6 +438,77 @@ impl CtfRelayerClient {
             )
             .await?;
         self.submit(body).await
+    }
+
+    /// Wrap USDC.e held by the deposit wallet (proxy) into pUSD via Polymarket's
+    /// CollateralOnramp. This is the programmatic equivalent of clicking
+    /// "Activate Funds" in the UI: merge proceeds land as USDC.e in the proxy
+    /// and must be wrapped to pUSD before they show up as tradable balance.
+    ///
+    /// The batched WALLET tx contains two calls signed once by the EOA owner:
+    ///   1. `USDC.e.approve(CollateralOnramp, amount)` from the proxy wallet
+    ///   2. `CollateralOnramp.wrap(USDC.e, proxy_wallet, amount)`
+    pub async fn wrap_usdce_to_pusd(
+        &self,
+        signer: &PrivateKeySigner,
+        amount: U256,
+        metadata: String,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        if self.config.signature_type_code != 3 {
+            return Err(ExecutionError::BadRequest(format!(
+                "wrap_usdce_to_pusd requires POLYMARKET_SIGNATURE_TYPE=3 (poly_1271), got {}",
+                self.config.signature_type_code
+            )));
+        }
+        if amount.is_zero() {
+            return Err(ExecutionError::BadRequest(
+                "wrap_usdce_to_pusd: amount must be > 0".to_string(),
+            ));
+        }
+        let deposit_wallet = self.deposit_wallet()?;
+        let onramp = parse_address(COLLATERAL_ONRAMP_ADDRESS, "collateral onramp")?;
+        let usdce = parse_address(DEFAULT_USDCE_ADDRESS, "USDC.e")?;
+        let approve_calldata = approveCall {
+            spender: onramp,
+            amount,
+        }
+        .abi_encode();
+        let wrap_calldata = wrapCall {
+            _asset: usdce,
+            _to: deposit_wallet,
+            _amount: amount,
+        }
+        .abi_encode();
+        let body = self
+            .build_wallet_transaction_request(
+                signer,
+                vec![
+                    wallet_call_request(DEFAULT_USDCE_ADDRESS, Bytes::from(approve_calldata))?,
+                    wallet_call_request(COLLATERAL_ONRAMP_ADDRESS, Bytes::from(wrap_calldata))?,
+                ],
+                metadata,
+            )
+            .await?;
+        self.submit(body).await
+    }
+
+    /// Read the USDC.e balance currently held by the proxy/deposit wallet.
+    /// Non-zero indicates pending merge proceeds awaiting `wrap_usdce_to_pusd`.
+    pub async fn deposit_wallet_usdce_balance(&self) -> Result<U256, ExecutionError> {
+        let rpc_url = self
+            .config
+            .polygon_rpc_url
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ExecutionError::BadRequest(
+                    "deposit_wallet_usdce_balance requires POLYGON_RPC_URL".to_string(),
+                )
+            })?;
+        let submitter = EoaPolygonSubmitter::from_env(rpc_url.to_string());
+        let usdce = parse_address(DEFAULT_USDCE_ADDRESS, "USDC.e")?;
+        let wallet = self.deposit_wallet()?;
+        submitter.erc20_balance(usdce, wallet).await
     }
 
     async fn submit_wallet_redeem(
@@ -1146,6 +1224,124 @@ mod tests {
         assert_eq!(body.metadata, "{\"test\":true}");
         assert!(body.data.starts_with("0x"));
         assert!(body.signature.starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn wrap_usdce_to_pusd_builds_approve_then_wrap_batch() {
+        let mut config = test_config();
+        config.signature_type_code = 3;
+        config.proxy_wallet_address =
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string());
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+        let amount = U256::from(6_240_000_u64);
+        let body = client
+            .build_wallet_transaction_request_with_nonce_deadline(
+                &signer,
+                vec![
+                    wallet_call_request(
+                        DEFAULT_USDCE_ADDRESS,
+                        Bytes::from(
+                            approveCall {
+                                spender: Address::from_str(COLLATERAL_ONRAMP_ADDRESS).unwrap(),
+                                amount,
+                            }
+                            .abi_encode(),
+                        ),
+                    )
+                    .unwrap(),
+                    wallet_call_request(
+                        COLLATERAL_ONRAMP_ADDRESS,
+                        Bytes::from(
+                            wrapCall {
+                                _asset: Address::from_str(DEFAULT_USDCE_ADDRESS).unwrap(),
+                                _to: Address::from_str(
+                                    "0xa57189d5b2285A5E64083d3925687bDFCE01fC83",
+                                )
+                                .unwrap(),
+                                _amount: amount,
+                            }
+                            .abi_encode(),
+                        ),
+                    )
+                    .unwrap(),
+                ],
+                "3".to_string(),
+                1_760_000_000,
+                "{\"wrap\":true}".to_string(),
+            )
+            .await
+            .expect("wrap batch");
+
+        assert_eq!(body.tx_type, "WALLET");
+        assert_eq!(body.deposit_wallet_params.calls.len(), 2);
+        assert_eq!(
+            body.deposit_wallet_params.calls[0].target.to_lowercase(),
+            DEFAULT_USDCE_ADDRESS.to_lowercase()
+        );
+        assert_eq!(
+            body.deposit_wallet_params.calls[1].target.to_lowercase(),
+            COLLATERAL_ONRAMP_ADDRESS.to_lowercase()
+        );
+        let approve_decoded = approveCall::abi_decode(
+            &Bytes::from_str(&body.deposit_wallet_params.calls[0].data).unwrap(),
+        )
+        .expect("approve decodes");
+        assert_eq!(
+            approve_decoded.spender,
+            Address::from_str(COLLATERAL_ONRAMP_ADDRESS).unwrap()
+        );
+        assert_eq!(approve_decoded.amount, amount);
+        let wrap_decoded = wrapCall::abi_decode(
+            &Bytes::from_str(&body.deposit_wallet_params.calls[1].data).unwrap(),
+        )
+        .expect("wrap decodes");
+        assert_eq!(
+            wrap_decoded._asset,
+            Address::from_str(DEFAULT_USDCE_ADDRESS).unwrap()
+        );
+        assert_eq!(
+            wrap_decoded._to,
+            Address::from_str("0xa57189d5b2285A5E64083d3925687bDFCE01fC83").unwrap()
+        );
+        assert_eq!(wrap_decoded._amount, amount);
+    }
+
+    #[tokio::test]
+    async fn wrap_usdce_to_pusd_rejects_non_poly1271_signature_type() {
+        let mut config = test_config();
+        config.signature_type_code = 1;
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+        let err = client
+            .wrap_usdce_to_pusd(&signer, U256::from(1_000_000_u64), "{}".to_string())
+            .await
+            .expect_err("non-poly1271 rejected");
+        assert!(err.to_string().contains("poly_1271"));
+    }
+
+    #[tokio::test]
+    async fn wrap_usdce_to_pusd_rejects_zero_amount() {
+        let mut config = test_config();
+        config.signature_type_code = 3;
+        config.proxy_wallet_address =
+            Some("0xa57189d5b2285A5E64083d3925687bDFCE01fC83".to_string());
+        let client = CtfRelayerClient::new(config);
+        let signer = PrivateKeySigner::from_str(
+            "0x59c6995e998f97a5a0044966f094538340a3a38f1a07c6d82e841fe4b0d9f10a",
+        )
+        .expect("test signer");
+        let err = client
+            .wrap_usdce_to_pusd(&signer, U256::ZERO, "{}".to_string())
+            .await
+            .expect_err("zero amount rejected");
+        assert!(err.to_string().contains("amount must be > 0"));
     }
 
     #[tokio::test]
