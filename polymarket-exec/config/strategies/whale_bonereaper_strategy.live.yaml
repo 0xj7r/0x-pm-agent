@@ -84,13 +84,18 @@ paired_core:
   book_sanity_max_queue_ahead_usd: 1500.0
   book_sanity_max_queue_imbalance_ratio: 3.0
   book_sanity_max_projected_pair_cost: 0.995
-  # Reverted to mid-anchored after observing posture-detection lag with
-  # touch-anchored on 2272092: 21 Yes shares filled at 0.54-0.57 in fast
-  # move before BarbellDirectional latched, leaving -$10.87 stranded. Mid
-  # is more conservative — rungs sit far enough from touch that fast
-  # directional moves don't fill them. Touch can be re-enabled with
-  # preventive gates (fast-move detection + ladder depth limiting).
   ladder_anchor: mid
+  # Fast-move guard: BTC 30s return magnitude > 5 bps blocks NEW ladder
+  # emissions; vol > 4 bps caps ladder depth to 2 levels. This is the
+  # predictive complement to the reactive signal-driven cancel — by the
+  # time posture latches BarbellDirectional the fills are already done,
+  # but the BTC tape velocity is observable BEFORE the prediction-market
+  # book commits. Today's 2272092 incident (21 Yes filled in fast move
+  # before posture caught up) is exactly what this guards against.
+  fast_move_guard_enabled: true
+  fast_move_guard_threshold_bps: 5.0
+  fast_move_guard_high_vol_threshold_bps: 4.0
+  fast_move_guard_high_vol_max_levels: 2
 
 late_favorite:
   sizing:

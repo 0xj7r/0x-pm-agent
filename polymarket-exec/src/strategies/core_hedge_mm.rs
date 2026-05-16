@@ -138,6 +138,19 @@ pub struct CoreHedgeMmConfig {
     pub book_sanity_max_projected_pair_cost: f64,
     /// Where each ladder rung is positioned. See `PairedCoreLadderAnchor`.
     pub ladder_anchor: PairedCoreLadderAnchor,
+    /// Fast-move guard: skip new paired-core ladder emissions when BTC
+    /// 30s return magnitude exceeds the threshold (bps). Preventive
+    /// counter to the posture-detection lag — by the time
+    /// BarbellDirectional latches, fills are already on the books.
+    /// Catching the BTC tape velocity at emit time blocks fresh ladders
+    /// from being posted into a fast move.
+    pub fast_move_guard_enabled: bool,
+    pub fast_move_guard_threshold_bps: f64,
+    /// When realized vol exceeds this threshold (bps), cap the ladder
+    /// depth to `fast_move_guard_high_vol_max_levels`. Smaller ladder
+    /// in turbulent regimes bounds per-market exposure.
+    pub fast_move_guard_high_vol_threshold_bps: f64,
+    pub fast_move_guard_high_vol_max_levels: usize,
 }
 
 impl Default for CoreHedgeMmConfig {
@@ -176,6 +189,10 @@ impl Default for CoreHedgeMmConfig {
             book_sanity_max_queue_imbalance_ratio: 3.0,
             book_sanity_max_projected_pair_cost: 0.995,
             ladder_anchor: PairedCoreLadderAnchor::Mid,
+            fast_move_guard_enabled: false,
+            fast_move_guard_threshold_bps: 5.0,
+            fast_move_guard_high_vol_threshold_bps: 4.0,
+            fast_move_guard_high_vol_max_levels: 2,
         }
     }
 }
@@ -1296,7 +1313,43 @@ where
                     "paired_core balanced bundle mode projected_yes={projected_yes_qty:.4} projected_no={projected_no_qty:.4}",
                 ));
             }
-            for idx in 0..levels {
+            // Fast-move guard: check BTC tape velocity + vol BEFORE posting
+            // new ladder rungs. Posture-detection lags spot moves, so any
+            // rungs posted into a fast move risk catching the descent
+            // before the strategy can react. Skip or shrink the ladder
+            // when the tape is hot.
+            let r30_abs = input
+                .btc_regime
+                .return_30s_bps
+                .unwrap_or(0.0)
+                .abs();
+            let realized_vol = input
+                .btc_regime
+                .realized_vol_5m_bps
+                .unwrap_or(0.0);
+            let effective_levels = if cfg.fast_move_guard_enabled {
+                if r30_abs > cfg.fast_move_guard_threshold_bps {
+                    notes.push(format!(
+                        "paired_core fast-move guard: skipping new ladder (btc_ret_30s_abs={r30_abs:.2}bps > {:.2}bps threshold)",
+                        cfg.fast_move_guard_threshold_bps,
+                    ));
+                    0
+                } else if realized_vol > cfg.fast_move_guard_high_vol_threshold_bps {
+                    let capped = levels.min(cfg.fast_move_guard_high_vol_max_levels);
+                    if capped < levels {
+                        notes.push(format!(
+                            "paired_core fast-move guard: capping ladder to {capped} levels (vol={realized_vol:.2}bps > {:.2}bps threshold)",
+                            cfg.fast_move_guard_high_vol_threshold_bps,
+                        ));
+                    }
+                    capped
+                } else {
+                    levels
+                }
+            } else {
+                levels
+            };
+            for idx in 0..effective_levels {
                 if in_repair_mode {
                     if filled_abs_imbalance >= max_unpaired_core_qty + 1e-9 {
                         notes.push(format!(

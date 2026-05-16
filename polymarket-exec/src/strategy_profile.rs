@@ -221,6 +221,10 @@ pub struct CoreHedgeSection {
     pub clip_scale: Option<f64>,
     /// Paired-core ladder anchor: "mid" (legacy) or "touch" (new).
     pub ladder_anchor: Option<String>,
+    pub fast_move_guard_enabled: Option<bool>,
+    pub fast_move_guard_threshold_bps: Option<f64>,
+    pub fast_move_guard_high_vol_threshold_bps: Option<f64>,
+    pub fast_move_guard_high_vol_max_levels: Option<usize>,
 }
 
 impl StrategyProfile {
@@ -332,6 +336,18 @@ impl StrategyProfile {
                     .unwrap_or(defaults.book_sanity_max_projected_pair_cost),
                 ladder_anchor: parse_paired_core_ladder_anchor(s.ladder_anchor.as_deref())
                     .unwrap_or(defaults.ladder_anchor),
+                fast_move_guard_enabled: s
+                    .fast_move_guard_enabled
+                    .unwrap_or(defaults.fast_move_guard_enabled),
+                fast_move_guard_threshold_bps: s
+                    .fast_move_guard_threshold_bps
+                    .unwrap_or(defaults.fast_move_guard_threshold_bps),
+                fast_move_guard_high_vol_threshold_bps: s
+                    .fast_move_guard_high_vol_threshold_bps
+                    .unwrap_or(defaults.fast_move_guard_high_vol_threshold_bps),
+                fast_move_guard_high_vol_max_levels: s
+                    .fast_move_guard_high_vol_max_levels
+                    .unwrap_or(defaults.fast_move_guard_high_vol_max_levels),
                 ..defaults
             },
         }
