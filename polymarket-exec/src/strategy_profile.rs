@@ -15,7 +15,7 @@ use crate::market_making::paired_mm::{
 use crate::quote_engine::QuoteEngineConfig;
 use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
-    LateFavoriteStrategyConfig, ReversalHedgeConfig,
+    LateFavAnticipateConfig, LateFavoriteStrategyConfig, ReversalHedgeConfig,
 };
 use crate::strategies::core_hedge_mm::{CoreHedgeMmConfig, CoreHedgeMmStrategyConfig};
 use crate::strategies::paired_mm::PairedMmStrategyConfig;
@@ -55,9 +55,29 @@ pub struct StrategyProfile {
 #[serde(default)]
 pub struct LateFavoriteSection {
     pub favorite_climb: FavoriteClimbSubsection,
+    pub favorite_anticipate: LateFavAnticipateSubsection,
     pub convex_tail: ConvexTailSubsection,
     pub reversal_hedge: ReversalHedgeSubsection,
     pub sizing: DirectionalSizingSubsection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LateFavAnticipateSubsection {
+    pub enabled: Option<bool>,
+    pub allow_flat_regime: Option<bool>,
+    pub allow_whipsaw_regime: Option<bool>,
+    pub min_model_favorite: Option<f64>,
+    pub max_path_reversal_risk: Option<f64>,
+    pub require_btc_confirms: Option<bool>,
+    pub min_favorite_ask: Option<f64>,
+    pub max_favorite_ask: Option<f64>,
+    pub min_remaining_ms: Option<u64>,
+    pub clip_usd: Option<f64>,
+    pub max_load_usd: Option<f64>,
+    pub min_order_usd: Option<f64>,
+    pub ladder_levels: Option<usize>,
+    pub level_step_ticks: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -299,9 +319,11 @@ impl StrategyProfile {
 
     pub fn late_favorite_config(&self) -> LateFavoriteStrategyConfig {
         let climb_def = FavoriteClimbConfig::default();
+        let anticipate_def = LateFavAnticipateConfig::default();
         let tail_def = ConvexTailConfig::default();
         let reversal_def = ReversalHedgeConfig::default();
         let c = &self.late_favorite.favorite_climb;
+        let a = &self.late_favorite.favorite_anticipate;
         let t = &self.late_favorite.convex_tail;
         let r = &self.late_favorite.reversal_hedge;
         let s = &self.late_favorite.sizing;
@@ -351,6 +373,40 @@ impl StrategyProfile {
                     .unwrap_or(climb_def.taker_min_favorite_ask),
                 taker_window_sec: c.taker_window_sec.unwrap_or(climb_def.taker_window_sec),
                 disable_after_ms: c.disable_after_ms,
+            },
+            favorite_anticipate: LateFavAnticipateConfig {
+                enabled: a.enabled.unwrap_or(anticipate_def.enabled),
+                allow_flat_regime: a
+                    .allow_flat_regime
+                    .unwrap_or(anticipate_def.allow_flat_regime),
+                allow_whipsaw_regime: a
+                    .allow_whipsaw_regime
+                    .unwrap_or(anticipate_def.allow_whipsaw_regime),
+                min_model_favorite: a
+                    .min_model_favorite
+                    .unwrap_or(anticipate_def.min_model_favorite),
+                max_path_reversal_risk: a
+                    .max_path_reversal_risk
+                    .unwrap_or(anticipate_def.max_path_reversal_risk),
+                require_btc_confirms: a
+                    .require_btc_confirms
+                    .unwrap_or(anticipate_def.require_btc_confirms),
+                min_favorite_ask: a
+                    .min_favorite_ask
+                    .unwrap_or(anticipate_def.min_favorite_ask),
+                max_favorite_ask: a
+                    .max_favorite_ask
+                    .unwrap_or(anticipate_def.max_favorite_ask),
+                min_remaining_ms: a
+                    .min_remaining_ms
+                    .unwrap_or(anticipate_def.min_remaining_ms),
+                clip_usd: a.clip_usd.unwrap_or(anticipate_def.clip_usd),
+                max_load_usd: a.max_load_usd.unwrap_or(anticipate_def.max_load_usd),
+                min_order_usd: a.min_order_usd.unwrap_or(anticipate_def.min_order_usd),
+                ladder_levels: a.ladder_levels.unwrap_or(anticipate_def.ladder_levels),
+                level_step_ticks: a
+                    .level_step_ticks
+                    .unwrap_or(anticipate_def.level_step_ticks),
             },
             convex_tail: ConvexTailConfig {
                 enabled: t.enabled.unwrap_or(tail_def.enabled),

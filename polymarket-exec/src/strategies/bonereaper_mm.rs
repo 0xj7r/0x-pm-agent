@@ -129,6 +129,74 @@ impl Default for FavoriteClimbConfig {
     }
 }
 
+/// Forward-looking maker lane for the late-favorite side. Rather than waiting
+/// for `favorite_ask` to climb into the FAK chase band, this posts post-only
+/// limit bids on the favorite leg when conviction is high and enough time
+/// remains in the bar. The bids sit at or just below `favorite_bid`, catching
+/// profit-takers selling into the climb. Fill rate is lower per attempt than
+/// FAK but realised fill price is materially better, and queue position is
+/// preserved across ticks because the COID is stable (no `now_ms` salt).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LateFavAnticipateConfig {
+    pub enabled: bool,
+    /// Allow anticipate in low-vol Flat regime. Default false; flat regimes
+    /// rarely produce sustained climbs so anticipate fills are likely to be
+    /// adverse selection.
+    pub allow_flat_regime: bool,
+    /// Allow anticipate in high-vol Whipsaw regime. Default false; whipsaw
+    /// climbs reverse too often for the maker-rest pattern to be EV+.
+    pub allow_whipsaw_regime: bool,
+    /// Minimum model probability assigned to the favorite leg.
+    pub min_model_favorite: f64,
+    /// Maximum tolerated path-reversal-risk score. Anticipate cancels if
+    /// reversal risk spikes above this.
+    pub max_path_reversal_risk: f64,
+    /// Require BTC spot direction to confirm the favorite side before
+    /// anticipating. Cheap insurance against signalless entries.
+    pub require_btc_confirms: bool,
+    /// Lower bound on `favorite_ask`. Below this, the market hasn't broken
+    /// directional enough to anticipate yet; the paired-core lane handles
+    /// the noisy band.
+    pub min_favorite_ask: f64,
+    /// Upper bound on `favorite_ask`. Above this, the FAK climb already
+    /// owns the band and anticipate adds nothing.
+    pub max_favorite_ask: f64,
+    /// Minimum time-to-resolve before anticipating. Below this, queue
+    /// priority is worth less than reactive FAK.
+    pub min_remaining_ms: u64,
+    /// Per-level clip in USD.
+    pub clip_usd: f64,
+    /// Hard cap on total anticipate notional for this market.
+    pub max_load_usd: f64,
+    /// Venue-min order size guard in USD.
+    pub min_order_usd: f64,
+    /// Number of maker rungs to ladder.
+    pub ladder_levels: usize,
+    /// Tick spacing between adjacent rungs.
+    pub level_step_ticks: u32,
+}
+
+impl Default for LateFavAnticipateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_flat_regime: false,
+            allow_whipsaw_regime: false,
+            min_model_favorite: 0.92,
+            max_path_reversal_risk: 0.15,
+            require_btc_confirms: true,
+            min_favorite_ask: 0.55,
+            max_favorite_ask: 0.80,
+            min_remaining_ms: 120_000,
+            clip_usd: 5.0,
+            max_load_usd: 25.0,
+            min_order_usd: 1.0,
+            ladder_levels: 3,
+            level_step_ticks: 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ConvexTailConfig {
     pub enabled: bool,
@@ -383,6 +451,7 @@ impl DirectionalConviction {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LateFavoriteStrategyConfig {
     pub favorite_climb: FavoriteClimbConfig,
+    pub favorite_anticipate: LateFavAnticipateConfig,
     pub convex_tail: ConvexTailConfig,
     pub reversal_hedge: ReversalHedgeConfig,
     pub sizing: DirectionalSizingConfig,
@@ -392,6 +461,7 @@ impl Default for LateFavoriteStrategyConfig {
     fn default() -> Self {
         Self {
             favorite_climb: FavoriteClimbConfig::default(),
+            favorite_anticipate: LateFavAnticipateConfig::default(),
             convex_tail: ConvexTailConfig::default(),
             reversal_hedge: ReversalHedgeConfig::default(),
             sizing: DirectionalSizingConfig::default(),
@@ -2946,6 +3016,82 @@ where
             }
         }
 
+        let anticipate_cfg = self.config.favorite_anticipate;
+        let anticipate_regime_ok = match input.btc_regime.regime() {
+            Some(BtcRegime::DirectionalSmooth) | Some(BtcRegime::TrendingVolatile) => true,
+            Some(BtcRegime::Flat) => anticipate_cfg.allow_flat_regime,
+            Some(BtcRegime::Whipsaw) => anticipate_cfg.allow_whipsaw_regime,
+            None => false,
+        };
+        if anticipate_cfg.enabled
+            && climb_cfg.enabled
+            && anticipate_regime_ok
+            && directional_conviction.model_favorite >= anticipate_cfg.min_model_favorite
+            && directional_conviction.path_reversal_risk <= anticipate_cfg.max_path_reversal_risk
+            && (!anticipate_cfg.require_btc_confirms || directional_conviction.btc_confirms)
+            && legs.favorite_ask >= anticipate_cfg.min_favorite_ask
+            && legs.favorite_ask <= anticipate_cfg.max_favorite_ask
+            && remaining_ms >= anticipate_cfg.min_remaining_ms
+            && legs.favorite_bid > 0.0
+        {
+            let current_anticipate_exposure_usd =
+                directional_favorite_leg_spend_usd(self, &input, legs.favorite_leg);
+            let remaining_load = (anticipate_cfg.max_load_usd
+                - current_anticipate_exposure_usd)
+                .max(0.0);
+            if remaining_load >= anticipate_cfg.min_order_usd {
+                let levels = anticipate_cfg.ladder_levels.max(1);
+                let step_ticks = anticipate_cfg.level_step_ticks.max(1) as f64;
+                let mut load_left = remaining_load;
+                for level in 0..levels {
+                    if load_left < anticipate_cfg.min_order_usd {
+                        break;
+                    }
+                    let px = legs.favorite_bid - tick * step_ticks * level as f64;
+                    if px <= 0.0 || px >= legs.favorite_ask {
+                        continue;
+                    }
+                    let clip = anticipate_cfg
+                        .clip_usd
+                        .min(load_left)
+                        .max(anticipate_cfg.min_order_usd);
+                    let qty = (clip / px).max(input.market.min_order_size());
+                    let reason = format!(
+                        "late_favorite anticipate leg={:?} level={} px={:.4} bid={:.4} ask={:.4} regime={:?} model_fav={:.3} reversal={:.3} remaining_ms={remaining_ms} clip_usd={:.2} cumulative={:.2}/{:.2}",
+                        legs.favorite_leg,
+                        level,
+                        px,
+                        legs.favorite_bid,
+                        legs.favorite_ask,
+                        input.btc_regime.regime(),
+                        directional_conviction.model_favorite,
+                        directional_conviction.path_reversal_risk,
+                        clip,
+                        current_anticipate_exposure_usd + (remaining_load - load_left),
+                        anticipate_cfg.max_load_usd,
+                    );
+                    notes.push(reason.clone());
+                    intents.push(build_late_favorite_intent(
+                        &input.market,
+                        legs.favorite_leg,
+                        px,
+                        qty,
+                        &format!("anticipate:{level}"),
+                        false,
+                        reason,
+                        input.now_ms,
+                    ));
+                    self.reserve_notional(
+                        input.market.market_id(),
+                        legs.favorite_leg,
+                        clip,
+                        input.now_ms,
+                    );
+                    load_left -= clip;
+                }
+            }
+        }
+
         if tail_cfg.enabled && tail_enabled && legs.cheap_ask <= tail_cfg.max_cheap_ask {
             let late_fav_filled_qty =
                 inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg)
@@ -4981,6 +5127,154 @@ mod tests {
         assert!(
             (late_favorite_regime_multiplier(&regime, LadderLeg::Yes, &cfg, 0.95) - 0.375).abs()
                 < 1e-9
+        );
+    }
+
+    fn high_conviction_regime() -> crate::signals::BtcRegimeSnapshot {
+        // Low vol (<8 bps) + dominant trend (return_180s / vol >= 5) → DirectionalSmooth.
+        crate::signals::BtcRegimeSnapshot {
+            realized_vol_5m_bps: Some(2.0),
+            return_30s_bps: Some(15.0),
+            return_60s_bps: Some(16.0),
+            return_120s_bps: Some(18.0),
+            return_180s_bps: Some(20.0),
+            last_price: Some(120.0),
+            ..Default::default()
+        }
+    }
+
+    fn anticipate_config(enabled: bool) -> LateFavoriteStrategyConfig {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate = LateFavAnticipateConfig {
+            enabled,
+            ..LateFavAnticipateConfig::default()
+        };
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = 0.50;
+        cfg
+    }
+
+    fn anticipate_intents(decision: &StrategyDecision) -> Vec<&OrderIntent> {
+        let intents: &[OrderIntent] = match decision {
+            StrategyDecision::QuoteSet { intents, .. } => intents,
+            StrategyDecision::Mixed { intents, .. } => intents,
+            _ => return Vec::new(),
+        };
+        intents
+            .iter()
+            .filter(|intent| {
+                intent
+                    .quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.starts_with("late-fav-anticipate"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anticipate_emits_maker_ladder_when_all_gates_pass() {
+        let cfg = anticipate_config(true);
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.95,
+            120_000,
+        );
+        let decision = strategy.on_tick(input);
+        let intents = anticipate_intents(&decision);
+        assert!(
+            !intents.is_empty(),
+            "expected anticipate ladder to emit; decision={decision:?}"
+        );
+        assert_eq!(intents.len(), 3, "expected 3-level ladder");
+        for intent in &intents {
+            assert!(
+                intent.limit_price <= 0.71 + 1e-9,
+                "anticipate price must rest at or below favorite_bid; px={}",
+                intent.limit_price
+            );
+            assert!(
+                intent.limit_price >= 0.68 - 1e-9,
+                "anticipate price must stay within step-ticks band; px={}",
+                intent.limit_price
+            );
+            assert!(intent.client_order_id.as_str().ends_with(":maker"));
+        }
+    }
+
+    #[test]
+    fn anticipate_skips_when_disabled() {
+        let cfg = anticipate_config(false);
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.95,
+            120_000,
+        );
+        let decision = strategy.on_tick(input);
+        assert!(
+            anticipate_intents(&decision).is_empty(),
+            "expected no anticipate intents when disabled"
+        );
+    }
+
+    #[test]
+    fn anticipate_skips_when_favorite_ask_below_band() {
+        let cfg = anticipate_config(true);
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.51, 0.52, 0.47, 0.48);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.95,
+            120_000,
+        );
+        let decision = strategy.on_tick(input);
+        assert!(
+            anticipate_intents(&decision).is_empty(),
+            "expected no anticipate intents when favorite_ask below min_favorite_ask"
+        );
+    }
+
+    #[test]
+    fn anticipate_skips_when_remaining_time_short() {
+        let cfg = anticipate_config(true);
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.95,
+            240_000,
+        );
+        let decision = strategy.on_tick(input);
+        assert!(
+            anticipate_intents(&decision).is_empty(),
+            "expected no anticipate intents when remaining_ms < min_remaining_ms (60s left)"
         );
     }
 }

@@ -120,6 +120,27 @@ late_favorite:
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
     min_order_usd: 10.0
+  favorite_anticipate:
+    # Forward-looking maker bids on the favorite leg, posted at favorite_bid
+    # (and 1-2 ticks below) while the favorite is climbing through 0.55-0.80.
+    # Designed to catch profit-takers selling into the climb, capturing the
+    # favorite at a materially better price than the FAK climb chase. Sizes
+    # start tiny ($5/level x 3 = $15) until live observation confirms the
+    # realized fill rate and entry-price improvement vs late_fav climb.
+    enabled: true
+    allow_flat_regime: false
+    allow_whipsaw_regime: false
+    min_model_favorite: 0.92
+    max_path_reversal_risk: 0.15
+    require_btc_confirms: true
+    min_favorite_ask: 0.55
+    max_favorite_ask: 0.80
+    min_remaining_ms: 120000
+    clip_usd: 5.0
+    max_load_usd: 25.0
+    min_order_usd: 1.0
+    ladder_levels: 3
+    level_step_ticks: 1
   convex_tail:
     enabled: true
     clip_usd: 3.0
