@@ -2926,13 +2926,19 @@ where
                             favorite_load_levels(&climb_cfg, legs.favorite_ask, sizing_remaining_ms)
                         })
                         .min(entry_policy.max_levels);
-                        // Late-favorite is an active payoff sleeve, not passive
-                        // inventory discovery. Once the entry policy has opted
-                        // into taker execution, do not leave lower passive
-                        // maker rungs behind: those create tiny scrap fills
-                        // when the real trade was to consume available
-                        // high-cert liquidity now.
-                        let aggressive_all_levels = use_aggressive_taker;
+                        // Late-favorite FAK with maker-rest fallback: fire
+                        // level 0 as FAK at favorite_ask to lift any visible
+                        // liquidity, then let levels 1+ rest as post-only
+                        // makers at favorite_bid (and a tick below per level).
+                        // Without the fallback rungs, every climb where the
+                        // visible offer has already been swept by faster bots
+                        // produces a "no orders found to match with FAK order"
+                        // venue rejection and zero exposure, even when the
+                        // strategy strongly wants this entry. The maker rest
+                        // catches the post-spike dip if the FAK no-matches and
+                        // mirrors the cheap-tail `use_ultra_cheap_maker_fallback`
+                        // pattern.
+                        let aggressive_all_levels = false;
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -5253,6 +5259,94 @@ mod tests {
             anticipate_intents(&decision).is_empty(),
             "expected no anticipate intents when favorite_ask below min_favorite_ask"
         );
+    }
+
+    fn climb_intents(decision: &StrategyDecision) -> Vec<&OrderIntent> {
+        let intents: &[OrderIntent] = match decision {
+            StrategyDecision::QuoteSet { intents, .. } => intents,
+            StrategyDecision::Mixed { intents, .. } => intents,
+            _ => return Vec::new(),
+        };
+        intents
+            .iter()
+            .filter(|intent| {
+                intent
+                    .quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.contains("climb"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn climb_keeps_maker_rest_levels_when_level_zero_is_taker() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = 0.50;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.favorite_climb.taker_min_favorite_ask = 0.90;
+        cfg.favorite_climb.near_touch_min_favorite_ask = 0.85;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.94, 0.95, 0.04, 0.05);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.98,
+            120_000,
+        );
+        let decision = strategy.on_tick(input);
+        let intents = climb_intents(&decision);
+        assert!(
+            !intents.is_empty(),
+            "expected climb intents to emit at favorite_ask=0.95; decision={decision:?}"
+        );
+        let taker_intents: Vec<&&OrderIntent> = intents
+            .iter()
+            .filter(|i| {
+                i.quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.starts_with("late-fav-taker-"))
+            })
+            .collect();
+        let maker_intents: Vec<&&OrderIntent> = intents
+            .iter()
+            .filter(|i| {
+                i.quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| {
+                        tag.starts_with("late-fav-climb") || tag.starts_with("late-fav-climb:")
+                    })
+            })
+            .collect();
+        assert!(
+            !taker_intents.is_empty(),
+            "expected at least one taker FAK intent at level 0; tags={:?}",
+            intents
+                .iter()
+                .map(|i| i.quote_level_tag.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !maker_intents.is_empty(),
+            "expected at least one maker post-only rest intent at levels 1+; tags={:?}",
+            intents
+                .iter()
+                .map(|i| i.quote_level_tag.clone())
+                .collect::<Vec<_>>()
+        );
+        for taker in &taker_intents {
+            assert!(taker.client_order_id.as_str().contains("climb:0"));
+        }
+        for maker in &maker_intents {
+            assert!(maker.client_order_id.as_str().ends_with(":maker"));
+            assert!(maker.limit_price < 0.95 - 1e-9);
+        }
     }
 
     #[test]
