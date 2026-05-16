@@ -208,11 +208,8 @@ impl Default for LateFavAnticipateConfig {
             // Loosened 0.15 -> 0.20 -> 0.25. Reversal risk now drives
             // the multiplier penalty rather than a hard skip.
             max_path_reversal_risk: 0.25,
-            // No longer a hard requirement; size_multiplier downscales
-            // when btc_confirms is false (0.7x). Many late-stage climbs
-            // happen on time-decay of uncertainty rather than BTC spot.
-            require_btc_confirms: false,
-            min_favorite_ask: 0.55,
+            require_btc_confirms: true,
+            min_favorite_ask: 0.60,
             max_favorite_ask: 0.80,
             // Time-remaining is no longer gated. The model's BSM variance
             // term collapses as time->0, so `model_favorite` naturally

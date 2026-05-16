@@ -140,11 +140,8 @@ late_favorite:
     min_model_favorite: 0.85
     # Loosened 0.15 -> 0.20 -> 0.25 (reversal-risk now penalises size via multiplier)
     max_path_reversal_risk: 0.25
-    # No longer a hard requirement; btc_confirms=false scales size by 0.7x
-    # rather than skipping. Late-stage climbs often happen on time-decay of
-    # uncertainty rather than BTC spot.
-    require_btc_confirms: false
-    min_favorite_ask: 0.55
+    require_btc_confirms: true
+    min_favorite_ask: 0.60
     max_favorite_ask: 0.80
     # No time-remaining gate. `model_favorite >= 0.85` is self-governing
     # near resolution (BSM variance collapses -> step function). Venue
