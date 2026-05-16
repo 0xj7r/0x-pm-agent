@@ -1354,7 +1354,15 @@ fn favorite_direction_signal<M: MarketDescriptor>(
             .into_iter()
             .flatten()
             .any(|r| r >= threshold * 0.35);
-    let model_ok = model_favorite >= (legs.favorite_ask + 0.03).min(0.98)
+    let model_edge_cutoff = if legs.favorite_ask >= cfg.taker_min_favorite_ask {
+        0.02
+    } else if legs.favorite_ask >= cfg.near_touch_min_favorite_ask {
+        0.005
+    } else {
+        0.03
+    };
+
+    let model_ok = model_favorite >= (legs.favorite_ask + model_edge_cutoff).min(0.98)
         && no_sharp_reversal
         && (side_strike.map(|m| m >= 0.5).unwrap_or(false)
             || [side_60, side_120, side_180]
@@ -1366,7 +1374,7 @@ fn favorite_direction_signal<M: MarketDescriptor>(
     (
         ok,
         format!(
-            "favorite_signal favorite={:?} ok={} ask={:.4} side_strike_bps={:?} side_30s_bps={:?} side_60s_bps={:?} side_120s_bps={:?} side_180s_bps={:?} model_favorite={:.4} threshold_bps={:.2} momentum_ok={} strike_ok={} model_ok={}",
+            "favorite_signal favorite={:?} ok={} ask={:.4} side_strike_bps={:?} side_30s_bps={:?} side_60s_bps={:?} side_120s_bps={:?} side_180s_bps={:?} model_favorite={:.4} model_edge_cutoff={:.3} threshold_bps={:.2} momentum_ok={} strike_ok={} model_ok={}",
             legs.favorite_leg,
             ok,
             legs.favorite_ask,
@@ -1376,6 +1384,7 @@ fn favorite_direction_signal<M: MarketDescriptor>(
             side_120,
             side_180,
             model_favorite,
+            model_edge_cutoff,
             threshold,
             momentum_ok,
             strike_ok,
