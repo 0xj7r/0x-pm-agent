@@ -189,16 +189,29 @@ impl Default for LateFavAnticipateConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            // Flat/Whipsaw regimes intentionally remain off by default —
+            // maker bids in those regimes fill on adverse selection rather
+            // than profit-taker flow into the climb the lane is built for.
             allow_flat_regime: false,
             allow_whipsaw_regime: false,
-            min_model_favorite: 0.92,
-            max_path_reversal_risk: 0.15,
+            // Loosened from 0.92 -> 0.90 to allow more participation while
+            // still requiring strong model conviction. At 0.90 vs 0.92 the
+            // worst-case EV per share at the top of the band drops from
+            // $0.12 to $0.10, still positive on every entry in 0.55-0.80.
+            min_model_favorite: 0.90,
+            // Loosened 0.15 -> 0.20: tolerate slightly more reversal risk
+            // since size_multiplier already discounts entry size by it.
+            max_path_reversal_risk: 0.20,
             require_btc_confirms: true,
             min_favorite_ask: 0.55,
             max_favorite_ask: 0.80,
-            min_remaining_ms: 120_000,
-            clip_usd: 5.0,
-            max_load_usd: 25.0,
+            // Loosened 120s -> 90s: enter earlier in the bar so maker bids
+            // have more time to be hit by profit-takers.
+            min_remaining_ms: 90_000,
+            // Modest size bump (5 -> 7, 25 -> 35) now that we have one
+            // resolved-favorable maker-rest fill to validate the pattern.
+            clip_usd: 7.0,
+            max_load_usd: 35.0,
             min_order_usd: 1.0,
             ladder_levels: 3,
             level_step_ticks: 1,
