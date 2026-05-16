@@ -3491,8 +3491,12 @@ where
                         legs.cheap_ask,
                         reversal_score,
                     );
-                    let aggressive_all_levels =
-                        use_aggressive_taker && directional_conviction.barbell;
+                    // Always keep maker-rest rungs behind level 0 FAK, even
+                    // in barbell mode. Without the rest, an FAK that no-matches
+                    // because the visible offer was already lifted produces
+                    // zero hedge fills, leaving the favorite sleeve uncovered.
+                    // Mirrors the late-fav climb FAK->maker fallback pattern.
+                    let aggressive_all_levels = false;
                     for level in 0..level_count {
                         if load_left < reversal_cfg.min_order_usd {
                             break;
