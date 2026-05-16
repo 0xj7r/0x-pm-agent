@@ -214,10 +214,14 @@ impl Default for LateFavAnticipateConfig {
             require_btc_confirms: false,
             min_favorite_ask: 0.55,
             max_favorite_ask: 0.80,
-            // Loosened 120s -> 90s -> 30s. Captures final-minute climbs
-            // that are driven by resolution-gambling flow even when the
-            // first 4 minutes of the bar were quiet.
-            min_remaining_ms: 30_000,
+            // Time-remaining is no longer gated. The model's BSM variance
+            // term collapses as time->0, so `model_favorite` naturally
+            // becomes a step function and `model_favorite >= 0.85` only
+            // admits the all-but-resolved winning side near expiry. Plus
+            // Bonereaper empirically fills in the final 10-30s, so flow
+            // exists. The venue will reject any order that arrives after
+            // resolution — that's the only "too late" safety we need.
+            min_remaining_ms: 0,
             // Modest size bump now that gates are continuous.
             clip_usd: 7.0,
             max_load_usd: 35.0,
@@ -5572,12 +5576,14 @@ mod tests {
     }
 
     #[test]
-    fn anticipate_skips_when_remaining_time_short() {
+    fn anticipate_fires_at_very_low_time_remaining_when_model_confident() {
+        // Time-remaining is no longer gated. With model_favorite=0.95 and
+        // only 15s left in the bar, the model is near-certain and the
+        // strategy should still emit a maker ladder (Bonereaper-style
+        // final-seconds participation).
         let cfg = anticipate_config(true);
         let mut strategy = LateFavoriteStrategy::new(cfg);
         let snapshot = snap(0.71, 0.72, 0.27, 0.28);
-        // 5-min bar starts at t=0, ends at t=300_000. To leave less than the
-        // default 30s remaining we need now_ms >= 270_000.
         let input = strategy_input(
             snapshot,
             high_conviction_regime(),
@@ -5591,8 +5597,8 @@ mod tests {
         );
         let decision = strategy.on_tick(input);
         assert!(
-            anticipate_intents(&decision).is_empty(),
-            "expected no anticipate intents when remaining_ms < min_remaining_ms (15s left)"
+            !anticipate_intents(&decision).is_empty(),
+            "expected anticipate to fire at very low remaining_ms when model is confident; decision={decision:?}"
         );
     }
 }

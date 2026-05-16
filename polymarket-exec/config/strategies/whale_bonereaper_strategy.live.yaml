@@ -146,9 +146,11 @@ late_favorite:
     require_btc_confirms: false
     min_favorite_ask: 0.55
     max_favorite_ask: 0.80
-    # Loosened 120s -> 90s -> 30s. Captures final-minute climbs that
-    # accumulate in the last 60s of a bar (observed on market 1778956200).
-    min_remaining_ms: 30000
+    # No time-remaining gate. `model_favorite >= 0.85` is self-governing
+    # near resolution (BSM variance collapses -> step function). Venue
+    # rejects post-resolution orders mechanically. Lets Bonereaper-style
+    # final-seconds entries through when the model is confident.
+    min_remaining_ms: 0
     clip_usd: 7.0
     max_load_usd: 35.0
     min_order_usd: 1.0
