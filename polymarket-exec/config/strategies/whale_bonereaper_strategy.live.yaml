@@ -109,7 +109,8 @@ late_favorite:
     # it belongs in reversal_hedge with its own sizing. This is a payoff
     # *classification* boundary, not a tunable knob.
     max_cheap_ask: 0.10
-    max_late_fav_spend_fraction: 0.06
+    max_late_fav_spend_fraction: 0.04
+    max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.04
     # Ultra-cheap maker rungs at 1c collapse the ladder to a single level once
     # we improve by a tick (level 1 -> 0c, filtered). Setting 0 keeps every

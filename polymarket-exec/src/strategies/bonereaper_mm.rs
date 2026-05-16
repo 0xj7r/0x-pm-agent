@@ -1853,11 +1853,11 @@ fn cheap_tail_cap_usd(
         return 0.0;
     }
     let favorite_loss_at_risk = late_fav_qty * favorite_avg_price;
-    // Edge-erosion cap must be funded by *realized* favorite-win upside, not
-    // upside implied by working/reserved notional. Otherwise the bundled cap
-    // stays inflated while makers are resting, and repeated tail emissions
-    // accumulate well past the win-edge fraction once fills land.
-    let favorite_win_upside = if late_fav_filled_qty > 0.0
+    // Favorability for tail spend should be constrained by realized upside
+    // whenever possible, but if only working/in-flight favorite exposure is
+    // present we still apply upside-aware limits to avoid overloading the
+    // sleeve while it is not yet filled.
+    let realized_favorite_win_upside = if late_fav_filled_qty > 0.0
         && favorite_avg_filled_price > 0.0
         && favorite_avg_filled_price < 1.0
     {
@@ -1865,6 +1865,15 @@ fn cheap_tail_cap_usd(
     } else {
         0.0
     };
+    let expected_favorite_win_upside = if late_fav_qty > 0.0
+        && favorite_avg_price > 0.0
+        && favorite_avg_price < 1.0
+    {
+        late_fav_qty * (1.0 - favorite_avg_price)
+    } else {
+        0.0
+    };
+    let favorite_win_upside = realized_favorite_win_upside.max(expected_favorite_win_upside);
     let coverage_fraction = (cheap_tail_coverage_fraction(cfg, regime)
         * (1.0
             + path_reversal_risk.clamp(0.0, 1.0)
@@ -4331,8 +4340,8 @@ mod tests {
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
-        assert_eq!(cfg.max_win_edge_spend_fraction, 0.45);
-        assert_eq!(cfg.max_late_fav_spend_fraction, 0.06);
+        assert_eq!(cfg.max_win_edge_spend_fraction, 0.30);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.04);
         assert_eq!(cfg.ultra_cheap_max_ask, 0.04);
         assert_eq!(cfg.maker_improve_ticks, 0.0);
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
