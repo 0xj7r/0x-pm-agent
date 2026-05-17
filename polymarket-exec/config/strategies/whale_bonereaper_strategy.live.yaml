@@ -54,13 +54,15 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # Legacy paired-MM execution shape: many tiny maker probes rather than one
-  # meaningful 20-share center clip.
-  # KNOWN ISSUE 2026-05-17: max_unpaired_core_qty cap checks PROJECTED
-  # imbalance (assuming symmetric fills), not actual leg-fill counts.
-  # Markets observed leaking 10-20 share asymmetric inventory per bar.
-  # Fix path: book-imbalance gating per leg (next ship).
-  enabled: true
+  # PAUSED 2026-05-17 per operator direction. Lane was not contributing
+  # meaningful P&L at current size (5sh venue-min clips × 12 thin rungs
+  # = $172/3hr) and confirmed asymmetric leg-fill leak (15-20sh
+  # imbalances on multiple markets in 6hr baseline). Unlawful_shear's
+  # paired-MM uses 10x bigger clips (~50sh) at concentrated levels —
+  # the right replication needs per-leg book-imbalance gating to fix
+  # the asymmetric leak before scaling clip size. Late-fav + cheap-tail
+  # + reversal-hedge carry the strategy until paired-core is rebuilt.
+  enabled: false
   center_probe_only: false
   ladder_levels: 12
   ladder_span: 0.60
