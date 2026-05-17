@@ -98,6 +98,10 @@ pub struct FavoriteClimbConfig {
     /// dominant failure mode.
     pub taker_min_favorite_ask: f64,
     pub taker_window_sec: u64,
+    /// Extra ticks of limit-price tolerance for aggressive FAK favorite buys.
+    /// The actual submitted limit is still capped at `p_adj - kelly.min_edge`,
+    /// so this covers touch drift/latency without allowing negative-edge chase.
+    pub taker_slippage_ticks: f64,
     /// Optional hard cutoff after which this phase is disabled.
     pub disable_after_ms: Option<EpochMillis>,
     /// Stale-maker -> FAK escalation. When a `late-fav:climb:N:*:maker`
@@ -148,6 +152,7 @@ impl Default for FavoriteClimbConfig {
             reversal_multiplier: 0.55,
             taker_min_favorite_ask: 0.87,
             taker_window_sec: 120,
+            taker_slippage_ticks: 0.0,
             disable_after_ms: None,
             escalation_enabled: true,
             escalation_age_ms: 25_000,
@@ -1186,6 +1191,25 @@ fn late_favorite_maker_base_price(
     let max_passive = (ask - tick).max(tick);
     let px = passive_px.max(near_touch_px).min(max_passive);
     (px > 0.0 && px < ask && px < 1.0).then_some(px)
+}
+
+fn aggressive_favorite_limit_price(
+    ask: f64,
+    tick: f64,
+    cfg: &FavoriteClimbConfig,
+    kelly_p_adj: f64,
+) -> Option<f64> {
+    if ask <= 0.0 || tick <= 0.0 {
+        return None;
+    }
+    let slippage_cap = ask + cfg.taker_slippage_ticks.max(0.0) * tick;
+    let edge_cap = kelly_p_adj - cfg.kelly.min_edge.max(0.0);
+    let raw_px = slippage_cap.min(edge_cap).min(cfg.max_favorite_ask);
+    let ticked_px = ((raw_px / tick) + 1e-9).floor() * tick;
+    if ticked_px + 1e-9 < ask || ticked_px <= 0.0 || ticked_px >= 1.0 {
+        return None;
+    }
+    Some(ticked_px)
 }
 
 fn build_late_favorite_intent<M: MarketDescriptor>(
@@ -3155,6 +3179,13 @@ where
                             + (directional_conviction.model_favorite - 0.5)
                                 * (1.0 - directional_conviction.path_reversal_risk);
                         let kelly_edge = kelly_p_adj - legs.favorite_ask;
+                        let aggressive_limit_px = aggressive_favorite_limit_price(
+                            legs.favorite_ask,
+                            tick,
+                            &climb_cfg,
+                            kelly_p_adj,
+                        )
+                        .unwrap_or(legs.favorite_ask);
                         let mut load_left = remaining_load;
                         let use_sub90_fak = entry_policy.allow_taker
                             && legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
@@ -3228,14 +3259,17 @@ where
                             let aggressive_taker = aggressive_all_levels
                                 || (use_aggressive_taker && level == 0 && level0_immediate_fak);
                             let px = if aggressive_taker {
-                                legs.favorite_ask
+                                aggressive_limit_px
                             } else {
                                 base_px - tick * level as f64
                             };
                             if px + 1e-9 < entry_policy.min_price {
                                 continue;
                             }
-                            if px <= 0.0 || px > legs.favorite_ask {
+                            if px <= 0.0 || px > climb_cfg.max_favorite_ask + 1e-9 {
+                                continue;
+                            }
+                            if !aggressive_taker && px > legs.favorite_ask {
                                 continue;
                             }
                             if !aggressive_taker && px >= legs.favorite_ask {
@@ -5812,6 +5846,7 @@ mod tests {
         assert_eq!(climb.max_load_usd, 200.0);
         assert_eq!(climb.min_order_usd, 10.0);
         assert_eq!(climb.taker_min_favorite_ask, 0.87);
+        assert_eq!(climb.taker_slippage_ticks, 3.0);
         assert!(
             cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
                 < cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::Whipsaw))
@@ -6058,6 +6093,27 @@ mod tests {
             assert!(maker.client_order_id.as_str().ends_with(":maker"));
             assert!(maker.limit_price < 0.95 - 1e-9);
         }
+    }
+
+    #[test]
+    fn aggressive_favorite_limit_price_uses_edge_bounded_slippage() {
+        let mut cfg = FavoriteClimbConfig::default();
+        cfg.max_favorite_ask = 0.99;
+        cfg.taker_slippage_ticks = 3.0;
+        cfg.kelly.min_edge = 0.025;
+
+        let px = aggressive_favorite_limit_price(0.79, 0.01, &cfg, 0.8482)
+            .expect("three ticks of slippage should fit inside Kelly edge");
+        assert!((px - 0.82).abs() < 1e-9);
+
+        let px = aggressive_favorite_limit_price(0.79, 0.01, &cfg, 0.815)
+            .expect("edge cap should allow touch but no extra slippage");
+        assert!((px - 0.79).abs() < 1e-9);
+
+        assert!(
+            aggressive_favorite_limit_price(0.92, 0.01, &cfg, 0.895).is_none(),
+            "must not chase when p_adj - min_edge is already below touch"
+        );
     }
 
     #[test]

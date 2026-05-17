@@ -109,6 +109,7 @@ late_favorite:
       fractional: 0.30
       max_clip_fraction: 0.30
       min_edge: 0.025
+    taker_slippage_ticks: 3.0
     escalation_age_ms: 60000
     escalation_drift_ticks: 4
     per_bar_gross_cap_usd: 400.0

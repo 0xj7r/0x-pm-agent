@@ -128,6 +128,7 @@ pub struct FavoriteClimbSubsection {
     pub reversal_multiplier: Option<f64>,
     pub taker_min_favorite_ask: Option<f64>,
     pub taker_window_sec: Option<u64>,
+    pub taker_slippage_ticks: Option<f64>,
     pub disable_after_ms: Option<u64>,
     pub clip_scale: Option<f64>,
     pub escalation_enabled: Option<bool>,
@@ -460,6 +461,9 @@ impl StrategyProfile {
                     .taker_min_favorite_ask
                     .unwrap_or(climb_def.taker_min_favorite_ask),
                 taker_window_sec: c.taker_window_sec.unwrap_or(climb_def.taker_window_sec),
+                taker_slippage_ticks: c
+                    .taker_slippage_ticks
+                    .unwrap_or(climb_def.taker_slippage_ticks),
                 disable_after_ms: c.disable_after_ms,
                 escalation_enabled: c.escalation_enabled.unwrap_or(climb_def.escalation_enabled),
                 escalation_age_ms: c.escalation_age_ms.unwrap_or(climb_def.escalation_age_ms),
