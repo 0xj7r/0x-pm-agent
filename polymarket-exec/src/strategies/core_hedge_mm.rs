@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent, QuoteSnapshot};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
-use crate::signals::BtcRegime;
+use crate::signals::{BookModelAgreement, BtcRegime};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, MarketId, MergeIntent, StrategyDecision, SuppressionScope};
 
@@ -31,6 +31,11 @@ const PAIRED_CORE_CENTER_PROBE_MIN_PRICE: f64 = 0.42;
 const PAIRED_CORE_CENTER_PROBE_MAX_PRICE: f64 = 0.58;
 const PAIRED_CORE_REPAIR_PAIR_COST_LIMIT: f64 = 0.99;
 const PAIRED_CORE_MERGE_PAIR_COST_LIMIT: f64 = 0.99;
+const DENSE_FRESH_MAX_FAVORITE_ASK: f64 = 0.65;
+const DENSE_FRESH_MIN_CHEAP_ASK: f64 = 0.35;
+const DENSE_FRESH_MAX_MODEL_BOOK_DIVERGENCE: f64 = 0.18;
+const DENSE_FRESH_MAX_MODEL_FAVORITE: f64 = 0.68;
+const DENSE_FRESH_MAX_TOXICITY: f64 = 0.35;
 
 /// Where each paired-core ladder rung is positioned relative to the book.
 ///
@@ -961,6 +966,197 @@ fn build_mate_repair_order<M: MarketDescriptor>(
     )
 }
 
+fn paired_core_open_order_count<M: MarketDescriptor>(input: &StrategyInput<M>) -> usize {
+    input
+        .open_orders
+        .iter()
+        .filter(|order| {
+            order
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("paired-core:"))
+        })
+        .count()
+}
+
+fn dense_fresh_entry_gate<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    yes_ask: f64,
+    no_ask: f64,
+) -> Result<String, String> {
+    let favorite_leg = if yes_ask >= no_ask {
+        LadderLeg::Yes
+    } else {
+        LadderLeg::No
+    };
+    let favorite_ask = yes_ask.max(no_ask);
+    let cheap_ask = yes_ask.min(no_ask);
+    if favorite_ask > DENSE_FRESH_MAX_FAVORITE_ASK + 1e-9
+        || cheap_ask < DENSE_FRESH_MIN_CHEAP_ASK - 1e-9
+    {
+        return Err(format!(
+            "paired_core dense fresh blocked: non-centered book favorite_ask={favorite_ask:.4} cheap_ask={cheap_ask:.4} max_favorite={DENSE_FRESH_MAX_FAVORITE_ASK:.4} min_cheap={DENSE_FRESH_MIN_CHEAP_ASK:.4}",
+        ));
+    }
+
+    let model_favorite = match favorite_leg {
+        LadderLeg::Yes => input.fair_value.p_up,
+        LadderLeg::No => input.fair_value.p_down,
+    };
+    if model_favorite.is_finite() {
+        let divergence = (model_favorite - favorite_ask).abs();
+        if divergence > DENSE_FRESH_MAX_MODEL_BOOK_DIVERGENCE + 1e-9
+            || model_favorite > DENSE_FRESH_MAX_MODEL_FAVORITE + 1e-9
+        {
+            return Err(format!(
+                "paired_core dense fresh blocked: model/book directional divergence favorite_leg={favorite_leg:?} model_favorite={model_favorite:.4} favorite_ask={favorite_ask:.4} divergence={divergence:.4} max_divergence={DENSE_FRESH_MAX_MODEL_BOOK_DIVERGENCE:.4} max_model_favorite={DENSE_FRESH_MAX_MODEL_FAVORITE:.4}",
+            ));
+        }
+    }
+
+    let agreement =
+        BookModelAgreement::compute(favorite_leg, &input.order_book_pressure, &input.momentum);
+    if agreement.signal_confidence > 0.0
+        && agreement.toxicity_score > DENSE_FRESH_MAX_TOXICITY + 1e-9
+    {
+        return Err(format!(
+            "paired_core dense fresh blocked: toxic flow/depth/momentum favorite_leg={favorite_leg:?} toxicity={:.4} max_toxicity={DENSE_FRESH_MAX_TOXICITY:.4} agreement={:.4} flow={:.4} depth={:.4} momentum={:.4}",
+            agreement.toxicity_score,
+            agreement.agreement,
+            agreement.flow_score,
+            agreement.depth_score,
+            agreement.momentum_score,
+        ));
+    }
+
+    Ok(format!(
+        "paired_core dense fresh gate passed favorite_ask={favorite_ask:.4} cheap_ask={cheap_ask:.4} model_favorite={model_favorite:.4} toxicity={:.4} signal_confidence={:.4}",
+        agreement.toxicity_score,
+        agreement.signal_confidence,
+    ))
+}
+
+fn dense_mate_repair_decision<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    cfg: &CoreHedgeMmConfig,
+    yes_bid: f64,
+    yes_ask: f64,
+    no_bid: f64,
+    no_ask: f64,
+    notes: &mut Vec<String>,
+) -> Option<StrategyDecision> {
+    let filled_yes_qty = input.paired_core_inventory.yes_qty.max(0.0);
+    let filled_no_qty = input.paired_core_inventory.no_qty.max(0.0);
+    let filled_abs_imbalance = (filled_yes_qty - filled_no_qty).abs();
+    let min_repair_qty = input.market.min_order_size().max(0.0);
+    if filled_abs_imbalance <= 1e-9 {
+        return None;
+    }
+
+    let open_count = paired_core_open_order_count(input);
+    if open_count > 0
+        || input.open_paired_core_order_exposure.yes_qty > 1e-9
+        || input.open_paired_core_order_exposure.no_qty > 1e-9
+    {
+        notes.push(format!(
+            "paired_core dense one-sided fill: cancelling working paired-core quotes before repair filled_yes={filled_yes_qty:.4} filled_no={filled_no_qty:.4} open_orders={open_count} open_yes={:.4} open_no={:.4}",
+            input.open_paired_core_order_exposure.yes_qty,
+            input.open_paired_core_order_exposure.no_qty,
+        ));
+        return Some(StrategyDecision::Suppress {
+            scope: SuppressionScope::PairedOnly,
+            reason: CoolingReason::AsymmetricFillCooldown,
+            preserve_quotes: false,
+            notes: notes.clone(),
+        });
+    }
+
+    if filled_abs_imbalance + 1e-9 < min_repair_qty {
+        notes.push(format!(
+            "paired_core dense fresh stopped after sub-min unpaired fill filled_abs_imbalance={filled_abs_imbalance:.4} min_repair_qty={min_repair_qty:.4}",
+        ));
+        return Some(StrategyDecision::Suppress {
+            scope: SuppressionScope::PairedOnly,
+            reason: CoolingReason::AsymmetricFillCooldown,
+            preserve_quotes: false,
+            notes: notes.clone(),
+        });
+    }
+
+    let repair_leg = if filled_yes_qty > filled_no_qty {
+        LadderLeg::No
+    } else {
+        LadderLeg::Yes
+    };
+    let (best_bid, best_ask) = match repair_leg {
+        LadderLeg::Yes => (yes_bid, yes_ask),
+        LadderLeg::No => (no_bid, no_ask),
+    };
+    let repair_limit = effective_repair_pair_cost_limit(cfg);
+    let fee_buffer = cfg.repair_fee_buffer.max(0.0);
+    let Some(pair_cost) = paired_core_repair_pair_cost(input, repair_leg, best_ask, fee_buffer)
+    else {
+        notes.push(format!(
+            "paired_core dense mate repair skipped leg={repair_leg:?}: missing opposite filled average cost",
+        ));
+        return Some(StrategyDecision::Suppress {
+            scope: SuppressionScope::PairedOnly,
+            reason: CoolingReason::AsymmetricFillCooldown,
+            preserve_quotes: false,
+            notes: notes.clone(),
+        });
+    };
+    if pair_cost >= repair_limit {
+        notes.push(format!(
+            "paired_core dense mate repair skipped leg={repair_leg:?}: pair_cost={pair_cost:.4} limit={repair_limit:.4} fee_buffer={fee_buffer:.4}",
+        ));
+        return Some(StrategyDecision::Suppress {
+            scope: SuppressionScope::PairedOnly,
+            reason: CoolingReason::AsymmetricFillCooldown,
+            preserve_quotes: false,
+            notes: notes.clone(),
+        });
+    }
+
+    let target_qty = filled_yes_qty.max(filled_no_qty);
+    let filled_repair_qty = match repair_leg {
+        LadderLeg::Yes => filled_yes_qty,
+        LadderLeg::No => filled_no_qty,
+    };
+    let repair_qty = (target_qty - filled_repair_qty)
+        .min(cfg.dense_tandem.clip_shares.max(min_repair_qty))
+        .max(0.0);
+    let Some(intent) = build_mate_repair_order(
+        &input.market,
+        repair_leg,
+        best_bid,
+        best_ask,
+        repair_qty,
+        cfg.min_order_usd,
+        cfg.maker_improve_ticks,
+        input.now_ms,
+    ) else {
+        notes.push(format!(
+            "paired_core dense mate repair skipped leg={repair_leg:?}: no passive quote fit repair_qty={repair_qty:.4}",
+        ));
+        return Some(StrategyDecision::Suppress {
+            scope: SuppressionScope::PairedOnly,
+            reason: CoolingReason::AsymmetricFillCooldown,
+            preserve_quotes: false,
+            notes: notes.clone(),
+        });
+    };
+
+    notes.push(format!(
+        "paired_core dense repair-only emitted leg={repair_leg:?} qty={:.4} px={:.4} pair_cost={pair_cost:.4} limit={repair_limit:.4}; broad dense ladder halted until flat",
+        intent.quantity, intent.limit_price,
+    ));
+    Some(StrategyDecision::QuoteSet {
+        intents: vec![intent],
+        notes: notes.clone(),
+    })
+}
+
 fn dense_tandem_decision<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     cfg: &CoreHedgeMmConfig,
@@ -1041,6 +1237,38 @@ fn dense_tandem_decision<M: MarketDescriptor>(
         }
     }
 
+    if let Some(decision) =
+        dense_mate_repair_decision(input, cfg, yes_bid, yes_ask, no_bid, no_ask, &mut notes)
+    {
+        return decision;
+    }
+
+    let open_count = paired_core_open_order_count(input);
+    if open_count > 0
+        || input.open_paired_core_order_exposure.yes_qty > 1e-9
+        || input.open_paired_core_order_exposure.no_qty > 1e-9
+    {
+        notes.push(format!(
+            "paired_core dense fresh suppressed: awaiting working paired-core orders open_orders={open_count} open_yes={:.4} open_no={:.4}; working orders do not count as hedge inventory",
+            input.open_paired_core_order_exposure.yes_qty,
+            input.open_paired_core_order_exposure.no_qty,
+        ));
+        return StrategyDecision::Noop { notes };
+    }
+
+    match dense_fresh_entry_gate(input, yes_ask, no_ask) {
+        Ok(note) => notes.push(note),
+        Err(reason) => {
+            notes.push(reason);
+            return StrategyDecision::Suppress {
+                scope: SuppressionScope::PairedOnly,
+                reason: CoolingReason::BtcTrending,
+                preserve_quotes: false,
+                notes,
+            };
+        }
+    }
+
     let book = DenseTandemBook {
         yes_bid,
         yes_ask,
@@ -1048,12 +1276,8 @@ fn dense_tandem_decision<M: MarketDescriptor>(
         no_ask,
     };
     let inventory = DenseTandemInventory {
-        yes_shares: (input.paired_core_inventory.yes_qty
-            + input.open_paired_core_order_exposure.yes_qty)
-            .max(0.0),
-        no_shares: (input.paired_core_inventory.no_qty
-            + input.open_paired_core_order_exposure.no_qty)
-            .max(0.0),
+        yes_shares: input.paired_core_inventory.yes_qty.max(0.0),
+        no_shares: input.paired_core_inventory.no_qty.max(0.0),
     };
 
     let rungs = match compute_dense_tandem_emission(&dense_cfg, &book, &inventory) {
@@ -2142,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_tandem_blocks_heavier_realized_plus_working_side() {
+    fn dense_tandem_cancels_working_quotes_before_repair_after_one_sided_fill() {
         let config = dense_paired_core_config();
         let mut strategy =
             CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
@@ -2153,14 +2377,130 @@ mod tests {
         let decision = strategy.on_tick(input);
 
         match decision {
-            StrategyDecision::QuoteSet { intents, .. } => {
-                assert!(intents
-                    .iter()
-                    .all(|intent| intent.instrument_id.as_str() == "no"));
-                assert_eq!(intents.len(), 3);
-                assert!(intents.iter().all(|intent| intent.pair_id.is_none()));
+            StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                assert_eq!(scope, SuppressionScope::PairedOnly);
+                assert!(!preserve_quotes);
+                assert!(notes.iter().any(|note| note.contains("one-sided fill")
+                    && note.contains("cancelling working paired-core quotes")));
             }
-            other => panic!("expected no-leg catch-up quotes, got {other:?}"),
+            other => panic!("expected paired-core cancel before repair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_awaits_working_orders_without_counting_them_as_hedge() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let mut input = strategy_input(snap_with_quotes(0.48, 0.50, 0.47, 0.49));
+        input.open_paired_core_order_exposure.no_qty = 10.0;
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::Noop { notes } => {
+                assert!(notes.iter().any(|note| {
+                    note.contains("awaiting working paired-core orders")
+                        && note.contains("do not count as hedge inventory")
+                }));
+            }
+            other => panic!("expected dense fresh no-op while working orders exist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_repair_only_after_one_sided_fill_when_books_are_clear() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let mut input = strategy_input(snap_with_quotes(0.48, 0.50, 0.47, 0.49));
+        input.paired_core_inventory = PairedInventorySnapshot {
+            yes_qty: 10.0,
+            yes_avg_cost: 0.27,
+            no_qty: 0.0,
+            no_avg_cost: 0.0,
+            ..PairedInventorySnapshot::default()
+        };
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::QuoteSet { intents, notes } => {
+                assert_eq!(intents.len(), 1);
+                assert_eq!(intents[0].instrument_id.as_str(), "no");
+                assert_eq!(
+                    intents[0].quote_level_tag.as_deref(),
+                    Some("paired-core:repair:mate")
+                );
+                assert!(notes
+                    .iter()
+                    .any(|note| note.contains("repair-only emitted")));
+                assert!(!notes
+                    .iter()
+                    .any(|note| note.contains("dense fresh gate passed")));
+            }
+            other => panic!("expected dense mate repair quote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_blocks_fresh_entries_outside_centered_chop() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let input = strategy_input(snap_with_quotes(0.64, 0.66, 0.31, 0.33));
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                assert_eq!(scope, SuppressionScope::PairedOnly);
+                assert!(!preserve_quotes);
+                assert!(notes.iter().any(|note| note.contains("non-centered book")));
+            }
+            other => panic!("expected dense fresh centered-chop block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_blocks_fresh_entries_when_model_and_book_diverge() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let mut input = strategy_input(snap_with_quotes(0.48, 0.50, 0.47, 0.49));
+        input.fair_value = FairValueEstimate {
+            p_up: 0.82,
+            p_down: 0.18,
+            ..neutral_fair_value()
+        };
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                assert_eq!(scope, SuppressionScope::PairedOnly);
+                assert!(!preserve_quotes);
+                assert!(notes.iter().any(|note| {
+                    note.contains("model/book directional divergence")
+                        && note.contains("model_favorite=0.8200")
+                }));
+            }
+            other => panic!("expected dense model/book divergence block, got {other:?}"),
         }
     }
 
