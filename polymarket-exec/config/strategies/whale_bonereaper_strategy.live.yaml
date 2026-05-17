@@ -136,9 +136,9 @@ late_favorite:
     # market is still mid-band.
     enabled: true
     min_ask: 0.48
-    max_ask: 0.58
-    min_model_probability: 0.90
-    max_path_reversal_risk: 0.35
+    max_ask: 0.64
+    min_model_probability: 0.85
+    max_path_reversal_risk: 0.55
     min_book_model_agreement: 0.45
     max_toxicity_score: 0.35
     min_btc_confirm_bps: 1.0

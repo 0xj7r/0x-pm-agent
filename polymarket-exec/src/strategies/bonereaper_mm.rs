@@ -6392,8 +6392,9 @@ mod tests {
         assert_eq!(reversal.taker_slippage_ticks, 1.0);
         assert!(mid_shadow.enabled);
         assert_eq!(mid_shadow.min_ask, 0.48);
-        assert_eq!(mid_shadow.max_ask, 0.58);
-        assert_eq!(mid_shadow.min_model_probability, 0.90);
+        assert_eq!(mid_shadow.max_ask, 0.64);
+        assert_eq!(mid_shadow.min_model_probability, 0.85);
+        assert_eq!(mid_shadow.max_path_reversal_risk, 0.55);
         assert_eq!(mid_shadow.max_clip_usd, 5.0);
         assert_eq!(climb.clip_usd, 45.0);
         // YAML no longer specifies max_load_usd literal -- the runtime
