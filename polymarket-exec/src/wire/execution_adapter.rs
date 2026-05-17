@@ -1130,10 +1130,7 @@ impl PolymarketExecutionAdapter {
                 // as USDC.e on the proxy; this converts them to pUSD so
                 // the runtime sees the proceeds as tradable balance
                 // (otherwise the "Activate Funds" UI step is needed).
-                let balance = self
-                    .relayer_client
-                    .deposit_wallet_usdce_balance()
-                    .await?;
+                let balance = self.relayer_client.deposit_wallet_usdce_balance().await?;
                 if balance < min_wrap_amount {
                     return Ok(Some(PusdWrapReport {
                         wallet: self
@@ -1150,9 +1147,8 @@ impl PolymarketExecutionAdapter {
                         wrap_tx_hash: None,
                     }));
                 }
-                let metadata = format!(
-                    "{{\"action\":\"auto_wrap_usdce_to_pusd\",\"amount\":\"{balance}\"}}"
-                );
+                let metadata =
+                    format!("{{\"action\":\"auto_wrap_usdce_to_pusd\",\"amount\":\"{balance}\"}}");
                 let ack = self
                     .relayer_client
                     .wrap_usdce_to_pusd(&self.signer, balance, metadata)

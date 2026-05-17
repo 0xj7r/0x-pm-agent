@@ -405,7 +405,10 @@ impl MmQuoteKind {
             Some(Self::ConvexAccumulation)
         } else if tag.contains("capital-recycle") || tag.contains("buy-light") {
             Some(Self::CapitalRecycle)
-        } else if tag.contains("mm-paired-bid") || tag.contains("paired-mm") {
+        } else if tag.contains("mm-paired-bid")
+            || tag.contains("paired-mm")
+            || tag.contains("paired-core")
+        {
             Some(Self::PairedEntry)
         } else if tag.contains("hedge-rescue") || tag.contains("rescue") {
             Some(Self::HedgeRescue)

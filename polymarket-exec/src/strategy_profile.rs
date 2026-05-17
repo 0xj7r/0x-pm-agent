@@ -17,16 +17,26 @@ use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
     LateFavAnticipateConfig, LateFavoriteStrategyConfig, ReversalHedgeConfig,
 };
-use crate::strategies::kelly_sizing::KellyClipConfig;
 use crate::strategies::core_hedge_mm::{
-    CoreHedgeMmConfig, CoreHedgeMmStrategyConfig, PairedCoreLadderAnchor,
+    CoreHedgeMmConfig, CoreHedgeMmStrategyConfig, DenseTandemConfig, PairedCoreEmitMode,
+    PairedCoreLadderAnchor,
 };
+use crate::strategies::kelly_sizing::KellyClipConfig;
 
 fn parse_paired_core_ladder_anchor(raw: Option<&str>) -> Option<PairedCoreLadderAnchor> {
     let raw = raw?.trim().to_ascii_lowercase();
     match raw.as_str() {
         "mid" => Some(PairedCoreLadderAnchor::Mid),
         "touch" => Some(PairedCoreLadderAnchor::Touch),
+        _ => None,
+    }
+}
+
+fn parse_paired_core_emit_mode(raw: Option<&str>) -> Option<PairedCoreEmitMode> {
+    let raw = raw?.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "legacy" => Some(PairedCoreEmitMode::Legacy),
+        "dense" | "dense_tandem" | "dense-tandem" => Some(PairedCoreEmitMode::DenseTandem),
         _ => None,
     }
 }
@@ -207,6 +217,14 @@ pub struct DirectionalSizingSubsection {
 #[serde(default)]
 pub struct CoreHedgeSection {
     pub enabled: Option<bool>,
+    pub emit_mode: Option<String>,
+    pub dense_levels_per_side: Option<usize>,
+    pub dense_tick: Option<f64>,
+    pub dense_clip_shares: Option<f64>,
+    pub dense_max_entry_pair_cost: Option<f64>,
+    pub dense_max_leg_imbalance_shares: Option<f64>,
+    pub dense_ladder_min_price: Option<f64>,
+    pub dense_ladder_max_price: Option<f64>,
     pub ladder_levels: Option<usize>,
     pub ladder_span: Option<f64>,
     pub center_price: Option<f64>,
@@ -303,6 +321,29 @@ impl StrategyProfile {
         CoreHedgeMmStrategyConfig {
             core_hedge: CoreHedgeMmConfig {
                 enabled: s.enabled.unwrap_or(defaults.enabled),
+                emit_mode: parse_paired_core_emit_mode(s.emit_mode.as_deref())
+                    .unwrap_or(defaults.emit_mode),
+                dense_tandem: DenseTandemConfig {
+                    levels_per_side: s
+                        .dense_levels_per_side
+                        .unwrap_or(defaults.dense_tandem.levels_per_side),
+                    tick: s.dense_tick.unwrap_or(defaults.dense_tandem.tick),
+                    clip_shares: s
+                        .dense_clip_shares
+                        .unwrap_or(defaults.dense_tandem.clip_shares),
+                    max_entry_pair_cost: s
+                        .dense_max_entry_pair_cost
+                        .unwrap_or(defaults.dense_tandem.max_entry_pair_cost),
+                    max_leg_imbalance_shares: s
+                        .dense_max_leg_imbalance_shares
+                        .unwrap_or(defaults.dense_tandem.max_leg_imbalance_shares),
+                    ladder_min_price: s
+                        .dense_ladder_min_price
+                        .unwrap_or(defaults.dense_tandem.ladder_min_price),
+                    ladder_max_price: s
+                        .dense_ladder_max_price
+                        .unwrap_or(defaults.dense_tandem.ladder_max_price),
+                },
                 ladder_levels: s.ladder_levels.unwrap_or(defaults.ladder_levels),
                 ladder_span: s.ladder_span.unwrap_or(defaults.ladder_span),
                 center_price: s.center_price.unwrap_or(defaults.center_price),
@@ -420,12 +461,8 @@ impl StrategyProfile {
                     .unwrap_or(climb_def.taker_min_favorite_ask),
                 taker_window_sec: c.taker_window_sec.unwrap_or(climb_def.taker_window_sec),
                 disable_after_ms: c.disable_after_ms,
-                escalation_enabled: c
-                    .escalation_enabled
-                    .unwrap_or(climb_def.escalation_enabled),
-                escalation_age_ms: c
-                    .escalation_age_ms
-                    .unwrap_or(climb_def.escalation_age_ms),
+                escalation_enabled: c.escalation_enabled.unwrap_or(climb_def.escalation_enabled),
+                escalation_age_ms: c.escalation_age_ms.unwrap_or(climb_def.escalation_age_ms),
                 escalation_drift_ticks: c
                     .escalation_drift_ticks
                     .unwrap_or(climb_def.escalation_drift_ticks),
@@ -573,12 +610,8 @@ impl StrategyProfile {
                     .favorite_max_load_max_usd
                     .unwrap_or(sizing_def.favorite_max_load_max_usd),
                 tail_clip_bps: s.tail_clip_bps.unwrap_or(sizing_def.tail_clip_bps),
-                tail_clip_min_usd: s
-                    .tail_clip_min_usd
-                    .unwrap_or(sizing_def.tail_clip_min_usd),
-                tail_clip_max_usd: s
-                    .tail_clip_max_usd
-                    .unwrap_or(sizing_def.tail_clip_max_usd),
+                tail_clip_min_usd: s.tail_clip_min_usd.unwrap_or(sizing_def.tail_clip_min_usd),
+                tail_clip_max_usd: s.tail_clip_max_usd.unwrap_or(sizing_def.tail_clip_max_usd),
                 tail_max_load_bps: s.tail_max_load_bps.unwrap_or(sizing_def.tail_max_load_bps),
                 tail_max_load_min_usd: s
                     .tail_max_load_min_usd
@@ -586,9 +619,7 @@ impl StrategyProfile {
                 tail_max_load_max_usd: s
                     .tail_max_load_max_usd
                     .unwrap_or(sizing_def.tail_max_load_max_usd),
-                reversal_clip_bps: s
-                    .reversal_clip_bps
-                    .unwrap_or(sizing_def.reversal_clip_bps),
+                reversal_clip_bps: s.reversal_clip_bps.unwrap_or(sizing_def.reversal_clip_bps),
                 reversal_clip_min_usd: s
                     .reversal_clip_min_usd
                     .unwrap_or(sizing_def.reversal_clip_min_usd),
@@ -819,10 +850,19 @@ impl StrategyProfile {
 
 fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
     s.enabled.is_some()
+        || s.emit_mode.is_some()
+        || s.dense_levels_per_side.is_some()
+        || s.dense_tick.is_some()
+        || s.dense_clip_shares.is_some()
+        || s.dense_max_entry_pair_cost.is_some()
+        || s.dense_max_leg_imbalance_shares.is_some()
+        || s.dense_ladder_min_price.is_some()
+        || s.dense_ladder_max_price.is_some()
         || s.ladder_levels.is_some()
         || s.ladder_span.is_some()
         || s.center_price.is_some()
         || s.clip_shares.is_some()
+        || s.max_unpaired_core_qty.is_some()
         || s.ladder_min_price.is_some()
         || s.ladder_max_price.is_some()
         || s.center_probe_only.is_some()
@@ -841,6 +881,11 @@ fn core_hedge_section_has_overrides(s: &CoreHedgeSection) -> bool {
         || s.book_sanity_max_queue_imbalance_ratio.is_some()
         || s.book_sanity_max_projected_pair_cost.is_some()
         || s.clip_scale.is_some()
+        || s.ladder_anchor.is_some()
+        || s.fast_move_guard_enabled.is_some()
+        || s.fast_move_guard_threshold_bps.is_some()
+        || s.fast_move_guard_high_vol_threshold_bps.is_some()
+        || s.fast_move_guard_high_vol_max_levels.is_some()
 }
 
 fn resolve_profile_path(path: &Path) -> PathBuf {

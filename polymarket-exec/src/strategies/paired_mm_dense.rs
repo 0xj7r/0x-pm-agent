@@ -1,10 +1,10 @@
 //! Dense tandem paired-MM emit logic. Mirrors unlawful_shear's
 //! pre-04-29 historical playbook (per research/whales/unlawful.md):
 //!
-//! - 30+ price levels at 1¢ spacing centred on mid
+//! - 1¢ spacing near the active touch
 //! - Stable per-fill clip across all levels (no size scaling by price)
 //! - Both legs quoted in tandem on every tick (atomic refresh)
-//! - Pair-cost gate: skip emission when yes_ask + no_ask > threshold
+//! - Pair-cost gate: skip emission when the top maker pair cost is above threshold
 //! - Per-leg inventory tracking to skip over-filled side
 //!
 //! This module is pure-function: given current book state and inventory,
@@ -99,6 +99,7 @@ pub struct DenseTandemInventory {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenseTandemRung {
+    pub level: usize,
     pub leg: LadderLeg,
     pub price: f64,
     pub qty: f64,
@@ -122,13 +123,10 @@ pub enum DenseTandemSkip {
 /// 1. Validate book (positive, finite, bid < ask on each leg).
 /// 2. Check pair-cost gate against current yes_ask + no_ask. If above,
 ///    skip entirely (no edge).
-/// 3. Compute mid = (yes_ask + no_ask - 1) / 2 + 0.5  (since complements
-///    sum to 1; this is the canonical book mid). Anchor ladder at mid.
-/// 4. For each of N levels symmetric around mid, generate yes_price =
-///    mid - k*tick and no_price = mid + k*tick (so both sum to ~2*mid =
-///    1.0; pair cost is preserved across the ladder).
+/// 3. Anchor each leg at touch: yes_ask - tick, no_ask - tick.
+/// 4. Step each side down by one tick per level.
 /// 5. Clamp prices to [ladder_min_price, ladder_max_price].
-/// 6. Per leg, check inventory imbalance: if yes_shares - no_shares >
+/// 6. Per leg, check inventory imbalance: if yes_shares - no_shares >=
 ///    max_leg_imbalance, skip yes rungs (mate hasn't caught up).
 pub fn compute_dense_tandem_emission(
     cfg: &DenseTandemConfig,
@@ -139,7 +137,9 @@ pub fn compute_dense_tandem_emission(
         return Err(DenseTandemSkip::BookInvalid);
     }
 
-    let pair_cost = book.yes_ask + book.no_ask;
+    let yes_start = book.yes_ask - cfg.tick;
+    let no_start = book.no_ask - cfg.tick;
+    let pair_cost = yes_start + no_start;
     if pair_cost > cfg.max_entry_pair_cost {
         return Err(DenseTandemSkip::PairCostAboveGate {
             pair_cost,
@@ -148,19 +148,11 @@ pub fn compute_dense_tandem_emission(
     }
 
     let imbalance = inventory.yes_shares - inventory.no_shares;
-    let skip_yes = imbalance > cfg.max_leg_imbalance_shares;
-    let skip_no = -imbalance > cfg.max_leg_imbalance_shares;
+    let skip_yes = imbalance >= cfg.max_leg_imbalance_shares;
+    let skip_no = -imbalance >= cfg.max_leg_imbalance_shares;
     if skip_yes && skip_no {
         return Err(DenseTandemSkip::InventoryFull);
     }
-
-    // Anchor each leg's ladder at the current ask. Level 0 sits at
-    // (ask - tick) -- the highest price we can post as a maker bid
-    // without crossing. Each subsequent level steps down by tick.
-    // This mirrors unlawful's behaviour: bid right under the ask and
-    // ladder downward at 1¢ spacing.
-    let yes_start = book.yes_ask - cfg.tick;
-    let no_start = book.no_ask - cfg.tick;
 
     let mut rungs = Vec::with_capacity(cfg.levels_per_side * 2);
     for k in 0..cfg.levels_per_side {
@@ -170,6 +162,7 @@ pub fn compute_dense_tandem_emission(
             let yes_price = yes_start - offset;
             if yes_price >= cfg.ladder_min_price && yes_price < book.yes_ask {
                 rungs.push(DenseTandemRung {
+                    level: k,
                     leg: LadderLeg::Yes,
                     price: round_to_tick(yes_price, cfg.tick),
                     qty: cfg.clip_shares,
@@ -181,6 +174,7 @@ pub fn compute_dense_tandem_emission(
             let no_price = no_start - offset;
             if no_price >= cfg.ladder_min_price && no_price < book.no_ask {
                 rungs.push(DenseTandemRung {
+                    level: k,
                     leg: LadderLeg::No,
                     price: round_to_tick(no_price, cfg.tick),
                     qty: cfg.clip_shares,
@@ -244,8 +238,8 @@ mod tests {
     #[test]
     fn emits_balanced_ladder_when_book_is_centred() {
         let book = balanced_book(0.50);
-        let rungs = compute_dense_tandem_emission(&cfg(), &book, &empty_inventory())
-            .expect("should emit");
+        let rungs =
+            compute_dense_tandem_emission(&cfg(), &book, &empty_inventory()).expect("should emit");
 
         // Both legs should produce rungs.
         let yes_count = rungs.iter().filter(|r| r.leg == LadderLeg::Yes).count();
@@ -272,11 +266,11 @@ mod tests {
             no_bid: 0.06,
             no_ask: 0.10,
         };
-        // pair_cost = 0.92 + 0.10 = 1.02 > 0.97 gate
+        // top maker pair_cost = (0.92 - 0.01) + (0.10 - 0.01) = 1.00 > 0.97 gate
         let result = compute_dense_tandem_emission(&cfg(), &book, &empty_inventory());
         match result {
             Err(DenseTandemSkip::PairCostAboveGate { pair_cost, gate }) => {
-                assert!((pair_cost - 1.02).abs() < 1e-9);
+                assert!((pair_cost - 1.00).abs() < 1e-9);
                 assert!((gate - 0.97).abs() < 1e-9);
             }
             other => panic!("expected PairCostAboveGate, got {:?}", other),

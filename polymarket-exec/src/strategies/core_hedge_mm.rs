@@ -57,13 +57,18 @@ impl Default for PairedCoreLadderAnchor {
     }
 }
 
-pub use super::paired_mm_dense::{
-    DenseTandemConfig, PairedCoreEmitMode,
+use super::paired_mm_dense::{
+    compute_dense_tandem_emission, DenseTandemBook, DenseTandemInventory, DenseTandemSkip,
 };
+pub use super::paired_mm_dense::{DenseTandemConfig, PairedCoreEmitMode};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
     pub enabled: bool,
+    /// Entry emitter selected for fresh paired-core quotes.
+    pub emit_mode: PairedCoreEmitMode,
+    /// Touch-anchored dense tandem paired-MM parameters.
+    pub dense_tandem: DenseTandemConfig,
     /// Maximum ask price for the cheap leg to be considered a valid hedge.
     pub cheap_leg_max_price: f64,
     /// Inclusive ask-price band for the expensive leg to be considered the
@@ -161,6 +166,8 @@ impl Default for CoreHedgeMmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            emit_mode: PairedCoreEmitMode::Legacy,
+            dense_tandem: DenseTandemConfig::default(),
             cheap_leg_max_price: 0.38,
             expensive_leg_min_price: 0.52,
             expensive_leg_max_price: 0.92,
@@ -516,8 +523,7 @@ fn paired_core_repair_pair_cost<M: MarketDescriptor>(
         LadderLeg::Yes => input.paired_core_inventory.no_avg_cost,
         LadderLeg::No => input.paired_core_inventory.yes_avg_cost,
     };
-    if other_avg.is_finite() && other_avg > 0.0 && opposite_ask.is_finite() && opposite_ask > 0.0
-    {
+    if other_avg.is_finite() && other_avg > 0.0 && opposite_ask.is_finite() && opposite_ask > 0.0 {
         Some(other_avg + opposite_ask + fee_buffer.max(0.0))
     } else {
         None
@@ -769,10 +775,26 @@ fn paired_core_book_sanity(
         return Ok("disabled".to_string());
     }
 
-    let yes_bid = yes_quote.best_bid.as_ref().map(|level| level.price).unwrap_or(0.0);
-    let yes_ask = yes_quote.best_ask.as_ref().map(|level| level.price).unwrap_or(0.0);
-    let no_bid = no_quote.best_bid.as_ref().map(|level| level.price).unwrap_or(0.0);
-    let no_ask = no_quote.best_ask.as_ref().map(|level| level.price).unwrap_or(0.0);
+    let yes_bid = yes_quote
+        .best_bid
+        .as_ref()
+        .map(|level| level.price)
+        .unwrap_or(0.0);
+    let yes_ask = yes_quote
+        .best_ask
+        .as_ref()
+        .map(|level| level.price)
+        .unwrap_or(0.0);
+    let no_bid = no_quote
+        .best_bid
+        .as_ref()
+        .map(|level| level.price)
+        .unwrap_or(0.0);
+    let no_ask = no_quote
+        .best_ask
+        .as_ref()
+        .map(|level| level.price)
+        .unwrap_or(0.0);
     let yes_spread = (yes_ask - yes_bid).max(0.0);
     let no_spread = (no_ask - no_bid).max(0.0);
     let max_spread = cfg.book_sanity_max_spread.max(0.0);
@@ -939,6 +961,202 @@ fn build_mate_repair_order<M: MarketDescriptor>(
     )
 }
 
+fn dense_tandem_decision<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    cfg: &CoreHedgeMmConfig,
+) -> StrategyDecision {
+    let yes_bid = input.snapshot.yes_quote.best_bid.as_ref().map(|l| l.price);
+    let yes_ask = input.snapshot.yes_quote.best_ask.as_ref().map(|l| l.price);
+    let no_bid = input.snapshot.no_quote.best_bid.as_ref().map(|l| l.price);
+    let no_ask = input.snapshot.no_quote.best_ask.as_ref().map(|l| l.price);
+    let (Some(yes_bid), Some(yes_ask), Some(no_bid), Some(no_ask)) =
+        (yes_bid, yes_ask, no_bid, no_ask)
+    else {
+        return StrategyDecision::Noop {
+            notes: vec![format!(
+                "paired_core dense missing quotes yes_bid={yes_bid:?} yes_ask={yes_ask:?} no_bid={no_bid:?} no_ask={no_ask:?}",
+            )],
+        };
+    };
+
+    let mut notes = Vec::new();
+    let elapsed_ms = market_elapsed_ms(input);
+    let mut dense_cfg = cfg.dense_tandem;
+    match paired_core_broad_posture(
+        input,
+        elapsed_ms,
+        cfg.disable_after_elapsed_ms,
+        yes_ask,
+        no_ask,
+        cfg.dense_tandem.levels_per_side,
+    ) {
+        PairedCoreBroadPosture::Full => {}
+        PairedCoreBroadPosture::CenterOnly {
+            reason,
+            center_band,
+        } => {
+            notes.push(reason);
+            dense_cfg.levels_per_side = dense_cfg.levels_per_side.min(center_band + 1);
+            notes.push(format!(
+                "paired_core dense center-only cap levels={}",
+                dense_cfg.levels_per_side
+            ));
+        }
+        PairedCoreBroadPosture::Suppressed { reason } => {
+            notes.push(reason);
+            return StrategyDecision::Suppress {
+                scope: SuppressionScope::PairedOnly,
+                reason: CoolingReason::BtcTrending,
+                preserve_quotes: false,
+                notes,
+            };
+        }
+    }
+
+    if cfg.fast_move_guard_enabled {
+        let r30_abs = input.btc_regime.return_30s_bps.unwrap_or(0.0).abs();
+        let realized_vol = input.btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
+        if r30_abs > cfg.fast_move_guard_threshold_bps {
+            notes.push(format!(
+                "paired_core dense fast-move guard: skipping new ladder (btc_ret_30s_abs={r30_abs:.2}bps > {:.2}bps threshold)",
+                cfg.fast_move_guard_threshold_bps,
+            ));
+            return StrategyDecision::Suppress {
+                scope: SuppressionScope::PairedOnly,
+                reason: CoolingReason::BtcTrending,
+                preserve_quotes: false,
+                notes,
+            };
+        } else if realized_vol > cfg.fast_move_guard_high_vol_threshold_bps {
+            let capped = dense_cfg
+                .levels_per_side
+                .min(cfg.fast_move_guard_high_vol_max_levels);
+            if capped < dense_cfg.levels_per_side {
+                notes.push(format!(
+                    "paired_core dense fast-move guard: capping ladder to {capped} levels (vol={realized_vol:.2}bps > {:.2}bps threshold)",
+                    cfg.fast_move_guard_high_vol_threshold_bps,
+                ));
+                dense_cfg.levels_per_side = capped;
+            }
+        }
+    }
+
+    let book = DenseTandemBook {
+        yes_bid,
+        yes_ask,
+        no_bid,
+        no_ask,
+    };
+    let inventory = DenseTandemInventory {
+        yes_shares: (input.paired_core_inventory.yes_qty
+            + input.open_paired_core_order_exposure.yes_qty)
+            .max(0.0),
+        no_shares: (input.paired_core_inventory.no_qty
+            + input.open_paired_core_order_exposure.no_qty)
+            .max(0.0),
+    };
+
+    let rungs = match compute_dense_tandem_emission(&dense_cfg, &book, &inventory) {
+        Ok(rungs) => rungs,
+        Err(DenseTandemSkip::PairCostAboveGate { pair_cost, gate }) => {
+            notes.push(format!(
+                "paired_core dense pair-cost gate blocked top_maker_pair_cost={pair_cost:.4} gate={gate:.4}",
+            ));
+            return StrategyDecision::Suppress {
+                scope: SuppressionScope::PairedOnly,
+                reason: CoolingReason::PremiumFairCap,
+                preserve_quotes: false,
+                notes,
+            };
+        }
+        Err(DenseTandemSkip::BookInvalid) => {
+            return StrategyDecision::Noop {
+                notes: vec!["paired_core dense invalid book".to_string()],
+            };
+        }
+        Err(DenseTandemSkip::InventoryFull) => {
+            return StrategyDecision::Noop {
+                notes: vec!["paired_core dense inventory full".to_string()],
+            };
+        }
+    };
+
+    let mut intents = Vec::with_capacity(rungs.len());
+    for level in 0..dense_cfg.levels_per_side {
+        let yes_rung = rungs
+            .iter()
+            .copied()
+            .find(|rung| rung.level == level && rung.leg == LadderLeg::Yes);
+        let no_rung = rungs
+            .iter()
+            .copied()
+            .find(|rung| rung.level == level && rung.leg == LadderLeg::No);
+
+        if let (Some(yes), Some(no)) = (yes_rung, no_rung) {
+            if let Err(reason) = paired_core_book_sanity(
+                cfg,
+                &input.snapshot.yes_quote,
+                &input.snapshot.no_quote,
+                yes.price,
+                no.price,
+            ) {
+                notes.push(format!(
+                    "paired_core dense depth sanity blocked level={level}: {reason}",
+                ));
+                continue;
+            }
+        }
+
+        let mut level_intents = Vec::with_capacity(2);
+        for rung in [yes_rung, no_rung].into_iter().flatten() {
+            let best_ask = match rung.leg {
+                LadderLeg::Yes => yes_ask,
+                LadderLeg::No => no_ask,
+            };
+            let Some(intent) = build_ladder_level(
+                &input.market,
+                rung.leg,
+                best_ask,
+                rung.price,
+                rung.qty,
+                &format!("dense:{level}"),
+                cfg.min_order_usd,
+                input.now_ms,
+            ) else {
+                continue;
+            };
+            level_intents.push(intent);
+        }
+
+        if level_intents.len() == 2 {
+            let pair_id = format!(
+                "paired-core:{}:dense:{level}:{}",
+                input.market.market_id(),
+                input.now_ms
+            );
+            for intent in &mut level_intents {
+                intent.pair_id = Some(pair_id.clone());
+            }
+        }
+        intents.extend(level_intents);
+    }
+
+    notes.push(format!(
+        "paired_core dense levels={} emitted={} yes_qty={:.4} no_qty={:.4} top_maker_pair_cost={:.4}",
+        dense_cfg.levels_per_side,
+        intents.len(),
+        inventory.yes_shares,
+        inventory.no_shares,
+        (yes_ask - dense_cfg.tick) + (no_ask - dense_cfg.tick),
+    ));
+
+    if intents.is_empty() {
+        StrategyDecision::Noop { notes }
+    } else {
+        StrategyDecision::QuoteSet { intents, notes }
+    }
+}
+
 impl<M> TradingStrategy<M> for CoreHedgeMmStrategy
 where
     M: MarketDescriptor,
@@ -1018,6 +1236,10 @@ where
                     )],
                 };
             }
+        }
+
+        if cfg.emit_mode == PairedCoreEmitMode::DenseTandem {
+            return dense_tandem_decision(&input, &cfg);
         }
 
         if let Some(ladder) = effective_paired_core_ladder(&cfg) {
@@ -1322,15 +1544,8 @@ where
             // rungs posted into a fast move risk catching the descent
             // before the strategy can react. Skip or shrink the ladder
             // when the tape is hot.
-            let r30_abs = input
-                .btc_regime
-                .return_30s_bps
-                .unwrap_or(0.0)
-                .abs();
-            let realized_vol = input
-                .btc_regime
-                .realized_vol_5m_bps
-                .unwrap_or(0.0);
+            let r30_abs = input.btc_regime.return_30s_bps.unwrap_or(0.0).abs();
+            let realized_vol = input.btc_regime.realized_vol_5m_bps.unwrap_or(0.0);
             let effective_levels = if cfg.fast_move_guard_enabled {
                 if r30_abs > cfg.fast_move_guard_threshold_bps {
                     notes.push(format!(
@@ -1385,20 +1600,20 @@ where
                     }
                 }
                 let Some(yes_intent) = ladder_candidate(
-                        &input.market,
-                        LadderLeg::Yes,
-                        yes_bid,
-                        yes_ask,
-                        levels,
-                        half_span,
-                        cfg.center_price,
-                        idx,
-                        ladder.min_price,
-                        ladder.max_price,
-                        cfg.clip_shares,
-                        cfg.min_order_usd,
-                        cfg.maker_improve_ticks,
-                        cfg.ladder_anchor,
+                    &input.market,
+                    LadderLeg::Yes,
+                    yes_bid,
+                    yes_ask,
+                    levels,
+                    half_span,
+                    cfg.center_price,
+                    idx,
+                    ladder.min_price,
+                    ladder.max_price,
+                    cfg.clip_shares,
+                    cfg.min_order_usd,
+                    cfg.maker_improve_ticks,
+                    cfg.ladder_anchor,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1408,16 +1623,16 @@ where
                     LadderLeg::No,
                     no_bid,
                     no_ask,
-                        levels,
-                        half_span,
-                        cfg.center_price,
-                        idx,
-                        ladder.min_price,
-                        ladder.max_price,
-                        cfg.clip_shares,
-                        cfg.min_order_usd,
-                        cfg.maker_improve_ticks,
-                        cfg.ladder_anchor,
+                    levels,
+                    half_span,
+                    cfg.center_price,
+                    idx,
+                    ladder.min_price,
+                    ladder.max_price,
+                    cfg.clip_shares,
+                    cfg.min_order_usd,
+                    cfg.maker_improve_ticks,
+                    cfg.ladder_anchor,
                     input.now_ms,
                 ) else {
                     continue;
@@ -1661,7 +1876,7 @@ mod tests {
         OrderBookPressureSignal,
     };
     use crate::strategies::traits::PairedOpenOrderExposure;
-    use crate::types::{QuoteSnapshot, StrategyDecision};
+    use crate::types::{QuoteSnapshot, StrategyDecision, SuppressionScope};
 
     fn snap_with_quotes(
         yes_bid: f64,
@@ -1742,6 +1957,24 @@ mod tests {
             max_unpaired_core_qty: 5.0,
             ladder_min_price: 0.20,
             ladder_max_price: 0.70,
+            min_order_usd: 1.0,
+            ..CoreHedgeMmConfig::default()
+        }
+    }
+
+    fn dense_paired_core_config() -> CoreHedgeMmConfig {
+        CoreHedgeMmConfig {
+            enabled: true,
+            emit_mode: PairedCoreEmitMode::DenseTandem,
+            dense_tandem: DenseTandemConfig {
+                levels_per_side: 3,
+                tick: 0.01,
+                clip_shares: 10.0,
+                max_entry_pair_cost: 0.97,
+                max_leg_imbalance_shares: 30.0,
+                ladder_min_price: 0.02,
+                ladder_max_price: 0.98,
+            },
             min_order_usd: 1.0,
             ..CoreHedgeMmConfig::default()
         }
@@ -1837,9 +2070,8 @@ mod tests {
     #[test]
     fn live_like_center_probe_does_not_emit_broad_ladder() {
         let config = live_like_paired_core_config();
-        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
-            core_hedge: config,
-        });
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
         let input = strategy_input(snap_with_quotes(0.48, 0.62, 0.48, 0.62));
 
         let decision = strategy.on_tick(input);
@@ -1858,9 +2090,101 @@ mod tests {
                     intent.limit_price >= PAIRED_CORE_CENTER_PROBE_MIN_PRICE - 1e-9
                         && intent.limit_price <= PAIRED_CORE_CENTER_PROBE_MAX_PRICE + 1e-9
                 }));
-                assert!(notes.iter().any(|note| note.contains("center probe active")));
+                assert!(notes
+                    .iter()
+                    .any(|note| note.contains("center probe active")));
             }
             other => panic!("expected constrained center-probe quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_emits_touch_anchored_quotes() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let input = strategy_input(snap_with_quotes(0.48, 0.50, 0.47, 0.49));
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::QuoteSet { intents, notes } => {
+                assert_eq!(intents.len(), 6);
+                let yes_prices: Vec<f64> = intents
+                    .iter()
+                    .filter(|intent| intent.instrument_id.as_str() == "yes")
+                    .map(|intent| intent.limit_price)
+                    .collect();
+                let no_prices: Vec<f64> = intents
+                    .iter()
+                    .filter(|intent| intent.instrument_id.as_str() == "no")
+                    .map(|intent| intent.limit_price)
+                    .collect();
+                assert_eq!(yes_prices.len(), 3);
+                assert_eq!(no_prices.len(), 3);
+                for (actual, expected) in yes_prices.iter().zip([0.49, 0.48, 0.47]) {
+                    assert!((actual - expected).abs() < 1e-9);
+                }
+                for (actual, expected) in no_prices.iter().zip([0.48, 0.47, 0.46]) {
+                    assert!((actual - expected).abs() < 1e-9);
+                }
+                assert!(intents.iter().all(|intent| {
+                    intent
+                        .quote_level_tag
+                        .as_deref()
+                        .is_some_and(|tag| tag.starts_with("paired-core:dense:"))
+                }));
+                assert!(intents.iter().all(|intent| intent.pair_id.is_some()));
+                assert!(notes.iter().any(|note| note.contains("paired_core dense")));
+            }
+            other => panic!("expected dense tandem quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_blocks_heavier_realized_plus_working_side() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let mut input = strategy_input(snap_with_quotes(0.48, 0.50, 0.47, 0.49));
+        input.paired_core_inventory.yes_qty = 20.0;
+        input.open_paired_core_order_exposure.yes_qty = 10.0;
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::QuoteSet { intents, .. } => {
+                assert!(intents
+                    .iter()
+                    .all(|intent| intent.instrument_id.as_str() == "no"));
+                assert_eq!(intents.len(), 3);
+                assert!(intents.iter().all(|intent| intent.pair_id.is_none()));
+            }
+            other => panic!("expected no-leg catch-up quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dense_tandem_pair_cost_gate_suppresses_and_cancels_quotes() {
+        let config = dense_paired_core_config();
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
+        let input = strategy_input(snap_with_quotes(0.50, 0.52, 0.47, 0.49));
+
+        let decision = strategy.on_tick(input);
+
+        match decision {
+            StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                assert_eq!(scope, SuppressionScope::PairedOnly);
+                assert!(!preserve_quotes);
+                assert!(notes.iter().any(|note| note.contains("pair-cost gate")));
+            }
+            other => panic!("expected dense pair-cost suppression, got {other:?}"),
         }
     }
 
@@ -1876,9 +2200,8 @@ mod tests {
             no_avg_cost: 0.0,
             ..PairedInventorySnapshot::default()
         };
-        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
-            core_hedge: config,
-        });
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
 
         let positive_decision = strategy.on_tick(positive_input);
 
@@ -1889,12 +2212,12 @@ mod tests {
                     intents[0].quote_level_tag.as_deref(),
                     Some("paired-core:repair:mate")
                 );
-                assert!(notes.iter().any(|note| note.contains("mate repair emitted")));
-                assert!(
-                    !notes
-                        .iter()
-                        .any(|note| note.contains("balanced bundle mode"))
-                );
+                assert!(notes
+                    .iter()
+                    .any(|note| note.contains("mate repair emitted")));
+                assert!(!notes
+                    .iter()
+                    .any(|note| note.contains("balanced bundle mode")));
             }
             other => panic!("expected positive pair-cost mate repair, got {other:?}"),
         }
@@ -1907,9 +2230,8 @@ mod tests {
             no_avg_cost: 0.0,
             ..PairedInventorySnapshot::default()
         };
-        let mut strategy = CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig {
-            core_hedge: config,
-        });
+        let mut strategy =
+            CoreHedgeMmStrategy::new(CoreHedgeMmStrategyConfig { core_hedge: config });
 
         let negative_decision = strategy.on_tick(negative_input);
 
@@ -1918,11 +2240,9 @@ mod tests {
                 assert!(notes.iter().any(|note| {
                     note.contains("mate repair skipped") && note.contains("bundle salvage")
                 }));
-                assert!(
-                    !notes
-                        .iter()
-                        .any(|note| note.contains("balanced bundle mode"))
-                );
+                assert!(!notes
+                    .iter()
+                    .any(|note| note.contains("balanced bundle mode")));
             }
             other => panic!("expected negative pair-cost repair skip, got {other:?}"),
         }

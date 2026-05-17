@@ -282,8 +282,7 @@ fn anticipate_size_multiplier(
         .clamp(0.0, 1.0);
     let momentum_strength = momentum.strength.clamp(0.0, 1.0);
     let reversal_cap = cfg.max_path_reversal_risk.max(1e-3);
-    let reversal_penalty =
-        (conviction.path_reversal_risk / reversal_cap).clamp(0.0, 1.0) * 0.5;
+    let reversal_penalty = (conviction.path_reversal_risk / reversal_cap).clamp(0.0, 1.0) * 0.5;
     let reversal_factor = 1.0 - reversal_penalty;
     let regime_factor = match btc_regime {
         Some(BtcRegime::DirectionalSmooth) => 1.0,
@@ -792,7 +791,6 @@ impl LateFavoriteStrategy {
             working_tail_spend_usd,
         }
     }
-
 }
 
 fn directional_favorite_leg_spend_usd<M: MarketDescriptor>(
@@ -834,7 +832,10 @@ fn directional_bankroll_usd<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     cfg: DirectionalSizingConfig,
 ) -> f64 {
-    let live_equity = input.inventory.equity_usd.max(input.inventory.free_cash_usd);
+    let live_equity = input
+        .inventory
+        .equity_usd
+        .max(input.inventory.free_cash_usd);
     if live_equity > 0.0 {
         live_equity
     } else {
@@ -994,7 +995,10 @@ impl LateFavBundleState {
             };
         }
 
-        if self.side_flip && proposed_leg != self.dominant_fav_leg && proposed_price > cfg.ultra_cheap_max_ask {
+        if self.side_flip
+            && proposed_leg != self.dominant_fav_leg
+            && proposed_price > cfg.ultra_cheap_max_ask
+        {
             let tail_payoff_after = self.payoff_if_tail_wins_after_favorite_add(proposed_spend_usd);
             if tail_payoff_after < 0.0 {
                 return BundleOrderGate {
@@ -1834,8 +1838,8 @@ fn model_confirmed_wing_accumulation<M: MarketDescriptor>(
         return true;
     }
 
-    let market_path_separating =
-        legs.favorite_ask >= MARKET_WING_MIN_FAVORITE_ASK || legs.cheap_ask <= MARKET_WING_MAX_CHEAP_ASK;
+    let market_path_separating = legs.favorite_ask >= MARKET_WING_MIN_FAVORITE_ASK
+        || legs.cheap_ask <= MARKET_WING_MAX_CHEAP_ASK;
     market_path_separating
         && path_reversal_risk <= MARKET_WING_MAX_PATH_REVERSAL_RISK
         && model_favorite >= MARKET_WING_MIN_MODEL_FAVORITE
@@ -2398,14 +2402,12 @@ fn cheap_tail_cap_usd(
     } else {
         0.0
     };
-    let expected_favorite_win_upside = if late_fav_qty > 0.0
-        && favorite_avg_price > 0.0
-        && favorite_avg_price < 1.0
-    {
-        late_fav_qty * (1.0 - favorite_avg_price)
-    } else {
-        0.0
-    };
+    let expected_favorite_win_upside =
+        if late_fav_qty > 0.0 && favorite_avg_price > 0.0 && favorite_avg_price < 1.0 {
+            late_fav_qty * (1.0 - favorite_avg_price)
+        } else {
+            0.0
+        };
     let favorite_win_upside = realized_favorite_win_upside.max(expected_favorite_win_upside);
     let coverage_fraction = (cheap_tail_coverage_fraction(cfg, regime)
         * (1.0
@@ -2434,8 +2436,7 @@ fn cheap_tail_cap_usd(
     } else {
         cfg.max_late_fav_spend_fraction
     };
-    let fractional_late_fav_budget_cap =
-        favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
+    let fractional_late_fav_budget_cap = favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
     let late_fav_budget_cap = fractional_late_fav_budget_cap.max(min_positive_payoff_tail_cap);
 
     let desired_tail_notional =
@@ -2472,8 +2473,7 @@ fn unbundled_ultra_cheap_tail_cap_usd(
         return 0.0;
     }
 
-    let realized_favorite_win_upside =
-        late_fav_filled_qty * (1.0 - favorite_avg_filled_price);
+    let realized_favorite_win_upside = late_fav_filled_qty * (1.0 - favorite_avg_filled_price);
     let edge_cap = realized_favorite_win_upside * cfg.max_win_edge_spend_fraction.max(0.0);
     let cap = cfg.clip_usd.min(cfg.max_load_usd).min(edge_cap);
     if cap >= cfg.min_order_usd {
@@ -2537,8 +2537,7 @@ fn wing_reversal_hedge_cap_usd(
     }
 
     let favorite_win_upside = favorite_filled_qty * (1.0 - favorite_avg_price);
-    let fav_win_payoff_now =
-        favorite_win_upside - existing_hedge_spend_usd.max(0.0);
+    let fav_win_payoff_now = favorite_win_upside - existing_hedge_spend_usd.max(0.0);
     let positive_payoff_cap =
         (fav_win_payoff_now - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD).max(0.0);
     let hard_cap = WING_REVERSAL_HEDGE_MAX_LOAD_USD
@@ -2773,8 +2772,12 @@ where
         // late-favorite entries for 15min to prevent compounding losses
         // in a bad regime / streak. Tunables hardcoded for now; YAML
         // exposure can come later if we want per-deployment tuning.
+        // 2026-05-17 v2: tightened threshold 150 -> 80 after observing
+        // two consecutive ~$130 losing bars (~$260 cumulative). The 150
+        // threshold required two losses to trip; 80 trips after one
+        // bad bar, halting before a second can compound.
         const CIRCUIT_WINDOW_MS: u64 = 15 * 60 * 1000;
-        const CIRCUIT_LOSS_THRESHOLD_USD: f64 = 150.0;
+        const CIRCUIT_LOSS_THRESHOLD_USD: f64 = 80.0;
         const CIRCUIT_HALT_MS: u64 = 15 * 60 * 1000;
         let now_ms = input.now_ms;
         let live_equity = input
@@ -2800,9 +2803,7 @@ where
         // Trip the breaker on fresh threshold breaches (not already
         // halted) so a sustained drawdown doesn't keep extending the
         // halt window forever.
-        let already_halted = self
-            .halt_until_ms
-            .is_some_and(|until| now_ms < until);
+        let already_halted = self.halt_until_ms.is_some_and(|until| now_ms < until);
         if !already_halted && window_delta < -CIRCUIT_LOSS_THRESHOLD_USD {
             self.halt_until_ms = Some(now_ms + CIRCUIT_HALT_MS);
         }
@@ -2873,9 +2874,7 @@ where
         ));
         notes.push(format!(
             "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
-            late_fav_rearm_ready,
-            late_fav_stable_bars,
-            LATE_FAV_REARM_MAX_PATH_RISK,
+            late_fav_rearm_ready, late_fav_stable_bars, LATE_FAV_REARM_MAX_PATH_RISK,
         ));
         let bundle_state = self.bundle_state(&input, &legs);
         notes.push(format!(
@@ -3071,8 +3070,8 @@ where
                         let regime_kelly_scale = match input.btc_regime.regime() {
                             Some(BtcRegime::DirectionalSmooth) | Some(BtcRegime::Flat) => 1.0,
                             Some(BtcRegime::TrendingVolatile) => 0.67, // 0.30 -> 0.20
-                            Some(BtcRegime::Whipsaw) => 0.50,           // 0.30 -> 0.15
-                            None => 0.67,                               // warmup safety
+                            Some(BtcRegime::Whipsaw) => 0.50,          // 0.30 -> 0.15
+                            None => 0.67,                              // warmup safety
                         };
                         let regime_scaled_kelly_cfg = super::kelly_sizing::KellyClipConfig {
                             fractional: climb_cfg.kelly.fractional * regime_kelly_scale,
@@ -3177,9 +3176,7 @@ where
                                 break;
                             }
                             let aggressive_taker = aggressive_all_levels
-                                || (use_aggressive_taker
-                                    && level == 0
-                                    && level0_immediate_fak);
+                                || (use_aggressive_taker && level == 0 && level0_immediate_fak);
                             let px = if aggressive_taker {
                                 legs.favorite_ask
                             } else {
@@ -3194,9 +3191,7 @@ where
                             if !aggressive_taker && px >= legs.favorite_ask {
                                 continue;
                             }
-                            let clip = per_level_clip
-                                .min(load_left)
-                                .max(climb_cfg.min_order_usd);
+                            let clip = per_level_clip.min(load_left).max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
                             let bundle_gate = bundle_state.gate_favorite_add(
                                 &tail_cfg,
@@ -3299,9 +3294,9 @@ where
                 // Clip the escalation to a small residual to avoid sweeping
                 // the venue if the maker was big. Convert USD cap into
                 // shares at the current ask.
-                let clip_usd = climb_cfg.escalation_max_clip_usd.min(
-                    open.remaining_qty * open.limit_price,
-                );
+                let clip_usd = climb_cfg
+                    .escalation_max_clip_usd
+                    .min(open.remaining_qty * open.limit_price);
                 let qty = (clip_usd / legs.favorite_ask).max(input.market.min_order_size());
                 let reason = format!(
                     "late_favorite climb-escalate leg={:?} stale_age_ms={} drift_ticks={} resting_px={:.4} now_ask={:.4} residual_qty={:.4} escalation_clip_usd={:.2}",
@@ -3362,10 +3357,10 @@ where
                 &input.momentum,
                 input.btc_regime.regime(),
             );
-            let scaled_max_load = (anticipate_cfg.max_load_usd * size_multiplier)
-                .max(anticipate_cfg.min_order_usd);
-            let scaled_clip = (anticipate_cfg.clip_usd * size_multiplier)
-                .max(anticipate_cfg.min_order_usd);
+            let scaled_max_load =
+                (anticipate_cfg.max_load_usd * size_multiplier).max(anticipate_cfg.min_order_usd);
+            let scaled_clip =
+                (anticipate_cfg.clip_usd * size_multiplier).max(anticipate_cfg.min_order_usd);
             // Add 1 rung when scale crosses 1.5x, 2 rungs at 2.0x+.
             let extra_levels = if size_multiplier >= 2.0 {
                 2
@@ -3387,9 +3382,7 @@ where
                     if px <= 0.0 || px >= legs.favorite_ask {
                         continue;
                     }
-                    let clip = scaled_clip
-                        .min(load_left)
-                        .max(anticipate_cfg.min_order_usd);
+                    let clip = scaled_clip.min(load_left).max(anticipate_cfg.min_order_usd);
                     let qty = (clip / px).max(input.market.min_order_size());
                     let reason = format!(
                         "late_favorite anticipate leg={:?} level={} px={:.4} bid={:.4} ask={:.4} regime={:?} model_fav={:.3} reversal={:.3} momentum={:.3} size_mult={:.2} remaining_ms={remaining_ms} clip_usd={:.2} cumulative={:.2}/{:.2}",
@@ -3583,8 +3576,8 @@ where
                     // ultra-cheap levels resting at touch as maker fallback.
                     // If visible liquidity exists, the FAK can take it. If the
                     // venue says no orders match, the fallback can still rest.
-                    let use_ultra_cheap_maker_fallback = use_aggressive_taker
-                        && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
+                    let use_ultra_cheap_maker_fallback =
+                        use_aggressive_taker && legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask;
                     let aggressive_all_levels =
                         use_aggressive_taker && !use_ultra_cheap_maker_fallback;
                     let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
@@ -5543,10 +5536,21 @@ mod tests {
             "config/strategies/whale_bonereaper_strategy.live.yaml",
         ))
         .expect("load live bonereaper profile");
-        let late_favorite = profile.bonereaper_mm_config().late_favorite;
+        let bonereaper = profile.bonereaper_mm_config();
+        let late_favorite = bonereaper.late_favorite;
+        let paired_core = bonereaper.core_hedge.core_hedge;
         let cfg = late_favorite.convex_tail;
         let climb = late_favorite.favorite_climb;
 
+        assert!(!paired_core.enabled);
+        assert_eq!(
+            paired_core.emit_mode,
+            crate::strategies::core_hedge_mm::PairedCoreEmitMode::DenseTandem
+        );
+        assert_eq!(paired_core.dense_tandem.levels_per_side, 20);
+        assert_eq!(paired_core.dense_tandem.tick, 0.01);
+        assert_eq!(paired_core.dense_tandem.max_entry_pair_cost, 0.97);
+        assert_eq!(paired_core.dense_tandem.max_leg_imbalance_shares, 30.0);
         assert!(cfg.enabled);
         // Test rot fix 2026-05-17: YAML drifted from these fixture values
         // during prior config tuning. Updated to current YAML values.
@@ -5787,11 +5791,9 @@ mod tests {
         let maker_intents: Vec<&&OrderIntent> = intents
             .iter()
             .filter(|i| {
-                i.quote_level_tag
-                    .as_deref()
-                    .is_some_and(|tag| {
-                        tag.starts_with("late-fav-climb") || tag.starts_with("late-fav-climb:")
-                    })
+                i.quote_level_tag.as_deref().is_some_and(|tag| {
+                    tag.starts_with("late-fav-climb") || tag.starts_with("late-fav-climb:")
+                })
             })
             .collect();
         assert!(
@@ -5838,9 +5840,15 @@ mod tests {
     #[test]
     fn anticipate_size_multiplier_is_one_at_gate_threshold() {
         let cfg = LateFavAnticipateConfig::default();
-        let conviction = conviction_for_scale_test(cfg.min_model_favorite, cfg.max_path_reversal_risk);
+        let conviction =
+            conviction_for_scale_test(cfg.min_model_favorite, cfg.max_path_reversal_risk);
         let momentum = MomentumSignal::default();
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
+        let mult = anticipate_size_multiplier(
+            &cfg,
+            &conviction,
+            &momentum,
+            Some(BtcRegime::DirectionalSmooth),
+        );
         assert!(
             (mult - 1.0).abs() < 1e-6,
             "expected scale=1.0 at gate threshold, got {mult}"
@@ -5856,7 +5864,12 @@ mod tests {
             latest_window_return_bps: Some(20.0),
             ..MomentumSignal::default()
         };
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
+        let mult = anticipate_size_multiplier(
+            &cfg,
+            &conviction,
+            &momentum,
+            Some(BtcRegime::DirectionalSmooth),
+        );
         assert!(
             (mult - cfg.conviction_size_scale_max).abs() < 1e-6,
             "expected scale={} at peak signal, got {mult}",
@@ -5874,7 +5887,12 @@ mod tests {
             latest_window_return_bps: Some(20.0),
             ..MomentumSignal::default()
         };
-        let mult = anticipate_size_multiplier(&cfg, &conviction, &momentum, Some(BtcRegime::DirectionalSmooth));
+        let mult = anticipate_size_multiplier(
+            &cfg,
+            &conviction,
+            &momentum,
+            Some(BtcRegime::DirectionalSmooth),
+        );
         assert!(
             (mult - 1.0).abs() < 1e-9,
             "scale_max=1.0 must produce constant 1.0 multiplier, got {mult}"
@@ -5891,8 +5909,18 @@ mod tests {
         };
         let low_reversal = conviction_for_scale_test(1.0, 0.0);
         let high_reversal = conviction_for_scale_test(1.0, cfg.max_path_reversal_risk);
-        let low_mult = anticipate_size_multiplier(&cfg, &low_reversal, &momentum, Some(BtcRegime::DirectionalSmooth));
-        let high_mult = anticipate_size_multiplier(&cfg, &high_reversal, &momentum, Some(BtcRegime::DirectionalSmooth));
+        let low_mult = anticipate_size_multiplier(
+            &cfg,
+            &low_reversal,
+            &momentum,
+            Some(BtcRegime::DirectionalSmooth),
+        );
+        let high_mult = anticipate_size_multiplier(
+            &cfg,
+            &high_reversal,
+            &momentum,
+            Some(BtcRegime::DirectionalSmooth),
+        );
         assert!(
             high_mult < low_mult,
             "reversal risk must reduce size multiplier, low_reversal={low_mult} high_reversal={high_mult}"
@@ -5925,7 +5953,10 @@ mod tests {
         };
         let decision = strategy.on_tick(input);
         let intents = anticipate_intents(&decision);
-        assert!(!intents.is_empty(), "expected anticipate intents at peak signal");
+        assert!(
+            !intents.is_empty(),
+            "expected anticipate intents at peak signal"
+        );
         // At peak signal we add 2 extra rungs on top of the base 3 = 5 levels max.
         assert!(
             intents.len() >= 3,
@@ -5936,9 +5967,7 @@ mod tests {
         // carries qty >= base_qty * 1.4 (1.5x scale x some safety).
         let base_qty = 5.0_f64 / 0.71;
         let scaled_qty_min = base_qty * 1.4;
-        let has_scaled = intents
-            .iter()
-            .any(|i| i.quantity >= scaled_qty_min);
+        let has_scaled = intents.iter().any(|i| i.quantity >= scaled_qty_min);
         assert!(
             has_scaled,
             "expected at least one rung qty scaled by conviction, got qtys={:?}",

@@ -134,7 +134,10 @@ mod tests {
         // edge 0.15 at ask 0.85: f_kelly = 1.0, fractional 0.30 -> f = 0.30
         // but capped at max_clip_fraction = 0.30 -> $135
         let clip = kelly_clip_usd(params(1.00, 0.85, 0.0, 450.0), &cfg());
-        assert!((clip - 135.0).abs() < 0.5, "expected $135 cap, got ${clip:.2}");
+        assert!(
+            (clip - 135.0).abs() < 0.5,
+            "expected $135 cap, got ${clip:.2}"
+        );
     }
 
     #[test]

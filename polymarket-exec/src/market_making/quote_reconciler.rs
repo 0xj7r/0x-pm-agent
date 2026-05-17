@@ -340,10 +340,11 @@ impl QuoteReconciler {
 
     fn is_paired_entry(intent: &OrderIntent) -> bool {
         intent.kind == crate::types::IntentKind::Entry
-            && intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("mm-paired-bid") || tag.contains(":PairedEntry"))
+            && intent.quote_level_tag.as_deref().is_some_and(|tag| {
+                tag.starts_with("mm-paired-bid")
+                    || tag.starts_with("paired-core")
+                    || tag.contains(":PairedEntry")
+            })
     }
 
     pub fn plan(

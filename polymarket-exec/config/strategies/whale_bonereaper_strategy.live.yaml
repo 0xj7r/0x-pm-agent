@@ -3,23 +3,12 @@ profile_name: whale_bonereaper_strategy
 version: "1.0"
 last_updated: 2026-05-11
 description: |
-  Bonereaper strategy as one profile with explicit paired MM core and late-favorite
-  directional overlay: paired-core is handled by paired_core, directional timing by
-  late_favorite. The favorite load is reactive to BTC spot direction throughout
-  the eligible bar, with an opening-noise guard, smaller sub-90c overlays, and
-  size increasing toward expiry.
-
-  Important: this profile is capital-scaled for the 3K live wallet. It preserves
-  the Bonereaper shape, but keeps per-level shares at the venue minimum and
-  broadens the ladder through more levels, wider spacing, and larger per-market
-  headroom rather than by making any one ticket large.
-  Late-favorite clips are heuristic shape+hard-cap driven (anti-Kelly), scale
-  with bar progress, and are capped by max_load_usd.
-  The whale behavior is consistent with hard shape controls plus hard per-market clips,
-  not per-bet Kelly optimization.
+  Bonereaper live profile: paired-core plus late-favorite directional overlay.
+  Paired-core remains disabled until the dense tandem lane is explicitly re-enabled.
+  Late-favorite sizing is bankroll-scaled fractional Kelly with hard per-bar caps.
 
 quote:
-  levels_per_side: 17
+  levels_per_side: 20
 
 inventory:
   max_open_orders_total: 120
@@ -28,14 +17,8 @@ inventory:
   max_gross_notional_usd: 1200.0
   max_net_notional_per_market_usd: 900.0
   max_position_quantity_per_instrument: 1500.0
-  # Tinylive may be manually de-risked from the UI, leaving only a small USDC
-  # float for bot entries. Keep the hard drawdown rail below as the primary
-  # overnight safety guard; do not let a stale absolute cash floor pin runtime
-  # in sticky RiskOff after manual UI activity.
   min_free_cash_usd: 1.0
   min_free_cash_bps: 0.0
-  # Hard overnight safety rail: stop new lane risk and flatten entries once realized+open pnl
-  # pushes portfolio equity below (starting_cash_usd - 200).
   max_session_loss_usd: 200.0
   max_session_loss_bps: 0.0
 
@@ -54,15 +37,17 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # PAUSED 2026-05-17 per operator direction. Lane was not contributing
-  # meaningful P&L at current size (5sh venue-min clips × 12 thin rungs
-  # = $172/3hr) and confirmed asymmetric leg-fill leak (15-20sh
-  # imbalances on multiple markets in 6hr baseline). Unlawful_shear's
-  # paired-MM uses 10x bigger clips (~50sh) at concentrated levels —
-  # the right replication needs per-leg book-imbalance gating to fix
-  # the asymmetric leak before scaling clip size. Late-fav + cheap-tail
-  # + reversal-hedge carry the strategy until paired-core is rebuilt.
+  # Paused. dense_tandem is wired for shadow/controlled re-enable, but live
+  # default remains late-fav only.
   enabled: false
+  emit_mode: dense_tandem
+  dense_levels_per_side: 20
+  dense_tick: 0.01
+  dense_clip_shares: 10.0
+  dense_max_entry_pair_cost: 0.97
+  dense_max_leg_imbalance_shares: 30.0
+  dense_ladder_min_price: 0.02
+  dense_ladder_max_price: 0.98
   center_probe_only: false
   ladder_levels: 12
   ladder_span: 0.60
@@ -73,12 +58,7 @@ paired_core:
   ladder_max_price: 0.70
   repair_pair_cost_limit: 0.99
   repair_fee_buffer: 0.0
-  # Stop fresh paired-core in the late window. After 180s elapsed, the bar
-  # should allocate new risk to explicit late-favorite and cheap-tail/reversal
-  # lanes; any existing paired-core inventory can still merge or redeem.
   disable_after_elapsed_ms: 180000
-  # Join rather than chase. The edge comes from tiny breadth in flat markets,
-  # not from paying up for independent one-sided fills.
   maker_improve_ticks: 0.0
   merge_min_qty: 5.0
   merge_batch_cap: 100.0
@@ -89,14 +69,7 @@ paired_core:
   book_sanity_max_queue_ahead_usd: 1500.0
   book_sanity_max_queue_imbalance_ratio: 3.0
   book_sanity_max_projected_pair_cost: 0.995
-  ladder_anchor: mid
-  # Fast-move guard: BTC 30s return magnitude > 5 bps blocks NEW ladder
-  # emissions; vol > 4 bps caps ladder depth to 2 levels. This is the
-  # predictive complement to the reactive signal-driven cancel — by the
-  # time posture latches BarbellDirectional the fills are already done,
-  # but the BTC tape velocity is observable BEFORE the prediction-market
-  # book commits. Today's 2272092 incident (21 Yes filled in fast move
-  # before posture caught up) is exactly what this guards against.
+  ladder_anchor: touch
   fast_move_guard_enabled: true
   fast_move_guard_threshold_bps: 5.0
   fast_move_guard_high_vol_threshold_bps: 4.0
@@ -106,17 +79,9 @@ late_favorite:
   sizing:
     enabled: true
     fallback_bankroll_usd: 3200.0
-    # Current 3.2K wallet maps to roughly the prior fixed values:
-    # favorite clip ~= $45, favorite cap ~= $450, tail clip ~= $3,
-    # tail cap ~= $30, reversal clip/cap stay tiny.
     favorite_clip_bps: 140.0
     favorite_clip_min_usd: 25.0
     favorite_clip_max_usd: 150.0
-    # 2026-05-17: 1400 -> 1500 bps (14% -> 15% of live equity). Max raised
-    # from $1500 -> $3000 so the cap doesn't bind until equity grows past
-    # $20K. This is the SOLE driver of max_load (runtime overrides any
-    # literal favorite_climb.max_load_usd via apply_directional_bankroll_sizing
-    # whenever sizing.enabled is true).
     favorite_max_load_bps: 1500.0
     favorite_max_load_min_usd: 150.0
     favorite_max_load_max_usd: 3000.0
@@ -137,122 +102,47 @@ late_favorite:
     min_favorite_ask: 0.70
     max_favorite_ask: 0.99
     clip_usd: 45.0
-    # max_load_usd intentionally omitted: late_favorite.sizing.* is the
-    # SOLE driver at runtime when sizing.enabled is true (which it is).
-    # apply_directional_bankroll_sizing overwrites max_load_usd to
-    # bankroll × favorite_max_load_bps clamped to [min, max]. Leaving
-    # the literal here was misleading -- people thought it bound the
-    # cap, but it never did.
+    # max_load_usd is intentionally omitted; sizing.* owns the runtime cap.
     min_order_usd: 10.0
-    # 2026-05-17: regime_flat_multiplier 0.70 -> 1.0. Kelly already shrinks
-    # bets when model edge is small (the actual concern in flat regime —
-    # book is tight and efficient). Penalizing lane bankroll on top was
-    # double-counting Kelly's edge logic. Whipsaw/TrendingVolatile penalties
-    # remain because those genuinely encode path-reversal risk Kelly can't
-    # fully anticipate.
     regime_flat_multiplier: 1.0
-    # Fractional Kelly sizing replaces the legacy 5-multiplier compound.
-    # f* = (p_adj - ask) / (1 - ask); p_adj shrinks model_favorite toward
-    # 0.5 by path_reversal_risk. Lane bankroll = adjusted_max_load_usd
-    # (regime × cap scaled), so whipsaw defense is preserved at the budget.
     kelly:
       fractional: 0.30
       max_clip_fraction: 0.30
-      # 2026-05-17: 0.02 -> 0.015 -> 0.025. Lowering captured the 1.5-2c
-      # band but also let through fragile high-ask saturation entries at
-      # 0.95+ where BSM model_favorite=0.99 with edge of 0.04 sized big
-      # via the (1-ask) Kelly amplification. Raising to 0.025 keeps the
-      # genuinely confident entries while filtering the marginal-edge
-      # high-ask cases that drove the 5.5hr drawdown.
       min_edge: 0.025
-    # Maker patience knobs: 6hr data showed makers cancel at 10-30s avg
-    # (the prior 25s + 3-tick escalation triggered too eagerly). Makers
-    # fill at ~2.9¢/share better price than taker FAK. Loosened to 60s
-    # age + 4-tick drift: gives makers a full minute to fill before we
-    # escalate to FAK, but still escalates promptly on 4¢ walk-aways.
     escalation_age_ms: 60000
     escalation_drift_ticks: 4
-    # Per-bar gross spend backstop. Caps adjusted_max_load_usd at this
-    # ceiling regardless of regime / cap_multiplier amplification. Set
-    # above typical Kelly output ($200-300) so it only binds on outlier
-    # over-conviction cases (today's $478 over-load bar would have been
-    # capped at $400). At higher bankrolls, raise this proportionally.
     per_bar_gross_cap_usd: 400.0
   favorite_anticipate:
-    # DISABLED — anticipate ladder produced marginal-band fires (0.51-0.59
-    # ladder rungs below the conviction floor) with undersized cheap-tail
-    # hedge, leaking expected value on adverse resolutions. Today's $449
-    # daily P&L was earned with this lane disabled. Re-enable only after
-    # implementing (1) ladder rungs anchored to min_favorite_ask floor
-    # and (2) share-count-parity tail hedging.
+    # Disabled until anticipate ladders are rebuilt around the conviction floor.
     enabled: false
-    # Regime is no longer a binary gate. Both flags are true so any regime
-    # can fire anticipate; the size_multiplier scales down in Flat (0.5x)
-    # and Whipsaw (0.3x). Diagnostic showed 98.4% of ticks were in Flat
-    # regime so the previous skip suppressed anticipate to 0 emissions.
     allow_flat_regime: true
     allow_whipsaw_regime: true
-    # Loosened 0.92 -> 0.90 -> 0.88 -> 0.85. Size multiplier self-scales:
-    # at-threshold trades get ~30% size (small bite), peak-conviction
-    # trades get full ladder. Worst-case EV at top of band = $0.05/share.
     min_model_favorite: 0.85
-    # Loosened 0.15 -> 0.20 -> 0.25 (reversal-risk now penalises size via multiplier)
     max_path_reversal_risk: 0.25
     require_btc_confirms: true
     min_favorite_ask: 0.60
     max_favorite_ask: 0.80
-    # No time-remaining gate. `model_favorite >= 0.85` is self-governing
-    # near resolution (BSM variance collapses -> step function). Venue
-    # rejects post-resolution orders mechanically. Lets Bonereaper-style
-    # final-seconds entries through when the model is confident.
     min_remaining_ms: 0
     clip_usd: 7.0
     max_load_usd: 35.0
     min_order_usd: 1.0
     ladder_levels: 3
     level_step_ticks: 1
-    # Scale per-level clip and total max_load with conviction strength.
-    # Multiplier interpolates 1.0 (just past the gate threshold) -> this
-    # value (peak model_favorite + momentum, zero reversal risk). At
-    # multiplier >= 1.5 we also add a 4th rung; at >= 2.0 a 5th rung.
-    # 2.5 = up to ~$12.50/level x 5 = ~$62.50 max per market at peak signal.
     conviction_size_scale_max: 2.5
   convex_tail:
     enabled: true
     clip_usd: 3.0
     max_load_usd: 30.0
     min_order_usd: 1.0
-    # Aligned to observed Bonereaper tape (May 2026 48h pull): 66% of buy spend
-    # is >=90c favorite, ~1.4% is <=10c tail, ~0.3% is <=3c ultra. Median
-    # opposing-tail / high-fav ratio is 3.6%, p75 ~6%.
-    #
-    # <=4c is true tiny convex tail. 4-10c is only allowed by the strategy code
-    # when it is attached to existing favorite/stranded exposure and remains
-    # payoff-capped; never as standalone dog speculation.
+    # 4-10c tail is only allowed when attached to existing favorite exposure.
     max_cheap_ask: 0.10
     max_late_fav_spend_fraction: 0.04
     max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.04
-    # Ultra-cheap maker rungs at 1c collapse the ladder to a single level once
-    # we improve by a tick (level 1 -> 0c, filtered). Setting 0 keeps every
-    # rung at touch so the multi-level all-levels-at-touch path can emit the
-    # "huge shares on tiny dollars" Bonereaper shape.
     maker_improve_ticks: 0.0
   reversal_hedge:
     enabled: true
-    # Defensive hedge, not normal tail loading. Already structurally
-    # bound to late-favorite exposure via reversal_hedge_cap_usd
-    # (returns 0 when late_fav_qty <= 0) and the entry gate at
-    # bonereaper_mm.rs:3799 (favorite_exposure_usd >= min_order_usd).
-    # So this lane CANNOT fire without an open late-fav position to
-    # defend.
-    # 2026-05-17 v2: expanded to cover the early-entry band (0.20 -> 0.30
-    # max hedge ask) since late-fav now fires at 0.70-0.85 favorite (cheap
-    # leg sits at 0.15-0.30, previously blocked by 0.20 cap). Tightened
-    # min_reversal_score 0.55 -> 0.70 to compensate: lane fires in a
-    # wider band but only on much stronger reversal signal. Sizing
-    # stays small ($2 clip, $6 max load) -- this is a defensive trim,
-    # not a full hedge.
+    # Defensive trim only; code gates this behind open late-favorite exposure.
     min_hedge_ask: 0.10
     max_hedge_ask: 0.30
     clip_usd: 2.0
@@ -260,4 +150,9 @@ late_favorite:
     max_favorite_exposure_fraction: 0.50
     max_win_edge_spend_fraction: 0.45
     min_order_usd: 2.0
-    min_reversal_score: 0.70
+    # 2026-05-17 v3: 0.70 -> 0.60. Tightened too far on prior pass --
+    # observed back-to-back losing bars at reversal_score ~0.55 where the
+    # 0.70 threshold blocked all hedges. 0.60 catches genuine starts-
+    # of-reversal while still filtering low-signal noise (which the
+    # 0.55 baseline let through).
+    min_reversal_score: 0.60
