@@ -156,13 +156,14 @@ late_favorite:
     min_order_usd: 1.0
     # 4-10c tail is only allowed when attached to existing favorite exposure.
     max_cheap_ask: 0.10
-    # Budget cheap-tail in share terms first: when coverage wants the hedge,
-    # allow about 0.6 cheap-tail shares per favorite share before spend caps
-    # can truncate it. Favorite-win payoff and max_load still bound the lane.
+    # For 1-3c tails, budget in share terms first: when coverage wants the
+    # hedge, allow about 0.6 cheap-tail shares per favorite share before spend
+    # caps can truncate it. Higher-priced tails still hedge, but stay
+    # dollar/payoff-budgeted so they do not eat too much favorite-win upside.
     min_tail_share_fraction: 0.60
-    max_late_fav_spend_fraction: 0.075
+    max_late_fav_spend_fraction: 0.04
     max_win_edge_spend_fraction: 0.30
-    ultra_cheap_max_ask: 0.04
+    ultra_cheap_max_ask: 0.03
     maker_improve_ticks: 0.0
     taker_slippage_ticks: 1.0
   reversal_hedge:

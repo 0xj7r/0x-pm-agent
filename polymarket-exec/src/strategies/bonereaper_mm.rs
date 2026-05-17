@@ -327,10 +327,10 @@ pub struct ConvexTailConfig {
     /// from `favorite_loss / (1 - tail_price)`, then converted back into
     /// allowed notional.
     pub max_favorite_exposure_fraction: f64,
-    /// Minimum cheap-tail shares, expressed as a fraction of favorite shares,
-    /// that the spend budget should allow when the payoff-aware hedge target is
-    /// larger. This prevents a low dollar-spend cap from silently truncating a
-    /// hedge to too few shares in 7-10c tail bands.
+    /// Minimum ultra-cheap tail shares, expressed as a fraction of favorite
+    /// shares, that the spend budget should allow when the payoff-aware hedge
+    /// target is larger. This only applies at or below `ultra_cheap_max_ask`;
+    /// ordinary 4-10c hedges remain dollar/payoff-budgeted.
     pub min_tail_share_fraction: f64,
     /// Hard upper bound as a fraction of late-favorite win-upside when the
     /// combined favorite+tail pair is not EV-positive. If the pair cost is
@@ -2775,8 +2775,11 @@ fn cheap_tail_cap_usd(
     } else {
         late_fav_qty
     };
-    let share_floor_budget_cap =
-        realized_favorite_qty * cfg.min_tail_share_fraction.max(0.0) * cheap_ask;
+    let share_floor_budget_cap = if cheap_ask <= cfg.ultra_cheap_max_ask {
+        realized_favorite_qty * cfg.min_tail_share_fraction.max(0.0) * cheap_ask
+    } else {
+        0.0
+    };
     let late_fav_budget_cap = fractional_late_fav_budget_cap
         .max(share_floor_budget_cap)
         .max(min_positive_payoff_tail_cap);
@@ -5780,7 +5783,7 @@ mod tests {
     }
 
     #[test]
-    fn cheap_tail_cap_uses_share_floor_when_spend_cap_truncates_hedge() {
+    fn cheap_tail_cap_uses_share_floor_only_for_ultra_cheap_hedge() {
         let cfg = ConvexTailConfig {
             clip_usd: 3.0,
             max_load_usd: 30.0,
@@ -5790,12 +5793,13 @@ mod tests {
             min_tail_share_fraction: 0.60,
             max_late_fav_spend_fraction: 0.04,
             max_win_edge_spend_fraction: 0.30,
+            ultra_cheap_max_ask: 0.03,
             ..ConvexTailConfig::default()
         };
 
         let favorite_qty = 78.3;
         let favorite_avg_price = 0.799;
-        let cap = cheap_tail_cap_usd(
+        let ordinary_tail_cap = cheap_tail_cap_usd(
             &cfg,
             favorite_qty,
             favorite_avg_price,
@@ -5808,13 +5812,31 @@ mod tests {
             favorite_avg_price,
         );
 
-        let tail_shares = cap / 0.09;
+        let ordinary_tail_shares = ordinary_tail_cap / 0.09;
         assert!(
-            tail_shares >= favorite_qty * 0.60 - 1e-6,
-            "share floor should allow about 60% tail shares, got {tail_shares}"
+            ordinary_tail_shares < favorite_qty * 0.60,
+            "ordinary 9c tail should stay spend-budgeted, got {ordinary_tail_shares}"
+        );
+
+        let ultra_tail_cap = cheap_tail_cap_usd(
+            &cfg,
+            favorite_qty,
+            favorite_avg_price,
+            0.98,
+            0.03,
+            Some(BtcRegime::Flat),
+            0.25,
+            0.0,
+            favorite_qty,
+            favorite_avg_price,
+        );
+        let ultra_tail_shares = ultra_tail_cap / 0.03;
+        assert!(
+            ultra_tail_shares >= favorite_qty * 0.60 - 1e-6,
+            "ultra-cheap share floor should allow about 60% tail shares, got {ultra_tail_shares}"
         );
         assert!(
-            cap < favorite_qty * (1.0 - favorite_avg_price),
+            ultra_tail_cap < favorite_qty * (1.0 - favorite_avg_price),
             "tail cap should still leave favorite-win payoff positive"
         );
     }
@@ -6361,8 +6383,8 @@ mod tests {
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
         assert_eq!(cfg.min_tail_share_fraction, 0.60);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.30);
-        assert_eq!(cfg.max_late_fav_spend_fraction, 0.075);
-        assert_eq!(cfg.ultra_cheap_max_ask, 0.04);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.04);
+        assert_eq!(cfg.ultra_cheap_max_ask, 0.03);
         assert_eq!(cfg.maker_improve_ticks, 0.0);
         assert_eq!(cfg.taker_slippage_ticks, 1.0);
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
