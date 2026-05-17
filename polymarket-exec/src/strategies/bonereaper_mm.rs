@@ -665,6 +665,7 @@ struct ReservedNotional {
 enum ReservationClass {
     Resting,
     Aggressive,
+    Hedge,
 }
 
 impl ReservationClass {
@@ -672,6 +673,7 @@ impl ReservationClass {
         match self {
             Self::Resting => 20_000,
             Self::Aggressive => 1_500,
+            Self::Hedge => 20_000,
         }
     }
 
@@ -679,6 +681,7 @@ impl ReservationClass {
         match self {
             Self::Resting => "resting",
             Self::Aggressive => "aggressive",
+            Self::Hedge => "hedge",
         }
     }
 }
@@ -986,6 +989,10 @@ impl LateFavBundleState {
             - self.working_fav_spend_usd
             - self.working_tail_spend_usd
             - proposed_fav_spend
+    }
+
+    fn payoff_if_fav_wins_after_tail_add(self, proposed_tail_spend: f64) -> f64 {
+        self.payoff_if_fav_wins_after(0.0, 0.0) - proposed_tail_spend.max(0.0)
     }
 
     fn payoff_if_tail_wins(self) -> f64 {
@@ -3700,6 +3707,15 @@ where
                         let clip = (load_left / remaining_levels)
                             .max(tail_cfg.min_order_usd)
                             .min(load_left);
+                        let planned_tail_spend = total_clip - load_left;
+                        let projected_fav_win_payoff = bundle_state
+                            .payoff_if_fav_wins_after_tail_add(planned_tail_spend + clip);
+                        if projected_fav_win_payoff < -1e-9 {
+                            notes.push(format!(
+                                "cheap_tail blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={projected_fav_win_payoff:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} tail_cap={tail_cap_usd:.2}",
+                            ));
+                            break;
+                        }
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
@@ -3753,11 +3769,7 @@ where
                             legs.cheap_leg,
                             clip,
                             input.now_ms,
-                            if aggressive_taker {
-                                ReservationClass::Aggressive
-                            } else {
-                                ReservationClass::Resting
-                            },
+                            ReservationClass::Hedge,
                         );
                         load_left -= clip;
                     }
@@ -3946,6 +3958,15 @@ where
                         let clip = (load_left / remaining_levels)
                             .max(reversal_cfg.min_order_usd)
                             .min(load_left);
+                        let planned_tail_spend = total_clip - load_left;
+                        let projected_fav_win_payoff = bundle_state
+                            .payoff_if_fav_wins_after_tail_add(planned_tail_spend + clip);
+                        if projected_fav_win_payoff < -1e-9 {
+                            notes.push(format!(
+                                "reversal_hedge blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={projected_fav_win_payoff:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} hedge_cap={hedge_cap_usd:.2}",
+                            ));
+                            break;
+                        }
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
@@ -3990,11 +4011,7 @@ where
                             legs.cheap_leg,
                             clip,
                             input.now_ms,
-                            if aggressive_taker {
-                                ReservationClass::Aggressive
-                            } else {
-                                ReservationClass::Resting
-                            },
+                            ReservationClass::Hedge,
                         );
                         load_left -= clip;
                     }
@@ -4823,6 +4840,31 @@ mod tests {
     }
 
     #[test]
+    fn hedge_reservations_survive_fast_aggressive_expiry() {
+        let mut strategy = LateFavoriteStrategy::new(LateFavoriteStrategyConfig::default());
+        let market_id = MarketId::new("m");
+        let now = 1_000;
+
+        strategy.reserve_notional(
+            &market_id,
+            LadderLeg::No,
+            2.75,
+            now,
+            ReservationClass::Hedge,
+        );
+
+        strategy.prune_reservations(now + 1_501);
+        assert_eq!(
+            strategy.reserved_notional(&market_id, LadderLeg::No),
+            2.75,
+            "cheap-tail/reversal hedge budget must stay reserved while taker fills reconcile"
+        );
+
+        strategy.prune_reservations(now + 20_001);
+        assert_eq!(strategy.reserved_notional(&market_id, LadderLeg::No), 0.0);
+    }
+
+    #[test]
     fn combine_suppresses_resting_paired_core_when_broad_core_is_stopped() {
         let decision = BonereaperMmStrategy::combine(
             StrategyDecision::Noop { notes: Vec::new() },
@@ -5200,6 +5242,58 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn cheap_tail_cap_matches_live_incident_payoff_budget() {
+        let cfg = ConvexTailConfig {
+            clip_usd: 3.0,
+            max_load_usd: 30.0,
+            min_order_usd: 1.0,
+            max_cheap_ask: 0.10,
+            max_favorite_exposure_fraction: 0.55,
+            max_late_fav_spend_fraction: 0.04,
+            max_win_edge_spend_fraction: 0.30,
+            ultra_cheap_max_ask: 0.04,
+            ..ConvexTailConfig::default()
+        };
+
+        let cap = cheap_tail_cap_usd(
+            &cfg,
+            94.4906,
+            80.9033 / 94.4906,
+            0.91,
+            0.10,
+            Some(BtcRegime::Flat),
+            0.19,
+            0.0,
+            94.4906,
+            80.9033 / 94.4906,
+        );
+
+        assert!(
+            cap <= 3.2362 + 1e-4,
+            "incident basket should cap cheap-tail spend near 4% of $80.90 favorite spend, got {cap}"
+        );
+    }
+
+    #[test]
+    fn bundle_state_blocks_tail_that_makes_favorite_win_negative() {
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::Yes,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::No,
+            side_flip: false,
+            fav_filled_qty: 96.1408,
+            fav_filled_spend_usd: 80.9033,
+            tail_filled_qty: 278.7244,
+            tail_filled_spend_usd: 23.6742,
+            working_fav_spend_usd: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        assert!(bundle.payoff_if_fav_wins_after(0.0, 0.0) < 0.0);
+        assert!(bundle.payoff_if_fav_wins_after_tail_add(1.0) < 0.0);
     }
 
     #[test]
