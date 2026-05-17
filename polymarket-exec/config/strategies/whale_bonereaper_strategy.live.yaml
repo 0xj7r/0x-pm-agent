@@ -55,12 +55,11 @@ pair:
 
 paired_core:
   # Legacy paired-MM execution shape: many tiny maker probes rather than one
-  # meaningful 20-share center clip. This improves fill opportunity in flat
-  # oscillating markets while capping one-sided damage to one venue-min clip.
+  # meaningful 20-share center clip.
   # KNOWN ISSUE 2026-05-17: max_unpaired_core_qty cap checks PROJECTED
   # imbalance (assuming symmetric fills), not actual leg-fill counts.
   # Markets observed leaking 10-20 share asymmetric inventory per bar.
-  # Fix path: actual-fill-driven imbalance gating in core_hedge_mm emit loop.
+  # Fix path: book-imbalance gating per leg (next ship).
   enabled: true
   center_probe_only: false
   ladder_levels: 12
@@ -136,6 +135,17 @@ late_favorite:
     # computed clips were collapsing to venue-min 5-share dribbles, which
     # under-expresses the Bonereaper lane while still taking reversal risk.
     min_order_usd: 10.0
+    # Fractional Kelly sizing replaces the legacy 5-multiplier compound
+    # (regime × confidence × timing × conviction × price_taper) that was
+    # collapsing per-clip to ~$10-20 even at high model conviction.
+    # Kelly: f* = (p_adj - ask) / (1 - ask), where p_adj shrinks
+    # model_favorite toward 0.5 by path_reversal_risk. Lane bankroll is
+    # the existing adjusted_max_load_usd (regime × policy scaled), so
+    # whipsaw defense is preserved at the budget layer.
+    kelly:
+      fractional: 0.30        # quarter-to-half Kelly (MacLean/Thorp/Ziemba)
+      max_clip_fraction: 0.30 # hard cap at 30% of lane bankroll per clip
+      min_edge: 0.02          # skip if reversal-adjusted edge < 2 cents
   favorite_anticipate:
     # DISABLED — anticipate ladder produced marginal-band fires (0.51-0.59
     # ladder rungs below the conviction floor) with undersized cheap-tail

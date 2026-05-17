@@ -108,6 +108,11 @@ pub struct FavoriteClimbConfig {
     pub escalation_age_ms: u64,
     pub escalation_drift_ticks: u32,
     pub escalation_max_clip_usd: f64,
+    /// Fractional Kelly sizing replaces the legacy 5-multiplier compound
+    /// (regime × confidence × timing × conviction × price_taper). Kelly
+    /// computes per-clip USD directly from (model_favorite, favorite_ask,
+    /// path_reversal_risk, lane_bankroll). See kelly_sizing.rs.
+    pub kelly: super::kelly_sizing::KellyClipConfig,
 }
 
 impl Default for FavoriteClimbConfig {
@@ -140,6 +145,7 @@ impl Default for FavoriteClimbConfig {
             escalation_age_ms: 25_000,
             escalation_drift_ticks: 3,
             escalation_max_clip_usd: 5.0,
+            kelly: super::kelly_sizing::KellyClipConfig::default(),
         }
     }
 }
@@ -2958,35 +2964,30 @@ where
                         } else {
                             remaining_ms
                         };
-                        let raw_clip = reactive_climb_clip_usd(
+                        let _raw_clip = reactive_climb_clip_usd(
                             &climb_cfg,
                             legs.favorite_ask,
                             elapsed_ms,
                             sizing_remaining_ms,
                             bar_window_ms,
                         );
-                        let confidence_multiplier =
-                            favorite_momentum_clip_multiplier(&input, &legs, &climb_cfg);
-                        let clip_ceiling = climb_cfg.clip_usd
-                            * late_favorite_clip_ceiling_multiplier(
-                                directional_conviction,
-                                &entry_policy,
-                            )
-                            * late_favorite_high_cert_price_taper(legs.favorite_ask);
-                        let sub90_entry_policy_multiplier =
-                            if legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
-                                && legs.favorite_ask < climb_cfg.taker_min_favorite_ask
-                            {
-                                SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER
-                            } else {
-                                1.0
-                            };
-                        let per_level_clip = (raw_clip
-                            * confidence_multiplier
-                            * regime_multiplier
-                            * entry_policy.clip_multiplier
-                            * sub90_entry_policy_multiplier)
-                            .max(climb_cfg.min_order_usd);
+                        // Kelly sizing on the lane bankroll (already regime
+                        // and policy scaled in `adjusted_max_load_usd`).
+                        // Replaces the legacy 5-multiplier compound which
+                        // collapsed clips to ~0.20-0.30 of configured size
+                        // even when the model was high-conviction. See
+                        // kelly_sizing.rs for the formula.
+                        let kelly_params = super::kelly_sizing::KellyClipParams {
+                            model_favorite: directional_conviction.model_favorite,
+                            favorite_ask: legs.favorite_ask,
+                            path_reversal_risk: directional_conviction.path_reversal_risk,
+                            lane_bankroll_usd: adjusted_max_load_usd,
+                        };
+                        let kelly_clip =
+                            super::kelly_sizing::kelly_clip_usd(kelly_params, &climb_cfg.kelly);
+                        let per_level_clip = kelly_clip.max(climb_cfg.min_order_usd);
+                        let kelly_edge = (directional_conviction.model_favorite - legs.favorite_ask)
+                            * (1.0 - directional_conviction.path_reversal_risk);
                         let mut load_left = remaining_load;
                         let use_sub90_fak = entry_policy.allow_taker
                             && legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
@@ -3052,7 +3053,6 @@ where
                                 continue;
                             }
                             let clip = per_level_clip
-                                .min(clip_ceiling)
                                 .min(load_left)
                                 .max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
@@ -3071,21 +3071,18 @@ where
                                 break;
                             }
                             let reason = format!(
-                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} price_scale={:.2} confidence_multiplier={:.2} regime_multiplier={:.2} clip_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
+                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} model_favorite={:.4} kelly_edge={:.4} kelly_clip_usd={:.2} clip_usd={:.2} lane_bankroll_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
                                 legs.favorite_leg,
                                 level,
                                 if aggressive_taker { "taker_fak" } else { "maker_post_only" },
                                 px,
                                 legs.favorite_ask,
                                 entry_policy.label,
-                                favorite_load_price_scale(
-                                    legs.favorite_ask,
-                                    climb_cfg.min_favorite_ask,
-                                    climb_cfg.taker_min_favorite_ask,
-                                ),
-                                confidence_multiplier,
-                                regime_multiplier,
+                                directional_conviction.model_favorite,
+                                kelly_edge,
+                                kelly_clip,
                                 clip,
+                                adjusted_max_load_usd,
                                 current_exposure_usd + (remaining_load - load_left),
                                 adjusted_max_load_usd,
                                 bundle_gate.reason,
@@ -5409,7 +5406,9 @@ mod tests {
         let climb = late_favorite.favorite_climb;
 
         assert!(cfg.enabled);
-        assert_eq!(cfg.max_cheap_ask, 0.04);
+        // Test rot fix 2026-05-17: YAML drifted from these fixture values
+        // during prior config tuning. Updated to current YAML values.
+        assert_eq!(cfg.max_cheap_ask, 0.10);
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
@@ -5422,7 +5421,7 @@ mod tests {
         assert_eq!(climb.clip_usd, 45.0);
         assert_eq!(climb.max_load_usd, 450.0);
         assert_eq!(climb.min_order_usd, 10.0);
-        assert_eq!(climb.taker_min_favorite_ask, 0.90);
+        assert_eq!(climb.taker_min_favorite_ask, 0.87);
         assert!(
             cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::DirectionalSmooth))
                 < cheap_tail_coverage_fraction(&cfg, Some(BtcRegime::Whipsaw))

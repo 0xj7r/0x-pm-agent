@@ -17,6 +17,7 @@ use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
     LateFavAnticipateConfig, LateFavoriteStrategyConfig, ReversalHedgeConfig,
 };
+use crate::strategies::kelly_sizing::KellyClipConfig;
 use crate::strategies::core_hedge_mm::{
     CoreHedgeMmConfig, CoreHedgeMmStrategyConfig, PairedCoreLadderAnchor,
 };
@@ -123,6 +124,15 @@ pub struct FavoriteClimbSubsection {
     pub escalation_age_ms: Option<u64>,
     pub escalation_drift_ticks: Option<u32>,
     pub escalation_max_clip_usd: Option<f64>,
+    pub kelly: Option<KellyClipSubsection>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KellyClipSubsection {
+    pub fractional: Option<f64>,
+    pub max_clip_fraction: Option<f64>,
+    pub min_edge: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -421,6 +431,20 @@ impl StrategyProfile {
                 escalation_max_clip_usd: c
                     .escalation_max_clip_usd
                     .unwrap_or(climb_def.escalation_max_clip_usd),
+                kelly: {
+                    let kdef = climb_def.kelly;
+                    if let Some(k) = c.kelly.as_ref() {
+                        KellyClipConfig {
+                            fractional: k.fractional.unwrap_or(kdef.fractional),
+                            max_clip_fraction: k
+                                .max_clip_fraction
+                                .unwrap_or(kdef.max_clip_fraction),
+                            min_edge: k.min_edge.unwrap_or(kdef.min_edge),
+                        }
+                    } else {
+                        kdef
+                    }
+                },
             },
             favorite_anticipate: LateFavAnticipateConfig {
                 enabled: a.enabled.unwrap_or(anticipate_def.enabled),
