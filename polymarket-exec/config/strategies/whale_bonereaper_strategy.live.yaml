@@ -19,7 +19,7 @@ inventory:
   max_position_quantity_per_instrument: 1500.0
   min_free_cash_usd: 1.0
   min_free_cash_bps: 0.0
-  max_session_loss_usd: 200.0
+  max_session_loss_usd: 1000.0
   max_session_loss_bps: 0.0
 
 health:
