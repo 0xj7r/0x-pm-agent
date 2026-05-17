@@ -132,10 +132,12 @@ late_favorite:
     min_favorite_ask: 0.70
     max_favorite_ask: 0.99
     clip_usd: 45.0
-    # 2026-05-17: raised from 450 -> 600. Kelly bankroll = max_load × regime
-    # × cap_multiplier, so this lifts per-clip Kelly outputs ~33%. TODO:
-    # parameterize as % of live equity for proper compounding.
-    max_load_usd: 600.0
+    # 2026-05-17: 450 -> 600 -> 500. First lift drove $452 peak-to-trough
+    # drawdown over 5.5hr unattended with implied 85% hit rate vs 91.2%
+    # break-even at avg 0.912 entry. Backing off to 500 while we collect
+    # more data on whether BSM model saturates too aggressively at the
+    # 0.95+ ask band.
+    max_load_usd: 500.0
     min_order_usd: 10.0
     # 2026-05-17: regime_flat_multiplier 0.70 -> 1.0. Kelly already shrinks
     # bets when model edge is small (the actual concern in flat regime —
@@ -151,9 +153,13 @@ late_favorite:
     kelly:
       fractional: 0.30
       max_clip_fraction: 0.30
-      # 2026-05-17: 0.02 -> 0.015 to capture the 1.5-2c edge band on 90+ ask
-      # entries (where (1-ask) denominator amplifies small edges into big Kelly).
-      min_edge: 0.015
+      # 2026-05-17: 0.02 -> 0.015 -> 0.025. Lowering captured the 1.5-2c
+      # band but also let through fragile high-ask saturation entries at
+      # 0.95+ where BSM model_favorite=0.99 with edge of 0.04 sized big
+      # via the (1-ask) Kelly amplification. Raising to 0.025 keeps the
+      # genuinely confident entries while filtering the marginal-edge
+      # high-ask cases that drove the 5.5hr drawdown.
+      min_edge: 0.025
     # Maker patience knobs: 6hr data showed makers cancel at 10-30s avg
     # (the prior 25s + 3-tick escalation triggered too eagerly). Makers
     # fill at ~2.9¢/share better price than taker FAK. Loosened to 60s
