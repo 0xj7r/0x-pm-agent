@@ -130,6 +130,25 @@ late_favorite:
     ladder_levels: 3
     level_step_ticks: 1
     conviction_size_scale_max: 2.5
+  mid_directional_shadow:
+    # Shadow-only current-bar experiment. Emits no orders; logs would-buy
+    # candidates when the BSM/tape model strongly favors a side while the
+    # market is still mid-band.
+    enabled: true
+    min_ask: 0.48
+    max_ask: 0.58
+    min_model_probability: 0.90
+    max_path_reversal_risk: 0.35
+    min_book_model_agreement: 0.45
+    max_toxicity_score: 0.35
+    min_btc_confirm_bps: 1.0
+    bankroll_usd: 100.0
+    max_clip_usd: 5.0
+    min_emit_interval_ms: 5000
+    kelly:
+      fractional: 0.10
+      max_clip_fraction: 0.05
+      min_edge: 0.02
   convex_tail:
     enabled: true
     clip_usd: 3.0
@@ -137,7 +156,11 @@ late_favorite:
     min_order_usd: 1.0
     # 4-10c tail is only allowed when attached to existing favorite exposure.
     max_cheap_ask: 0.10
-    max_late_fav_spend_fraction: 0.04
+    # Budget cheap-tail in share terms first: when coverage wants the hedge,
+    # allow about 0.6 cheap-tail shares per favorite share before spend caps
+    # can truncate it. Favorite-win payoff and max_load still bound the lane.
+    min_tail_share_fraction: 0.60
+    max_late_fav_spend_fraction: 0.075
     max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.04
     maker_improve_ticks: 0.0

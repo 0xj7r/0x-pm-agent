@@ -15,7 +15,8 @@ use crate::market_making::paired_mm::{
 use crate::quote_engine::QuoteEngineConfig;
 use crate::strategies::bonereaper_mm::{
     BonereaperMmStrategyConfig, ConvexTailConfig, DirectionalSizingConfig, FavoriteClimbConfig,
-    LateFavAnticipateConfig, LateFavoriteStrategyConfig, ReversalHedgeConfig,
+    LateFavAnticipateConfig, LateFavoriteStrategyConfig, MidDirectionalShadowConfig,
+    ReversalHedgeConfig,
 };
 use crate::strategies::core_hedge_mm::{
     CoreHedgeMmConfig, CoreHedgeMmStrategyConfig, DenseTandemConfig, PairedCoreEmitMode,
@@ -80,6 +81,7 @@ pub struct LateFavoriteSection {
     pub favorite_anticipate: LateFavAnticipateSubsection,
     pub convex_tail: ConvexTailSubsection,
     pub reversal_hedge: ReversalHedgeSubsection,
+    pub mid_directional_shadow: MidDirectionalShadowSubsection,
     pub sizing: DirectionalSizingSubsection,
 }
 
@@ -149,6 +151,23 @@ pub struct KellyClipSubsection {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
+pub struct MidDirectionalShadowSubsection {
+    pub enabled: Option<bool>,
+    pub min_ask: Option<f64>,
+    pub max_ask: Option<f64>,
+    pub min_model_probability: Option<f64>,
+    pub max_path_reversal_risk: Option<f64>,
+    pub min_book_model_agreement: Option<f64>,
+    pub max_toxicity_score: Option<f64>,
+    pub min_btc_confirm_bps: Option<f64>,
+    pub bankroll_usd: Option<f64>,
+    pub max_clip_usd: Option<f64>,
+    pub min_emit_interval_ms: Option<u64>,
+    pub kelly: Option<KellyClipSubsection>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConvexTailSubsection {
     pub enabled: Option<bool>,
     pub max_cheap_ask: Option<f64>,
@@ -157,6 +176,7 @@ pub struct ConvexTailSubsection {
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
     pub max_favorite_exposure_fraction: Option<f64>,
+    pub min_tail_share_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
     pub max_late_fav_spend_fraction: Option<f64>,
     pub ultra_cheap_max_ask: Option<f64>,
@@ -417,8 +437,10 @@ impl StrategyProfile {
         let a = &self.late_favorite.favorite_anticipate;
         let t = &self.late_favorite.convex_tail;
         let r = &self.late_favorite.reversal_hedge;
+        let m = &self.late_favorite.mid_directional_shadow;
         let s = &self.late_favorite.sizing;
         let sizing_def = DirectionalSizingConfig::default();
+        let mid_shadow_def = MidDirectionalShadowConfig::default();
         LateFavoriteStrategyConfig {
             favorite_climb: FavoriteClimbConfig {
                 enabled: c.enabled.unwrap_or(climb_def.enabled),
@@ -540,6 +562,9 @@ impl StrategyProfile {
                 max_favorite_exposure_fraction: t
                     .max_favorite_exposure_fraction
                     .unwrap_or(tail_def.max_favorite_exposure_fraction),
+                min_tail_share_fraction: t
+                    .min_tail_share_fraction
+                    .unwrap_or(tail_def.min_tail_share_fraction),
                 max_win_edge_spend_fraction: t
                     .max_win_edge_spend_fraction
                     .unwrap_or(tail_def.max_win_edge_spend_fraction),
@@ -599,6 +624,45 @@ impl StrategyProfile {
                     .directional_smooth_score_penalty
                     .unwrap_or(reversal_def.directional_smooth_score_penalty),
                 disable_after_ms: r.disable_after_ms,
+            },
+            mid_directional_shadow: MidDirectionalShadowConfig {
+                enabled: m.enabled.unwrap_or(mid_shadow_def.enabled),
+                min_ask: m.min_ask.unwrap_or(mid_shadow_def.min_ask),
+                max_ask: m.max_ask.unwrap_or(mid_shadow_def.max_ask),
+                min_model_probability: m
+                    .min_model_probability
+                    .unwrap_or(mid_shadow_def.min_model_probability),
+                max_path_reversal_risk: m
+                    .max_path_reversal_risk
+                    .unwrap_or(mid_shadow_def.max_path_reversal_risk),
+                min_book_model_agreement: m
+                    .min_book_model_agreement
+                    .unwrap_or(mid_shadow_def.min_book_model_agreement),
+                max_toxicity_score: m
+                    .max_toxicity_score
+                    .unwrap_or(mid_shadow_def.max_toxicity_score),
+                min_btc_confirm_bps: m
+                    .min_btc_confirm_bps
+                    .unwrap_or(mid_shadow_def.min_btc_confirm_bps),
+                bankroll_usd: m.bankroll_usd.unwrap_or(mid_shadow_def.bankroll_usd),
+                max_clip_usd: m.max_clip_usd.unwrap_or(mid_shadow_def.max_clip_usd),
+                min_emit_interval_ms: m
+                    .min_emit_interval_ms
+                    .unwrap_or(mid_shadow_def.min_emit_interval_ms),
+                kelly: {
+                    let kdef = mid_shadow_def.kelly;
+                    if let Some(k) = m.kelly.as_ref() {
+                        KellyClipConfig {
+                            fractional: k.fractional.unwrap_or(kdef.fractional),
+                            max_clip_fraction: k
+                                .max_clip_fraction
+                                .unwrap_or(kdef.max_clip_fraction),
+                            min_edge: k.min_edge.unwrap_or(kdef.min_edge),
+                        }
+                    } else {
+                        kdef
+                    }
+                },
             },
             sizing: DirectionalSizingConfig {
                 enabled: s.enabled.unwrap_or(sizing_def.enabled),

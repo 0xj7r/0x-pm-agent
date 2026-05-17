@@ -327,14 +327,20 @@ pub struct ConvexTailConfig {
     /// from `favorite_loss / (1 - tail_price)`, then converted back into
     /// allowed notional.
     pub max_favorite_exposure_fraction: f64,
+    /// Minimum cheap-tail shares, expressed as a fraction of favorite shares,
+    /// that the spend budget should allow when the payoff-aware hedge target is
+    /// larger. This prevents a low dollar-spend cap from silently truncating a
+    /// hedge to too few shares in 7-10c tail bands.
+    pub min_tail_share_fraction: f64,
     /// Hard upper bound as a fraction of late-favorite win-upside when the
     /// combined favorite+tail pair is not EV-positive. If the pair cost is
     /// positive-EV, this cap does not bind; the hedge is then useful paired
     /// inventory, not pure insurance drag.
     pub max_win_edge_spend_fraction: f64,
-    /// Hard upper bound as a fraction of late-favorite spend. This keeps
-    /// cheap-tail as a small dollar-budget insurance sleeve instead of a
-    /// share-count hedge that competes with the late-favorite edge.
+    /// Default upper bound as a fraction of late-favorite spend. The explicit
+    /// share floor above can raise this budget when the payoff-aware hedge
+    /// target needs more shares; favorite-win payoff and max_load remain hard
+    /// caps.
     pub max_late_fav_spend_fraction: f64,
     /// Ultra-cheap tail threshold where a small dollar budget buys materially
     /// different convexity than ordinary 5-10c tail.
@@ -363,6 +369,7 @@ impl Default for ConvexTailConfig {
             clip_usd: 1.25,
             max_load_usd: 8.0,
             max_favorite_exposure_fraction: 0.55,
+            min_tail_share_fraction: 0.0,
             max_win_edge_spend_fraction: 0.45,
             max_late_fav_spend_fraction: 0.025,
             ultra_cheap_max_ask: 0.03,
@@ -487,6 +494,45 @@ impl Default for DirectionalSizingConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MidDirectionalShadowConfig {
+    pub enabled: bool,
+    pub min_ask: f64,
+    pub max_ask: f64,
+    pub min_model_probability: f64,
+    pub max_path_reversal_risk: f64,
+    pub min_book_model_agreement: f64,
+    pub max_toxicity_score: f64,
+    pub min_btc_confirm_bps: f64,
+    pub bankroll_usd: f64,
+    pub max_clip_usd: f64,
+    pub min_emit_interval_ms: u64,
+    pub kelly: super::kelly_sizing::KellyClipConfig,
+}
+
+impl Default for MidDirectionalShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_ask: 0.48,
+            max_ask: 0.58,
+            min_model_probability: 0.90,
+            max_path_reversal_risk: 0.35,
+            min_book_model_agreement: 0.45,
+            max_toxicity_score: 0.35,
+            min_btc_confirm_bps: 1.0,
+            bankroll_usd: 100.0,
+            max_clip_usd: 5.0,
+            min_emit_interval_ms: 5_000,
+            kelly: super::kelly_sizing::KellyClipConfig {
+                fractional: 0.10,
+                max_clip_fraction: 0.05,
+                min_edge: 0.02,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct FavoriteEntryPolicy {
     min_price: f64,
     max_levels: usize,
@@ -495,6 +541,7 @@ struct FavoriteEntryPolicy {
     allow_taker: bool,
     force_taker: bool,
     near_touch_maker: bool,
+    maker_touch_offset_ticks: f64,
     path_reversal_risk: f64,
     label: &'static str,
 }
@@ -571,6 +618,7 @@ pub struct LateFavoriteStrategyConfig {
     pub favorite_anticipate: LateFavAnticipateConfig,
     pub convex_tail: ConvexTailConfig,
     pub reversal_hedge: ReversalHedgeConfig,
+    pub mid_directional_shadow: MidDirectionalShadowConfig,
     pub sizing: DirectionalSizingConfig,
 }
 
@@ -581,6 +629,7 @@ impl Default for LateFavoriteStrategyConfig {
             favorite_anticipate: LateFavAnticipateConfig::default(),
             convex_tail: ConvexTailConfig::default(),
             reversal_hedge: ReversalHedgeConfig::default(),
+            mid_directional_shadow: MidDirectionalShadowConfig::default(),
             sizing: DirectionalSizingConfig::default(),
         }
     }
@@ -652,6 +701,7 @@ pub struct LateFavoriteStrategy {
     config: LateFavoriteStrategyConfig,
     reserved_directional_notional: HashMap<String, ReservedNotional>,
     late_fav_rearm_state: HashMap<MarketId, LateFavRearmState>,
+    mid_directional_shadow_last_emit: HashMap<MarketId, EpochMillis>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -691,6 +741,7 @@ impl LateFavoriteStrategy {
             config,
             reserved_directional_notional: HashMap::new(),
             late_fav_rearm_state: HashMap::new(),
+            mid_directional_shadow_last_emit: HashMap::new(),
         }
     }
 
@@ -719,6 +770,25 @@ impl LateFavoriteStrategy {
             .filter(|(key, _)| key.starts_with(&prefix))
             .map(|(_, reserved)| reserved.notional_usd.max(0.0))
             .sum()
+    }
+
+    fn mid_directional_shadow_due(
+        &mut self,
+        market_id: &MarketId,
+        now_ms: EpochMillis,
+        interval_ms: u64,
+    ) -> bool {
+        let last = self
+            .mid_directional_shadow_last_emit
+            .get(market_id)
+            .copied()
+            .unwrap_or(0);
+        if now_ms.saturating_sub(last) < interval_ms {
+            return false;
+        }
+        self.mid_directional_shadow_last_emit
+            .insert(market_id.clone(), now_ms);
+        true
     }
 
     fn reserve_notional(
@@ -1186,11 +1256,7 @@ fn late_favorite_maker_base_price(
         return maker_limit_price(bid, ask, tick, cfg.maker_improve_ticks);
     }
     let passive_px = maker_limit_price(bid, ask, tick, cfg.maker_improve_ticks)?;
-    let near_touch_ticks = if ask >= cfg.near_touch_min_favorite_ask {
-        1.0
-    } else {
-        2.0
-    };
+    let near_touch_ticks = entry_policy.maker_touch_offset_ticks.max(1.0);
     let near_touch_px = ask - tick * near_touch_ticks;
     let max_passive = (ask - tick).max(tick);
     let px = passive_px.max(near_touch_px).min(max_passive);
@@ -1664,11 +1730,139 @@ fn favorite_probability(leg: LadderLeg, p_up: f64, p_down: f64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MidDirectionalShadowCandidate {
+    leg: LadderLeg,
+    ask: f64,
+    bid: f64,
+    model_probability: f64,
+    path_reversal_risk: f64,
+    book_model_agreement: BookModelAgreement,
+    kelly_clip_usd: f64,
+}
+
+fn leg_bid_ask(legs: &LegQuotes, leg: LadderLeg) -> (f64, f64) {
+    if leg == legs.favorite_leg {
+        (legs.favorite_bid, legs.favorite_ask)
+    } else {
+        (legs.cheap_bid, legs.cheap_ask)
+    }
+}
+
+fn leg_quotes_for(legs: &LegQuotes, leg: LadderLeg) -> LegQuotes {
+    let (favorite_bid, favorite_ask) = leg_bid_ask(legs, leg);
+    let cheap_leg = opposite_leg(leg);
+    let (cheap_bid, cheap_ask) = leg_bid_ask(legs, cheap_leg);
+    LegQuotes {
+        favorite_leg: leg,
+        cheap_leg,
+        favorite_ask,
+        favorite_bid,
+        cheap_ask,
+        cheap_bid,
+    }
+}
+
 fn book_model_agreement_for<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     favorite_leg: LadderLeg,
 ) -> BookModelAgreement {
     BookModelAgreement::compute(favorite_leg, &input.order_book_pressure, &input.momentum)
+}
+
+fn btc_confirms_leg<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    leg: LadderLeg,
+    min_confirm_bps: f64,
+) -> bool {
+    let threshold = min_confirm_bps.max(0.0);
+    let side_30 = input
+        .btc_regime
+        .return_30s_bps
+        .map(|r| signed_for_favorite(leg, r));
+    let confirms_window = [
+        side_30,
+        input
+            .btc_regime
+            .return_60s_bps
+            .map(|r| signed_for_favorite(leg, r)),
+        input
+            .btc_regime
+            .return_120s_bps
+            .map(|r| signed_for_favorite(leg, r)),
+        input
+            .btc_regime
+            .return_180s_bps
+            .map(|r| signed_for_favorite(leg, r)),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|ret| ret >= threshold);
+    let no_recent_snapback = side_30
+        .map(|ret| ret >= -threshold.max(1.0) * 0.50)
+        .unwrap_or(true);
+    confirms_window && no_recent_snapback
+}
+
+fn mid_directional_shadow_candidate<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    cfg: &MidDirectionalShadowConfig,
+) -> Option<MidDirectionalShadowCandidate> {
+    if !cfg.enabled {
+        return None;
+    }
+    let model_leg = if input.fair_value.p_up >= input.fair_value.p_down {
+        LadderLeg::Yes
+    } else {
+        LadderLeg::No
+    };
+    let model_probability =
+        favorite_probability(model_leg, input.fair_value.p_up, input.fair_value.p_down);
+    if model_probability < cfg.min_model_probability {
+        return None;
+    }
+    let (bid, ask) = leg_bid_ask(legs, model_leg);
+    if ask < cfg.min_ask || ask > cfg.max_ask {
+        return None;
+    }
+    if !btc_confirms_leg(input, model_leg, cfg.min_btc_confirm_bps) {
+        return None;
+    }
+    let model_legs = leg_quotes_for(legs, model_leg);
+    let path_reversal_risk = path_reversal_risk_score(input, &model_legs);
+    if path_reversal_risk > cfg.max_path_reversal_risk {
+        return None;
+    }
+    let book_model_agreement = book_model_agreement_for(input, model_leg);
+    if book_model_agreement.agreement < cfg.min_book_model_agreement
+        || book_model_agreement.toxicity_score > cfg.max_toxicity_score
+    {
+        return None;
+    }
+    let kelly_clip_usd = super::kelly_sizing::kelly_clip_usd(
+        super::kelly_sizing::KellyClipParams {
+            model_favorite: model_probability,
+            favorite_ask: ask,
+            path_reversal_risk,
+            lane_bankroll_usd: cfg.bankroll_usd,
+        },
+        &cfg.kelly,
+    )
+    .min(cfg.max_clip_usd.max(0.0));
+    if kelly_clip_usd <= 0.0 {
+        return None;
+    }
+
+    Some(MidDirectionalShadowCandidate {
+        leg: model_leg,
+        ask,
+        bid,
+        model_probability,
+        path_reversal_risk,
+        book_model_agreement,
+        kelly_clip_usd,
+    })
 }
 
 fn near_strike_fragility_for<M: MarketDescriptor>(
@@ -2224,9 +2418,10 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             } else {
                 0.35
             },
-            allow_taker: model_confirmed_wing,
-            force_taker: model_confirmed_wing,
+            allow_taker: false,
+            force_taker: false,
             near_touch_maker: true,
+            maker_touch_offset_ticks: if model_confirmed_wing { 1.0 } else { 2.0 },
             path_reversal_risk,
             label: if model_confirmed_wing && early_late {
                 "model_confirmed_wing_65_79_early"
@@ -2348,11 +2543,10 @@ fn favorite_entry_policy<M: MarketDescriptor>(
                 * whipsaw_scale
                 * flat_scale
                 * probe_scale,
-            allow_taker: (model_confirmed_wing || clean_directional_persistence || barbell_sub90)
-                && legs.favorite_ask >= cfg.near_touch_min_favorite_ask
-                && (elapsed_sec >= 180 || barbell_sub90 || model_confirmed_wing),
-            force_taker: model_confirmed_wing,
+            allow_taker: false,
+            force_taker: false,
             near_touch_maker,
+            maker_touch_offset_ticks: 1.0,
             path_reversal_risk,
             label: if model_confirmed_wing && early_late {
                 "model_confirmed_wing_80_84_early"
@@ -2396,6 +2590,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
         allow_taker: true,
         force_taker: false,
         near_touch_maker: true,
+        maker_touch_offset_ticks: 1.0,
         path_reversal_risk,
         label: if pre_standard_late_window && whipsaw {
             "true_late_fav_90_plus_barbell_whipsaw_early"
@@ -2575,7 +2770,16 @@ fn cheap_tail_cap_usd(
         cfg.max_late_fav_spend_fraction
     };
     let fractional_late_fav_budget_cap = favorite_loss_at_risk * late_fav_spend_fraction.max(0.0);
-    let late_fav_budget_cap = fractional_late_fav_budget_cap.max(min_positive_payoff_tail_cap);
+    let realized_favorite_qty = if late_fav_filled_qty > 0.0 {
+        late_fav_filled_qty
+    } else {
+        late_fav_qty
+    };
+    let share_floor_budget_cap =
+        realized_favorite_qty * cfg.min_tail_share_fraction.max(0.0) * cheap_ask;
+    let late_fav_budget_cap = fractional_late_fav_budget_cap
+        .max(share_floor_budget_cap)
+        .max(min_positive_payoff_tail_cap);
 
     let desired_tail_notional =
         if hedge_notional > 0.0 && min_positive_payoff_tail_cap >= cfg.min_order_usd {
@@ -2966,6 +3170,51 @@ where
             directional_conviction.near_strike_fragility.fragility_factor,
             directional_conviction.near_strike_fragility.reason,
         ));
+        if let Some(shadow) =
+            mid_directional_shadow_candidate(&input, &legs, &self.config.mid_directional_shadow)
+        {
+            let note = format!(
+                "mid_directional_shadow would_buy leg={:?} asset={} ask={:.4} bid={:.4} model_probability={:.4} path_reversal_risk={:.2} book_model_agreement={:.2} toxicity={:.2} kelly_clip_usd={:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}",
+                shadow.leg,
+                outcome_label(input.market.kind(), shadow.leg),
+                shadow.ask,
+                shadow.bid,
+                shadow.model_probability,
+                shadow.path_reversal_risk,
+                shadow.book_model_agreement.agreement,
+                shadow.book_model_agreement.toxicity_score,
+                shadow.kelly_clip_usd,
+            );
+            notes.push(note.clone());
+            if self.mid_directional_shadow_due(
+                input.market.market_id(),
+                input.now_ms,
+                self.config.mid_directional_shadow.min_emit_interval_ms,
+            ) {
+                tracing::info!(
+                    target: "mid_directional_shadow",
+                    market_id = ?input.market.market_id(),
+                    leg = ?shadow.leg,
+                    asset = outcome_label(input.market.kind(), shadow.leg),
+                    ask = shadow.ask,
+                    bid = shadow.bid,
+                    model_probability = shadow.model_probability,
+                    p_up = input.fair_value.p_up,
+                    p_down = input.fair_value.p_down,
+                    path_reversal_risk = shadow.path_reversal_risk,
+                    book_model_agreement = shadow.book_model_agreement.agreement,
+                    toxicity = shadow.book_model_agreement.toxicity_score,
+                    kelly_clip_usd = shadow.kelly_clip_usd,
+                    btc_ret_30s_bps = ?input.btc_regime.return_30s_bps,
+                    btc_ret_60s_bps = ?input.btc_regime.return_60s_bps,
+                    btc_ret_120s_bps = ?input.btc_regime.return_120s_bps,
+                    btc_ret_180s_bps = ?input.btc_regime.return_180s_bps,
+                    elapsed_ms = elapsed_ms,
+                    remaining_ms = remaining_ms,
+                    "mid_directional_shadow would_buy"
+                );
+            }
+        }
         notes.push(format!(
             "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
             late_fav_rearm_ready, late_fav_stable_bars, LATE_FAV_REARM_MAX_PATH_RISK,
@@ -4574,26 +4823,16 @@ fn log_market_classification<M: MarketDescriptor>(
         threshold,
         conviction.model_favorite,
     );
-    let late_fav_skip_reason = if legs.favorite_ask < cfg.favorite_climb.min_favorite_ask {
-        "favorite_ask_below_min"
-    } else if !conviction.btc_confirms {
-        "btc_model_not_confirming"
-    } else if model_confirmed_wing {
-        "model_confirmed_wing_eligible"
-    } else if market_path_wing {
-        "market_path_wing_eligible"
-    } else if !latched_posture.suppresses_broad_paired_core()
-        && !conviction.barbell
-        && legs.favorite_ask < cfg.favorite_climb.near_touch_min_favorite_ask
-    {
-        "paired_core_mid_market"
-    } else if conviction.path_reversal_risk >= SUB90_LATE_FAV_REVERSAL_BLOCK_RISK
-        && legs.favorite_ask < cfg.favorite_climb.taker_min_favorite_ask
-    {
-        "reversal_risk_sub90"
-    } else {
-        "eligible_or_blocked_deeper"
-    };
+    let late_fav_skip_reason = late_fav_classification_reason(
+        input,
+        &legs,
+        observed_posture,
+        latched_posture,
+        cfg,
+        conviction,
+        model_confirmed_wing,
+        market_path_wing,
+    );
     let cheap_tail_skip_reason = if legs.cheap_ask > cfg.convex_tail.max_cheap_ask {
         "cheap_ask_above_max"
     } else if !latched_posture.suppresses_broad_paired_core()
@@ -4638,6 +4877,105 @@ fn log_market_classification<M: MarketDescriptor>(
         cheap_tail_skip_reason = cheap_tail_skip_reason,
         "bonereaper classification"
     );
+}
+
+fn late_fav_classification_reason<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    _observed_posture: MarketPosture,
+    latched_posture: MarketPosture,
+    cfg: &LateFavoriteStrategyConfig,
+    conviction: DirectionalConviction,
+    model_confirmed_wing: bool,
+    market_path_wing: bool,
+) -> String {
+    let climb_cfg = &cfg.favorite_climb;
+    if !climb_cfg.enabled {
+        return "favorite_climb_disabled".to_string();
+    }
+    if climb_cfg
+        .disable_after_ms
+        .map(|disable_ms| input.now_ms >= disable_ms)
+        .unwrap_or(false)
+    {
+        return "favorite_climb_phase_disabled".to_string();
+    }
+    if legs.favorite_ask < climb_cfg.min_favorite_ask {
+        return "favorite_ask_below_min".to_string();
+    }
+    if legs.favorite_ask > climb_cfg.max_favorite_ask {
+        return "favorite_ask_above_max".to_string();
+    }
+
+    let remaining_ms = input
+        .market
+        .time_remaining_ms(input.now_ms)
+        .unwrap_or_else(|| input.market.window_ms());
+    let bar_window_ms = input.market.window_ms().max(1);
+    let elapsed_ms = elapsed_ms(&input.market, input.now_ms, remaining_ms);
+    let climb_window_ms =
+        phase_window_ms(climb_cfg.window_sec, climb_cfg.start_frac, bar_window_ms);
+    if remaining_ms > climb_window_ms {
+        return "outside_climb_window".to_string();
+    }
+    if elapsed_ms < climb_cfg.min_elapsed_sec.saturating_mul(1_000) {
+        return "opening_noise_guard".to_string();
+    }
+
+    if !conviction.btc_confirms {
+        return "btc_model_not_confirming".to_string();
+    }
+    if model_confirmed_wing {
+        return "model_confirmed_wing_eligible".to_string();
+    }
+    if market_path_wing {
+        return "market_path_wing_eligible".to_string();
+    }
+    if !latched_posture.suppresses_broad_paired_core()
+        && !conviction.barbell
+        && legs.favorite_ask < climb_cfg.near_touch_min_favorite_ask
+    {
+        return "paired_core_mid_market".to_string();
+    }
+    if conviction.path_reversal_risk >= SUB90_LATE_FAV_REVERSAL_BLOCK_RISK
+        && legs.favorite_ask < climb_cfg.taker_min_favorite_ask
+    {
+        return "reversal_risk_sub90".to_string();
+    }
+
+    let (direction_ok, _) = favorite_direction_signal(input, legs, climb_cfg);
+    let market_structure_override =
+        should_override_favorite_signal_for_barbell(legs, climb_cfg, &cfg.convex_tail, conviction);
+    if !direction_ok && !market_structure_override {
+        return "favorite_signal_blocked".to_string();
+    }
+
+    let hard_barbell_favorite_entry = market_structure_override
+        && legs.favorite_ask >= climb_cfg.taker_min_favorite_ask
+        && is_directional_barbell_favorite(climb_cfg, legs.favorite_ask, legs.cheap_ask);
+    let policy_elapsed_ms = if hard_barbell_favorite_entry {
+        elapsed_ms.max(climb_cfg.min_elapsed_sec.saturating_mul(1_000))
+    } else {
+        elapsed_ms
+    };
+    let policy_remaining_ms = if hard_barbell_favorite_entry {
+        remaining_ms.min(climb_cfg.taker_window_sec.saturating_mul(1_000))
+    } else {
+        remaining_ms
+    };
+    if favorite_entry_policy(
+        input,
+        legs,
+        climb_cfg,
+        policy_elapsed_ms,
+        policy_remaining_ms,
+    )
+    .is_none()
+    {
+        return "entry_policy_blocked".to_string();
+    }
+
+    "eligible_or_blocked_deeper".to_string()
 }
 
 fn is_merge_planner_note(note: &str) -> bool {
@@ -4728,6 +5066,98 @@ mod tests {
         assert_eq!(l.cheap_leg, LadderLeg::No);
         assert!((l.favorite_ask - 0.97).abs() < 1e-9);
         assert!((l.cheap_ask - 0.03).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mid_directional_shadow_marks_current_bar_model_side_candidate() {
+        let cfg = MidDirectionalShadowConfig {
+            enabled: true,
+            min_ask: 0.48,
+            max_ask: 0.58,
+            min_model_probability: 0.90,
+            ..MidDirectionalShadowConfig::default()
+        };
+        let snapshot = snap(0.55, 0.56, 0.44, 0.45);
+        let legs = read_legs(&snapshot).unwrap();
+        let input = strategy_input(
+            snapshot,
+            crate::signals::BtcRegimeSnapshot {
+                last_price: Some(100.10),
+                realized_vol_5m_bps: Some(2.0),
+                return_30s_bps: Some(2.0),
+                return_60s_bps: Some(3.0),
+                return_120s_bps: Some(3.0),
+                return_180s_bps: Some(3.0),
+                ..Default::default()
+            },
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(3.0),
+                ..MomentumSignal::default()
+            },
+            0.92,
+            120_000,
+        );
+
+        let candidate = mid_directional_shadow_candidate(&input, &legs, &cfg)
+            .expect("expected current-bar mid directional shadow candidate");
+
+        assert_eq!(candidate.leg, LadderLeg::Yes);
+        assert!((candidate.ask - 0.56).abs() < 1e-9);
+        assert!(candidate.kelly_clip_usd > 0.0);
+        assert!(candidate.kelly_clip_usd <= cfg.max_clip_usd);
+    }
+
+    #[test]
+    fn mid_directional_shadow_respects_ask_band_and_model_floor() {
+        let cfg = MidDirectionalShadowConfig {
+            enabled: true,
+            min_ask: 0.48,
+            max_ask: 0.58,
+            min_model_probability: 0.90,
+            ..MidDirectionalShadowConfig::default()
+        };
+        let regime = crate::signals::BtcRegimeSnapshot {
+            last_price: Some(100.10),
+            realized_vol_5m_bps: Some(2.0),
+            return_30s_bps: Some(2.0),
+            return_60s_bps: Some(3.0),
+            return_120s_bps: Some(3.0),
+            return_180s_bps: Some(3.0),
+            ..Default::default()
+        };
+
+        let high_ask_snapshot = snap(0.59, 0.60, 0.40, 0.41);
+        let high_ask_legs = read_legs(&high_ask_snapshot).unwrap();
+        let high_ask_input = strategy_input(
+            high_ask_snapshot,
+            regime.clone(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(3.0),
+                ..MomentumSignal::default()
+            },
+            0.92,
+            120_000,
+        );
+        assert!(mid_directional_shadow_candidate(&high_ask_input, &high_ask_legs, &cfg).is_none());
+
+        let low_model_snapshot = snap(0.55, 0.56, 0.44, 0.45);
+        let low_model_legs = read_legs(&low_model_snapshot).unwrap();
+        let low_model_input = strategy_input(
+            low_model_snapshot,
+            regime,
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(3.0),
+                ..MomentumSignal::default()
+            },
+            0.89,
+            120_000,
+        );
+        assert!(
+            mid_directional_shadow_candidate(&low_model_input, &low_model_legs, &cfg).is_none()
+        );
     }
 
     #[test]
@@ -5350,6 +5780,46 @@ mod tests {
     }
 
     #[test]
+    fn cheap_tail_cap_uses_share_floor_when_spend_cap_truncates_hedge() {
+        let cfg = ConvexTailConfig {
+            clip_usd: 3.0,
+            max_load_usd: 30.0,
+            min_order_usd: 1.0,
+            max_cheap_ask: 0.10,
+            max_favorite_exposure_fraction: 0.55,
+            min_tail_share_fraction: 0.60,
+            max_late_fav_spend_fraction: 0.04,
+            max_win_edge_spend_fraction: 0.30,
+            ..ConvexTailConfig::default()
+        };
+
+        let favorite_qty = 78.3;
+        let favorite_avg_price = 0.799;
+        let cap = cheap_tail_cap_usd(
+            &cfg,
+            favorite_qty,
+            favorite_avg_price,
+            0.81,
+            0.09,
+            Some(BtcRegime::Flat),
+            0.25,
+            0.0,
+            favorite_qty,
+            favorite_avg_price,
+        );
+
+        let tail_shares = cap / 0.09;
+        assert!(
+            tail_shares >= favorite_qty * 0.60 - 1e-6,
+            "share floor should allow about 60% tail shares, got {tail_shares}"
+        );
+        assert!(
+            cap < favorite_qty * (1.0 - favorite_avg_price),
+            "tail cap should still leave favorite-win payoff positive"
+        );
+    }
+
+    #[test]
     fn bundle_state_blocks_tail_that_makes_favorite_win_negative() {
         let bundle = LateFavBundleState {
             dominant_fav_leg: LadderLeg::Yes,
@@ -5871,6 +6341,7 @@ mod tests {
         let cfg = late_favorite.convex_tail;
         let climb = late_favorite.favorite_climb;
         let reversal = late_favorite.reversal_hedge;
+        let mid_shadow = late_favorite.mid_directional_shadow;
 
         assert!(!paired_core.enabled);
         assert_eq!(
@@ -5888,14 +6359,20 @@ mod tests {
         assert_eq!(cfg.clip_usd, 3.0);
         assert_eq!(cfg.max_load_usd, 30.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
+        assert_eq!(cfg.min_tail_share_fraction, 0.60);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.30);
-        assert_eq!(cfg.max_late_fav_spend_fraction, 0.04);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.075);
         assert_eq!(cfg.ultra_cheap_max_ask, 0.04);
         assert_eq!(cfg.maker_improve_ticks, 0.0);
         assert_eq!(cfg.taker_slippage_ticks, 1.0);
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(reversal.taker_slippage_ticks, 1.0);
+        assert!(mid_shadow.enabled);
+        assert_eq!(mid_shadow.min_ask, 0.48);
+        assert_eq!(mid_shadow.max_ask, 0.58);
+        assert_eq!(mid_shadow.min_model_probability, 0.90);
+        assert_eq!(mid_shadow.max_clip_usd, 5.0);
         assert_eq!(climb.clip_usd, 45.0);
         // YAML no longer specifies max_load_usd literal -- the runtime
         // bankroll-sizing path overwrites it from late_favorite.sizing.
@@ -6167,6 +6644,58 @@ mod tests {
     }
 
     #[test]
+    fn model_confirmed_wing_below_80c_is_maker_only() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = MODEL_WING_MIN_FAVORITE_ASK;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.favorite_climb.taker_min_favorite_ask = 0.90;
+        cfg.favorite_climb.near_touch_min_favorite_ask = 0.85;
+        cfg.favorite_climb.kelly.min_edge = 0.01;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.78, 0.79, 0.20, 0.21);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            1.0,
+            120_000,
+        );
+
+        let decision = strategy.on_tick(input);
+        let intents = climb_intents(&decision);
+        assert!(
+            !intents.is_empty(),
+            "expected model-confirmed sub-80 wing to emit maker bids; decision={decision:?}"
+        );
+        assert!(
+            intents
+                .iter()
+                .all(|intent| intent.client_order_id.as_str().ends_with(":maker")),
+            "sub-80 wing should not emit FAK/taker orders; tags={:?}",
+            intents
+                .iter()
+                .map(|intent| intent.quote_level_tag.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            intents
+                .iter()
+                .all(|intent| intent.limit_price < 0.79 - 1e-9),
+            "maker bids must rest below touch; prices={:?}",
+            intents
+                .iter()
+                .map(|intent| intent.limit_price)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn aggressive_favorite_limit_price_uses_edge_bounded_slippage() {
         let mut cfg = FavoriteClimbConfig::default();
         cfg.max_favorite_ask = 0.99;
@@ -6198,6 +6727,7 @@ mod tests {
             allow_taker: true,
             force_taker: true,
             near_touch_maker: true,
+            maker_touch_offset_ticks: 1.0,
             path_reversal_risk: 0.20,
             label: "test",
         };
@@ -6205,8 +6735,8 @@ mod tests {
         let px = late_favorite_maker_base_price(0.74, 0.79, 0.01, &cfg, &policy)
             .expect("near-touch maker should be available below 80c");
         assert!(
-            (px - 0.77).abs() < 1e-9,
-            "sub-85c model-confirmed fallback should anchor at ask - 2 ticks"
+            (px - 0.78).abs() < 1e-9,
+            "sub-85c model-confirmed fallback should anchor at ask - 1 tick"
         );
         assert_eq!(late_favorite_passive_level_index(1, true, true), 0);
         assert_eq!(late_favorite_passive_level_index(2, true, true), 1);
