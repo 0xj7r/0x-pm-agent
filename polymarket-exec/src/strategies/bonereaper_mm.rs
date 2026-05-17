@@ -4,7 +4,7 @@
 //! that composes the canonical paired-core and late-bar directional behaviors.
 //! The wiring stays in one place so the shape can be managed cleanly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
@@ -639,6 +639,16 @@ pub struct LateFavoriteStrategy {
     config: LateFavoriteStrategyConfig,
     reserved_directional_notional: HashMap<String, ReservedNotional>,
     late_fav_rearm_state: HashMap<MarketId, LateFavRearmState>,
+    /// Rolling history of (timestamp_ms, equity_usd) used by the loss
+    /// circuit breaker. Entries older than CIRCUIT_WINDOW_MS are pruned
+    /// every tick. When current equity vs oldest entry in the window
+    /// drops by more than CIRCUIT_LOSS_THRESHOLD_USD, halts new entries
+    /// for CIRCUIT_HALT_MS to prevent compounding losses in a bad streak.
+    equity_history: VecDeque<(EpochMillis, f64)>,
+    /// Set when the loss circuit breaker has tripped. While now_ms <
+    /// this value, late-favorite emission is suppressed entirely.
+    /// Cleared automatically when the timer expires.
+    halt_until_ms: Option<EpochMillis>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -653,6 +663,8 @@ impl LateFavoriteStrategy {
             config,
             reserved_directional_notional: HashMap::new(),
             late_fav_rearm_state: HashMap::new(),
+            equity_history: VecDeque::new(),
+            halt_until_ms: None,
         }
     }
 
@@ -2755,6 +2767,57 @@ where
     fn on_tick(&mut self, input: StrategyInput<M>) -> StrategyDecision {
         self.prune_reservations(input.now_ms);
         self.prune_rearm_state(input.now_ms);
+
+        // Loss circuit breaker: track rolling 15-min equity delta. If
+        // equity drops more than $150 within that window, halt new
+        // late-favorite entries for 15min to prevent compounding losses
+        // in a bad regime / streak. Tunables hardcoded for now; YAML
+        // exposure can come later if we want per-deployment tuning.
+        const CIRCUIT_WINDOW_MS: u64 = 15 * 60 * 1000;
+        const CIRCUIT_LOSS_THRESHOLD_USD: f64 = 150.0;
+        const CIRCUIT_HALT_MS: u64 = 15 * 60 * 1000;
+        let now_ms = input.now_ms;
+        let live_equity = input
+            .inventory
+            .equity_usd
+            .max(input.inventory.free_cash_usd);
+        if live_equity > 0.0 {
+            self.equity_history.push_back((now_ms, live_equity));
+            while let Some(&(t, _)) = self.equity_history.front() {
+                if now_ms.saturating_sub(t) > CIRCUIT_WINDOW_MS {
+                    self.equity_history.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+        let window_delta = if self.equity_history.len() > 1 {
+            let oldest_equity = self.equity_history.front().map(|(_, e)| *e).unwrap_or(0.0);
+            live_equity - oldest_equity
+        } else {
+            0.0
+        };
+        // Trip the breaker on fresh threshold breaches (not already
+        // halted) so a sustained drawdown doesn't keep extending the
+        // halt window forever.
+        let already_halted = self
+            .halt_until_ms
+            .is_some_and(|until| now_ms < until);
+        if !already_halted && window_delta < -CIRCUIT_LOSS_THRESHOLD_USD {
+            self.halt_until_ms = Some(now_ms + CIRCUIT_HALT_MS);
+        }
+        if let Some(until) = self.halt_until_ms {
+            if now_ms < until {
+                return StrategyDecision::Noop {
+                    notes: vec![format!(
+                        "late_favorite halted by loss circuit breaker until_ms={until} window_delta_usd={window_delta:+.2} threshold_usd={CIRCUIT_LOSS_THRESHOLD_USD}"
+                    )],
+                };
+            } else {
+                self.halt_until_ms = None;
+            }
+        }
+
         let (climb_cfg, tail_cfg, reversal_cfg, sizing_note) = apply_directional_bankroll_sizing(
             self.config.favorite_climb,
             self.config.convex_tail,
