@@ -2771,10 +2771,11 @@ where
         // Loss circuit breaker: track rolling 15-min equity delta. If
         // equity drops more than $150 within that window, halt new
         // late-favorite entries for 15min to prevent compounding losses
-        // in a bad regime / streak. Tunables hardcoded for now; YAML
-        // exposure can come later if we want per-deployment tuning.
+        // in a bad regime / streak. 2026-05-17 v2: 150 -> 80 after two
+        // consecutive ~$130 losing bars. 150 required two losses to
+        // trip; 80 trips after one bad bar.
         const CIRCUIT_WINDOW_MS: u64 = 15 * 60 * 1000;
-        const CIRCUIT_LOSS_THRESHOLD_USD: f64 = 150.0;
+        const CIRCUIT_LOSS_THRESHOLD_USD: f64 = 80.0;
         const CIRCUIT_HALT_MS: u64 = 15 * 60 * 1000;
         let now_ms = input.now_ms;
         let live_equity = input
@@ -4184,6 +4185,9 @@ fn observe_market_posture<M: MarketDescriptor>(
         } else {
             MarketPosture::NoFreshCore
         };
+    }
+    if favorite_is_separating && path_reversal_risk >= 0.45 {
+        return MarketPosture::WhipsawHedge;
     }
 
     match input.btc_regime.regime() {

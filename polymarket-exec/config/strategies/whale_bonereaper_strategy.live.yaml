@@ -3,23 +3,12 @@ profile_name: whale_bonereaper_strategy
 version: "1.0"
 last_updated: 2026-05-11
 description: |
-  Bonereaper strategy as one profile with explicit paired MM core and late-favorite
-  directional overlay: paired-core is handled by paired_core, directional timing by
-  late_favorite. The favorite load is reactive to BTC spot direction throughout
-  the eligible bar, with an opening-noise guard, smaller sub-90c overlays, and
-  size increasing toward expiry.
-
-  Important: this profile is capital-scaled for the 3K live wallet. It preserves
-  the Bonereaper shape, but keeps per-level shares at the venue minimum and
-  broadens the ladder through more levels, wider spacing, and larger per-market
-  headroom rather than by making any one ticket large.
-  Late-favorite clips are heuristic shape+hard-cap driven (anti-Kelly), scale
-  with bar progress, and are capped by max_load_usd.
-  The whale behavior is consistent with hard shape controls plus hard per-market clips,
-  not per-bet Kelly optimization.
+  Bonereaper live profile: paired-core plus late-favorite directional overlay.
+  Paired-core remains disabled until the dense tandem lane is explicitly re-enabled.
+  Late-favorite sizing is bankroll-scaled fractional Kelly with hard per-bar caps.
 
 quote:
-  levels_per_side: 17
+  levels_per_side: 20
 
 inventory:
   max_open_orders_total: 120
@@ -28,14 +17,8 @@ inventory:
   max_gross_notional_usd: 1200.0
   max_net_notional_per_market_usd: 900.0
   max_position_quantity_per_instrument: 1500.0
-  # Tinylive may be manually de-risked from the UI, leaving only a small USDC
-  # float for bot entries. Keep the hard drawdown rail below as the primary
-  # overnight safety guard; do not let a stale absolute cash floor pin runtime
-  # in sticky RiskOff after manual UI activity.
   min_free_cash_usd: 1.0
   min_free_cash_bps: 0.0
-  # Hard overnight safety rail: stop new lane risk and flatten entries once realized+open pnl
-  # pushes portfolio equity below (starting_cash_usd - 200).
   max_session_loss_usd: 200.0
   max_session_loss_bps: 0.0
 
@@ -54,15 +37,17 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # PAUSED 2026-05-17 per operator direction. Lane was not contributing
-  # meaningful P&L at current size (5sh venue-min clips × 12 thin rungs
-  # = $172/3hr) and confirmed asymmetric leg-fill leak (15-20sh
-  # imbalances on multiple markets in 6hr baseline). Unlawful_shear's
-  # paired-MM uses 10x bigger clips (~50sh) at concentrated levels —
-  # the right replication needs per-leg book-imbalance gating to fix
-  # the asymmetric leak before scaling clip size. Late-fav + cheap-tail
-  # + reversal-hedge carry the strategy until paired-core is rebuilt.
+  # Paused. dense_tandem is wired for shadow/controlled re-enable, but live
+  # default remains late-fav only.
   enabled: false
+  emit_mode: dense_tandem
+  dense_levels_per_side: 20
+  dense_tick: 0.01
+  dense_clip_shares: 10.0
+  dense_max_entry_pair_cost: 0.97
+  dense_max_leg_imbalance_shares: 30.0
+  dense_ladder_min_price: 0.02
+  dense_ladder_max_price: 0.98
   center_probe_only: false
   ladder_levels: 12
   ladder_span: 0.60
@@ -73,12 +58,7 @@ paired_core:
   ladder_max_price: 0.70
   repair_pair_cost_limit: 0.99
   repair_fee_buffer: 0.0
-  # Stop fresh paired-core in the late window. After 180s elapsed, the bar
-  # should allocate new risk to explicit late-favorite and cheap-tail/reversal
-  # lanes; any existing paired-core inventory can still merge or redeem.
   disable_after_elapsed_ms: 180000
-  # Join rather than chase. The edge comes from tiny breadth in flat markets,
-  # not from paying up for independent one-sided fills.
   maker_improve_ticks: 0.0
   merge_min_qty: 5.0
   merge_batch_cap: 100.0
@@ -89,14 +69,7 @@ paired_core:
   book_sanity_max_queue_ahead_usd: 1500.0
   book_sanity_max_queue_imbalance_ratio: 3.0
   book_sanity_max_projected_pair_cost: 0.995
-  ladder_anchor: mid
-  # Fast-move guard: BTC 30s return magnitude > 5 bps blocks NEW ladder
-  # emissions; vol > 4 bps caps ladder depth to 2 levels. This is the
-  # predictive complement to the reactive signal-driven cancel — by the
-  # time posture latches BarbellDirectional the fills are already done,
-  # but the BTC tape velocity is observable BEFORE the prediction-market
-  # book commits. Today's 2272092 incident (21 Yes filled in fast move
-  # before posture caught up) is exactly what this guards against.
+  ladder_anchor: touch
   fast_move_guard_enabled: true
   fast_move_guard_threshold_bps: 5.0
   fast_move_guard_high_vol_threshold_bps: 4.0
@@ -260,4 +233,7 @@ late_favorite:
     max_favorite_exposure_fraction: 0.50
     max_win_edge_spend_fraction: 0.45
     min_order_usd: 2.0
-    min_reversal_score: 0.70
+    # 2026-05-17 v3: 0.70 -> 0.60. Tightened too far on prior pass --
+    # observed back-to-back losing bars at reversal_score ~0.55 where the
+    # 0.70 threshold blocked all hedges.
+    min_reversal_score: 0.60
