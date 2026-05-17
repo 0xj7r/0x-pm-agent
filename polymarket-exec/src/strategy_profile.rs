@@ -163,6 +163,7 @@ pub struct ConvexTailSubsection {
     pub ultra_cheap_min_favorite_ask: Option<f64>,
     pub ultra_cheap_max_late_fav_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
+    pub taker_slippage_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
     pub disable_after_ms: Option<u64>,
 }
@@ -180,6 +181,7 @@ pub struct ReversalHedgeSubsection {
     pub max_favorite_exposure_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
+    pub taker_slippage_ticks: Option<f64>,
     pub min_order_usd: Option<f64>,
     pub min_reversal_score: Option<f64>,
     pub whipsaw_score_bonus: Option<f64>,
@@ -556,6 +558,9 @@ impl StrategyProfile {
                 maker_improve_ticks: t
                     .maker_improve_ticks
                     .unwrap_or(tail_def.maker_improve_ticks),
+                taker_slippage_ticks: t
+                    .taker_slippage_ticks
+                    .unwrap_or(tail_def.taker_slippage_ticks),
                 min_order_usd: t.min_order_usd.unwrap_or(tail_def.min_order_usd),
                 disable_after_ms: t.disable_after_ms,
             },
@@ -576,6 +581,9 @@ impl StrategyProfile {
                 maker_improve_ticks: r
                     .maker_improve_ticks
                     .unwrap_or(reversal_def.maker_improve_ticks),
+                taker_slippage_ticks: r
+                    .taker_slippage_ticks
+                    .unwrap_or(reversal_def.taker_slippage_ticks),
                 min_order_usd: r.min_order_usd.unwrap_or(reversal_def.min_order_usd),
                 min_reversal_score: r
                     .min_reversal_score

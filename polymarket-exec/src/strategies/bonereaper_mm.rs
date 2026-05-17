@@ -347,6 +347,7 @@ pub struct ConvexTailConfig {
     /// of late-favorite spend so dollar budget remains bounded.
     pub ultra_cheap_max_late_fav_spend_fraction: f64,
     pub maker_improve_ticks: f64,
+    pub taker_slippage_ticks: f64,
     pub min_order_usd: f64,
     /// Optional hard cutoff after which this phase is disabled.
     pub disable_after_ms: Option<EpochMillis>,
@@ -368,6 +369,7 @@ impl Default for ConvexTailConfig {
             ultra_cheap_min_favorite_ask: 0.90,
             ultra_cheap_max_late_fav_spend_fraction: 0.075,
             maker_improve_ticks: 1.0,
+            taker_slippage_ticks: 0.0,
             min_order_usd: 1.0,
             disable_after_ms: None,
         }
@@ -396,6 +398,7 @@ pub struct ReversalHedgeConfig {
     /// cheap-tail/reversal-hedge fills and open orders count against it.
     pub max_win_edge_spend_fraction: f64,
     pub maker_improve_ticks: f64,
+    pub taker_slippage_ticks: f64,
     pub min_order_usd: f64,
     /// Minimum live reversal score required before this lane can fire.
     pub min_reversal_score: f64,
@@ -420,6 +423,7 @@ impl Default for ReversalHedgeConfig {
             max_favorite_exposure_fraction: 0.50,
             max_win_edge_spend_fraction: 0.45,
             maker_improve_ticks: 0.0,
+            taker_slippage_ticks: 0.0,
             min_order_usd: 1.0,
             min_reversal_score: 0.35,
             whipsaw_score_bonus: 0.25,
@@ -1193,6 +1197,18 @@ fn late_favorite_maker_base_price(
     (px > 0.0 && px < ask && px < 1.0).then_some(px)
 }
 
+fn late_favorite_passive_level_index(
+    level: usize,
+    use_aggressive_taker: bool,
+    level0_immediate_fak: bool,
+) -> usize {
+    if use_aggressive_taker && level0_immediate_fak {
+        level.saturating_sub(1)
+    } else {
+        level
+    }
+}
+
 fn aggressive_favorite_limit_price(
     ask: f64,
     tick: f64,
@@ -1205,6 +1221,23 @@ fn aggressive_favorite_limit_price(
     let slippage_cap = ask + cfg.taker_slippage_ticks.max(0.0) * tick;
     let edge_cap = kelly_p_adj - cfg.kelly.min_edge.max(0.0);
     let raw_px = slippage_cap.min(edge_cap).min(cfg.max_favorite_ask);
+    let ticked_px = ((raw_px / tick) + 1e-9).floor() * tick;
+    if ticked_px + 1e-9 < ask || ticked_px <= 0.0 || ticked_px >= 1.0 {
+        return None;
+    }
+    Some(ticked_px)
+}
+
+fn slippage_limited_taker_price(
+    ask: f64,
+    tick: f64,
+    slippage_ticks: f64,
+    max_price: f64,
+) -> Option<f64> {
+    if ask <= 0.0 || tick <= 0.0 {
+        return None;
+    }
+    let raw_px = (ask + slippage_ticks.max(0.0) * tick).min(max_price);
     let ticked_px = ((raw_px / tick) + 1e-9).floor() * tick;
     if ticked_px + 1e-9 < ask || ticked_px <= 0.0 || ticked_px >= 1.0 {
         return None;
@@ -2193,7 +2226,7 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             },
             allow_taker: model_confirmed_wing,
             force_taker: model_confirmed_wing,
-            near_touch_maker: !model_confirmed_wing,
+            near_touch_maker: true,
             path_reversal_risk,
             label: if model_confirmed_wing && early_late {
                 "model_confirmed_wing_65_79_early"
@@ -3258,10 +3291,15 @@ where
                             }
                             let aggressive_taker = aggressive_all_levels
                                 || (use_aggressive_taker && level == 0 && level0_immediate_fak);
+                            let maker_level = late_favorite_passive_level_index(
+                                level,
+                                use_aggressive_taker,
+                                level0_immediate_fak,
+                            );
                             let px = if aggressive_taker {
                                 aggressive_limit_px
                             } else {
-                                base_px - tick * level as f64
+                                base_px - tick * maker_level as f64
                             };
                             if px + 1e-9 < entry_policy.min_price {
                                 continue;
@@ -3696,13 +3734,22 @@ where
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
-                            legs.cheap_ask
+                            slippage_limited_taker_price(
+                                legs.cheap_ask,
+                                tick,
+                                tail_cfg.taker_slippage_ticks,
+                                tail_cfg.max_cheap_ask,
+                            )
+                            .unwrap_or(legs.cheap_ask)
                         } else if use_ultra_cheap_maker_fallback {
                             legs.cheap_ask
                         } else {
                             base_px - tick * ladder_step_ticks * level as f64
                         };
-                        if px <= 0.0 || px > legs.cheap_ask {
+                        if px <= 0.0
+                            || (!aggressive_taker && px > legs.cheap_ask)
+                            || (aggressive_taker && px > tail_cfg.max_cheap_ask)
+                        {
                             continue;
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
@@ -3947,11 +3994,20 @@ where
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
-                            legs.cheap_ask
+                            slippage_limited_taker_price(
+                                legs.cheap_ask,
+                                tick,
+                                reversal_cfg.taker_slippage_ticks,
+                                reversal_cfg.max_hedge_ask,
+                            )
+                            .unwrap_or(legs.cheap_ask)
                         } else {
                             base_px - tick * level as f64
                         };
-                        if px <= 0.0 || px > legs.cheap_ask {
+                        if px <= 0.0
+                            || (!aggressive_taker && px > legs.cheap_ask)
+                            || (aggressive_taker && px > reversal_cfg.max_hedge_ask)
+                        {
                             continue;
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
@@ -5814,6 +5870,7 @@ mod tests {
         let paired_core = bonereaper.core_hedge.core_hedge;
         let cfg = late_favorite.convex_tail;
         let climb = late_favorite.favorite_climb;
+        let reversal = late_favorite.reversal_hedge;
 
         assert!(!paired_core.enabled);
         assert_eq!(
@@ -5835,8 +5892,10 @@ mod tests {
         assert_eq!(cfg.max_late_fav_spend_fraction, 0.04);
         assert_eq!(cfg.ultra_cheap_max_ask, 0.04);
         assert_eq!(cfg.maker_improve_ticks, 0.0);
+        assert_eq!(cfg.taker_slippage_ticks, 1.0);
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
+        assert_eq!(reversal.taker_slippage_ticks, 1.0);
         assert_eq!(climb.clip_usd, 45.0);
         // YAML no longer specifies max_load_usd literal -- the runtime
         // bankroll-sizing path overwrites it from late_favorite.sizing.
@@ -6093,6 +6152,18 @@ mod tests {
             assert!(maker.client_order_id.as_str().ends_with(":maker"));
             assert!(maker.limit_price < 0.95 - 1e-9);
         }
+        let first_maker = maker_intents
+            .iter()
+            .find(|i| {
+                i.quote_level_tag
+                    .as_deref()
+                    .is_some_and(|tag| tag.starts_with("late-fav-climb:1"))
+            })
+            .expect("first maker fallback should be emitted after level-0 FAK");
+        assert!(
+            (first_maker.limit_price - 0.94).abs() < 1e-9,
+            "first passive fallback should sit one tick below touch, not two"
+        );
     }
 
     #[test]
@@ -6113,6 +6184,47 @@ mod tests {
         assert!(
             aggressive_favorite_limit_price(0.92, 0.01, &cfg, 0.895).is_none(),
             "must not chase when p_adj - min_edge is already below touch"
+        );
+    }
+
+    #[test]
+    fn late_favorite_maker_base_price_can_sit_near_touch_below_80c() {
+        let cfg = FavoriteClimbConfig::default();
+        let policy = FavoriteEntryPolicy {
+            min_price: 0.65,
+            max_levels: 2,
+            clip_multiplier: 1.0,
+            cap_multiplier: 1.0,
+            allow_taker: true,
+            force_taker: true,
+            near_touch_maker: true,
+            path_reversal_risk: 0.20,
+            label: "test",
+        };
+
+        let px = late_favorite_maker_base_price(0.74, 0.79, 0.01, &cfg, &policy)
+            .expect("near-touch maker should be available below 80c");
+        assert!(
+            (px - 0.77).abs() < 1e-9,
+            "sub-85c model-confirmed fallback should anchor at ask - 2 ticks"
+        );
+        assert_eq!(late_favorite_passive_level_index(1, true, true), 0);
+        assert_eq!(late_favorite_passive_level_index(2, true, true), 1);
+    }
+
+    #[test]
+    fn slippage_limited_taker_price_crosses_only_to_configured_cap() {
+        let px = slippage_limited_taker_price(0.03, 0.01, 1.0, 0.10)
+            .expect("one tick of hedge slippage should be allowed");
+        assert!((px - 0.04).abs() < 1e-9);
+
+        let px = slippage_limited_taker_price(0.10, 0.01, 2.0, 0.10)
+            .expect("max price cap should still allow touch");
+        assert!((px - 0.10).abs() < 1e-9);
+
+        assert!(
+            slippage_limited_taker_price(0.11, 0.01, 1.0, 0.10).is_none(),
+            "must not submit when touch is already above the lane cap"
         );
     }
 

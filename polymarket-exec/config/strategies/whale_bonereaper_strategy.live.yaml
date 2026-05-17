@@ -141,6 +141,7 @@ late_favorite:
     max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.04
     maker_improve_ticks: 0.0
+    taker_slippage_ticks: 1.0
   reversal_hedge:
     enabled: true
     # Defensive trim only; code gates this behind open late-favorite exposure.
@@ -151,6 +152,7 @@ late_favorite:
     max_favorite_exposure_fraction: 0.50
     max_win_edge_spend_fraction: 0.45
     min_order_usd: 2.0
+    taker_slippage_ticks: 1.0
     # 2026-05-17 v3: 0.70 -> 0.60. Tightened too far on prior pass --
     # observed back-to-back losing bars at reversal_score ~0.55 where the
     # 0.70 threshold blocked all hedges. 0.60 catches genuine starts-
