@@ -112,9 +112,14 @@ late_favorite:
     favorite_clip_bps: 140.0
     favorite_clip_min_usd: 25.0
     favorite_clip_max_usd: 150.0
-    favorite_max_load_bps: 1400.0
+    # 2026-05-17: 1400 -> 1500 bps (14% -> 15% of live equity). Max raised
+    # from $1500 -> $3000 so the cap doesn't bind until equity grows past
+    # $20K. This is the SOLE driver of max_load (runtime overrides any
+    # literal favorite_climb.max_load_usd via apply_directional_bankroll_sizing
+    # whenever sizing.enabled is true).
+    favorite_max_load_bps: 1500.0
     favorite_max_load_min_usd: 150.0
-    favorite_max_load_max_usd: 1500.0
+    favorite_max_load_max_usd: 3000.0
     tail_clip_bps: 10.0
     tail_clip_min_usd: 1.0
     tail_clip_max_usd: 10.0
@@ -132,12 +137,12 @@ late_favorite:
     min_favorite_ask: 0.70
     max_favorite_ask: 0.99
     clip_usd: 45.0
-    # 2026-05-17: 450 -> 600 -> 500. First lift drove $452 peak-to-trough
-    # drawdown over 5.5hr unattended with implied 85% hit rate vs 91.2%
-    # break-even at avg 0.912 entry. Backing off to 500 while we collect
-    # more data on whether BSM model saturates too aggressively at the
-    # 0.95+ ask band.
-    max_load_usd: 500.0
+    # max_load_usd intentionally omitted: late_favorite.sizing.* is the
+    # SOLE driver at runtime when sizing.enabled is true (which it is).
+    # apply_directional_bankroll_sizing overwrites max_load_usd to
+    # bankroll × favorite_max_load_bps clamped to [min, max]. Leaving
+    # the literal here was misleading -- people thought it bound the
+    # cap, but it never did.
     min_order_usd: 10.0
     # 2026-05-17: regime_flat_multiplier 0.70 -> 1.0. Kelly already shrinks
     # bets when model edge is small (the actual concern in flat regime —

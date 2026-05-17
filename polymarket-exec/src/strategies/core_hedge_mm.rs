@@ -57,6 +57,10 @@ impl Default for PairedCoreLadderAnchor {
     }
 }
 
+pub use super::paired_mm_dense::{
+    DenseTandemConfig, PairedCoreEmitMode,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreHedgeMmConfig {
     pub enabled: bool,
