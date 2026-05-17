@@ -5446,7 +5446,7 @@ mod tests {
         assert_eq!(cfg.ultra_cheap_min_favorite_ask, 0.90);
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(climb.clip_usd, 45.0);
-        assert_eq!(climb.max_load_usd, 450.0);
+        assert_eq!(climb.max_load_usd, 600.0);
         assert_eq!(climb.min_order_usd, 10.0);
         assert_eq!(climb.taker_min_favorite_ask, 0.87);
         assert!(
