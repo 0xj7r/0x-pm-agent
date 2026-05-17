@@ -2997,8 +2997,18 @@ where
                         } else {
                             0.0
                         };
-                        let kelly_edge = (directional_conviction.model_favorite - legs.favorite_ask)
-                            * (1.0 - directional_conviction.path_reversal_risk);
+                        // Display the SAME edge Kelly uses internally to
+                        // decide sizing: p_adj = 0.5 + (model - 0.5) ×
+                        // (1 - reversal), edge = p_adj - ask. The prior
+                        // log formula `(model - ask) × (1 - reversal)`
+                        // was misleading -- it produced positive values
+                        // for cases where Kelly internally saw negative
+                        // edge (e.g. model=1.0 ask=0.94 reversal=0.55
+                        // showed +0.027 but Kelly saw -0.215).
+                        let kelly_p_adj = 0.5
+                            + (directional_conviction.model_favorite - 0.5)
+                                * (1.0 - directional_conviction.path_reversal_risk);
+                        let kelly_edge = kelly_p_adj - legs.favorite_ask;
                         let mut load_left = remaining_load;
                         let use_sub90_fak = entry_policy.allow_taker
                             && legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
