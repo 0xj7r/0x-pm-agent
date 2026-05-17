@@ -3032,12 +3032,28 @@ where
                         // mirrors the cheap-tail `use_ultra_cheap_maker_fallback`
                         // pattern.
                         let aggressive_all_levels = false;
+                        // Defer level 0 FAK to maker-first when there's
+                        // time and structure permits. Per 6hr data,
+                        // makers fill at ~2.9¢/share better price than
+                        // taker FAK but at lower rate. The existing
+                        // escalation logic (climb_cfg.escalation_*)
+                        // converts stale makers to FAK if ask walks
+                        // away, so worst-case we still FAK eventually
+                        // but at a later point with better information.
+                        // Speed-critical cases (force_taker policy,
+                        // barbell structure, last 45s of bar) still
+                        // FAK level 0 immediately.
+                        let level0_immediate_fak = entry_policy.force_taker
+                            || directional_conviction.barbell
+                            || sizing_remaining_ms <= 45_000;
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
                             }
-                            let aggressive_taker =
-                                use_aggressive_taker && (level == 0 || aggressive_all_levels);
+                            let aggressive_taker = aggressive_all_levels
+                                || (use_aggressive_taker
+                                    && level == 0
+                                    && level0_immediate_fak);
                             let px = if aggressive_taker {
                                 legs.favorite_ask
                             } else {

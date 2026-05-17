@@ -146,6 +146,13 @@ late_favorite:
       fractional: 0.30        # quarter-to-half Kelly (MacLean/Thorp/Ziemba)
       max_clip_fraction: 0.30 # hard cap at 30% of lane bankroll per clip
       min_edge: 0.02          # skip if reversal-adjusted edge < 2 cents
+    # Maker patience knobs: 6hr data showed makers cancel at 10-30s avg
+    # (the prior 25s + 3-tick escalation triggered too eagerly). Makers
+    # fill at ~2.9¢/share better price than taker FAK. Loosened to 60s
+    # age + 4-tick drift: gives makers a full minute to fill before we
+    # escalate to FAK, but still escalates promptly on 4¢ walk-aways.
+    escalation_age_ms: 60000
+    escalation_drift_ticks: 4
   favorite_anticipate:
     # DISABLED — anticipate ladder produced marginal-band fires (0.51-0.59
     # ladder rungs below the conviction floor) with undersized cheap-tail
