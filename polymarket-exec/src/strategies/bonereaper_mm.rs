@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
-use crate::markets::MarketDescriptor;
+use crate::markets::{MarketDescriptor, MarketKind};
 use crate::signals::{
     compute_near_strike_fragility, BookModelAgreement, BtcRegime, MomentumSignal,
     NearStrikeFragility,
@@ -1144,6 +1144,13 @@ fn opposite_leg(leg: LadderLeg) -> LadderLeg {
     match leg {
         LadderLeg::Yes => LadderLeg::No,
         LadderLeg::No => LadderLeg::Yes,
+    }
+}
+
+fn outcome_label(kind: MarketKind, leg: LadderLeg) -> &'static str {
+    match (kind, leg) {
+        (MarketKind::UpDownBinary, LadderLeg::Yes) => "UP",
+        (MarketKind::UpDownBinary, LadderLeg::No) => "DOWN",
     }
 }
 
@@ -4519,8 +4526,10 @@ fn log_market_classification<M: MarketDescriptor>(
         suppress_broad_paired_core = latched_posture.suppresses_broad_paired_core(),
         market_path = market_path,
         favorite_leg = ?legs.favorite_leg,
+        favorite_asset = outcome_label(input.market.kind(), legs.favorite_leg),
         favorite_ask = legs.favorite_ask,
         cheap_leg = ?legs.cheap_leg,
+        cheap_asset = outcome_label(input.market.kind(), legs.cheap_leg),
         cheap_ask = legs.cheap_ask,
         btc_vol_5m_bps = ?input.btc_regime.realized_vol_5m_bps,
         btc_ret_30s_bps = ?input.btc_regime.return_30s_bps,
