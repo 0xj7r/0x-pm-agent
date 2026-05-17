@@ -8,6 +8,7 @@ pub mod bonereaper_mm;
 pub(crate) mod core_hedge_mm;
 pub mod kelly_sizing;
 pub mod paired_mm;
+pub mod paired_mm_dense;
 pub mod registry;
 pub mod traits;
 pub mod unlawful_mm;
