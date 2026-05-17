@@ -54,14 +54,14 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # DISABLED 2026-05-17: asymmetric leg-fill leak confirmed in 3hr audit.
-  # Multiple markets fill 15-20 shares on one leg while mate only catches
-  # 5 (max_unpaired_core_qty=5.0 cap checks PROJECTED imbalance assuming
-  # both legs fill symmetrically, not ACTUAL leg fill counts). Stranded
-  # inventory leaks until bar resolution. Late-fav climb + cheap-tail +
-  # reversal-hedge carry the strategy until paired-core is rebuilt with
-  # actual-fill-driven imbalance gating.
-  enabled: false
+  # Legacy paired-MM execution shape: many tiny maker probes rather than one
+  # meaningful 20-share center clip. This improves fill opportunity in flat
+  # oscillating markets while capping one-sided damage to one venue-min clip.
+  # KNOWN ISSUE 2026-05-17: max_unpaired_core_qty cap checks PROJECTED
+  # imbalance (assuming symmetric fills), not actual leg-fill counts.
+  # Markets observed leaking 10-20 share asymmetric inventory per bar.
+  # Fix path: actual-fill-driven imbalance gating in core_hedge_mm emit loop.
+  enabled: true
   center_probe_only: false
   ladder_levels: 12
   ladder_span: 0.60
