@@ -5705,7 +5705,7 @@ mod tests {
         let cfg = late_favorite.convex_tail;
         let climb = late_favorite.favorite_climb;
 
-        assert!(paired_core.enabled);
+        assert!(!paired_core.enabled);
         assert_eq!(
             paired_core.emit_mode,
             crate::strategies::core_hedge_mm::PairedCoreEmitMode::DenseTandem

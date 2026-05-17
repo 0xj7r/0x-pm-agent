@@ -37,9 +37,9 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # Controlled dense-tandem live trial. Keep clip/rung sizing conservative;
-  # actual-fill imbalance and pair-cost gates are the primary safety rails.
-  enabled: true
+  # Paused. Dense tandem reproduced the old adverse-selection failure mode in
+  # live trial: one side swept across multiple rungs while mate quotes missed.
+  enabled: false
   emit_mode: dense_tandem
   dense_levels_per_side: 20
   dense_tick: 0.01
