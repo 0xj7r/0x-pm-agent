@@ -37,9 +37,9 @@ pair:
   merge_market_exposure_pressure_usd: 999999.0
 
 paired_core:
-  # Paused. dense_tandem is wired for shadow/controlled re-enable, but live
-  # default remains late-fav only.
-  enabled: false
+  # Controlled dense-tandem live trial. Keep clip/rung sizing conservative;
+  # actual-fill imbalance and pair-cost gates are the primary safety rails.
+  enabled: true
   emit_mode: dense_tandem
   dense_levels_per_side: 20
   dense_tick: 0.01
