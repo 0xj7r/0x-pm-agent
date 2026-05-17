@@ -2985,7 +2985,18 @@ where
                         };
                         let kelly_clip =
                             super::kelly_sizing::kelly_clip_usd(kelly_params, &climb_cfg.kelly);
-                        let per_level_clip = kelly_clip.max(climb_cfg.min_order_usd);
+                        // If Kelly returns 0 (edge below min_edge),
+                        // skip emission entirely instead of flooring to
+                        // min_order_usd. Flooring would force tiny
+                        // entries with negative expected edge, bypassing
+                        // the min_edge gate. Per_level_clip = 0 makes
+                        // the loop break immediately on
+                        // load_left < min_order_usd.
+                        let per_level_clip = if kelly_clip > 0.0 {
+                            kelly_clip.max(climb_cfg.min_order_usd)
+                        } else {
+                            0.0
+                        };
                         let kelly_edge = (directional_conviction.model_favorite - legs.favorite_ask)
                             * (1.0 - directional_conviction.path_reversal_risk);
                         let mut load_left = remaining_load;
