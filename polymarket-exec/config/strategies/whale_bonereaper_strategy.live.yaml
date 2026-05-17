@@ -233,11 +233,16 @@ late_favorite:
     # already committed and reversal risk rises, permit a small opposite-leg
     # hedge before the tail becomes ultra-cheap. Sizing remains payoff-capped
     # so a favorite win still keeps at least a small positive payoff.
+    # 2026-05-17: tightened thresholds. Observed 18 fires/$17.46 in 5.5hr at
+    # min_order_usd=1, mostly $1 noise clips that didn't materially hedge.
+    # Raised min_reversal_score 0.35 -> 0.55 (require strong reversal signal,
+    # cuts fire rate ~70%), clip_usd 1 -> 2 and min_order_usd 1 -> 2 (when we
+    # do fire, the hedge is meaningful instead of dust).
     min_hedge_ask: 0.10
     max_hedge_ask: 0.20
-    clip_usd: 1.0
-    max_load_usd: 3.0
+    clip_usd: 2.0
+    max_load_usd: 6.0
     max_favorite_exposure_fraction: 0.50
     max_win_edge_spend_fraction: 0.45
-    min_order_usd: 1.0
-    min_reversal_score: 0.35
+    min_order_usd: 2.0
+    min_reversal_score: 0.55
