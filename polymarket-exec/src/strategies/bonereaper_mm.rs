@@ -3061,6 +3061,14 @@ where
                             if load_left < climb_cfg.min_order_usd {
                                 break;
                             }
+                            // If Kelly says no edge, skip the entire
+                            // emit loop. Without this guard, the inner
+                            // `.max(min_order_usd)` flooring below would
+                            // resurrect a $10 forced clip from a 0-Kelly
+                            // output, bypassing the kelly.min_edge gate.
+                            if per_level_clip <= 0.0 {
+                                break;
+                            }
                             let aggressive_taker = aggressive_all_levels
                                 || (use_aggressive_taker
                                     && level == 0
