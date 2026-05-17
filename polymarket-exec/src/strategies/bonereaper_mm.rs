@@ -9,7 +9,10 @@ use std::collections::{HashMap, VecDeque};
 use crate::core::types::{ClientOrderId, EpochMillis, IntentKind, OrderIntent};
 use crate::market_making::pairing::types::{LadderLeg, PairedMarketSnapshot};
 use crate::markets::MarketDescriptor;
-use crate::signals::{BtcRegime, MomentumSignal};
+use crate::signals::{
+    compute_near_strike_fragility, BookModelAgreement, BtcRegime, MomentumSignal,
+    NearStrikeFragility,
+};
 use crate::strategies::core_hedge_mm::{CoreHedgeMmStrategy, CoreHedgeMmStrategyConfig};
 use crate::strategies::traits::{StrategyFillInput, StrategyInput, TradingStrategy};
 use crate::types::{CoolingReason, MarketId, RuntimeCommand, StrategyDecision, SuppressionScope};
@@ -500,6 +503,8 @@ struct DirectionalConviction {
     strongest_bps: f64,
     spot_vs_strike_bps: Option<f64>,
     model_favorite: f64,
+    book_model_agreement: BookModelAgreement,
+    near_strike_fragility: NearStrikeFragility,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1573,6 +1578,35 @@ fn favorite_probability(leg: LadderLeg, p_up: f64, p_down: f64) -> f64 {
     }
 }
 
+fn book_model_agreement_for<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    favorite_leg: LadderLeg,
+) -> BookModelAgreement {
+    BookModelAgreement::compute(favorite_leg, &input.order_book_pressure, &input.momentum)
+}
+
+fn near_strike_fragility_for<M: MarketDescriptor>(
+    input: &StrategyInput<M>,
+    legs: &LegQuotes,
+    agreement: &BookModelAgreement,
+) -> NearStrikeFragility {
+    let remaining_s = input
+        .market
+        .time_remaining_ms(input.now_ms)
+        .map(|ms| ms as f64 / 1_000.0)
+        .unwrap_or_else(|| input.fair_value.time_remaining_s.max(0.0));
+    compute_near_strike_fragility(
+        spot_vs_strike_bps(
+            &input.market,
+            input.btc_regime.last_price,
+            legs.favorite_leg,
+        ),
+        remaining_s,
+        legs.favorite_ask,
+        agreement.flow_score,
+    )
+}
+
 fn directional_conviction<M: MarketDescriptor>(
     input: &StrategyInput<M>,
     legs: &LegQuotes,
@@ -1610,6 +1644,8 @@ fn directional_conviction<M: MarketDescriptor>(
         input.fair_value.p_up,
         input.fair_value.p_down,
     );
+    let book_model_agreement = book_model_agreement_for(input, legs.favorite_leg);
+    let near_strike_fragility = near_strike_fragility_for(input, legs, &book_model_agreement);
     let barbell = is_directional_barbell_favorite(cfg, legs.favorite_ask, legs.cheap_ask);
     let btc_confirms = strongest >= threshold * 0.75
         || spot_vs_strike
@@ -1658,6 +1694,8 @@ fn directional_conviction<M: MarketDescriptor>(
         strongest_bps: strongest,
         spot_vs_strike_bps: spot_vs_strike,
         model_favorite,
+        book_model_agreement,
+        near_strike_fragility,
     }
 }
 
@@ -2354,8 +2392,22 @@ fn path_reversal_risk_score<M: MarketDescriptor>(
         Some(BtcRegime::Flat) => 0.10,
         Some(BtcRegime::DirectionalSmooth) | None => 0.0,
     };
+    let book_model_agreement = book_model_agreement_for(input, legs.favorite_leg);
+    let near_strike_fragility = near_strike_fragility_for(input, legs, &book_model_agreement);
+    let microstructure_component = book_model_agreement.path_reversal_adder().min(0.35);
+    let fragility_component = if near_strike_fragility.in_fragile_zone {
+        ((1.0 - near_strike_fragility.fragility_factor) * 0.10).clamp(0.0, 0.10)
+    } else {
+        0.0
+    };
 
-    (reversal_component + strike_component + vol_component + regime_component).clamp(0.0, 1.0)
+    (reversal_component
+        + strike_component
+        + vol_component
+        + regime_component
+        + microstructure_component
+        + fragility_component)
+        .clamp(0.0, 1.0)
 }
 
 fn should_use_aggressive_favorite_taker(
@@ -2859,7 +2911,7 @@ where
             input.now_ms,
         );
         notes.push(format!(
-            "directional_conviction score={:.2} barbell={} btc_confirms={} regime={:?} favorite_ask={:.4} cheap_ask={:.4} recent_bps={:.2} strongest_bps={:.2} spot_vs_strike_bps={:?} model_favorite={:.4} path_reversal_risk={:.2}",
+            "directional_conviction score={:.2} barbell={} btc_confirms={} regime={:?} favorite_ask={:.4} cheap_ask={:.4} recent_bps={:.2} strongest_bps={:.2} spot_vs_strike_bps={:?} model_favorite={:.4} path_reversal_risk={:.2} book_model_agreement={:.2} flow_score={:.2} depth_score={:.2} momentum_score={:.2} toxicity={:.2} near_strike={} near_strike_factor={:.2} near_strike_reason={}",
             directional_conviction.score,
             directional_conviction.barbell,
             directional_conviction.btc_confirms,
@@ -2871,6 +2923,14 @@ where
             directional_conviction.spot_vs_strike_bps,
             directional_conviction.model_favorite,
             directional_conviction.path_reversal_risk,
+            directional_conviction.book_model_agreement.agreement,
+            directional_conviction.book_model_agreement.flow_score,
+            directional_conviction.book_model_agreement.depth_score,
+            directional_conviction.book_model_agreement.momentum_score,
+            directional_conviction.book_model_agreement.toxicity_score,
+            directional_conviction.near_strike_fragility.in_fragile_zone,
+            directional_conviction.near_strike_fragility.fragility_factor,
+            directional_conviction.near_strike_fragility.reason,
         ));
         notes.push(format!(
             "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
@@ -3073,8 +3133,21 @@ where
                             Some(BtcRegime::Whipsaw) => 0.50,          // 0.30 -> 0.15
                             None => 0.67,                              // warmup safety
                         };
+                        let microstructure_kelly_scale =
+                            if directional_conviction.near_strike_fragility.blocks_entry() {
+                                0.0
+                            } else {
+                                directional_conviction
+                                    .book_model_agreement
+                                    .kelly_multiplier()
+                                    * directional_conviction
+                                        .near_strike_fragility
+                                        .fragility_factor
+                            };
                         let regime_scaled_kelly_cfg = super::kelly_sizing::KellyClipConfig {
-                            fractional: climb_cfg.kelly.fractional * regime_kelly_scale,
+                            fractional: climb_cfg.kelly.fractional
+                                * regime_kelly_scale
+                                * microstructure_kelly_scale,
                             ..climb_cfg.kelly
                         };
                         let kelly_clip = super::kelly_sizing::kelly_clip_usd(
@@ -3208,7 +3281,7 @@ where
                                 break;
                             }
                             let reason = format!(
-                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} model_favorite={:.4} kelly_edge={:.4} kelly_clip_usd={:.2} clip_usd={:.2} lane_bankroll_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
+                                "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} model_favorite={:.4} kelly_edge={:.4} kelly_clip_usd={:.2} kelly_scale={:.2} book_model_agreement={:.2} toxicity={:.2} near_strike_factor={:.2} clip_usd={:.2} lane_bankroll_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
                                 legs.favorite_leg,
                                 level,
                                 if aggressive_taker { "taker_fak" } else { "maker_post_only" },
@@ -3218,6 +3291,10 @@ where
                                 directional_conviction.model_favorite,
                                 kelly_edge,
                                 kelly_clip,
+                                microstructure_kelly_scale,
+                                directional_conviction.book_model_agreement.agreement,
+                                directional_conviction.book_model_agreement.toxicity_score,
+                                directional_conviction.near_strike_fragility.fragility_factor,
                                 clip,
                                 adjusted_max_load_usd,
                                 current_exposure_usd + (remaining_load - load_left),
@@ -4477,7 +4554,9 @@ mod tests {
     use super::*;
     use crate::core::types::BookLevel;
     use crate::markets::BinaryOutcomeMarket;
-    use crate::signals::{FairValueEstimate, FairValueModel, MomentumSignal, SignalDirection};
+    use crate::signals::{
+        FairValueEstimate, FairValueModel, MomentumSignal, OrderBookPressureSignal, SignalDirection,
+    };
     use crate::types::QuoteSnapshot;
 
     fn snap(yes_bid: f64, yes_ask: f64, no_bid: f64, no_ask: f64) -> PairedMarketSnapshot {
@@ -5250,6 +5329,8 @@ mod tests {
             strongest_bps: 18.0,
             spot_vs_strike_bps: Some(12.0),
             model_favorite: 0.95,
+            book_model_agreement: BookModelAgreement::default(),
+            near_strike_fragility: NearStrikeFragility::default(),
         };
         let unclear = DirectionalConviction {
             btc_confirms: false,
@@ -5824,6 +5905,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn near_strike_fragility_blocks_sub75_favorite_climb_even_with_model_edge() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.convex_tail.enabled = false;
+        cfg.reversal_hedge.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = 0.50;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.favorite_climb.kelly.min_edge = 0.0;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.71, 0.72, 0.27, 0.28);
+        let input = strategy_input(
+            snapshot,
+            crate::signals::BtcRegimeSnapshot {
+                last_price: Some(100.005),
+                realized_vol_5m_bps: Some(2.0),
+                return_30s_bps: Some(8.0),
+                return_60s_bps: Some(15.0),
+                return_120s_bps: Some(18.0),
+                return_180s_bps: Some(20.0),
+                ..Default::default()
+            },
+            MomentumSignal {
+                direction: SignalDirection::Up,
+                score: 1.0,
+                strength: 1.0,
+                latest_window_return_bps: Some(12.0),
+                acceleration_bps: Some(4.0),
+                window_returns_bps: vec![12.0, 8.0],
+            },
+            0.99,
+            270_000,
+        );
+
+        let decision = strategy.on_tick(input);
+
+        assert!(
+            climb_intents(&decision).is_empty(),
+            "near-strike hard block should suppress climb intents; decision={decision:?}"
+        );
+        let notes = match &decision {
+            StrategyDecision::Noop { notes }
+            | StrategyDecision::QuoteSet { notes, .. }
+            | StrategyDecision::CapitalRecycle { notes, .. }
+            | StrategyDecision::Rescue { notes, .. }
+            | StrategyDecision::Merge { notes, .. }
+            | StrategyDecision::Mixed { notes, .. }
+            | StrategyDecision::Suppress { notes, .. } => notes,
+        };
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("near_strike_reason=fragile_block")),
+            "expected fragile_block diagnostic, notes={notes:?}"
+        );
+    }
+
+    #[test]
+    fn adverse_book_model_agreement_raises_reversal_risk() {
+        let snapshot = snap(0.91, 0.92, 0.07, 0.08);
+        let legs = read_legs(&snapshot).unwrap();
+        let mut input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                direction: SignalDirection::Down,
+                score: -1.0,
+                strength: 1.0,
+                latest_window_return_bps: Some(-14.0),
+                acceleration_bps: Some(-7.0),
+                window_returns_bps: vec![-14.0, -6.0],
+            },
+            0.96,
+            240_000,
+        );
+        input.order_book_pressure = OrderBookPressureSignal {
+            yes_bid_notional: 10.0,
+            yes_ask_notional: 120.0,
+            no_bid_notional: 100.0,
+            no_ask_notional: 10.0,
+            yes_taker_buy_qty_60s: 1.0,
+            yes_taker_sell_qty_60s: 35.0,
+            no_taker_buy_qty_60s: 40.0,
+            no_taker_sell_qty_60s: 2.0,
+            ..Default::default()
+        };
+
+        let risk = path_reversal_risk_score(&input, &legs);
+        let conviction = directional_conviction(&input, &legs, &FavoriteClimbConfig::default());
+
+        assert!(
+            risk > 0.30,
+            "expected microstructure risk adder, got {risk}"
+        );
+        assert!(
+            conviction.book_model_agreement.kelly_multiplier() < 0.60,
+            "expected adverse agreement to shrink Kelly, conviction={conviction:?}"
+        );
+    }
+
     fn conviction_for_scale_test(model_fav: f64, path_reversal: f64) -> DirectionalConviction {
         DirectionalConviction {
             score: 0.0,
@@ -5837,6 +6019,8 @@ mod tests {
             strongest_bps: 12.0,
             spot_vs_strike_bps: Some(8.0),
             model_favorite: model_fav,
+            book_model_agreement: BookModelAgreement::default(),
+            near_strike_fragility: NearStrikeFragility::default(),
         }
     }
 
