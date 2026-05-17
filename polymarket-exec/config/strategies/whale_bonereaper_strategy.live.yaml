@@ -172,6 +172,12 @@ late_favorite:
     # escalate to FAK, but still escalates promptly on 4¢ walk-aways.
     escalation_age_ms: 60000
     escalation_drift_ticks: 4
+    # Per-bar gross spend backstop. Caps adjusted_max_load_usd at this
+    # ceiling regardless of regime / cap_multiplier amplification. Set
+    # above typical Kelly output ($200-300) so it only binds on outlier
+    # over-conviction cases (today's $478 over-load bar would have been
+    # capped at $400). At higher bankrolls, raise this proportionally.
+    per_bar_gross_cap_usd: 400.0
   favorite_anticipate:
     # DISABLED — anticipate ladder produced marginal-band fires (0.51-0.59
     # ladder rungs below the conviction floor) with undersized cheap-tail

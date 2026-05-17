@@ -125,6 +125,7 @@ pub struct FavoriteClimbSubsection {
     pub escalation_drift_ticks: Option<u32>,
     pub escalation_max_clip_usd: Option<f64>,
     pub kelly: Option<KellyClipSubsection>,
+    pub per_bar_gross_cap_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -445,6 +446,9 @@ impl StrategyProfile {
                         kdef
                     }
                 },
+                per_bar_gross_cap_usd: c
+                    .per_bar_gross_cap_usd
+                    .unwrap_or(climb_def.per_bar_gross_cap_usd),
             },
             favorite_anticipate: LateFavAnticipateConfig {
                 enabled: a.enabled.unwrap_or(anticipate_def.enabled),

@@ -113,6 +113,11 @@ pub struct FavoriteClimbConfig {
     /// computes per-clip USD directly from (model_favorite, favorite_ask,
     /// path_reversal_risk, lane_bankroll). See kelly_sizing.rs.
     pub kelly: super::kelly_sizing::KellyClipConfig,
+    /// Per-bar gross spend cap (USD). Backstop against Kelly + barbell
+    /// amplifier producing oversize single-bar exposure. Set to 0 to
+    /// disable. When > 0, clamps `adjusted_max_load_usd` so total bar
+    /// notional never exceeds this regardless of regime / cap multipliers.
+    pub per_bar_gross_cap_usd: f64,
 }
 
 impl Default for FavoriteClimbConfig {
@@ -146,6 +151,7 @@ impl Default for FavoriteClimbConfig {
             escalation_drift_ticks: 3,
             escalation_max_clip_usd: 5.0,
             kelly: super::kelly_sizing::KellyClipConfig::default(),
+            per_bar_gross_cap_usd: 0.0,
         }
     }
 }
@@ -2948,8 +2954,18 @@ where
                         side_flip_debt_usd
                     ));
                 }
-                let adjusted_max_load_usd =
+                let raw_adjusted_max_load_usd =
                     climb_cfg.max_load_usd * regime_multiplier * entry_policy.cap_multiplier;
+                // Per-bar gross cap: hard backstop against Kelly + the
+                // barbell conviction amplifier producing $500+ per-bar
+                // exposure. Configurable; 0 disables. Applied AFTER
+                // regime/cap_multiplier scaling so it acts as a true
+                // ceiling, not a primary sizing mechanism.
+                let adjusted_max_load_usd = if climb_cfg.per_bar_gross_cap_usd > 0.0 {
+                    raw_adjusted_max_load_usd.min(climb_cfg.per_bar_gross_cap_usd)
+                } else {
+                    raw_adjusted_max_load_usd
+                };
                 let remaining_load = (adjusted_max_load_usd - current_exposure_usd).max(0.0);
                 if remaining_load >= climb_cfg.min_order_usd {
                     if let Some(base_px) = late_favorite_maker_base_price(
@@ -2983,8 +2999,26 @@ where
                             path_reversal_risk: directional_conviction.path_reversal_risk,
                             lane_bankroll_usd: adjusted_max_load_usd,
                         };
-                        let kelly_clip =
-                            super::kelly_sizing::kelly_clip_usd(kelly_params, &climb_cfg.kelly);
+                        // Regime-conditional Kelly fraction: tighten the
+                        // base fractional in high-risk regimes where the
+                        // BSM model is less reliable. Flat /
+                        // DirectionalSmooth keep base 0.30; Whipsaw and
+                        // TrendingVolatile drop further. None = warmup,
+                        // treat as moderate risk.
+                        let regime_kelly_scale = match input.btc_regime.regime() {
+                            Some(BtcRegime::DirectionalSmooth) | Some(BtcRegime::Flat) => 1.0,
+                            Some(BtcRegime::TrendingVolatile) => 0.67, // 0.30 -> 0.20
+                            Some(BtcRegime::Whipsaw) => 0.50,           // 0.30 -> 0.15
+                            None => 0.67,                               // warmup safety
+                        };
+                        let regime_scaled_kelly_cfg = super::kelly_sizing::KellyClipConfig {
+                            fractional: climb_cfg.kelly.fractional * regime_kelly_scale,
+                            ..climb_cfg.kelly
+                        };
+                        let kelly_clip = super::kelly_sizing::kelly_clip_usd(
+                            kelly_params,
+                            &regime_scaled_kelly_cfg,
+                        );
                         // If Kelly returns 0 (edge below min_edge),
                         // skip emission entirely instead of flooring to
                         // min_order_usd. Flooring would force tiny
