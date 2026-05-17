@@ -2236,7 +2236,14 @@ mod tests {
         let negative_decision = strategy.on_tick(negative_input);
 
         match negative_decision {
-            StrategyDecision::Noop { notes } => {
+            StrategyDecision::Suppress {
+                scope,
+                preserve_quotes,
+                notes,
+                ..
+            } => {
+                assert_eq!(scope, SuppressionScope::PairedOnly);
+                assert!(!preserve_quotes);
                 assert!(notes.iter().any(|note| {
                     note.contains("mate repair skipped") && note.contains("bundle salvage")
                 }));

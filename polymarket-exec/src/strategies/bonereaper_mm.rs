@@ -4178,6 +4178,9 @@ fn observe_market_posture<M: MarketDescriptor>(
             MarketPosture::NoFreshCore
         };
     }
+    if favorite_is_separating && path_reversal_risk >= 0.45 {
+        return MarketPosture::WhipsawHedge;
+    }
 
     match input.btc_regime.regime() {
         Some(BtcRegime::Whipsaw) if path_reversal_risk >= 0.55 => MarketPosture::WhipsawHedge,
