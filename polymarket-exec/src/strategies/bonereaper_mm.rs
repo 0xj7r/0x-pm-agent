@@ -658,7 +658,29 @@ pub struct LateFavoriteStrategy {
 #[derive(Clone, Copy, Debug)]
 struct ReservedNotional {
     notional_usd: f64,
-    updated_at_ms: EpochMillis,
+    expires_at_ms: EpochMillis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReservationClass {
+    Resting,
+    Aggressive,
+}
+
+impl ReservationClass {
+    fn ttl_ms(self) -> u64 {
+        match self {
+            Self::Resting => 20_000,
+            Self::Aggressive => 1_500,
+        }
+    }
+
+    fn as_key_suffix(self) -> &'static str {
+        match self {
+            Self::Resting => "resting",
+            Self::Aggressive => "aggressive",
+        }
+    }
 }
 
 impl LateFavoriteStrategy {
@@ -672,15 +694,17 @@ impl LateFavoriteStrategy {
         }
     }
 
-    fn reservation_key(market_id: &MarketId, leg: LadderLeg) -> String {
-        format!("{market_id}:{leg:?}")
+    fn reservation_key(market_id: &MarketId, leg: LadderLeg, class: ReservationClass) -> String {
+        format!("{market_id}:{leg:?}:{}", class.as_key_suffix())
+    }
+
+    fn reservation_prefix(market_id: &MarketId, leg: LadderLeg) -> String {
+        format!("{market_id}:{leg:?}:")
     }
 
     fn prune_reservations(&mut self, now_ms: EpochMillis) {
-        const RESERVATION_TTL_MS: u64 = 20_000;
-        self.reserved_directional_notional.retain(|_, reserved| {
-            now_ms.saturating_sub(reserved.updated_at_ms) <= RESERVATION_TTL_MS
-        });
+        self.reserved_directional_notional
+            .retain(|_, reserved| now_ms <= reserved.expires_at_ms);
     }
 
     fn prune_rearm_state(&mut self, now_ms: EpochMillis) {
@@ -689,10 +713,12 @@ impl LateFavoriteStrategy {
     }
 
     fn reserved_notional(&self, market_id: &MarketId, leg: LadderLeg) -> f64 {
+        let prefix = Self::reservation_prefix(market_id, leg);
         self.reserved_directional_notional
-            .get(&Self::reservation_key(market_id, leg))
-            .map(|reserved| reserved.notional_usd.max(0.0))
-            .unwrap_or(0.0)
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, reserved)| reserved.notional_usd.max(0.0))
+            .sum()
     }
 
     fn reserve_notional(
@@ -701,20 +727,21 @@ impl LateFavoriteStrategy {
         leg: LadderLeg,
         notional_usd: f64,
         now_ms: EpochMillis,
+        class: ReservationClass,
     ) {
         if notional_usd <= 0.0 || !notional_usd.is_finite() {
             return;
         }
-        let key = Self::reservation_key(market_id, leg);
+        let key = Self::reservation_key(market_id, leg, class);
         let entry = self
             .reserved_directional_notional
             .entry(key)
             .or_insert(ReservedNotional {
                 notional_usd: 0.0,
-                updated_at_ms: now_ms,
+                expires_at_ms: now_ms,
             });
         entry.notional_usd += notional_usd;
-        entry.updated_at_ms = now_ms;
+        entry.expires_at_ms = now_ms.saturating_add(class.ttl_ms());
     }
 
     fn update_late_fav_rearm_state(
@@ -3317,6 +3344,11 @@ where
                                 legs.favorite_leg,
                                 clip,
                                 input.now_ms,
+                                if aggressive_taker {
+                                    ReservationClass::Aggressive
+                                } else {
+                                    ReservationClass::Resting
+                                },
                             );
                             load_left -= clip;
                         }
@@ -3401,6 +3433,7 @@ where
                     legs.favorite_leg,
                     clip_usd,
                     input.now_ms,
+                    ReservationClass::Aggressive,
                 );
                 escalated_in_market = true;
                 break; // one escalation per market per tick
@@ -3493,6 +3526,7 @@ where
                         legs.favorite_leg,
                         clip,
                         input.now_ms,
+                        ReservationClass::Resting,
                     );
                     load_left -= clip;
                 }
@@ -3719,6 +3753,11 @@ where
                             legs.cheap_leg,
                             clip,
                             input.now_ms,
+                            if aggressive_taker {
+                                ReservationClass::Aggressive
+                            } else {
+                                ReservationClass::Resting
+                            },
                         );
                         load_left -= clip;
                     }
@@ -3799,6 +3838,7 @@ where
                         legs.cheap_leg,
                         clip,
                         input.now_ms,
+                        ReservationClass::Resting,
                     );
                 }
             } else if favorite_filled_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD {
@@ -3950,6 +3990,11 @@ where
                             legs.cheap_leg,
                             clip,
                             input.now_ms,
+                            if aggressive_taker {
+                                ReservationClass::Aggressive
+                            } else {
+                                ReservationClass::Resting
+                            },
                         );
                         load_left -= clip;
                     }
@@ -4741,6 +4786,40 @@ mod tests {
         assert!((bundle.fav_filled_spend_usd - 90.0).abs() < 1e-9);
         assert!((bundle.tail_filled_qty - 50.0).abs() < 1e-9);
         assert!((bundle.tail_filled_spend_usd - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn aggressive_directional_reservations_expire_fast_without_clearing_resting_budget() {
+        let mut strategy = LateFavoriteStrategy::new(LateFavoriteStrategyConfig::default());
+        let market_id = MarketId::new("m");
+        let now = 1_000;
+
+        strategy.reserve_notional(
+            &market_id,
+            LadderLeg::Yes,
+            20.0,
+            now,
+            ReservationClass::Aggressive,
+        );
+        strategy.reserve_notional(
+            &market_id,
+            LadderLeg::Yes,
+            30.0,
+            now,
+            ReservationClass::Resting,
+        );
+
+        assert_eq!(strategy.reserved_notional(&market_id, LadderLeg::Yes), 50.0);
+
+        strategy.prune_reservations(now + 1_501);
+        assert_eq!(
+            strategy.reserved_notional(&market_id, LadderLeg::Yes),
+            30.0,
+            "FAK/IOC reservation should clear quickly after likely reject/no-match, but resting maker budget remains"
+        );
+
+        strategy.prune_reservations(now + 20_001);
+        assert_eq!(strategy.reserved_notional(&market_id, LadderLeg::Yes), 0.0);
     }
 
     #[test]
