@@ -197,6 +197,13 @@ pub struct AppConfig {
     /// submit records the intended order plus top-N book depth so offline
     /// calibration can compare quote decisions against later book movement.
     pub shadow_quote_log_path: Option<PathBuf>,
+    /// Optional JSONL path for next-bar directional shadow records. This is a
+    /// no-order signal feed: it records book, flow, and BTC-context features
+    /// for active/upcoming BTC timed markets so we can calibrate pre-resolution
+    /// directional entries without enabling live risk.
+    pub next_bar_shadow_log_path: Option<PathBuf>,
+    /// Minimum milliseconds between next-bar shadow records per market.
+    pub next_bar_shadow_interval_ms: u64,
     /// Phase 5 paper env: max depth levels per side captured in each book
     /// snapshot record. Bigger = bigger files; smaller = less faithful
     /// replay. Default 10.
@@ -525,6 +532,9 @@ impl AppConfig {
         let paper_report_path = parse_path_optional("PM_BTC_5M_PAPER_REPORT_PATH");
         let book_snapshot_log_path = parse_path_optional("PM_BTC_5M_BOOK_SNAPSHOT_LOG_PATH");
         let shadow_quote_log_path = parse_path_optional("PM_BTC_5M_SHADOW_QUOTE_LOG_PATH");
+        let next_bar_shadow_log_path = parse_path_optional("PM_BTC_5M_NEXT_BAR_SHADOW_LOG_PATH");
+        let next_bar_shadow_interval_ms =
+            parse_duration_ms("PM_BTC_5M_NEXT_BAR_SHADOW_INTERVAL_MS", 1_000)?.as_millis() as u64;
         let book_snapshot_max_levels = parse_usize("PM_BTC_5M_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
         let paper_maker_rebate_coeff = parse_f64("PM_BTC_5M_PAPER_MAKER_REBATE_COEFF", 0.0)?;
         let paper_taker_fee_coeff_override = env_value("PM_BTC_5M_PAPER_TAKER_FEE_COEFF")
@@ -627,6 +637,8 @@ impl AppConfig {
             paper_report_path,
             book_snapshot_log_path,
             shadow_quote_log_path,
+            next_bar_shadow_log_path,
+            next_bar_shadow_interval_ms,
             book_snapshot_max_levels,
             paper_maker_rebate_coeff,
             paper_taker_fee_coeff_override,

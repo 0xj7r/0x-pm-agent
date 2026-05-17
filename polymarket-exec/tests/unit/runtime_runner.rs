@@ -111,6 +111,8 @@ fn runner_test_config() -> AppConfig {
         paper_cancel_race_window_ms: 500,
         paper_report_path: None,
         shadow_quote_log_path: None,
+        next_bar_shadow_log_path: None,
+        next_bar_shadow_interval_ms: 1_000,
         book_snapshot_log_path: None,
         book_snapshot_max_levels: 10,
         paper_maker_rebate_coeff: 0.0,

@@ -738,6 +738,16 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
             )
         })
         .transpose()?;
+    let mut next_bar_shadow: Option<crate::paper::next_bar_shadow::NextBarShadowWriter> = config
+        .next_bar_shadow_log_path
+        .as_deref()
+        .map(|path| {
+            crate::paper::next_bar_shadow::NextBarShadowWriter::open(
+                path,
+                config.next_bar_shadow_interval_ms,
+            )
+        })
+        .transpose()?;
 
     let mut startup_outcome = runtime.recover_from_store(
         now_unix_ms(),
@@ -855,6 +865,7 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut paper_report,
         &mut book_snapshot,
         &mut shadow_quote,
+        &mut next_bar_shadow,
         &mut paper_order_ctx,
         &mut execution_venue_map,
         &mut live_safety,
@@ -945,6 +956,22 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 target: "shadow_quote.flush",
                 output = %shadow.path().display(),
                 "shadow quote log flushed"
+            );
+        }
+    }
+    if let Some(shadow) = next_bar_shadow.as_mut() {
+        if let Err(error) = shadow.flush() {
+            warn!(
+                target: "next_bar_shadow.flush",
+                output = %shadow.path().display(),
+                error = %error,
+                "failed to flush next-bar shadow log on shutdown"
+            );
+        } else {
+            info!(
+                target: "next_bar_shadow.flush",
+                output = %shadow.path().display(),
+                "next-bar shadow log flushed"
             );
         }
     }
@@ -1146,6 +1173,7 @@ async fn run_runtime_loop(
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
     book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
     shadow_quote: &mut Option<crate::paper::shadow_quote::ShadowQuoteWriter>,
+    next_bar_shadow: &mut Option<crate::paper::next_bar_shadow::NextBarShadowWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
     execution_venue_map: &mut HashMap<ClientOrderId, Option<OrderId>>,
     live_safety: &mut LiveSafetyState,
@@ -1366,6 +1394,14 @@ async fn run_runtime_loop(
                 metrics.refresh_stream_ages();
                 let current_universe = market_universe.read().await.clone();
                 let current_assets = current_universe.market_assets.clone();
+                record_next_bar_shadow_signals(
+                    runtime,
+                    books,
+                    &current_universe,
+                    next_bar_shadow,
+                    now_unix_ms(),
+                )
+                .await;
                 if execution_policy.paper_mode && !paper_market_closed {
                     if let Some(close_at_ms) = execution_policy.paper_market_close_at_ms {
                         let now = now_unix_ms();
@@ -1840,6 +1876,53 @@ async fn run_runtime_loop(
                     "runtime book summary"
                 );
             }
+        }
+    }
+}
+
+async fn record_next_bar_shadow_signals(
+    runtime: &Runtime<StrategyMode>,
+    books: &BookStore,
+    universe: &RuntimeMarketUniverse,
+    writer: &mut Option<crate::paper::next_bar_shadow::NextBarShadowWriter>,
+    observed_at_ms: u64,
+) {
+    let Some(writer) = writer.as_mut() else {
+        return;
+    };
+    let btc = runtime.btc_regime_snapshot(observed_at_ms);
+    let mut seen_markets = HashSet::new();
+    for market_id_raw in universe.market_id_by_asset.values() {
+        if !seen_markets.insert(market_id_raw.clone()) {
+            continue;
+        }
+        let market_id = MarketId::from(market_id_raw.as_str());
+        let Some(context) = runtime.market_context_record(&market_id) else {
+            continue;
+        };
+        let (Some(yes_id), Some(no_id)) = (
+            context.instrument_ids.first(),
+            context.instrument_ids.get(1),
+        ) else {
+            continue;
+        };
+        let (Some(yes_book), Some(no_book)) =
+            (books.snapshot(yes_id).await, books.snapshot(no_id).await)
+        else {
+            continue;
+        };
+        if yes_book.last_update_unix_ms == 0 || no_book.last_update_unix_ms == 0 {
+            continue;
+        }
+        if let Err(error) =
+            writer.record_if_due(&context, &yes_book, &no_book, &btc, observed_at_ms)
+        {
+            warn!(
+                target: "next_bar_shadow",
+                market_id = %context.market_id,
+                error = %error,
+                "failed to write next-bar shadow record"
+            );
         }
     }
 }

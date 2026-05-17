@@ -112,12 +112,17 @@ pub(super) async fn fetch_btc_5m_market_contexts(
     now_ms: u64,
 ) -> Result<MarketContextStore> {
     let records = fetch_btc_5m_gamma_records(config, now_ms).await?;
-    let selected = filter_tradeable_price_to_beat_records(select_runtime_market_records(
+    let selected = select_runtime_market_records(
         records,
         now_ms,
         config.market_discovery_include_prev,
         config.market_discovery_include_next,
-    ));
+    );
+    let selected = if config.paper_mode && config.next_bar_shadow_log_path.is_some() {
+        filter_tradeable_or_shadow_upcoming_records(selected, now_ms)
+    } else {
+        filter_tradeable_price_to_beat_records(selected)
+    };
     Ok(MarketContextStore::from_records(
         selected,
         Some("gamma-api:engine-discovery".to_string()),
@@ -369,6 +374,42 @@ fn filter_tradeable_price_to_beat_records(
         .collect()
 }
 
+fn filter_tradeable_or_shadow_upcoming_records(
+    records: Vec<MarketContextRecord>,
+    now_ms: u64,
+) -> Vec<MarketContextRecord> {
+    records
+        .into_iter()
+        .filter(|record| {
+            if record.price_to_beat.is_some() {
+                return true;
+            }
+            if record
+                .event_start_time_ms
+                .is_some_and(|start| start > now_ms)
+                && record.instrument_ids.len() >= 2
+            {
+                info!(
+                    target: "market_discovery",
+                    market_id = record.market_id,
+                    start_ms = ?record.event_start_time_ms,
+                    end_ms = ?record.event_end_time_ms,
+                    "keeping unpriced upcoming BTC timed market for paper next-bar shadow"
+                );
+                return true;
+            }
+            warn!(
+                target: "market_discovery",
+                market_id = record.market_id,
+                start_ms = ?record.event_start_time_ms,
+                end_ms = ?record.event_end_time_ms,
+                "dropping BTC timed market without price_to_beat; discovery will retry before trading"
+            );
+            false
+        })
+        .collect()
+}
+
 fn parse_gamma_market_record(
     value: &Value,
     slug_prefix: &str,
@@ -564,5 +605,35 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].market_id, "ready");
         assert_eq!(selected[0].price_to_beat, Some(78_722.0));
+    }
+
+    #[test]
+    fn paper_shadow_keeps_unpriced_upcoming_market_context() {
+        let now_ms = 1_777_750_100_000;
+        let selected = filter_tradeable_or_shadow_upcoming_records(
+            vec![
+                MarketContextRecord {
+                    market_id: "upcoming-shadow".to_string(),
+                    instrument_ids: vec!["up-a".to_string(), "down-a".to_string()],
+                    price_to_beat: None,
+                    final_price: None,
+                    event_start_time_ms: Some(1_777_750_200_000),
+                    event_end_time_ms: Some(1_777_750_500_000),
+                },
+                MarketContextRecord {
+                    market_id: "active-unpriced".to_string(),
+                    instrument_ids: vec!["up-b".to_string(), "down-b".to_string()],
+                    price_to_beat: None,
+                    final_price: None,
+                    event_start_time_ms: Some(1_777_749_900_000),
+                    event_end_time_ms: Some(1_777_750_200_000),
+                },
+            ],
+            now_ms,
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].market_id, "upcoming-shadow");
+        assert_eq!(selected[0].price_to_beat, None);
     }
 }
