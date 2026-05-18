@@ -40,6 +40,8 @@ const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.45;
 const WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD: f64 = 10.0;
 const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 3.0;
 const SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER: f64 = 1.25;
+const BUNDLE_MIN_PROJECTED_EV_USD: f64 = 0.0;
+const BUNDLE_EV_EPSILON_USD: f64 = 1e-9;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FavoriteClimbConfig {
@@ -705,6 +707,7 @@ struct LateFavBundleState {
     fav_filled_spend_usd: f64,
     tail_filled_qty: f64,
     tail_filled_spend_usd: f64,
+    working_fav_qty: f64,
     working_fav_spend_usd: f64,
     working_tail_qty: f64,
     working_tail_spend_usd: f64,
@@ -714,6 +717,14 @@ struct LateFavBundleState {
 struct BundleOrderGate {
     allowed: bool,
     reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LateFavBundleProjection {
+    favorite_win_probability: f64,
+    favorite_win_payoff_usd: f64,
+    tail_win_payoff_usd: f64,
+    expected_value_usd: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1094,6 +1105,8 @@ impl LateFavoriteStrategy {
         let tail_filled_spend_usd =
             filled_inventory_spend_usd(input.cheap_tail_inventory, tail_leg)
                 + stranded_paired_core_spend_usd(input.paired_core_inventory, tail_leg);
+        let working_fav_qty =
+            open_order_qty_for_leg(input.open_late_fav_order_exposure, dominant_fav_leg);
         let working_fav_spend_usd =
             directional_favorite_working_spend_usd(self, input, dominant_fav_leg);
         let working_tail_qty = open_order_qty_for_leg(input.open_convex_order_exposure, tail_leg);
@@ -1108,6 +1121,7 @@ impl LateFavoriteStrategy {
             fav_filled_spend_usd,
             tail_filled_qty,
             tail_filled_spend_usd,
+            working_fav_qty,
             working_fav_spend_usd,
             working_tail_qty,
             working_tail_spend_usd,
@@ -1264,6 +1278,48 @@ impl LateFavBundleState {
         }
     }
 
+    fn projection_after(
+        self,
+        favorite_win_probability: f64,
+        proposed_fav_qty: f64,
+        proposed_fav_spend: f64,
+        proposed_tail_qty: f64,
+        proposed_tail_spend: f64,
+    ) -> LateFavBundleProjection {
+        let proposed_fav_qty = proposed_fav_qty.max(0.0);
+        let proposed_fav_spend = proposed_fav_spend.max(0.0);
+        let proposed_tail_qty = proposed_tail_qty.max(0.0);
+        let proposed_tail_spend = proposed_tail_spend.max(0.0);
+        let total_spend = self.fav_filled_spend_usd
+            + self.tail_filled_spend_usd
+            + self.working_fav_spend_usd
+            + self.working_tail_spend_usd
+            + proposed_fav_spend
+            + proposed_tail_spend;
+        let favorite_win_payoff_usd =
+            self.fav_filled_qty + self.working_fav_qty + proposed_fav_qty - total_spend;
+        let tail_win_payoff_usd =
+            self.tail_filled_qty + self.working_tail_qty + proposed_tail_qty - total_spend;
+        let favorite_win_probability = favorite_win_probability.clamp(0.0, 1.0);
+        let expected_value_usd = favorite_win_probability * favorite_win_payoff_usd
+            + (1.0 - favorite_win_probability) * tail_win_payoff_usd;
+
+        LateFavBundleProjection {
+            favorite_win_probability,
+            favorite_win_payoff_usd,
+            tail_win_payoff_usd,
+            expected_value_usd,
+        }
+    }
+
+    fn current_projection(self, favorite_win_probability: f64) -> LateFavBundleProjection {
+        self.projection_after(favorite_win_probability, 0.0, 0.0, 0.0, 0.0)
+    }
+
+    fn projection_has_positive_ev(projection: LateFavBundleProjection) -> bool {
+        projection.expected_value_usd + BUNDLE_EV_EPSILON_USD >= BUNDLE_MIN_PROJECTED_EV_USD
+    }
+
     fn tail_coverage_ratio_after_favorite_add(self, proposed_fav_spend: f64) -> f64 {
         let loss_at_risk = self.fav_committed_spend_usd() + proposed_fav_spend.max(0.0);
         if loss_at_risk <= 0.0 {
@@ -1294,28 +1350,22 @@ impl LateFavBundleState {
     }
 
     fn payoff_if_fav_wins_after(self, proposed_fav_qty: f64, proposed_fav_spend: f64) -> f64 {
-        self.fav_filled_qty + proposed_fav_qty
-            - self.fav_filled_spend_usd
-            - self.tail_filled_spend_usd
-            - self.working_fav_spend_usd
-            - self.working_tail_spend_usd
-            - proposed_fav_spend
+        self.projection_after(1.0, proposed_fav_qty, proposed_fav_spend, 0.0, 0.0)
+            .favorite_win_payoff_usd
     }
 
     fn payoff_if_fav_wins_after_tail_add(self, proposed_tail_spend: f64) -> f64 {
-        self.payoff_if_fav_wins_after(0.0, 0.0) - proposed_tail_spend.max(0.0)
+        self.projection_after(1.0, 0.0, 0.0, 0.0, proposed_tail_spend)
+            .favorite_win_payoff_usd
     }
 
     fn payoff_if_tail_wins(self) -> f64 {
-        self.tail_filled_qty
-            - self.fav_filled_spend_usd
-            - self.tail_filled_spend_usd
-            - self.working_fav_spend_usd
-            - self.working_tail_spend_usd
+        self.current_projection(0.0).tail_win_payoff_usd
     }
 
     fn payoff_if_tail_wins_after_favorite_add(self, proposed_fav_spend_usd: f64) -> f64 {
-        self.payoff_if_tail_wins() - proposed_fav_spend_usd
+        self.projection_after(0.0, 0.0, proposed_fav_spend_usd, 0.0, 0.0)
+            .tail_win_payoff_usd
     }
 
     fn gate_favorite_add(
@@ -1327,12 +1377,27 @@ impl LateFavBundleState {
         proposed_spend_usd: f64,
         hedge_ask: f64,
         proposed_hedge_qty: f64,
+        favorite_win_probability: f64,
         regime: Option<BtcRegime>,
         path_reversal_risk: f64,
         book_model_agreement: BookModelAgreement,
         near_strike_fragility: NearStrikeFragility,
         late_fav_rearm_ready: bool,
     ) -> BundleOrderGate {
+        let (projected_fav_qty, projected_fav_spend, projected_tail_qty, projected_tail_spend) =
+            if proposed_leg == self.dominant_fav_leg {
+                (proposed_qty, proposed_spend_usd, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, proposed_qty, proposed_spend_usd)
+            };
+        let projected_bundle = self.projection_after(
+            favorite_win_probability,
+            projected_fav_qty,
+            projected_fav_spend,
+            projected_tail_qty,
+            projected_tail_spend,
+        );
+
         if self.side_flip && proposed_leg != self.dominant_fav_leg && !late_fav_rearm_ready {
             return BundleOrderGate {
                 allowed: false,
@@ -1440,16 +1505,36 @@ impl LateFavBundleState {
             }
         }
 
+        if !Self::projection_has_positive_ev(projected_bundle) {
+            return BundleOrderGate {
+                allowed: false,
+                reason: format!(
+                    "bundle blocks add: projected EV negative p_fav={:.4} ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} proposed_leg={:?} proposed_qty={:.2} proposed_spend={:.2}",
+                    projected_bundle.favorite_win_probability,
+                    projected_bundle.expected_value_usd,
+                    projected_bundle.favorite_win_payoff_usd,
+                    projected_bundle.tail_win_payoff_usd,
+                    proposed_leg,
+                    proposed_qty,
+                    proposed_spend_usd,
+                ),
+            };
+        }
+
         BundleOrderGate {
             allowed: true,
             reason: format!(
-                "bundle allows favorite add fav_leg={:?} tail_leg={:?} side_flip={} fav_spend={:.2} tail_spend={:.2} tail_coverage={:.2}",
+                "bundle allows favorite add fav_leg={:?} tail_leg={:?} side_flip={} fav_spend={:.2} tail_spend={:.2} tail_coverage={:.2} p_fav={:.4} bundle_ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2}",
                 self.dominant_fav_leg,
                 self.tail_leg,
                 self.side_flip,
                 self.fav_committed_spend_usd(),
                 self.tail_filled_spend_usd,
                 self.tail_coverage_ratio(),
+                projected_bundle.favorite_win_probability,
+                projected_bundle.expected_value_usd,
+                projected_bundle.favorite_win_payoff_usd,
+                projected_bundle.tail_win_payoff_usd,
             ),
         }
     }
@@ -2302,6 +2387,13 @@ fn favorite_probability(leg: LadderLeg, p_up: f64, p_down: f64) -> f64 {
         LadderLeg::Yes => p_up,
         LadderLeg::No => p_down,
     }
+}
+
+fn adjusted_bundle_favorite_probability(model_probability: f64, path_reversal_risk: f64) -> f64 {
+    let p = model_probability.clamp(0.0, 1.0);
+    let reversal = path_reversal_risk.clamp(0.0, 1.0);
+
+    0.5 + (p - 0.5) * (1.0 - reversal)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3759,8 +3851,30 @@ where
             late_fav_rearm_ready, late_fav_stable_bars, LATE_FAV_REARM_MAX_PATH_RISK,
         ));
         let bundle_state = self.bundle_state(&input, &legs);
+        let bundle_legs = leg_quotes_for(&legs, bundle_state.dominant_fav_leg);
+        let bundle_model_favorite = favorite_probability(
+            bundle_state.dominant_fav_leg,
+            input.fair_value.p_up,
+            input.fair_value.p_down,
+        );
+        let bundle_book_model_agreement = if bundle_state.dominant_fav_leg == legs.favorite_leg {
+            directional_conviction.book_model_agreement
+        } else {
+            book_model_agreement_for(&input, bundle_state.dominant_fav_leg)
+        };
+        let bundle_near_strike_fragility =
+            near_strike_fragility_for(&input, &bundle_legs, &bundle_book_model_agreement);
+        let bundle_path_reversal_risk = if bundle_state.dominant_fav_leg == legs.favorite_leg {
+            directional_conviction.path_reversal_risk
+        } else {
+            path_reversal_risk_score(&input, &bundle_legs)
+        };
+        let bundle_favorite_win_probability =
+            adjusted_bundle_favorite_probability(bundle_model_favorite, bundle_path_reversal_risk);
+        let current_bundle_projection =
+            bundle_state.current_projection(bundle_favorite_win_probability);
         notes.push(format!(
-            "late_fav_bundle dominant={:?} current={:?} tail={:?} side_flip={} fav_committed={:.2} fav_filled={:.2} fav_qty={:.2} tail_spend={:.2} tail_qty={:.2} working_fav={:.2} working_tail={:.2} tail_coverage={:.2} fav_win_payoff_now={:.2} tail_win_payoff_now={:.2}",
+            "late_fav_bundle dominant={:?} current={:?} tail={:?} side_flip={} fav_committed={:.2} fav_filled={:.2} fav_qty={:.2} tail_spend={:.2} tail_qty={:.2} working_fav={:.2} working_fav_qty={:.2} working_tail={:.2} tail_coverage={:.2} p_fav_adj={:.4} model_fav={:.4} path_reversal={:.2} agreement={:.2} toxicity={:.2} near_strike_factor={:.2} bundle_ev_now={:.2} fav_win_payoff_now={:.2} tail_win_payoff_now={:.2}",
             bundle_state.dominant_fav_leg,
             bundle_state.current_fav_leg,
             bundle_state.tail_leg,
@@ -3771,10 +3885,18 @@ where
             bundle_state.tail_filled_spend_usd,
             bundle_state.tail_filled_qty,
             bundle_state.working_fav_spend_usd,
+            bundle_state.working_fav_qty,
             bundle_state.working_tail_spend_usd,
             bundle_state.tail_coverage_ratio(),
-            bundle_state.payoff_if_fav_wins_after(0.0, 0.0),
-            bundle_state.payoff_if_tail_wins(),
+            bundle_favorite_win_probability,
+            bundle_model_favorite,
+            bundle_path_reversal_risk,
+            bundle_book_model_agreement.agreement,
+            bundle_book_model_agreement.toxicity_score,
+            bundle_near_strike_fragility.fragility_factor,
+            current_bundle_projection.expected_value_usd,
+            current_bundle_projection.favorite_win_payoff_usd,
+            current_bundle_projection.tail_win_payoff_usd,
         ));
         let climb_enabled = climb_cfg
             .disable_after_ms
@@ -4065,6 +4187,8 @@ where
                         let level0_immediate_fak = entry_policy.force_taker
                             || directional_conviction.barbell
                             || sizing_remaining_ms <= 45_000;
+                        let mut planned_fav_qty = 0.0;
+                        let mut planned_fav_spend = 0.0;
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -4103,14 +4227,16 @@ where
                             }
                             let clip = per_level_clip.min(load_left).max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
+                            let notional = qty * px;
                             let bundle_gate = bundle_state.gate_favorite_add(
                                 &tail_cfg,
                                 legs.favorite_leg,
                                 px,
-                                qty,
-                                clip,
+                                planned_fav_qty + qty,
+                                planned_fav_spend + notional,
                                 legs.cheap_ask,
                                 0.0,
+                                bundle_favorite_win_probability,
                                 input.btc_regime.regime(),
                                 entry_policy.path_reversal_risk,
                                 directional_conviction.book_model_agreement,
@@ -4168,6 +4294,8 @@ where
                                     ReservationClass::Resting
                                 },
                             );
+                            planned_fav_qty += qty;
+                            planned_fav_spend += notional;
                             load_left -= clip;
                         }
                     }
@@ -4225,8 +4353,31 @@ where
                     .escalation_max_clip_usd
                     .min(open.remaining_qty * open.limit_price);
                 let qty = (clip_usd / legs.favorite_ask).max(input.market.min_order_size());
+                let notional = qty * legs.favorite_ask;
+                let bundle_gate = bundle_state.gate_favorite_add(
+                    &tail_cfg,
+                    legs.favorite_leg,
+                    legs.favorite_ask,
+                    qty,
+                    notional,
+                    legs.cheap_ask,
+                    0.0,
+                    bundle_favorite_win_probability,
+                    input.btc_regime.regime(),
+                    directional_conviction.path_reversal_risk,
+                    directional_conviction.book_model_agreement,
+                    directional_conviction.near_strike_fragility,
+                    late_fav_rearm_ready,
+                );
+                if !bundle_gate.allowed {
+                    notes.push(format!(
+                        "late_favorite climb-escalate blocked by bundle gate: {}",
+                        bundle_gate.reason
+                    ));
+                    continue;
+                }
                 let reason = format!(
-                    "late_favorite climb-escalate leg={:?} stale_age_ms={} drift_ticks={} resting_px={:.4} now_ask={:.4} residual_qty={:.4} escalation_clip_usd={:.2}",
+                    "late_favorite climb-escalate leg={:?} stale_age_ms={} drift_ticks={} resting_px={:.4} now_ask={:.4} residual_qty={:.4} escalation_clip_usd={:.2}; {}",
                     legs.favorite_leg,
                     age_ms,
                     drift_ticks as i64,
@@ -4234,6 +4385,7 @@ where
                     legs.favorite_ask,
                     open.remaining_qty,
                     clip_usd,
+                    bundle_gate.reason,
                 );
                 notes.push(reason.clone());
                 intents.push(build_late_favorite_intent(
@@ -4521,6 +4673,8 @@ where
                     let aggressive_all_levels =
                         use_aggressive_taker && !use_ultra_cheap_maker_fallback;
                     let ladder_step_ticks = cheap_tail_ladder_step_ticks(&tail_cfg, legs.cheap_ask);
+                    let mut planned_tail_qty = 0.0;
+                    let mut planned_tail_spend = 0.0;
                     for level in 0..level_count {
                         if load_left < tail_cfg.min_order_usd {
                             break;
@@ -4529,15 +4683,6 @@ where
                         let clip = (load_left / remaining_levels)
                             .max(tail_cfg.min_order_usd)
                             .min(load_left);
-                        let planned_tail_spend = total_clip - load_left;
-                        let projected_fav_win_payoff = bundle_state
-                            .payoff_if_fav_wins_after_tail_add(planned_tail_spend + clip);
-                        if projected_fav_win_payoff < -1e-9 {
-                            notes.push(format!(
-                                "cheap_tail blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={projected_fav_win_payoff:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} tail_cap={tail_cap_usd:.2}",
-                            ));
-                            break;
-                        }
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
@@ -4560,8 +4705,33 @@ where
                             continue;
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
+                        let notional = qty * px;
+                        let projected_bundle = bundle_state.projection_after(
+                            bundle_favorite_win_probability,
+                            0.0,
+                            0.0,
+                            planned_tail_qty + qty,
+                            planned_tail_spend + notional,
+                        );
+                        if projected_bundle.favorite_win_payoff_usd < -1e-9 {
+                            notes.push(format!(
+                                "cheap_tail blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} tail_cap={tail_cap_usd:.2}",
+                                projected_bundle.favorite_win_payoff_usd,
+                            ));
+                            break;
+                        }
+                        if !LateFavBundleState::projection_has_positive_ev(projected_bundle) {
+                            notes.push(format!(
+                                "cheap_tail blocked: projected bundle EV negative p_fav={:.4} ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} clip_usd={clip:.2} qty={qty:.2} planned_tail_spend={planned_tail_spend:.2} tail_cap={tail_cap_usd:.2}",
+                                projected_bundle.favorite_win_probability,
+                                projected_bundle.expected_value_usd,
+                                projected_bundle.favorite_win_payoff_usd,
+                                projected_bundle.tail_win_payoff_usd,
+                            ));
+                            break;
+                        }
                         let reason = format!(
-                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} qty={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} target_tail_shares={:.2} filled_tail_shares={:.2} working_tail_shares={:.2} tail_share_deficit={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} model_wing_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
+                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} qty={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} target_tail_shares={:.2} filled_tail_shares={:.2} working_tail_shares={:.2} tail_share_deficit={:.2} bundle_ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} model_wing_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             if aggressive_taker { "taker_ioc" } else { "maker_post_only" },
@@ -4581,6 +4751,9 @@ where
                             cheap_tail_filled_qty,
                             working_tail_qty,
                             tail_share_deficit,
+                            projected_bundle.expected_value_usd,
+                            projected_bundle.favorite_win_payoff_usd,
+                            projected_bundle.tail_win_payoff_usd,
                             regime_multiplier,
                             path_reversal_risk,
                             coverage_target,
@@ -4607,6 +4780,8 @@ where
                             input.now_ms,
                             ReservationClass::Hedge,
                         );
+                        planned_tail_qty += qty;
+                        planned_tail_spend += notional;
                         load_left -= clip;
                     }
                 }
@@ -4667,12 +4842,22 @@ where
                     let clip = WING_REVERSAL_HEDGE_CLIP_USD
                         .min(position_plan.remaining_hedge_budget_usd)
                         .max(tail_cfg.min_order_usd);
+                    let qty = (clip / px).max(input.market.min_order_size());
+                    let notional = qty * px;
                     let projected_fav_win_payoff =
-                        position_plan.projected_favorite_win_payoff_after_hedge(clip);
-                    if position_plan.preserves_favorite_win_payoff(clip) {
-                        let qty = (clip / px).max(input.market.min_order_size());
+                        position_plan.projected_favorite_win_payoff_after_hedge(notional);
+                    let projected_bundle = bundle_state.projection_after(
+                        bundle_favorite_win_probability,
+                        0.0,
+                        0.0,
+                        qty,
+                        notional,
+                    );
+                    if position_plan.preserves_favorite_win_payoff(notional)
+                        && LateFavBundleState::projection_has_positive_ev(projected_bundle)
+                    {
                         let reason = format!(
-                            "position_hedge leg={:?} mode=taker_ioc px={:.4} bid={:.4} ask={:.4} clip_usd={:.2} remaining_cap={:.2} target_share_fraction={:.2} loss_if_fav_loses={:.2} loss_budget={:.2} projected_fav_win_payoff={:.2} fav_win_floor={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_qty={:.2} existing_hedge_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
+                            "position_hedge leg={:?} mode=taker_ioc px={:.4} bid={:.4} ask={:.4} clip_usd={:.2} remaining_cap={:.2} target_share_fraction={:.2} loss_if_fav_loses={:.2} loss_budget={:.2} projected_fav_win_payoff={:.2} fav_win_floor={:.2} bundle_ev={:.2} bundle_tail_win_payoff={:.2} p_fav={:.4} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_qty={:.2} existing_hedge_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
                             legs.cheap_leg,
                             px,
                             legs.cheap_bid,
@@ -4684,6 +4869,9 @@ where
                             position_plan.target_loss_budget_usd,
                             projected_fav_win_payoff,
                             position_plan.min_favorite_win_payoff_usd,
+                            projected_bundle.expected_value_usd,
+                            projected_bundle.tail_win_payoff_usd,
+                            projected_bundle.favorite_win_probability,
                             position_plan.favorite_spend_usd,
                             position_plan.favorite_qty,
                             position_plan.hedge_qty,
@@ -4710,10 +4898,23 @@ where
                             input.now_ms,
                             ReservationClass::Hedge,
                         );
-                    } else {
+                    } else if !position_plan.preserves_favorite_win_payoff(notional) {
                         notes.push(format!(
                             "position_hedge blocked: projected favorite-win payoff would breach floor projected_fav_win_payoff={projected_fav_win_payoff:.2} floor={:.2} clip_usd={clip:.2} remaining_cap={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_spend={:.2} existing_hedge_qty={:.2}",
                             position_plan.min_favorite_win_payoff_usd,
+                            position_plan.remaining_hedge_budget_usd,
+                            position_plan.favorite_spend_usd,
+                            position_plan.favorite_qty,
+                            position_plan.hedge_spend_usd,
+                            position_plan.hedge_qty,
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "position_hedge blocked: projected bundle EV negative p_fav={:.4} ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} clip_usd={clip:.2} remaining_cap={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_spend={:.2} existing_hedge_qty={:.2}",
+                            projected_bundle.favorite_win_probability,
+                            projected_bundle.expected_value_usd,
+                            projected_bundle.favorite_win_payoff_usd,
+                            projected_bundle.tail_win_payoff_usd,
                             position_plan.remaining_hedge_budget_usd,
                             position_plan.favorite_spend_usd,
                             position_plan.favorite_qty,
@@ -4823,6 +5024,8 @@ where
                     // zero hedge fills, leaving the favorite sleeve uncovered.
                     // Mirrors the late-fav climb FAK->maker fallback pattern.
                     let aggressive_all_levels = false;
+                    let mut planned_tail_qty = 0.0;
+                    let mut planned_tail_spend = 0.0;
                     for level in 0..level_count {
                         if load_left < reversal_cfg.min_order_usd {
                             break;
@@ -4831,15 +5034,6 @@ where
                         let clip = (load_left / remaining_levels)
                             .max(reversal_cfg.min_order_usd)
                             .min(load_left);
-                        let planned_tail_spend = total_clip - load_left;
-                        let projected_fav_win_payoff = bundle_state
-                            .payoff_if_fav_wins_after_tail_add(planned_tail_spend + clip);
-                        if projected_fav_win_payoff < -1e-9 {
-                            notes.push(format!(
-                                "reversal_hedge blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={projected_fav_win_payoff:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} hedge_cap={hedge_cap_usd:.2}",
-                            ));
-                            break;
-                        }
                         let aggressive_taker =
                             use_aggressive_taker && (level == 0 || aggressive_all_levels);
                         let px = if aggressive_taker {
@@ -4860,8 +5054,33 @@ where
                             continue;
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
+                        let notional = qty * px;
+                        let projected_bundle = bundle_state.projection_after(
+                            bundle_favorite_win_probability,
+                            0.0,
+                            0.0,
+                            planned_tail_qty + qty,
+                            planned_tail_spend + notional,
+                        );
+                        if projected_bundle.favorite_win_payoff_usd < -1e-9 {
+                            notes.push(format!(
+                                "reversal_hedge blocked: projected favorite-win payoff would be negative projected_fav_win_payoff={:.2} clip_usd={clip:.2} planned_tail_spend={planned_tail_spend:.2} hedge_cap={hedge_cap_usd:.2}",
+                                projected_bundle.favorite_win_payoff_usd,
+                            ));
+                            break;
+                        }
+                        if !LateFavBundleState::projection_has_positive_ev(projected_bundle) {
+                            notes.push(format!(
+                                "reversal_hedge blocked: projected bundle EV negative p_fav={:.4} ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} clip_usd={clip:.2} qty={qty:.2} planned_tail_spend={planned_tail_spend:.2} hedge_cap={hedge_cap_usd:.2}",
+                                projected_bundle.favorite_win_probability,
+                                projected_bundle.expected_value_usd,
+                                projected_bundle.favorite_win_payoff_usd,
+                                projected_bundle.tail_win_payoff_usd,
+                            ));
+                            break;
+                        }
                         let reason = format!(
-                            "reversal_hedge leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} favorite_exposure={:.2} favorite_avg={:.4} favorite_win_upside={:.2} reversal_score={:.2} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
+                            "reversal_hedge leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} favorite_exposure={:.2} favorite_avg={:.4} favorite_win_upside={:.2} bundle_ev={:.2} fav_win_payoff={:.2} tail_win_payoff={:.2} reversal_score={:.2} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             if aggressive_taker { "taker_ioc" } else { "maker_post_only" },
@@ -4873,6 +5092,9 @@ where
                             favorite_exposure_usd,
                             favorite_avg_price,
                             effective_late_fav_qty * (1.0 - favorite_avg_price).max(0.0),
+                            projected_bundle.expected_value_usd,
+                            projected_bundle.favorite_win_payoff_usd,
+                            projected_bundle.tail_win_payoff_usd,
                             reversal_score,
                             working_late_fav_usd,
                             reserved_late_fav_usd,
@@ -4895,6 +5117,8 @@ where
                             input.now_ms,
                             ReservationClass::Hedge,
                         );
+                        planned_tail_qty += qty;
+                        planned_tail_spend += notional;
                         load_left -= clip;
                     }
                 }
@@ -6449,6 +6673,7 @@ mod tests {
             fav_filled_spend_usd: 80.9033,
             tail_filled_qty: 278.7244,
             tail_filled_spend_usd: 23.6742,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -6456,6 +6681,63 @@ mod tests {
 
         assert!(bundle.payoff_if_fav_wins_after(0.0, 0.0) < 0.0);
         assert!(bundle.payoff_if_fav_wins_after_tail_add(1.0) < 0.0);
+    }
+
+    #[test]
+    fn bundle_projection_blocks_negative_ev_even_when_favorite_win_stays_positive() {
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::Yes,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::No,
+            side_flip: false,
+            fav_filled_qty: 200.0,
+            fav_filled_spend_usd: 160.0,
+            tail_filled_qty: 0.0,
+            tail_filled_spend_usd: 0.0,
+            working_fav_qty: 0.0,
+            working_fav_spend_usd: 0.0,
+            working_tail_qty: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let projection = bundle.projection_after(0.70, 0.0, 0.0, 100.0, 25.0);
+
+        assert!(projection.favorite_win_payoff_usd > 0.0);
+        assert!(projection.expected_value_usd < 0.0);
+        assert!(!LateFavBundleState::projection_has_positive_ev(projection));
+    }
+
+    #[test]
+    fn bundle_projection_allows_cheap_convex_tail_when_bundle_ev_stays_positive() {
+        let bundle = LateFavBundleState {
+            dominant_fav_leg: LadderLeg::Yes,
+            current_fav_leg: LadderLeg::Yes,
+            tail_leg: LadderLeg::No,
+            side_flip: false,
+            fav_filled_qty: 200.0,
+            fav_filled_spend_usd: 160.0,
+            tail_filled_qty: 0.0,
+            tail_filled_spend_usd: 0.0,
+            working_fav_qty: 0.0,
+            working_fav_spend_usd: 0.0,
+            working_tail_qty: 0.0,
+            working_tail_spend_usd: 0.0,
+        };
+
+        let projection = bundle.projection_after(0.70, 0.0, 0.0, 500.0, 10.0);
+
+        assert!(projection.favorite_win_payoff_usd > 0.0);
+        assert!(projection.tail_win_payoff_usd > 0.0);
+        assert!(LateFavBundleState::projection_has_positive_ev(projection));
+    }
+
+    #[test]
+    fn adjusted_bundle_probability_uses_kelly_reversal_shrink() {
+        let base = adjusted_bundle_favorite_probability(0.95, 0.0);
+        let fragile = adjusted_bundle_favorite_probability(0.95, 0.20);
+
+        assert!(base > fragile);
+        assert!(fragile >= 0.5);
     }
 
     #[test]
@@ -6989,6 +7271,7 @@ mod tests {
             fav_filled_spend_usd: 92.0,
             tail_filled_qty: 0.0,
             tail_filled_spend_usd: 0.0,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -7002,6 +7285,7 @@ mod tests {
             9.72,
             0.19,
             0.0,
+            0.20,
             Some(BtcRegime::Whipsaw),
             0.60,
             BookModelAgreement::default(),
@@ -7029,6 +7313,7 @@ mod tests {
             fav_filled_spend_usd: 92.0,
             tail_filled_qty: 0.0,
             tail_filled_spend_usd: 0.0,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -7042,6 +7327,7 @@ mod tests {
             4.0,
             0.05,
             0.0,
+            0.20,
             Some(BtcRegime::Whipsaw),
             0.60,
             BookModelAgreement::default(),
@@ -7068,6 +7354,7 @@ mod tests {
             fav_filled_spend_usd: 92.0,
             tail_filled_qty: 1.0,
             tail_filled_spend_usd: 0.02,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -7081,6 +7368,7 @@ mod tests {
             4.0,
             0.10,
             0.0,
+            0.20,
             Some(BtcRegime::Whipsaw),
             0.60,
             BookModelAgreement::default(),
@@ -7109,6 +7397,7 @@ mod tests {
             fav_filled_spend_usd: 90.0,
             tail_filled_qty: 5.0,
             tail_filled_spend_usd: 0.25,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -7122,6 +7411,7 @@ mod tests {
             27.60,
             0.08,
             0.0,
+            0.95,
             Some(BtcRegime::Whipsaw),
             0.55,
             BookModelAgreement::default(),
@@ -7145,6 +7435,7 @@ mod tests {
             fav_filled_spend_usd: 0.0,
             tail_filled_qty: 200.0,
             tail_filled_spend_usd: 16.0,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 0.0,
             working_tail_qty: 0.0,
             working_tail_spend_usd: 0.0,
@@ -7158,6 +7449,7 @@ mod tests {
             4.50,
             0.08,
             0.0,
+            0.95,
             Some(BtcRegime::DirectionalSmooth),
             0.10,
             BookModelAgreement::default(),
@@ -7186,6 +7478,7 @@ mod tests {
             fav_filled_spend_usd: 90.0,
             tail_filled_qty: 60.0,
             tail_filled_spend_usd: 3.0,
+            working_fav_qty: 0.0,
             working_fav_spend_usd: 20.0,
             working_tail_qty: 200.0,
             working_tail_spend_usd: 6.0,
@@ -7193,7 +7486,7 @@ mod tests {
 
         assert!((bundle.tail_coverage_ratio() - (9.0 / 110.0)).abs() < 1e-9);
         assert!((bundle.payoff_if_fav_wins_after(0.0, 0.0) + 19.0).abs() < 1e-9);
-        assert!((bundle.payoff_if_tail_wins() + 59.0).abs() < 1e-9);
+        assert!((bundle.payoff_if_tail_wins() - 141.0).abs() < 1e-9);
 
         let gate = bundle.gate_favorite_add(
             &cfg,
@@ -7203,6 +7496,7 @@ mod tests {
             9.20,
             0.08,
             0.0,
+            0.95,
             Some(BtcRegime::Whipsaw),
             0.55,
             BookModelAgreement::default(),
