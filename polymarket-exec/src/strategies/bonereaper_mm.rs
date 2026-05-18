@@ -5799,6 +5799,26 @@ fn late_fav_classification_reason<M: MarketDescriptor>(
         return "entry_policy_blocked".to_string();
     }
 
+    if conviction.near_strike_fragility.blocks_entry() {
+        return format!(
+            "near_strike_fragility_block reason={} factor={:.2}",
+            conviction.near_strike_fragility.reason,
+            conviction.near_strike_fragility.fragility_factor
+        );
+    }
+
+    let kelly_p_adj =
+        0.5 + (conviction.model_favorite - 0.5) * (1.0 - conviction.path_reversal_risk);
+    let kelly_edge = kelly_p_adj - legs.favorite_ask;
+    if kelly_edge < climb_cfg.kelly.min_edge {
+        return format!(
+            "kelly_edge_below_min edge={kelly_edge:.4} p_adj={kelly_p_adj:.4} ask={:.4} min_edge={:.4} path_reversal={:.2}",
+            legs.favorite_ask,
+            climb_cfg.kelly.min_edge,
+            conviction.path_reversal_risk,
+        );
+    }
+
     "eligible_or_blocked_deeper".to_string()
 }
 
