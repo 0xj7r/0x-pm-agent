@@ -24,12 +24,12 @@ const LATE_FAV_REARM_TTL_MS: u64 = 180_000;
 const SUB90_LATE_FAV_REVERSAL_BLOCK_RISK: f64 = 0.70;
 const MODEL_WING_MIN_FAVORITE_ASK: f64 = 0.65;
 const MODEL_WING_MAX_FAVORITE_ASK: f64 = 0.85;
-const MODEL_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.25;
-const MODEL_WING_MIN_MODEL_FAVORITE: f64 = 0.94;
-const MODEL_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.85;
-const MODEL_WING_MIN_STRONGEST_MULTIPLIER: f64 = 1.25;
-const MODEL_WING_CLIP_MULTIPLIER: f64 = 0.30;
-const MODEL_WING_CAP_MULTIPLIER: f64 = 0.25;
+const MODEL_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.35;
+const MODEL_WING_MIN_MODEL_FAVORITE: f64 = 0.90;
+const MODEL_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.60;
+const MODEL_WING_MIN_STRONGEST_MULTIPLIER: f64 = 0.75;
+const MODEL_WING_CLIP_MULTIPLIER: f64 = 0.50;
+const MODEL_WING_CAP_MULTIPLIER: f64 = 0.50;
 const MARKET_WING_MIN_FAVORITE_ASK: f64 = 0.75;
 const MARKET_WING_MAX_CHEAP_ASK: f64 = 0.25;
 const MARKET_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.35;
@@ -496,6 +496,7 @@ impl Default for DirectionalSizingConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MidDirectionalShadowConfig {
     pub enabled: bool,
+    pub live_enabled: bool,
     pub min_ask: f64,
     pub max_ask: f64,
     pub min_model_probability: f64,
@@ -505,6 +506,16 @@ pub struct MidDirectionalShadowConfig {
     pub min_btc_confirm_bps: f64,
     pub bankroll_usd: f64,
     pub max_clip_usd: f64,
+    pub max_market_notional_usd: f64,
+    pub min_order_usd: f64,
+    pub maker_improve_ticks: f64,
+    pub hedge_enabled: bool,
+    pub hedge_share_fraction: f64,
+    pub hedge_max_ask: f64,
+    pub hedge_max_pair_cost: f64,
+    pub hedge_max_notional_usd: f64,
+    pub hedge_min_order_usd: f64,
+    pub hedge_maker_improve_ticks: f64,
     pub min_emit_interval_ms: u64,
     pub kelly: super::kelly_sizing::KellyClipConfig,
 }
@@ -513,6 +524,7 @@ impl Default for MidDirectionalShadowConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            live_enabled: false,
             min_ask: 0.48,
             max_ask: 0.58,
             min_model_probability: 0.90,
@@ -522,6 +534,16 @@ impl Default for MidDirectionalShadowConfig {
             min_btc_confirm_bps: 1.0,
             bankroll_usd: 100.0,
             max_clip_usd: 5.0,
+            max_market_notional_usd: 25.0,
+            min_order_usd: 2.0,
+            maker_improve_ticks: 10.0,
+            hedge_enabled: false,
+            hedge_share_fraction: 0.35,
+            hedge_max_ask: 0.50,
+            hedge_max_pair_cost: 0.99,
+            hedge_max_notional_usd: 12.0,
+            hedge_min_order_usd: 2.0,
+            hedge_maker_improve_ticks: 10.0,
             min_emit_interval_ms: 5_000,
             kelly: super::kelly_sizing::KellyClipConfig {
                 fractional: 0.10,
@@ -812,6 +834,182 @@ impl LateFavoriteStrategy {
             });
         entry.notional_usd += notional_usd;
         entry.expires_at_ms = now_ms.saturating_add(class.ttl_ms());
+    }
+
+    fn mid_directional_live_intents<M: MarketDescriptor>(
+        &mut self,
+        input: &StrategyInput<M>,
+        legs: &LegQuotes,
+        candidate: &MidDirectionalShadowCandidate,
+        tick: f64,
+        notes: &mut Vec<String>,
+    ) -> Vec<OrderIntent> {
+        let cfg = self.config.mid_directional_shadow;
+        if !cfg.live_enabled {
+            return Vec::new();
+        }
+
+        let mut intents = Vec::new();
+        let market_id = input.market.market_id();
+        let primary_committed = directional_favorite_leg_spend_usd(self, input, candidate.leg);
+        let primary_remaining = cfg.max_market_notional_usd.max(0.0) - primary_committed;
+        if primary_remaining >= cfg.min_order_usd.max(0.0) {
+            if let Some(px) =
+                maker_limit_price(candidate.bid, candidate.ask, tick, cfg.maker_improve_ticks)
+            {
+                let desired_notional = candidate
+                    .kelly_clip_usd
+                    .min(cfg.max_clip_usd.max(0.0))
+                    .min(primary_remaining)
+                    .max(cfg.min_order_usd.max(0.0));
+                let qty = (desired_notional / px).max(input.market.min_order_size());
+                let notional = qty * px;
+                if notional <= primary_remaining + 1e-9 {
+                    notes.push(format!(
+                        "mid_directional_accumulator primary leg={:?} asset={} px={:.4} ask={:.4} qty={:.2} notional={:.2} cap_remaining={:.2} model_probability={:.4}",
+                        candidate.leg,
+                        outcome_label(input.market.kind(), candidate.leg),
+                        px,
+                        candidate.ask,
+                        qty,
+                        notional,
+                        primary_remaining,
+                        candidate.model_probability,
+                    ));
+                    intents.push(build_mid_directional_primary_intent(
+                        &input.market,
+                        candidate.leg,
+                        px,
+                        qty,
+                        format!(
+                            "mid_directional_accumulator primary asset={} model_probability={:.4} ask={:.4} bid={:.4} path_reversal_risk={:.2} book_model_agreement={:.2} toxicity={:.2} kelly_clip_usd={:.2}",
+                            outcome_label(input.market.kind(), candidate.leg),
+                            candidate.model_probability,
+                            candidate.ask,
+                            candidate.bid,
+                            candidate.path_reversal_risk,
+                            candidate.book_model_agreement.agreement,
+                            candidate.book_model_agreement.toxicity_score,
+                            candidate.kelly_clip_usd,
+                        ),
+                        input.now_ms,
+                    ));
+                    self.reserve_notional(
+                        market_id,
+                        candidate.leg,
+                        notional,
+                        input.now_ms,
+                        ReservationClass::Resting,
+                    );
+                } else {
+                    notes.push(format!(
+                        "mid_directional_accumulator primary blocked by venue-min cap notional={notional:.2} cap_remaining={primary_remaining:.2}",
+                    ));
+                }
+            }
+        }
+
+        if !cfg.hedge_enabled {
+            return intents;
+        }
+
+        let primary_filled_qty = inventory_qty_for_leg(input.late_fav_inventory, candidate.leg);
+        if primary_filled_qty <= 1e-9 {
+            notes.push(
+                "mid_directional_accumulator hedge blocked: no filled primary leg".to_string(),
+            );
+            return intents;
+        }
+
+        let hedge_leg = opposite_leg(candidate.leg);
+        let (hedge_bid, hedge_ask) = leg_bid_ask(legs, hedge_leg);
+        if hedge_ask > cfg.hedge_max_ask {
+            notes.push(format!(
+                "mid_directional_accumulator hedge blocked: hedge_ask={hedge_ask:.4} max={:.4}",
+                cfg.hedge_max_ask
+            ));
+            return intents;
+        }
+        let Some(hedge_px) =
+            maker_limit_price(hedge_bid, hedge_ask, tick, cfg.hedge_maker_improve_ticks)
+        else {
+            return intents;
+        };
+        let primary_avg_cost =
+            inventory_avg_cost_or(input.late_fav_inventory, candidate.leg, candidate.ask);
+        if primary_avg_cost + hedge_px > cfg.hedge_max_pair_cost + 1e-9 {
+            notes.push(format!(
+                "mid_directional_accumulator hedge blocked: pair_cost={:.4} max={:.4}",
+                primary_avg_cost + hedge_px,
+                cfg.hedge_max_pair_cost
+            ));
+            return intents;
+        }
+
+        let target_hedge_qty = primary_filled_qty * cfg.hedge_share_fraction.clamp(0.0, 1.0);
+        let existing_hedge_qty = inventory_qty_for_leg(input.cheap_tail_inventory, hedge_leg)
+            + open_order_qty_for_leg(input.open_convex_order_exposure, hedge_leg);
+        let qty_left = (target_hedge_qty - existing_hedge_qty).max(0.0);
+        if qty_left <= 1e-9 {
+            return intents;
+        }
+        let hedge_spend = filled_inventory_spend_usd(input.cheap_tail_inventory, hedge_leg)
+            + directional_tail_working_spend_usd(self, input, hedge_leg);
+        let hedge_remaining = (cfg.hedge_max_notional_usd.max(0.0) - hedge_spend).max(0.0);
+        if hedge_remaining < cfg.hedge_min_order_usd.max(0.0) {
+            return intents;
+        }
+        let desired_hedge_notional = (qty_left * hedge_px)
+            .min(hedge_remaining)
+            .max(cfg.hedge_min_order_usd.max(0.0));
+        let hedge_qty = (desired_hedge_notional / hedge_px)
+            .min(qty_left)
+            .max(input.market.min_order_size());
+        let hedge_notional = hedge_qty * hedge_px;
+        if hedge_notional > hedge_remaining + 1e-9 {
+            notes.push(format!(
+                "mid_directional_accumulator hedge blocked by venue-min cap notional={hedge_notional:.2} cap_remaining={hedge_remaining:.2}",
+            ));
+            return intents;
+        }
+
+        notes.push(format!(
+            "mid_directional_accumulator hedge leg={:?} asset={} px={:.4} ask={:.4} qty={:.2}/{:.2} notional={:.2} pair_cost={:.4} primary_filled_qty={:.2}",
+            hedge_leg,
+            outcome_label(input.market.kind(), hedge_leg),
+            hedge_px,
+            hedge_ask,
+            hedge_qty,
+            target_hedge_qty,
+            hedge_notional,
+            primary_avg_cost + hedge_px,
+            primary_filled_qty,
+        ));
+        intents.push(build_mid_directional_hedge_intent(
+            &input.market,
+            hedge_leg,
+            hedge_px,
+            hedge_qty,
+            format!(
+                "mid_directional_accumulator hedge asset={} primary_asset={} primary_avg_cost={:.4} pair_cost={:.4} target_hedge_qty={:.2} existing_hedge_qty={:.2}",
+                outcome_label(input.market.kind(), hedge_leg),
+                outcome_label(input.market.kind(), candidate.leg),
+                primary_avg_cost,
+                primary_avg_cost + hedge_px,
+                target_hedge_qty,
+                existing_hedge_qty,
+            ),
+            input.now_ms,
+        ));
+        self.reserve_notional(
+            market_id,
+            hedge_leg,
+            hedge_notional,
+            input.now_ms,
+            ReservationClass::Hedge,
+        );
+
+        intents
     }
 
     fn update_late_fav_rearm_state(
@@ -1366,6 +1564,58 @@ fn build_late_favorite_intent<M: MarketDescriptor>(
     intent
 }
 
+fn build_mid_directional_primary_intent<M: MarketDescriptor>(
+    market: &M,
+    leg: LadderLeg,
+    limit_price: f64,
+    qty: f64,
+    reason: String,
+    now_ms: EpochMillis,
+) -> OrderIntent {
+    let instrument_id = match leg {
+        LadderLeg::Yes => market.yes_instrument_id().clone(),
+        LadderLeg::No => market.no_instrument_id().clone(),
+    };
+    let mut intent = OrderIntent::new_buy(
+        ClientOrderId::from(format!("mid-dir:{}:{:?}:primary", market.market_id(), leg,)),
+        market.market_id().clone(),
+        instrument_id,
+        limit_price,
+        qty,
+        reason,
+        now_ms,
+    );
+    intent.kind = IntentKind::Entry;
+    intent.quote_level_tag = Some(format!("late-fav-mid-directional:primary:{leg:?}"));
+    intent
+}
+
+fn build_mid_directional_hedge_intent<M: MarketDescriptor>(
+    market: &M,
+    leg: LadderLeg,
+    limit_price: f64,
+    qty: f64,
+    reason: String,
+    now_ms: EpochMillis,
+) -> OrderIntent {
+    let instrument_id = match leg {
+        LadderLeg::Yes => market.yes_instrument_id().clone(),
+        LadderLeg::No => market.no_instrument_id().clone(),
+    };
+    let mut intent = OrderIntent::new_buy(
+        ClientOrderId::from(format!("mid-dir:{}:{:?}:hedge", market.market_id(), leg,)),
+        market.market_id().clone(),
+        instrument_id,
+        limit_price,
+        qty,
+        reason,
+        now_ms,
+    );
+    intent.kind = IntentKind::Entry;
+    intent.quote_level_tag = Some(format!("cheap-tail:mid-directional-hedge:{leg:?}"));
+    intent
+}
+
 fn build_cheap_tail_intent<M: MarketDescriptor>(
     market: &M,
     leg: LadderLeg,
@@ -1511,6 +1761,17 @@ fn open_order_notional_for_leg(
     match leg {
         LadderLeg::Yes => exposure.yes_notional_usd,
         LadderLeg::No => exposure.no_notional_usd,
+    }
+    .max(0.0)
+}
+
+fn open_order_qty_for_leg(
+    exposure: crate::strategies::traits::PairedOpenOrderExposure,
+    leg: LadderLeg,
+) -> f64 {
+    match leg {
+        LadderLeg::Yes => exposure.yes_qty,
+        LadderLeg::No => exposure.no_qty,
     }
     .max(0.0)
 }
@@ -2437,10 +2698,10 @@ fn favorite_entry_policy<M: MarketDescriptor>(
 
     if legs.favorite_ask < cfg.taker_min_favorite_ask {
         let clean_directional_persistence = !whipsaw
-            && path_reversal_risk <= 0.20
-            && strongest >= threshold * 1.50
-            && recent >= threshold * 0.25
-            && model_favorite >= 0.88;
+            && path_reversal_risk <= 0.35
+            && strongest >= threshold * 0.75
+            && recent >= -threshold * 0.10
+            && model_favorite >= 0.84;
         let directional_probe_below_near_touch = directional_barbell
             && legs.favorite_ask >= cfg.min_favorite_ask
             && legs.favorite_ask < cfg.near_touch_min_favorite_ask
@@ -2452,16 +2713,16 @@ fn favorite_entry_policy<M: MarketDescriptor>(
             && !barbell_sub90
             && !model_confirmed_wing
             && if flat_regime {
-                strongest < threshold * 1.15 || model_favorite < 0.86
+                strongest < threshold * 0.60 || model_favorite < 0.82
             } else {
-                !clean_regime || strongest < threshold || model_favorite < 0.82
+                !clean_regime || strongest < threshold * 0.50 || model_favorite < 0.80
             }
         {
             return None;
         }
         if whipsaw
             && if barbell_sub90 {
-                model_favorite < 0.86 || strongest < threshold * 0.75
+                model_favorite < 0.82 || strongest < threshold * 0.50
             } else {
                 model_favorite < 0.88 || strongest < threshold * 1.50
             }
@@ -2775,6 +3036,11 @@ fn cheap_tail_cap_usd(
     } else {
         late_fav_qty
     };
+    let share_target_notional = if cheap_ask <= cfg.ultra_cheap_max_ask {
+        realized_favorite_qty * cfg.min_tail_share_fraction.max(0.0) * cheap_ask
+    } else {
+        0.0
+    };
     let share_floor_budget_cap = if cheap_ask <= cfg.ultra_cheap_max_ask {
         realized_favorite_qty * cfg.min_tail_share_fraction.max(0.0) * cheap_ask
     } else {
@@ -2786,9 +3052,11 @@ fn cheap_tail_cap_usd(
 
     let desired_tail_notional =
         if hedge_notional > 0.0 && min_positive_payoff_tail_cap >= cfg.min_order_usd {
-            hedge_notional.max(cfg.min_order_usd)
-        } else {
             hedge_notional
+                .max(share_target_notional)
+                .max(cfg.min_order_usd)
+        } else {
+            hedge_notional.max(share_target_notional)
         };
 
     cfg.max_load_usd
@@ -3217,6 +3485,9 @@ where
                     "mid_directional_shadow would_buy"
                 );
             }
+            let live_mid_intents =
+                self.mid_directional_live_intents(&input, &legs, &shadow, tick, &mut notes);
+            intents.extend(live_mid_intents);
         }
         notes.push(format!(
             "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
@@ -3934,6 +4205,15 @@ where
                         input.btc_regime.regime(),
                         path_reversal_risk,
                     );
+                    let working_tail_qty =
+                        open_order_qty_for_leg(input.open_convex_order_exposure, legs.cheap_leg);
+                    let target_tail_share_qty = if legs.cheap_ask <= tail_cfg.ultra_cheap_max_ask {
+                        late_fav_filled_qty * tail_cfg.min_tail_share_fraction.max(0.0)
+                    } else {
+                        0.0
+                    };
+                    let tail_share_deficit =
+                        (target_tail_share_qty - cheap_tail_filled_qty - working_tail_qty).max(0.0);
                     let coverage_deficit_forces_taker = bundle_state.fav_committed_spend_usd()
                         >= tail_cfg.max_load_usd.min(30.0)
                         && bundle_state.tail_coverage_ratio() < coverage_target
@@ -4006,13 +4286,14 @@ where
                         }
                         let qty = (clip / px).max(input.market.min_order_size());
                         let reason = format!(
-                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} model_wing_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
+                            "cheap_tail leg={:?} level={} mode={} px={:.4} ask={:.4} clip_usd={:.2} qty={:.2} cumulative={:.2}/{:.2} bundled_cap={:.2} unbundled_ultra_cap={:.2} favorite_exposure={:.2} favorite_avg={:.4} hedge_ratio={:.2} favorite_win_upside={:.2} target_tail_shares={:.2} filled_tail_shares={:.2} working_tail_shares={:.2} tail_share_deficit={:.2} regime_multiplier={:.2} path_reversal_risk={:.2} coverage_target={:.2} coverage_deficit_forces_taker={} model_wing_forces_taker={} working_late_fav_usd={:.2} reserved_late_fav_usd={:.2} remaining_ms={remaining_ms}",
                             legs.cheap_leg,
                             level,
                             if aggressive_taker { "taker_ioc" } else { "maker_post_only" },
                             px,
                             legs.cheap_ask,
                             clip,
+                            qty,
                             current_exposure_usd + (total_clip - load_left),
                             tail_cap_usd,
                             bundled_tail_cap_usd,
@@ -4021,6 +4302,10 @@ where
                             favorite_avg_price,
                             cheap_tail_coverage_fraction(&tail_cfg, input.btc_regime.regime()),
                             effective_late_fav_qty * (1.0 - favorite_avg_price).max(0.0),
+                            target_tail_share_qty,
+                            cheap_tail_filled_qty,
+                            working_tail_qty,
+                            tail_share_deficit,
                             regime_multiplier,
                             path_reversal_risk,
                             coverage_target,
@@ -6364,6 +6649,7 @@ mod tests {
         let climb = late_favorite.favorite_climb;
         let reversal = late_favorite.reversal_hedge;
         let mid_shadow = late_favorite.mid_directional_shadow;
+        let sizing = late_favorite.sizing;
 
         assert!(!paired_core.enabled);
         assert_eq!(
@@ -6378,12 +6664,12 @@ mod tests {
         // Test rot fix 2026-05-17: YAML drifted from these fixture values
         // during prior config tuning. Updated to current YAML values.
         assert_eq!(cfg.max_cheap_ask, 0.10);
-        assert_eq!(cfg.clip_usd, 3.0);
-        assert_eq!(cfg.max_load_usd, 30.0);
+        assert_eq!(cfg.clip_usd, 5.0);
+        assert_eq!(cfg.max_load_usd, 50.0);
         assert_eq!(cfg.max_favorite_exposure_fraction, 0.55);
-        assert_eq!(cfg.min_tail_share_fraction, 0.60);
+        assert_eq!(cfg.min_tail_share_fraction, 0.70);
         assert_eq!(cfg.max_win_edge_spend_fraction, 0.30);
-        assert_eq!(cfg.max_late_fav_spend_fraction, 0.04);
+        assert_eq!(cfg.max_late_fav_spend_fraction, 0.05);
         assert_eq!(cfg.ultra_cheap_max_ask, 0.03);
         assert_eq!(cfg.maker_improve_ticks, 0.0);
         assert_eq!(cfg.taker_slippage_ticks, 1.0);
@@ -6391,12 +6677,25 @@ mod tests {
         assert_eq!(cfg.ultra_cheap_max_late_fav_spend_fraction, 0.075);
         assert_eq!(reversal.taker_slippage_ticks, 1.0);
         assert!(mid_shadow.enabled);
+        assert!(!mid_shadow.live_enabled);
         assert_eq!(mid_shadow.min_ask, 0.48);
         assert_eq!(mid_shadow.max_ask, 0.64);
         assert_eq!(mid_shadow.min_model_probability, 0.85);
         assert_eq!(mid_shadow.max_path_reversal_risk, 0.55);
         assert_eq!(mid_shadow.max_clip_usd, 5.0);
+        assert_eq!(sizing.favorite_clip_bps, 300.0);
+        assert_eq!(sizing.favorite_clip_min_usd, 50.0);
+        assert_eq!(sizing.favorite_clip_max_usd, 300.0);
+        assert_eq!(sizing.favorite_max_load_bps, 3000.0);
+        assert_eq!(sizing.favorite_max_load_min_usd, 300.0);
         assert_eq!(climb.clip_usd, 45.0);
+        assert_eq!(climb.min_favorite_ask, 0.70);
+        assert_eq!(climb.spot_filter_bps, 6.0);
+        assert_eq!(climb.near_touch_min_favorite_ask, 0.80);
+        assert_eq!(climb.kelly.fractional, 0.50);
+        assert_eq!(climb.kelly.max_clip_fraction, 0.45);
+        assert_eq!(climb.kelly.min_edge, 0.020);
+        assert_eq!(climb.per_bar_gross_cap_usd, 550.0);
         // YAML no longer specifies max_load_usd literal -- the runtime
         // bankroll-sizing path overwrites it from late_favorite.sizing.
         // So this assertion now reflects the FavoriteClimbConfig default

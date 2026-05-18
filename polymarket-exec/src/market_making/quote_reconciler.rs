@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::runtime::types::{ManagedOrder, ManagedOrderStatus};
 use crate::types::{ClientOrderId, EpochMillis, OrderIntent};
 
+const FAST_REFRESH_MIN_ORDER_AGE_MS: u64 = 500;
+const FAST_REFRESH_PRICE_THRESHOLD: f64 = 0.000_001;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReconcilerConfig {
     pub min_order_age_ms: u64,
@@ -187,6 +190,16 @@ impl QuoteReconciler {
         Self::order_age_ms(order, now_ms) >= self.config.min_order_age_ms
     }
 
+    fn can_fast_refresh(&self, order: &ManagedOrder, now_ms: EpochMillis) -> bool {
+        if matches!(
+            order.status,
+            ManagedOrderStatus::Filled | ManagedOrderStatus::Cancelled
+        ) {
+            return false;
+        }
+        Self::order_age_ms(order, now_ms) >= FAST_REFRESH_MIN_ORDER_AGE_MS
+    }
+
     fn prune_window(events: &mut VecDeque<EpochMillis>, now_ms: EpochMillis, window_ms: u64) {
         let window_ms = window_ms.max(1);
         while let Some(front) = events.front() {
@@ -345,6 +358,20 @@ impl QuoteReconciler {
                     || tag.starts_with("paired-core")
                     || tag.contains(":PairedEntry")
             })
+    }
+
+    fn is_fast_refresh_quote(intent: &OrderIntent) -> bool {
+        intent.kind == crate::types::IntentKind::Entry
+            && intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("cheap-tail"))
+    }
+
+    fn materially_different_fast_quote(current: &OrderIntent, desired: &OrderIntent) -> bool {
+        (current.limit_price - desired.limit_price).abs() > FAST_REFRESH_PRICE_THRESHOLD
+            || (current.quantity - desired.quantity).abs()
+                > ReconcilerConfig::default().quantity_replace_threshold
     }
 
     pub fn plan(
@@ -517,7 +544,15 @@ impl QuoteReconciler {
             }
 
             let (existing_id, existing_order) = matches.remove(0);
-            if !self.materially_different_quote(&existing_order.intent, &desired_intent) {
+            let fast_refresh = Self::is_fast_refresh_quote(&existing_order.intent)
+                || Self::is_fast_refresh_quote(&desired_intent);
+            let materially_different = if fast_refresh {
+                Self::materially_different_fast_quote(&existing_order.intent, &desired_intent)
+            } else {
+                self.materially_different_quote(&existing_order.intent, &desired_intent)
+            };
+
+            if !materially_different {
                 plan.actions
                     .push(QuoteAction::Keep(existing_order.intent.clone()));
             } else if Self::is_paired_entry(&existing_order.intent)
@@ -529,7 +564,11 @@ impl QuoteReconciler {
                     "paired entry replace suppressed: keeping existing maker leg until fill/cancel"
                         .to_string(),
                 );
-            } else if self.can_change(existing_order, now_ms) {
+            } else if if fast_refresh {
+                self.can_fast_refresh(existing_order, now_ms)
+            } else {
+                self.can_change(existing_order, now_ms)
+            } {
                 if self.can_replace(now_ms, planned_replaces + 1) {
                     plan.actions.push(QuoteAction::Replace {
                         existing_client_order_id: existing_id,

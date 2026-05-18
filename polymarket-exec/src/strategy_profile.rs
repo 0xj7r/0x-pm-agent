@@ -153,6 +153,7 @@ pub struct KellyClipSubsection {
 #[serde(default)]
 pub struct MidDirectionalShadowSubsection {
     pub enabled: Option<bool>,
+    pub live_enabled: Option<bool>,
     pub min_ask: Option<f64>,
     pub max_ask: Option<f64>,
     pub min_model_probability: Option<f64>,
@@ -162,6 +163,16 @@ pub struct MidDirectionalShadowSubsection {
     pub min_btc_confirm_bps: Option<f64>,
     pub bankroll_usd: Option<f64>,
     pub max_clip_usd: Option<f64>,
+    pub max_market_notional_usd: Option<f64>,
+    pub min_order_usd: Option<f64>,
+    pub maker_improve_ticks: Option<f64>,
+    pub hedge_enabled: Option<bool>,
+    pub hedge_share_fraction: Option<f64>,
+    pub hedge_max_ask: Option<f64>,
+    pub hedge_max_pair_cost: Option<f64>,
+    pub hedge_max_notional_usd: Option<f64>,
+    pub hedge_min_order_usd: Option<f64>,
+    pub hedge_maker_improve_ticks: Option<f64>,
     pub min_emit_interval_ms: Option<u64>,
     pub kelly: Option<KellyClipSubsection>,
 }
@@ -627,6 +638,7 @@ impl StrategyProfile {
             },
             mid_directional_shadow: MidDirectionalShadowConfig {
                 enabled: m.enabled.unwrap_or(mid_shadow_def.enabled),
+                live_enabled: m.live_enabled.unwrap_or(mid_shadow_def.live_enabled),
                 min_ask: m.min_ask.unwrap_or(mid_shadow_def.min_ask),
                 max_ask: m.max_ask.unwrap_or(mid_shadow_def.max_ask),
                 min_model_probability: m
@@ -646,6 +658,30 @@ impl StrategyProfile {
                     .unwrap_or(mid_shadow_def.min_btc_confirm_bps),
                 bankroll_usd: m.bankroll_usd.unwrap_or(mid_shadow_def.bankroll_usd),
                 max_clip_usd: m.max_clip_usd.unwrap_or(mid_shadow_def.max_clip_usd),
+                max_market_notional_usd: m
+                    .max_market_notional_usd
+                    .unwrap_or(mid_shadow_def.max_market_notional_usd),
+                min_order_usd: m.min_order_usd.unwrap_or(mid_shadow_def.min_order_usd),
+                maker_improve_ticks: m
+                    .maker_improve_ticks
+                    .unwrap_or(mid_shadow_def.maker_improve_ticks),
+                hedge_enabled: m.hedge_enabled.unwrap_or(mid_shadow_def.hedge_enabled),
+                hedge_share_fraction: m
+                    .hedge_share_fraction
+                    .unwrap_or(mid_shadow_def.hedge_share_fraction),
+                hedge_max_ask: m.hedge_max_ask.unwrap_or(mid_shadow_def.hedge_max_ask),
+                hedge_max_pair_cost: m
+                    .hedge_max_pair_cost
+                    .unwrap_or(mid_shadow_def.hedge_max_pair_cost),
+                hedge_max_notional_usd: m
+                    .hedge_max_notional_usd
+                    .unwrap_or(mid_shadow_def.hedge_max_notional_usd),
+                hedge_min_order_usd: m
+                    .hedge_min_order_usd
+                    .unwrap_or(mid_shadow_def.hedge_min_order_usd),
+                hedge_maker_improve_ticks: m
+                    .hedge_maker_improve_ticks
+                    .unwrap_or(mid_shadow_def.hedge_maker_improve_ticks),
                 min_emit_interval_ms: m
                     .min_emit_interval_ms
                     .unwrap_or(mid_shadow_def.min_emit_interval_ms),

@@ -13,9 +13,9 @@ quote:
 inventory:
   max_open_orders_total: 120
   max_open_orders_per_market: 48
-  max_order_notional_usd: 250.0
-  max_gross_notional_usd: 1200.0
-  max_net_notional_per_market_usd: 900.0
+  max_order_notional_usd: 350.0
+  max_gross_notional_usd: 2000.0
+  max_net_notional_per_market_usd: 1200.0
   max_position_quantity_per_instrument: 1500.0
   min_free_cash_usd: 1.0
   min_free_cash_bps: 0.0
@@ -79,17 +79,17 @@ late_favorite:
   sizing:
     enabled: true
     fallback_bankroll_usd: 3200.0
-    favorite_clip_bps: 140.0
-    favorite_clip_min_usd: 25.0
-    favorite_clip_max_usd: 150.0
-    favorite_max_load_bps: 1500.0
-    favorite_max_load_min_usd: 150.0
+    favorite_clip_bps: 300.0
+    favorite_clip_min_usd: 50.0
+    favorite_clip_max_usd: 300.0
+    favorite_max_load_bps: 3000.0
+    favorite_max_load_min_usd: 300.0
     favorite_max_load_max_usd: 3000.0
-    tail_clip_bps: 10.0
-    tail_clip_min_usd: 1.0
+    tail_clip_bps: 15.0
+    tail_clip_min_usd: 2.0
     tail_clip_max_usd: 10.0
-    tail_max_load_bps: 100.0
-    tail_max_load_min_usd: 3.0
+    tail_max_load_bps: 150.0
+    tail_max_load_min_usd: 5.0
     tail_max_load_max_usd: 100.0
     reversal_clip_bps: 3.0
     reversal_clip_min_usd: 1.0
@@ -104,15 +104,17 @@ late_favorite:
     clip_usd: 45.0
     # max_load_usd is intentionally omitted; sizing.* owns the runtime cap.
     min_order_usd: 10.0
+    spot_filter_bps: 6.0
     regime_flat_multiplier: 1.0
+    near_touch_min_favorite_ask: 0.80
     kelly:
-      fractional: 0.30
-      max_clip_fraction: 0.30
-      min_edge: 0.025
+      fractional: 0.50
+      max_clip_fraction: 0.45
+      min_edge: 0.020
     taker_slippage_ticks: 3.0
     escalation_age_ms: 60000
     escalation_drift_ticks: 4
-    per_bar_gross_cap_usd: 400.0
+    per_bar_gross_cap_usd: 550.0
   favorite_anticipate:
     # Disabled until anticipate ladders are rebuilt around the conviction floor.
     enabled: false
@@ -131,10 +133,10 @@ late_favorite:
     level_step_ticks: 1
     conviction_size_scale_max: 2.5
   mid_directional_shadow:
-    # Shadow-only current-bar experiment. Emits no orders; logs would-buy
-    # candidates when the BSM/tape model strongly favors a side while the
-    # market is still mid-band.
+    # Shadow-only current-bar experiment. Keep this small while the main
+    # capital increase goes through late-favorite sizing.
     enabled: true
+    live_enabled: false
     min_ask: 0.48
     max_ask: 0.64
     min_model_probability: 0.85
@@ -144,6 +146,16 @@ late_favorite:
     min_btc_confirm_bps: 1.0
     bankroll_usd: 100.0
     max_clip_usd: 5.0
+    max_market_notional_usd: 25.0
+    min_order_usd: 2.0
+    maker_improve_ticks: 10.0
+    hedge_enabled: false
+    hedge_share_fraction: 0.35
+    hedge_max_ask: 0.45
+    hedge_max_pair_cost: 0.99
+    hedge_max_notional_usd: 12.0
+    hedge_min_order_usd: 2.0
+    hedge_maker_improve_ticks: 10.0
     min_emit_interval_ms: 5000
     kelly:
       fractional: 0.10
@@ -151,8 +163,8 @@ late_favorite:
       min_edge: 0.02
   convex_tail:
     enabled: true
-    clip_usd: 3.0
-    max_load_usd: 30.0
+    clip_usd: 5.0
+    max_load_usd: 50.0
     min_order_usd: 1.0
     # 4-10c tail is only allowed when attached to existing favorite exposure.
     max_cheap_ask: 0.10
@@ -160,8 +172,8 @@ late_favorite:
     # hedge, allow about 0.6 cheap-tail shares per favorite share before spend
     # caps can truncate it. Higher-priced tails still hedge, but stay
     # dollar/payoff-budgeted so they do not eat too much favorite-win upside.
-    min_tail_share_fraction: 0.60
-    max_late_fav_spend_fraction: 0.04
+    min_tail_share_fraction: 0.70
+    max_late_fav_spend_fraction: 0.05
     max_win_edge_spend_fraction: 0.30
     ultra_cheap_max_ask: 0.03
     maker_improve_ticks: 0.0
