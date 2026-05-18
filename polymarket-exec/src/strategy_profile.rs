@@ -209,6 +209,8 @@ pub struct ReversalHedgeSubsection {
     pub start_frac: Option<f64>,
     pub clip_usd: Option<f64>,
     pub max_load_usd: Option<f64>,
+    pub max_loss_if_favorite_loses_usd: Option<f64>,
+    pub max_loss_if_favorite_loses_fraction: Option<f64>,
     pub max_favorite_exposure_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
     pub maker_improve_ticks: Option<f64>,
@@ -608,6 +610,12 @@ impl StrategyProfile {
                 start_frac: r.start_frac.unwrap_or(reversal_def.start_frac),
                 clip_usd: r.clip_usd.unwrap_or(reversal_def.clip_usd),
                 max_load_usd: r.max_load_usd.unwrap_or(reversal_def.max_load_usd),
+                max_loss_if_favorite_loses_usd: r
+                    .max_loss_if_favorite_loses_usd
+                    .unwrap_or(reversal_def.max_loss_if_favorite_loses_usd),
+                max_loss_if_favorite_loses_fraction: r
+                    .max_loss_if_favorite_loses_fraction
+                    .unwrap_or(reversal_def.max_loss_if_favorite_loses_fraction),
                 max_favorite_exposure_fraction: r
                     .max_favorite_exposure_fraction
                     .unwrap_or(reversal_def.max_favorite_exposure_fraction),

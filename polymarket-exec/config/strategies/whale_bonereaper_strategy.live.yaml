@@ -185,6 +185,11 @@ late_favorite:
     max_hedge_ask: 0.30
     clip_usd: 8.0
     max_load_usd: 45.0
+    # Position-level hedge target: keep buying the opposite leg until the loss
+    # if the favorite loses is below min($15, 8% of filled favorite spend),
+    # while still preserving positive favorite-win payoff.
+    max_loss_if_favorite_loses_usd: 15.0
+    max_loss_if_favorite_loses_fraction: 0.08
     # Share-count target, not spend target: at high reversal score, try to own
     # about 70 opposite-leg hedge shares per 100 filled favorite shares, while
     # payoff guards keep the favorite-win bundle positive.
