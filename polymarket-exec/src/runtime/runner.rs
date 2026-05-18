@@ -75,63 +75,11 @@ pub async fn run() -> Result<()> {
         "live_reconcile" => return run_live_reconcile(config).await,
         "live_redeem" => return run_live_redeem(config).await,
         "shadow_live" => return run_shadow_live(config).await,
-        "replay" => return run_replay_cli(config).await,
         _ => {}
     }
     // Suppress unused-must-use mut warning when no shadow path is taken.
     let _ = &mut config;
     run_with_config(config).await
-}
-
-/// Phase 5 paper env: replay mode. Reads a recorded book snapshot log
-/// (the JSONL produced by `BookSnapshotWriter` during a prior live or
-/// shadow_live run), drives `Runtime<StrategyMode>` through it
-/// deterministically, routes any submits the strategy emits through
-/// `paper_fill_from_book_snapshot` using the recorded timestamp as the
-/// replay clock, and writes a `PaperReportSummary` JSON.
-///
-/// Inputs:
-/// - `PM_BTC_5M_REPLAY_INPUT_PATH`: required. Path to the JSONL log.
-/// - `PM_BTC_5M_PAPER_REPORT_PATH`: optional. Where to write the
-///   resulting `paper_report.json`. Defaults to `<input>.replay.json`.
-///
-/// This is the foundation for A/B parameter calibration: change a paper
-/// fill knob (queue depth, post-only reject prob, latency), re-run
-/// replay against the same recorded log, and compare two report cards.
-async fn run_replay_cli(config: AppConfig) -> Result<()> {
-    crate::logging::init(&config)?;
-    let input_path = runtime_env("PM_BTC_5M_REPLAY_INPUT_PATH")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| {
-            anyhow::anyhow!("PM_BTC_5M_EXEC_MODE=replay requires PM_BTC_5M_REPLAY_INPUT_PATH")
-        })?;
-    let output_path = config.paper_report_path.clone().unwrap_or_else(|| {
-        let mut p = input_path.clone();
-        let stem = p
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "replay".to_string());
-        p.set_file_name(format!("{stem}.replay.json"));
-        p
-    });
-    info!(
-        target: "replay.startup",
-        input = %input_path.display(),
-        output = %output_path.display(),
-        starting_cash_usd = config.starting_cash_usd,
-        "replay mode engaged (strategy-driven)"
-    );
-    let outcome =
-        crate::paper::replay::replay_runtime_from_snapshots(&config, &input_path, &output_path)
-            .await?;
-    info!(
-        target: "replay.complete",
-        records_consumed = outcome.records_consumed,
-        assets_seen = outcome.assets_seen,
-        report = %output_path.display(),
-        "replay finished"
-    );
-    Ok(())
 }
 
 /// Phase 4 paper env: shadow-live mode. Connects live market_ws + spot_ws +
@@ -705,15 +653,9 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         .as_deref()
         .map(|path| AuditWriter::open(path, config.journal_rotate_bytes))
         .transpose()?;
-    // Decision log: previously gated on `if config.paper_mode { ... }` which
-    // meant LIVE mode wrote no decision log, blocking shadow-live <-> tinylive
-    // comparison. The writer's mode-agnostic methods (record_book_observation,
-    // record_runtime_outcome, record_suppression_sample) work identically in
-    // either mode. Now path-driven instead of mode-driven, mirroring how
-    // book_snapshot writer works (line ~944). Live mode still won't get
-    // paper_fill records (those are gated on execution_policy.paper_mode at
-    // each call site), but suppression decisions and runtime events DO land,
-    // which is what we need for cross-mode A/B testing.
+    // Decision log is path-driven instead of mode-driven. Live mode still
+    // won't get paper_fill records because those are gated on execution_policy
+    // at each call site.
     let mut paper_report: Option<crate::paper::report::PaperReportWriter> =
         config.paper_report_path.clone().map(|path| {
             crate::paper::report::PaperReportWriter::new(
@@ -723,18 +665,13 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 now_unix_ms(),
             )
         });
-    let mut book_snapshot: Option<crate::paper::snapshot::BookSnapshotWriter> = config
-        .book_snapshot_log_path
-        .as_deref()
-        .map(crate::paper::snapshot::BookSnapshotWriter::open)
-        .transpose()?;
     let mut shadow_quote: Option<crate::paper::shadow_quote::ShadowQuoteWriter> = config
         .shadow_quote_log_path
         .as_deref()
         .map(|path| {
             crate::paper::shadow_quote::ShadowQuoteWriter::open(
                 path,
-                config.book_snapshot_max_levels,
+                config.shadow_quote_max_levels,
             )
         })
         .transpose()?;
@@ -863,7 +800,6 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
         &mut journal,
         &mut audit,
         &mut paper_report,
-        &mut book_snapshot,
         &mut shadow_quote,
         &mut next_bar_shadow,
         &mut paper_order_ctx,
@@ -923,23 +859,6 @@ pub async fn run_with_config(config: AppConfig) -> Result<()> {
                 target: "paper_report.flush",
                 output = %report.output_path().display(),
                 "paper report written"
-            );
-        }
-    }
-    if let Some(snap) = book_snapshot.as_mut() {
-        if let Err(error) = snap.flush() {
-            warn!(
-                target: "book_snapshot.flush",
-                output = %snap.path().display(),
-                error = %error,
-                "failed to flush book snapshot log on shutdown"
-            );
-        } else {
-            info!(
-                target: "book_snapshot.flush",
-                output = %snap.path().display(),
-                bytes_written = snap.bytes_written(),
-                "book snapshot log flushed"
             );
         }
     }
@@ -1171,7 +1090,6 @@ async fn run_runtime_loop(
     journal: &mut JournalFanout,
     audit: &mut Option<AuditWriter>,
     paper_report: &mut Option<crate::paper::report::PaperReportWriter>,
-    book_snapshot: &mut Option<crate::paper::snapshot::BookSnapshotWriter>,
     shadow_quote: &mut Option<crate::paper::shadow_quote::ShadowQuoteWriter>,
     next_bar_shadow: &mut Option<crate::paper::next_bar_shadow::NextBarShadowWriter>,
     paper_order_ctx: &mut HashMap<ClientOrderId, PaperOrderContext>,
@@ -1582,18 +1500,6 @@ async fn run_runtime_loop(
                 for asset_id in &current_assets {
                     match books.snapshot(asset_id).await {
                         Some(book) if book.last_update_unix_ms > 0 => {
-                            if let Some(snap) = book_snapshot.as_mut() {
-                                if let Err(error) =
-                                    snap.record(&book, config.book_snapshot_max_levels)
-                                {
-                                    warn!(
-                                        target: "book_snapshot",
-                                        asset = %asset_id,
-                                        error = %error,
-                                        "failed to append book snapshot record"
-                                    );
-                                }
-                            }
                             metrics.observe_book(&book, config.book_stale_after);
                             let (c10, c30, c60, last_age_ms) =
                                 books.trade_activity(asset_id, now_unix_ms()).await;

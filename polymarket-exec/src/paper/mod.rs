@@ -1,9 +1,5 @@
-//! Paper-environment auxiliary modules: report card writer, book snapshot
-//! capture, and (Phase 5) deterministic replay support. See
-//! `docs/architecture/2026-04-25-paper-env-design.md` for the design.
+//! Paper-environment auxiliary modules for live strategy dry-runs.
 
 pub mod next_bar_shadow;
-pub mod replay;
 pub mod report;
 pub mod shadow_quote;
-pub mod snapshot;

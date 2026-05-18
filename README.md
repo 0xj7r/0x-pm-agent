@@ -10,7 +10,6 @@ This workspace contains the Rust execution scaffold for whale-pair.
 
 ## Operational runbooks
 
-- Backtest pipeline: `docs/backtest_aws_fleet.md`
 - Paper/tiny-live runbook: `docs/architecture/2026-04-23-btc-5m-mm-paper-and-tiny-live-runbook.md`
 - Infra requirements: `docs/architecture/2026-04-23-btc-5m-mm-infra-requirements.md`
 - Paper storage/archive plan: `docs/architecture/2026-04-24-paper-storage-archive-plan.md`
@@ -51,5 +50,5 @@ If `PM_BTC_5M_INSTRUMENT_MARKETS` is omitted, the runtime falls back to treating
 
 - Downstream execution adapter currently supports paper-mode simulation only.
 - Primary strategy now defaults to `GoatPairStrategy` (env configured).
-- No persistence or replay beyond in-memory event log and inventory state.
+- No durable strategy-event replay beyond live order/inventory state recovery.
 - No authenticated execution path from user websocket events into order state transitions.

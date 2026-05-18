@@ -188,11 +188,6 @@ pub struct AppConfig {
     /// runtime instantiates a `PaperReportWriter`, accumulates fill / edge
     /// / reject metrics, and flushes on shutdown. None disables.
     pub paper_report_path: Option<PathBuf>,
-    /// Phase 5 paper env: optional JSONL path for compact book-state
-    /// snapshots. When set, every book update is appended; the resulting
-    /// file is the input to `PM_BTC_5M_EXEC_MODE=replay`. Useful in any
-    /// mode (paper, shadow_live, even live) for forensic post-hoc replay.
-    pub book_snapshot_log_path: Option<PathBuf>,
     /// Optional JSONL path for shadow quote records. Each paper/shadow-live
     /// submit records the intended order plus top-N book depth so offline
     /// calibration can compare quote decisions against later book movement.
@@ -204,10 +199,8 @@ pub struct AppConfig {
     pub next_bar_shadow_log_path: Option<PathBuf>,
     /// Minimum milliseconds between next-bar shadow records per market.
     pub next_bar_shadow_interval_ms: u64,
-    /// Phase 5 paper env: max depth levels per side captured in each book
-    /// snapshot record. Bigger = bigger files; smaller = less faithful
-    /// replay. Default 10.
-    pub book_snapshot_max_levels: usize,
+    /// Max depth levels per side captured in each shadow quote record.
+    pub shadow_quote_max_levels: usize,
     /// Maker rebate coefficient. Applied as a negative fee on maker fills
     /// in paper mode: `fee_usd = -notional * coeff * p * (1-p)`. Default
     /// 0.0 (no rebate). Set to V2's actual maker-rebate value to model
@@ -530,12 +523,11 @@ impl AppConfig {
         let paper_cancel_race_window_ms =
             parse_duration_ms("PM_BTC_5M_PAPER_CANCEL_RACE_WINDOW_MS", 500)?.as_millis() as u64;
         let paper_report_path = parse_path_optional("PM_BTC_5M_PAPER_REPORT_PATH");
-        let book_snapshot_log_path = parse_path_optional("PM_BTC_5M_BOOK_SNAPSHOT_LOG_PATH");
         let shadow_quote_log_path = parse_path_optional("PM_BTC_5M_SHADOW_QUOTE_LOG_PATH");
         let next_bar_shadow_log_path = parse_path_optional("PM_BTC_5M_NEXT_BAR_SHADOW_LOG_PATH");
         let next_bar_shadow_interval_ms =
             parse_duration_ms("PM_BTC_5M_NEXT_BAR_SHADOW_INTERVAL_MS", 1_000)?.as_millis() as u64;
-        let book_snapshot_max_levels = parse_usize("PM_BTC_5M_BOOK_SNAPSHOT_MAX_LEVELS", 10)?;
+        let shadow_quote_max_levels = parse_usize("PM_BTC_5M_SHADOW_QUOTE_MAX_LEVELS", 10)?;
         let paper_maker_rebate_coeff = parse_f64("PM_BTC_5M_PAPER_MAKER_REBATE_COEFF", 0.0)?;
         let paper_taker_fee_coeff_override = env_value("PM_BTC_5M_PAPER_TAKER_FEE_COEFF")
             .filter(|v| !v.trim().is_empty())
@@ -635,11 +627,10 @@ impl AppConfig {
             paper_post_only_reject_probability,
             paper_cancel_race_window_ms,
             paper_report_path,
-            book_snapshot_log_path,
             shadow_quote_log_path,
             next_bar_shadow_log_path,
             next_bar_shadow_interval_ms,
-            book_snapshot_max_levels,
+            shadow_quote_max_levels,
             paper_maker_rebate_coeff,
             paper_taker_fee_coeff_override,
         })
@@ -691,14 +682,6 @@ fn parse_strategy_profile_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn parse_duration_ms_or_profile(key: &str, profile: Option<u64>, default: u64) -> Result<Duration> {
-    if env_value(key).is_some() {
-        parse_duration_ms(key, default)
-    } else {
-        Ok(Duration::from_millis(profile.unwrap_or(default)))
-    }
-}
-
 fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Duration {
     if paper_mode {
         configured
@@ -718,22 +701,6 @@ fn parse_f64_or_profile(key: &str, profile: Option<f64>, default: f64) -> Result
         Ok(profile)
     } else if env.is_some() {
         parse_f64(key, default)
-    } else {
-        Ok(default)
-    }
-}
-
-fn parse_usize_or_profile(key: &str, profile: Option<usize>, default: usize) -> Result<usize> {
-    let env = env_value(key);
-    if let (Some(_), Some(_)) = (profile, env.as_ref()) {
-        anyhow::bail!(
-            "ambiguous config for {key}: value is set in both strategy profile and environment; remove the env var so the profile remains the single source of truth"
-        );
-    }
-    if let Some(profile) = profile {
-        Ok(profile)
-    } else if env.is_some() {
-        parse_usize(key, default)
     } else {
         Ok(default)
     }

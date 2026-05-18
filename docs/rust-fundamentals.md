@@ -45,7 +45,7 @@ A trait is a behavior contract. Generics let a function work for any type that s
 `async fn` returns a `Future`. Futures don't run until polled. The Tokio runtime polls many futures concurrently on a thread pool. `.await` is a yield point.
 
 - `wire/market_ws.rs`, `wire/user_ws.rs`, `wire/spot_ws.rs` — each WebSocket connection is an async task. They communicate with the synchronous strategy core via channels, *not* shared state.
-- `bin/live_collector.rs`, `bin/backtest_runner.rs` use `#[tokio::main]` to spin up the runtime.
+- `main.rs` and operational binaries use `#[tokio::main]` to spin up the runtime.
 
 **Footgun called out by clippy:** holding a synchronous `MutexGuard` across an `.await` deadlocks if any other task on the same thread also tries to lock. There's one such warning in tests (`tests/unit/runtime_runner.rs:747`); production code is clean. Use `tokio::sync::Mutex` or scope the guard before the await.
 

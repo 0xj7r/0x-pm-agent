@@ -113,8 +113,7 @@ fn runner_test_config() -> AppConfig {
         shadow_quote_log_path: None,
         next_bar_shadow_log_path: None,
         next_bar_shadow_interval_ms: 1_000,
-        book_snapshot_log_path: None,
-        book_snapshot_max_levels: 10,
+        shadow_quote_max_levels: 10,
         paper_maker_rebate_coeff: 0.0,
         paper_taker_fee_coeff_override: None,
     }

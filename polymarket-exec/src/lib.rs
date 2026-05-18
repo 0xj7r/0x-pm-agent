@@ -12,7 +12,6 @@ pub mod market_making;
 pub mod markets;
 pub mod metrics;
 pub mod paper;
-pub mod replay;
 pub mod runtime;
 pub mod signals;
 pub mod strategies;
