@@ -343,13 +343,6 @@ fn classify_data_quality(summary: &mut DataQualitySummary, cfg: &DataQualityConf
             .reject_reasons
             .push(format!("max_book_gap_ns={}", summary.max_book_gap_ns));
     }
-    if summary.crossed_book_persistent_count > 0 {
-        summary.reject_reasons.push(format!(
-            "crossed_book_persistent_count={},max_duration_ns={}",
-            summary.crossed_book_persistent_count, summary.crossed_book_max_duration_ns
-        ));
-    }
-
     if summary.timestamp_drift_warn_count > 0 {
         summary.warnings.push(format!(
             "timestamp_drift_warn_count={}",
@@ -382,6 +375,12 @@ fn classify_data_quality(summary: &mut DataQualitySummary, cfg: &DataQualityConf
         summary.warnings.push(format!(
             "crossed_book_samples={},max_duration_ns={}",
             summary.crossed_book_samples, summary.crossed_book_max_duration_ns
+        ));
+    }
+    if summary.crossed_book_persistent_count > 0 {
+        summary.warnings.push(format!(
+            "crossed_book_persistent_count={},max_duration_ns={}",
+            summary.crossed_book_persistent_count, summary.crossed_book_max_duration_ns
         ));
     }
     if summary.resolution_event_count == 0 {
@@ -650,5 +649,32 @@ mod tests {
             .reject_reasons
             .iter()
             .any(|reason| reason.contains("timestamp_drift_reject_count")));
+    }
+
+    #[test]
+    fn quality_warns_on_persistent_crossed_book() {
+        let events = vec![
+            meta(),
+            book("UP", "buy", "0.60", 2),
+            book("UP", "sell", "0.50", 3),
+            book("UP", "sell", "0.61", NS_PER_SECOND),
+            book("DOWN", "buy", "0.48", NS_PER_SECOND + 1),
+            book("DOWN", "sell", "0.52", NS_PER_SECOND + 2),
+            Event {
+                event_type: EventType::Resolution,
+                raw: json!({ "winning_outcome": "Up" }),
+                ..event(EventType::Resolution, NS_PER_SECOND + 3)
+            },
+        ];
+
+        let summary = summarize_data_quality("w", &events, &DataQualityConfig::default());
+
+        assert_eq!(summary.status, DataQualityStatus::Warn);
+        assert!(summary.reject_reasons.is_empty());
+        assert_eq!(summary.crossed_book_persistent_count, 1);
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("crossed_book_persistent_count=1")));
     }
 }
