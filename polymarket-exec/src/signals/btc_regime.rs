@@ -3,6 +3,13 @@
 #[derive(Debug, Clone, Default)]
 pub struct BtcRegimeSnapshot {
     pub last_price: Option<f64>,
+    /// Wall-clock span covered by the retained BTC spot samples.
+    ///
+    /// This is intentionally separate from trade_count: after a live process
+    /// restart, REST bootstrap can forward many trades covering only a few
+    /// seconds. Directional entry logic needs to know whether the signal window
+    /// actually covers the current prediction-market bar.
+    pub price_history_ms: u64,
     pub realized_vol_5m_bps: Option<f64>,
     pub realized_vol_15m_bps: Option<f64>,
     pub trade_count_5m: u64,

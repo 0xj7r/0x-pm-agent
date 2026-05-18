@@ -17,6 +17,9 @@ SKIP_FETCH="${AWS_LIVE_SKIP_FETCH:-0}"
 SKIP_BUILD="${AWS_LIVE_SKIP_BUILD:-0}"
 SKIP_RESTART="${AWS_LIVE_SKIP_RESTART:-1}"
 RESTART_CMD="${AWS_LIVE_RESTART_CMD:-}"
+WAIT_FOR_ROLLOVER="${AWS_LIVE_WAIT_FOR_ROLLOVER:-1}"
+ROLLOVER_SAFE_SECONDS="${AWS_LIVE_ROLLOVER_SAFE_SECONDS:-12}"
+ROLLOVER_MAX_WAIT_SECONDS="${AWS_LIVE_ROLLOVER_MAX_WAIT_SECONDS:-330}"
 
 log() {
   echo "[deploy-live-aws-ec2] $1"
@@ -148,17 +151,48 @@ ssh_base "systemctl --user status polymarket-exec-live-smoke.service --no-pager 
 
 if [[ "$SKIP_RESTART" == "1" ]]; then
   log "skipping safe-restart (AWS_LIVE_SKIP_RESTART=1)"
-elif [[ -n "$RESTART_CMD" ]]; then
-  log "running custom restart command"
-  ssh_base "$RESTART_CMD"
-elif [[ -n "$LIVE_SLEEVE" ]]; then
-  log "restarting service unit: $REMOTE_SERVICE_UNIT"
-  ssh_base "systemctl --user restart '$REMOTE_SERVICE_UNIT'"
-elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
-  log "running poly-safe-restart for btc_5m_paired_mm_tinylive"
-  ssh_base "\$HOME/.local/bin/poly-safe-restart.sh btc_5m_paired_mm_tinylive"
 else
-  log "poly-safe-restart.sh not found on remote; skipping (manual restart required)"
+  if [[ "$WAIT_FOR_ROLLOVER" == "1" ]]; then
+    log "waiting for start of next 5-minute BTC bar before restart"
+    ssh_base "
+      set -euo pipefail
+      safe_seconds='$ROLLOVER_SAFE_SECONDS'
+      max_wait_seconds='$ROLLOVER_MAX_WAIT_SECONDS'
+      deadline=\$(( \$(date +%s) + max_wait_seconds ))
+      while true; do
+        now=\$(date +%s)
+        into_bar=\$(( now % 300 ))
+        if [ \"\$into_bar\" -le \"\$safe_seconds\" ]; then
+          echo \"restart window open: into_bar=\${into_bar}s safe_seconds=\${safe_seconds}s\"
+          break
+        fi
+        if [ \"\$now\" -ge \"\$deadline\" ]; then
+          echo \"timed out waiting for rollover; continuing restart after \${max_wait_seconds}s\" >&2
+          break
+        fi
+        sleep_for=\$(( 300 - into_bar + 1 ))
+        remaining=\$(( deadline - now ))
+        if [ \"\$sleep_for\" -gt \"\$remaining\" ]; then
+          sleep_for=\"\$remaining\"
+        fi
+        echo \"waiting \${sleep_for}s for 5-minute rollover; into_bar=\${into_bar}s\"
+        sleep \"\$sleep_for\"
+      done
+    "
+  fi
+
+  if [[ -n "$RESTART_CMD" ]]; then
+    log "running custom restart command"
+    ssh_base "$RESTART_CMD"
+  elif [[ -n "$LIVE_SLEEVE" ]]; then
+    log "restarting service unit: $REMOTE_SERVICE_UNIT"
+    ssh_base "systemctl --user restart '$REMOTE_SERVICE_UNIT'"
+  elif ssh_base "test -x \$HOME/.local/bin/poly-safe-restart.sh" 2>/dev/null; then
+    log "running poly-safe-restart for btc_5m_paired_mm_tinylive"
+    ssh_base "\$HOME/.local/bin/poly-safe-restart.sh btc_5m_paired_mm_tinylive"
+  else
+    log "poly-safe-restart.sh not found on remote; skipping (manual restart required)"
+  fi
 fi
 
 cat <<EOF

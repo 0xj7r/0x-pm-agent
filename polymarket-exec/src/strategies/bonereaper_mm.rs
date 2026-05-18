@@ -2123,6 +2123,17 @@ fn elapsed_ms<M: MarketDescriptor>(market: &M, now_ms: EpochMillis, remaining_ms
         .unwrap_or_else(|| market.window_ms().saturating_sub(remaining_ms))
 }
 
+const BTC_SIGNAL_CURRENT_BAR_WARMUP_SLACK_MS: u64 = 10_000;
+
+fn btc_signal_history_covers_market_elapsed(
+    btc: &crate::signals::BtcRegimeSnapshot,
+    elapsed_ms: u64,
+) -> bool {
+    btc.price_history_ms
+        .saturating_add(BTC_SIGNAL_CURRENT_BAR_WARMUP_SLACK_MS)
+        >= elapsed_ms
+}
+
 fn directional_exposure_usd(favorite_qty: f64, other_qty: f64, px: f64) -> f64 {
     let unmatched = (favorite_qty - other_qty).max(0.0);
     unmatched * px.max(0.0)
@@ -3764,10 +3775,20 @@ where
         let tick = input.market.tick_size().max(0.0001);
         let bar_window_ms = input.market.window_ms();
         let elapsed_ms = elapsed_ms(&input.market, input.now_ms, remaining_ms);
+        let btc_signal_current_bar_warm =
+            btc_signal_history_covers_market_elapsed(&input.btc_regime, elapsed_ms);
         let mut intents = Vec::new();
         let mut notes = Vec::new();
         if let Some(note) = sizing_note {
             notes.push(note);
+        }
+        if !btc_signal_current_bar_warm {
+            notes.push(format!(
+                "btc_signal_current_bar_warmup blocks fresh entries history_ms={} elapsed_ms={} slack_ms={}",
+                input.btc_regime.price_history_ms,
+                elapsed_ms,
+                BTC_SIGNAL_CURRENT_BAR_WARMUP_SLACK_MS
+            ));
         }
         let directional_conviction = directional_conviction(&input, &legs, &climb_cfg);
         let (late_fav_rearm_ready, late_fav_stable_bars) = self.update_late_fav_rearm_state(
@@ -3842,9 +3863,16 @@ where
                     "mid_directional_shadow would_buy"
                 );
             }
-            let live_mid_intents =
-                self.mid_directional_live_intents(&input, &legs, &shadow, tick, &mut notes);
-            intents.extend(live_mid_intents);
+            if btc_signal_current_bar_warm {
+                let live_mid_intents =
+                    self.mid_directional_live_intents(&input, &legs, &shadow, tick, &mut notes);
+                intents.extend(live_mid_intents);
+            } else if self.config.mid_directional_shadow.live_enabled {
+                notes.push(format!(
+                    "mid_directional_live blocked by btc_signal_current_bar_warmup history_ms={} elapsed_ms={}",
+                    input.btc_regime.price_history_ms, elapsed_ms
+                ));
+            }
         }
         notes.push(format!(
             "late_fav_rearm ready={} stable_bars={} max_path_risk={:.2}",
@@ -3932,6 +3960,7 @@ where
         );
         if climb_cfg.enabled
             && climb_enabled
+            && btc_signal_current_bar_warm
             && remaining_ms <= climb_window_ms
             && elapsed_ms >= climb_cfg.min_elapsed_sec.saturating_mul(1_000)
             && legs.favorite_ask >= climb_cfg.min_favorite_ask
@@ -5689,6 +5718,7 @@ fn log_market_classification<M: MarketDescriptor>(
         btc_ret_60s_bps = ?input.btc_regime.return_60s_bps,
         btc_ret_120s_bps = ?input.btc_regime.return_120s_bps,
         btc_ret_180s_bps = ?input.btc_regime.return_180s_bps,
+        btc_signal_history_ms = input.btc_regime.price_history_ms,
         momentum_strength = input.momentum.strength,
         momentum_latest_bps = ?input.momentum.latest_window_return_bps,
         barbell = conviction.barbell,
@@ -5744,6 +5774,12 @@ fn late_fav_classification_reason<M: MarketDescriptor>(
     }
     if elapsed_ms < climb_cfg.min_elapsed_sec.saturating_mul(1_000) {
         return "opening_noise_guard".to_string();
+    }
+    if !btc_signal_history_covers_market_elapsed(&input.btc_regime, elapsed_ms) {
+        return format!(
+            "btc_signal_current_bar_warmup history_ms={} elapsed_ms={} slack_ms={}",
+            input.btc_regime.price_history_ms, elapsed_ms, BTC_SIGNAL_CURRENT_BAR_WARMUP_SLACK_MS
+        );
     }
 
     if !conviction.btc_confirms {
@@ -5873,6 +5909,24 @@ mod tests {
             time_remaining_s: 120.0,
             model: FairValueModel::BsmBinary,
         }
+    }
+
+    #[test]
+    fn btc_signal_history_must_cover_current_bar_elapsed_for_fresh_entries() {
+        let warm = crate::signals::BtcRegimeSnapshot {
+            price_history_ms: 110_000,
+            ..Default::default()
+        };
+        assert!(btc_signal_history_covers_market_elapsed(&warm, 115_000));
+
+        let restarted_mid_bar = crate::signals::BtcRegimeSnapshot {
+            price_history_ms: 15_000,
+            ..Default::default()
+        };
+        assert!(!btc_signal_history_covers_market_elapsed(
+            &restarted_mid_bar,
+            115_000
+        ));
     }
 
     fn strategy_input(
@@ -7646,6 +7700,7 @@ mod tests {
     fn high_conviction_regime() -> crate::signals::BtcRegimeSnapshot {
         // Low vol (<8 bps) + dominant trend (return_180s / vol >= 5) → DirectionalSmooth.
         crate::signals::BtcRegimeSnapshot {
+            price_history_ms: 300_000,
             realized_vol_5m_bps: Some(2.0),
             return_30s_bps: Some(15.0),
             return_60s_bps: Some(16.0),

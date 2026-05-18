@@ -7,6 +7,7 @@ use crate::signals::{BtcRegimeSnapshot, MomentumEngine, MomentumSignal};
 const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_45M_MS: u64 = 45 * 60 * 1_000;
+const BTC_SIGNAL_MIN_VOL_HISTORY_MS: u64 = 60 * 1_000;
 const MAX_BTC_PRICE_SAMPLES: usize = 20_000;
 
 #[derive(Debug, Default)]
@@ -30,6 +31,7 @@ impl BtcSignalStore {
     }
 
     pub(super) fn snapshot(&self, now_ms: u64) -> BtcRegimeSnapshot {
+        let price_history_ms = self.price_history_ms(now_ms);
         let realized_vol_5m_bps = self.realized_vol_bps(now_ms, BTC_SIGNAL_WINDOW_5M_MS);
         let realized_vol_15m_bps = self.realized_vol_bps(now_ms, BTC_SIGNAL_WINDOW_15M_MS);
         let trade_count_5m = self.trade_count(now_ms, BTC_SIGNAL_WINDOW_5M_MS);
@@ -41,6 +43,7 @@ impl BtcSignalStore {
 
         BtcRegimeSnapshot {
             last_price: self.last_price,
+            price_history_ms,
             realized_vol_5m_bps,
             realized_vol_15m_bps,
             trade_count_5m,
@@ -84,6 +87,13 @@ impl BtcSignalStore {
             .count() as u64
     }
 
+    fn price_history_ms(&self, now_ms: u64) -> u64 {
+        self.price_samples
+            .front()
+            .map(|(sample_ms, _)| now_ms.saturating_sub(*sample_ms))
+            .unwrap_or(0)
+    }
+
     fn realized_vol_bps(&self, now_ms: u64, window_ms: u64) -> Option<f64> {
         let points = self
             .price_samples
@@ -93,6 +103,14 @@ impl BtcSignalStore {
                 now_ms.saturating_sub(*sample_ms) <= window_ms && price.is_finite() && *price > 0.0
             })
             .collect::<Vec<_>>();
+        let coverage_ms = points
+            .first()
+            .zip(points.last())
+            .map(|(first, last)| last.0.saturating_sub(first.0))
+            .unwrap_or(0);
+        if coverage_ms < BTC_SIGNAL_MIN_VOL_HISTORY_MS.min(window_ms) {
+            return None;
+        }
         if points.len() < 2 {
             return None;
         }
@@ -128,16 +146,56 @@ impl BtcSignalStore {
             .iter()
             .rev()
             .find(|(sample_ms, _)| *sample_ms <= target_ms)
-            .map(|(_, price)| *price)
-            .or_else(|| {
-                self.price_samples
-                    .iter()
-                    .find(|(sample_ms, _)| *sample_ms >= target_ms)
-                    .map(|(_, price)| *price)
-            })?;
+            .map(|(_, price)| *price)?;
         if baseline <= 0.0 {
             return None;
         }
         Some(((current / baseline) - 1.0) * 10_000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_require_history_covering_the_requested_horizon() {
+        let mut store = BtcSignalStore::default();
+        store.record_trade(100.0, 1_000);
+        store.record_trade(101.0, 6_000);
+
+        let snap = store.snapshot(6_000);
+
+        assert_eq!(snap.price_history_ms, 5_000);
+        assert_eq!(snap.return_30s_bps, None);
+        assert_eq!(snap.return_60s_bps, None);
+        assert_eq!(snap.return_120s_bps, None);
+        assert_eq!(snap.return_180s_bps, None);
+    }
+
+    #[test]
+    fn realized_vol_requires_real_time_history_not_just_many_recent_ticks() {
+        let mut store = BtcSignalStore::default();
+        for i in 0..100 {
+            store.record_trade(100.0 + (i as f64 * 0.01), 1_000 + i * 10);
+        }
+
+        let snap = store.snapshot(2_000);
+
+        assert_eq!(snap.price_history_ms, 1_000);
+        assert_eq!(snap.realized_vol_5m_bps, None);
+    }
+
+    #[test]
+    fn returns_appear_once_history_covers_the_horizon() {
+        let mut store = BtcSignalStore::default();
+        store.record_trade(100.0, 1_000);
+        store.record_trade(101.0, 31_000);
+
+        let snap = store.snapshot(31_000);
+
+        assert_eq!(snap.price_history_ms, 30_000);
+        assert!(snap.return_30s_bps.is_some());
+        assert_eq!(snap.return_60s_bps, None);
     }
 }

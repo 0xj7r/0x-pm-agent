@@ -107,6 +107,7 @@ fn context(
         market_context: Some(market_context(market_id, yes_id, no_id)),
         btc_regime: BtcRegimeSnapshot {
             last_price: Some(spot),
+            price_history_ms: 300_000,
             realized_vol_5m_bps: Some(5.0),
             realized_vol_15m_bps: Some(30.0),
             trade_count_5m: 200,

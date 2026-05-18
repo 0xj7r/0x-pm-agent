@@ -237,6 +237,14 @@ impl BtcRollingWindow {
         self.prices.len() as u64
     }
 
+    fn coverage_ms(&self) -> u64 {
+        self.prices
+            .front()
+            .zip(self.prices.back())
+            .map(|(first, last)| last.0.saturating_sub(first.0))
+            .unwrap_or(0)
+    }
+
     fn realized_vol_bps(&self) -> Option<f64> {
         let count = self.returns.len();
         if count == 0 {
@@ -314,6 +322,7 @@ impl BtcRegimeAggregator {
     fn compute_snapshot(&self) -> BtcRegimeSnapshot {
         BtcRegimeSnapshot {
             last_price: self.last_price(),
+            price_history_ms: self.window_15m.coverage_ms(),
             realized_vol_5m_bps: self.window_5m.realized_vol_bps(),
             realized_vol_15m_bps: self.window_15m.realized_vol_bps(),
             trade_count_5m: self.window_5m.trade_count(),
