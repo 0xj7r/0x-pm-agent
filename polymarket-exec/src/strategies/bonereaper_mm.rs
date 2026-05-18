@@ -1220,6 +1220,10 @@ fn apply_directional_bankroll_sizing(
 }
 
 impl LateFavBundleState {
+    fn favorite_is_positioned(self) -> bool {
+        self.fav_filled_qty > 0.0 || self.working_fav_spend_usd > 0.0
+    }
+
     fn fav_committed_spend_usd(self) -> f64 {
         self.fav_filled_spend_usd + self.working_fav_spend_usd
     }
@@ -1342,35 +1346,37 @@ impl LateFavBundleState {
         }
 
         if proposed_leg == self.dominant_fav_leg {
-            let required_hedge_share_fraction = required_hedge_share_fraction(
-                proposed_price,
-                hedge_ask,
-                regime,
-                path_reversal_risk,
-            );
-            let projected_hedge_share_coverage = self.hedge_share_coverage_after_favorite_add(
-                proposed_qty,
-                proposed_price,
-                proposed_hedge_qty,
-            );
-            if projected_hedge_share_coverage + 1e-9 < required_hedge_share_fraction {
-                return BundleOrderGate {
-                    allowed: false,
-                    reason: format!(
-                        "bundle blocks favorite add: hedge share coverage {:.2} below required {:.2} projected_fav_qty={:.2} tail_qty={:.2} working_tail_qty={:.2} fav_px={:.4} hedge_ask={:.4} regime={:?} path_reversal={:.2}",
-                        projected_hedge_share_coverage,
-                        required_hedge_share_fraction,
-                        self.fav_filled_qty
-                            + self.working_fav_spend_usd / proposed_price.max(0.01)
-                            + proposed_qty,
-                        self.tail_filled_qty,
-                        self.working_tail_qty + proposed_hedge_qty.max(0.0),
-                        proposed_price,
-                        hedge_ask,
-                        regime,
-                        path_reversal_risk,
-                    ),
-                };
+            if self.favorite_is_positioned() {
+                let required_hedge_share_fraction = required_hedge_share_fraction(
+                    proposed_price,
+                    hedge_ask,
+                    regime,
+                    path_reversal_risk,
+                );
+                let projected_hedge_share_coverage = self.hedge_share_coverage_after_favorite_add(
+                    proposed_qty,
+                    proposed_price,
+                    proposed_hedge_qty,
+                );
+                if projected_hedge_share_coverage + 1e-9 < required_hedge_share_fraction {
+                    return BundleOrderGate {
+                        allowed: false,
+                        reason: format!(
+                            "bundle blocks favorite add: hedge share coverage {:.2} below required {:.2} projected_fav_qty={:.2} tail_qty={:.2} working_tail_qty={:.2} fav_px={:.4} hedge_ask={:.4} regime={:?} path_reversal={:.2}",
+                            projected_hedge_share_coverage,
+                            required_hedge_share_fraction,
+                            self.fav_filled_qty
+                                + self.working_fav_spend_usd / proposed_price.max(0.01)
+                                + proposed_qty,
+                            self.tail_filled_qty,
+                            self.working_tail_qty + proposed_hedge_qty.max(0.0),
+                            proposed_price,
+                            hedge_ask,
+                            regime,
+                            path_reversal_risk,
+                        ),
+                    };
+                }
             }
 
             let payoff_if_fav_wins =
@@ -3891,7 +3897,6 @@ where
                         let level0_immediate_fak = entry_policy.force_taker
                             || directional_conviction.barbell
                             || sizing_remaining_ms <= 45_000;
-                        let mut projected_bundle_hedge_qty = 0.0;
                         for level in 0..level_count {
                             if load_left < climb_cfg.min_order_usd {
                                 break;
@@ -3930,92 +3935,6 @@ where
                             }
                             let clip = per_level_clip.min(load_left).max(climb_cfg.min_order_usd);
                             let qty = (clip / px).max(input.market.min_order_size());
-                            let required_hedge_fraction = required_hedge_share_fraction(
-                                px,
-                                legs.cheap_ask,
-                                input.btc_regime.regime(),
-                                entry_policy.path_reversal_risk,
-                            );
-                            let working_fav_qty = bundle_state.working_fav_spend_usd / px.max(0.01);
-                            let projected_favorite_qty =
-                                bundle_state.fav_filled_qty + working_fav_qty + qty;
-                            let projected_hedge_qty = bundle_state.tail_filled_qty
-                                + bundle_state.working_tail_qty
-                                + projected_bundle_hedge_qty;
-                            let hedge_deficit_qty = (projected_favorite_qty
-                                * required_hedge_fraction
-                                - projected_hedge_qty)
-                                .max(0.0);
-                            let mut proposed_hedge_qty = 0.0;
-                            let mut pending_hedge_intent: Option<(OrderIntent, f64)> = None;
-                            if hedge_deficit_qty > 0.0
-                                && legs.cheap_ask <= WING_REVERSAL_HEDGE_MAX_ASK
-                            {
-                                let pair_cost_is_positive_ev = px + legs.cheap_ask <= 1.0 + 1e-9;
-                                let hedge_aggressive = legs.cheap_ask <= tail_cfg.max_cheap_ask
-                                    || pair_cost_is_positive_ev;
-                                let hedge_px = if hedge_aggressive {
-                                    slippage_limited_taker_price(
-                                        legs.cheap_ask,
-                                        tick,
-                                        reversal_cfg.taker_slippage_ticks.max(1.0),
-                                        WING_REVERSAL_HEDGE_MAX_ASK,
-                                    )
-                                    .unwrap_or(legs.cheap_ask)
-                                } else if let Some(maker_px) = maker_limit_price(
-                                    legs.cheap_bid,
-                                    legs.cheap_ask,
-                                    tick,
-                                    reversal_cfg.maker_improve_ticks,
-                                ) {
-                                    maker_px
-                                } else {
-                                    0.0
-                                };
-                                if hedge_px > 0.0 {
-                                    let hedge_payoff_cap =
-                                        bundle_state.payoff_if_fav_wins_after(qty, clip).max(0.0)
-                                            - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD;
-                                    let hedge_notional = (hedge_deficit_qty * hedge_px)
-                                        .min(reversal_cfg.max_load_usd)
-                                        .min(hedge_payoff_cap.max(0.0));
-                                    if hedge_notional >= reversal_cfg.min_order_usd {
-                                        proposed_hedge_qty = (hedge_notional / hedge_px)
-                                            .max(input.market.min_order_size());
-                                        let reason = format!(
-                                            "bundle_hedge leg={:?} level={} mode={} px={:.4} ask={:.4} qty={:.2} notional={:.2} required_share_fraction={:.2} projected_favorite_qty={:.2} projected_hedge_qty={:.2} hedge_deficit_qty={:.2} favorite_level_px={:.4} favorite_clip_usd={:.2}",
-                                            legs.cheap_leg,
-                                            level,
-                                            if hedge_aggressive { "taker_ioc" } else { "maker_post_only" },
-                                            hedge_px,
-                                            legs.cheap_ask,
-                                            proposed_hedge_qty,
-                                            proposed_hedge_qty * hedge_px,
-                                            required_hedge_fraction,
-                                            projected_favorite_qty,
-                                            projected_hedge_qty,
-                                            hedge_deficit_qty,
-                                            px,
-                                            clip,
-                                        );
-                                        pending_hedge_intent = Some((
-                                            build_reversal_hedge_intent(
-                                                &input.market,
-                                                legs.cheap_leg,
-                                                hedge_px,
-                                                proposed_hedge_qty,
-                                                &format!("bundle:{level}"),
-                                                hedge_aggressive,
-                                                reason,
-                                                input.now_ms,
-                                            ),
-                                            proposed_hedge_qty * hedge_px,
-                                        ));
-                                    }
-                                }
-                            }
-                            let gate_projected_hedge_qty =
-                                projected_bundle_hedge_qty + proposed_hedge_qty;
                             let bundle_gate = bundle_state.gate_favorite_add(
                                 &tail_cfg,
                                 legs.favorite_leg,
@@ -4023,7 +3942,7 @@ where
                                 qty,
                                 clip,
                                 legs.cheap_ask,
-                                gate_projected_hedge_qty,
+                                0.0,
                                 input.btc_regime.regime(),
                                 entry_policy.path_reversal_risk,
                                 late_fav_rearm_ready,
@@ -4031,18 +3950,6 @@ where
                             if !bundle_gate.allowed {
                                 notes.push(bundle_gate.reason);
                                 break;
-                            }
-                            if let Some((hedge_intent, hedge_notional)) = pending_hedge_intent {
-                                notes.push(hedge_intent.reason.clone());
-                                intents.push(hedge_intent);
-                                self.reserve_notional(
-                                    input.market.market_id(),
-                                    legs.cheap_leg,
-                                    hedge_notional,
-                                    input.now_ms,
-                                    ReservationClass::Hedge,
-                                );
-                                projected_bundle_hedge_qty += proposed_hedge_qty;
                             }
                             let reason = format!(
                                 "late_favorite climb leg={:?} level={} mode={} px={:.4} ask={:.4} entry_policy={} model_favorite={:.4} kelly_edge={:.4} kelly_clip_usd={:.2} kelly_scale={:.2} book_model_agreement={:.2} toxicity={:.2} near_strike_factor={:.2} clip_usd={:.2} lane_bankroll_usd={:.2} cumulative={:.2}/{:.2} elapsed_ms={elapsed_ms} remaining_ms={remaining_ms}; {}",
@@ -7143,6 +7050,14 @@ mod tests {
             .collect()
     }
 
+    fn all_quote_intents(decision: &StrategyDecision) -> Vec<&OrderIntent> {
+        match decision {
+            StrategyDecision::QuoteSet { intents, .. } => intents.iter().collect(),
+            StrategyDecision::Mixed { intents, .. } => intents.iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     #[test]
     fn climb_keeps_maker_rest_levels_when_level_zero_is_taker() {
         let mut cfg = LateFavoriteStrategyConfig::default();
@@ -7274,6 +7189,54 @@ mod tests {
             intents
                 .iter()
                 .map(|intent| intent.limit_price)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn model_confirmed_wing_does_not_emit_projected_bundle_hedge() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = MODEL_WING_MIN_FAVORITE_ASK;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.favorite_climb.taker_min_favorite_ask = 0.90;
+        cfg.favorite_climb.near_touch_min_favorite_ask = 0.85;
+        cfg.favorite_climb.kelly.min_edge = 0.01;
+        cfg.reversal_hedge.max_load_usd = 45.0;
+        cfg.reversal_hedge.min_order_usd = 1.0;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.70, 0.71, 0.29, 0.30);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            1.0,
+            203_000,
+        );
+
+        let decision = strategy.on_tick(input);
+        let all_intents = all_quote_intents(&decision);
+        assert!(
+            all_intents.iter().any(|intent| intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("late-fav-climb"))),
+            "expected favorite maker intent; decision={decision:?}"
+        );
+        assert!(
+            all_intents.iter().all(|intent| !intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("reversal-hedge-taker:bundle"))),
+            "must not buy a hedge against a projected favorite order; tags={:?}",
+            all_intents
+                .iter()
+                .map(|intent| intent.quote_level_tag.clone())
                 .collect::<Vec<_>>()
         );
     }
