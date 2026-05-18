@@ -211,7 +211,6 @@ pub struct ReversalHedgeSubsection {
     pub max_load_usd: Option<f64>,
     pub max_loss_if_favorite_loses_usd: Option<f64>,
     pub max_loss_if_favorite_loses_fraction: Option<f64>,
-    pub min_favorite_win_payoff_usd: Option<f64>,
     pub min_favorite_win_payoff_fraction: Option<f64>,
     pub max_favorite_exposure_fraction: Option<f64>,
     pub max_win_edge_spend_fraction: Option<f64>,
@@ -618,9 +617,6 @@ impl StrategyProfile {
                 max_loss_if_favorite_loses_fraction: r
                     .max_loss_if_favorite_loses_fraction
                     .unwrap_or(reversal_def.max_loss_if_favorite_loses_fraction),
-                min_favorite_win_payoff_usd: r
-                    .min_favorite_win_payoff_usd
-                    .unwrap_or(reversal_def.min_favorite_win_payoff_usd),
                 min_favorite_win_payoff_fraction: r
                     .min_favorite_win_payoff_fraction
                     .unwrap_or(reversal_def.min_favorite_win_payoff_fraction),

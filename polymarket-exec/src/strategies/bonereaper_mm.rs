@@ -39,7 +39,6 @@ const MARKET_WING_MIN_STRONGEST_MULTIPLIER: f64 = 0.75;
 const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.45;
 const WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD: f64 = 10.0;
 const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 3.0;
-const WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD: f64 = 1.0;
 const SUB90_LATE_FAV_ENTRY_POLICY_SIZE_MULTIPLIER: f64 = 1.25;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -397,9 +396,8 @@ pub struct ReversalHedgeConfig {
     /// is met, subject to max_load and favorite-win payoff guards.
     pub max_loss_if_favorite_loses_usd: f64,
     pub max_loss_if_favorite_loses_fraction: f64,
-    /// Preserve meaningful upside if the favorite wins. This prevents cheap
-    /// tail hedges from consuming the whole directional edge.
-    pub min_favorite_win_payoff_usd: f64,
+    /// Preserve a fraction of favorite-win upside so hedging does not consume
+    /// the whole directional edge.
     pub min_favorite_win_payoff_fraction: f64,
     /// Target fraction of filled late-favorite shares to hedge when reversal
     /// risk is present. Multiplied by the live reversal score, then capped by
@@ -433,7 +431,6 @@ impl Default for ReversalHedgeConfig {
             max_load_usd: 3.0,
             max_loss_if_favorite_loses_usd: 10.0,
             max_loss_if_favorite_loses_fraction: 0.08,
-            min_favorite_win_payoff_usd: WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD,
             min_favorite_win_payoff_fraction: 0.0,
             max_favorite_exposure_fraction: 0.50,
             max_win_edge_spend_fraction: 0.45,
@@ -1463,7 +1460,6 @@ impl LateFavPositionPlan {
         max_hedge_load_usd: f64,
         max_loss_if_favorite_loses_usd: f64,
         max_loss_if_favorite_loses_fraction: f64,
-        min_favorite_win_payoff_usd: f64,
         min_favorite_win_payoff_fraction: f64,
         regime: Option<BtcRegime>,
         path_reversal_risk: f64,
@@ -1501,9 +1497,8 @@ impl LateFavPositionPlan {
         let target_hedge_share_fraction =
             position_hedge_share_fraction(hedge_ask, regime, path_reversal_risk);
         let favorite_win_upside = favorite_qty * (1.0 - favorite_avg_price);
-        let min_favorite_win_payoff = min_favorite_win_payoff_usd
-            .max(favorite_win_upside * min_favorite_win_payoff_fraction.clamp(0.0, 1.0))
-            .max(0.0);
+        let min_favorite_win_payoff =
+            (favorite_win_upside * min_favorite_win_payoff_fraction.clamp(0.0, 1.0)).max(0.0);
         let positive_payoff_cap = (favorite_win_upside - min_favorite_win_payoff).max(0.0);
         let target_loss_budget_usd = max_loss_if_favorite_loses_usd
             .max(0.0)
@@ -3369,10 +3364,8 @@ fn reversal_hedge_cap_usd(
     .clamp(0.0, 1.0);
     let target_hedge_shares = late_fav_qty * target_share_fraction;
     let hedge_notional = target_hedge_shares * hedge_ask;
-    let min_favorite_win_payoff = cfg
-        .min_favorite_win_payoff_usd
-        .max(favorite_win_upside * cfg.min_favorite_win_payoff_fraction.clamp(0.0, 1.0))
-        .max(0.0);
+    let min_favorite_win_payoff =
+        (favorite_win_upside * cfg.min_favorite_win_payoff_fraction.clamp(0.0, 1.0)).max(0.0);
     let positive_payoff_cap = (favorite_win_upside - min_favorite_win_payoff).max(0.0);
 
     cfg.max_load_usd
@@ -4581,7 +4574,6 @@ where
                 reversal_cfg.max_load_usd,
                 reversal_cfg.max_loss_if_favorite_loses_usd,
                 reversal_cfg.max_loss_if_favorite_loses_fraction,
-                reversal_cfg.min_favorite_win_payoff_usd,
                 reversal_cfg.min_favorite_win_payoff_fraction,
                 input.btc_regime.regime(),
                 path_reversal_risk,
@@ -6560,7 +6552,7 @@ mod tests {
 
         let cap = reversal_hedge_cap_usd(&cfg, 20.0, 0.90, 0.30, 1.0);
 
-        assert!((cap - 1.0).abs() < 1e-9);
+        assert!((cap - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -6568,27 +6560,26 @@ mod tests {
         let cfg = ReversalHedgeConfig {
             max_load_usd: 75.0,
             max_favorite_exposure_fraction: 1.0,
-            min_favorite_win_payoff_usd: 15.0,
             min_favorite_win_payoff_fraction: 0.40,
             ..ReversalHedgeConfig::default()
         };
 
         let cap = reversal_hedge_cap_usd(&cfg, 172.2, 0.82, 0.20, 1.0);
 
-        assert!((cap - 15.996).abs() < 0.01);
+        assert!((cap - 18.60).abs() < 0.01);
     }
 
     #[test]
     fn position_hedge_plan_uses_worst_case_loss_budget() {
         let cap = LateFavPositionPlan::for_position(
-            167.2, 131.71, 123.2, 27.63, 0.224, 45.0, 15.0, 0.08, 1.0, 0.0, None, 0.0,
+            167.2, 131.71, 123.2, 27.63, 0.224, 45.0, 15.0, 0.08, 0.0, None, 0.0,
         )
         .remaining_hedge_budget_usd;
 
-        assert!((6.5..7.0).contains(&cap));
+        assert!((7.3..7.5).contains(&cap));
 
         let covered = LateFavPositionPlan::for_position(
-            167.2, 131.71, 160.0, 35.90, 0.224, 45.0, 15.0, 0.08, 1.0, 0.0, None, 0.0,
+            167.2, 131.71, 160.0, 35.90, 0.224, 45.0, 15.0, 0.08, 0.0, None, 0.0,
         )
         .remaining_hedge_budget_usd;
         assert!(covered < 1.0);
@@ -6597,7 +6588,7 @@ mod tests {
     #[test]
     fn position_hedge_plan_prefers_share_target_when_tail_is_cheap() {
         let plan = LateFavPositionPlan::for_position(
-            300.0, 225.0, 0.0, 0.0, 0.02, 45.0, 15.0, 0.08, 1.0, 0.0, None, 0.0,
+            300.0, 225.0, 0.0, 0.0, 0.02, 45.0, 15.0, 0.08, 0.0, None, 0.0,
         );
 
         assert!((plan.remaining_hedge_budget_usd - 5.7).abs() < 1e-9);
@@ -6606,7 +6597,7 @@ mod tests {
     #[test]
     fn position_hedge_plan_preserves_meaningful_favorite_upside() {
         let plan = LateFavPositionPlan::for_position(
-            172.2, 141.19, 358.1, 29.11, 0.081, 45.0, 15.0, 0.08, 15.0, 0.40, None, 0.0,
+            172.2, 141.19, 358.1, 29.11, 0.081, 45.0, 15.0, 0.08, 0.40, None, 0.0,
         );
 
         assert!(plan.remaining_hedge_budget_usd < 1.0);
@@ -7013,7 +7004,6 @@ mod tests {
         assert_eq!(reversal.max_load_usd, 45.0);
         assert_eq!(reversal.max_loss_if_favorite_loses_usd, 15.0);
         assert_eq!(reversal.max_loss_if_favorite_loses_fraction, 0.08);
-        assert_eq!(reversal.min_favorite_win_payoff_usd, 15.0);
         assert_eq!(reversal.min_favorite_win_payoff_fraction, 0.40);
         assert_eq!(reversal.max_hedge_ask, 0.30);
         assert_eq!(reversal.max_favorite_exposure_fraction, 0.70);
