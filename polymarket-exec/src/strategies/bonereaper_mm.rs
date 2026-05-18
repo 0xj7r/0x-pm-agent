@@ -1328,6 +1328,8 @@ impl LateFavBundleState {
         proposed_hedge_qty: f64,
         regime: Option<BtcRegime>,
         path_reversal_risk: f64,
+        book_model_agreement: BookModelAgreement,
+        near_strike_fragility: NearStrikeFragility,
         late_fav_rearm_ready: bool,
     ) -> BundleOrderGate {
         if self.side_flip && proposed_leg != self.dominant_fav_leg && !late_fav_rearm_ready {
@@ -1370,6 +1372,8 @@ impl LateFavBundleState {
                     hedge_ask,
                     regime,
                     path_reversal_risk,
+                    book_model_agreement,
+                    near_strike_fragility,
                 );
                 let projected_hedge_share_coverage = self.hedge_share_coverage_after_favorite_add(
                     proposed_qty,
@@ -1463,6 +1467,8 @@ impl LateFavPositionPlan {
         min_favorite_win_payoff_fraction: f64,
         regime: Option<BtcRegime>,
         path_reversal_risk: f64,
+        book_model_agreement: BookModelAgreement,
+        near_strike_fragility: NearStrikeFragility,
     ) -> Self {
         if favorite_qty <= 0.0 || favorite_spend_usd <= 0.0 || hedge_ask <= 0.0 || hedge_ask >= 1.0
         {
@@ -1494,8 +1500,13 @@ impl LateFavPositionPlan {
             };
         }
 
-        let target_hedge_share_fraction =
-            position_hedge_share_fraction(hedge_ask, regime, path_reversal_risk);
+        let target_hedge_share_fraction = position_hedge_share_fraction(
+            hedge_ask,
+            regime,
+            path_reversal_risk,
+            book_model_agreement,
+            near_strike_fragility,
+        );
         let favorite_win_upside = favorite_qty * (1.0 - favorite_avg_price);
         let min_favorite_win_payoff =
             (favorite_win_upside * min_favorite_win_payoff_fraction.clamp(0.0, 1.0)).max(0.0);
@@ -1545,6 +1556,8 @@ fn required_hedge_share_fraction(
     hedge_ask: f64,
     regime: Option<BtcRegime>,
     path_reversal_risk: f64,
+    book_model_agreement: BookModelAgreement,
+    near_strike_fragility: NearStrikeFragility,
 ) -> f64 {
     if favorite_price <= 0.0 || !favorite_price.is_finite() {
         return 1.0;
@@ -1577,13 +1590,18 @@ fn required_hedge_share_fraction(
     } else {
         0.0
     };
-    (base + regime_add + risk_add).clamp(0.0, 1.0)
+    let base_fraction = (base + regime_add + risk_add).clamp(0.0, 1.0);
+    (base_fraction
+        * hedge_share_risk_adj_multiplier(hedge_ask, book_model_agreement, near_strike_fragility))
+    .clamp(0.0, 1.0)
 }
 
 fn position_hedge_share_fraction(
     hedge_ask: f64,
     regime: Option<BtcRegime>,
     path_reversal_risk: f64,
+    book_model_agreement: BookModelAgreement,
+    near_strike_fragility: NearStrikeFragility,
 ) -> f64 {
     if hedge_ask <= 0.0 || !hedge_ask.is_finite() {
         return 0.0;
@@ -1613,7 +1631,37 @@ fn position_hedge_share_fraction(
     } else {
         0.0
     };
-    (base + regime_add + risk_add).clamp(0.0, 1.0)
+    let base_fraction = (base + regime_add + risk_add).clamp(0.0, 1.0);
+    (base_fraction
+        * hedge_share_risk_adj_multiplier(hedge_ask, book_model_agreement, near_strike_fragility))
+    .clamp(0.0, 1.0)
+}
+
+fn hedge_share_risk_adj_multiplier(
+    hedge_ask: f64,
+    book_model_agreement: BookModelAgreement,
+    near_strike_fragility: NearStrikeFragility,
+) -> f64 {
+    let agreement = book_model_agreement.agreement.clamp(0.0, 1.0);
+    let toxicity = book_model_agreement.toxicity_score.clamp(0.0, 1.0);
+
+    let mut mult = (0.45 + 0.55 * agreement).clamp(0.45, 1.0);
+    mult *= (1.0 - 0.30 * toxicity).clamp(0.65, 1.0);
+
+    if hedge_ask > 0.10 {
+        let expensive = (hedge_ask - 0.10) / (WING_REVERSAL_HEDGE_MAX_ASK - 0.10);
+        let expensive = expensive.clamp(0.0, 1.0);
+        mult *= 1.0 - 0.30 * expensive;
+    }
+
+    if near_strike_fragility.in_fragile_zone {
+        mult *= (1.0 + (1.0 - near_strike_fragility.fragility_factor).clamp(0.0, 1.0) * 0.40)
+            .clamp(1.0, 1.40);
+    } else {
+        mult *= 0.95;
+    }
+
+    mult.clamp(0.25, 1.2)
 }
 
 fn read_legs(snapshot: &PairedMarketSnapshot) -> Option<LegQuotes> {
@@ -4046,6 +4094,8 @@ where
                                 0.0,
                                 input.btc_regime.regime(),
                                 entry_policy.path_reversal_risk,
+                                directional_conviction.book_model_agreement,
+                                directional_conviction.near_strike_fragility,
                                 late_fav_rearm_ready,
                             );
                             if !bundle_gate.allowed {
@@ -4577,6 +4627,8 @@ where
                 reversal_cfg.min_favorite_win_payoff_fraction,
                 input.btc_regime.regime(),
                 path_reversal_risk,
+                directional_conviction.book_model_agreement,
+                directional_conviction.near_strike_fragility,
             );
             if position_plan.should_hedge(tail_cfg.min_order_usd) {
                 let max_hedge_price =
@@ -6572,14 +6624,38 @@ mod tests {
     #[test]
     fn position_hedge_plan_uses_worst_case_loss_budget() {
         let cap = LateFavPositionPlan::for_position(
-            167.2, 131.71, 123.2, 27.63, 0.224, 45.0, 15.0, 0.08, 0.0, None, 0.0,
+            167.2,
+            131.71,
+            123.2,
+            27.63,
+            0.224,
+            45.0,
+            15.0,
+            0.08,
+            0.0,
+            None,
+            0.0,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
         )
         .remaining_hedge_budget_usd;
 
         assert!((7.3..7.5).contains(&cap));
 
         let covered = LateFavPositionPlan::for_position(
-            167.2, 131.71, 160.0, 35.90, 0.224, 45.0, 15.0, 0.08, 0.0, None, 0.0,
+            167.2,
+            131.71,
+            160.0,
+            35.90,
+            0.224,
+            45.0,
+            15.0,
+            0.08,
+            0.0,
+            None,
+            0.0,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
         )
         .remaining_hedge_budget_usd;
         assert!(covered < 1.0);
@@ -6588,16 +6664,48 @@ mod tests {
     #[test]
     fn position_hedge_plan_prefers_share_target_when_tail_is_cheap() {
         let plan = LateFavPositionPlan::for_position(
-            300.0, 225.0, 0.0, 0.0, 0.02, 45.0, 15.0, 0.08, 0.0, None, 0.0,
+            300.0,
+            225.0,
+            0.0,
+            0.0,
+            0.02,
+            45.0,
+            15.0,
+            0.08,
+            0.0,
+            None,
+            0.0,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
         );
 
-        assert!((plan.remaining_hedge_budget_usd - 5.7).abs() < 1e-9);
+        let target_fraction = position_hedge_share_fraction(
+            0.02,
+            None,
+            0.0,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
+        );
+        let target_budget = (300.0 * target_fraction * 0.02).min(45.0);
+        assert!((plan.remaining_hedge_budget_usd - target_budget).abs() < 1e-9);
     }
 
     #[test]
     fn position_hedge_plan_preserves_meaningful_favorite_upside() {
         let plan = LateFavPositionPlan::for_position(
-            172.2, 141.19, 358.1, 29.11, 0.081, 45.0, 15.0, 0.08, 0.40, None, 0.0,
+            172.2,
+            141.19,
+            358.1,
+            29.11,
+            0.081,
+            45.0,
+            15.0,
+            0.08,
+            0.40,
+            None,
+            0.0,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
         );
 
         assert!(plan.remaining_hedge_budget_usd < 1.0);
@@ -6606,13 +6714,61 @@ mod tests {
     #[test]
     fn position_hedge_share_target_prefers_cheaper_coverage() {
         assert!(
-            position_hedge_share_fraction(0.02, Some(BtcRegime::DirectionalSmooth), 0.0)
-                > position_hedge_share_fraction(0.25, Some(BtcRegime::DirectionalSmooth), 0.0)
+            position_hedge_share_fraction(
+                0.02,
+                Some(BtcRegime::DirectionalSmooth),
+                0.0,
+                BookModelAgreement::default(),
+                NearStrikeFragility::default(),
+            ) > position_hedge_share_fraction(
+                0.25,
+                Some(BtcRegime::DirectionalSmooth),
+                0.0,
+                BookModelAgreement::default(),
+                NearStrikeFragility::default(),
+            )
         );
         assert!(
-            position_hedge_share_fraction(0.25, Some(BtcRegime::Whipsaw), 0.50)
-                > position_hedge_share_fraction(0.25, Some(BtcRegime::DirectionalSmooth), 0.0)
+            position_hedge_share_fraction(
+                0.25,
+                Some(BtcRegime::Whipsaw),
+                0.50,
+                BookModelAgreement::default(),
+                NearStrikeFragility::default(),
+            ) > position_hedge_share_fraction(
+                0.25,
+                Some(BtcRegime::DirectionalSmooth),
+                0.0,
+                BookModelAgreement::default(),
+                NearStrikeFragility::default(),
+            )
         );
+    }
+
+    #[test]
+    fn required_hedge_share_dynamically_penalizes_expensive_hedges_with_poor_agreement() {
+        let good_agreement = required_hedge_share_fraction(
+            0.92,
+            0.22,
+            Some(BtcRegime::DirectionalSmooth),
+            0.30,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
+        );
+        let poor_agreement = required_hedge_share_fraction(
+            0.92,
+            0.22,
+            Some(BtcRegime::DirectionalSmooth),
+            0.30,
+            BookModelAgreement {
+                agreement: 0.10,
+                toxicity_score: 0.75,
+                ..BookModelAgreement::default()
+            },
+            NearStrikeFragility::default(),
+        );
+
+        assert!(poor_agreement < good_agreement);
     }
 
     #[test]
@@ -6763,6 +6919,8 @@ mod tests {
             0.0,
             Some(BtcRegime::Whipsaw),
             0.60,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             false,
         );
 
@@ -6801,6 +6959,8 @@ mod tests {
             0.0,
             Some(BtcRegime::Whipsaw),
             0.60,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             true,
         );
 
@@ -6838,6 +6998,8 @@ mod tests {
             0.0,
             Some(BtcRegime::Whipsaw),
             0.60,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             true,
         );
 
@@ -6877,6 +7039,8 @@ mod tests {
             0.0,
             Some(BtcRegime::Whipsaw),
             0.55,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             false,
         );
 
@@ -6911,6 +7075,8 @@ mod tests {
             0.0,
             Some(BtcRegime::DirectionalSmooth),
             0.10,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             false,
         );
 
@@ -6954,6 +7120,8 @@ mod tests {
             0.0,
             Some(BtcRegime::Whipsaw),
             0.55,
+            BookModelAgreement::default(),
+            NearStrikeFragility::default(),
             false,
         );
 
