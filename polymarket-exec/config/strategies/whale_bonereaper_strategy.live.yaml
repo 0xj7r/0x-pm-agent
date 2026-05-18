@@ -190,6 +190,11 @@ late_favorite:
     # while still preserving positive favorite-win payoff.
     max_loss_if_favorite_loses_usd: 15.0
     max_loss_if_favorite_loses_fraction: 0.08
+    # Do not let hedging consume the whole directional edge. For example, a
+    # favorite block with ~$31 gross win-upside must retain at least $15;
+    # larger blocks retain at least 40% of gross win-upside.
+    min_favorite_win_payoff_usd: 15.0
+    min_favorite_win_payoff_fraction: 0.40
     # Share-count target, not spend target: at high reversal score, try to own
     # about 70 opposite-leg hedge shares per 100 filled favorite shares, while
     # payoff guards keep the favorite-win bundle positive.
