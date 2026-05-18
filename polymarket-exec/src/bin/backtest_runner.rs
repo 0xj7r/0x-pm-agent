@@ -908,7 +908,7 @@ fn profile_requires_btc_ticks(profile: &StrategyProfile) -> bool {
 }
 
 fn required_event_types(cli: &Cli, profile: &StrategyProfile) -> BTreeSet<&'static str> {
-    let mut required = BTreeSet::from(["trade", "book_delta", "market_meta"]);
+    let mut required = BTreeSet::from(["book_delta", "market_meta"]);
     if profile_requires_btc_ticks(profile) {
         required.insert("btc_tick");
     }
@@ -1820,6 +1820,34 @@ mod tests {
         assert!(event_matches_market_filter(&event("btc_ref"), &filter));
         assert!(event_matches_market_filter(&event("reference"), &filter));
         assert!(!event_matches_market_filter(&event("eth_5m"), &filter));
+    }
+
+    #[test]
+    fn required_event_types_allow_quiet_markets_without_trades() {
+        let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config/strategies/archive/btc_5m_paired_mm.live.yaml");
+        let cli = Cli::parse_from([
+            "backtest_runner",
+            "--window-start",
+            "2026-05-15T12:20:00Z",
+            "--window-end",
+            "2026-05-15T12:25:00Z",
+            "--strategy-profile",
+            profile_path.to_str().unwrap(),
+            "--input-prefix",
+            "/tmp/input",
+            "--output-prefix",
+            "/tmp/output",
+            "--git-rev",
+            "0123456789abcdef0123456789abcdef01234567",
+        ]);
+        let profile = StrategyProfile::load(&profile_path).unwrap();
+
+        let required = required_event_types(&cli, &profile);
+
+        assert!(required.contains("book_delta"));
+        assert!(required.contains("market_meta"));
+        assert!(!required.contains("trade"));
     }
 
     #[test]

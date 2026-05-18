@@ -360,6 +360,9 @@ fn classify_data_quality(summary: &mut DataQualitySummary, cfg: &DataQualityConf
             .warnings
             .push(format!("invalid_size_count={}", summary.invalid_size_count));
     }
+    if summary.trade_event_count == 0 {
+        summary.warnings.push("missing_trade_events".to_string());
+    }
     if summary.max_book_gap_ns > cfg.book_gap_warn_ns {
         summary
             .warnings
@@ -676,5 +679,29 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("crossed_book_persistent_count=1")));
+    }
+
+    #[test]
+    fn quality_warns_on_missing_trade_events() {
+        let events = vec![
+            meta(),
+            book("UP", "buy", "0.49", 2),
+            book("UP", "sell", "0.51", 3),
+            book("DOWN", "buy", "0.48", 4),
+            book("DOWN", "sell", "0.52", 5),
+            Event {
+                event_type: EventType::Resolution,
+                raw: json!({ "winning_outcome": "Up" }),
+                ..event(EventType::Resolution, 6)
+            },
+        ];
+
+        let summary = summarize_data_quality("w", &events, &DataQualityConfig::default());
+
+        assert_eq!(summary.status, DataQualityStatus::Warn);
+        assert!(summary.reject_reasons.is_empty());
+        assert!(summary
+            .warnings
+            .contains(&"missing_trade_events".to_string()));
     }
 }
