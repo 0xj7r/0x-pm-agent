@@ -23,12 +23,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use arrow::array::{
-    Array, BinaryArray, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    UInt32Array,
+    Array, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
+    UInt32Array, UInt64Array,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use walkdir::WalkDir;
 
 use crate::collector::partition::event_type_str;
@@ -273,14 +274,7 @@ fn record_batch_to_events(
         let source_str = string_at(batch, source_col, row).context("source value required")?;
         let raw = if replay_requires_raw(event_type) {
             raw_col
-                .and_then(|i| {
-                    if let Some(s) = string_at(batch, i, row) {
-                        Some(s)
-                    } else {
-                        bytes_at(batch, i, row).map(|b| String::from_utf8_lossy(&b).into_owned())
-                    }
-                })
-                .map(|s| serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))
+                .map(|i| raw_value_at(batch.column(i).as_ref(), row))
                 .unwrap_or(Value::Null)
         } else {
             Value::Null
@@ -305,6 +299,101 @@ fn record_batch_to_events(
     Ok(events)
 }
 
+fn raw_value_at(array: &dyn Array, row: usize) -> Value {
+    if array.is_null(row) {
+        return Value::Null;
+    }
+    if let Some(s) = string_scalar_at(array, row) {
+        return serde_json::from_str::<Value>(&s).unwrap_or(Value::Null);
+    }
+    if let Some(bytes) = bytes_scalar_at(array, row) {
+        let text = String::from_utf8_lossy(&bytes);
+        return serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+    }
+    arrow_value_at(array, row)
+}
+
+fn arrow_value_at(array: &dyn Array, row: usize) -> Value {
+    if array.is_null(row) {
+        return Value::Null;
+    }
+    if let Some(s) = string_scalar_at(array, row) {
+        return Value::String(s);
+    }
+    if let Some(bytes) = bytes_scalar_at(array, row) {
+        return Value::String(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Value::Bool(a.value(row));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return Value::Number(Number::from(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return Value::Number(Number::from(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Value::Number(Number::from(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Value::Number(Number::from(a.value(row)));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
+        return Number::from_f64(a.value(row) as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+        return Number::from_f64(a.value(row))
+            .map(Value::Number)
+            .unwrap_or(Value::Null);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StructArray>() {
+        let mut object = Map::new();
+        for (field, column) in a.fields().iter().zip(a.columns()) {
+            object.insert(field.name().clone(), arrow_value_at(column.as_ref(), row));
+        }
+        return Value::Object(object);
+    }
+    if let Some(a) = array.as_any().downcast_ref::<ListArray>() {
+        let values = a.value(row);
+        return Value::Array(
+            (0..values.len())
+                .map(|idx| arrow_value_at(values.as_ref(), idx))
+                .collect(),
+        );
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeListArray>() {
+        let values = a.value(row);
+        return Value::Array(
+            (0..values.len())
+                .map(|idx| arrow_value_at(values.as_ref(), idx))
+                .collect(),
+        );
+    }
+    Value::Null
+}
+
+fn string_scalar_at(array: &dyn Array, row: usize) -> Option<String> {
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    None
+}
+
+fn bytes_scalar_at(array: &dyn Array, row: usize) -> Option<Vec<u8>> {
+    if let Some(a) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Some(a.value(row).to_vec());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        return Some(a.value(row).to_vec());
+    }
+    None
+}
+
 fn string_at(batch: &arrow::record_batch::RecordBatch, col: usize, row: usize) -> Option<String> {
     let arr = batch.column(col);
     if arr.is_null(row) {
@@ -315,20 +404,6 @@ fn string_at(batch: &arrow::record_batch::RecordBatch, col: usize, row: usize) -
     }
     if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
         return Some(a.value(row).to_string());
-    }
-    None
-}
-
-fn bytes_at(batch: &arrow::record_batch::RecordBatch, col: usize, row: usize) -> Option<Vec<u8>> {
-    let arr = batch.column(col);
-    if arr.is_null(row) {
-        return None;
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<BinaryArray>() {
-        return Some(a.value(row).to_vec());
-    }
-    if let Some(a) = arr.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Some(a.value(row).to_vec());
     }
     None
 }
@@ -643,6 +718,69 @@ mod tests {
         assert_eq!(
             read[0].raw.get("end_time_ms").and_then(|v| v.as_i64()),
             Some(1_777_788_300_000i64)
+        );
+    }
+
+    #[test]
+    fn raw_value_at_decodes_arrow_struct_metadata() {
+        use arrow::array::{ArrayRef, ListBuilder, StringBuilder, StructArray};
+        use arrow::datatypes::{DataType, Field, Fields};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let mut assets = ListBuilder::new(StringBuilder::new());
+        assets.values().append_value("up-token");
+        assets.values().append_value("down-token");
+        assets.append(true);
+        let raw = StructArray::from(vec![
+            (
+                Arc::new(Field::new(
+                    "asset_ids",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                )),
+                Arc::new(assets.finish()) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("start_time_ms", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![Some(1_778_617_800_000i64)])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("source", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("telonex_markets")])) as ArrayRef,
+            ),
+        ]);
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "raw",
+            DataType::Struct(Fields::from(vec![
+                Field::new(
+                    "asset_ids",
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    true,
+                ),
+                Field::new("start_time_ms", DataType::Int64, true),
+                Field::new("source", DataType::Utf8, true),
+            ])),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(raw)]).unwrap();
+
+        let value = raw_value_at(batch.column(0).as_ref(), 0);
+
+        assert_eq!(
+            value.get("asset_ids").and_then(|value| value.as_array()),
+            Some(&vec![
+                Value::String("up-token".into()),
+                Value::String("down-token".into())
+            ])
+        );
+        assert_eq!(
+            value.get("start_time_ms").and_then(|value| value.as_i64()),
+            Some(1_778_617_800_000i64)
+        );
+        assert_eq!(
+            value.get("source").and_then(|value| value.as_str()),
+            Some("telonex_markets")
         );
     }
 

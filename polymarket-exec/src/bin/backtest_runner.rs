@@ -661,23 +661,38 @@ fn group_events_into_windows(events: Vec<Event>, cli: &Cli) -> BTreeMap<String, 
 }
 
 fn join_market_metadata(
-    mut events: Vec<Event>,
+    events: Vec<Event>,
     metadata_prefix: &PathBuf,
     market_filter: &str,
 ) -> Result<Vec<Event>> {
     let market_filter = parse_market_filter(market_filter);
-    let needed_slugs = discovered_market_slugs(&events, &market_filter);
+    let metadata_events = read_local_filtered(metadata_prefix, None)
+        .with_context(|| format!("reading metadata prefix {}", metadata_prefix.display()))?;
+    merge_market_metadata_events(
+        events,
+        metadata_events,
+        &market_filter,
+        &metadata_prefix.display().to_string(),
+    )
+}
+
+fn merge_market_metadata_events(
+    mut events: Vec<Event>,
+    metadata_events: Vec<Event>,
+    market_filter: &[String],
+    metadata_label: &str,
+) -> Result<Vec<Event>> {
+    let needed_slugs = discovered_market_slugs(&events, market_filter);
     if needed_slugs.is_empty() {
         return Ok(events);
     }
-    let metadata_events = read_local_filtered(metadata_prefix, None)
-        .with_context(|| format!("reading metadata prefix {}", metadata_prefix.display()))?;
     let mut matched_slugs = BTreeSet::new();
+    let mut matched_metadata = Vec::new();
     for event in metadata_events {
         if event.event_type != EventType::MarketMeta {
             continue;
         }
-        if !event_matches_market_filter(&event, &market_filter) {
+        if !event_matches_market_filter(&event, market_filter) {
             continue;
         }
         let Some(slug) = event.market_slug.as_deref() else {
@@ -685,7 +700,7 @@ fn join_market_metadata(
         };
         if needed_slugs.contains(slug) {
             matched_slugs.insert(slug.to_string());
-            events.push(event);
+            matched_metadata.push(normalize_market_meta_timestamp(event));
         }
     }
     let missing = needed_slugs
@@ -696,12 +711,39 @@ fn join_market_metadata(
     if !missing.is_empty() {
         anyhow::bail!(
             "metadata prefix {} is missing market_meta for {} discovered market slugs; sample: {}",
-            metadata_prefix.display(),
+            metadata_label,
             needed_slugs.len() - matched_slugs.len(),
             missing.join(", ")
         );
     }
+    events.retain(|event| {
+        !(event.event_type == EventType::MarketMeta
+            && event
+                .market_slug
+                .as_deref()
+                .is_some_and(|slug| matched_slugs.contains(slug)))
+    });
+    events.extend(matched_metadata);
     Ok(dedupe_and_sort(events))
+}
+
+fn normalize_market_meta_timestamp(mut event: Event) -> Event {
+    if event.event_type != EventType::MarketMeta {
+        return event;
+    }
+    let start_time_ms = raw_i64(&event.raw, &["start_time_ms", "window_start_ms"]).or_else(|| {
+        event
+            .market_slug
+            .as_deref()
+            .and_then(|slug| infer_market_window_from_slug(slug, &event.market_type))
+            .map(|bounds| bounds.start_ns / 1_000_000)
+    });
+    if let Some(start_time_ms) = start_time_ms {
+        let start_ns = start_time_ms.saturating_mul(1_000_000);
+        event.ts_ns = start_ns;
+        event.received_ns = start_ns;
+    }
+    event
 }
 
 fn filter_events_to_replay_window(events: Vec<Event>, start_ns: i64, end_ns: i64) -> Vec<Event> {
@@ -2055,6 +2097,50 @@ mod tests {
             "btc_5m",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn joined_market_metadata_replaces_synthetic_meta_at_market_start() {
+        let mut synthetic = market_event(EventType::MarketMeta);
+        synthetic.received_ns = 1_778_544_000_000_000_000;
+        synthetic.ts_ns = synthetic.received_ns;
+        synthetic.raw = json!({
+            "source": "resolved_raw_replay_market_meta",
+            "start_time_ms": 1_778_617_800_000i64,
+            "end_time_ms": 1_778_618_100_000i64,
+            "strike": 103000.0,
+        });
+        let mut trade = market_event(EventType::Trade);
+        trade.received_ns = 1_778_617_900_000_000_000;
+        trade.ts_ns = trade.received_ns;
+        let mut metadata = market_event(EventType::MarketMeta);
+        metadata.received_ns = 1_778_544_000_000_000_000;
+        metadata.ts_ns = metadata.received_ns;
+        metadata.raw = json!({
+            "source": "telonex_markets",
+            "start_time_ms": 1_778_617_800_000i64,
+            "end_time_ms": 1_778_618_100_000i64,
+        });
+
+        let merged = merge_market_metadata_events(
+            vec![synthetic, trade.clone()],
+            vec![metadata],
+            &["btc_5m".to_string()],
+            "test-metadata",
+        )
+        .unwrap();
+        let metas = merged
+            .iter()
+            .filter(|event| event.event_type == EventType::MarketMeta)
+            .collect::<Vec<_>>();
+
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].received_ns, 1_778_617_800_000_000_000);
+        assert_eq!(
+            metas[0].raw.get("source").and_then(|value| value.as_str()),
+            Some("telonex_markets")
+        );
+        assert!(merged.iter().any(|event| event == &trade));
     }
 
     #[test]
