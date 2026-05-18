@@ -3441,7 +3441,7 @@ impl<S: Strategy> Runtime<S> {
                     self.event_log
                         .push(adjustment.to_event("reserved inventory for submit")),
                 );
-                let managed = ManagedOrder {
+                let mut managed = ManagedOrder {
                     reserved_cash_usd: if matches!(intent.side, crate::types::TradeSide::Buy) {
                         intent.notional_usd()
                     } else {
@@ -3453,36 +3453,115 @@ impl<S: Strategy> Runtime<S> {
                     intent: intent.clone(),
                 };
                 if let Some(order_store) = self.order_store.as_mut() {
-                    let record = OrderRecord::from_intent(
-                        self.run_id.clone(),
-                        &managed.intent,
-                        self.strategy.name(),
-                    );
-                    if let Err(error) = order_store.insert(record) {
-                        warn!(
-                            run_id = %self.run_id,
-                            error = ?error,
-                            client_order_id = %intent.client_order_id,
-                            "failed to persist pending submit intent; releasing reservation"
+                    let mut retries_remaining = 1u8;
+                    let mut persisted = false;
+                    while !persisted {
+                        let record = OrderRecord::from_intent(
+                            self.run_id.clone(),
+                            &intent,
+                            self.strategy.name(),
                         );
-                        if let Some(release) = self
-                            .inventory
-                            .release_reservation(&intent.client_order_id, now_ms)
-                        {
-                            outcome.push_event(self.event_log.push(release.to_event(
-                                "released reservation after durable persistence failure",
-                            )));
+                        match order_store.insert(record) {
+                            Ok(()) => {
+                                persisted = true;
+                            }
+                            Err(error) => {
+                                let mut retriable_conflict = false;
+                                if retries_remaining > 0 {
+                                    if let Ok(Some(existing)) =
+                                        order_store.get(&intent.client_order_id)
+                                    {
+                                        if existing.status.is_terminal() {
+                                            let old_id = intent.client_order_id.clone();
+                                            if let Some(release) =
+                                                self.inventory.release_reservation(&old_id, now_ms)
+                                            {
+                                                outcome.push_event(self.event_log.push(
+                                                    release.to_event(
+                                                        "released stale reservation for terminal coid conflict",
+                                                    ),
+                                                ));
+                                            }
+                                            retries_remaining = retries_remaining.saturating_sub(1);
+                                            intent.client_order_id = ClientOrderId::from(format!(
+                                                "{old_id}:retry:{now_ms}"
+                                            ));
+                                            managed.intent = intent.clone();
+                                            match self.inventory.reserve_for_order(&intent) {
+                                                Ok(retry_adjustment) => {
+                                                    outcome.push_event(self.event_log.push(
+                                                        retry_adjustment.to_event(
+                                                            "reserved inventory for submit",
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(source) => {
+                                                    warn!(
+                                                        run_id = %self.run_id,
+                                                        error = ?source,
+                                                        client_order_id = %intent.client_order_id,
+                                                        "retry coid reservation failed after terminal store conflict"
+                                                    );
+                                                    outcome.push_event(
+                                                        self.event_log.push(
+                                                            EventRecord::new(
+                                                                EventCategory::Runtime,
+                                                                now_ms,
+                                                                "order not accepted due to inventory allocation failure",
+                                                            )
+                                                            .with_client_order(
+                                                                intent.client_order_id.clone(),
+                                                            ),
+                                                        ),
+                                                    );
+                                                    return outcome;
+                                                }
+                                            }
+                                            retriable_conflict = true;
+                                            outcome.push_event(self.event_log.push(
+                                                    EventRecord::new(
+                                                        EventCategory::Runtime,
+                                                        now_ms,
+                                                        "order store conflict on terminal id; retrying with fresh client_order_id",
+                                                    )
+                                                    .with_client_order(old_id),
+                                            ));
+                                        }
+                                    }
+                                }
+                                if retriable_conflict {
+                                    continue;
+                                }
+
+                                warn!(
+                                    run_id = %self.run_id,
+                                    error = ?error,
+                                    client_order_id = %intent.client_order_id,
+                                    "failed to persist pending submit intent; releasing reservation"
+                                );
+                                if let Some(release) = self
+                                    .inventory
+                                    .release_reservation(&intent.client_order_id, now_ms)
+                                {
+                                    outcome.push_event(self.event_log.push(release.to_event(
+                                        "released reservation after durable persistence failure",
+                                    )));
+                                }
+                                outcome.push_event(
+                                    self.event_log.push(
+                                        EventRecord::new(
+                                            EventCategory::Runtime,
+                                            now_ms,
+                                            "order not accepted due to durable store failure",
+                                        )
+                                        .with_client_order(intent.client_order_id.clone()),
+                                    ),
+                                );
+                                return outcome;
+                            }
                         }
-                        outcome.push_event(
-                            self.event_log.push(
-                                EventRecord::new(
-                                    EventCategory::Runtime,
-                                    now_ms,
-                                    "order not accepted due to durable store failure",
-                                )
-                                .with_client_order(intent.client_order_id.clone()),
-                            ),
-                        );
+                    }
+                    if !persisted {
                         return outcome;
                     }
                 }

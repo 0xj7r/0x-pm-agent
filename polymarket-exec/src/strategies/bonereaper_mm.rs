@@ -1810,6 +1810,7 @@ fn build_late_favorite_intent<M: MarketDescriptor>(
     qty: f64,
     tag: &str,
     aggressive_taker: bool,
+    fast_refresh: bool,
     reason: String,
     now_ms: EpochMillis,
 ) -> OrderIntent {
@@ -1852,6 +1853,8 @@ fn build_late_favorite_intent<M: MarketDescriptor>(
     intent.kind = IntentKind::Entry;
     intent.quote_level_tag = Some(if aggressive_taker {
         format!("late-fav-taker-{tag}")
+    } else if fast_refresh {
+        format!("late-fav-{tag}:fast")
     } else {
         format!("late-fav-{tag}")
     });
@@ -4124,6 +4127,9 @@ where
                                 bundle_gate.reason,
                             );
                             notes.push(reason.clone());
+                            let maker_fast_refresh = !aggressive_taker
+                                && legs.favorite_ask >= climb_cfg.near_touch_min_favorite_ask
+                                && level <= 1;
                             intents.push(build_late_favorite_intent(
                                 &input.market,
                                 legs.favorite_leg,
@@ -4131,6 +4137,7 @@ where
                                 qty,
                                 &format!("climb:{level}"),
                                 aggressive_taker,
+                                maker_fast_refresh,
                                 reason,
                                 input.now_ms,
                             ));
@@ -4220,6 +4227,7 @@ where
                     qty,
                     "climb-escalate",
                     true, // aggressive_taker = FAK
+                    false,
                     reason,
                     input.now_ms,
                 ));
@@ -4312,6 +4320,7 @@ where
                         px,
                         qty,
                         &format!("anticipate:{level}"),
+                        false,
                         false,
                         reason,
                         input.now_ms,
@@ -7476,6 +7485,46 @@ mod tests {
         assert!(
             (first_maker.limit_price - 0.94).abs() < 1e-9,
             "first passive fallback should sit one tick below touch, not two"
+        );
+    }
+
+    #[test]
+    fn climb_near_touch_maker_tagged_for_fast_refresh() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_favorite_ask = 0.50;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.favorite_climb.taker_min_favorite_ask = 0.90;
+        cfg.favorite_climb.near_touch_min_favorite_ask = 0.85;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.94, 0.95, 0.04, 0.05);
+        let input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            0.98,
+            120_000,
+        );
+
+        let decision = strategy.on_tick(input);
+        let intents = climb_intents(&decision);
+        let maker_fast_refresh = intents.iter().any(|i| {
+            i.quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("late-fav-climb") && tag.ends_with(":fast"))
+        });
+        assert!(
+            maker_fast_refresh,
+            "expected near-touch late-fav maker to be tagged for fast refresh; tags={:?}",
+            intents
+                .iter()
+                .map(|i| i.quote_level_tag.clone())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -362,10 +362,10 @@ impl QuoteReconciler {
 
     fn is_fast_refresh_quote(intent: &OrderIntent) -> bool {
         intent.kind == crate::types::IntentKind::Entry
-            && intent
-                .quote_level_tag
-                .as_deref()
-                .is_some_and(|tag| tag.starts_with("cheap-tail"))
+            && intent.quote_level_tag.as_deref().is_some_and(|tag| {
+                tag.starts_with("cheap-tail")
+                    || (tag.starts_with("late-fav") && tag.contains(":fast"))
+            })
     }
 
     fn materially_different_fast_quote(current: &OrderIntent, desired: &OrderIntent) -> bool {
@@ -831,6 +831,44 @@ mod tests {
         };
         let plan = reconciler.plan(desired, &open_orders, 10);
         assert!(matches!(plan.actions[0], QuoteAction::Keep(_)));
+    }
+
+    #[test]
+    fn quote_reconciler_fast_refresh_allows_replace_before_min_age() {
+        let mut existing_intent = intent("existing", 0.2);
+        existing_intent.quote_level_tag = Some("late-fav-climb:0:fast".to_string());
+        let mut open_orders = HashMap::new();
+        open_orders.insert(
+            ClientOrderId::from("existing"),
+            managed("existing", &existing_intent, 101),
+        );
+
+        let mut reconciler = QuoteReconciler::new(ReconcilerConfig {
+            min_order_age_ms: 750,
+            max_churn_per_window: 16,
+            churn_window_ms: 10_000,
+            hard_pull_ms: 5_000,
+            max_submit_per_window: 6,
+            max_replace_per_window: 4,
+            max_cancel_per_window: 12,
+            ..ReconcilerConfig::default()
+        });
+        let mut replacement = intent("replacement", 0.23);
+        replacement.quote_level_tag = Some("late-fav-climb:0:fast".to_string());
+        let desired = crate::quote_engine::DesiredQuoteSet {
+            quotes: vec![crate::quote_engine::DesiredQuote {
+                intent: replacement,
+                level: 0,
+                is_cleanup: false,
+                suppress_if_stale: false,
+                expires_at_ms: None,
+            }],
+            stale_quote_max_age_ms: None,
+            quote_expiry_ms: None,
+        };
+
+        let plan = reconciler.plan(desired, &open_orders, 700);
+        assert!(matches!(plan.actions[0], QuoteAction::Replace { .. }));
     }
 
     #[test]

@@ -2678,6 +2678,73 @@ fn stale_needs_reconcile_order_uses_durable_terminal_state_instead_of_quarantine
 }
 
 #[test]
+fn accept_intent_retries_submit_on_terminal_store_conflict() {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "polymarket-exec-terminal-conflict-retry-{ts}.sqlite"
+    ));
+    let mut store = SqliteOrderStore::open(&path).unwrap();
+    let terminal_id = ClientOrderId::from("coid-terminal-conflict");
+    let terminal_intent = OrderIntent {
+        client_order_id: terminal_id.clone(),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.45,
+        quantity: 5.0,
+        reduce_only: false,
+        reason: "terminal-record".to_string(),
+        quote_level_tag: Some("late-fav-climb:0:0:terminal".to_string()),
+        created_at_ms: 5,
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let mut record = OrderRecord::from_intent("run-1", &terminal_intent, "test");
+    record.status = ManagedOrderStatus::Filled;
+    record.last_update_ms = 5;
+    store.insert(record).unwrap();
+
+    let mut runtime = Runtime::new_with_order_store(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+        Some(Box::new(store)),
+        "run-1".to_string(),
+    );
+
+    let mut incoming = btc_mm_intent("market-1", "token-1", "late-fav-climb:0:live", 0.45);
+    incoming.client_order_id = terminal_id.clone();
+
+    let outcome = runtime.accept_intent(incoming, 10);
+    assert_eq!(outcome.commands.len(), 1);
+    let submitted = match outcome.commands.first().unwrap() {
+        RuntimeCommand::Submit(intent) => intent.client_order_id.clone(),
+        other => panic!("expected submit command, got {other:?}"),
+    };
+    assert_ne!(submitted, terminal_id);
+    assert!(
+        submitted.as_str().contains("retry"),
+        "expected retry client_order_id, got {submitted}"
+    );
+    let open_count = runtime.open_orders().count();
+    assert_eq!(open_count, 1);
+    assert!(runtime
+        .open_orders()
+        .any(|managed| managed.intent.client_order_id == submitted));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn venue_position_reconciliation_recovers_missing_cost_basis_from_filled_buys() {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
