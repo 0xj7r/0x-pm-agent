@@ -36,12 +36,8 @@ const MARKET_WING_MAX_PATH_REVERSAL_RISK: f64 = 0.35;
 const MARKET_WING_MIN_MODEL_FAVORITE: f64 = 0.90;
 const MARKET_WING_MIN_MOMENTUM_STRENGTH: f64 = 0.50;
 const MARKET_WING_MIN_STRONGEST_MULTIPLIER: f64 = 0.75;
-const WING_REVERSAL_HEDGE_MIN_ASK: f64 = 0.07;
-const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.30;
+const WING_REVERSAL_HEDGE_MAX_ASK: f64 = 0.45;
 const WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD: f64 = 10.0;
-const WING_REVERSAL_HEDGE_MIN_PATH_RISK: f64 = 0.25;
-const WING_REVERSAL_HEDGE_MODEL_EXTREME: f64 = 0.97;
-const WING_REVERSAL_HEDGE_TARGET_SHARE_FRACTION: f64 = 0.55;
 const WING_REVERSAL_HEDGE_CLIP_USD: f64 = 3.0;
 const WING_REVERSAL_HEDGE_MAX_LOAD_USD: f64 = 45.0;
 const WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD: f64 = 1.0;
@@ -709,6 +705,16 @@ struct LateFavBundleState {
 struct BundleOrderGate {
     allowed: bool,
     reason: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LateFavPositionPlan {
+    favorite_qty: f64,
+    favorite_spend_usd: f64,
+    hedge_spend_usd: f64,
+    hedge_ask: f64,
+    target_hedge_share_fraction: f64,
+    remaining_hedge_budget_usd: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1432,6 +1438,66 @@ impl LateFavBundleState {
     }
 }
 
+impl LateFavPositionPlan {
+    fn for_position(
+        favorite_qty: f64,
+        favorite_spend_usd: f64,
+        hedge_spend_usd: f64,
+        hedge_ask: f64,
+        regime: Option<BtcRegime>,
+        path_reversal_risk: f64,
+    ) -> Self {
+        if favorite_qty <= 0.0 || favorite_spend_usd <= 0.0 || hedge_ask <= 0.0 || hedge_ask >= 1.0
+        {
+            return Self {
+                favorite_qty,
+                favorite_spend_usd,
+                hedge_spend_usd,
+                hedge_ask,
+                target_hedge_share_fraction: 0.0,
+                remaining_hedge_budget_usd: 0.0,
+            };
+        }
+
+        let favorite_avg_price = favorite_spend_usd / favorite_qty;
+        if favorite_avg_price <= 0.0 || favorite_avg_price >= 1.0 {
+            return Self {
+                favorite_qty,
+                favorite_spend_usd,
+                hedge_spend_usd,
+                hedge_ask,
+                target_hedge_share_fraction: 0.0,
+                remaining_hedge_budget_usd: 0.0,
+            };
+        }
+
+        let target_hedge_share_fraction =
+            position_hedge_share_fraction(hedge_ask, regime, path_reversal_risk);
+        let favorite_win_upside = favorite_qty * (1.0 - favorite_avg_price);
+        let positive_payoff_cap =
+            (favorite_win_upside - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD).max(0.0);
+        let target_hedge_notional = favorite_qty * target_hedge_share_fraction * hedge_ask;
+        let hard_cap = WING_REVERSAL_HEDGE_MAX_LOAD_USD
+            .min(target_hedge_notional)
+            .min(positive_payoff_cap);
+        let remaining_hedge_budget_usd = (hard_cap - hedge_spend_usd.max(0.0)).max(0.0);
+
+        Self {
+            favorite_qty,
+            favorite_spend_usd,
+            hedge_spend_usd,
+            hedge_ask,
+            target_hedge_share_fraction,
+            remaining_hedge_budget_usd,
+        }
+    }
+
+    fn should_hedge(self, min_order_usd: f64) -> bool {
+        self.favorite_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD
+            && self.remaining_hedge_budget_usd >= min_order_usd
+    }
+}
+
 fn required_hedge_share_fraction(
     favorite_price: f64,
     hedge_ask: f64,
@@ -1441,7 +1507,7 @@ fn required_hedge_share_fraction(
     if favorite_price <= 0.0 || !favorite_price.is_finite() {
         return 1.0;
     }
-    if hedge_ask <= 0.0 || !hedge_ask.is_finite() || hedge_ask > WING_REVERSAL_HEDGE_MAX_ASK {
+    if hedge_ask <= 0.0 || !hedge_ask.is_finite() {
         return 1.0;
     }
 
@@ -1449,10 +1515,48 @@ fn required_hedge_share_fraction(
         0.95
     } else if hedge_ask <= 0.10 {
         0.75
+    } else if hedge_ask > WING_REVERSAL_HEDGE_MAX_ASK {
+        0.25
     } else if favorite_price < MODEL_WING_MAX_FAVORITE_ASK {
         0.65
     } else {
         0.45
+    };
+    let regime_add: f64 = match regime {
+        Some(BtcRegime::Whipsaw) => 0.15,
+        Some(BtcRegime::TrendingVolatile) => 0.10,
+        Some(BtcRegime::Flat) => 0.05,
+        _ => 0.0,
+    };
+    let risk_add: f64 = if path_reversal_risk >= 0.50 {
+        0.15
+    } else if path_reversal_risk >= 0.35 {
+        0.10
+    } else {
+        0.0
+    };
+    (base + regime_add + risk_add).clamp(0.0, 1.0)
+}
+
+fn position_hedge_share_fraction(
+    hedge_ask: f64,
+    regime: Option<BtcRegime>,
+    path_reversal_risk: f64,
+) -> f64 {
+    if hedge_ask <= 0.0 || !hedge_ask.is_finite() {
+        return 0.0;
+    }
+
+    let base: f64 = if hedge_ask <= 0.03 {
+        0.95
+    } else if hedge_ask <= 0.10 {
+        0.70
+    } else if hedge_ask <= 0.30 {
+        0.55
+    } else if hedge_ask <= WING_REVERSAL_HEDGE_MAX_ASK {
+        0.25
+    } else {
+        0.10
     };
     let regime_add: f64 = match regime {
         Some(BtcRegime::Whipsaw) => 0.15,
@@ -3226,52 +3330,6 @@ fn reversal_hedge_cap_usd(
         .min(positive_payoff_cap)
 }
 
-fn wing_reversal_hedge_cap_usd(
-    favorite_filled_qty: f64,
-    favorite_filled_spend_usd: f64,
-    hedge_ask: f64,
-    existing_hedge_spend_usd: f64,
-) -> f64 {
-    if favorite_filled_qty <= 0.0
-        || favorite_filled_spend_usd <= 0.0
-        || hedge_ask <= 0.0
-        || hedge_ask >= 1.0
-    {
-        return 0.0;
-    }
-
-    let favorite_avg_price = favorite_filled_spend_usd / favorite_filled_qty;
-    if favorite_avg_price <= 0.0 || favorite_avg_price >= 1.0 {
-        return 0.0;
-    }
-
-    let favorite_win_upside = favorite_filled_qty * (1.0 - favorite_avg_price);
-    let fav_win_payoff_now = favorite_win_upside - existing_hedge_spend_usd.max(0.0);
-    let positive_payoff_cap =
-        (fav_win_payoff_now - WING_REVERSAL_HEDGE_MIN_FAV_WIN_PAYOFF_USD).max(0.0);
-    let share_target_notional =
-        favorite_filled_qty * WING_REVERSAL_HEDGE_TARGET_SHARE_FRACTION * hedge_ask;
-    let hard_cap = WING_REVERSAL_HEDGE_MAX_LOAD_USD
-        .min(share_target_notional)
-        .min(positive_payoff_cap);
-    (hard_cap - existing_hedge_spend_usd.max(0.0)).max(0.0)
-}
-
-fn should_fire_wing_reversal_hedge(
-    regime: Option<BtcRegime>,
-    model_favorite: f64,
-    path_reversal_risk: f64,
-) -> bool {
-    if model_favorite >= WING_REVERSAL_HEDGE_MODEL_EXTREME {
-        return false;
-    }
-    path_reversal_risk >= WING_REVERSAL_HEDGE_MIN_PATH_RISK
-        || matches!(
-            regime,
-            Some(BtcRegime::Whipsaw | BtcRegime::TrendingVolatile)
-        )
-}
-
 fn cheap_tail_coverage_fraction(cfg: &ConvexTailConfig, regime: Option<BtcRegime>) -> f64 {
     let base = cfg.max_favorite_exposure_fraction.max(0.0);
     let regime_multiplier = match regime {
@@ -4442,9 +4500,7 @@ where
             }
         }
 
-        if legs.cheap_ask >= WING_REVERSAL_HEDGE_MIN_ASK
-            && legs.cheap_ask <= WING_REVERSAL_HEDGE_MAX_ASK
-        {
+        if legs.cheap_ask > 0.0 && legs.cheap_ask < 1.0 {
             let favorite_filled_qty =
                 inventory_qty_for_leg(input.late_fav_inventory, legs.favorite_leg)
                     + stranded_paired_core_qty_for_leg(
@@ -4462,35 +4518,39 @@ where
                     + stranded_paired_core_spend_usd(input.paired_core_inventory, legs.cheap_leg)
                     + directional_tail_working_spend_usd(self, &input, legs.cheap_leg);
             let path_reversal_risk = path_reversal_risk_score(&input, &legs);
-            let remaining_load = wing_reversal_hedge_cap_usd(
+            let position_plan = LateFavPositionPlan::for_position(
                 favorite_filled_qty,
                 favorite_filled_spend_usd,
-                legs.cheap_ask,
                 current_hedge_spend_usd,
+                legs.cheap_ask,
+                input.btc_regime.regime(),
+                path_reversal_risk,
             );
-            let should_fire = favorite_filled_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD
-                && should_fire_wing_reversal_hedge(
-                    input.btc_regime.regime(),
-                    directional_conviction.model_favorite,
-                    path_reversal_risk,
-                );
-            if should_fire && remaining_load >= tail_cfg.min_order_usd {
-                if let Some(px) = maker_limit_price(legs.cheap_bid, legs.cheap_ask, tick, 0.0) {
+            if position_plan.should_hedge(tail_cfg.min_order_usd) {
+                let max_hedge_price =
+                    (legs.cheap_ask + reversal_cfg.taker_slippage_ticks.max(0.0) * tick).min(0.98);
+                if let Some(px) = slippage_limited_taker_price(
+                    legs.cheap_ask,
+                    tick,
+                    reversal_cfg.taker_slippage_ticks,
+                    max_hedge_price,
+                ) {
                     let clip = WING_REVERSAL_HEDGE_CLIP_USD
-                        .min(remaining_load)
+                        .min(position_plan.remaining_hedge_budget_usd)
                         .max(tail_cfg.min_order_usd);
                     let qty = (clip / px).max(input.market.min_order_size());
                     let reason = format!(
-                        "wing_reversal_hedge leg={:?} mode=maker_post_only px={:.4} bid={:.4} ask={:.4} clip_usd={:.2} remaining_cap={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
+                        "position_hedge leg={:?} mode=taker_ioc px={:.4} bid={:.4} ask={:.4} clip_usd={:.2} remaining_cap={:.2} target_share_fraction={:.2} favorite_filled_spend={:.2} favorite_filled_qty={:.2} existing_hedge_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
                         legs.cheap_leg,
                         px,
                         legs.cheap_bid,
-                        legs.cheap_ask,
+                        position_plan.hedge_ask,
                         clip,
-                        remaining_load,
-                        favorite_filled_spend_usd,
-                        favorite_filled_qty,
-                        current_hedge_spend_usd,
+                        position_plan.remaining_hedge_budget_usd,
+                        position_plan.target_hedge_share_fraction,
+                        position_plan.favorite_spend_usd,
+                        position_plan.favorite_qty,
+                        position_plan.hedge_spend_usd,
                         directional_conviction.model_favorite,
                         path_reversal_risk,
                         input.btc_regime.regime(),
@@ -4502,7 +4562,7 @@ where
                         px,
                         qty,
                         "wing:0",
-                        false,
+                        true,
                         reason,
                         input.now_ms,
                     ));
@@ -4511,15 +4571,15 @@ where
                         legs.cheap_leg,
                         clip,
                         input.now_ms,
-                        ReservationClass::Resting,
+                        ReservationClass::Aggressive,
                     );
                 }
             } else if favorite_filled_spend_usd >= WING_REVERSAL_HEDGE_MIN_FAV_SPEND_USD {
                 notes.push(format!(
-                    "wing_reversal_hedge blocked ask={:.4} should_fire={} remaining_cap={:.2} min_order={:.2} favorite_filled_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
+                    "position_hedge blocked ask={:.4} remaining_cap={:.2} target_share_fraction={:.2} min_order={:.2} favorite_filled_spend={:.2} model_favorite={:.4} path_reversal_risk={:.2} regime={:?}",
                     legs.cheap_ask,
-                    should_fire,
-                    remaining_load,
+                    position_plan.remaining_hedge_budget_usd,
+                    position_plan.target_hedge_share_fraction,
                     tail_cfg.min_order_usd,
                     favorite_filled_spend_usd,
                     directional_conviction.model_favorite,
@@ -6437,13 +6497,27 @@ mod tests {
     }
 
     #[test]
-    fn wing_reversal_hedge_cap_uses_share_target() {
-        let cap = wing_reversal_hedge_cap_usd(300.0, 225.0, 0.25, 0.0);
+    fn position_hedge_plan_uses_share_target() {
+        let cap = LateFavPositionPlan::for_position(300.0, 225.0, 0.0, 0.25, None, 0.0)
+            .remaining_hedge_budget_usd;
 
         assert!((cap - 41.25).abs() < 1e-9);
 
-        let after_existing = wing_reversal_hedge_cap_usd(300.0, 225.0, 0.25, 30.0);
+        let after_existing = LateFavPositionPlan::for_position(300.0, 225.0, 30.0, 0.25, None, 0.0)
+            .remaining_hedge_budget_usd;
         assert!((after_existing - 11.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn position_hedge_share_target_prefers_cheaper_coverage() {
+        assert!(
+            position_hedge_share_fraction(0.02, Some(BtcRegime::DirectionalSmooth), 0.0)
+                > position_hedge_share_fraction(0.25, Some(BtcRegime::DirectionalSmooth), 0.0)
+        );
+        assert!(
+            position_hedge_share_fraction(0.25, Some(BtcRegime::Whipsaw), 0.50)
+                > position_hedge_share_fraction(0.25, Some(BtcRegime::DirectionalSmooth), 0.0)
+        );
     }
 
     #[test]
@@ -7234,6 +7308,51 @@ mod tests {
                 .as_deref()
                 .is_some_and(|tag| tag.starts_with("reversal-hedge-taker:bundle"))),
             "must not buy a hedge against a projected favorite order; tags={:?}",
+            all_intents
+                .iter()
+                .map(|intent| intent.quote_level_tag.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn positioned_favorite_emits_taker_hedge_even_when_model_is_extreme() {
+        let mut cfg = LateFavoriteStrategyConfig::default();
+        cfg.favorite_anticipate.enabled = false;
+        cfg.favorite_climb.enabled = true;
+        cfg.favorite_climb.min_elapsed_sec = 0;
+        cfg.convex_tail.min_order_usd = 1.0;
+        cfg.reversal_hedge.min_order_usd = 1.0;
+        let mut strategy = LateFavoriteStrategy::new(cfg);
+        let snapshot = snap(0.76, 0.77, 0.23, 0.24);
+        let mut input = strategy_input(
+            snapshot,
+            high_conviction_regime(),
+            MomentumSignal {
+                strength: 1.0,
+                latest_window_return_bps: Some(14.0),
+                ..MomentumSignal::default()
+            },
+            1.0,
+            120_000,
+        );
+        input.late_fav_inventory = crate::market_making::pairing::types::PairedInventorySnapshot {
+            yes_qty: 180.0,
+            yes_avg_cost: 0.765,
+            no_qty: 0.0,
+            no_avg_cost: 0.0,
+            free_cash_usd: 0.0,
+            equity_usd: 0.0,
+        };
+
+        let decision = strategy.on_tick(input);
+        let all_intents = all_quote_intents(&decision);
+        assert!(
+            all_intents.iter().any(|intent| intent
+                .quote_level_tag
+                .as_deref()
+                .is_some_and(|tag| tag.starts_with("reversal-hedge-taker:wing"))),
+            "positioned favorite should emit an opposite-leg hedge even at extreme model confidence; tags={:?} decision={decision:?}",
             all_intents
                 .iter()
                 .map(|intent| intent.quote_level_tag.clone())
