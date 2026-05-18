@@ -91,12 +91,12 @@ late_favorite:
     tail_max_load_bps: 150.0
     tail_max_load_min_usd: 5.0
     tail_max_load_max_usd: 100.0
-    reversal_clip_bps: 3.0
-    reversal_clip_min_usd: 1.0
-    reversal_clip_max_usd: 5.0
-    reversal_max_load_bps: 10.0
-    reversal_max_load_min_usd: 2.0
-    reversal_max_load_max_usd: 30.0
+    reversal_clip_bps: 30.0
+    reversal_clip_min_usd: 4.0
+    reversal_clip_max_usd: 15.0
+    reversal_max_load_bps: 150.0
+    reversal_max_load_min_usd: 15.0
+    reversal_max_load_max_usd: 75.0
   favorite_climb:
     enabled: true
     min_favorite_ask: 0.70
@@ -183,10 +183,12 @@ late_favorite:
     # Defensive trim only; code gates this behind open late-favorite exposure.
     min_hedge_ask: 0.10
     max_hedge_ask: 0.30
-    clip_usd: 2.0
-    max_load_usd: 6.0
-    max_favorite_exposure_fraction: 0.50
-    max_win_edge_spend_fraction: 0.45
+    clip_usd: 8.0
+    max_load_usd: 45.0
+    # Share-count target, not spend target: at high reversal score, try to own
+    # about 70 opposite-leg hedge shares per 100 filled favorite shares, while
+    # payoff guards keep the favorite-win bundle positive.
+    max_favorite_exposure_fraction: 0.70
     min_order_usd: 2.0
     taker_slippage_ticks: 1.0
     # 2026-05-17 v3: 0.70 -> 0.60. Tightened too far on prior pass --
