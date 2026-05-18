@@ -967,17 +967,6 @@ fn event_type_key(event_type: &EventType) -> String {
         .unwrap_or_else(|| format!("{event_type:?}").to_ascii_lowercase())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 fn summarize_input_windows(
     windows: &BTreeMap<String, Vec<Event>>,
     required_types: &BTreeSet<&'static str>,
@@ -986,17 +975,14 @@ fn summarize_input_windows(
         .iter()
         .map(|(window_id, events)| {
             let mut event_type_counts = BTreeMap::new();
-            let mut checksum_payload = Vec::new();
+            let mut hasher = Sha256::new();
             for event in events {
                 *event_type_counts
                     .entry(event_type_key(&event.event_type))
                     .or_insert(0) += 1;
-                checksum_payload.extend(
-                    serde_json::to_vec(event)
-                        .context("serialize replay event for manifest checksum")?,
-                );
-                checksum_payload.push(b'\n');
+                update_event_digest(&mut hasher, event)?;
             }
+            let digest = hasher.finalize();
             let missing_required_event_types = required_types
                 .iter()
                 .filter(|event_type| !event_type_counts.contains_key(**event_type))
@@ -1006,11 +992,66 @@ fn summarize_input_windows(
                 window_id: window_id.clone(),
                 total_events: events.len() as u64,
                 event_type_counts,
-                event_checksum_sha256: sha256_hex(&checksum_payload),
+                event_checksum_sha256: hex_digest(&digest),
                 missing_required_event_types,
             })
         })
         .collect()
+}
+
+fn update_event_digest(hasher: &mut Sha256, event: &Event) -> Result<()> {
+    hasher.update(event.v.to_le_bytes());
+    hasher.update(event.ts_ns.to_le_bytes());
+    hasher.update(event.received_ns.to_le_bytes());
+    hasher.update(event_type_key(&event.event_type).as_bytes());
+    update_digest_str(hasher, &event.market_type);
+    update_digest_opt_str(hasher, event.market_slug.as_deref());
+    update_digest_opt_str(hasher, event.asset_id.as_deref());
+    update_digest_opt_str(hasher, event.side.as_deref());
+    update_digest_opt_str(hasher, event.price.as_deref());
+    update_digest_opt_str(hasher, event.size.as_deref());
+    match event.sequence {
+        Some(sequence) => {
+            hasher.update([1]);
+            hasher.update(sequence.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(
+        serde_json::to_vec(&event.source)
+            .context("serialize replay event source for manifest checksum")?,
+    );
+    if !event.raw.is_null() {
+        hasher.update(
+            serde_json::to_vec(&event.raw)
+                .context("serialize replay event raw payload for manifest checksum")?,
+        );
+    }
+    hasher.update(b"\n");
+    Ok(())
+}
+
+fn update_digest_str(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn update_digest_opt_str(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            update_digest_str(hasher, value);
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn validate_input_window_digests(digests: &[InputWindowDigest]) -> Result<()> {
@@ -1045,6 +1086,18 @@ fn portfolio_windows_from_grouped(
         .values()
         .flat_map(|events| events.iter().cloned())
         .collect::<Vec<_>>();
+    BTreeMap::from([(
+        portfolio_window_id(window_start, window_end),
+        dedupe_and_sort(events),
+    )])
+}
+
+fn portfolio_windows_from_grouped_owned(
+    windows: BTreeMap<String, Vec<Event>>,
+    window_start: &str,
+    window_end: &str,
+) -> BTreeMap<String, Vec<Event>> {
+    let events = windows.into_values().flatten().collect::<Vec<_>>();
     BTreeMap::from([(
         portfolio_window_id(window_start, window_end),
         dedupe_and_sort(events),
@@ -1148,7 +1201,7 @@ fn run_main(cli: Cli) -> Result<i32> {
     }
     let (mut windows, diagnostic_windows): (
         BTreeMap<String, Vec<Event>>,
-        BTreeMap<String, Vec<Event>>,
+        Option<BTreeMap<String, Vec<Event>>>,
     ) = match cli.input_format.as_str() {
         "rust-event" => {
             let mut events = read_local_filtered(&cli.input_prefix, None)
@@ -1196,13 +1249,13 @@ fn run_main(cli: Cli) -> Result<i32> {
             if cli.independent_windows {
                 let windows = group_events_into_windows(events, &cli);
                 validate_rust_event_market_meta(&windows)?;
-                (windows.clone(), windows)
+                (windows, None)
             } else {
                 let diagnostic_windows = group_events_into_windows(events.clone(), &cli);
                 validate_rust_event_market_meta_events(&events, &cli.market_filter)?;
                 (
                     portfolio_window_from_events(events, &cli.window_start, &cli.window_end),
-                    diagnostic_windows,
+                    Some(diagnostic_windows),
                 )
             }
         }
@@ -1243,7 +1296,7 @@ fn run_main(cli: Cli) -> Result<i32> {
             events = join_market_metadata(events, metadata_prefix, &cli.market_filter)?;
             events = filter_market_events_to_market_windows(events);
             let windows = group_events_into_windows(events, &cli);
-            (windows.clone(), windows)
+            (windows, None)
         }
         "tape" => {
             let markets = parse_raw_market_asset_maps(&cli.raw_market_asset_maps)?;
@@ -1267,17 +1320,18 @@ fn run_main(cli: Cli) -> Result<i32> {
                     cli.input_prefix.display()
                 )
             })?;
-            (windows.clone(), windows)
+            (windows, None)
         }
         other => anyhow::bail!("unknown --input-format: {other}"),
     };
-    let input_windows = summarize_input_windows(&diagnostic_windows, &required_types)?;
+    let diagnostic_windows_ref = diagnostic_windows.as_ref().unwrap_or(&windows);
+    let input_windows = summarize_input_windows(diagnostic_windows_ref, &required_types)?;
     validate_input_window_digests(&input_windows)?;
     let data_quality =
-        summarize_data_quality_windows(&diagnostic_windows, &DataQualityConfig::default());
+        summarize_data_quality_windows(diagnostic_windows_ref, &DataQualityConfig::default());
     validate_data_quality(&data_quality)?;
     if !cli.independent_windows && cli.input_format != "rust-event" {
-        windows = portfolio_windows_from_grouped(&windows, &cli.window_start, &cli.window_end);
+        windows = portfolio_windows_from_grouped_owned(windows, &cli.window_start, &cli.window_end);
     }
 
     // Build window plan in deterministic order.
