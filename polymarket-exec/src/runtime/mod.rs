@@ -12,6 +12,7 @@ mod live_auth;
 mod live_health;
 mod market_universe;
 pub mod order_store;
+pub mod paired_mm_live;
 mod paper_fill;
 pub mod reconcile;
 pub mod runner;

@@ -1177,6 +1177,12 @@ async fn run_runtime_loop(
         config.paper_mode,
         config.live_kill_switch_path.as_deref(),
     );
+    // Calm-regime PAIRED-MM overlay (INC1): OFF unless PM_BTC_5M_PAIRED_MM_SHADOW
+    // is truthy. SHADOW-ONLY: it decides + logs the two-sided touch quotes and a
+    // simulated pairing/inventory/PnL it WOULD place and SUBMITS NOTHING. It is
+    // driven only when br2 is NOT quoting the same market (regime-disjoint).
+    let mut paired_mm_shadow =
+        crate::runtime::paired_mm_live::PairedMmLiveShadow::from_env();
     if let Some(shadow) = br2_shadow.as_ref() {
         if shadow.live_trade_armed() {
             warn!(
@@ -1219,6 +1225,9 @@ async fn run_runtime_loop(
                                 event.observed_at_ms,
                                 event.is_buyer_maker,
                             );
+                        }
+                        if let Some(mm) = paired_mm_shadow.as_mut() {
+                            mm.on_spot_trade(event.price, event.observed_at_ms);
                         }
                     }
                     None => {
@@ -1559,6 +1568,7 @@ async fn run_runtime_loop(
                                 report.record_book_observation(&market_id, &instrument_id, &book);
                             }
                             let mut br2_submit_intents: Vec<OrderIntent> = Vec::new();
+                            let mut br2_quoting_this_market = false;
                             if let Some(shadow) = br2_shadow.as_mut() {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
                                     // Thread the REAL paper position into br2's
@@ -1598,7 +1608,24 @@ async fn run_runtime_loop(
                                         no_book.as_ref(),
                                         now_unix_ms(),
                                     );
+                                    br2_quoting_this_market = !result.orders.is_empty();
                                     br2_submit_intents = result.submit_intents;
+                                }
+                            }
+                            // Paired-MM SHADOW overlay (INC1): logs the two-sided
+                            // touch quotes + simulated pairing/PnL it WOULD place;
+                            // SUBMITS NOTHING. Driven only when br2 is NOT quoting
+                            // this market (regime-disjoint). No-op unless
+                            // PM_BTC_5M_PAIRED_MM_SHADOW is set (from_env -> None).
+                            if let Some(mm) = paired_mm_shadow.as_mut() {
+                                if let Some(record) = runtime.market_context_record(&market_id) {
+                                    let _ = mm.decide_tick(
+                                        &market_id,
+                                        &record,
+                                        &book,
+                                        br2_quoting_this_market,
+                                        now_unix_ms(),
+                                    );
                                 }
                             }
                             let mut outcome = runtime.on_book_state(

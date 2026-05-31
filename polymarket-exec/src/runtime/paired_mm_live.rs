@@ -1,0 +1,732 @@
+//! Live glue for the calm-regime PAIRED market-making overlay (INC1, SHADOW-ONLY).
+//!
+//! This module is ADDITIVE and SUBMITS NOTHING. It mirrors the structure of
+//! [`crate::runtime::br2_live`] (an env-gated, shadow-logging runtime overlay
+//! driven by the Binance spot tap + the Polymarket book tick), but implements
+//! the VALIDATED two-sided touch-quoting paired-MM the backtest settled on (see
+//! `polymarket-backtest/scripts/mm_paired_sim.py` and
+//! `.claude/paired_mm_overlay_build_plan.md`). It DECIDES + LOGS the two-sided
+//! quotes and the simulated pairing / inventory / PnL it WOULD place. No order
+//! submission, no [`OrderIntent`] construction, no execution-path interaction.
+//!
+//! Behavior (all from the build plan, not re-derived):
+//!   - TWO-SIDED TOUCH quoting at best_bid / best_ask, tiny clips (~10-20 sh,
+//!     configurable), TOUCH-ONLY (no laddering: deeper rungs don't fill on the
+//!     1c spread), continuous requote each tick.
+//!   - STRICT PAIRING: track matched Up+Down pairs vs unmatched residual; HARD
+//!     residual cap (~5% net skew via a repair band on |yes_long - no_long|);
+//!     when one-sided, SKEW to re-pair (pull the leading leg, keep quoting the
+//!     missing side), NEVER trade out of a stranded leg. Matched pairs realize
+//!     to $1 (redeem). Inventory + PnL simulated internally.
+//!   - LATE-PULL: stop quoting in the last ~45-60s (configurable).
+//!   - REGIME GATE: quote only when low spot vol + narrow YES range-so-far +
+//!     healthy sign-flip + mid in ~0.30-0.70. Computed from a self-contained
+//!     trailing spot tape (fed by `on_spot_trade`) exactly as the reference
+//!     Python (30s-grid returns: stdev = vol, fraction-of-sign-flips = flips).
+//!   - SIMULATED FILL: a conservative pro-rata clip/(clip+depth_ahead) model.
+//!     Because the runtime loop surfaces only book SNAPSHOTS (not individual
+//!     taker prints), a taker print is inferred from a change in the YES book's
+//!     `last_trade_price` between ticks and classified against OUR resting
+//!     touch quotes (print <= our bid => taker SELL hits our bid; print >= our
+//!     ask => taker BUY lifts our ask). depth_ahead is the resting top-of-book
+//!     size at that level. This is the faithful adaptation of the tape model to
+//!     the snapshot stream available at the wiring point (see the module-level
+//!     note in the report; it is the one deliberate simplification).
+//!
+//! Gating: OFF by default. [`PairedMmLiveShadow::from_env`] returns `None`
+//! unless `PM_BTC_5M_PAIRED_MM_SHADOW` is truthy, so with the flag unset the
+//! runtime does NO paired-MM work at all and the existing live path is
+//! byte-identical. There is NO paper or live arm in INC1: this overlay can only
+//! log.
+//!
+//! Regime-disjoint wiring (see runtime/runner.rs): the overlay is driven only
+//! when br2 is NOT quoting that market. The caller passes `br2_quoting` (true
+//! when the br2 driver produced any order for this market this tick); when set,
+//! the overlay records the abstention and skips quoting, so the two strategies
+//! never double-quote the same market.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+
+use tracing::info;
+
+use crate::book::BookState;
+use crate::market_context::MarketContextRecord;
+use crate::types::MarketId;
+
+/// Minimum spacing between paired-MM shadow decisions for one market. Mirrors
+/// br2's 1s book cadence so decisions are comparable and the log is not spammed
+/// on every book delta.
+const DECISION_CADENCE_MS: u64 = 1_000;
+
+// Defaults transcribed from scripts/mm_paired_sim.py (the validated config).
+const DEFAULT_CLIP_SHARES: f64 = 10.0;
+const ACTIVE_WIN_SECS: f64 = 300.0; // quote over the last 5 minutes
+const REGIME_WARMUP_SECS: f64 = 60.0; // need >=60s of history before quoting
+const REGIME_MID_LO: f64 = 0.30;
+const REGIME_MID_HI: f64 = 0.70;
+const REGIME_RANGE_MAX: f64 = 0.06; // YES mid range-so-far must be <= 6c
+const REGIME_SPOT_VOL_MAX: f64 = 0.00012; // max stdev of 30s-grid spot returns
+const REGIME_FLIP_MIN: f64 = 0.20; // min fraction of spot-return sign flips
+const LATE_PULL_SECS: f64 = 45.0; // pull both legs in the last N seconds
+const REPAIR_DELTA_SHARES: f64 = 2.0; // residual-cap band on |yes_long - no_long|
+const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (logged)
+const TAKER_FEE_FRAC: f64 = 0.0156;
+const REBATE_FRAC: f64 = 0.20 * TAKER_FEE_FRAC; // maker rebate ~20% of taker fee, on notional
+
+/// A trailing spot tape entry (price at a wall-clock ms). Kept self-contained so
+/// the regime gate is computed exactly like the reference Python and does not
+/// depend on the runtime's own (differently-windowed) signal store.
+#[derive(Clone, Copy)]
+struct SpotSample {
+    ts_ms: u64,
+    price: f64,
+}
+
+/// Simulated paired inventory + realized/marked PnL for one BTC-5m market.
+///
+/// `yes_long` = YES shares bought on our resting bid; `no_long` = NO shares
+/// acquired by selling YES on our resting ask (a YES short == a NO long, the
+/// single-mirrored-book identity the backtest uses). Matched pairs redeem to $1.
+#[derive(Default, Clone)]
+struct SimInventory {
+    yes_long: f64,
+    no_long: f64,
+    yes_long_cost: f64, // $ paid for YES
+    no_long_cost: f64,  // $ paid for NO (= 1 - our_yes_ask)
+    rebate_usdc: f64,
+    n_fills: u64,
+    filled_shares: f64,
+}
+
+impl SimInventory {
+    /// Net skew between the two legs. Drives the strict-pairing repair.
+    fn skew(&self) -> f64 {
+        self.yes_long - self.no_long
+    }
+
+    /// Matched pairs (each redeems to $1) and unmatched residual shares.
+    fn paired(&self) -> f64 {
+        self.yes_long.min(self.no_long)
+    }
+
+    fn residual_shares(&self) -> f64 {
+        (self.yes_long - self.paired()) + (self.no_long - self.paired())
+    }
+
+    fn residual_frac(&self) -> f64 {
+        let total = self.yes_long + self.no_long;
+        if total > 0.0 {
+            self.residual_shares() / total
+        } else {
+            0.0
+        }
+    }
+
+    /// Realized PnL if the market resolved now: matched pairs realize
+    /// (1 - pair_cost) each; the unmatched residual is marked to the running
+    /// YES mid (NOT traded out, matching the strict-pairing rule). Rebate added
+    /// only when `rebate_on`.
+    fn marked_pnl(&self, yes_mid: f64, rebate_on: bool) -> f64 {
+        let paired = self.paired();
+        let yes_avg = if self.yes_long > 0.0 {
+            self.yes_long_cost / self.yes_long
+        } else {
+            0.0
+        };
+        let no_avg = if self.no_long > 0.0 {
+            self.no_long_cost / self.no_long
+        } else {
+            0.0
+        };
+        let mut pnl = 0.0;
+        if paired > 0.0 {
+            pnl += paired * (1.0 - (yes_avg + no_avg));
+        }
+        let res_yes = self.yes_long - paired;
+        let res_no = self.no_long - paired;
+        // Residual marked to mid (YES leg at yes_mid, NO leg at 1 - yes_mid).
+        if res_yes > 0.0 {
+            pnl += res_yes * (yes_mid - yes_avg);
+        }
+        if res_no > 0.0 {
+            pnl += res_no * ((1.0 - yes_mid) - no_avg);
+        }
+        if rebate_on {
+            pnl += self.rebate_usdc;
+        }
+        pnl
+    }
+}
+
+/// Tracks the runtime-active BTC-5m market the overlay is currently driving.
+struct ActiveMarket {
+    market_id: MarketId,
+    yes_asset_id: String,
+    close_ms: u64,
+    last_decision_ms: u64,
+    /// Running min/max of the YES mid since open (range-so-far for the gate).
+    mid_min: f64,
+    mid_max: f64,
+    /// Last YES `last_trade_price` we observed, to detect a fresh taker print.
+    last_trade_price: f64,
+    inventory: SimInventory,
+}
+
+/// Per-tick quote/fill decision, logged by [`PairedMmLiveShadow::decide_tick`].
+#[derive(Debug, Default, Clone)]
+pub struct PairedMmTickResult {
+    /// Whether the overlay was quoting (gates all passed, at least one leg live).
+    pub quoting: bool,
+    /// The bid touch price it would post (None when the bid leg was pulled).
+    pub bid_price: Option<f64>,
+    /// The ask touch price it would post (None when the ask leg was pulled).
+    pub ask_price: Option<f64>,
+}
+
+/// Runtime-side driver that feeds the paired-MM shadow overlay from live feeds.
+/// SUBMITS NOTHING: it only decides + logs.
+pub struct PairedMmLiveShadow {
+    active: Option<ActiveMarket>,
+    clip_shares: f64,
+    rebate_on: bool,
+    /// Self-contained trailing spot tape for the regime gate.
+    spot: VecDeque<SpotSample>,
+    /// One-shot guard so the "br2 owns this market" disjoint note logs sparingly.
+    disjoint_skip_markets: HashMap<String, u64>,
+}
+
+impl PairedMmLiveShadow {
+    /// Construct the overlay IFF `PM_BTC_5M_PAIRED_MM_SHADOW` is truthy. Returns
+    /// `None` (no-op) otherwise so the runtime path stays byte-identical.
+    ///
+    /// There is NO submission arm in INC1; the overlay can only log. The two
+    /// optional knobs are SHADOW-only tuning:
+    ///   - `PM_BTC_5M_PAIRED_MM_CLIP_SHARES` (f64 > 0): touch clip size; default 10.
+    ///   - `PM_BTC_5M_PAIRED_MM_REBATE` (truthy): include the maker rebate in the
+    ///     simulated PnL (the backtest is positive at rebate=0; rebate is upside).
+    pub fn from_env() -> Option<Self> {
+        if !env_truthy("PM_BTC_5M_PAIRED_MM_SHADOW") {
+            return None;
+        }
+        let clip_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_CLIP_SHARES").unwrap_or(DEFAULT_CLIP_SHARES);
+        let rebate_on = env_truthy("PM_BTC_5M_PAIRED_MM_REBATE");
+        info!(
+            target: "paired_mm",
+            clip_shares,
+            rebate_on,
+            mid_lo = REGIME_MID_LO,
+            mid_hi = REGIME_MID_HI,
+            range_max = REGIME_RANGE_MAX,
+            spot_vol_max = REGIME_SPOT_VOL_MAX,
+            flip_min = REGIME_FLIP_MIN,
+            late_pull_secs = LATE_PULL_SECS,
+            repair_delta = REPAIR_DELTA_SHARES,
+            residual_cap_frac = RESIDUAL_CAP_FRAC,
+            "PAIRED-MM SHADOW overlay enabled (logging only; submits nothing). \
+             Quotes only when br2 is NOT quoting the market (regime-disjoint)."
+        );
+        Some(Self {
+            active: None,
+            clip_shares,
+            rebate_on,
+            spot: VecDeque::new(),
+            disjoint_skip_markets: HashMap::new(),
+        })
+    }
+
+    /// Tap one live Binance aggTrade print into the trailing spot tape. Prunes
+    /// to the active-window horizon so the gate's vol/flip measure stays bounded.
+    pub fn on_spot_trade(&mut self, price: f64, observed_at_ms: u64) {
+        if !price.is_finite() || price <= 0.0 {
+            return;
+        }
+        self.spot.push_back(SpotSample { ts_ms: observed_at_ms, price });
+        // Keep ~2x the active window so range/vol over the whole quoting window
+        // is always covered.
+        let horizon_ms = (ACTIVE_WIN_SECS as u64) * 2 * 1_000;
+        while let Some(front) = self.spot.front().copied() {
+            if observed_at_ms.saturating_sub(front.ts_ms) <= horizon_ms {
+                break;
+            }
+            self.spot.pop_front();
+        }
+    }
+
+    /// Drive the BTC-5m lifecycle + one shadow paired-MM decision from a YES book
+    /// update. `br2_quoting` is true when the br2 driver produced an order for
+    /// this market this tick; when set, the overlay abstains (regime-disjoint).
+    /// Returns the (logged) quote decision. SUBMITS NOTHING.
+    pub fn decide_tick(
+        &mut self,
+        market_id: &MarketId,
+        record: &MarketContextRecord,
+        yes_book: &BookState,
+        br2_quoting: bool,
+        now_ms: u64,
+    ) -> PairedMmTickResult {
+        let (Some(open_ms), Some(close_ms)) = (record.event_start_time_ms, record.event_end_time_ms)
+        else {
+            return PairedMmTickResult::default();
+        };
+        let Some(yes_asset_id) = record.instrument_ids.first() else {
+            return PairedMmTickResult::default();
+        };
+
+        // Expire OUR active market once past ITS close: log a final realized
+        // summary (matched pairs redeem to $1, residual marked to last mid).
+        if let Some(active) = &self.active {
+            if now_ms > active.close_ms {
+                self.log_market_close();
+                self.active = None;
+            }
+        }
+
+        // Ignore ticks for markets not currently live; never re-open a resolved
+        // window.
+        if now_ms > close_ms || now_ms < open_ms {
+            return PairedMmTickResult::default();
+        }
+
+        // Roll to a new live BTC-5m window if the runtime moved on.
+        let is_new_market = match &self.active {
+            Some(active) => &active.market_id != market_id,
+            None => true,
+        };
+        if is_new_market {
+            if self.active.is_some() {
+                self.log_market_close();
+            }
+            info!(
+                target: "paired_mm",
+                market = %market_id,
+                open_ms,
+                close_ms,
+                yes_asset = %yes_asset_id,
+                "PAIRED-MM SHADOW opened BTC-5m market"
+            );
+            self.active = Some(ActiveMarket {
+                market_id: market_id.clone(),
+                yes_asset_id: yes_asset_id.clone(),
+                close_ms,
+                last_decision_ms: 0,
+                mid_min: f64::INFINITY,
+                mid_max: f64::NEG_INFINITY,
+                last_trade_price: yes_book.last_trade_price,
+                inventory: SimInventory::default(),
+            });
+        }
+
+        // Only the YES book drives decisions; throttle to the 1s cadence.
+        let should_decide = match &self.active {
+            Some(active) => {
+                yes_book.asset_id == active.yes_asset_id
+                    && now_ms.saturating_sub(active.last_decision_ms) >= DECISION_CADENCE_MS
+            }
+            None => false,
+        };
+        if !should_decide {
+            return PairedMmTickResult::default();
+        }
+        // Need a two-sided YES top-of-book.
+        if yes_book.best_bid <= 0.0 || yes_book.best_ask <= 0.0 || yes_book.best_ask < yes_book.best_bid {
+            return PairedMmTickResult::default();
+        }
+
+        let yes_mid = 0.5 * (yes_book.best_bid + yes_book.best_ask);
+
+        // Update range-so-far + cadence bookkeeping, snapshot fields we need.
+        let (mid_min, mid_max, prev_trade_price) = {
+            let active = self.active.as_mut().expect("active set above");
+            active.mid_min = active.mid_min.min(yes_mid);
+            active.mid_max = active.mid_max.max(yes_mid);
+            active.last_decision_ms = now_ms;
+            (active.mid_min, active.mid_max, active.last_trade_price)
+        };
+
+        let secs_to_close = (close_ms as i64 - now_ms as i64) as f64 / 1000.0;
+
+        // Regime-disjoint: never quote a market br2 is quoting.
+        if br2_quoting {
+            let last = self.disjoint_skip_markets.get(market_id.as_str()).copied().unwrap_or(0);
+            if now_ms.saturating_sub(last) >= 15_000 {
+                info!(
+                    target: "paired_mm",
+                    market = %market_id,
+                    secs_to_close,
+                    "PAIRED-MM SHADOW abstaining: br2 is quoting this market (regime-disjoint)"
+                );
+                self.disjoint_skip_markets.insert(market_id.as_str().to_string(), now_ms);
+            }
+            return PairedMmTickResult::default();
+        }
+
+        // First, simulate any fill since the last tick from a fresh taker print
+        // crossing our PREVIOUS resting touch quotes. (We posted at the prior
+        // best_bid/best_ask; approximate that with the current touch since we
+        // requote continuously at the touch each tick.) This uses the same
+        // pro-rata clip/(clip+depth_ahead) model as the backtest.
+        self.simulate_fill(yes_book, prev_trade_price, yes_mid);
+        if let Some(active) = self.active.as_mut() {
+            active.last_trade_price = yes_book.last_trade_price;
+        }
+
+        // Regime quote-gate (evaluated on data SO FAR, no lookahead).
+        let warmup_ok = self.spot_history_secs(now_ms) >= REGIME_WARMUP_SECS;
+        let in_window = (ACTIVE_WIN_SECS - secs_to_close.max(0.0)) >= 0.0
+            && secs_to_close <= ACTIVE_WIN_SECS;
+        let mid_ok = (REGIME_MID_LO..=REGIME_MID_HI).contains(&yes_mid);
+        let range = if mid_max.is_finite() && mid_min.is_finite() {
+            mid_max - mid_min
+        } else {
+            0.0
+        };
+        let range_ok = range <= REGIME_RANGE_MAX;
+        let (vol, flips) = self.spot_metrics(now_ms);
+        let vol_ok = vol <= REGIME_SPOT_VOL_MAX;
+        let flip_ok = flips >= REGIME_FLIP_MIN;
+
+        let regime_ok = warmup_ok && in_window && mid_ok && range_ok && vol_ok && flip_ok;
+        if !regime_ok {
+            // Throttled via cadence (already 1s); log the gate snapshot so a
+            // reader can tell which gate blocked the quote.
+            info!(
+                target: "paired_mm",
+                market = %market_id,
+                secs_to_close,
+                yes_mid,
+                range,
+                vol,
+                flips,
+                warmup_ok,
+                mid_ok,
+                range_ok,
+                vol_ok,
+                flip_ok,
+                "PAIRED-MM SHADOW not quoting: regime gate not met"
+            );
+            return PairedMmTickResult::default();
+        }
+
+        // Dynamic gates: which legs are live this tick.
+        let mut bid_live = true; // resting YES bid (we buy YES)
+        let mut ask_live = true; // resting YES ask (we sell YES == buy NO)
+
+        // Late-window pull: pull both.
+        if secs_to_close <= LATE_PULL_SECS {
+            bid_live = false;
+            ask_live = false;
+        }
+
+        // Strict-pairing repair / residual cap: if one leg outran the other past
+        // the band, stop adding to the leading leg and only quote the missing
+        // side to re-pair. This is the structural residual cap, NOT a trade-out.
+        let skew = self.active.as_ref().map(|a| a.inventory.skew()).unwrap_or(0.0);
+        if skew > REPAIR_DELTA_SHARES {
+            bid_live = false;
+        } else if skew < -REPAIR_DELTA_SHARES {
+            ask_live = false;
+        }
+
+        let bid_price = bid_live.then_some(yes_book.best_bid);
+        let ask_price = ask_live.then_some(yes_book.best_ask);
+        let quoting = bid_price.is_some() || ask_price.is_some();
+
+        if let Some(active) = self.active.as_ref() {
+            let inv = &active.inventory;
+            let sim_pnl = inv.marked_pnl(yes_mid, self.rebate_on);
+            info!(
+                target: "paired_mm",
+                market = %market_id,
+                secs_to_close,
+                yes_bid = yes_book.best_bid,
+                yes_ask = yes_book.best_ask,
+                yes_mid,
+                clip = self.clip_shares,
+                quote_bid = ?bid_price,
+                quote_ask = ?ask_price,
+                skew,
+                yes_long = inv.yes_long,
+                no_long = inv.no_long,
+                matched_pairs = inv.paired(),
+                residual_shares = inv.residual_shares(),
+                residual_frac = inv.residual_frac(),
+                n_fills = inv.n_fills,
+                filled_shares = inv.filled_shares,
+                sim_pnl,
+                "PAIRED-MM SHADOW quote+sim tick (submits nothing)"
+            );
+        }
+
+        PairedMmTickResult { quoting, bid_price, ask_price }
+    }
+
+    /// Conservative simulated fill from a fresh taker print crossing our resting
+    /// touch quotes. A change in `last_trade_price` since the previous tick is
+    /// treated as one taker print of one clip's worth of taker size; classified
+    /// against our resting touch and filled pro-rata by clip/(clip+depth_ahead).
+    fn simulate_fill(&mut self, yes_book: &BookState, prev_trade_price: f64, yes_mid: f64) {
+        let print_price = yes_book.last_trade_price;
+        // No fresh print, or a non-finite/zero print: nothing to simulate.
+        if !print_price.is_finite() || print_price <= 0.0 {
+            return;
+        }
+        if (print_price - prev_trade_price).abs() <= 1e-9 {
+            return; // last_trade_price unchanged => no new print this tick
+        }
+
+        let clip = self.clip_shares;
+        let Some(active) = self.active.as_mut() else { return };
+        let inv = &mut active.inventory;
+
+        // Taker SELL hits our resting YES bid: print at/below best_bid. We buy
+        // YES. depth_ahead = resting bid size.
+        if print_price <= yes_book.best_bid + 1e-9 && yes_book.best_bid > 0.0 {
+            let ahead = yes_book.best_bid_size.max(0.0);
+            let frac = clip / (clip + ahead);
+            let mut qty = clip * frac;
+            // Don't let this fill push yes ahead of no past the repair band.
+            qty = qty.min((inv.no_long + REPAIR_DELTA_SHARES - inv.yes_long).max(0.0));
+            if qty > 1e-9 {
+                inv.yes_long += qty;
+                inv.yes_long_cost += qty * yes_book.best_bid;
+                inv.filled_shares += qty;
+                inv.n_fills += 1;
+                inv.rebate_usdc += qty * yes_book.best_bid * REBATE_FRAC;
+            }
+            return;
+        }
+
+        // Taker BUY lifts our resting YES ask: print at/above best_ask. We sell
+        // YES == buy NO at (1 - ask). depth_ahead = resting ask size.
+        if print_price >= yes_book.best_ask - 1e-9 && yes_book.best_ask > 0.0 {
+            let ahead = yes_book.best_ask_size.max(0.0);
+            let frac = clip / (clip + ahead);
+            let mut qty = clip * frac;
+            qty = qty.min((inv.yes_long + REPAIR_DELTA_SHARES - inv.no_long).max(0.0));
+            if qty > 1e-9 {
+                let no_price = 1.0 - yes_book.best_ask;
+                inv.no_long += qty;
+                inv.no_long_cost += qty * no_price;
+                inv.filled_shares += qty;
+                inv.n_fills += 1;
+                inv.rebate_usdc += qty * no_price * REBATE_FRAC;
+            }
+        }
+        let _ = yes_mid; // mid used only by the marked-PnL log, not by the fill model
+    }
+
+    /// Log a final realized summary for the active market at close. Matched
+    /// pairs redeem to $1; residual is marked to the last observed mid (never
+    /// traded out). Pure logging.
+    fn log_market_close(&self) {
+        let Some(active) = self.active.as_ref() else { return };
+        let inv = &active.inventory;
+        let last_mid = if active.mid_max.is_finite() && active.mid_min.is_finite() {
+            0.5 * (active.mid_min + active.mid_max)
+        } else {
+            0.5
+        };
+        info!(
+            target: "paired_mm",
+            market = %active.market_id,
+            yes_long = inv.yes_long,
+            no_long = inv.no_long,
+            matched_pairs = inv.paired(),
+            residual_shares = inv.residual_shares(),
+            residual_frac = inv.residual_frac(),
+            n_fills = inv.n_fills,
+            filled_shares = inv.filled_shares,
+            sim_pnl = inv.marked_pnl(last_mid, self.rebate_on),
+            "PAIRED-MM SHADOW closed BTC-5m market (final simulated paired PnL)"
+        );
+    }
+
+    /// Wall-clock span (seconds) covered by the retained spot tape.
+    fn spot_history_secs(&self, now_ms: u64) -> f64 {
+        match self.spot.front() {
+            Some(front) => now_ms.saturating_sub(front.ts_ms) as f64 / 1000.0,
+            None => 0.0,
+        }
+    }
+
+    /// Stdev of 30s-grid spot returns and the sign-flip fraction over the active
+    /// window, matching `spot_metrics` in the reference Python. The Python grids
+    /// at 5s; here the runtime spot tape is ~1Hz, so we grid at 5s as well to
+    /// keep the vol measure discriminating (raw per-tick stdev is too granular).
+    fn spot_metrics(&self, now_ms: u64) -> (f64, f64) {
+        let lo_ms = now_ms.saturating_sub(ACTIVE_WIN_SECS as u64 * 1_000);
+        let seg: Vec<SpotSample> = self
+            .spot
+            .iter()
+            .copied()
+            .filter(|s| s.ts_ms >= lo_ms && s.ts_ms <= now_ms && s.price > 0.0)
+            .collect();
+        if seg.len() < 10 {
+            return (0.0, 0.0);
+        }
+        let start = seg.first().unwrap().ts_ms;
+        let end = seg.last().unwrap().ts_ms;
+        if end <= start {
+            return (0.0, 0.0);
+        }
+        // Build a 5s grid; sample the last price at or before each grid point.
+        let step_ms = 5_000u64;
+        let mut grid_prices: Vec<f64> = Vec::new();
+        let mut g = start;
+        let mut idx = 0usize;
+        while g < end {
+            while idx + 1 < seg.len() && seg[idx + 1].ts_ms <= g {
+                idx += 1;
+            }
+            grid_prices.push(seg[idx].price);
+            g += step_ms;
+        }
+        if grid_prices.len() < 8 {
+            return (0.0, 0.0);
+        }
+        let mut rets: Vec<f64> = Vec::with_capacity(grid_prices.len() - 1);
+        for w in grid_prices.windows(2) {
+            if w[0] > 0.0 {
+                rets.push((w[1] - w[0]) / w[0]);
+            }
+        }
+        if rets.len() < 2 {
+            return (0.0, 0.0);
+        }
+        let mean = rets.iter().sum::<f64>() / rets.len() as f64;
+        let var = rets.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / rets.len() as f64;
+        let vol = var.sqrt();
+        // Sign-flip fraction over nonzero returns.
+        let signs: Vec<f64> = rets.iter().map(|r| r.signum()).filter(|s| *s != 0.0).collect();
+        let flips = if signs.len() > 1 {
+            let mut flip = 0usize;
+            for w in signs.windows(2) {
+                if w[0] != w[1] {
+                    flip += 1;
+                }
+            }
+            flip as f64 / (signs.len() - 1) as f64
+        } else {
+            0.0
+        };
+        (vol, flips)
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
+fn env_positive_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book(bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, last_trade: f64) -> BookState {
+        BookState::from_top_of_book("yes", bid, bid_sz, ask, ask_sz, last_trade, 0)
+    }
+
+    #[test]
+    fn pro_rata_fill_haircut_matches_clip_over_clip_plus_ahead() {
+        let mut inv = SimInventory::default();
+        // clip 10, 200 ahead => frac = 10/210 => qty = 10 * 10/210 ~= 0.476
+        let clip = 10.0;
+        let ahead = 200.0;
+        let frac = clip / (clip + ahead);
+        let qty = clip * frac;
+        inv.yes_long += qty;
+        assert!((inv.yes_long - 0.47619).abs() < 1e-4);
+    }
+
+    #[test]
+    fn matched_pairs_redeem_to_one_residual_marked_to_mid() {
+        let mut inv = SimInventory::default();
+        // 5 YES @ 0.48, 5 NO @ 0.49 => fully paired, pair_cost 0.97 => 5*0.03=0.15
+        inv.yes_long = 5.0;
+        inv.yes_long_cost = 5.0 * 0.48;
+        inv.no_long = 5.0;
+        inv.no_long_cost = 5.0 * 0.49;
+        let pnl = inv.marked_pnl(0.5, false);
+        assert!((pnl - 0.15).abs() < 1e-9, "pnl={pnl}");
+        assert_eq!(inv.paired(), 5.0);
+        assert_eq!(inv.residual_shares(), 0.0);
+    }
+
+    #[test]
+    fn residual_frac_reflects_unmatched_skew() {
+        let mut inv = SimInventory::default();
+        inv.yes_long = 12.0;
+        inv.no_long = 10.0;
+        assert_eq!(inv.paired(), 10.0);
+        assert_eq!(inv.residual_shares(), 2.0);
+        // residual / total = 2 / 22
+        assert!((inv.residual_frac() - (2.0 / 22.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simulate_fill_buys_yes_on_taker_sell_hitting_our_bid() {
+        let mut mm = PairedMmLiveShadow {
+            active: Some(ActiveMarket {
+                market_id: MarketId::from("m"),
+                yes_asset_id: "yes".to_string(),
+                close_ms: 10_000,
+                last_decision_ms: 0,
+                mid_min: 0.5,
+                mid_max: 0.5,
+                last_trade_price: 0.0,
+                inventory: SimInventory::default(),
+            }),
+            clip_shares: 10.0,
+            rebate_on: false,
+            spot: VecDeque::new(),
+            disjoint_skip_markets: HashMap::new(),
+        };
+        // Fresh print at 0.48 == our resting bid; 0 depth ahead => full clip.
+        let b = book(0.48, 0.0, 0.50, 100.0, 0.48);
+        mm.simulate_fill(&b, 0.0, 0.49);
+        let inv = &mm.active.as_ref().unwrap().inventory;
+        assert!(inv.yes_long > 0.0);
+        assert_eq!(inv.no_long, 0.0);
+    }
+
+    #[test]
+    fn no_fill_when_last_trade_price_unchanged() {
+        let mut mm = PairedMmLiveShadow {
+            active: Some(ActiveMarket {
+                market_id: MarketId::from("m"),
+                yes_asset_id: "yes".to_string(),
+                close_ms: 10_000,
+                last_decision_ms: 0,
+                mid_min: 0.5,
+                mid_max: 0.5,
+                last_trade_price: 0.48,
+                inventory: SimInventory::default(),
+            }),
+            clip_shares: 10.0,
+            rebate_on: false,
+            spot: VecDeque::new(),
+            disjoint_skip_markets: HashMap::new(),
+        };
+        let b = book(0.48, 0.0, 0.50, 100.0, 0.48);
+        mm.simulate_fill(&b, 0.48, 0.49);
+        let inv = &mm.active.as_ref().unwrap().inventory;
+        assert_eq!(inv.yes_long, 0.0);
+        assert_eq!(inv.no_long, 0.0);
+    }
+
+    #[test]
+    fn from_env_is_none_when_flag_unset() {
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
+        assert!(PairedMmLiveShadow::from_env().is_none());
+    }
+}
