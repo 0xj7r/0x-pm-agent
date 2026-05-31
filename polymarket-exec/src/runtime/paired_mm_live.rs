@@ -93,7 +93,9 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
@@ -228,6 +230,31 @@ impl SimInventory {
     }
 }
 
+/// A POST lifecycle event for the queue-modeling capture, collected by
+/// `manage_paper_legs` as legs are created and flushed to the queue-log after
+/// the `active` borrow ends (so the log write does not entangle the trading
+/// borrow). Pure instrumentation.
+struct QueuePostEvent {
+    client_order_id: String,
+    leg: &'static str,
+    price: f64,
+    clip: f64,
+    shares_ahead_at_submit: f64,
+}
+
+/// A CANCEL/replace lifecycle event for the queue-modeling capture. Carries the
+/// time the leg rested and how much of it had filled (so the unfilled remainder
+/// is recoverable offline).
+struct QueueCancelEvent {
+    client_order_id: String,
+    leg: &'static str,
+    price: f64,
+    clip: f64,
+    filled_so_far: f64,
+    time_rested_ms: u64,
+    reason: &'static str,
+}
+
 /// One resting maker quote leg the paper/live arm is managing. Tracks the live
 /// client_order_id and the price we posted it at so the next tick can decide
 /// keep-vs-cancel/replace as the touch moves, plus the SUBMIT-time queue-capture
@@ -292,6 +319,42 @@ impl PairedPosition {
     fn skew(&self) -> f64 {
         self.yes_shares - self.no_shares
     }
+
+    /// Matched pairs (each redeems to $1) from the REAL position.
+    fn matched_pairs(&self) -> f64 {
+        self.yes_shares.min(self.no_shares)
+    }
+
+    /// Unmatched residual shares (|skew|) from the REAL position.
+    fn residual_shares(&self) -> f64 {
+        self.skew().abs()
+    }
+
+    /// REAL marked PnL proxy: matched pairs are ~riskless (each redeems to $1,
+    /// the captured-spread profit lives in entry cost which the runtime tracks,
+    /// not here) and the unmatched residual is marked to the YES mid (YES residual
+    /// at `mid`, NO residual at `1 - mid`). This is a coarse mark-to-market of the
+    /// directional residual risk for the live log; it intentionally does NOT
+    /// reconstruct cost basis (the runtime inventory owns realized PnL). The
+    /// per-share residual mark is bounded to [-1, 1] and a degenerate mid falls
+    /// back to 0.5, so |residual contribution| <= residual shares.
+    fn marked_pnl(&self, yes_mid: f64) -> f64 {
+        let mid = if yes_mid.is_finite() {
+            yes_mid.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let skew = self.skew();
+        if skew > 0.0 {
+            // Net long YES residual marked at mid.
+            skew * mid.clamp(0.0, 1.0)
+        } else if skew < 0.0 {
+            // Net long NO residual marked at 1 - mid.
+            (-skew) * (1.0 - mid).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Per-tick quote/fill decision, logged by [`PairedMmLiveShadow::decide_tick`].
@@ -312,6 +375,84 @@ pub struct PairedMmTickResult {
     /// moved, or the leg was pulled). Paired with `submit_intents` to realize a
     /// cancel/replace. Empty unless the paper arm is armed.
     pub cancel_ids: Vec<ClientOrderId>,
+}
+
+/// Durable structured JSONL sink for the queue-position-modeling capture.
+///
+/// One line per lifecycle event for OUR maker orders (`post`, `tick`, `fill`,
+/// `cancel`), enough to fit "actual capture vs pro-rata" offline: each `post`
+/// carries the queue depth ahead at submit + book/clock context; each `tick`
+/// snapshots the depth at our resting level + observed taker volume + cumulative
+/// fill while a leg is alive; each `fill` carries incremental/cumulative filled,
+/// time-since-post, realized vs pro-rata; each `cancel` carries time-rested and
+/// the unfilled remainder. Gated entirely by
+/// `PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH`: when that env var is unset/empty the
+/// sink is never constructed and NOTHING is written (default-off, additive).
+///
+/// Records are flushed per write so a crash loses at most the in-flight line.
+struct QueueLog {
+    writer: BufWriter<File>,
+    path: PathBuf,
+}
+
+impl QueueLog {
+    /// Open the queue-log sink IFF `PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH` is set to
+    /// a non-empty path. Returns `None` (no-op, default-off) otherwise. An open
+    /// error WARNS and returns `None` rather than failing the runtime: the
+    /// capture is best-effort instrumentation and must never gate trading.
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(trimmed);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => {
+                info!(
+                    target: "paired_mm",
+                    path = %path.display(),
+                    "PAIRED-MM queue-modeling capture enabled (structured JSONL per maker-order lifecycle event)"
+                );
+                Some(Self { writer: BufWriter::new(file), path })
+            }
+            Err(error) => {
+                warn!(
+                    target: "paired_mm",
+                    path = %path.display(),
+                    %error,
+                    "PAIRED-MM queue-log path set but could not be opened; capture DISABLED (instrumentation only, trading unaffected)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Append one record as a JSON line. Best-effort: a write/flush error warns
+    /// once-ish and is otherwise swallowed (never gates trading).
+    fn append(&mut self, value: &serde_json::Value) {
+        let mut line = match serde_json::to_vec(value) {
+            Ok(line) => line,
+            Err(error) => {
+                warn!(target: "paired_mm", %error, "PAIRED-MM queue-log serialize failed");
+                return;
+            }
+        };
+        line.push(b'\n');
+        if let Err(error) = self.writer.write_all(&line).and_then(|_| self.writer.flush()) {
+            warn!(
+                target: "paired_mm",
+                path = %self.path.display(),
+                %error,
+                "PAIRED-MM queue-log write failed (capture line dropped)"
+            );
+        }
+    }
 }
 
 /// Runtime-side driver that feeds the paired-MM shadow overlay from live feeds.
@@ -365,6 +506,10 @@ pub struct PairedMmLiveShadow {
     spot: VecDeque<SpotSample>,
     /// One-shot guard so the "br2 owns this market" disjoint note logs sparingly.
     disjoint_skip_markets: HashMap<String, u64>,
+    /// Durable queue-modeling capture sink. `None` (default) unless
+    /// `PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH` is set; when `None` no capture is
+    /// written and behavior is byte-identical.
+    queue_log: Option<QueueLog>,
 }
 
 impl PairedMmLiveShadow {
@@ -539,6 +684,7 @@ impl PairedMmLiveShadow {
             requote_min_ticks,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
+            queue_log: QueueLog::from_env(),
         })
     }
 
@@ -808,6 +954,8 @@ impl PairedMmLiveShadow {
         // difference is where the runner routes the resulting intents and the
         // per-order/per-market/gross notional caps applied on the live arm.
         let mut submit_intents: Vec<OrderIntent> = Vec::new();
+        let mut post_events: Vec<QueuePostEvent> = Vec::new();
+        let mut cancel_events: Vec<QueueCancelEvent> = Vec::new();
         if self.submission_armed() {
             self.manage_paper_legs(
                 market_id,
@@ -818,42 +966,260 @@ impl PairedMmLiveShadow {
                 now_ms,
                 &mut submit_intents,
                 &mut cancel_ids,
+                &mut post_events,
+                &mut cancel_events,
             );
         }
+        // Flush queue-modeling POST / CANCEL records (default-off; only when the
+        // capture path is enabled). Done after manage_paper_legs returns so the
+        // log write does not overlap the `active` mutable borrow.
+        self.log_queue_posts_cancels(
+            market_id,
+            yes_book,
+            yes_mid,
+            secs_to_close,
+            now_ms,
+            &post_events,
+            &cancel_events,
+        );
 
+        let armed = self.submission_armed();
         if let Some(active) = self.active.as_ref() {
             let inv = &active.inventory;
             let sim_pnl = inv.marked_pnl(yes_mid, self.rebate_on);
-            info!(
-                target: "paired_mm",
-                market = %market_id,
-                secs_to_close,
-                yes_bid = yes_book.best_bid,
-                yes_ask = yes_book.best_ask,
-                yes_mid,
-                clip = self.clip_shares,
-                quote_bid = ?bid_price,
-                quote_ask = ?ask_price,
-                skew,
-                paper_armed = self.paper_trade_armed,
-                live_armed = self.live_trade_armed,
-                real_yes = pos.yes_shares,
-                real_no = pos.no_shares,
-                n_submit = submit_intents.len(),
-                n_cancel = cancel_ids.len(),
-                yes_long = inv.yes_long,
-                no_long = inv.no_long,
-                matched_pairs = inv.paired(),
-                residual_shares = inv.residual_shares(),
-                residual_frac = inv.residual_frac(),
-                n_fills = inv.n_fills,
-                filled_shares = inv.filled_shares,
-                sim_pnl,
-                "PAIRED-MM quote tick"
-            );
+            if armed {
+                // ARMED (paper or live): the internal SimInventory does NOT reflect
+                // the real position, so log the REAL residual / matched pairs /
+                // marked PnL from `pos` (Fix: the old log printed the stale sim as if
+                // it were real). The sim fields are still useful for the off-path
+                // comparison but are clearly suffixed `_sim` so a reader can never
+                // mistake them for the real position.
+                let real_matched = pos.matched_pairs();
+                let real_residual = pos.residual_shares();
+                let real_marked_pnl = pos.marked_pnl(yes_mid);
+                info!(
+                    target: "paired_mm",
+                    market = %market_id,
+                    secs_to_close,
+                    yes_bid = yes_book.best_bid,
+                    yes_ask = yes_book.best_ask,
+                    yes_mid,
+                    clip = self.clip_shares,
+                    quote_bid = ?bid_price,
+                    quote_ask = ?ask_price,
+                    skew,
+                    paper_armed = self.paper_trade_armed,
+                    live_armed = self.live_trade_armed,
+                    real_yes = pos.yes_shares,
+                    real_no = pos.no_shares,
+                    real_matched_pairs = real_matched,
+                    real_residual_shares = real_residual,
+                    real_marked_pnl,
+                    n_submit = submit_intents.len(),
+                    n_cancel = cancel_ids.len(),
+                    matched_pairs_sim = inv.paired(),
+                    residual_shares_sim = inv.residual_shares(),
+                    n_fills_sim = inv.n_fills,
+                    filled_shares_sim = inv.filled_shares,
+                    sim_pnl,
+                    "PAIRED-MM quote tick"
+                );
+            } else {
+                // PURE-SHADOW (unarmed): no real position exists, so the SimInventory
+                // IS the simulated state we are reporting. Unchanged from INC1.
+                info!(
+                    target: "paired_mm",
+                    market = %market_id,
+                    secs_to_close,
+                    yes_bid = yes_book.best_bid,
+                    yes_ask = yes_book.best_ask,
+                    yes_mid,
+                    clip = self.clip_shares,
+                    quote_bid = ?bid_price,
+                    quote_ask = ?ask_price,
+                    skew,
+                    paper_armed = self.paper_trade_armed,
+                    live_armed = self.live_trade_armed,
+                    yes_long = inv.yes_long,
+                    no_long = inv.no_long,
+                    matched_pairs = inv.paired(),
+                    residual_shares = inv.residual_shares(),
+                    residual_frac = inv.residual_frac(),
+                    n_fills = inv.n_fills,
+                    filled_shares = inv.filled_shares,
+                    sim_pnl,
+                    "PAIRED-MM quote tick (shadow sim)"
+                );
+            }
         }
 
+        // Queue-modeling capture: per-tick snapshot of each LIVE resting leg's
+        // depth-at-level + observed taker volume + cumulative fill, so the queue
+        // drain can be reconstructed offline even without per-print taker plumbing.
+        self.log_queue_tick(market_id, yes_book, yes_mid, secs_to_close, now_ms);
+
         PairedMmTickResult { quoting, bid_price, ask_price, submit_intents, cancel_ids }
+    }
+
+    /// Common book/clock context fields shared by every queue-log record, so a
+    /// reader can join an order's lifecycle against the prevailing market state.
+    fn queue_ctx(
+        market_id: &MarketId,
+        yes_book: &BookState,
+        yes_mid: f64,
+        secs_to_close: f64,
+        now_ms: u64,
+    ) -> serde_json::Value {
+        let spread = if yes_book.best_bid > 0.0 && yes_book.best_ask > 0.0 {
+            yes_book.best_ask - yes_book.best_bid
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "ts_ms": now_ms,
+            "market": market_id.as_str(),
+            "best_bid": yes_book.best_bid,
+            "best_ask": yes_book.best_ask,
+            "best_bid_size": yes_book.best_bid_size,
+            "best_ask_size": yes_book.best_ask_size,
+            "spread": spread,
+            "yes_mid": yes_mid,
+            "secs_to_close": secs_to_close,
+        })
+    }
+
+    /// Emit queue-log POST and CANCEL/REPLACE records for this tick's lifecycle
+    /// events. No-op unless the capture path is enabled (queue_log is Some).
+    fn log_queue_posts_cancels(
+        &mut self,
+        market_id: &MarketId,
+        yes_book: &BookState,
+        yes_mid: f64,
+        secs_to_close: f64,
+        now_ms: u64,
+        post_events: &[QueuePostEvent],
+        cancel_events: &[QueueCancelEvent],
+    ) {
+        let Some(queue_log) = self.queue_log.as_mut() else { return };
+        for ev in cancel_events {
+            let unfilled = (ev.clip - ev.filled_so_far).max(0.0);
+            let mut rec = Self::queue_ctx(market_id, yes_book, yes_mid, secs_to_close, now_ms);
+            if let serde_json::Value::Object(map) = &mut rec {
+                map.insert("event".to_string(), serde_json::json!("cancel"));
+                map.insert("client_order_id".to_string(), serde_json::json!(ev.client_order_id));
+                map.insert("leg".to_string(), serde_json::json!(ev.leg));
+                map.insert("price".to_string(), serde_json::json!(ev.price));
+                map.insert("clip".to_string(), serde_json::json!(ev.clip));
+                map.insert("filled_so_far".to_string(), serde_json::json!(ev.filled_so_far));
+                map.insert("unfilled_remainder".to_string(), serde_json::json!(unfilled));
+                map.insert("time_rested_ms".to_string(), serde_json::json!(ev.time_rested_ms));
+                map.insert("reason".to_string(), serde_json::json!(ev.reason));
+            }
+            queue_log.append(&rec);
+        }
+        for ev in post_events {
+            let pro_rata = ev.clip / (ev.clip + ev.shares_ahead_at_submit.max(0.0));
+            let mut rec = Self::queue_ctx(market_id, yes_book, yes_mid, secs_to_close, now_ms);
+            if let serde_json::Value::Object(map) = &mut rec {
+                map.insert("event".to_string(), serde_json::json!("post"));
+                map.insert("client_order_id".to_string(), serde_json::json!(ev.client_order_id));
+                map.insert("leg".to_string(), serde_json::json!(ev.leg));
+                map.insert("price".to_string(), serde_json::json!(ev.price));
+                map.insert("clip".to_string(), serde_json::json!(ev.clip));
+                map.insert(
+                    "shares_ahead_at_submit".to_string(),
+                    serde_json::json!(ev.shares_ahead_at_submit),
+                );
+                map.insert(
+                    "pro_rata_expected_capture".to_string(),
+                    serde_json::json!(pro_rata),
+                );
+            }
+            queue_log.append(&rec);
+        }
+    }
+
+    /// Emit a per-tick queue-log snapshot for each LIVE resting leg: the depth at
+    /// our resting level (queue we sit behind / our own size), the observed taker
+    /// volume over the trailing 60s (buy + sell qty, the flow that could drain our
+    /// queue), and our cumulative fill so far. Per the task's fallback path, this
+    /// makes the queue drain reconstructable offline WITHOUT per-print taker
+    /// plumbing: combined with each `post` (`shares_ahead_at_submit`) and each
+    /// `fill`, it yields the (depth_ahead, taker_volume_through_level, time_rested,
+    /// realized_fill) tuples needed to fit the queue model. No-op unless the
+    /// capture path is enabled.
+    fn log_queue_tick(
+        &mut self,
+        market_id: &MarketId,
+        yes_book: &BookState,
+        yes_mid: f64,
+        secs_to_close: f64,
+        now_ms: u64,
+    ) {
+        if self.queue_log.is_none() {
+            return;
+        }
+        // Observed taker flow over the trailing 60s on the YES book (buy lifts,
+        // sell hits). The MM module only ever sees BookState SNAPSHOTS, not
+        // individual taker prints; this trailing volume + the per-tick depth is the
+        // closest reconstructable proxy for "taker volume through our level". See
+        // the report note: per-print taker prints are NOT plumbed into the MM path.
+        let (taker_buy_qty_60s, taker_sell_qty_60s) = yes_book.taker_flow_qty_60s(now_ms);
+        let last_trade_price = yes_book.last_trade_price;
+        let legs: Vec<(String, &'static str, f64, f64, f64, f64)> = {
+            let Some(active) = self.active.as_ref() else { return };
+            [active.bid_leg.as_ref(), active.no_leg.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|leg| {
+                    // Depth at OUR resting level: for the YES-bid leg, the resting
+                    // best_bid_size; for the NO leg (mirrored to the YES ask) the
+                    // best_ask_size. This is the current queue at our price.
+                    let depth_at_level = match leg.leg {
+                        "bidyes" => yes_book.best_bid_size.max(0.0),
+                        "buyno" => yes_book.best_ask_size.max(0.0),
+                        _ => 0.0,
+                    };
+                    (
+                        leg.client_order_id.as_str().to_string(),
+                        leg.leg,
+                        leg.price,
+                        leg.shares_ahead,
+                        leg.filled_so_far,
+                        depth_at_level,
+                    )
+                })
+                .collect()
+        };
+        if legs.is_empty() {
+            return;
+        }
+        let queue_log = self.queue_log.as_mut().expect("checked is_none above");
+        for (coid, leg, price, shares_ahead_at_submit, filled_so_far, depth_at_level) in legs {
+            let mut rec = Self::queue_ctx(market_id, yes_book, yes_mid, secs_to_close, now_ms);
+            if let serde_json::Value::Object(map) = &mut rec {
+                map.insert("event".to_string(), serde_json::json!("tick"));
+                map.insert("client_order_id".to_string(), serde_json::json!(coid));
+                map.insert("leg".to_string(), serde_json::json!(leg));
+                map.insert("price".to_string(), serde_json::json!(price));
+                map.insert(
+                    "shares_ahead_at_submit".to_string(),
+                    serde_json::json!(shares_ahead_at_submit),
+                );
+                map.insert("depth_at_level".to_string(), serde_json::json!(depth_at_level));
+                map.insert("filled_so_far".to_string(), serde_json::json!(filled_so_far));
+                map.insert("last_trade_price".to_string(), serde_json::json!(last_trade_price));
+                map.insert(
+                    "taker_buy_qty_60s".to_string(),
+                    serde_json::json!(taker_buy_qty_60s),
+                );
+                map.insert(
+                    "taker_sell_qty_60s".to_string(),
+                    serde_json::json!(taker_sell_qty_60s),
+                );
+            }
+            queue_log.append(&rec);
+        }
     }
 
     /// Realize the maker quote lifecycle for the armed (paper OR live) arm: for
@@ -894,6 +1260,8 @@ impl PairedMmLiveShadow {
         now_ms: u64,
         submit_intents: &mut Vec<OrderIntent>,
         cancel_ids: &mut Vec<ClientOrderId>,
+        post_events: &mut Vec<QueuePostEvent>,
+        cancel_events: &mut Vec<QueueCancelEvent>,
     ) {
         let clip = self.clip_shares;
         // Snapshot the live-arm caps before borrowing `active` mutably. On the
@@ -952,6 +1320,15 @@ impl PairedMmLiveShadow {
             }
             (Some(price), existing) => {
                 if let Some(existing) = existing {
+                    cancel_events.push(QueueCancelEvent {
+                        client_order_id: existing.client_order_id.as_str().to_string(),
+                        leg: existing.leg,
+                        price: existing.price,
+                        clip: existing.clip,
+                        filled_so_far: existing.filled_so_far,
+                        time_rested_ms: now_ms.saturating_sub(existing.submit_ms),
+                        reason: "replace",
+                    });
                     cancel_ids.push(existing.client_order_id);
                 }
                 let leg_clip = Self::bound_clip_to_caps(
@@ -963,6 +1340,13 @@ impl PairedMmLiveShadow {
                     let coid = Self::leg_coid(market_id, "bidyes", active.quote_seq, now_ms);
                     let intent =
                         Self::maker_buy(coid.clone(), market_id, &yes_token, price, leg_clip, now_ms);
+                    post_events.push(QueuePostEvent {
+                        client_order_id: coid.as_str().to_string(),
+                        leg: "bidyes",
+                        price,
+                        clip: leg_clip,
+                        shares_ahead_at_submit: bid_ahead,
+                    });
                     active.bid_leg = Some(RestingLeg {
                         client_order_id: coid,
                         price,
@@ -979,6 +1363,15 @@ impl PairedMmLiveShadow {
                 }
             }
             (None, Some(existing)) => {
+                cancel_events.push(QueueCancelEvent {
+                    client_order_id: existing.client_order_id.as_str().to_string(),
+                    leg: existing.leg,
+                    price: existing.price,
+                    clip: existing.clip,
+                    filled_so_far: existing.filled_so_far,
+                    time_rested_ms: now_ms.saturating_sub(existing.submit_ms),
+                    reason: "pull",
+                });
                 cancel_ids.push(existing.client_order_id);
                 active.bid_leg = None;
             }
@@ -1012,6 +1405,15 @@ impl PairedMmLiveShadow {
                 }
                 (Some(price), existing) => {
                     if let Some(existing) = existing {
+                        cancel_events.push(QueueCancelEvent {
+                            client_order_id: existing.client_order_id.as_str().to_string(),
+                            leg: existing.leg,
+                            price: existing.price,
+                            clip: existing.clip,
+                            filled_so_far: existing.filled_so_far,
+                            time_rested_ms: now_ms.saturating_sub(existing.submit_ms),
+                            reason: "replace",
+                        });
                         cancel_ids.push(existing.client_order_id);
                     }
                     let leg_clip = Self::bound_clip_to_caps(
@@ -1023,6 +1425,13 @@ impl PairedMmLiveShadow {
                         let coid = Self::leg_coid(market_id, "buyno", active.quote_seq, now_ms);
                         let intent =
                             Self::maker_buy(coid.clone(), market_id, &no_token, price, leg_clip, now_ms);
+                        post_events.push(QueuePostEvent {
+                            client_order_id: coid.as_str().to_string(),
+                            leg: "buyno",
+                            price,
+                            clip: leg_clip,
+                            shares_ahead_at_submit: no_ahead,
+                        });
                         active.no_leg = Some(RestingLeg {
                             client_order_id: coid,
                             price,
@@ -1039,12 +1448,30 @@ impl PairedMmLiveShadow {
                     }
                 }
                 (None, Some(existing)) => {
+                    cancel_events.push(QueueCancelEvent {
+                        client_order_id: existing.client_order_id.as_str().to_string(),
+                        leg: existing.leg,
+                        price: existing.price,
+                        clip: existing.clip,
+                        filled_so_far: existing.filled_so_far,
+                        time_rested_ms: now_ms.saturating_sub(existing.submit_ms),
+                        reason: "pull",
+                    });
                     cancel_ids.push(existing.client_order_id);
                     active.no_leg = None;
                 }
                 (None, None) => {}
             }
         } else if let Some(existing) = active.no_leg.take() {
+            cancel_events.push(QueueCancelEvent {
+                client_order_id: existing.client_order_id.as_str().to_string(),
+                leg: existing.leg,
+                price: existing.price,
+                clip: existing.clip,
+                filled_so_far: existing.filled_so_far,
+                time_rested_ms: now_ms.saturating_sub(existing.submit_ms),
+                reason: "no_token_missing",
+            });
             cancel_ids.push(existing.client_order_id);
         }
         let _ = gross_resting_accum;
@@ -1144,56 +1571,84 @@ impl PairedMmLiveShadow {
     /// instrumentation: it mutates only the per-leg `filled_so_far` watermark.
     pub fn observe_order_fills(&mut self, observed: &[(ClientOrderId, f64)]) {
         let clip_default = self.clip_shares;
-        let Some(active) = self.active.as_mut() else { return };
-        let now_ms = active.last_decision_ms;
-        let market = active.market_id.clone();
-        for leg_slot in [active.bid_leg.as_mut(), active.no_leg.as_mut()] {
-            let Some(leg) = leg_slot else { continue };
-            let Some((_, cumulative)) = observed
-                .iter()
-                .find(|(coid, _)| *coid == leg.client_order_id)
-            else {
-                continue;
-            };
-            let cumulative = *cumulative;
-            if cumulative <= leg.filled_so_far + 1e-9 {
-                continue;
-            }
-            let incremental = cumulative - leg.filled_so_far;
-            leg.filled_so_far = cumulative;
-            let clip = if leg.clip > 0.0 { leg.clip } else { clip_default };
-            // Backtest pro-rata expectation: the share of a clip we EXPECT to
-            // capture given the resting queue ahead of us at submit.
-            let pro_rata_expected = clip / (clip + leg.shares_ahead.max(0.0));
-            // Realized capture: the share of our clip actually filled (cumulative,
-            // not just this increment), the apples-to-apples comparison.
-            let realized_capture = if clip > 0.0 {
-                (cumulative / clip).min(1.0)
-            } else {
-                0.0
-            };
-            let time_to_fill_ms = now_ms.saturating_sub(leg.submit_ms);
-            info!(
-                target: "paired_mm",
-                event = "maker_fill",
-                market = %market,
-                leg = leg.leg,
-                client_order_id = %leg.client_order_id,
-                fill_price = leg.price,
-                fill_incremental_shares = incremental,
-                fill_cumulative_shares = cumulative,
-                clip,
-                shares_ahead_at_submit = leg.shares_ahead,
-                time_to_fill_ms,
-                pro_rata_expected_capture = pro_rata_expected,
-                realized_capture,
-                capture_ratio_realized_over_prorata = if pro_rata_expected > 0.0 {
+        // Collect a structured fill record per fresh fill so we can write the
+        // durable queue-log AFTER the `active` mutable borrow ends (the borrow
+        // checker won't let us touch `self.queue_log` while `active` is held).
+        let mut fill_records: Vec<serde_json::Value> = Vec::new();
+        {
+            let Some(active) = self.active.as_mut() else { return };
+            let now_ms = active.last_decision_ms;
+            let market = active.market_id.clone();
+            for leg_slot in [active.bid_leg.as_mut(), active.no_leg.as_mut()] {
+                let Some(leg) = leg_slot else { continue };
+                let Some((_, cumulative)) = observed
+                    .iter()
+                    .find(|(coid, _)| *coid == leg.client_order_id)
+                else {
+                    continue;
+                };
+                let cumulative = *cumulative;
+                if cumulative <= leg.filled_so_far + 1e-9 {
+                    continue;
+                }
+                let incremental = cumulative - leg.filled_so_far;
+                leg.filled_so_far = cumulative;
+                let clip = if leg.clip > 0.0 { leg.clip } else { clip_default };
+                // Backtest pro-rata expectation: the share of a clip we EXPECT to
+                // capture given the resting queue ahead of us at submit.
+                let pro_rata_expected = clip / (clip + leg.shares_ahead.max(0.0));
+                // Realized capture: the share of our clip actually filled (cumulative,
+                // not just this increment), the apples-to-apples comparison.
+                let realized_capture = if clip > 0.0 {
+                    (cumulative / clip).min(1.0)
+                } else {
+                    0.0
+                };
+                let time_to_fill_ms = now_ms.saturating_sub(leg.submit_ms);
+                let capture_ratio = if pro_rata_expected > 0.0 {
                     realized_capture / pro_rata_expected
                 } else {
                     f64::NAN
-                },
-                "PAIRED-MM maker fill (queue-capture measurement: realized vs backtest pro-rata)"
-            );
+                };
+                info!(
+                    target: "paired_mm",
+                    event = "maker_fill",
+                    market = %market,
+                    leg = leg.leg,
+                    client_order_id = %leg.client_order_id,
+                    fill_price = leg.price,
+                    fill_incremental_shares = incremental,
+                    fill_cumulative_shares = cumulative,
+                    clip,
+                    shares_ahead_at_submit = leg.shares_ahead,
+                    time_to_fill_ms,
+                    pro_rata_expected_capture = pro_rata_expected,
+                    realized_capture,
+                    capture_ratio_realized_over_prorata = capture_ratio,
+                    "PAIRED-MM maker fill (queue-capture measurement: realized vs backtest pro-rata)"
+                );
+                fill_records.push(serde_json::json!({
+                    "event": "fill",
+                    "ts_ms": now_ms,
+                    "market": market.as_str(),
+                    "client_order_id": leg.client_order_id.as_str(),
+                    "leg": leg.leg,
+                    "price": leg.price,
+                    "clip": clip,
+                    "shares_ahead_at_submit": leg.shares_ahead,
+                    "fill_incremental_shares": incremental,
+                    "fill_cumulative_shares": cumulative,
+                    "time_since_post_ms": time_to_fill_ms,
+                    "pro_rata_expected_capture": pro_rata_expected,
+                    "realized_capture": realized_capture,
+                    "capture_ratio_realized_over_prorata": capture_ratio,
+                }));
+            }
+        }
+        if let Some(queue_log) = self.queue_log.as_mut() {
+            for rec in &fill_records {
+                queue_log.append(rec);
+            }
         }
     }
 
@@ -1450,6 +1905,38 @@ fn env_nonneg_f64(name: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
+    impl PairedMmLiveShadow {
+        /// Test wrapper: invokes `manage_paper_legs` with throwaway queue-event
+        /// sinks so the existing quote-lifecycle tests stay unchanged after the
+        /// queue-capture out-params were added.
+        fn mpl_test(
+            &mut self,
+            market_id: &MarketId,
+            yes_book: &BookState,
+            bid_price: Option<f64>,
+            ask_price: Option<f64>,
+            pos: PairedPosition,
+            now_ms: u64,
+            submit_intents: &mut Vec<OrderIntent>,
+            cancel_ids: &mut Vec<ClientOrderId>,
+        ) {
+            let mut posts = Vec::new();
+            let mut cancels = Vec::new();
+            self.manage_paper_legs(
+                market_id,
+                yes_book,
+                bid_price,
+                ask_price,
+                pos,
+                now_ms,
+                submit_intents,
+                cancel_ids,
+                &mut posts,
+                &mut cancels,
+            );
+        }
+    }
+
     fn book(bid: f64, bid_sz: f64, ask: f64, ask_sz: f64, last_trade: f64) -> BookState {
         BookState::from_top_of_book("yes", bid, bid_sz, ask, ask_sz, last_trade, 0)
     }
@@ -1526,6 +2013,7 @@ mod tests {
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
+            queue_log: None,
         };
         // Fresh print at 0.48 == our resting bid; 0 depth ahead => full clip.
         let b = book(0.48, 0.0, 0.50, 100.0, 0.48);
@@ -1570,6 +2058,7 @@ mod tests {
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
+            queue_log: None,
         };
         let b = book(0.48, 0.0, 0.50, 100.0, 0.48);
         mm.simulate_fill(&b, 0.48, 0.49);
@@ -1612,6 +2101,7 @@ mod tests {
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
+            queue_log: None,
         }
     }
 
@@ -1762,7 +2252,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.49),
@@ -1791,13 +2281,13 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
 
         // Same touch next tick: keep, no churn.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
         assert!(submits.is_empty() && cancels.is_empty(), "unchanged touch must not churn");
 
         // Touch moves on the bid leg by 1c but leg age (2_000-1_000=1_000ms) is
@@ -1806,7 +2296,7 @@ mod tests {
         // every sub-5s tick.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
         assert!(
             submits.is_empty() && cancels.is_empty(),
             "young leg must HOLD even when the touch moved (rest-and-hold)"
@@ -1816,7 +2306,7 @@ mod tests {
         // bid leg only.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 6_500, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 6_500, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 1, "only the aged+moved leg replaces");
         assert_eq!(cancels.len(), 1, "old bid leg cancelled");
         assert!((submits[0].limit_price - 0.48).abs() < 1e-9);
@@ -1832,12 +2322,12 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
         // Aged 9s, but bid moved only 1c (< 2c min): hold.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 10_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 10_000, &mut submits, &mut cancels);
         assert!(
             submits.is_empty() && cancels.is_empty(),
             "aged but sub-min-tick move must HOLD"
@@ -1855,7 +2345,7 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b0, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b0, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
         // Market collapses: best_bid/ask drop to 0.47/0.48. Our resting YES bid at
         // 0.49 is now >= best_ask (0.48) => would cross. Target bid is 0.47, only
@@ -1863,7 +2353,7 @@ mod tests {
         let b1 = book(0.47, 5.0, 0.48, 5.0, 0.47);
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b1, Some(0.47), Some(0.48), pos, 1_200, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b1, Some(0.47), Some(0.48), pos, 1_200, &mut submits, &mut cancels);
         let yes = submits.iter().find(|i| i.instrument_id.as_str() == "yes");
         assert!(yes.is_some(), "crossing YES bid must reprice immediately despite young age");
         assert!((yes.unwrap().limit_price - 0.47).abs() < 1e-9);
@@ -1876,13 +2366,13 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
 
         // Bid leg pulled (e.g. late-pull or repair skew) => cancel it, keep NO.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, None, Some(0.50), PairedPosition::default(), 2_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, None, Some(0.50), PairedPosition::default(), 2_000, &mut submits, &mut cancels);
         assert!(submits.is_empty(), "no new posts when pulling");
         assert_eq!(cancels.len(), 1, "pulled bid leg cancelled");
         assert!(mm.active.as_ref().unwrap().bid_leg.is_none());
@@ -1896,7 +2386,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
         cancels.clear();
         mm.drain_resting_legs(&mut cancels);
         assert_eq!(cancels.len(), 2, "both resting legs pulled on drain");
@@ -1911,7 +2401,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.49),
@@ -2017,7 +2507,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.49),
@@ -2048,7 +2538,7 @@ mod tests {
         let b = book(0.50, 5.0, 0.50, 5.0, 0.50);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.50),
@@ -2082,7 +2572,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.49),
@@ -2099,7 +2589,7 @@ mod tests {
         let paired = PairedPosition { yes_shares: 40.0, no_shares: 40.0 };
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(
+        mm.mpl_test(
             &MarketId::from("m"),
             &b,
             Some(0.49),
@@ -2144,5 +2634,165 @@ mod tests {
         // A further fill advances the watermark.
         mm.observe_order_fills(&[(coid, 7.5)]);
         assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 7.5).abs() < 1e-9);
+    }
+
+    // --- TASK 1: REAL position drives the armed quote-tick log (not SimInventory) ---
+
+    #[test]
+    fn real_position_residual_matched_and_pnl_drive_armed_log() {
+        // Repro of the observed live bug: SimInventory said residual 0.52 / pnl
+        // -0.14 while the REAL position was 10 YES / 0 NO. The armed log must
+        // report the REAL residual (|skew| = 10), REAL matched pairs (min = 0),
+        // and a REAL residual mark (10 * mid). These are exactly the helper
+        // values the armed branch logs.
+        let pos = PairedPosition { yes_shares: 10.0, no_shares: 0.0 };
+        assert_eq!(pos.residual_shares(), 10.0, "real residual = |skew|");
+        assert_eq!(pos.matched_pairs(), 0.0, "no matched pairs when one-sided");
+        // 10 YES residual marked at mid 0.5 => 5.0 (NOT the sim's -0.14).
+        assert!((pos.marked_pnl(0.5) - 5.0).abs() < 1e-9, "got {}", pos.marked_pnl(0.5));
+
+        // Fully paired: matched pairs = the shared count, residual = 0, and the
+        // residual mark contributes nothing (matched pairs are ~riskless here).
+        let paired = PairedPosition { yes_shares: 8.0, no_shares: 8.0 };
+        assert_eq!(paired.matched_pairs(), 8.0);
+        assert_eq!(paired.residual_shares(), 0.0);
+        assert!((paired.marked_pnl(0.5)).abs() < 1e-9);
+
+        // Net-NO residual marked at 1 - mid; bounded by the residual share count.
+        let net_no = PairedPosition { yes_shares: 2.0, no_shares: 5.0 };
+        assert_eq!(net_no.residual_shares(), 3.0);
+        assert!((net_no.marked_pnl(0.4) - 3.0 * 0.6).abs() < 1e-9);
+        // Degenerate mid falls back to 0.5; residual mark stays <= residual shares.
+        assert!(net_no.marked_pnl(f64::NAN).abs() <= net_no.residual_shares() + 1e-9);
+        assert!(net_no.marked_pnl(99.0).abs() <= net_no.residual_shares() + 1e-9);
+    }
+
+    // --- TASK 2: queue-modeling capture record shape ---
+
+    fn read_queue_log_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("valid JSON line"))
+            .collect()
+    }
+
+    #[test]
+    fn queue_log_post_tick_fill_cancel_record_shapes() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pairedmm_queue_test_{}.jsonl", now_test_nonce()));
+        let _ = std::fs::remove_file(&path);
+
+        // Build a paper-armed overlay with the queue-log sink attached directly
+        // (bypasses the env so the test does not race other env-mutating tests).
+        let mut mm = paper_shadow_with_market(Some("no"));
+        mm.queue_log = Some(QueueLog {
+            writer: BufWriter::new(
+                OpenOptions::new().create(true).append(true).open(&path).unwrap(),
+            ),
+            path: path.clone(),
+        });
+        let market = MarketId::from("m");
+        let book_ctx = book(0.49, 7.0, 0.50, 9.0, 0.49);
+
+        // POST: drive the lifecycle helpers exactly as decide_tick does.
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        let mut posts = Vec::new();
+        let mut cancel_events = Vec::new();
+        mm.manage_paper_legs(
+            &market, &book_ctx, Some(0.49), Some(0.50), PairedPosition::default(),
+            1_000, &mut submits, &mut cancels, &mut posts, &mut cancel_events,
+        );
+        assert_eq!(posts.len(), 2, "two POST events (YES bid + NO)");
+        mm.log_queue_posts_cancels(&market, &book_ctx, 0.495, 120.0, 1_000, &posts, &cancel_events);
+
+        // TICK: snapshot the live legs.
+        mm.log_queue_tick(&market, &book_ctx, 0.495, 119.0, 2_000);
+
+        // FILL: a cumulative fill on the YES bid leg emits a `fill` record.
+        if let Some(active) = mm.active.as_mut() {
+            active.last_decision_ms = 3_000;
+        }
+        let yes_coid = mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().client_order_id.clone();
+        mm.observe_order_fills(&[(yes_coid.clone(), 3.0)]);
+
+        // CANCEL: pull both legs (target None) => two cancel events with remainder.
+        let mut s2 = Vec::new();
+        let mut c2 = Vec::new();
+        let mut p2 = Vec::new();
+        let mut ce2 = Vec::new();
+        mm.manage_paper_legs(
+            &market, &book_ctx, None, None, PairedPosition::default(),
+            10_000, &mut s2, &mut c2, &mut p2, &mut ce2,
+        );
+        assert_eq!(ce2.len(), 2, "both legs pulled");
+        mm.log_queue_posts_cancels(&market, &book_ctx, 0.495, 110.0, 10_000, &p2, &ce2);
+
+        mm.queue_log.as_mut().unwrap().writer.flush().unwrap();
+        let lines = read_queue_log_lines(&path);
+
+        let posts: Vec<_> = lines.iter().filter(|l| l["event"] == "post").collect();
+        let ticks: Vec<_> = lines.iter().filter(|l| l["event"] == "tick").collect();
+        let fills: Vec<_> = lines.iter().filter(|l| l["event"] == "fill").collect();
+        let cancels_l: Vec<_> = lines.iter().filter(|l| l["event"] == "cancel").collect();
+        assert_eq!(posts.len(), 2, "two post records");
+        assert_eq!(ticks.len(), 2, "two tick records (both legs live)");
+        assert_eq!(fills.len(), 1, "one fill record");
+        assert_eq!(cancels_l.len(), 2, "two cancel records");
+
+        // POST record carries the queue-model inputs.
+        let post = &posts[0];
+        for field in [
+            "client_order_id", "leg", "price", "clip", "shares_ahead_at_submit",
+            "pro_rata_expected_capture", "best_bid", "best_ask", "spread", "yes_mid",
+            "secs_to_close", "market", "ts_ms",
+        ] {
+            assert!(post.get(field).is_some(), "post missing {field}: {post}");
+        }
+
+        // TICK record carries depth-at-level + observed taker volume + cumulative fill.
+        let tick = &ticks[0];
+        for field in [
+            "depth_at_level", "shares_ahead_at_submit", "filled_so_far",
+            "taker_buy_qty_60s", "taker_sell_qty_60s", "last_trade_price",
+        ] {
+            assert!(tick.get(field).is_some(), "tick missing {field}: {tick}");
+        }
+
+        // FILL record carries realized vs pro-rata + time-since-post.
+        let fill = &fills[0];
+        for field in [
+            "fill_incremental_shares", "fill_cumulative_shares", "time_since_post_ms",
+            "pro_rata_expected_capture", "realized_capture", "capture_ratio_realized_over_prorata",
+        ] {
+            assert!(fill.get(field).is_some(), "fill missing {field}: {fill}");
+        }
+        assert!((fill["fill_cumulative_shares"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+        assert!(fill["time_since_post_ms"].as_f64().unwrap() >= 2000.0);
+
+        // CANCEL record carries time-rested + unfilled remainder.
+        let cancel = &cancels_l[0];
+        for field in ["time_rested_ms", "filled_so_far", "unfilled_remainder", "reason"] {
+            assert!(cancel.get(field).is_some(), "cancel missing {field}: {cancel}");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_log_disabled_when_env_unset_is_default_off() {
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH");
+        assert!(QueueLog::from_env().is_none(), "default-off when env unset");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH", "   ");
+        assert!(QueueLog::from_env().is_none(), "empty/whitespace path => off");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH");
+    }
+
+    fn now_test_nonce() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     }
 }
