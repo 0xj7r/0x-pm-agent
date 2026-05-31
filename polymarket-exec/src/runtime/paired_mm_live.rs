@@ -127,6 +127,11 @@ const DEFAULT_MIN_REQUOTE_AGE_MS: u64 = 5_000; // hold a resting leg >=5s before
 const DEFAULT_REQUOTE_MIN_TICKS: f64 = 0.01; // and only chase once the touch moved >=1c
 const REPAIR_DELTA_SHARES: f64 = 2.0; // residual-cap band on |yes_long - no_long|
 const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (logged)
+// Side-aware EV-gated residual policy: extra directional budget (shares) we are
+// willing to HOLD on the +EV UNDERDOG side instead of re-pairing it away. 0.0
+// disables the policy entirely, so the residual handling is byte-identical to
+// the symmetric always-re-pair behavior (DEFAULT-OFF).
+const DEFAULT_UNDERDOG_HOLD_CAP_SHARES: f64 = 0.0;
 const TAKER_FEE_FRAC: f64 = 0.0156;
 const REBATE_FRAC: f64 = 0.20 * TAKER_FEE_FRAC; // maker rebate ~20% of taker fee, on notional
 
@@ -357,6 +362,129 @@ impl PairedPosition {
     }
 }
 
+/// Classification of the leading (net-long) residual side by its market price,
+/// for the side-aware EV-gated residual policy.
+///
+/// Backtest finding (May BTC-5m): the FAVOURITE (the side priced > 0.5) is
+/// OVERPRICED, so holding it is -EV (re-pair / flatten it). The UNDERDOG (the
+/// cheap side, < 0.5) is UNDERPRICED, so holding it is +EV (let a bounded
+/// residual stand to resolution).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidualSide {
+    /// No residual past the repair band (|skew| <= repair_delta).
+    None,
+    /// Leading side priced > 0.5 (-EV to hold): flatten.
+    Favourite,
+    /// Leading side priced < 0.5 (+EV to hold): hold up to the cap.
+    Underdog,
+}
+
+/// Action the residual policy took this tick, for the live log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidualAction {
+    /// No residual past the band: nothing suppressed.
+    NoneAction,
+    /// Re-pair: pull the leading-add leg, quote the lagging leg to flatten.
+    Flatten,
+    /// Hold the +EV underdog residual: leave BOTH legs quoting normally.
+    HoldUnderdog,
+}
+
+impl ResidualSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResidualSide::None => "none",
+            ResidualSide::Favourite => "favourite",
+            ResidualSide::Underdog => "underdog",
+        }
+    }
+}
+
+impl ResidualAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            ResidualAction::NoneAction => "none",
+            ResidualAction::Flatten => "flatten",
+            ResidualAction::HoldUnderdog => "hold_underdog",
+        }
+    }
+}
+
+/// Side-aware, EV-gated residual decision. Pure function of the inputs so it can
+/// be unit-tested without standing up a full market tick.
+///
+/// `skew` is the net YES-equivalent (+long YES, -long NO); `yes_mid` prices the
+/// YES side. Returns `(suppress_bid, suppress_ask, side, action)`, where
+/// `suppress_bid` stops adding to the YES bid leg and `suppress_ask` stops adding
+/// to the YES ask (NO) leg, exactly mirroring the legacy re-pair gate.
+///
+/// When `underdog_hold_cap <= 0.0` the policy is DISABLED: this returns the
+/// EXACT symmetric re-pair the legacy `if skew > repair_delta { bid } else if
+/// skew < -repair_delta { ask }` produced, so behavior is byte-identical.
+fn residual_policy(
+    skew: f64,
+    yes_mid: f64,
+    repair_delta: f64,
+    underdog_hold_cap: f64,
+) -> (bool, bool, ResidualSide, ResidualAction) {
+    // Within the band: no residual, nothing to do (matches legacy: neither
+    // branch fires).
+    if skew.abs() <= repair_delta {
+        return (false, false, ResidualSide::None, ResidualAction::NoneAction);
+    }
+
+    // Leading side + its price. skew > 0 => net long YES (priced at yes_mid);
+    // skew < 0 => net long NO (priced at 1 - yes_mid). FAVOURITE iff the leading
+    // side's price > 0.5.
+    let leading_long_yes = skew > 0.0;
+    let leading_price = if leading_long_yes { yes_mid } else { 1.0 - yes_mid };
+    let side = if leading_price > 0.5 {
+        ResidualSide::Favourite
+    } else {
+        ResidualSide::Underdog
+    };
+
+    // DEFAULT-OFF: cap <= 0 collapses to the legacy symmetric re-pair regardless
+    // of side classification.
+    if underdog_hold_cap <= 0.0 {
+        return if leading_long_yes {
+            (true, false, side, ResidualAction::Flatten)
+        } else {
+            (false, true, side, ResidualAction::Flatten)
+        };
+    }
+
+    match side {
+        // -EV favourite residual: re-pair as before (pull the leading-add leg,
+        // quote the lagging leg to flatten).
+        ResidualSide::Favourite => {
+            if leading_long_yes {
+                (true, false, side, ResidualAction::Flatten)
+            } else {
+                (false, true, side, ResidualAction::Flatten)
+            }
+        }
+        // +EV underdog residual.
+        ResidualSide::Underdog => {
+            if skew.abs() <= underdog_hold_cap {
+                // Within the directional budget: HOLD. Do NOT suppress either
+                // leg; keep capturing spread and let the residual stand.
+                (false, false, side, ResidualAction::HoldUnderdog)
+            } else {
+                // Past the budget: flatten only the EXCESS (same suppression as
+                // favourite re-pair, which pulls the leading-add leg until the
+                // skew drains back within the cap).
+                if leading_long_yes {
+                    (true, false, side, ResidualAction::Flatten)
+                } else {
+                    (false, true, side, ResidualAction::Flatten)
+                }
+            }
+        }
+        ResidualSide::None => (false, false, side, ResidualAction::NoneAction),
+    }
+}
+
 /// Per-tick quote/fill decision, logged by [`PairedMmLiveShadow::decide_tick`].
 #[derive(Debug, Default, Clone)]
 pub struct PairedMmTickResult {
@@ -496,6 +624,12 @@ pub struct PairedMmLiveShadow {
     flip_min: f64,
     late_pull_secs: f64,
     repair_delta: f64,
+    /// Side-aware EV-gated residual budget (shares). 0.0 (default) DISABLES the
+    /// policy: residual handling is byte-identical to the symmetric always-re-pair
+    /// behavior. When > 0, a residual on the +EV UNDERDOG side (cheap leg, priced
+    /// < 0.5) is HELD up to this cap instead of re-paired; the -EV FAVOURITE side
+    /// is always flattened. Bounded on top by the existing net notional cap.
+    underdog_hold_cap_shares: f64,
     /// Rest-and-hold requote discipline. A resting leg is KEPT (gains queue
     /// priority) unless it has aged past `min_requote_age_ms` AND the target touch
     /// has moved at least `requote_min_ticks` from the resting price (chase), or it
@@ -640,6 +774,9 @@ impl PairedMmLiveShadow {
         let late_pull_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS").unwrap_or(LATE_PULL_SECS);
         let repair_delta =
             env_positive_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES").unwrap_or(REPAIR_DELTA_SHARES);
+        // DEFAULT-OFF: unset/0 => symmetric always-re-pair (byte-identical).
+        let underdog_hold_cap_shares = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_UNDERDOG_HOLD_CAP_SHARES")
+            .unwrap_or(DEFAULT_UNDERDOG_HOLD_CAP_SHARES);
         let residual_cap_frac =
             env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_FRAC").unwrap_or(RESIDUAL_CAP_FRAC);
         let min_requote_age_ms = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MIN_REQUOTE_AGE_MS")
@@ -658,6 +795,7 @@ impl PairedMmLiveShadow {
             flip_min,
             late_pull_secs,
             repair_delta,
+            underdog_hold_cap_shares,
             residual_cap_frac,
             min_requote_age_ms,
             requote_min_ticks,
@@ -680,6 +818,7 @@ impl PairedMmLiveShadow {
             flip_min,
             late_pull_secs,
             repair_delta,
+            underdog_hold_cap_shares,
             min_requote_age_ms,
             requote_min_ticks,
             spot: VecDeque::new(),
@@ -935,9 +1074,24 @@ impl PairedMmLiveShadow {
         } else {
             self.active.as_ref().map(|a| a.inventory.skew()).unwrap_or(0.0)
         };
-        if skew > self.repair_delta {
+        // Side-aware, EV-gated residual policy. With underdog_hold_cap_shares == 0
+        // (default) this returns the EXACT symmetric re-pair the legacy gate did
+        // (favourite OR underdog => flatten), so behavior is byte-identical. When
+        // > 0, a +EV underdog residual within the cap is HELD (neither leg
+        // suppressed); the -EV favourite is always flattened; an underdog past the
+        // cap flattens the excess. The repair_delta band and the net notional cap
+        // (applied downstream in manage_paper_legs/bound_clip_to_caps) remain the
+        // absolute bounds.
+        let (suppress_bid, suppress_ask, residual_side, residual_action) = residual_policy(
+            skew,
+            yes_mid,
+            self.repair_delta,
+            self.underdog_hold_cap_shares,
+        );
+        if suppress_bid {
             bid_live = false;
-        } else if skew < -self.repair_delta {
+        }
+        if suppress_ask {
             ask_live = false;
         }
 
@@ -1022,6 +1176,9 @@ impl PairedMmLiveShadow {
                     n_fills_sim = inv.n_fills,
                     filled_shares_sim = inv.filled_shares,
                     sim_pnl,
+                    residual_side = residual_side.as_str(),
+                    residual_action = residual_action.as_str(),
+                    underdog_hold_cap_shares = self.underdog_hold_cap_shares,
                     "PAIRED-MM quote tick"
                 );
             } else {
@@ -1048,6 +1205,9 @@ impl PairedMmLiveShadow {
                     n_fills = inv.n_fills,
                     filled_shares = inv.filled_shares,
                     sim_pnl,
+                    residual_side = residual_side.as_str(),
+                    residual_action = residual_action.as_str(),
+                    underdog_hold_cap_shares = self.underdog_hold_cap_shares,
                     "PAIRED-MM quote tick (shadow sim)"
                 );
             }
@@ -1056,7 +1216,15 @@ impl PairedMmLiveShadow {
         // Queue-modeling capture: per-tick snapshot of each LIVE resting leg's
         // depth-at-level + observed taker volume + cumulative fill, so the queue
         // drain can be reconstructed offline even without per-print taker plumbing.
-        self.log_queue_tick(market_id, yes_book, yes_mid, secs_to_close, now_ms);
+        self.log_queue_tick(
+            market_id,
+            yes_book,
+            yes_mid,
+            secs_to_close,
+            now_ms,
+            residual_side.as_str(),
+            residual_action.as_str(),
+        );
 
         PairedMmTickResult { quoting, bid_price, ask_price, submit_intents, cancel_ids }
     }
@@ -1155,6 +1323,8 @@ impl PairedMmLiveShadow {
         yes_mid: f64,
         secs_to_close: f64,
         now_ms: u64,
+        residual_side: &'static str,
+        residual_action: &'static str,
     ) {
         if self.queue_log.is_none() {
             return;
@@ -1217,6 +1387,8 @@ impl PairedMmLiveShadow {
                     "taker_sell_qty_60s".to_string(),
                     serde_json::json!(taker_sell_qty_60s),
                 );
+                map.insert("residual_side".to_string(), serde_json::json!(residual_side));
+                map.insert("residual_action".to_string(), serde_json::json!(residual_action));
             }
             queue_log.append(&rec);
         }
@@ -2009,6 +2181,7 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2054,6 +2227,7 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2097,6 +2271,7 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2708,7 +2883,7 @@ mod tests {
         mm.log_queue_posts_cancels(&market, &book_ctx, 0.495, 120.0, 1_000, &posts, &cancel_events);
 
         // TICK: snapshot the live legs.
-        mm.log_queue_tick(&market, &book_ctx, 0.495, 119.0, 2_000);
+        mm.log_queue_tick(&market, &book_ctx, 0.495, 119.0, 2_000, "none", "none");
 
         // FILL: a cumulative fill on the YES bid leg emits a `fill` record.
         if let Some(active) = mm.active.as_mut() {
@@ -2794,5 +2969,96 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
+    }
+
+    // --- Side-aware EV-gated residual policy ---
+
+    const RD: f64 = REPAIR_DELTA_SHARES; // 2.0
+
+    #[test]
+    fn residual_policy_within_band_does_nothing() {
+        // |skew| <= repair_delta: no residual, no suppression (both cap settings).
+        for cap in [0.0, 5.0] {
+            let (sb, sa, side, act) = residual_policy(RD, 0.55, RD, cap);
+            assert!(!sb && !sa, "within band must not suppress (cap={cap})");
+            assert_eq!(side, ResidualSide::None);
+            assert_eq!(act, ResidualAction::NoneAction);
+            let (sb, sa, ..) = residual_policy(-RD, 0.45, RD, cap);
+            assert!(!sb && !sa, "within band (NO) must not suppress (cap={cap})");
+        }
+    }
+
+    #[test]
+    fn residual_policy_cap_zero_is_byte_identical_repair_both_signs() {
+        // DEFAULT-OFF: cap=0 must reproduce the legacy symmetric gate EXACTLY,
+        // regardless of whether the leading side is favourite or underdog.
+        // Legacy: skew > repair_delta => suppress bid; skew < -repair_delta =>
+        // suppress ask.
+        let cases: &[(f64, f64)] = &[
+            (10.0, 0.7),  // net-long YES, favourite
+            (10.0, 0.3),  // net-long YES, underdog (still flatten when cap=0)
+            (-10.0, 0.3), // net-long NO, favourite (1-mid=0.7)
+            (-10.0, 0.7), // net-long NO, underdog (still flatten when cap=0)
+        ];
+        for &(skew, mid) in cases {
+            let (sb, sa, _side, act) = residual_policy(skew, mid, RD, 0.0);
+            // Legacy reference.
+            let (lb, la) = (skew > RD, skew < -RD);
+            assert_eq!(sb, lb, "suppress_bid mismatch skew={skew} mid={mid}");
+            assert_eq!(sa, la, "suppress_ask mismatch skew={skew} mid={mid}");
+            assert_eq!(act, ResidualAction::Flatten, "cap=0 always flattens past band");
+        }
+    }
+
+    #[test]
+    fn residual_policy_favourite_repairs_both_signs() {
+        // skew > 0, yes_mid > 0.5 => leading YES is the FAVOURITE: pull bid.
+        let (sb, sa, side, act) = residual_policy(10.0, 0.72, RD, 5.0);
+        assert!(sb && !sa, "favourite net-long YES => suppress bid only");
+        assert_eq!(side, ResidualSide::Favourite);
+        assert_eq!(act, ResidualAction::Flatten);
+        // skew < 0, yes_mid < 0.5 => leading NO priced 1-mid > 0.5 = FAVOURITE: pull ask.
+        let (sb, sa, side, act) = residual_policy(-10.0, 0.28, RD, 5.0);
+        assert!(!sb && sa, "favourite net-long NO => suppress ask only");
+        assert_eq!(side, ResidualSide::Favourite);
+        assert_eq!(act, ResidualAction::Flatten);
+    }
+
+    #[test]
+    fn residual_policy_underdog_within_cap_holds_no_suppression() {
+        // skew > 0, yes_mid < 0.5 => leading YES is the UNDERDOG; |skew|<=cap => HOLD.
+        let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0);
+        assert!(!sb && !sa, "underdog within cap => neither leg suppressed (HOLD)");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::HoldUnderdog);
+        // skew < 0, yes_mid > 0.5 => leading NO priced 1-mid < 0.5 = UNDERDOG; HOLD.
+        let (sb, sa, side, act) = residual_policy(-4.0, 0.58, RD, 5.0);
+        assert!(!sb && !sa, "underdog (NO) within cap => HOLD");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::HoldUnderdog);
+    }
+
+    #[test]
+    fn residual_policy_underdog_over_cap_repairs_excess() {
+        // Underdog past the hold cap: flatten the excess (same suppression as
+        // favourite re-pair, draining the skew back toward the cap).
+        let (sb, sa, side, act) = residual_policy(8.0, 0.42, RD, 5.0);
+        assert!(sb && !sa, "underdog net-long YES over cap => suppress bid (flatten excess)");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::Flatten);
+        let (sb, sa, side, act) = residual_policy(-8.0, 0.58, RD, 5.0);
+        assert!(!sb && sa, "underdog net-long NO over cap => suppress ask (flatten excess)");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::Flatten);
+    }
+
+    #[test]
+    fn residual_policy_classification_both_skew_signs() {
+        // Net-long YES: favourite iff yes_mid > 0.5.
+        assert_eq!(residual_policy(10.0, 0.6, RD, 5.0).2, ResidualSide::Favourite);
+        assert_eq!(residual_policy(10.0, 0.4, RD, 5.0).2, ResidualSide::Underdog);
+        // Net-long NO: leading price = 1 - yes_mid; favourite iff yes_mid < 0.5.
+        assert_eq!(residual_policy(-10.0, 0.4, RD, 5.0).2, ResidualSide::Favourite);
+        assert_eq!(residual_policy(-10.0, 0.6, RD, 5.0).2, ResidualSide::Underdog);
     }
 }
