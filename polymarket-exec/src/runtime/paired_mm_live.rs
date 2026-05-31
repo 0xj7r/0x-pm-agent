@@ -127,15 +127,29 @@ impl SimInventory {
     /// (1 - pair_cost) each; the unmatched residual is marked to the running
     /// YES mid (NOT traded out, matching the strict-pairing rule). Rebate added
     /// only when `rebate_on`.
+    ///
+    /// The residual mark is hardened against degenerate/stale books: a garbage
+    /// `yes_mid` (NaN, or far outside [0,1] from a transient bad spread) would
+    /// otherwise mark the residual at a nonsensical price and blow the log up.
+    /// `yes_mid` and the per-share avg costs are clamped to [0,1], and each
+    /// per-share residual mark is clamped to [-1, +1] so a residual of N shares
+    /// can never contribute more than N (in magnitude) to PnL.
     fn marked_pnl(&self, yes_mid: f64, rebate_on: bool) -> f64 {
+        // Degenerate/stale mid (NaN or outside the share-price domain): fall
+        // back to a neutral 0.5 rather than marking at a garbage price.
+        let mid = if yes_mid.is_finite() {
+            yes_mid.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         let paired = self.paired();
         let yes_avg = if self.yes_long > 0.0 {
-            self.yes_long_cost / self.yes_long
+            (self.yes_long_cost / self.yes_long).clamp(0.0, 1.0)
         } else {
             0.0
         };
         let no_avg = if self.no_long > 0.0 {
-            self.no_long_cost / self.no_long
+            (self.no_long_cost / self.no_long).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -145,12 +159,13 @@ impl SimInventory {
         }
         let res_yes = self.yes_long - paired;
         let res_no = self.no_long - paired;
-        // Residual marked to mid (YES leg at yes_mid, NO leg at 1 - yes_mid).
+        // Residual marked to mid (YES leg at mid, NO leg at 1 - mid). The
+        // per-share mark is bounded to [-1, +1] so |residual PnL| <= shares.
         if res_yes > 0.0 {
-            pnl += res_yes * (yes_mid - yes_avg);
+            pnl += res_yes * (mid - yes_avg).clamp(-1.0, 1.0);
         }
         if res_no > 0.0 {
-            pnl += res_no * ((1.0 - yes_mid) - no_avg);
+            pnl += res_no * ((1.0 - mid) - no_avg).clamp(-1.0, 1.0);
         }
         if rebate_on {
             pnl += self.rebate_usdc;
@@ -890,5 +905,61 @@ mod tests {
     fn from_env_is_none_when_flag_unset() {
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
         assert!(PairedMmLiveShadow::from_env().is_none());
+    }
+
+    #[test]
+    fn degenerate_mid_cannot_blow_up_residual_pnl() {
+        // Repro of the observed live tick: 0.61-share NO residual, no matched
+        // pair, marked against a degenerate yes_mid (~16.1 from a transient bad
+        // spread). The old math produced sim_pnl=-9.54 (|pnl| >> shares). The
+        // mark must now stay bounded by the residual share count.
+        let mut inv = SimInventory::default();
+        inv.no_long = 0.61;
+        inv.no_long_cost = 0.61 * 0.49;
+        let pnl = inv.marked_pnl(16.147_093_442_622_953, false);
+        assert!(
+            pnl.abs() <= inv.residual_shares() + 1e-9,
+            "degenerate mid blew up residual PnL: pnl={pnl}, shares={}",
+            inv.residual_shares()
+        );
+    }
+
+    #[test]
+    fn residual_pnl_bounded_by_shares_across_pathological_inputs() {
+        // |residual PnL| can never exceed the residual share count, for any
+        // mid (incl. NaN / out-of-domain) and any (even garbage) cost basis.
+        let mids = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -50.0,
+            0.0,
+            0.5,
+            1.0,
+            999.0,
+        ];
+        let costs = [-10.0, 0.0, 0.25, 0.5, 1.0, 50.0];
+        for side_is_yes in [true, false] {
+            for n in [0.61_f64, 1.0, 7.5, 100.0] {
+                for &cost_per in &costs {
+                    for &mid in &mids {
+                        let mut inv = SimInventory::default();
+                        if side_is_yes {
+                            inv.yes_long = n;
+                            inv.yes_long_cost = n * cost_per;
+                        } else {
+                            inv.no_long = n;
+                            inv.no_long_cost = n * cost_per;
+                        }
+                        let pnl = inv.marked_pnl(mid, false);
+                        assert!(
+                            pnl.is_finite() && pnl.abs() <= n + 1e-9,
+                            "residual PnL exceeded shares: pnl={pnl}, n={n}, \
+                             cost_per={cost_per}, mid={mid}, yes={side_is_yes}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
