@@ -1,3 +1,13 @@
 [workspace]
 members = ["polymarket-exec"]
 resolver = "2"
+
+# Path dependencies on the proven BTC-5m br2 strategy crates living in the
+# sibling polymarket-backtest workspace. These crates are Nautilus-free, so the
+# live agent can run the EXACT SAME BonereaperV2::on_event decision logic that
+# the backtest uses. Read-only: never edit the br2 crates from here.
+[workspace.dependencies]
+pm-types    = { path = "../polymarket-backtest/crates/pm-types" }
+pm-model    = { path = "../polymarket-backtest/crates/pm-model" }
+pm-risk     = { path = "../polymarket-backtest/crates/pm-risk" }
+pm-strategy = { path = "../polymarket-backtest/crates/pm-strategy" }

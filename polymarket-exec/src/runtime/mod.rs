@@ -2,6 +2,8 @@
 
 mod attribution;
 mod audit;
+pub mod br2_live;
+pub mod br2_shadow;
 mod btc_signals;
 mod checkpoint;
 mod dashboard;

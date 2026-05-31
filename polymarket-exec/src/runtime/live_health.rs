@@ -27,12 +27,26 @@ pub(super) fn enforce_live_health(
     now_ms: u64,
     started_at_ms: u64,
 ) -> RuntimeOutcome {
-    if config.paper_mode || runtime.status() != RuntimeStatus::Running {
+    if config.paper_mode {
         return RuntimeOutcome::default();
     }
+    // Operator kill-switch is a HARD stop in EVERY runtime state. It must be
+    // evaluated before the status==Running gate below, otherwise a runtime
+    // parked in Starting/Degraded/RiskOff (for example behind the initial
+    // reconcile gate) would never observe the kill file and never log it.
     if let Some(reason) = live_kill_switch_reason(config.live_kill_switch_path.as_deref()) {
+        tracing::warn!(
+            target: "polymarket_exec::runtime::live_health",
+            mode = "live",
+            status = ?runtime.status(),
+            reason = %reason,
+            "operator kill switch active: forcing degrade_and_cancel_all in every runtime state"
+        );
         metrics.observe_riskoff_transition();
         return runtime.degrade_and_cancel_all(now_ms, format!("live health failure: {reason}"));
+    }
+    if runtime.status() != RuntimeStatus::Running {
+        return RuntimeOutcome::default();
     }
     if now_ms.saturating_sub(started_at_ms) < LIVE_HEALTH_STARTUP_GRACE_MS {
         return RuntimeOutcome::default();

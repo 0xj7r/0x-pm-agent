@@ -1570,6 +1570,9 @@ name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "bitvec"
@@ -3879,6 +3882,49 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "pm-model"
+version = "0.1.0"
+dependencies = [
+ "pm-types",
+ "serde",
+]
+
+[[package]]
+name = "pm-risk"
+version = "0.1.0"
+dependencies = [
+ "pm-types",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "pm-strategy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pm-model",
+ "pm-risk",
+ "pm-types",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "pm-types"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "polymarket-client-sdk"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3932,6 +3978,10 @@ dependencies = [
  "hostname",
  "http-body-util",
  "libc",
+ "pm-model",
+ "pm-risk",
+ "pm-strategy",
+ "pm-types",
  "polymarket-client-sdk",
  "polymarket_client_sdk_v2",
  "prometheus",

@@ -1166,6 +1166,37 @@ async fn run_runtime_loop(
     let mut seen_venue_fill_keys = HashSet::<String>::new();
     let mut paper_market_closed = false;
 
+    // br2 live driver: OFF unless PM_BTC_5M_BR2_SHADOW is truthy. Decides on
+    // live feeds and logs the orders it WOULD place. PAPER submission is ARMED
+    // only when PM_BTC_5M_BR2_PAPER_TRADE is set AND paper_mode is true.
+    // REAL-MONEY submission is ARMED only when PM_BTC_5M_BR2_LIVE_TRADE is set
+    // AND !paper_mode AND all preconditions hold (kill-switch path + both
+    // notional caps). Both gates live in from_env; the paper_mode flag and the
+    // kill-switch path are passed in so the real arm is impossible otherwise.
+    let mut br2_shadow = crate::runtime::br2_live::Br2LiveShadow::from_env(
+        config.paper_mode,
+        config.live_kill_switch_path.as_deref(),
+    );
+    if let Some(shadow) = br2_shadow.as_ref() {
+        if shadow.live_trade_armed() {
+            warn!(
+                target: "br2_shadow",
+                "BR2 live path enabled with REAL-MONEY submission armed (live execution + six \
+                 safety layers). Real orders WILL be placed."
+            );
+        } else if shadow.paper_trade_armed() {
+            info!(
+                target: "br2_shadow",
+                "BR2 live path enabled with PAPER submission armed (paper-fill sim only)"
+            );
+        } else {
+            info!(
+                target: "br2_shadow",
+                "BR2 live shadow-decision path enabled (logging only; no submission)"
+            );
+        }
+    }
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1181,6 +1212,14 @@ async fn run_runtime_loop(
                         let ingested_at_ms = now_unix_ms();
                         runtime.on_btc_trade(event.price, ingested_at_ms);
                         metrics.observe_btc_regime(&runtime.btc_regime_snapshot(ingested_at_ms));
+                        if let Some(shadow) = br2_shadow.as_mut() {
+                            shadow.on_spot_trade(
+                                event.price,
+                                event.quantity,
+                                event.observed_at_ms,
+                                event.is_buyer_maker,
+                            );
+                        }
                     }
                     None => {
                         spot_events_open = false;
@@ -1519,11 +1558,66 @@ async fn run_runtime_loop(
                             if let Some(report) = paper_report.as_mut() {
                                 report.record_book_observation(&market_id, &instrument_id, &book);
                             }
-                            let outcome = runtime.on_book_state(
+                            let mut br2_submit_intents: Vec<OrderIntent> = Vec::new();
+                            if let Some(shadow) = br2_shadow.as_mut() {
+                                if let Some(record) = runtime.market_context_record(&market_id) {
+                                    // Thread the REAL paper position into br2's
+                                    // position-aware lanes. YES = instrument_ids[0],
+                                    // NO = instrument_ids[1] (existing convention).
+                                    let inventory = runtime.inventory();
+                                    let yes_shares = record
+                                        .instrument_ids
+                                        .first()
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let no_shares = record
+                                        .instrument_ids
+                                        .get(1)
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let pos = crate::runtime::br2_shadow::DecisionPosition {
+                                        events_seen: 0,
+                                        yes_shares,
+                                        no_shares,
+                                        cash_usdc: inventory.free_cash_usd(),
+                                    };
+                                    // NO-token book for marketable-price fallback.
+                                    let no_book = match record.instrument_ids.get(1) {
+                                        Some(no_id) => books.snapshot(no_id.as_str()).await,
+                                        None => None,
+                                    };
+                                    let result = shadow.decide_tick(
+                                        &market_id,
+                                        &record,
+                                        &book,
+                                        pos,
+                                        no_book.as_ref(),
+                                        now_unix_ms(),
+                                    );
+                                    br2_submit_intents = result.submit_intents;
+                                }
+                            }
+                            let mut outcome = runtime.on_book_state(
                                 market_id,
                                 instrument_id,
                                 &book,
                             )?;
+                            // br2 paper submission: enqueue the converted intents
+                            // into THIS outcome so they flow through the SAME
+                            // execute_execution_adapter path (paper-fill sim +
+                            // safety) as on_book_state's own Submit commands. This
+                            // list is only ever non-empty when paper-trade is armed
+                            // (which requires paper_mode), so submission is
+                            // impossible outside paper mode.
+                            for intent in br2_submit_intents {
+                                outcome
+                                    .commands
+                                    .push(crate::types::RuntimeCommand::Submit(intent));
+                            }
                             let combined = execute_execution_adapter(
                                 runtime,
                                 books,
@@ -1643,6 +1737,18 @@ async fn run_runtime_loop(
                 // CTF redeem per unique condition_id (binary market both
                 // legs). Idempotent within process lifetime via the
                 // seen_conditions set; restarts re-discover from venue.
+                // A killed agent must take no on-chain action: skip the
+                // sweep entirely while the operator kill file is present.
+                if let Some(reason) =
+                    live_kill_switch_reason(config.live_kill_switch_path.as_deref())
+                {
+                    warn!(
+                        target: "auto_redeem",
+                        reason = %reason,
+                        "auto-redeem: skipped because operator kill switch is active"
+                    );
+                    continue;
+                }
                 match execution_adapter.sync_balances().await {
                     Ok(balances) => {
                         let mut by_condition: std::collections::BTreeMap<String, Vec<&VenuePosition>> =
@@ -3208,6 +3314,14 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("mm-late-bar-core"));
+    // br2 is a marketable taker that sweeps to a limit: its intents MUST be IOC
+    // (immediate-or-cancel), never resting GTC and never post-only. The
+    // br2_live driver tags real-money br2 intents `br2-taker`; route them to the
+    // same IOC taker branch as the late-fav/cheap-tail takers below.
+    let is_br2_taker = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("br2-taker"));
     let is_aggressive_late_fav = intent.quote_level_tag.as_deref().is_some_and(|tag| {
         tag.starts_with("late-fav-taker")
             || tag.starts_with("cheap-tail-taker")
@@ -3224,6 +3338,7 @@ fn submit_request_from_intent(
                 && execution_policy.live_order_ttl_ms > 0
                 && !is_hedge_rescue
                 && !is_aggressive_late_fav
+                && !is_br2_taker
                 && !is_late_bar_core
                 && !is_late_fav_maker)
                 .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
@@ -3232,7 +3347,7 @@ fn submit_request_from_intent(
             (!execution_policy.paper_mode && is_late_bar_core)
                 .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
-    let (time_in_force, post_only) = if is_hedge_rescue || is_aggressive_late_fav {
+    let (time_in_force, post_only) = if is_hedge_rescue || is_aggressive_late_fav || is_br2_taker {
         (TimeInForce::Ioc, false)
     } else if is_late_bar_core {
         (TimeInForce::Gtd, !execution_policy.paper_mode)

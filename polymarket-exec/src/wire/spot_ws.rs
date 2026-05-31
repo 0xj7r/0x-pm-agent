@@ -71,6 +71,10 @@ pub struct SpotTradeEvent {
     pub price: f64,
     pub quantity: f64,
     pub observed_at_ms: u64,
+    /// Binance aggTrade `m` flag: true if the buyer is the maker (seller-initiated,
+    /// aggressive-sell print). br2's BinanceFlowFeatures need this for signed flow.
+    /// `None` for feeds that do not provide aggressor side (e.g. Coinbase).
+    pub is_buyer_maker: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -575,6 +579,7 @@ fn parse_binance_ws_trade(payload: &Value, expected_symbol: &str) -> Option<Spot
         price,
         quantity,
         observed_at_ms,
+        is_buyer_maker: payload.get("m").and_then(Value::as_bool),
     })
 }
 
@@ -602,6 +607,7 @@ fn parse_binance_rest_trade(
         price,
         quantity,
         observed_at_ms,
+        is_buyer_maker: payload.get("m").and_then(Value::as_bool),
     })
 }
 
@@ -666,6 +672,7 @@ fn parse_coinbase_trade(payload: &Value, product_id: &str) -> Option<SpotTradeEv
         price,
         quantity,
         observed_at_ms,
+        is_buyer_maker: None,
     })
 }
 
