@@ -126,6 +126,11 @@ const LATE_PULL_SECS: f64 = 45.0; // pull both legs in the last N seconds
 const DEFAULT_MIN_REQUOTE_AGE_MS: u64 = 5_000; // hold a resting leg >=5s before chasing
 const DEFAULT_REQUOTE_MIN_TICKS: f64 = 0.01; // and only chase once the touch moved >=1c
 const REPAIR_DELTA_SHARES: f64 = 2.0; // residual-cap band on |yes_long - no_long|
+// Polymarket rejects any order with size < 5 shares ("minimum"). bound_clip_to_caps
+// never emits 0 < size < this: it rounds a cap-shrunk leg UP to the floor when that
+// still fits the relevant HARD bound, else drops the leg. repair_delta is clamped
+// to >= this so the residual cap bites at a real, clip-granular boundary.
+const DEFAULT_MIN_ORDER_SHARES: f64 = 5.0;
 const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (logged)
 // Side-aware EV-gated residual policy: extra directional budget (shares) we are
 // willing to HOLD on the +EV UNDERDOG side instead of re-pairing it away. 0.0
@@ -426,6 +431,7 @@ fn residual_policy(
     yes_mid: f64,
     repair_delta: f64,
     underdog_hold_cap: f64,
+    clip: f64,
 ) -> (bool, bool, ResidualSide, ResidualAction) {
     // Within the band: no residual, nothing to do (matches legacy: neither
     // branch fires).
@@ -466,11 +472,7 @@ fn residual_policy(
         }
         // +EV underdog residual.
         ResidualSide::Underdog => {
-            if skew.abs() <= underdog_hold_cap {
-                // Within the directional budget: HOLD. Do NOT suppress either
-                // leg; keep capturing spread and let the residual stand.
-                (false, false, side, ResidualAction::HoldUnderdog)
-            } else {
+            if skew.abs() > underdog_hold_cap {
                 // Past the budget: flatten only the EXCESS (same suppression as
                 // favourite re-pair, which pulls the leading-add leg until the
                 // skew drains back within the cap).
@@ -479,6 +481,22 @@ fn residual_policy(
                 } else {
                     (false, true, side, ResidualAction::Flatten)
                 }
+            } else if skew.abs() + clip > underdog_hold_cap {
+                // OVERSHOOT GUARD: still within the cap, but one more clip-sized
+                // add fill would push past it (and fills arrive in whole clips, so
+                // we cannot land exactly on the cap). Suppress the leading-ADD leg
+                // NOW so the held residual converges to ~hold_cap instead of
+                // overshooting by a clip each fill. The lagging/flatten leg keeps
+                // quoting (it reduces net, never overshoots).
+                if leading_long_yes {
+                    (true, false, side, ResidualAction::HoldUnderdog)
+                } else {
+                    (false, true, side, ResidualAction::HoldUnderdog)
+                }
+            } else {
+                // Comfortably within the directional budget: HOLD both legs;
+                // capturing spread and letting the residual stand cannot overshoot.
+                (false, false, side, ResidualAction::HoldUnderdog)
             }
         }
         ResidualSide::None => (false, false, side, ResidualAction::NoneAction),
@@ -630,6 +648,11 @@ pub struct PairedMmLiveShadow {
     /// < 0.5) is HELD up to this cap instead of re-paired; the -EV FAVOURITE side
     /// is always flattened. Bounded on top by the existing net notional cap.
     underdog_hold_cap_shares: f64,
+    /// Polymarket venue minimum order size (shares). bound_clip_to_caps rounds a
+    /// cap-shrunk positive leg UP to this when it still fits the hard bound, else
+    /// drops it; it NEVER emits 0 < size < this (the venue rejects it). repair_delta
+    /// is clamped >= this so the residual cap bites at a clip-granular boundary.
+    min_order_shares: f64,
     /// Rest-and-hold requote discipline. A resting leg is KEPT (gains queue
     /// priority) unless it has aged past `min_requote_age_ms` AND the target touch
     /// has moved at least `requote_min_ticks` from the resting price (chase), or it
@@ -772,8 +795,16 @@ impl PairedMmLiveShadow {
         let spot_vol_max = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_VOL_MAX").unwrap_or(REGIME_SPOT_VOL_MAX);
         let flip_min = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_FLIP_MIN").unwrap_or(REGIME_FLIP_MIN);
         let late_pull_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS").unwrap_or(LATE_PULL_SECS);
-        let repair_delta =
-            env_positive_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES").unwrap_or(REPAIR_DELTA_SHARES);
+        // Venue 5-share minimum order size. Cap-shrunk legs round UP to this or drop.
+        let min_order_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_MIN_ORDER_SHARES")
+            .unwrap_or(DEFAULT_MIN_ORDER_SHARES);
+        // Fix D: clamp the residual cap >= the venue floor (== clip granularity)
+        // so it bites at a real boundary. A configured residual_cap below the
+        // 5-share floor is incoherent (fills arrive in >=5-share lumps, so a
+        // sub-floor residual can never be held); clamp it up so the cap is meaningful.
+        let repair_delta = env_positive_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES")
+            .unwrap_or(REPAIR_DELTA_SHARES)
+            .max(min_order_shares);
         // DEFAULT-OFF: unset/0 => symmetric always-re-pair (byte-identical).
         let underdog_hold_cap_shares = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_UNDERDOG_HOLD_CAP_SHARES")
             .unwrap_or(DEFAULT_UNDERDOG_HOLD_CAP_SHARES);
@@ -796,6 +827,7 @@ impl PairedMmLiveShadow {
             late_pull_secs,
             repair_delta,
             underdog_hold_cap_shares,
+            min_order_shares,
             residual_cap_frac,
             min_requote_age_ms,
             requote_min_ticks,
@@ -819,6 +851,7 @@ impl PairedMmLiveShadow {
             late_pull_secs,
             repair_delta,
             underdog_hold_cap_shares,
+            min_order_shares,
             min_requote_age_ms,
             requote_min_ticks,
             spot: VecDeque::new(),
@@ -1087,6 +1120,7 @@ impl PairedMmLiveShadow {
             yes_mid,
             self.repair_delta,
             self.underdog_hold_cap_shares,
+            self.clip_shares,
         );
         if suppress_bid {
             bid_live = false;
@@ -1094,6 +1128,16 @@ impl PairedMmLiveShadow {
         if suppress_ask {
             ask_live = false;
         }
+        // Fix B: identify the leg that REDUCES net exposure (the lagging/flatten
+        // leg that pairs the residual down) so it is exempted from the net-cap
+        // bound downstream. When the policy suppressed the leading-ADD leg
+        // (Flatten or the overshoot-guard HoldUnderdog), the surviving opposite
+        // leg is the reducing one: suppress_bid => the NO (ask) leg reduces net;
+        // suppress_ask => the YES (bid) leg reduces net. With neither suppressed
+        // (full hold / no residual) both legs grow-or-hold net, so neither is
+        // marked reducing.
+        let bid_reduces_net = suppress_ask;
+        let ask_reduces_net = suppress_bid;
 
         let bid_price = bid_live.then_some(yes_book.best_bid);
         // The "ask" leg of the pair is acquired as a NO BUY at 1 - best_ask. We
@@ -1116,6 +1160,8 @@ impl PairedMmLiveShadow {
                 yes_book,
                 bid_price,
                 ask_price,
+                bid_reduces_net,
+                ask_reduces_net,
                 pos,
                 now_ms,
                 &mut submit_intents,
@@ -1422,12 +1468,15 @@ impl PairedMmLiveShadow {
     /// (reprice immediately for safety), OR the leg is pulled (`want=None`). When a
     /// leg is KEPT we emit nothing and do NOT touch its `submit_ms`, so age accrues
     /// and time-to-fill stays honest.
+    #[allow(clippy::too_many_arguments)]
     fn manage_paper_legs(
         &mut self,
         market_id: &MarketId,
         yes_book: &BookState,
         bid_price: Option<f64>,
         ask_price: Option<f64>,
+        bid_reduces_net: bool,
+        ask_reduces_net: bool,
         pos: PairedPosition,
         now_ms: u64,
         submit_intents: &mut Vec<OrderIntent>,
@@ -1436,6 +1485,7 @@ impl PairedMmLiveShadow {
         cancel_events: &mut Vec<QueueCancelEvent>,
     ) {
         let clip = self.clip_shares;
+        let min_order_shares = self.min_order_shares;
         // Snapshot the live-arm caps before borrowing `active` mutably. On the
         // paper/shadow path `live_trade_armed` is false and these are unused.
         let live_armed = self.live_trade_armed;
@@ -1506,6 +1556,7 @@ impl PairedMmLiveShadow {
                 let leg_clip = Self::bound_clip_to_caps(
                     live_armed, clip, price, max_order, max_market, max_gross,
                     net_inventory_notional, gross_resting_accum,
+                    bid_reduces_net, min_order_shares,
                 );
                 if leg_clip > 1e-9 {
                     active.quote_seq += 1;
@@ -1591,6 +1642,7 @@ impl PairedMmLiveShadow {
                     let leg_clip = Self::bound_clip_to_caps(
                         live_armed, clip, price, max_order, max_market, max_gross,
                         net_inventory_notional, gross_resting_accum,
+                        ask_reduces_net, min_order_shares,
                     );
                     if leg_clip > 1e-9 {
                         active.quote_seq += 1;
@@ -1694,12 +1746,23 @@ impl PairedMmLiveShadow {
     /// Bound a maker leg's clip (share count) to the TINY live caps. On the paper/
     /// shadow path (`live_armed=false`) the full clip rests (byte-identical to
     /// INC2). On the live arm the clip is clipped so that price*clip fits the
-    /// per-order cap, the remaining per-market NET-INVENTORY headroom
-    /// (`max_market - net_inventory_notional`, Fix 2: bounds money at risk, not
-    /// cumulative submits), AND the remaining gross resting headroom
-    /// (`max_gross - gross_resting_already`); returns 0 (drop the leg) if no
-    /// positive size fits or the price is non-positive. Rounded down to 2dp to
-    /// match the wire boundary.
+    /// per-order cap AND the remaining gross resting headroom
+    /// (`max_gross - gross_resting_already`).
+    ///
+    /// `reduces_net` (Fix B) marks the lagging/flatten leg that PAIRS DOWN the
+    /// residual: it makes the net market exposure SMALLER, so it must NOT be
+    /// throttled by the per-market net-notional headroom (doing so was what
+    /// stranded the residual: with the net cap exhausted the only leg that could
+    /// reduce it was refused). The net-cap bound applies ONLY to the leg that
+    /// GROWS net exposure (`reduces_net=false`).
+    ///
+    /// `min_order_shares` (Fix A) is the venue floor: Polymarket rejects any order
+    /// with 0 < size < 5. So a cap-shrunk positive clip below the floor is rounded
+    /// UP to the floor IFF that still fits the relevant HARD bound (per-order +
+    /// gross always; net too for the growing leg); otherwise the leg is DROPPED
+    /// (return 0). We NEVER emit 0 < size < `min_order_shares`. Returns 0 if the
+    /// price is non-positive. Rounded to 2dp to match the wire boundary.
+    #[allow(clippy::too_many_arguments)]
     fn bound_clip_to_caps(
         live_armed: bool,
         clip: f64,
@@ -1709,6 +1772,8 @@ impl PairedMmLiveShadow {
         max_gross: f64,
         net_inventory_notional: f64,
         gross_resting_already: f64,
+        reduces_net: bool,
+        min_order_shares: f64,
     ) -> f64 {
         if !live_armed {
             return clip;
@@ -1716,15 +1781,35 @@ impl PairedMmLiveShadow {
         if !(price > 0.0) {
             return 0.0;
         }
-        let market_headroom = (max_market - net_inventory_notional).max(0.0);
         let gross_headroom = (max_gross - gross_resting_already).max(0.0);
-        let allowed_notional = max_order.min(market_headroom).min(gross_headroom);
-        if allowed_notional <= 0.0 {
+        // Hard notional ceiling that must hold for ANY emitted size, including a
+        // floor round-up: per-order + gross always bind; the net-cap headroom
+        // binds ONLY the net-GROWING leg (the reducing leg shrinks net, so it is
+        // exempt).
+        let mut hard_notional = max_order.min(gross_headroom);
+        if !reduces_net {
+            let market_headroom = (max_market - net_inventory_notional).max(0.0);
+            hard_notional = hard_notional.min(market_headroom);
+        }
+        if hard_notional <= 0.0 {
             return 0.0;
         }
-        let max_shares = allowed_notional / price;
-        let bounded = clip.min(max_shares).max(0.0);
-        (bounded * 100.0).floor() / 100.0
+        let hard_max_shares = hard_notional / price;
+        let bounded = clip.min(hard_max_shares).max(0.0);
+        let rounded = (bounded * 100.0).floor() / 100.0;
+        if rounded <= 1e-9 {
+            return 0.0;
+        }
+        // Venue 5-share floor: never emit 0 < size < min_order_shares.
+        let floor = (min_order_shares * 100.0).floor() / 100.0;
+        if rounded + 1e-9 < floor {
+            // Round UP to the floor IFF the floor still fits the hard bound.
+            if floor <= hard_max_shares + 1e-9 {
+                return floor;
+            }
+            return 0.0;
+        }
+        rounded
     }
 
     /// THE INC3 DELIVERABLE: queue-capture measurement. The caller passes, each
@@ -2099,6 +2184,8 @@ mod tests {
                 yes_book,
                 bid_price,
                 ask_price,
+                false,
+                false,
                 pos,
                 now_ms,
                 submit_intents,
@@ -2182,6 +2269,7 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2228,6 +2316,7 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2272,6 +2361,7 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
@@ -2876,7 +2966,7 @@ mod tests {
         let mut posts = Vec::new();
         let mut cancel_events = Vec::new();
         mm.manage_paper_legs(
-            &market, &book_ctx, Some(0.49), Some(0.50), PairedPosition::default(),
+            &market, &book_ctx, Some(0.49), Some(0.50), false, false, PairedPosition::default(),
             1_000, &mut submits, &mut cancels, &mut posts, &mut cancel_events,
         );
         assert_eq!(posts.len(), 2, "two POST events (YES bid + NO)");
@@ -2898,7 +2988,7 @@ mod tests {
         let mut p2 = Vec::new();
         let mut ce2 = Vec::new();
         mm.manage_paper_legs(
-            &market, &book_ctx, None, None, PairedPosition::default(),
+            &market, &book_ctx, None, None, false, false, PairedPosition::default(),
             10_000, &mut s2, &mut c2, &mut p2, &mut ce2,
         );
         assert_eq!(ce2.len(), 2, "both legs pulled");
@@ -2979,11 +3069,11 @@ mod tests {
     fn residual_policy_within_band_does_nothing() {
         // |skew| <= repair_delta: no residual, no suppression (both cap settings).
         for cap in [0.0, 5.0] {
-            let (sb, sa, side, act) = residual_policy(RD, 0.55, RD, cap);
+            let (sb, sa, side, act) = residual_policy(RD, 0.55, RD, cap, 5.0);
             assert!(!sb && !sa, "within band must not suppress (cap={cap})");
             assert_eq!(side, ResidualSide::None);
             assert_eq!(act, ResidualAction::NoneAction);
-            let (sb, sa, ..) = residual_policy(-RD, 0.45, RD, cap);
+            let (sb, sa, ..) = residual_policy(-RD, 0.45, RD, cap, 5.0);
             assert!(!sb && !sa, "within band (NO) must not suppress (cap={cap})");
         }
     }
@@ -3001,7 +3091,7 @@ mod tests {
             (-10.0, 0.7), // net-long NO, underdog (still flatten when cap=0)
         ];
         for &(skew, mid) in cases {
-            let (sb, sa, _side, act) = residual_policy(skew, mid, RD, 0.0);
+            let (sb, sa, _side, act) = residual_policy(skew, mid, RD, 0.0, 5.0);
             // Legacy reference.
             let (lb, la) = (skew > RD, skew < -RD);
             assert_eq!(sb, lb, "suppress_bid mismatch skew={skew} mid={mid}");
@@ -3013,12 +3103,12 @@ mod tests {
     #[test]
     fn residual_policy_favourite_repairs_both_signs() {
         // skew > 0, yes_mid > 0.5 => leading YES is the FAVOURITE: pull bid.
-        let (sb, sa, side, act) = residual_policy(10.0, 0.72, RD, 5.0);
+        let (sb, sa, side, act) = residual_policy(10.0, 0.72, RD, 5.0, 5.0);
         assert!(sb && !sa, "favourite net-long YES => suppress bid only");
         assert_eq!(side, ResidualSide::Favourite);
         assert_eq!(act, ResidualAction::Flatten);
         // skew < 0, yes_mid < 0.5 => leading NO priced 1-mid > 0.5 = FAVOURITE: pull ask.
-        let (sb, sa, side, act) = residual_policy(-10.0, 0.28, RD, 5.0);
+        let (sb, sa, side, act) = residual_policy(-10.0, 0.28, RD, 5.0, 5.0);
         assert!(!sb && sa, "favourite net-long NO => suppress ask only");
         assert_eq!(side, ResidualSide::Favourite);
         assert_eq!(act, ResidualAction::Flatten);
@@ -3026,13 +3116,14 @@ mod tests {
 
     #[test]
     fn residual_policy_underdog_within_cap_holds_no_suppression() {
-        // skew > 0, yes_mid < 0.5 => leading YES is the UNDERDOG; |skew|<=cap => HOLD.
-        let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0);
-        assert!(!sb && !sa, "underdog within cap => neither leg suppressed (HOLD)");
+        // skew > 0, yes_mid < 0.5 => leading YES is the UNDERDOG; |skew|+clip<=cap
+        // (4+1<=5) => HOLD both legs (a further clip cannot overshoot the cap).
+        let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0, 1.0);
+        assert!(!sb && !sa, "underdog comfortably within cap => neither leg suppressed (HOLD)");
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::HoldUnderdog);
         // skew < 0, yes_mid > 0.5 => leading NO priced 1-mid < 0.5 = UNDERDOG; HOLD.
-        let (sb, sa, side, act) = residual_policy(-4.0, 0.58, RD, 5.0);
+        let (sb, sa, side, act) = residual_policy(-4.0, 0.58, RD, 5.0, 1.0);
         assert!(!sb && !sa, "underdog (NO) within cap => HOLD");
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::HoldUnderdog);
@@ -3042,11 +3133,11 @@ mod tests {
     fn residual_policy_underdog_over_cap_repairs_excess() {
         // Underdog past the hold cap: flatten the excess (same suppression as
         // favourite re-pair, draining the skew back toward the cap).
-        let (sb, sa, side, act) = residual_policy(8.0, 0.42, RD, 5.0);
+        let (sb, sa, side, act) = residual_policy(8.0, 0.42, RD, 5.0, 5.0);
         assert!(sb && !sa, "underdog net-long YES over cap => suppress bid (flatten excess)");
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::Flatten);
-        let (sb, sa, side, act) = residual_policy(-8.0, 0.58, RD, 5.0);
+        let (sb, sa, side, act) = residual_policy(-8.0, 0.58, RD, 5.0, 5.0);
         assert!(!sb && sa, "underdog net-long NO over cap => suppress ask (flatten excess)");
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::Flatten);
@@ -3055,10 +3146,117 @@ mod tests {
     #[test]
     fn residual_policy_classification_both_skew_signs() {
         // Net-long YES: favourite iff yes_mid > 0.5.
-        assert_eq!(residual_policy(10.0, 0.6, RD, 5.0).2, ResidualSide::Favourite);
-        assert_eq!(residual_policy(10.0, 0.4, RD, 5.0).2, ResidualSide::Underdog);
+        assert_eq!(residual_policy(10.0, 0.6, RD, 5.0, 5.0).2, ResidualSide::Favourite);
+        assert_eq!(residual_policy(10.0, 0.4, RD, 5.0, 5.0).2, ResidualSide::Underdog);
         // Net-long NO: leading price = 1 - yes_mid; favourite iff yes_mid < 0.5.
-        assert_eq!(residual_policy(-10.0, 0.4, RD, 5.0).2, ResidualSide::Favourite);
-        assert_eq!(residual_policy(-10.0, 0.6, RD, 5.0).2, ResidualSide::Underdog);
+        assert_eq!(residual_policy(-10.0, 0.4, RD, 5.0, 5.0).2, ResidualSide::Favourite);
+        assert_eq!(residual_policy(-10.0, 0.6, RD, 5.0, 5.0).2, ResidualSide::Underdog);
+    }
+
+    // Fix C: when the leading side is the UNDERDOG and one more clip-sized add
+    // fill would push past the hold cap, the ADD leg is suppressed NOW (no
+    // overshoot) while the flatten/pair leg keeps quoting.
+    #[test]
+    fn residual_policy_underdog_suppresses_add_leg_before_overshoot() {
+        // skew=4 (long YES underdog), cap=5, clip=5: 4+5=9 > 5 => suppress the
+        // YES-ADD (bid) leg, keep the NO (ask) flatten leg quoting. Still HOLD action.
+        let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0, 5.0);
+        assert!(sb && !sa, "overshoot-imminent underdog YES => suppress add (bid) leg only");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::HoldUnderdog);
+        // Mirror: long NO underdog. skew=-4, cap=5, clip=5 => suppress the NO-ADD
+        // (ask) leg, keep the YES (bid) flatten leg.
+        let (sb, sa, side, act) = residual_policy(-4.0, 0.58, RD, 5.0, 5.0);
+        assert!(!sb && sa, "overshoot-imminent underdog NO => suppress add (ask) leg only");
+        assert_eq!(side, ResidualSide::Underdog);
+        assert_eq!(act, ResidualAction::HoldUnderdog);
+        // Boundary: exactly at the cap (4+1==5) still HOLDs both legs (no overshoot).
+        let (sb, sa, _side, act) = residual_policy(4.0, 0.42, RD, 5.0, 1.0);
+        assert!(!sb && !sa, "exactly-at-cap underdog => HOLD both legs");
+        assert_eq!(act, ResidualAction::HoldUnderdog);
+    }
+
+    // Fix A: a cap-shrunk leg below the 5-share floor rounds UP to 5 if 5 still
+    // fits the hard bound, else drops to 0. NEVER emits 0 < size < 5.
+    #[test]
+    fn bound_clip_floor_rounds_up_or_drops_never_emits_sub_floor() {
+        let min = 5.0;
+        // Per-order cap $1.30 at price 0.50 allows ~2.6 sh (< 5). 5 sh would cost
+        // $2.50 > $1.30 hard bound => DROP (0), never emit 2 sh.
+        let dropped = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 1.30, 1e9, 1e9, 0.0, 0.0, false, min,
+        );
+        assert_eq!(dropped, 0.0, "sub-floor that cannot reach the floor must drop, not emit 2sh");
+        // Per-order cap $2.60 at 0.50 allows 5.2 sh; clip=10 but a higher hard
+        // gross headroom. Here raw allowed is 5.2 -> 5.2 floored to 5.2 (>=5), fine.
+        let ok = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 2.60, 1e9, 1e9, 0.0, 0.0, false, min,
+        );
+        assert!((ok - 5.2).abs() < 1e-9, "5.2sh allowed stays 5.2, got {ok}");
+        // A clip that the caps shrink to 4 sh but the floor (5) still fits a
+        // larger hard bound rounds UP to 5. price 0.10, per-order $0.40 -> 4 sh;
+        // but gross headroom $1.00 -> 10 sh; min(order, gross) hard = $0.40 = 4 sh,
+        // floor 5 sh costs $0.50 > $0.40 => DROP. Construct a case where floor fits:
+        // clip=4 (so raw=4 < 5), price 0.10, per-order $1.00 -> 10 sh hard ceiling.
+        let rounded = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 4.0, 0.10, 1.00, 1e9, 1e9, 0.0, 0.0, false, min,
+        );
+        assert!((rounded - 5.0).abs() < 1e-9, "4sh clip with room for 5 rounds UP to 5, got {rounded}");
+        // Paper path (live_armed=false) is untouched: full clip rests regardless.
+        let paper = PairedMmLiveShadow::bound_clip_to_caps(
+            false, 3.0, 0.50, 0.10, 0.10, 0.10, 0.0, 0.0, false, min,
+        );
+        assert_eq!(paper, 3.0, "paper path emits the full clip unbounded");
+    }
+
+    // Fix B: the reducing/flatten leg is NOT limited by the net-cap headroom (it
+    // shrinks net), but IS limited by the per-order and gross-resting caps.
+    #[test]
+    fn bound_clip_reducing_leg_exempt_from_net_cap_but_not_per_order_gross() {
+        let min = 5.0;
+        // Net cap fully EXHAUSTED (net_inventory_notional == max_market): the
+        // GROWING leg gets 0 (no net headroom). price 0.50, clip 10.
+        let growing = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 1e9, 8.0, 1e9, 8.0, 0.0, false, min,
+        );
+        assert_eq!(growing, 0.0, "growing leg with net cap exhausted must get 0");
+        // SAME state, but REDUCING leg: net cap is ignored, bounded only by
+        // per-order ($1e9) + gross ($1e9) => full 10-share clip rests.
+        let reducing = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 1e9, 8.0, 1e9, 8.0, 0.0, true, min,
+        );
+        assert!((reducing - 10.0).abs() < 1e-9, "reducing leg ignores net cap, got {reducing}");
+        // The reducing leg IS still bounded by the per-order cap: $3.00 at 0.50 =>
+        // 6 sh (>= floor), even with the net cap exhausted.
+        let reducing_per_order = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 3.00, 8.0, 1e9, 8.0, 0.0, true, min,
+        );
+        assert!((reducing_per_order - 6.0).abs() < 1e-9, "reducing leg still bounded by per-order, got {reducing_per_order}");
+        // And by the gross-resting cap: gross headroom $2.50 at 0.50 => 5 sh.
+        let reducing_gross = PairedMmLiveShadow::bound_clip_to_caps(
+            true, 10.0, 0.50, 1e9, 8.0, 5.0, 8.0, 2.50, true, min,
+        );
+        assert!((reducing_gross - 5.0).abs() < 1e-9, "reducing leg still bounded by gross, got {reducing_gross}");
+    }
+
+    // Fix D: a configured residual_cap below the venue floor is clamped UP to the
+    // floor so the cap bites at a real, clip-granular boundary.
+    #[test]
+    fn from_env_repair_delta_clamped_to_min_order_shares() {
+        // Serialize against sibling env-mutating tests via the SHADOW gate.
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES", "1");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MIN_ORDER_SHARES");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_PAPER_TRADE");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_LIVE_TRADE");
+        let mm = PairedMmLiveShadow::from_env(true, None).expect("shadow constructs");
+        assert!(
+            (mm.repair_delta - DEFAULT_MIN_ORDER_SHARES).abs() < 1e-9,
+            "repair_delta=1 must clamp UP to the 5-share floor, got {}",
+            mm.repair_delta
+        );
+        assert!((mm.min_order_shares - DEFAULT_MIN_ORDER_SHARES).abs() < 1e-9);
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
     }
 }
