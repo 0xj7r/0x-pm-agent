@@ -1177,12 +1177,28 @@ async fn run_runtime_loop(
         config.paper_mode,
         config.live_kill_switch_path.as_deref(),
     );
-    // Calm-regime PAIRED-MM overlay (INC1): OFF unless PM_BTC_5M_PAIRED_MM_SHADOW
-    // is truthy. SHADOW-ONLY: it decides + logs the two-sided touch quotes and a
-    // simulated pairing/inventory/PnL it WOULD place and SUBMITS NOTHING. It is
-    // driven only when br2 is NOT quoting the same market (regime-disjoint).
+    // Calm-regime PAIRED-MM overlay: OFF unless PM_BTC_5M_PAIRED_MM_SHADOW is
+    // truthy. Shadow path decides + logs the two-sided touch quotes and a
+    // simulated pairing/inventory/PnL and SUBMITS NOTHING. PAPER submission is
+    // ARMED only when PM_BTC_5M_PAIRED_MM_PAPER_TRADE is set AND paper_mode is
+    // true (hard-gated in from_env, exactly like br2's paper arm); there is no
+    // real-money arm, so real submission is impossible. Driven only when br2 is
+    // NOT quoting the same market (regime-disjoint).
     let mut paired_mm_shadow =
-        crate::runtime::paired_mm_live::PairedMmLiveShadow::from_env();
+        crate::runtime::paired_mm_live::PairedMmLiveShadow::from_env(config.paper_mode);
+    if let Some(mm) = paired_mm_shadow.as_ref() {
+        if mm.paper_trade_armed() {
+            info!(
+                target: "paired_mm",
+                "PAIRED-MM overlay enabled with PAPER submission armed (paper-fill sim only)"
+            );
+        } else {
+            info!(
+                target: "paired_mm",
+                "PAIRED-MM overlay enabled (shadow logging only; no submission)"
+            );
+        }
+    }
     if let Some(shadow) = br2_shadow.as_ref() {
         if shadow.live_trade_armed() {
             warn!(
@@ -1612,21 +1628,79 @@ async fn run_runtime_loop(
                                     br2_submit_intents = result.submit_intents;
                                 }
                             }
-                            // Paired-MM SHADOW overlay (INC1): logs the two-sided
-                            // touch quotes + simulated pairing/PnL it WOULD place;
-                            // SUBMITS NOTHING. Driven only when br2 is NOT quoting
-                            // this market (regime-disjoint). No-op unless
-                            // PM_BTC_5M_PAIRED_MM_SHADOW is set (from_env -> None).
+                            // Paired-MM overlay: logs the two-sided touch quotes +
+                            // simulated pairing/PnL. On the PAPER arm (armed only
+                            // when paper_mode), it also returns maker submit/cancel
+                            // intents for its resting quote loop. Driven only when
+                            // br2 is NOT quoting this market (regime-disjoint).
+                            // No-op unless PM_BTC_5M_PAIRED_MM_SHADOW is set.
+                            let mut mm_submit_intents: Vec<OrderIntent> = Vec::new();
+                            let mut mm_cancel_ids: Vec<ClientOrderId> = Vec::new();
                             if let Some(mm) = paired_mm_shadow.as_mut() {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
-                                    let _ = mm.decide_tick(
+                                    // Thread the REAL paper positions so the paper
+                                    // arm's strict-pairing/residual-cap uses genuine
+                                    // fills. YES = instrument_ids[0], NO = [1].
+                                    let inventory = runtime.inventory();
+                                    let yes_shares = record
+                                        .instrument_ids
+                                        .first()
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let no_shares = record
+                                        .instrument_ids
+                                        .get(1)
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let pos = crate::runtime::paired_mm_live::PairedPosition {
+                                        yes_shares,
+                                        no_shares,
+                                    };
+                                    let result = mm.decide_tick(
                                         &market_id,
                                         &record,
                                         &book,
                                         br2_quoting_this_market,
+                                        pos,
                                         now_unix_ms(),
                                     );
+                                    mm_submit_intents = result.submit_intents;
+                                    mm_cancel_ids = result.cancel_ids;
                                 }
+                            }
+                            // Paired-MM PAPER quote lifecycle: cancel stale resting
+                            // legs first (so a replace pulls the old leg before the
+                            // new one rests), then register the new maker legs
+                            // through the runtime's tracked-submit path. Both lists
+                            // are only ever non-empty when the paper arm is armed
+                            // (which requires paper_mode), so submission is
+                            // impossible outside paper mode. We stage the resulting
+                            // commands and merge them into THIS book outcome so they
+                            // flow through the SAME execute_execution_adapter path
+                            // (paper-fill sim + safety) as on_book_state's own
+                            // Submit/Cancel commands.
+                            let now_mm_ms = now_unix_ms();
+                            let mut mm_staged_commands: Vec<crate::types::RuntimeCommand> =
+                                Vec::new();
+                            let mut mm_staged_event_seqs: Vec<u64> = Vec::new();
+                            for coid in mm_cancel_ids {
+                                let cancel_outcome = runtime.request_cancel_order(
+                                    &coid,
+                                    now_mm_ms,
+                                    "paired-mm maker requote/pull",
+                                );
+                                mm_staged_commands.extend(cancel_outcome.commands);
+                                mm_staged_event_seqs.extend(cancel_outcome.event_seqs);
+                            }
+                            for intent in mm_submit_intents {
+                                let submit_outcome =
+                                    runtime.accept_external_intent(intent, now_mm_ms);
+                                mm_staged_commands.extend(submit_outcome.commands);
+                                mm_staged_event_seqs.extend(submit_outcome.event_seqs);
                             }
                             let mut outcome = runtime.on_book_state(
                                 market_id,
@@ -1645,6 +1719,10 @@ async fn run_runtime_loop(
                                     .commands
                                     .push(crate::types::RuntimeCommand::Submit(intent));
                             }
+                            // Paired-MM paper Submit/Cancel commands (tracked above)
+                            // flow through the same bridge as on_book_state's own.
+                            outcome.commands.extend(mm_staged_commands);
+                            outcome.event_seqs.extend(mm_staged_event_seqs);
                             let combined = execute_execution_adapter(
                                 runtime,
                                 books,

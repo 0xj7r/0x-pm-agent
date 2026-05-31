@@ -2631,6 +2631,23 @@ impl<S: Strategy> Runtime<S> {
         self.request_cancel(client_order_id, reason, now_ms)
     }
 
+    /// Register an externally-produced [`OrderIntent`] through the SAME tracked
+    /// submit path the strategy's own decisions use (`accept_intent`: risk gate,
+    /// inventory reservation, durable order-store insert, and a `Submit` command
+    /// in the returned outcome). This lets an additive overlay (the calm-regime
+    /// paired-MM) post RESTING maker quotes that the runtime tracks, so the
+    /// paper-fill simulator fills them on later book ticks and they can be
+    /// cancel/replaced via [`Runtime::request_cancel_order`]. It is the runtime's
+    /// existing submit machinery, not a new execution path: the resulting `Submit`
+    /// flows through the same `execute_execution_adapter` bridge as any other.
+    pub fn accept_external_intent(
+        &mut self,
+        intent: OrderIntent,
+        now_ms: EpochMillis,
+    ) -> RuntimeOutcome {
+        self.accept_intent(intent, now_ms)
+    }
+
     pub fn degrade_and_cancel_all(
         &mut self,
         now_ms: EpochMillis,
