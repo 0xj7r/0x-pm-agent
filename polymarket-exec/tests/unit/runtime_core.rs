@@ -2416,6 +2416,51 @@ fn plan_paper_close_cancels_open_orders_and_logs_close_event() {
 }
 
 #[test]
+fn kill_switch_degrade_cancels_paired_mm_maker_resting_orders() {
+    // INC3 kill-switch coverage: the paired-MM rests maker quotes through the
+    // SAME tracked path (accept_external_intent -> accept_intent -> order-store)
+    // every other order uses. degrade_and_cancel_all (the kill-switch action in
+    // enforce_live_health) calls request_cancel_all, which iterates EVERY open
+    // order regardless of tag, so the MM's resting legs are cancelled like any
+    // other live order. This test proves the mechanism end to end.
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+
+    // A pairedmm-maker tagged resting BUY, posted exactly as the overlay does.
+    let mut leg = btc_mm_intent("market-mm", "up", "ignored", 0.49);
+    leg.client_order_id = ClientOrderId::from("pairedmm-paper:market-mm:bidyes:1:1000");
+    leg.quote_level_tag = Some("pairedmm-maker".to_string());
+    leg.reason = "paired-mm:pairedmm-maker".to_string();
+    let leg_coid = leg.client_order_id.clone();
+    runtime.accept_external_intent(leg, 1);
+    // Move it to Working so a venue cancel is produced (NeedsReconcile orders are
+    // intentionally not venue-cancelled; a freshly-accepted order opens cleanly).
+    runtime.on_order_opened(&leg_coid, 2);
+    assert_eq!(runtime.open_orders().count(), 1);
+
+    let killed = runtime.degrade_and_cancel_all(3, "operator kill switch active");
+    assert_eq!(runtime.status(), RuntimeStatus::Degraded);
+    let cancelled_our_leg = killed.commands.iter().any(|cmd| matches!(
+        cmd,
+        RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &leg_coid
+    ));
+    assert!(
+        cancelled_our_leg,
+        "kill-switch degrade_and_cancel_all must cancel the MM's resting maker leg; got {:?}",
+        killed.commands
+    );
+}
+
+#[test]
 fn paired_entry_rejection_cancels_mate_to_prevent_naked_exposure() {
     let mut runtime = Runtime::new(
         RuntimeConfig {

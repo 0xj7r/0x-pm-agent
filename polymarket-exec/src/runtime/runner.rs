@@ -1184,10 +1184,18 @@ async fn run_runtime_loop(
     // true (hard-gated in from_env, exactly like br2's paper arm); there is no
     // real-money arm, so real submission is impossible. Driven only when br2 is
     // NOT quoting the same market (regime-disjoint).
-    let mut paired_mm_shadow =
-        crate::runtime::paired_mm_live::PairedMmLiveShadow::from_env(config.paper_mode);
+    let mut paired_mm_shadow = crate::runtime::paired_mm_live::PairedMmLiveShadow::from_env(
+        config.paper_mode,
+        config.live_kill_switch_path.as_deref(),
+    );
     if let Some(mm) = paired_mm_shadow.as_ref() {
-        if mm.paper_trade_armed() {
+        if mm.live_trade_armed() {
+            warn!(
+                target: "paired_mm",
+                "PAIRED-MM overlay enabled with REAL-MONEY submission armed (TINY post_only MAKER; \
+                 tracked-submit path + kill-switch cancel coverage). Real maker orders WILL be placed."
+            );
+        } else if mm.paper_trade_armed() {
             info!(
                 target: "paired_mm",
                 "PAIRED-MM overlay enabled with PAPER submission armed (paper-fill sim only)"
@@ -1660,6 +1668,32 @@ async fn run_runtime_loop(
                                         yes_shares,
                                         no_shares,
                                     };
+                                    // INC3 queue-capture measurement: feed the
+                                    // runtime-observed cumulative fills for OUR
+                                    // resting maker legs (pairedmm-maker tagged)
+                                    // so the overlay can log realized fills vs the
+                                    // backtest pro-rata expectation. Observed
+                                    // BEFORE decide_tick (which may cancel/replace
+                                    // the legs) so a leg's fill is captured before
+                                    // a requote forgets it.
+                                    let mm_observed_fills: Vec<(ClientOrderId, f64)> = runtime
+                                        .open_order_snapshots()
+                                        .into_iter()
+                                        .filter(|managed| {
+                                            managed
+                                                .intent
+                                                .quote_level_tag
+                                                .as_deref()
+                                                .is_some_and(|t| t.starts_with("pairedmm-maker"))
+                                        })
+                                        .map(|managed| {
+                                            (
+                                                managed.intent.client_order_id.clone(),
+                                                managed.cumulative_filled_qty,
+                                            )
+                                        })
+                                        .collect();
+                                    mm.observe_order_fills(&mm_observed_fills);
                                     let result = mm.decide_tick(
                                         &market_id,
                                         &record,
@@ -3432,6 +3466,17 @@ fn submit_request_from_intent(
             || tag.starts_with("cheap-tail-taker")
             || tag.starts_with("reversal-hedge-taker")
     });
+    // The calm-regime paired-MM overlay rests post_only MAKER limit orders
+    // tagged `pairedmm-maker`. They MUST be maker-only (never cross, never IOC):
+    // force post_only=true regardless of the global live_post_only flag so the
+    // live submit path pre-flights them through passive_post_only_limit_price
+    // (adjust-to-passive or reject-on-cross). In paper mode post_only stays false
+    // (the paper-fill sim's paper_post_only_should_reject already guards crossing
+    // and rests the non-crossing maker buys), keeping the paper arm byte-identical.
+    let is_paired_mm_maker = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("pairedmm-maker"));
     let is_late_fav_maker = intent
         .quote_level_tag
         .as_deref()
@@ -3445,7 +3490,8 @@ fn submit_request_from_intent(
                 && !is_aggressive_late_fav
                 && !is_br2_taker
                 && !is_late_bar_core
-                && !is_late_fav_maker)
+                && !is_late_fav_maker
+                && !is_paired_mm_maker)
                 .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
         })
         .or_else(|| {
@@ -3454,6 +3500,13 @@ fn submit_request_from_intent(
         });
     let (time_in_force, post_only) = if is_hedge_rescue || is_aggressive_late_fav || is_br2_taker {
         (TimeInForce::Ioc, false)
+    } else if is_paired_mm_maker {
+        // TINY-REAL paired-MM maker: resting post_only limit, GTC. post_only is
+        // forced true in LIVE (maker-only, reject/repost on cross) regardless of
+        // the global live_post_only flag; false in paper (sim guards crossing).
+        // The MM's own requote/cancel loop ages these out; the kill-switch
+        // cancels them via degrade_and_cancel_all (they are tracked orders).
+        (TimeInForce::Gtc, !execution_policy.paper_mode)
     } else if is_late_bar_core {
         (TimeInForce::Gtd, !execution_policy.paper_mode)
     } else if live_expires_at_ms.is_some() {

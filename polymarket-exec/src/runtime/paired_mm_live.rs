@@ -1,14 +1,46 @@
 //! Live glue for the calm-regime PAIRED market-making overlay.
 //!
-//! INC1 was SHADOW-ONLY. INC2 adds a PAPER submission arm behind a hard guard
-//! that mirrors br2's paper arm EXACTLY: the paired-MM may convert its two-sided
-//! touch quotes into MAKER (post_only LIMIT) order intents and rest them through
-//! the runtime's existing tracked-submit path ONLY when
-//! `PM_BTC_5M_PAIRED_MM_PAPER_TRADE` is truthy AND the runtime is in paper mode
-//! (`config.paper_mode == true`). There is NO real-money arm in this increment:
-//! if the paper-trade flag is set while the runtime is NOT in paper mode we WARN
-//! and REFUSE, leaving the overlay shadow-only. Real-money submission is
-//! IMPOSSIBLE here (there is no live arm and no live submit path).
+//! INC1 was SHADOW-ONLY. INC2 added a PAPER submission arm. INC3 adds the
+//! TINY-REAL maker arm: a real-money `live_trade_armed` switch behind a hard
+//! guard that mirrors br2's PROVEN live arm EXACTLY. When armed, the SAME
+//! two-sided touch quote loop INC2 built (post_only MAKER resting BUY YES @
+//! best_bid + BUY NO @ 1 - best_ask, cancel/replace-on-move) is routed through
+//! LIVE execution via the runtime's tracked-submit path (`accept_external_intent`
+//! / `request_cancel_order`). The orders are post_only MAKER limits (never IOC,
+//! never taker): the runner's `submit_request_from_intent` reads the
+//! `pairedmm-maker` tag and forces `post_only = true`, and the live submit path
+//! pre-flights every post_only order through `passive_post_only_limit_price`
+//! (adjust to passive or REJECT locally if it would cross) — maker-only with
+//! reject-on-cross. Because the legs are tracked orders, the kill-switch's
+//! `degrade_and_cancel_all -> request_cancel_all` (which iterates EVERY open
+//! order) cancels them, exactly like br2's live orders.
+//!
+//! REAL-MONEY PRECONDITIONS (ALL required, mirror br2 byte-for-byte, enforced in
+//! [`PairedMmLiveShadow::from_env`]):
+//!   - `PM_BTC_5M_PAIRED_MM_LIVE_TRADE` truthy, AND
+//!   - runtime is NOT in paper mode (`paper_mode == false`), AND
+//!   - a kill-switch path is configured (`PM_BTC_5M_LIVE_KILL_SWITCH_PATH`
+//!     non-empty), AND
+//!   - TINY MM-specific caps all set and > 0:
+//!     `PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD`,
+//!     `PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD`,
+//!     `PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD`.
+//! If `PM_BTC_5M_PAIRED_MM_LIVE_TRADE` is set but ANY precondition is missing (or
+//! the runtime is in paper mode), we REFUSE: warn loudly and leave
+//! `live_trade_armed=false` (shadow logging still runs, no real orders).
+//!
+//! The paper arm requires `paper_mode == true`; the live arm requires
+//! `paper_mode == false`. They are MUTUALLY EXCLUSIVE (one needs paper_mode, the
+//! other needs !paper_mode) and can never both be true.
+//!
+//! THE INC3 DELIVERABLE (queue-capture measurement): each resting maker leg
+//! captures, at SUBMIT time, our price, the resting top-of-book depth AHEAD of
+//! us at our price (`shares_ahead`), and a submit timestamp. On FILL the overlay
+//! emits a structured `paired_mm` log line with the filled price/size,
+//! time-to-fill, and the REALIZED capture vs the backtest's pro-rata expectation
+//! `clip/(clip + shares_ahead)`. This is the whole point of going real: it lets
+//! us compare actual queue capture against the pro-rata assumption (~200 sh
+//! ahead) the backtest baked in.
 //!
 //! When NOT (paper_mode && armed), behavior is byte-identical to INC1: the
 //! overlay decides + logs the two-sided quotes and a simulated pairing/inventory/
@@ -61,6 +93,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::path::Path;
 
 use tracing::{info, warn};
 
@@ -193,13 +226,28 @@ impl SimInventory {
     }
 }
 
-/// One resting maker quote leg the paper arm is managing. Tracks the live
+/// One resting maker quote leg the paper/live arm is managing. Tracks the live
 /// client_order_id and the price we posted it at so the next tick can decide
-/// keep-vs-cancel/replace as the touch moves.
+/// keep-vs-cancel/replace as the touch moves, plus the SUBMIT-time queue-capture
+/// metadata (the INC3 deliverable): the resting depth AHEAD of us at our price
+/// when we posted, the submit timestamp, our clip size, and the cumulative
+/// filled qty observed so far (to detect fresh fills and compute time-to-fill /
+/// realized-vs-pro-rata capture).
 #[derive(Clone)]
 struct RestingLeg {
     client_order_id: ClientOrderId,
     price: f64,
+    /// Which leg this is, for the fill log (`bidyes` or `buyno`).
+    leg: &'static str,
+    /// Resting top-of-book size at our price when we posted (queue ahead of us).
+    shares_ahead: f64,
+    /// Submit timestamp (unix ms) for time-to-fill.
+    submit_ms: u64,
+    /// Clip size we posted, for the pro-rata expectation clip/(clip+ahead).
+    clip: f64,
+    /// Cumulative filled qty already attributed to THIS leg (so the next fill
+    /// observation only logs the incremental fill).
+    filled_so_far: f64,
 }
 
 /// Tracks the runtime-active BTC-5m market the overlay is currently driving.
@@ -269,11 +317,31 @@ pub struct PairedMmTickResult {
 pub struct PairedMmLiveShadow {
     active: Option<ActiveMarket>,
     /// True when `PM_BTC_5M_PAIRED_MM_PAPER_TRADE` is armed AND the runtime is in
-    /// paper mode. The ONLY switch that lets `decide_tick` emit maker submit/
-    /// cancel intents. Can never be true outside paper mode (enforced in
-    /// `from_env`); there is no real-money arm in this increment, so real
-    /// submission is impossible.
+    /// paper mode. Lets `decide_tick` emit maker submit/cancel intents into the
+    /// PAPER-fill path. Can never be true outside paper mode (enforced in
+    /// `from_env`), and is mutually exclusive with `live_trade_armed`.
     paper_trade_armed: bool,
+    /// True when `PM_BTC_5M_PAIRED_MM_LIVE_TRADE` is armed AND the runtime is NOT
+    /// in paper mode AND every real-money precondition holds (kill-switch path +
+    /// all three MM notional caps > 0). Mirrors br2's `live_trade_armed`
+    /// byte-for-byte. The ONLY switch that lets `decide_tick` emit maker submit/
+    /// cancel intents into the REAL execution path. Can never be true in paper
+    /// mode, and is mutually exclusive with `paper_trade_armed`.
+    live_trade_armed: bool,
+    /// TINY per-order notional cap (USD, price*shares). Belt-and-suspenders bound
+    /// enforced INSIDE this module before emitting, like br2's. Only populated
+    /// when `live_trade_armed`.
+    max_order_notional_usd: f64,
+    /// Per-market cumulative SUBMITTED-notional cap (USD). Once a market reaches
+    /// it, further MM orders for that market are refused. Bounds accumulated
+    /// inventory. Only populated when `live_trade_armed`.
+    max_market_notional_usd: f64,
+    /// Gross RESTING-notional cap (USD) across all live MM legs at once. Bounds
+    /// the simultaneous resting exposure. Only populated when `live_trade_armed`.
+    max_gross_resting_usd: f64,
+    /// Running cumulative submitted notional per market id (for the per-market
+    /// cap). Only used when `live_trade_armed`.
+    submitted_notional_by_market: HashMap<String, f64>,
     clip_shares: f64,
     rebate_on: bool,
     /// Regime-gate thresholds + residual cap, env-overridable (defaults transcribed
@@ -296,12 +364,18 @@ impl PairedMmLiveShadow {
     /// `None` (no-op) otherwise so the runtime path stays byte-identical.
     ///
     /// `paper_mode` is the runtime's effective paper-mode flag (read from
-    /// AppConfig by the caller). It HARD-GATES the paper arm: paper submission
-    /// (`PM_BTC_5M_PAIRED_MM_PAPER_TRADE`) requires `paper_mode == true`. If the
-    /// flag is set while the runtime is NOT in paper mode we WARN loudly and
-    /// leave the arm disabled (shadow logging still runs). There is NO real-money
-    /// arm in this increment, so real submission is impossible regardless of any
-    /// env flag.
+    /// AppConfig by the caller). It HARD-GATES both arms in opposite directions:
+    /// paper submission (`PM_BTC_5M_PAIRED_MM_PAPER_TRADE`) requires
+    /// `paper_mode == true`; REAL-MONEY submission
+    /// (`PM_BTC_5M_PAIRED_MM_LIVE_TRADE`) requires `paper_mode == false`. If an
+    /// arm flag is set in the wrong mode (or, for live, a precondition is
+    /// missing) we WARN loudly and leave that arm disabled (shadow logging still
+    /// runs).
+    ///
+    /// `live_kill_switch_path` is the runtime's configured kill-switch path
+    /// (`config.live_kill_switch_path`). A non-empty path is a REQUIRED
+    /// precondition for arming real-money submission (mirrors br2): with no kill
+    /// switch configured, the live arm refuses regardless of the other flags.
     ///
     /// The two optional knobs are tuning (apply to both shadow and paper):
     ///   - `PM_BTC_5M_PAIRED_MM_CLIP_SHARES` (f64 > 0): touch clip size; default 10.
@@ -325,21 +399,21 @@ impl PairedMmLiveShadow {
     ///     target residual fraction.
     ///   - `PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS` (f64 >= 0; default 45): pull both
     ///     legs in the last N seconds.
-    pub fn from_env(paper_mode: bool) -> Option<Self> {
+    pub fn from_env(paper_mode: bool, live_kill_switch_path: Option<&Path>) -> Option<Self> {
         if !env_truthy("PM_BTC_5M_PAIRED_MM_SHADOW") {
             return None;
         }
-        // PAPER arm. Mirrors br2's hard guard exactly: armed IFF the flag is
-        // truthy AND the runtime is in paper mode. If set in the wrong mode we
-        // WARN and refuse (shadow-only). No real-money arm exists this increment.
+        // PAPER arm. Armed IFF the flag is truthy AND the runtime is in paper
+        // mode. If set in the wrong mode we WARN and refuse (shadow-only).
         let paper_trade_requested = env_truthy("PM_BTC_5M_PAIRED_MM_PAPER_TRADE");
         let paper_trade_armed = paper_trade_requested && paper_mode;
         if paper_trade_requested && !paper_mode {
             warn!(
                 target: "paired_mm",
                 "PAIRED-MM PAPER-TRADE flag PM_BTC_5M_PAIRED_MM_PAPER_TRADE is set but the runtime \
-                 is NOT in paper mode; REFUSING submission. The paired-MM stays SHADOW-ONLY (log \
-                 only). There is no real-money arm; real submission is impossible."
+                 is NOT in paper mode; REFUSING paper submission. The paired-MM stays SHADOW-ONLY \
+                 for the paper arm. (Real-money submission is governed separately by \
+                 PM_BTC_5M_PAIRED_MM_LIVE_TRADE.)"
             );
         }
         if paper_trade_armed {
@@ -347,6 +421,60 @@ impl PairedMmLiveShadow {
                 target: "paired_mm",
                 "PAIRED-MM PAPER-TRADE armed: maker quotes WILL rest through the paper-fill \
                  simulator (paper_mode=true). No real-money submission occurs."
+            );
+        }
+
+        // REAL-MONEY arm. Dormant by default. Mirrors br2's hard guard EXACTLY:
+        // arming requires PM_BTC_5M_PAIRED_MM_LIVE_TRADE truthy AND !paper_mode
+        // AND a configured kill-switch path AND all three TINY MM notional caps
+        // set and > 0. Any failure REFUSES (warns loudly, leaves the arm off).
+        // The caps are also the belt-and-suspenders bounds enforced in
+        // decide_tick (per-order, per-market accumulated, gross resting).
+        let live_trade_requested = env_truthy("PM_BTC_5M_PAIRED_MM_LIVE_TRADE");
+        let kill_switch_configured = live_kill_switch_path
+            .map(|p| !p.as_os_str().is_empty())
+            .unwrap_or(false);
+        let max_order_notional_usd = env_positive_f64("PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD");
+        let max_market_notional_usd =
+            env_positive_f64("PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD");
+        let max_gross_resting_usd = env_positive_f64("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD");
+        let live_preconditions_ok = !paper_mode
+            && kill_switch_configured
+            && max_order_notional_usd.is_some()
+            && max_market_notional_usd.is_some()
+            && max_gross_resting_usd.is_some();
+        let live_trade_armed = live_trade_requested && live_preconditions_ok;
+        if live_trade_requested && !live_trade_armed {
+            warn!(
+                target: "paired_mm",
+                paper_mode,
+                kill_switch_configured,
+                max_order_notional_usd = ?max_order_notional_usd,
+                max_market_notional_usd = ?max_market_notional_usd,
+                max_gross_resting_usd = ?max_gross_resting_usd,
+                "PAIRED-MM LIVE-TRADE flag PM_BTC_5M_PAIRED_MM_LIVE_TRADE is set but a precondition \
+                 is missing; REFUSING real-money submission. Required: !paper_mode AND \
+                 PM_BTC_5M_LIVE_KILL_SWITCH_PATH non-empty AND \
+                 PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD>0 AND \
+                 PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD>0 AND \
+                 PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD>0. The paired-MM stays SHADOW-ONLY (log \
+                 only). No real orders will be placed."
+            );
+        }
+        if live_trade_armed {
+            warn!(
+                target: "paired_mm",
+                max_order_notional_usd = max_order_notional_usd.unwrap_or(0.0),
+                max_market_notional_usd = max_market_notional_usd.unwrap_or(0.0),
+                max_gross_resting_usd = max_gross_resting_usd.unwrap_or(0.0),
+                kill_switch = ?live_kill_switch_path,
+                "PAIRED-MM REAL-MONEY submission ARMED (TINY post_only MAKER): max_order=${} \
+                 max_market=${} max_gross_resting=${} kill_switch={:?}. Real maker orders WILL be \
+                 placed.",
+                max_order_notional_usd.unwrap_or(0.0),
+                max_market_notional_usd.unwrap_or(0.0),
+                max_gross_resting_usd.unwrap_or(0.0),
+                live_kill_switch_path,
             );
         }
         let clip_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_CLIP_SHARES").unwrap_or(DEFAULT_CLIP_SHARES);
@@ -379,6 +507,11 @@ impl PairedMmLiveShadow {
         Some(Self {
             active: None,
             paper_trade_armed,
+            live_trade_armed,
+            max_order_notional_usd: max_order_notional_usd.unwrap_or(0.0),
+            max_market_notional_usd: max_market_notional_usd.unwrap_or(0.0),
+            max_gross_resting_usd: max_gross_resting_usd.unwrap_or(0.0),
+            submitted_notional_by_market: HashMap::new(),
             clip_shares,
             rebate_on,
             mid_lo,
@@ -398,6 +531,20 @@ impl PairedMmLiveShadow {
     /// lives in `decide_tick` and is the same boolean.
     pub fn paper_trade_armed(&self) -> bool {
         self.paper_trade_armed
+    }
+
+    /// True when the REAL-MONEY arm is armed (mirrors br2). Can only be true when
+    /// the runtime is NOT in paper mode and every precondition held at
+    /// construction. Mutually exclusive with `paper_trade_armed`.
+    pub fn live_trade_armed(&self) -> bool {
+        self.live_trade_armed
+    }
+
+    /// True when EITHER arm is armed: the single gate that decides whether
+    /// `decide_tick` emits any submit/cancel intents. The two arms are
+    /// mutually exclusive (paper needs paper_mode, live needs !paper_mode).
+    fn submission_armed(&self) -> bool {
+        self.paper_trade_armed || self.live_trade_armed
     }
 
     /// Tap one live Binance aggTrade print into the trailing spot tape. Prunes
@@ -618,9 +765,10 @@ impl PairedMmLiveShadow {
         // Strict-pairing repair / residual cap: if one leg outran the other past
         // the band, stop adding to the leading leg and only quote the missing
         // side to re-pair. This is the structural residual cap, NOT a trade-out.
-        // On the paper arm the skew is the REAL position (genuine fills); on the
-        // shadow path it is the internal SimInventory (byte-identical to INC1).
-        let skew = if self.paper_trade_armed {
+        // On EITHER submission arm (paper or live) the skew is the REAL position
+        // (genuine fills); on the shadow path it is the internal SimInventory
+        // (byte-identical to INC1).
+        let skew = if self.submission_armed() {
             pos.skew()
         } else {
             self.active.as_ref().map(|a| a.inventory.skew()).unwrap_or(0.0)
@@ -637,10 +785,14 @@ impl PairedMmLiveShadow {
         let ask_price = ask_live.then_some(yes_book.best_ask);
         let quoting = bid_price.is_some() || ask_price.is_some();
 
-        // Paper arm: realize the maker quote lifecycle (cancel/replace) for both
-        // legs against the current touch. Empty on the shadow path.
+        // Either submission arm: realize the maker quote lifecycle (cancel/
+        // replace) for both legs against the current touch. Empty on the shadow
+        // path. The SAME quote loop (post_only MAKER resting BUYs) drives both
+        // the paper-fill sim (paper arm) and LIVE execution (live arm); the only
+        // difference is where the runner routes the resulting intents and the
+        // per-order/per-market/gross notional caps applied on the live arm.
         let mut submit_intents: Vec<OrderIntent> = Vec::new();
-        if self.paper_trade_armed {
+        if self.submission_armed() {
             self.manage_paper_legs(
                 market_id,
                 yes_book,
@@ -667,6 +819,7 @@ impl PairedMmLiveShadow {
                 quote_ask = ?ask_price,
                 skew,
                 paper_armed = self.paper_trade_armed,
+                live_armed = self.live_trade_armed,
                 real_yes = pos.yes_shares,
                 real_no = pos.no_shares,
                 n_submit = submit_intents.len(),
@@ -686,17 +839,25 @@ impl PairedMmLiveShadow {
         PairedMmTickResult { quoting, bid_price, ask_price, submit_intents, cancel_ids }
     }
 
-    /// Realize the maker quote lifecycle for the paper arm: for each leg, compare
-    /// the desired post (or pull) against what is currently resting and emit a
-    /// CANCEL + SUBMIT (replace) only when the leg should move, a SUBMIT when
-    /// newly live, or a CANCEL when pulled. When a leg's target price is
-    /// unchanged we keep the resting quote (emit nothing) so we do not churn the
-    /// book every tick.
+    /// Realize the maker quote lifecycle for the armed (paper OR live) arm: for
+    /// each leg, compare the desired post (or pull) against what is currently
+    /// resting and emit a CANCEL + SUBMIT (replace) only when the leg should
+    /// move, a SUBMIT when newly live, or a CANCEL when pulled. When a leg's
+    /// target price is unchanged we keep the resting quote (emit nothing) so we
+    /// do not churn the book every tick.
     ///
-    /// YES-bid leg: BUY YES @ best_bid on the YES token. NO leg: BUY NO @
-    /// 1 - best_ask on the NO token. Both are post_only BUYs that rest strictly
-    /// below the mid, so the matched pair costs best_bid + (1 - best_ask) =
-    /// 1 - spread < $1 (the captured spread), mirroring the INC1 identity.
+    /// YES-bid leg: BUY YES @ best_bid on the YES token, queue ahead =
+    /// `best_bid_size`. NO leg: BUY NO @ 1 - best_ask on the NO token, queue
+    /// ahead = `best_ask_size` (the resting size we sit behind on the YES ask we
+    /// mirror). Both are post_only MAKER BUYs that rest strictly below the mid,
+    /// so the matched pair costs best_bid + (1 - best_ask) = 1 - spread < $1 (the
+    /// captured spread), mirroring the INC1 identity.
+    ///
+    /// On the LIVE arm the clip is bounded by the TINY MM caps (per-order
+    /// notional, per-market accumulated notional, gross resting notional) before
+    /// the intent is built; on the paper arm the full clip rests (byte-identical
+    /// to INC2). At submit time we record the queue-ahead depth + timestamp into
+    /// the RestingLeg for the INC3 fill-capture measurement.
     fn manage_paper_legs(
         &mut self,
         market_id: &MarketId,
@@ -708,32 +869,64 @@ impl PairedMmLiveShadow {
         cancel_ids: &mut Vec<ClientOrderId>,
     ) {
         let clip = self.clip_shares;
+        // Snapshot the live-arm caps before borrowing `active` mutably. On the
+        // paper/shadow path `live_trade_armed` is false and these are unused.
+        let live_armed = self.live_trade_armed;
+        let max_order = self.max_order_notional_usd;
+        let max_market = self.max_market_notional_usd;
+        let max_gross = self.max_gross_resting_usd;
+        // Gross resting notional already committed by THIS market's other legs
+        // (computed up-front so each leg sees the headroom left by the other).
+        let market_submitted_before = *self
+            .submitted_notional_by_market
+            .get(market_id.as_str())
+            .unwrap_or(&0.0);
+
         let Some(active) = self.active.as_mut() else { return };
         let yes_token = InstrumentId::from(active.yes_asset_id.as_str());
         let no_token = active.no_asset_id.as_ref().map(|id| InstrumentId::from(id.as_str()));
 
-        // YES-bid leg (BUY YES @ best_bid).
+        // Gross resting notional of legs we are KEEPING this tick (unchanged
+        // legs that do not replace). New posts must fit under max_gross alongside
+        // them. Computed before we mutate the legs.
+        let mut accumulated_market_notional = market_submitted_before;
+
+        // YES-bid leg (BUY YES @ best_bid). Queue ahead = resting best_bid_size.
         let want_bid = bid_price.filter(|p| p.is_finite() && *p > 0.0);
+        let bid_ahead = yes_book.best_bid_size.max(0.0);
         match (want_bid, active.bid_leg.clone()) {
             (Some(price), Some(existing)) if (existing.price - price).abs() <= 1e-9 => {
-                // Unchanged: keep the resting quote.
+                // Unchanged: keep the resting quote. Its notional is already
+                // counted in submitted_notional_by_market; do not double-count it
+                // against this tick's added notional.
             }
             (Some(price), existing) => {
                 if let Some(existing) = existing {
                     cancel_ids.push(existing.client_order_id);
                 }
-                active.quote_seq += 1;
-                let coid = Self::leg_coid(market_id, "bidyes", active.quote_seq, now_ms);
-                let intent = Self::maker_buy(
-                    coid.clone(),
-                    market_id,
-                    &yes_token,
-                    price,
-                    clip,
-                    now_ms,
+                let leg_clip = Self::bound_clip_to_caps(
+                    live_armed, clip, price, max_order, max_market, max_gross,
+                    accumulated_market_notional,
                 );
-                active.bid_leg = Some(RestingLeg { client_order_id: coid, price });
-                submit_intents.push(intent);
+                if leg_clip > 1e-9 {
+                    active.quote_seq += 1;
+                    let coid = Self::leg_coid(market_id, "bidyes", active.quote_seq, now_ms);
+                    let intent =
+                        Self::maker_buy(coid.clone(), market_id, &yes_token, price, leg_clip, now_ms);
+                    active.bid_leg = Some(RestingLeg {
+                        client_order_id: coid,
+                        price,
+                        leg: "bidyes",
+                        shares_ahead: bid_ahead,
+                        submit_ms: now_ms,
+                        clip: leg_clip,
+                        filled_so_far: 0.0,
+                    });
+                    accumulated_market_notional += price * leg_clip;
+                    submit_intents.push(intent);
+                } else {
+                    active.bid_leg = None;
+                }
             }
             (None, Some(existing)) => {
                 cancel_ids.push(existing.client_order_id);
@@ -742,32 +935,43 @@ impl PairedMmLiveShadow {
             (None, None) => {}
         }
 
-        // NO leg (BUY NO @ 1 - best_ask). Requires a NO token; if the market
-        // exposes none we cannot rest this leg (skip; the bid leg still rests).
+        // NO leg (BUY NO @ 1 - best_ask). Queue ahead = resting best_ask_size.
+        // Requires a NO token; if the market exposes none we cannot rest this leg.
         let want_no_price = ask_price
             .filter(|p| p.is_finite() && *p > 0.0)
             .map(|ask| 1.0 - ask)
             .filter(|p| p.is_finite() && *p > 0.0);
+        let no_ahead = yes_book.best_ask_size.max(0.0);
         if let Some(no_token) = no_token {
-            let _ = yes_book; // book is sourced via ask_price; kept for symmetry
             match (want_no_price, active.no_leg.clone()) {
                 (Some(price), Some(existing)) if (existing.price - price).abs() <= 1e-9 => {}
                 (Some(price), existing) => {
                     if let Some(existing) = existing {
                         cancel_ids.push(existing.client_order_id);
                     }
-                    active.quote_seq += 1;
-                    let coid = Self::leg_coid(market_id, "buyno", active.quote_seq, now_ms);
-                    let intent = Self::maker_buy(
-                        coid.clone(),
-                        market_id,
-                        &no_token,
-                        price,
-                        clip,
-                        now_ms,
+                    let leg_clip = Self::bound_clip_to_caps(
+                        live_armed, clip, price, max_order, max_market, max_gross,
+                        accumulated_market_notional,
                     );
-                    active.no_leg = Some(RestingLeg { client_order_id: coid, price });
-                    submit_intents.push(intent);
+                    if leg_clip > 1e-9 {
+                        active.quote_seq += 1;
+                        let coid = Self::leg_coid(market_id, "buyno", active.quote_seq, now_ms);
+                        let intent =
+                            Self::maker_buy(coid.clone(), market_id, &no_token, price, leg_clip, now_ms);
+                        active.no_leg = Some(RestingLeg {
+                            client_order_id: coid,
+                            price,
+                            leg: "buyno",
+                            shares_ahead: no_ahead,
+                            submit_ms: now_ms,
+                            clip: leg_clip,
+                            filled_so_far: 0.0,
+                        });
+                        accumulated_market_notional += price * leg_clip;
+                        submit_intents.push(intent);
+                    } else {
+                        active.no_leg = None;
+                    }
                 }
                 (None, Some(existing)) => {
                     cancel_ids.push(existing.client_order_id);
@@ -777,6 +981,119 @@ impl PairedMmLiveShadow {
             }
         } else if let Some(existing) = active.no_leg.take() {
             cancel_ids.push(existing.client_order_id);
+        }
+
+        // On the live arm, accumulate the new submitted notional against the
+        // per-market cap so it bounds cumulative inventory across the window.
+        if live_armed {
+            let added = accumulated_market_notional - market_submitted_before;
+            if added > 0.0 {
+                *self
+                    .submitted_notional_by_market
+                    .entry(market_id.as_str().to_string())
+                    .or_insert(0.0) += added;
+            }
+        }
+    }
+
+    /// Bound a maker leg's clip (share count) to the TINY live caps. On the paper/
+    /// shadow path (`live_armed=false`) the full clip rests (byte-identical to
+    /// INC2). On the live arm the clip is clipped so that price*clip fits the
+    /// per-order cap, the remaining per-market headroom, AND the remaining gross
+    /// resting headroom; returns 0 (drop the leg) if no positive size fits or the
+    /// price is non-positive. Rounded down to 2dp to match the wire boundary.
+    fn bound_clip_to_caps(
+        live_armed: bool,
+        clip: f64,
+        price: f64,
+        max_order: f64,
+        max_market: f64,
+        max_gross: f64,
+        market_already: f64,
+    ) -> f64 {
+        if !live_armed {
+            return clip;
+        }
+        if !(price > 0.0) {
+            return 0.0;
+        }
+        let market_headroom = (max_market - market_already).max(0.0);
+        let gross_headroom = (max_gross - market_already).max(0.0);
+        let allowed_notional = max_order.min(market_headroom).min(gross_headroom);
+        if allowed_notional <= 0.0 {
+            return 0.0;
+        }
+        let max_shares = allowed_notional / price;
+        let bounded = clip.min(max_shares).max(0.0);
+        (bounded * 100.0).floor() / 100.0
+    }
+
+    /// THE INC3 DELIVERABLE: queue-capture measurement. The caller passes, each
+    /// tick, the runtime-observed cumulative filled qty for OUR resting maker
+    /// legs (keyed by client_order_id, looked up from the order store's
+    /// `cumulative_filled_qty`). For each leg whose observed cumulative fill has
+    /// grown since we last checked, we emit a structured `paired_mm` log line
+    /// recording the incremental fill, the SUBMIT-time queue depth ahead of us,
+    /// the time-to-fill, and the REALIZED capture vs the backtest's pro-rata
+    /// expectation `clip/(clip + shares_ahead)`. This is how we compare real
+    /// queue capture to the pro-rata assumption the backtest baked in (~200 sh
+    /// ahead). Driven on BOTH arms (paper measures the sim, live measures real
+    /// venue queue capture, which is the point of going real).
+    ///
+    /// `observed` entries are `(client_order_id, cumulative_filled_qty)`. Pure
+    /// instrumentation: it mutates only the per-leg `filled_so_far` watermark.
+    pub fn observe_order_fills(&mut self, observed: &[(ClientOrderId, f64)]) {
+        let clip_default = self.clip_shares;
+        let Some(active) = self.active.as_mut() else { return };
+        let now_ms = active.last_decision_ms;
+        let market = active.market_id.clone();
+        for leg_slot in [active.bid_leg.as_mut(), active.no_leg.as_mut()] {
+            let Some(leg) = leg_slot else { continue };
+            let Some((_, cumulative)) = observed
+                .iter()
+                .find(|(coid, _)| *coid == leg.client_order_id)
+            else {
+                continue;
+            };
+            let cumulative = *cumulative;
+            if cumulative <= leg.filled_so_far + 1e-9 {
+                continue;
+            }
+            let incremental = cumulative - leg.filled_so_far;
+            leg.filled_so_far = cumulative;
+            let clip = if leg.clip > 0.0 { leg.clip } else { clip_default };
+            // Backtest pro-rata expectation: the share of a clip we EXPECT to
+            // capture given the resting queue ahead of us at submit.
+            let pro_rata_expected = clip / (clip + leg.shares_ahead.max(0.0));
+            // Realized capture: the share of our clip actually filled (cumulative,
+            // not just this increment), the apples-to-apples comparison.
+            let realized_capture = if clip > 0.0 {
+                (cumulative / clip).min(1.0)
+            } else {
+                0.0
+            };
+            let time_to_fill_ms = now_ms.saturating_sub(leg.submit_ms);
+            info!(
+                target: "paired_mm",
+                event = "maker_fill",
+                market = %market,
+                leg = leg.leg,
+                client_order_id = %leg.client_order_id,
+                fill_price = leg.price,
+                fill_incremental_shares = incremental,
+                fill_cumulative_shares = cumulative,
+                clip,
+                shares_ahead_at_submit = leg.shares_ahead,
+                time_to_fill_ms,
+                pro_rata_expected_capture = pro_rata_expected,
+                realized_capture,
+                capture_ratio_realized_over_prorata = if pro_rata_expected > 0.0 {
+                    realized_capture / pro_rata_expected
+                } else {
+                    f64::NAN
+                },
+                "PAIRED-MM maker fill (queue-capture measurement: realized vs backtest pro-rata)"
+            );
         }
     }
 
@@ -1092,6 +1409,11 @@ mod tests {
                 quote_seq: 0,
             }),
             paper_trade_armed: false,
+            live_trade_armed: false,
+            max_order_notional_usd: 0.0,
+            max_market_notional_usd: 0.0,
+            max_gross_resting_usd: 0.0,
+            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1130,6 +1452,11 @@ mod tests {
                 quote_seq: 0,
             }),
             paper_trade_armed: false,
+            live_trade_armed: false,
+            max_order_notional_usd: 0.0,
+            max_market_notional_usd: 0.0,
+            max_gross_resting_usd: 0.0,
+            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1166,6 +1493,11 @@ mod tests {
                 quote_seq: 0,
             }),
             paper_trade_armed: false,
+            live_trade_armed: false,
+            max_order_notional_usd: 0.0,
+            max_market_notional_usd: 0.0,
+            max_gross_resting_usd: 0.0,
+            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1229,8 +1561,8 @@ mod tests {
     #[test]
     fn from_env_is_none_when_flag_unset() {
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
-        assert!(PairedMmLiveShadow::from_env(true).is_none());
-        assert!(PairedMmLiveShadow::from_env(false).is_none());
+        assert!(PairedMmLiveShadow::from_env(true, None).is_none());
+        assert!(PairedMmLiveShadow::from_env(false, None).is_none());
     }
 
     #[test]
@@ -1306,12 +1638,12 @@ mod tests {
         // each from_env call so a sibling env-mutating test cannot race it away.
         std::env::set_var("PM_BTC_5M_PAIRED_MM_PAPER_TRADE", "true");
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
-        let refused = PairedMmLiveShadow::from_env(false);
+        let refused = PairedMmLiveShadow::from_env(false, None);
         if let Some(refused) = refused {
             assert!(!refused.paper_trade_armed(), "paper arm must be refused when !paper_mode");
         }
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
-        let armed = PairedMmLiveShadow::from_env(true);
+        let armed = PairedMmLiveShadow::from_env(true, None);
         if let Some(armed) = armed {
             assert!(armed.paper_trade_armed(), "paper arm must arm under paper_mode");
         }
@@ -1425,5 +1757,205 @@ mod tests {
         );
         assert_eq!(submits.len(), 1, "only YES leg without a NO token");
         assert_eq!(submits[0].instrument_id.as_str(), "yes");
+    }
+
+    // --- INC3: TINY-REAL maker arm ---
+
+    /// A live-armed overlay with TINY caps and a NO token, for routing/cap tests.
+    fn live_shadow_with_market(no_asset: Option<&str>) -> PairedMmLiveShadow {
+        let mut mm = shadow_with_inv(0.0, SimInventory::default());
+        mm.live_trade_armed = true;
+        mm.max_order_notional_usd = 5.0;
+        mm.max_market_notional_usd = 20.0;
+        mm.max_gross_resting_usd = 10.0;
+        if let Some(active) = mm.active.as_mut() {
+            active.no_asset_id = no_asset.map(|s| s.to_string());
+        }
+        mm
+    }
+
+    #[test]
+    fn live_arm_refused_in_paper_mode_caps_or_kill_path_unset() {
+        // Mirror br2: PM_BTC_5M_PAIRED_MM_LIVE_TRADE must NOT arm unless
+        // !paper_mode AND a kill-switch path AND all three caps > 0.
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_LIVE_TRADE", "true");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD", "5");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD", "20");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD", "10");
+        let kill = std::path::PathBuf::from("/tmp/paired-mm-test.kill");
+
+        // paper_mode=true => refused (mutually exclusive with the paper arm).
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+        if let Some(mm) = PairedMmLiveShadow::from_env(true, Some(&kill)) {
+            assert!(!mm.live_trade_armed(), "live arm must refuse in paper mode");
+        }
+        // !paper_mode but NO kill-switch path => refused.
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+        if let Some(mm) = PairedMmLiveShadow::from_env(false, None) {
+            assert!(!mm.live_trade_armed(), "live arm must refuse without kill-switch path");
+        }
+        // !paper_mode, kill-switch path, but a cap unset => refused.
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+        if let Some(mm) = PairedMmLiveShadow::from_env(false, Some(&kill)) {
+            assert!(!mm.live_trade_armed(), "live arm must refuse when a cap is unset");
+        }
+        // All preconditions hold => armed, and paper arm stays OFF.
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD", "10");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+        if let Some(mm) = PairedMmLiveShadow::from_env(false, Some(&kill)) {
+            assert!(mm.live_trade_armed(), "live arm must arm with all preconditions");
+            assert!(!mm.paper_trade_armed(), "arms are mutually exclusive");
+        }
+
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_LIVE_TRADE");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
+    }
+
+    #[test]
+    fn live_and_paper_arms_are_mutually_exclusive() {
+        // paper requires paper_mode; live requires !paper_mode. They can never
+        // both be true for any paper_mode value.
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_PAPER_TRADE", "true");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_LIVE_TRADE", "true");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD", "5");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD", "20");
+        std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD", "10");
+        let kill = std::path::PathBuf::from("/tmp/paired-mm-test.kill");
+        for paper_mode in [true, false] {
+            std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
+            if let Some(mm) = PairedMmLiveShadow::from_env(paper_mode, Some(&kill)) {
+                assert!(
+                    !(mm.paper_trade_armed() && mm.live_trade_armed()),
+                    "both arms must never be true at once (paper_mode={paper_mode})"
+                );
+            }
+        }
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_PAPER_TRADE");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_LIVE_TRADE");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_ORDER_NOTIONAL_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_MARKET_NOTIONAL_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD");
+        std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
+    }
+
+    #[test]
+    fn live_arm_routes_maker_buys_tagged_post_only() {
+        // The live arm emits the SAME post_only MAKER BUYs (pairedmm-maker tag,
+        // BUY side, resting below the touch) the paper arm does. The tag is what
+        // the runner reads to force post_only=true on the live submit path.
+        let mut mm = live_shadow_with_market(Some("no"));
+        let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        mm.manage_paper_legs(
+            &MarketId::from("m"),
+            &b,
+            Some(0.49),
+            Some(0.50),
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
+        assert_eq!(submits.len(), 2, "both legs rest on the live arm too");
+        for intent in &submits {
+            assert_eq!(intent.side, crate::types::TradeSide::Buy, "maker BUY only");
+            assert_eq!(
+                intent.quote_level_tag.as_deref(),
+                Some(MM_QUOTE_TAG),
+                "must carry the pairedmm-maker tag for post_only routing"
+            );
+        }
+    }
+
+    #[test]
+    fn live_caps_clip_order_and_per_market_notional() {
+        // max_order=5, price 0.50 => clip bounded to 10 shares ($5). Default clip
+        // is 10, so the order cap exactly binds (10 sh * 0.50 = $5).
+        let mut mm = live_shadow_with_market(Some("no"));
+        mm.max_market_notional_usd = 100.0;
+        mm.max_gross_resting_usd = 100.0;
+        let b = book(0.50, 5.0, 0.50, 5.0, 0.50);
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        mm.manage_paper_legs(
+            &MarketId::from("m"),
+            &b,
+            Some(0.50),
+            Some(0.50),
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
+        for intent in &submits {
+            assert!(
+                intent.notional_usd() <= mm.max_order_notional_usd + 1e-9,
+                "per-order notional cap must bound the clip: {}",
+                intent.notional_usd()
+            );
+        }
+        // Per-market cumulative accounting accrued.
+        let acc = *mm
+            .submitted_notional_by_market
+            .get("m")
+            .unwrap_or(&0.0);
+        assert!(acc > 0.0, "per-market submitted notional must accumulate");
+    }
+
+    #[test]
+    fn live_per_market_cap_refuses_further_orders() {
+        // Per-market cap fully consumed already => zero headroom => no legs rest.
+        let mut mm = live_shadow_with_market(Some("no"));
+        mm.max_market_notional_usd = 20.0;
+        mm.max_gross_resting_usd = 20.0;
+        mm.submitted_notional_by_market
+            .insert("m".to_string(), 20.0);
+        let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        mm.manage_paper_legs(
+            &MarketId::from("m"),
+            &b,
+            Some(0.49),
+            Some(0.50),
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
+        assert!(submits.is_empty(), "no orders rest once the market cap is hit");
+    }
+
+    #[test]
+    fn observe_order_fills_logs_realized_vs_prorata() {
+        // A bid leg posted with 200 shares ahead and clip 10 (pro-rata expected
+        // 10/210). A cumulative fill of 4 shares is observed => realized capture
+        // 0.4. The watermark advances so a re-observe of the same cumulative does
+        // not double-count. (We assert the watermark; the log line itself is the
+        // deliverable and is emitted via tracing.)
+        let mut mm = live_shadow_with_market(Some("no"));
+        let coid = ClientOrderId::from("leg-1");
+        if let Some(active) = mm.active.as_mut() {
+            active.last_decision_ms = 5_000;
+            active.bid_leg = Some(RestingLeg {
+                client_order_id: coid.clone(),
+                price: 0.49,
+                leg: "bidyes",
+                shares_ahead: 200.0,
+                submit_ms: 1_000,
+                clip: 10.0,
+                filled_so_far: 0.0,
+            });
+        }
+        mm.observe_order_fills(&[(coid.clone(), 4.0)]);
+        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 4.0).abs() < 1e-9);
+        // Re-observe same cumulative => no change (no double count).
+        mm.observe_order_fills(&[(coid.clone(), 4.0)]);
+        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 4.0).abs() < 1e-9);
+        // A further fill advances the watermark.
+        mm.observe_order_fills(&[(coid, 7.5)]);
+        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 7.5).abs() < 1e-9);
     }
 }

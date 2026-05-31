@@ -1682,6 +1682,58 @@ fn late_bar_core_submit_uses_gtd_with_60s_ttl_and_post_only() {
 }
 
 #[test]
+fn paired_mm_maker_live_forces_post_only_gtc_regardless_of_live_post_only() {
+    // INC3: the pairedmm-maker tag MUST route to a post_only MAKER limit on the
+    // live arm even when the global live_post_only flag is OFF, and must be GTC
+    // (no IOC, no TTL expiry; the MM manages requote/cancel itself).
+    let intent = OrderIntent {
+        client_order_id: ClientOrderId::from("pairedmm-paper:m:bidyes:1:1000"),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.49,
+        quantity: 10.0,
+        reduce_only: false,
+        reason: "paired-mm:pairedmm-maker".to_string(),
+        quote_level_tag: Some("pairedmm-maker".to_string()),
+        created_at_ms: 10,
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let policy = ExecutionPolicy {
+        live_post_only: false,
+        ..live_test_policy()
+    };
+    let request = submit_request_from_intent(&intent, 1_000, &policy);
+    assert!(request.post_only, "live maker MUST be post_only even when live_post_only=false");
+    assert_eq!(request.time_in_force, TimeInForce::Gtc);
+    assert_eq!(request.expires_at_ms, None, "maker quote is not TTL-aged");
+}
+
+#[test]
+fn paired_mm_maker_paper_is_not_post_only_byte_identical() {
+    // In paper mode the maker tag stays post_only=false (the paper-fill sim
+    // guards crossing), keeping the paper arm byte-identical to INC2.
+    let intent = OrderIntent {
+        client_order_id: ClientOrderId::from("pairedmm-paper:m:buyno:2:2000"),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-2"),
+        side: TradeSide::Buy,
+        limit_price: 0.50,
+        quantity: 10.0,
+        reduce_only: false,
+        reason: "paired-mm:pairedmm-maker".to_string(),
+        quote_level_tag: Some("pairedmm-maker".to_string()),
+        created_at_ms: 10,
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let request = submit_request_from_intent(&intent, 1_000, &paper_test_policy());
+    assert!(!request.post_only, "paper maker stays post_only=false");
+    assert_eq!(request.time_in_force, TimeInForce::Gtc);
+}
+
+#[test]
 fn generic_post_only_submit_reject_does_not_consume_live_budget() {
     assert!(!submit_rejection_counts_against_live_budget(
         "execution venue rejected submit",
