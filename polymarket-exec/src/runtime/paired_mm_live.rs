@@ -509,6 +509,16 @@ impl PairedMmLiveShadow {
     /// touch quotes. A change in `last_trade_price` since the previous tick is
     /// treated as one taker print of one clip's worth of taker size; classified
     /// against our resting touch and filled pro-rata by clip/(clip+depth_ahead).
+    ///
+    /// RESTING-ONLY (maker, capture-the-spread): a leg can ONLY be booked at its
+    /// own maker touch (YES bought at `best_bid`, NO at `1 - best_ask`), and ONLY
+    /// when the taker print strictly crosses THAT resting side. We never book a
+    /// fill at a touch that moved against us between snapshots, so each leg's cost
+    /// is always a genuine maker price strictly below the mid. A matched pair then
+    /// costs `best_bid + (1 - best_ask) = 1 - spread < $1` (the captured spread).
+    /// Re-pairing a one-sided leg is the same resting model (we keep quoting the
+    /// missing side and only fill on a taker cross); if no cross arrives the
+    /// residual is held (hard-capped) to resolution, never crossed/lifted.
     fn simulate_fill(&mut self, yes_book: &BookState, prev_trade_price: f64, yes_mid: f64) {
         let print_price = yes_book.last_trade_price;
         // No fresh print, or a non-finite/zero print: nothing to simulate.
@@ -518,6 +528,11 @@ impl PairedMmLiveShadow {
         if (print_price - prev_trade_price).abs() <= 1e-9 {
             return; // last_trade_price unchanged => no new print this tick
         }
+        let bid = yes_book.best_bid;
+        let ask = yes_book.best_ask;
+        if !(bid > 0.0 && ask > 0.0 && ask > bid) {
+            return; // need a clean two-sided touch to define maker prices
+        }
 
         let clip = self.clip_shares;
         let repair_delta = self.repair_delta;
@@ -525,8 +540,10 @@ impl PairedMmLiveShadow {
         let inv = &mut active.inventory;
 
         // Taker SELL hits our resting YES bid: print at/below best_bid. We buy
-        // YES. depth_ahead = resting bid size.
-        if print_price <= yes_book.best_bid + 1e-9 && yes_book.best_bid > 0.0 {
+        // YES at the MAKER touch (best_bid). depth_ahead = resting bid size.
+        // RESTING-ONLY guard: best_bid is strictly below the mid, so this leg can
+        // never be booked above the mid; the pair cost stays < $1.
+        if print_price <= bid + 1e-9 {
             let ahead = yes_book.best_bid_size.max(0.0);
             let frac = clip / (clip + ahead);
             let mut qty = clip * frac;
@@ -534,23 +551,24 @@ impl PairedMmLiveShadow {
             qty = qty.min((inv.no_long + repair_delta - inv.yes_long).max(0.0));
             if qty > 1e-9 {
                 inv.yes_long += qty;
-                inv.yes_long_cost += qty * yes_book.best_bid;
+                inv.yes_long_cost += qty * bid;
                 inv.filled_shares += qty;
                 inv.n_fills += 1;
-                inv.rebate_usdc += qty * yes_book.best_bid * REBATE_FRAC;
+                inv.rebate_usdc += qty * bid * REBATE_FRAC;
             }
             return;
         }
 
         // Taker BUY lifts our resting YES ask: print at/above best_ask. We sell
-        // YES == buy NO at (1 - ask). depth_ahead = resting ask size.
-        if print_price >= yes_book.best_ask - 1e-9 && yes_book.best_ask > 0.0 {
+        // YES == buy NO at the MAKER touch (1 - best_ask). depth_ahead = resting
+        // ask size. RESTING-ONLY guard: 1 - best_ask is strictly below the mid.
+        if print_price >= ask - 1e-9 {
             let ahead = yes_book.best_ask_size.max(0.0);
             let frac = clip / (clip + ahead);
             let mut qty = clip * frac;
             qty = qty.min((inv.yes_long + repair_delta - inv.no_long).max(0.0));
             if qty > 1e-9 {
-                let no_price = 1.0 - yes_book.best_ask;
+                let no_price = 1.0 - ask;
                 inv.no_long += qty;
                 inv.no_long_cost += qty * no_price;
                 inv.filled_shares += qty;
@@ -558,6 +576,9 @@ impl PairedMmLiveShadow {
                 inv.rebate_usdc += qty * no_price * REBATE_FRAC;
             }
         }
+        // A print STRICTLY INSIDE the spread (bid < print < ask) crosses neither
+        // resting side: it is NOT our fill (it would imply paying the spread to
+        // re-pair). We book nothing and hold, matching the resting-only rule.
         let _ = yes_mid; // mid used only by the marked-PnL log, not by the fill model
     }
 
@@ -788,6 +809,78 @@ mod tests {
         };
         let b = book(0.48, 0.0, 0.50, 100.0, 0.48);
         mm.simulate_fill(&b, 0.48, 0.49);
+        let inv = &mm.active.as_ref().unwrap().inventory;
+        assert_eq!(inv.yes_long, 0.0);
+        assert_eq!(inv.no_long, 0.0);
+    }
+
+    fn shadow_with_inv(last_trade: f64, inv: SimInventory) -> PairedMmLiveShadow {
+        PairedMmLiveShadow {
+            active: Some(ActiveMarket {
+                market_id: MarketId::from("m"),
+                yes_asset_id: "yes".to_string(),
+                close_ms: 10_000,
+                last_decision_ms: 0,
+                mid_min: 0.5,
+                mid_max: 0.5,
+                last_trade_price: last_trade,
+                inventory: inv,
+            }),
+            clip_shares: 10.0,
+            rebate_on: false,
+            mid_lo: REGIME_MID_LO,
+            mid_hi: REGIME_MID_HI,
+            range_max: REGIME_RANGE_MAX,
+            spot_vol_max: REGIME_SPOT_VOL_MAX,
+            flip_min: REGIME_FLIP_MIN,
+            late_pull_secs: LATE_PULL_SECS,
+            repair_delta: REPAIR_DELTA_SHARES,
+            spot: VecDeque::new(),
+            disjoint_skip_markets: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn resting_pair_costs_below_one_on_clean_oscillation() {
+        // Clean 1c market: bid 0.49 / ask 0.50. A taker SELL prints at 0.49
+        // (hits our resting bid) then a taker BUY prints at 0.50 (lifts our
+        // resting ask). Both legs book at their MAKER touch, so the matched pair
+        // costs bid + (1 - ask) = 0.49 + 0.50 = 0.99 < $1 (the captured 1c spread).
+        let mut mm = shadow_with_inv(0.0, SimInventory::default());
+        // depth 0 ahead => full clip on each side so the legs pair exactly.
+        mm.simulate_fill(&book(0.49, 0.0, 0.50, 0.0, 0.49), 0.0, 0.495);
+        mm.simulate_fill(&book(0.49, 0.0, 0.50, 0.0, 0.50), 0.49, 0.495);
+        let inv = &mm.active.as_ref().unwrap().inventory;
+        let paired = inv.paired();
+        assert!(paired > 0.0, "expected a matched pair, got {paired}");
+        let pair_cost = (inv.yes_long_cost / inv.yes_long) + (inv.no_long_cost / inv.no_long);
+        assert!((pair_cost - 0.99).abs() < 1e-9, "pair_cost={pair_cost} (must be 1 - spread)");
+        // Realized PnL on the pair is positive (the captured spread).
+        assert!(inv.marked_pnl(0.495, false) > 0.0);
+    }
+
+    #[test]
+    fn mid_spread_print_books_nothing_never_crosses_to_repair() {
+        // One-sided (yes ahead of no past the repair band): the ask leg is the
+        // re-pairing side. A print STRICTLY INSIDE the spread (0.495, between
+        // bid 0.49 and ask 0.50) crosses neither resting side. Re-pairing must
+        // NOT lift/cross to fill it: nothing is booked, the residual is held.
+        let mut inv = SimInventory::default();
+        inv.yes_long = 5.0;
+        inv.yes_long_cost = 5.0 * 0.49;
+        let mut mm = shadow_with_inv(0.0, inv);
+        mm.simulate_fill(&book(0.49, 0.0, 0.50, 0.0, 0.495), 0.0, 0.495);
+        let after = &mm.active.as_ref().unwrap().inventory;
+        assert_eq!(after.no_long, 0.0, "mid-spread print must not re-pair by crossing");
+        assert_eq!(after.yes_long, 5.0);
+    }
+
+    #[test]
+    fn locked_book_books_nothing() {
+        // ask == bid (locked, zero spread): a "pair" here would cost exactly $1
+        // with no edge. The resting-only model must reject it (no spread to capture).
+        let mut mm = shadow_with_inv(0.0, SimInventory::default());
+        mm.simulate_fill(&book(0.50, 0.0, 0.50, 0.0, 0.50), 0.0, 0.50);
         let inv = &mm.active.as_ref().unwrap().inventory;
         assert_eq!(inv.yes_long, 0.0);
         assert_eq!(inv.no_long, 0.0);
