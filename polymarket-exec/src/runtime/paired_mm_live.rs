@@ -121,6 +121,8 @@ const REGIME_RANGE_MAX: f64 = 0.06; // YES mid range-so-far must be <= 6c
 const REGIME_SPOT_VOL_MAX: f64 = 0.00012; // max stdev of 30s-grid spot returns
 const REGIME_FLIP_MIN: f64 = 0.20; // min fraction of spot-return sign flips
 const LATE_PULL_SECS: f64 = 45.0; // pull both legs in the last N seconds
+const DEFAULT_MIN_REQUOTE_AGE_MS: u64 = 5_000; // hold a resting leg >=5s before chasing
+const DEFAULT_REQUOTE_MIN_TICKS: f64 = 0.01; // and only chase once the touch moved >=1c
 const REPAIR_DELTA_SHARES: f64 = 2.0; // residual-cap band on |yes_long - no_long|
 const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (logged)
 const TAKER_FEE_FRAC: f64 = 0.0156;
@@ -332,16 +334,16 @@ pub struct PairedMmLiveShadow {
     /// enforced INSIDE this module before emitting, like br2's. Only populated
     /// when `live_trade_armed`.
     max_order_notional_usd: f64,
-    /// Per-market cumulative SUBMITTED-notional cap (USD). Once a market reaches
-    /// it, further MM orders for that market are refused. Bounds accumulated
-    /// inventory. Only populated when `live_trade_armed`.
+    /// Per-market NET-inventory notional cap (USD). Bounds the actual directional
+    /// exposure |net YES-equiv position| * price (NOT cumulative submitted
+    /// notional): matched pairs are riskless (redeem to $1) and do NOT consume it;
+    /// only the unpaired/net residual does. Once a market's net exposure reaches
+    /// the cap, the leg that would grow it further is refused. Only populated when
+    /// `live_trade_armed`.
     max_market_notional_usd: f64,
     /// Gross RESTING-notional cap (USD) across all live MM legs at once. Bounds
     /// the simultaneous resting exposure. Only populated when `live_trade_armed`.
     max_gross_resting_usd: f64,
-    /// Running cumulative submitted notional per market id (for the per-market
-    /// cap). Only used when `live_trade_armed`.
-    submitted_notional_by_market: HashMap<String, f64>,
     clip_shares: f64,
     rebate_on: bool,
     /// Regime-gate thresholds + residual cap, env-overridable (defaults transcribed
@@ -353,6 +355,12 @@ pub struct PairedMmLiveShadow {
     flip_min: f64,
     late_pull_secs: f64,
     repair_delta: f64,
+    /// Rest-and-hold requote discipline. A resting leg is KEPT (gains queue
+    /// priority) unless it has aged past `min_requote_age_ms` AND the target touch
+    /// has moved at least `requote_min_ticks` from the resting price (chase), or it
+    /// would cross / is off-book (reprice immediately for safety), or it is pulled.
+    min_requote_age_ms: u64,
+    requote_min_ticks: f64,
     /// Self-contained trailing spot tape for the regime gate.
     spot: VecDeque<SpotSample>,
     /// One-shot guard so the "br2 owns this market" disjoint note logs sparingly.
@@ -489,6 +497,11 @@ impl PairedMmLiveShadow {
             env_positive_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES").unwrap_or(REPAIR_DELTA_SHARES);
         let residual_cap_frac =
             env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_FRAC").unwrap_or(RESIDUAL_CAP_FRAC);
+        let min_requote_age_ms = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MIN_REQUOTE_AGE_MS")
+            .map(|v| v as u64)
+            .unwrap_or(DEFAULT_MIN_REQUOTE_AGE_MS);
+        let requote_min_ticks =
+            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_REQUOTE_MIN_TICKS").unwrap_or(DEFAULT_REQUOTE_MIN_TICKS);
         info!(
             target: "paired_mm",
             clip_shares,
@@ -501,6 +514,8 @@ impl PairedMmLiveShadow {
             late_pull_secs,
             repair_delta,
             residual_cap_frac,
+            min_requote_age_ms,
+            requote_min_ticks,
             "PAIRED-MM SHADOW overlay enabled (logging only; submits nothing). \
              Quotes only when br2 is NOT quoting the market (regime-disjoint)."
         );
@@ -511,7 +526,6 @@ impl PairedMmLiveShadow {
             max_order_notional_usd: max_order_notional_usd.unwrap_or(0.0),
             max_market_notional_usd: max_market_notional_usd.unwrap_or(0.0),
             max_gross_resting_usd: max_gross_resting_usd.unwrap_or(0.0),
-            submitted_notional_by_market: HashMap::new(),
             clip_shares,
             rebate_on,
             mid_lo,
@@ -521,6 +535,8 @@ impl PairedMmLiveShadow {
             flip_min,
             late_pull_secs,
             repair_delta,
+            min_requote_age_ms,
+            requote_min_ticks,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         })
@@ -798,6 +814,7 @@ impl PairedMmLiveShadow {
                 yes_book,
                 bid_price,
                 ask_price,
+                pos,
                 now_ms,
                 &mut submit_intents,
                 &mut cancel_ids,
@@ -854,16 +871,26 @@ impl PairedMmLiveShadow {
     /// captured spread), mirroring the INC1 identity.
     ///
     /// On the LIVE arm the clip is bounded by the TINY MM caps (per-order
-    /// notional, per-market accumulated notional, gross resting notional) before
+    /// notional, per-market NET-inventory notional, gross resting notional) before
     /// the intent is built; on the paper arm the full clip rests (byte-identical
     /// to INC2). At submit time we record the queue-ahead depth + timestamp into
     /// the RestingLeg for the INC3 fill-capture measurement.
+    ///
+    /// REST-AND-HOLD requote discipline (Fix 1): a resting leg is KEPT (so it
+    /// gains queue priority and the queue-capture measurement is meaningful)
+    /// unless `requote_due` says otherwise: it has aged past `min_requote_age_ms`
+    /// AND the target touch has moved >= `requote_min_ticks` from the resting
+    /// price (legitimate chase), OR the resting price would now CROSS / is off-book
+    /// (reprice immediately for safety), OR the leg is pulled (`want=None`). When a
+    /// leg is KEPT we emit nothing and do NOT touch its `submit_ms`, so age accrues
+    /// and time-to-fill stays honest.
     fn manage_paper_legs(
         &mut self,
         market_id: &MarketId,
         yes_book: &BookState,
         bid_price: Option<f64>,
         ask_price: Option<f64>,
+        pos: PairedPosition,
         now_ms: u64,
         submit_intents: &mut Vec<OrderIntent>,
         cancel_ids: &mut Vec<ClientOrderId>,
@@ -875,30 +902,53 @@ impl PairedMmLiveShadow {
         let max_order = self.max_order_notional_usd;
         let max_market = self.max_market_notional_usd;
         let max_gross = self.max_gross_resting_usd;
-        // Gross resting notional already committed by THIS market's other legs
-        // (computed up-front so each leg sees the headroom left by the other).
-        let market_submitted_before = *self
-            .submitted_notional_by_market
-            .get(market_id.as_str())
-            .unwrap_or(&0.0);
+        let min_requote_age_ms = self.min_requote_age_ms;
+        let requote_min_ticks = self.requote_min_ticks;
+        // Per-market NET-inventory notional already at risk (Fix 2): matched pairs
+        // are riskless and do NOT consume the cap; only the unpaired/net residual
+        // does. The net YES-equiv position is yes_shares - no_shares; its risk is
+        // marked at the current YES mid (NO residual exposure is symmetric at
+        // 1 - mid, same magnitude). New legs that would GROW this net exposure are
+        // bounded by the remaining headroom; legs that shrink it (re-pairing) are
+        // not (handled by the strict-pairing repair gate upstream).
+        let yes_mid = if yes_book.best_bid > 0.0 && yes_book.best_ask > 0.0 {
+            (0.5 * (yes_book.best_bid + yes_book.best_ask)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let net_inventory_notional = pos.skew().abs() * yes_mid;
 
         let Some(active) = self.active.as_mut() else { return };
         let yes_token = InstrumentId::from(active.yes_asset_id.as_str());
         let no_token = active.no_asset_id.as_ref().map(|id| InstrumentId::from(id.as_str()));
 
-        // Gross resting notional of legs we are KEEPING this tick (unchanged
-        // legs that do not replace). New posts must fit under max_gross alongside
-        // them. Computed before we mutate the legs.
-        let mut accumulated_market_notional = market_submitted_before;
+        // Headroom each leg sees: the per-market cap bounds NET inventory, so it is
+        // measured against the (riskful) net position, NOT a cumulative submitted
+        // counter. The gross-resting cap still bounds simultaneous resting notional;
+        // accumulate it across this tick's legs so the second leg sees the first.
+        let mut gross_resting_accum = 0.0;
 
         // YES-bid leg (BUY YES @ best_bid). Queue ahead = resting best_bid_size.
         let want_bid = bid_price.filter(|p| p.is_finite() && *p > 0.0);
         let bid_ahead = yes_book.best_bid_size.max(0.0);
+        let bid_keep = match (want_bid, &active.bid_leg) {
+            (Some(target), Some(existing)) => !Self::requote_due(
+                existing,
+                target,
+                yes_book,
+                now_ms,
+                min_requote_age_ms,
+                requote_min_ticks,
+            ),
+            _ => false,
+        };
         match (want_bid, active.bid_leg.clone()) {
-            (Some(price), Some(existing)) if (existing.price - price).abs() <= 1e-9 => {
-                // Unchanged: keep the resting quote. Its notional is already
-                // counted in submitted_notional_by_market; do not double-count it
-                // against this tick's added notional.
+            _ if bid_keep => {
+                // KEEP: hold queue priority. Count its resting notional against the
+                // gross cap (do not reset submit_ms; age must accrue).
+                if let Some(existing) = active.bid_leg.as_ref() {
+                    gross_resting_accum += existing.price * existing.clip;
+                }
             }
             (Some(price), existing) => {
                 if let Some(existing) = existing {
@@ -906,7 +956,7 @@ impl PairedMmLiveShadow {
                 }
                 let leg_clip = Self::bound_clip_to_caps(
                     live_armed, clip, price, max_order, max_market, max_gross,
-                    accumulated_market_notional,
+                    net_inventory_notional, gross_resting_accum,
                 );
                 if leg_clip > 1e-9 {
                     active.quote_seq += 1;
@@ -922,7 +972,7 @@ impl PairedMmLiveShadow {
                         clip: leg_clip,
                         filled_so_far: 0.0,
                     });
-                    accumulated_market_notional += price * leg_clip;
+                    gross_resting_accum += price * leg_clip;
                     submit_intents.push(intent);
                 } else {
                     active.bid_leg = None;
@@ -943,15 +993,30 @@ impl PairedMmLiveShadow {
             .filter(|p| p.is_finite() && *p > 0.0);
         let no_ahead = yes_book.best_ask_size.max(0.0);
         if let Some(no_token) = no_token {
+            let no_keep = match (want_no_price, &active.no_leg) {
+                (Some(target), Some(existing)) => !Self::requote_due(
+                    existing,
+                    target,
+                    yes_book,
+                    now_ms,
+                    min_requote_age_ms,
+                    requote_min_ticks,
+                ),
+                _ => false,
+            };
             match (want_no_price, active.no_leg.clone()) {
-                (Some(price), Some(existing)) if (existing.price - price).abs() <= 1e-9 => {}
+                _ if no_keep => {
+                    if let Some(existing) = active.no_leg.as_ref() {
+                        gross_resting_accum += existing.price * existing.clip;
+                    }
+                }
                 (Some(price), existing) => {
                     if let Some(existing) = existing {
                         cancel_ids.push(existing.client_order_id);
                     }
                     let leg_clip = Self::bound_clip_to_caps(
                         live_armed, clip, price, max_order, max_market, max_gross,
-                        accumulated_market_notional,
+                        net_inventory_notional, gross_resting_accum,
                     );
                     if leg_clip > 1e-9 {
                         active.quote_seq += 1;
@@ -967,7 +1032,7 @@ impl PairedMmLiveShadow {
                             clip: leg_clip,
                             filled_so_far: 0.0,
                         });
-                        accumulated_market_notional += price * leg_clip;
+                        gross_resting_accum += price * leg_clip;
                         submit_intents.push(intent);
                     } else {
                         active.no_leg = None;
@@ -982,26 +1047,60 @@ impl PairedMmLiveShadow {
         } else if let Some(existing) = active.no_leg.take() {
             cancel_ids.push(existing.client_order_id);
         }
+        let _ = gross_resting_accum;
+    }
 
-        // On the live arm, accumulate the new submitted notional against the
-        // per-market cap so it bounds cumulative inventory across the window.
-        if live_armed {
-            let added = accumulated_market_notional - market_submitted_before;
-            if added > 0.0 {
-                *self
-                    .submitted_notional_by_market
-                    .entry(market_id.as_str().to_string())
-                    .or_insert(0.0) += added;
-            }
+    /// Rest-and-hold requote predicate (Fix 1). Returns true when the resting
+    /// `leg` should be cancelled/replaced toward `target`; false to KEEP it (hold
+    /// queue priority).
+    ///
+    /// Reprice when EITHER:
+    ///   (a) WOULD-CROSS / off-book: the resting price is no longer a valid passive
+    ///       maker quote against the LIVE book. The YES-bid leg crosses when its
+    ///       price is at-or-above best_ask. The NO-bid leg rests at 1 - yes_ask on
+    ///       the NO token, whose ask mirrors to 1 - yes_bid; it crosses when its
+    ///       price >= 1 - yes_bid (equivalently 1 - price <= yes_bid). Either fires
+    ///       regardless of age, for safety. (A merely stale price that dropped
+    ///       below where we rest is NOT a cross: a passive bid sitting above the
+    ///       new touch is still passive, just stale, and is handled by (b).); OR
+    ///   (b) STALE-AND-MOVED: aged >= `min_requote_age_ms` AND the target touch has
+    ///       moved >= `requote_min_ticks` from the resting price (a legitimate
+    ///       chase). Below either threshold we KEEP and accrue queue priority.
+    fn requote_due(
+        leg: &RestingLeg,
+        target: f64,
+        yes_book: &BookState,
+        now_ms: u64,
+        min_requote_age_ms: u64,
+        requote_min_ticks: f64,
+    ) -> bool {
+        // (a) Would-cross against the live book, leg-specific. Fires at any age.
+        let crosses = match leg.leg {
+            "bidyes" => yes_book.best_ask > 0.0 && leg.price >= yes_book.best_ask - 1e-9,
+            "buyno" => yes_book.best_bid > 0.0 && leg.price >= (1.0 - yes_book.best_bid) - 1e-9,
+            _ => false,
+        };
+        if crosses {
+            return true;
         }
+        let moved = (target - leg.price).abs();
+        if moved <= 1e-9 {
+            return false; // exactly at target: keep
+        }
+        // (b) Stale-and-moved: only chase once aged out AND the touch moved enough.
+        let aged = now_ms.saturating_sub(leg.submit_ms) >= min_requote_age_ms;
+        aged && moved >= requote_min_ticks - 1e-9
     }
 
     /// Bound a maker leg's clip (share count) to the TINY live caps. On the paper/
     /// shadow path (`live_armed=false`) the full clip rests (byte-identical to
     /// INC2). On the live arm the clip is clipped so that price*clip fits the
-    /// per-order cap, the remaining per-market headroom, AND the remaining gross
-    /// resting headroom; returns 0 (drop the leg) if no positive size fits or the
-    /// price is non-positive. Rounded down to 2dp to match the wire boundary.
+    /// per-order cap, the remaining per-market NET-INVENTORY headroom
+    /// (`max_market - net_inventory_notional`, Fix 2: bounds money at risk, not
+    /// cumulative submits), AND the remaining gross resting headroom
+    /// (`max_gross - gross_resting_already`); returns 0 (drop the leg) if no
+    /// positive size fits or the price is non-positive. Rounded down to 2dp to
+    /// match the wire boundary.
     fn bound_clip_to_caps(
         live_armed: bool,
         clip: f64,
@@ -1009,7 +1108,8 @@ impl PairedMmLiveShadow {
         max_order: f64,
         max_market: f64,
         max_gross: f64,
-        market_already: f64,
+        net_inventory_notional: f64,
+        gross_resting_already: f64,
     ) -> f64 {
         if !live_armed {
             return clip;
@@ -1017,8 +1117,8 @@ impl PairedMmLiveShadow {
         if !(price > 0.0) {
             return 0.0;
         }
-        let market_headroom = (max_market - market_already).max(0.0);
-        let gross_headroom = (max_gross - market_already).max(0.0);
+        let market_headroom = (max_market - net_inventory_notional).max(0.0);
+        let gross_headroom = (max_gross - gross_resting_already).max(0.0);
         let allowed_notional = max_order.min(market_headroom).min(gross_headroom);
         if allowed_notional <= 0.0 {
             return 0.0;
@@ -1413,7 +1513,6 @@ mod tests {
             max_order_notional_usd: 0.0,
             max_market_notional_usd: 0.0,
             max_gross_resting_usd: 0.0,
-            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1423,6 +1522,8 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
+            requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         };
@@ -1456,7 +1557,6 @@ mod tests {
             max_order_notional_usd: 0.0,
             max_market_notional_usd: 0.0,
             max_gross_resting_usd: 0.0,
-            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1466,6 +1566,8 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
+            requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         };
@@ -1497,7 +1599,6 @@ mod tests {
             max_order_notional_usd: 0.0,
             max_market_notional_usd: 0.0,
             max_gross_resting_usd: 0.0,
-            submitted_notional_by_market: HashMap::new(),
             clip_shares: 10.0,
             rebate_on: false,
             mid_lo: REGIME_MID_LO,
@@ -1507,6 +1608,8 @@ mod tests {
             flip_min: REGIME_FLIP_MIN,
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
+            min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
+            requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         }
@@ -1664,6 +1767,7 @@ mod tests {
             &b,
             Some(0.49),
             Some(0.50),
+            PairedPosition::default(),
             1_000,
             &mut submits,
             &mut cancels,
@@ -1684,24 +1788,85 @@ mod tests {
         let mut mm = paper_shadow_with_market(Some("no"));
         let market = MarketId::from("m");
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
+        let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), 1_000, &mut submits, &mut cancels);
+        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
 
         // Same touch next tick: keep, no churn.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), 2_000, &mut submits, &mut cancels);
+        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
         assert!(submits.is_empty() && cancels.is_empty(), "unchanged touch must not churn");
 
-        // Touch moves on the bid leg: cancel old + submit new for that leg only.
+        // Touch moves on the bid leg by 1c but leg age (2_000-1_000=1_000ms) is
+        // below the 5s min-requote-age => REST-AND-HOLD keeps it (no churn). This
+        // is the whole point of Fix 1: hold queue priority instead of chasing
+        // every sub-5s tick.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), 3_000, &mut submits, &mut cancels);
-        assert_eq!(submits.len(), 1, "only the moved leg replaces");
+        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
+        assert!(
+            submits.is_empty() && cancels.is_empty(),
+            "young leg must HOLD even when the touch moved (rest-and-hold)"
+        );
+
+        // Now aged past 5s AND the touch moved >=1c: legitimate chase, reprice the
+        // bid leg only.
+        submits.clear();
+        cancels.clear();
+        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 6_500, &mut submits, &mut cancels);
+        assert_eq!(submits.len(), 1, "only the aged+moved leg replaces");
         assert_eq!(cancels.len(), 1, "old bid leg cancelled");
         assert!((submits[0].limit_price - 0.48).abs() < 1e-9);
+    }
+
+    #[test]
+    fn manage_paper_legs_holds_when_moved_below_min_ticks() {
+        // Aged out (>=5s) but the touch moved < min_ticks (default 1c): KEEP.
+        let mut mm = paper_shadow_with_market(Some("no"));
+        mm.requote_min_ticks = 0.02;
+        let market = MarketId::from("m");
+        let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
+        let pos = PairedPosition::default();
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        assert_eq!(submits.len(), 2);
+        // Aged 9s, but bid moved only 1c (< 2c min): hold.
+        submits.clear();
+        cancels.clear();
+        mm.manage_paper_legs(&market, &b, Some(0.48), Some(0.50), pos, 10_000, &mut submits, &mut cancels);
+        assert!(
+            submits.is_empty() && cancels.is_empty(),
+            "aged but sub-min-tick move must HOLD"
+        );
+    }
+
+    #[test]
+    fn manage_paper_legs_reprices_immediately_when_would_cross() {
+        // A resting YES bid that the book moved THROUGH (now at/above best_ask)
+        // would cross: reprice immediately regardless of age (safety), even though
+        // the leg is younger than min-requote-age.
+        let mut mm = paper_shadow_with_market(Some("no"));
+        let market = MarketId::from("m");
+        let b0 = book(0.49, 5.0, 0.50, 5.0, 0.49);
+        let pos = PairedPosition::default();
+        let mut submits = Vec::new();
+        let mut cancels = Vec::new();
+        mm.manage_paper_legs(&market, &b0, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        assert_eq!(submits.len(), 2);
+        // Market collapses: best_bid/ask drop to 0.47/0.48. Our resting YES bid at
+        // 0.49 is now >= best_ask (0.48) => would cross. Target bid is 0.47, only
+        // 200ms later (age 200ms << 5s) but must STILL reprice for safety.
+        let b1 = book(0.47, 5.0, 0.48, 5.0, 0.47);
+        submits.clear();
+        cancels.clear();
+        mm.manage_paper_legs(&market, &b1, Some(0.47), Some(0.48), pos, 1_200, &mut submits, &mut cancels);
+        let yes = submits.iter().find(|i| i.instrument_id.as_str() == "yes");
+        assert!(yes.is_some(), "crossing YES bid must reprice immediately despite young age");
+        assert!((yes.unwrap().limit_price - 0.47).abs() < 1e-9);
     }
 
     #[test]
@@ -1711,13 +1876,13 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), 1_000, &mut submits, &mut cancels);
+        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
         assert_eq!(submits.len(), 2);
 
         // Bid leg pulled (e.g. late-pull or repair skew) => cancel it, keep NO.
         submits.clear();
         cancels.clear();
-        mm.manage_paper_legs(&market, &b, None, Some(0.50), 2_000, &mut submits, &mut cancels);
+        mm.manage_paper_legs(&market, &b, None, Some(0.50), PairedPosition::default(), 2_000, &mut submits, &mut cancels);
         assert!(submits.is_empty(), "no new posts when pulling");
         assert_eq!(cancels.len(), 1, "pulled bid leg cancelled");
         assert!(mm.active.as_ref().unwrap().bid_leg.is_none());
@@ -1731,7 +1896,7 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), 1_000, &mut submits, &mut cancels);
+        mm.manage_paper_legs(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
         cancels.clear();
         mm.drain_resting_legs(&mut cancels);
         assert_eq!(cancels.len(), 2, "both resting legs pulled on drain");
@@ -1751,6 +1916,7 @@ mod tests {
             &b,
             Some(0.49),
             Some(0.50),
+            PairedPosition::default(),
             1_000,
             &mut submits,
             &mut cancels,
@@ -1856,6 +2022,7 @@ mod tests {
             &b,
             Some(0.49),
             Some(0.50),
+            PairedPosition::default(),
             1_000,
             &mut submits,
             &mut cancels,
@@ -1886,6 +2053,7 @@ mod tests {
             &b,
             Some(0.50),
             Some(0.50),
+            PairedPosition::default(),
             1_000,
             &mut submits,
             &mut cancels,
@@ -1897,22 +2065,20 @@ mod tests {
                 intent.notional_usd()
             );
         }
-        // Per-market cumulative accounting accrued.
-        let acc = *mm
-            .submitted_notional_by_market
-            .get("m")
-            .unwrap_or(&0.0);
-        assert!(acc > 0.0, "per-market submitted notional must accumulate");
+        assert!(!submits.is_empty(), "legs should rest with ample headroom");
     }
 
     #[test]
-    fn live_per_market_cap_refuses_further_orders() {
-        // Per-market cap fully consumed already => zero headroom => no legs rest.
+    fn live_per_market_cap_bounds_net_inventory_not_cumulative_submits() {
+        // Fix 2: the per-market cap bounds NET inventory at risk, NOT cumulative
+        // submitted notional. A market with a NET skew already past the cap (50 YES
+        // shares, 0 NO @ mid ~0.495 => ~$24.75 at risk > $20 cap) leaves zero
+        // headroom => no fresh legs rest. The cap is driven by `pos`, never by a
+        // monotonic submitted counter (which no longer exists).
         let mut mm = live_shadow_with_market(Some("no"));
         mm.max_market_notional_usd = 20.0;
-        mm.max_gross_resting_usd = 20.0;
-        mm.submitted_notional_by_market
-            .insert("m".to_string(), 20.0);
+        mm.max_gross_resting_usd = 100.0;
+        let pos = PairedPosition { yes_shares: 50.0, no_shares: 0.0 };
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
@@ -1921,11 +2087,32 @@ mod tests {
             &b,
             Some(0.49),
             Some(0.50),
+            pos,
             1_000,
             &mut submits,
             &mut cancels,
         );
-        assert!(submits.is_empty(), "no orders rest once the market cap is hit");
+        assert!(submits.is_empty(), "near-cap net inventory => no fresh legs");
+
+        // Matched pairs are riskless and must NOT consume the cap: 40 YES + 40 NO
+        // (net skew 0) leaves the full cap free, so legs rest again.
+        let paired = PairedPosition { yes_shares: 40.0, no_shares: 40.0 };
+        submits.clear();
+        cancels.clear();
+        mm.manage_paper_legs(
+            &MarketId::from("m"),
+            &b,
+            Some(0.49),
+            Some(0.50),
+            paired,
+            2_000,
+            &mut submits,
+            &mut cancels,
+        );
+        assert!(
+            !submits.is_empty(),
+            "matched pairs are riskless and must not consume the net-inventory cap"
+        );
     }
 
     #[test]
