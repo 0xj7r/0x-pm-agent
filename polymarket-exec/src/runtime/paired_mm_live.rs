@@ -190,6 +190,15 @@ pub struct PairedMmLiveShadow {
     active: Option<ActiveMarket>,
     clip_shares: f64,
     rebate_on: bool,
+    /// Regime-gate thresholds + residual cap, env-overridable (defaults transcribed
+    /// from the validated config). Set the per-gate sentinels to disable a gate.
+    mid_lo: f64,
+    mid_hi: f64,
+    range_max: f64,
+    spot_vol_max: f64,
+    flip_min: f64,
+    late_pull_secs: f64,
+    repair_delta: f64,
     /// Self-contained trailing spot tape for the regime gate.
     spot: VecDeque<SpotSample>,
     /// One-shot guard so the "br2 owns this market" disjoint note logs sparingly.
@@ -205,24 +214,52 @@ impl PairedMmLiveShadow {
     ///   - `PM_BTC_5M_PAIRED_MM_CLIP_SHARES` (f64 > 0): touch clip size; default 10.
     ///   - `PM_BTC_5M_PAIRED_MM_REBATE` (truthy): include the maker rebate in the
     ///     simulated PnL (the backtest is positive at rebate=0; rebate is upside).
+    ///
+    /// The regime gates + residual cap are ALSO env-overridable (defaults are the
+    /// validated config, so unset == byte-identical). Each gate is independently
+    /// disable-able by setting its sentinel:
+    ///   - `PM_BTC_5M_PAIRED_MM_RANGE_MAX` (f64 >= 0; default 0.06): YES mid
+    ///     range-so-far cap. Set >= 1.0 to disable (range can never exceed 1).
+    ///   - `PM_BTC_5M_PAIRED_MM_MID_LO` / `_MID_HI` (f64 in [0,1]; default 0.30 /
+    ///     0.70): mid band. Set 0.0 / 1.0 to disable.
+    ///   - `PM_BTC_5M_PAIRED_MM_VOL_MAX` (f64 >= 0; default 0.00012): spot-vol cap.
+    ///     Set huge (e.g. 1e9) to disable.
+    ///   - `PM_BTC_5M_PAIRED_MM_FLIP_MIN` (f64 >= 0; default 0.20): min sign-flip
+    ///     fraction. Set 0.0 to disable.
+    ///   - `PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES` (f64 > 0; default 2.0): the
+    ///     hard repair-band share cap on |yes_long - no_long|.
+    ///   - `PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_FRAC` (f64 >= 0; default 0.05): logged
+    ///     target residual fraction.
+    ///   - `PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS` (f64 >= 0; default 45): pull both
+    ///     legs in the last N seconds.
     pub fn from_env() -> Option<Self> {
         if !env_truthy("PM_BTC_5M_PAIRED_MM_SHADOW") {
             return None;
         }
         let clip_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_CLIP_SHARES").unwrap_or(DEFAULT_CLIP_SHARES);
         let rebate_on = env_truthy("PM_BTC_5M_PAIRED_MM_REBATE");
+        let mid_lo = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MID_LO").unwrap_or(REGIME_MID_LO);
+        let mid_hi = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MID_HI").unwrap_or(REGIME_MID_HI);
+        let range_max = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RANGE_MAX").unwrap_or(REGIME_RANGE_MAX);
+        let spot_vol_max = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_VOL_MAX").unwrap_or(REGIME_SPOT_VOL_MAX);
+        let flip_min = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_FLIP_MIN").unwrap_or(REGIME_FLIP_MIN);
+        let late_pull_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS").unwrap_or(LATE_PULL_SECS);
+        let repair_delta =
+            env_positive_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES").unwrap_or(REPAIR_DELTA_SHARES);
+        let residual_cap_frac =
+            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_FRAC").unwrap_or(RESIDUAL_CAP_FRAC);
         info!(
             target: "paired_mm",
             clip_shares,
             rebate_on,
-            mid_lo = REGIME_MID_LO,
-            mid_hi = REGIME_MID_HI,
-            range_max = REGIME_RANGE_MAX,
-            spot_vol_max = REGIME_SPOT_VOL_MAX,
-            flip_min = REGIME_FLIP_MIN,
-            late_pull_secs = LATE_PULL_SECS,
-            repair_delta = REPAIR_DELTA_SHARES,
-            residual_cap_frac = RESIDUAL_CAP_FRAC,
+            mid_lo,
+            mid_hi,
+            range_max,
+            spot_vol_max,
+            flip_min,
+            late_pull_secs,
+            repair_delta,
+            residual_cap_frac,
             "PAIRED-MM SHADOW overlay enabled (logging only; submits nothing). \
              Quotes only when br2 is NOT quoting the market (regime-disjoint)."
         );
@@ -230,6 +267,13 @@ impl PairedMmLiveShadow {
             active: None,
             clip_shares,
             rebate_on,
+            mid_lo,
+            mid_hi,
+            range_max,
+            spot_vol_max,
+            flip_min,
+            late_pull_secs,
+            repair_delta,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         })
@@ -375,16 +419,16 @@ impl PairedMmLiveShadow {
         let warmup_ok = self.spot_history_secs(now_ms) >= REGIME_WARMUP_SECS;
         let in_window = (ACTIVE_WIN_SECS - secs_to_close.max(0.0)) >= 0.0
             && secs_to_close <= ACTIVE_WIN_SECS;
-        let mid_ok = (REGIME_MID_LO..=REGIME_MID_HI).contains(&yes_mid);
+        let mid_ok = (self.mid_lo..=self.mid_hi).contains(&yes_mid);
         let range = if mid_max.is_finite() && mid_min.is_finite() {
             mid_max - mid_min
         } else {
             0.0
         };
-        let range_ok = range <= REGIME_RANGE_MAX;
+        let range_ok = range <= self.range_max;
         let (vol, flips) = self.spot_metrics(now_ms);
-        let vol_ok = vol <= REGIME_SPOT_VOL_MAX;
-        let flip_ok = flips >= REGIME_FLIP_MIN;
+        let vol_ok = vol <= self.spot_vol_max;
+        let flip_ok = flips >= self.flip_min;
 
         let regime_ok = warmup_ok && in_window && mid_ok && range_ok && vol_ok && flip_ok;
         if !regime_ok {
@@ -413,7 +457,7 @@ impl PairedMmLiveShadow {
         let mut ask_live = true; // resting YES ask (we sell YES == buy NO)
 
         // Late-window pull: pull both.
-        if secs_to_close <= LATE_PULL_SECS {
+        if secs_to_close <= self.late_pull_secs {
             bid_live = false;
             ask_live = false;
         }
@@ -422,9 +466,9 @@ impl PairedMmLiveShadow {
         // the band, stop adding to the leading leg and only quote the missing
         // side to re-pair. This is the structural residual cap, NOT a trade-out.
         let skew = self.active.as_ref().map(|a| a.inventory.skew()).unwrap_or(0.0);
-        if skew > REPAIR_DELTA_SHARES {
+        if skew > self.repair_delta {
             bid_live = false;
-        } else if skew < -REPAIR_DELTA_SHARES {
+        } else if skew < -self.repair_delta {
             ask_live = false;
         }
 
@@ -476,6 +520,7 @@ impl PairedMmLiveShadow {
         }
 
         let clip = self.clip_shares;
+        let repair_delta = self.repair_delta;
         let Some(active) = self.active.as_mut() else { return };
         let inv = &mut active.inventory;
 
@@ -486,7 +531,7 @@ impl PairedMmLiveShadow {
             let frac = clip / (clip + ahead);
             let mut qty = clip * frac;
             // Don't let this fill push yes ahead of no past the repair band.
-            qty = qty.min((inv.no_long + REPAIR_DELTA_SHARES - inv.yes_long).max(0.0));
+            qty = qty.min((inv.no_long + repair_delta - inv.yes_long).max(0.0));
             if qty > 1e-9 {
                 inv.yes_long += qty;
                 inv.yes_long_cost += qty * yes_book.best_bid;
@@ -503,7 +548,7 @@ impl PairedMmLiveShadow {
             let ahead = yes_book.best_ask_size.max(0.0);
             let frac = clip / (clip + ahead);
             let mut qty = clip * frac;
-            qty = qty.min((inv.yes_long + REPAIR_DELTA_SHARES - inv.no_long).max(0.0));
+            qty = qty.min((inv.yes_long + repair_delta - inv.no_long).max(0.0));
             if qty > 1e-9 {
                 let no_price = 1.0 - yes_book.best_ask;
                 inv.no_long += qty;
@@ -628,6 +673,16 @@ fn env_positive_f64(name: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v > 0.0)
 }
 
+/// Parse an env var as a finite, non-negative f64. Returns `None` if unset,
+/// unparseable, NaN/inf, or negative. Used for the regime-gate threshold
+/// overrides, where 0.0 is a valid disabling sentinel (e.g. mid_lo, flip_min).
+fn env_nonneg_f64(name: &str) -> Option<f64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +743,13 @@ mod tests {
             }),
             clip_shares: 10.0,
             rebate_on: false,
+            mid_lo: REGIME_MID_LO,
+            mid_hi: REGIME_MID_HI,
+            range_max: REGIME_RANGE_MAX,
+            spot_vol_max: REGIME_SPOT_VOL_MAX,
+            flip_min: REGIME_FLIP_MIN,
+            late_pull_secs: LATE_PULL_SECS,
+            repair_delta: REPAIR_DELTA_SHARES,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         };
@@ -714,6 +776,13 @@ mod tests {
             }),
             clip_shares: 10.0,
             rebate_on: false,
+            mid_lo: REGIME_MID_LO,
+            mid_hi: REGIME_MID_HI,
+            range_max: REGIME_RANGE_MAX,
+            spot_vol_max: REGIME_SPOT_VOL_MAX,
+            flip_min: REGIME_FLIP_MIN,
+            late_pull_secs: LATE_PULL_SECS,
+            repair_delta: REPAIR_DELTA_SHARES,
             spot: VecDeque::new(),
             disjoint_skip_markets: HashMap::new(),
         };
