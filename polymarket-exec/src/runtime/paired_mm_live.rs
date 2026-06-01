@@ -107,6 +107,10 @@ use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent};
 /// the accounting lane / MM gates never confuse it with another strategy's
 /// quotes, and so a reader can attribute paper fills to this overlay.
 const MM_QUOTE_TAG: &str = "pairedmm-maker";
+/// Tag for the ACTIVE-flatten taker: routed IOC (post_only=false) by the live
+/// submit path so it actually crosses the spread and reduces the stranded
+/// residual, instead of resting passively where it never fills.
+const MM_FLATTEN_TAG: &str = "pairedmm-flatten";
 
 /// Minimum spacing between paired-MM shadow decisions for one market. Mirrors
 /// br2's 1s book cadence so decisions are comparable and the log is not spammed
@@ -137,6 +141,11 @@ const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (
 // disables the policy entirely, so the residual handling is byte-identical to
 // the symmetric always-re-pair behavior (DEFAULT-OFF).
 const DEFAULT_UNDERDOG_HOLD_CAP_SHARES: f64 = 0.0;
+// Active-flatten: seconds a flatten-target residual must persist UNREDUCED (the
+// passive re-pair quote hasn't filled) before we pay the spread to exit it with a
+// taker. 0.0 (default) DISABLES active-flatten entirely: the residual is only ever
+// worked passively, exactly as before.
+const DEFAULT_ACTIVE_FLATTEN_SECS: f64 = 0.0;
 const TAKER_FEE_FRAC: f64 = 0.0156;
 const REBATE_FRAC: f64 = 0.20 * TAKER_FEE_FRAC; // maker rebate ~20% of taker fee, on notional
 
@@ -312,6 +321,14 @@ struct ActiveMarket {
     no_leg: Option<RestingLeg>,
     /// Monotonic counter for unique client_order_ids on this market.
     quote_seq: u64,
+    /// Active-flatten dwell tracker. `now_ms` at which a flatten-target residual on
+    /// the CURRENT `flatten_skew_sign` first appeared (and has not since cleared/
+    /// flipped). 0 = no flatten-target residual is currently being tracked. Used to
+    /// decide when a residual has persisted unreduced long enough to taker-flatten.
+    flatten_residual_since_ms: u64,
+    /// Sign of the residual currently being tracked for active-flatten (+1 long
+    /// YES, -1 long NO, 0 none). A sign flip resets the dwell timer.
+    flatten_skew_sign: i8,
 }
 
 /// The REAL runtime paper position for the active market, threaded into the
@@ -648,6 +665,20 @@ pub struct PairedMmLiveShadow {
     /// < 0.5) is HELD up to this cap instead of re-paired; the -EV FAVOURITE side
     /// is always flattened. Bounded on top by the existing net notional cap.
     underdog_hold_cap_shares: f64,
+    /// Active-flatten dwell (seconds). 0.0 (default) DISABLES active-flatten: a
+    /// flatten-target residual is only ever worked by the passive re-pair quote
+    /// (legacy behavior). When > 0, a residual the policy wants to FLATTEN
+    /// (favourite, or underdog-over-cap excess) that has persisted UNREDUCED for
+    /// >= this many seconds, OR while inside the late-pull window, is exited with a
+    /// marketable IOC taker (`pairedmm-flatten`) instead of riding to resolution.
+    active_flatten_secs: f64,
+    /// NO-CHASE-UP discipline (default ON). When true, a resting BUY leg is NEVER
+    /// repriced to a HIGHER price than where it already rests: if the touch rises,
+    /// we hold the deep passive bid (keeping queue priority) rather than chasing it
+    /// up and overpaying. The leg is still repriced DOWN (target below the resting
+    /// price) and is still cancelled/repriced immediately when it would CROSS the
+    /// book. Gated by `PM_BTC_5M_PAIRED_MM_NO_CHASE_UP`.
+    no_chase_up: bool,
     /// Polymarket venue minimum order size (shares). bound_clip_to_caps rounds a
     /// cap-shrunk positive leg UP to this when it still fits the hard bound, else
     /// drops it; it NEVER emits 0 < size < this (the venue rejects it). repair_delta
@@ -709,6 +740,14 @@ impl PairedMmLiveShadow {
     ///     target residual fraction.
     ///   - `PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS` (f64 >= 0; default 45): pull both
     ///     legs in the last N seconds.
+    ///   - `PM_BTC_5M_PAIRED_MM_ACTIVE_FLATTEN_SECS` (f64 >= 0; default 0 = OFF):
+    ///     when > 0, a residual the policy wants to FLATTEN (the -EV favourite, or
+    ///     the over-cap underdog excess) that has persisted UNREDUCED for >= this
+    ///     many seconds (the passive re-pair quote hasn't filled), OR while inside
+    ///     the late-pull window, is exited with a marketable IOC taker
+    ///     (`pairedmm-flatten`, post_only=false) bounded to the residual size and
+    ///     the >=5-share venue floor. +EV underdog holds within the cap are NEVER
+    ///     active-flattened. Requires a submission arm (paper or live).
     pub fn from_env(paper_mode: bool, live_kill_switch_path: Option<&Path>) -> Option<Self> {
         if !env_truthy("PM_BTC_5M_PAIRED_MM_SHADOW") {
             return None;
@@ -808,6 +847,11 @@ impl PairedMmLiveShadow {
         // DEFAULT-OFF: unset/0 => symmetric always-re-pair (byte-identical).
         let underdog_hold_cap_shares = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_UNDERDOG_HOLD_CAP_SHARES")
             .unwrap_or(DEFAULT_UNDERDOG_HOLD_CAP_SHARES);
+        // DEFAULT-OFF: unset/0 => no active-flatten (passive re-pair only).
+        let active_flatten_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_ACTIVE_FLATTEN_SECS")
+            .unwrap_or(DEFAULT_ACTIVE_FLATTEN_SECS);
+        // DEFAULT-ON: unset or anything not explicitly false => never chase a BUY up.
+        let no_chase_up = env_truthy_default_true("PM_BTC_5M_PAIRED_MM_NO_CHASE_UP");
         let residual_cap_frac =
             env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_FRAC").unwrap_or(RESIDUAL_CAP_FRAC);
         let min_requote_age_ms = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MIN_REQUOTE_AGE_MS")
@@ -827,6 +871,8 @@ impl PairedMmLiveShadow {
             late_pull_secs,
             repair_delta,
             underdog_hold_cap_shares,
+            active_flatten_secs,
+            no_chase_up,
             min_order_shares,
             residual_cap_frac,
             min_requote_age_ms,
@@ -851,6 +897,8 @@ impl PairedMmLiveShadow {
             late_pull_secs,
             repair_delta,
             underdog_hold_cap_shares,
+            active_flatten_secs,
+            no_chase_up,
             min_order_shares,
             min_requote_age_ms,
             requote_min_ticks,
@@ -988,6 +1036,8 @@ impl PairedMmLiveShadow {
                 bid_leg: None,
                 no_leg: None,
                 quote_seq: 0,
+                flatten_residual_since_ms: 0,
+                flatten_skew_sign: 0,
             });
         }
 
@@ -1139,6 +1189,25 @@ impl PairedMmLiveShadow {
         let bid_reduces_net = suppress_ask;
         let ask_reduces_net = suppress_bid;
 
+        // ACTIVE-FLATTEN (default-off; only when PM_BTC_5M_PAIRED_MM_ACTIVE_FLATTEN_SECS
+        // > 0 AND a submission arm is live). The passive re-pair quote above flattens
+        // a residual only when a taker happens to lift it; in a one-sided market that
+        // never fills and a -EV favourite residual rides to resolution. Here we cap
+        // that tail: a residual the policy wants to FLATTEN (favourite, or the
+        // over-cap underdog EXCESS — both surface as ResidualAction::Flatten) that
+        // has persisted UNREDUCED for >= active_flatten_secs, OR while we are inside
+        // the late-pull window, is exited with a marketable IOC taker. +EV underdog
+        // holds within the cap (HoldUnderdog / NoneAction) are NEVER touched.
+        let flatten_intent = self.maybe_active_flatten(
+            market_id,
+            yes_book,
+            yes_mid,
+            secs_to_close,
+            residual_action,
+            skew,
+            now_ms,
+        );
+
         let bid_price = bid_live.then_some(yes_book.best_bid);
         // The "ask" leg of the pair is acquired as a NO BUY at 1 - best_ask. We
         // surface the YES ask in the result for logging/parity with INC1.
@@ -1169,6 +1238,12 @@ impl PairedMmLiveShadow {
                 &mut post_events,
                 &mut cancel_events,
             );
+        }
+        // Append the active-flatten taker (if one was emitted this tick). It is a
+        // reduce-only Close IOC routed through the SAME tracked-submit path as the
+        // maker legs; the runner classifies its `pairedmm-flatten` tag as a taker.
+        if let Some(flatten) = flatten_intent {
+            submit_intents.push(flatten);
         }
         // Flush queue-modeling POST / CANCEL records (default-off; only when the
         // capture path is enabled). Done after manage_paper_legs returns so the
@@ -1494,6 +1569,7 @@ impl PairedMmLiveShadow {
         let max_gross = self.max_gross_resting_usd;
         let min_requote_age_ms = self.min_requote_age_ms;
         let requote_min_ticks = self.requote_min_ticks;
+        let no_chase_up = self.no_chase_up;
         // Per-market NET-inventory notional already at risk (Fix 2): matched pairs
         // are riskless and do NOT consume the cap; only the unpaired/net residual
         // does. The net YES-equiv position is yes_shares - no_shares; its risk is
@@ -1529,6 +1605,7 @@ impl PairedMmLiveShadow {
                 now_ms,
                 min_requote_age_ms,
                 requote_min_ticks,
+                no_chase_up,
             ),
             _ => false,
         };
@@ -1617,6 +1694,7 @@ impl PairedMmLiveShadow {
                     now_ms,
                     min_requote_age_ms,
                     requote_min_ticks,
+                    no_chase_up,
                 ),
                 _ => false,
             };
@@ -1724,8 +1802,11 @@ impl PairedMmLiveShadow {
         now_ms: u64,
         min_requote_age_ms: u64,
         requote_min_ticks: f64,
+        no_chase_up: bool,
     ) -> bool {
         // (a) Would-cross against the live book, leg-specific. Fires at any age.
+        // This ALWAYS reprices (or cancels) regardless of no-chase: a crossed
+        // resting price is a fill-against-us risk we never hold.
         let crosses = match leg.leg {
             "bidyes" => yes_book.best_ask > 0.0 && leg.price >= yes_book.best_ask - 1e-9,
             "buyno" => yes_book.best_bid > 0.0 && leg.price >= (1.0 - yes_book.best_bid) - 1e-9,
@@ -1738,7 +1819,15 @@ impl PairedMmLiveShadow {
         if moved <= 1e-9 {
             return false; // exactly at target: keep
         }
-        // (b) Stale-and-moved: only chase once aged out AND the touch moved enough.
+        // (b) NO-CHASE-UP: both legs are BUYs, so a target ABOVE the resting price
+        // is a chase up (paying more). When enabled we HOLD the deep passive bid
+        // (keep queue priority) and never reprice up; we still reprice DOWN (target
+        // below the resting price) below. The would-cross guard above already
+        // handles the only case where we must act on a rising touch.
+        if no_chase_up && target > leg.price + 1e-9 {
+            return false;
+        }
+        // (c) Stale-and-moved: only chase once aged out AND the touch moved enough.
         let aged = now_ms.saturating_sub(leg.submit_ms) >= min_requote_age_ms;
         aged && moved >= requote_min_ticks - 1e-9
     }
@@ -1948,6 +2037,147 @@ impl PairedMmLiveShadow {
         intent
     }
 
+    /// ACTIVE-FLATTEN (default-off). Decide whether to emit a marketable IOC taker
+    /// that reduces the stranded residual toward flat, and build it if so.
+    ///
+    /// Returns `None` (the legacy passive-only behavior, byte-identical) when:
+    ///   - `active_flatten_secs <= 0` (the feature is OFF), or
+    ///   - no submission arm is live (pure-shadow never submits), or
+    ///   - the residual policy is NOT flattening this residual
+    ///     (`residual_action != Flatten`): a +EV underdog HELD within its cap, or
+    ///     no residual past the band, is NEVER actively flattened, or
+    ///   - the residual is smaller than the venue minimum (`|skew| < 5`): we cannot
+    ///     emit a sub-minimum taker, so the remainder is left to the passive leg, or
+    ///   - the book has no usable opposite touch to cross.
+    ///
+    /// Dwell tracking: the per-market `flatten_residual_since_ms` / `flatten_skew_sign`
+    /// record when the CURRENT flatten-target residual first appeared. A sign flip or
+    /// a drop back inside the repair band resets the timer. We act only once the
+    /// residual has persisted UNREDUCED for `>= active_flatten_secs`, OR we are inside
+    /// the late-pull window (`secs_to_close <= late_pull_secs`) and must exit before
+    /// the toxic close regardless of dwell.
+    ///
+    /// Side/size: `skew > 0` (net long YES) => SELL YES at `best_bid` (cross down);
+    /// `skew < 0` (net long NO) => BUY YES at `best_ask` (cross up). Size is
+    /// `min(|skew|, clip_shares)` and never below the 5-share venue floor. The
+    /// intent is tagged `pairedmm-flatten` so the live submit path routes it as an
+    /// IOC taker (post_only=false), and `2dp`-rounded at the wire boundary by the
+    /// runner.
+    fn maybe_active_flatten(
+        &mut self,
+        market_id: &MarketId,
+        yes_book: &BookState,
+        yes_mid: f64,
+        secs_to_close: f64,
+        residual_action: ResidualAction,
+        skew: f64,
+        now_ms: u64,
+    ) -> Option<OrderIntent> {
+        // OFF unless explicitly enabled AND a submission arm is live.
+        if self.active_flatten_secs <= 0.0 || !self.submission_armed() {
+            // Keep the dwell tracker clean so flipping the feature on mid-market
+            // does not inherit a stale timer.
+            if let Some(active) = self.active.as_mut() {
+                active.flatten_residual_since_ms = 0;
+                active.flatten_skew_sign = 0;
+            }
+            return None;
+        }
+
+        let want_flatten = residual_action == ResidualAction::Flatten;
+        // +1 long YES, -1 long NO. Only meaningful past the band; the policy already
+        // collapsed within-band to NoneAction (no flatten target).
+        let sign: i8 = if skew > 0.0 { 1 } else if skew < 0.0 { -1 } else { 0 };
+
+        let active_flatten_secs = self.active_flatten_secs;
+        let late_pull_secs = self.late_pull_secs;
+        let clip = self.clip_shares;
+        let min_order_shares = self.min_order_shares;
+
+        let Some(active) = self.active.as_mut() else { return None };
+
+        // Maintain the dwell timer. The target persists only while the policy still
+        // wants to flatten AND the sign is unchanged; anything else resets it.
+        if !want_flatten || sign == 0 {
+            active.flatten_residual_since_ms = 0;
+            active.flatten_skew_sign = 0;
+            return None;
+        }
+        if active.flatten_skew_sign != sign || active.flatten_residual_since_ms == 0 {
+            active.flatten_residual_since_ms = now_ms;
+            active.flatten_skew_sign = sign;
+        }
+
+        let dwell_ms = now_ms.saturating_sub(active.flatten_residual_since_ms);
+        let dwell_secs = dwell_ms as f64 / 1000.0;
+        let late_window = secs_to_close <= late_pull_secs;
+        let triggered = dwell_secs + 1e-9 >= active_flatten_secs || late_window;
+        if !triggered {
+            return None;
+        }
+
+        // Size the taker to the residual, bounded by one clip, and never below the
+        // venue floor. A sub-minimum remainder is left to the passive leg.
+        let residual = skew.abs();
+        if residual + 1e-9 < min_order_shares {
+            return None;
+        }
+        let mut shares = residual.min(clip);
+        if shares + 1e-9 < min_order_shares {
+            // The clip would be below the floor: lift to the floor only when the
+            // residual itself covers it (checked above), so a single taker still
+            // reduces a real residual rather than emitting a rejected sub-min order.
+            shares = min_order_shares;
+        }
+        // Never overshoot the residual into the opposite direction.
+        shares = shares.min(residual);
+        if shares + 1e-9 < min_order_shares {
+            return None;
+        }
+
+        // Marketable cross: sell into the bid (long YES) or buy the ask (long NO).
+        let yes_token = InstrumentId::from(active.yes_asset_id.as_str());
+        active.quote_seq += 1;
+        let seq = active.quote_seq;
+
+        let coid = ClientOrderId::from(format!(
+            "pairedmm-flatten:{}:{}:{}",
+            market_id.as_str(),
+            seq,
+            now_ms
+        ));
+        let reason = format!("paired-mm:{MM_FLATTEN_TAG}");
+
+        let mut intent = if sign > 0 {
+            // Long YES: SELL YES, marketable at the bid.
+            let price = if yes_book.best_bid > 0.0 { yes_book.best_bid } else { yes_mid };
+            OrderIntent::new_sell(coid, market_id.clone(), yes_token, price.clamp(0.0, 1.0), shares, reason, now_ms)
+        } else {
+            // Long NO: BUY YES, marketable at the ask.
+            let price = if yes_book.best_ask > 0.0 { yes_book.best_ask } else { yes_mid };
+            OrderIntent::new_buy(coid, market_id.clone(), yes_token, price.clamp(0.0, 1.0), shares, reason, now_ms)
+        };
+        intent.quote_level_tag = Some(MM_FLATTEN_TAG.to_string());
+        // Reduce-only either way: this taker only ever pairs the residual DOWN.
+        intent.reduce_only = true;
+        intent.kind = crate::types::IntentKind::Close;
+
+        info!(
+            target: "paired_mm",
+            market = %market_id,
+            secs_to_close,
+            skew,
+            residual,
+            flatten_shares = shares,
+            dwell_secs,
+            late_window,
+            side = if sign > 0 { "sell_yes" } else { "buy_yes" },
+            "PAIRED-MM ACTIVE-FLATTEN taker (IOC, pairedmm-flatten)"
+        );
+
+        Some(intent)
+    }
+
     /// Deterministic-ish unique client_order_id for a resting leg.
     fn leg_coid(market_id: &MarketId, leg: &str, seq: u64, now_ms: u64) -> ClientOrderId {
         ClientOrderId::from(format!(
@@ -2141,6 +2371,17 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Parse a boolean env var that DEFAULTS TO TRUE: unset (or any value that is not
+/// explicitly false) => true; only `false`/`0`/`no` (case-insensitive) => false.
+/// Used for safety toggles like no-chase-up that should be on unless deliberately
+/// disabled.
+fn env_truthy_default_true(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+        .unwrap_or(true)
+}
+
 fn env_positive_f64(name: &str) -> Option<f64> {
     std::env::var(name)
         .ok()
@@ -2253,6 +2494,8 @@ mod tests {
                 bid_leg: None,
                 no_leg: None,
                 quote_seq: 0,
+                flatten_residual_since_ms: 0,
+                flatten_skew_sign: 0,
             }),
             paper_trade_armed: false,
             live_trade_armed: false,
@@ -2269,6 +2512,8 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            active_flatten_secs: DEFAULT_ACTIVE_FLATTEN_SECS,
+            no_chase_up: true,
             min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
@@ -2300,6 +2545,8 @@ mod tests {
                 bid_leg: None,
                 no_leg: None,
                 quote_seq: 0,
+                flatten_residual_since_ms: 0,
+                flatten_skew_sign: 0,
             }),
             paper_trade_armed: false,
             live_trade_armed: false,
@@ -2316,6 +2563,8 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            active_flatten_secs: DEFAULT_ACTIVE_FLATTEN_SECS,
+            no_chase_up: true,
             min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
@@ -2345,6 +2594,8 @@ mod tests {
                 bid_leg: None,
                 no_leg: None,
                 quote_seq: 0,
+                flatten_residual_since_ms: 0,
+                flatten_skew_sign: 0,
             }),
             paper_trade_armed: false,
             live_trade_armed: false,
@@ -2361,6 +2612,8 @@ mod tests {
             late_pull_secs: LATE_PULL_SECS,
             repair_delta: REPAIR_DELTA_SHARES,
             underdog_hold_cap_shares: DEFAULT_UNDERDOG_HOLD_CAP_SHARES,
+            active_flatten_secs: DEFAULT_ACTIVE_FLATTEN_SECS,
+            no_chase_up: true,
             min_order_shares: DEFAULT_MIN_ORDER_SHARES,
             min_requote_age_ms: DEFAULT_MIN_REQUOTE_AGE_MS,
             requote_min_ticks: DEFAULT_REQUOTE_MIN_TICKS,
@@ -3258,5 +3511,143 @@ mod tests {
         assert!((mm.min_order_shares - DEFAULT_MIN_ORDER_SHARES).abs() < 1e-9);
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_RESIDUAL_CAP_SHARES");
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
+    }
+
+    // --- ACTIVE-FLATTEN ---
+
+    /// A live-armed overlay with a YES token, used for active-flatten tests. The
+    /// caller sets `active_flatten_secs` per scenario; `no_chase_up` left default.
+    fn flatten_shadow(active_flatten_secs: f64) -> PairedMmLiveShadow {
+        let mut mm = live_shadow_with_market(Some("no"));
+        mm.active_flatten_secs = active_flatten_secs;
+        mm
+    }
+
+    #[test]
+    fn active_flatten_off_by_default_emits_no_taker() {
+        // active_flatten_secs == 0 (default) => never any IOC, even with a large,
+        // long-persisted favourite residual the policy wants to flatten.
+        let mut mm = flatten_shadow(0.0);
+        let b = book(0.60, 100.0, 0.62, 100.0, 0.61);
+        // Long YES favourite (priced > 0.5), residual 12 shares, way past the band.
+        let out = mm.maybe_active_flatten(
+            &MarketId::from("m"),
+            &b,
+            0.61,
+            120.0,
+            ResidualAction::Flatten,
+            12.0,
+            10_000,
+        );
+        assert!(out.is_none(), "active-flatten OFF must never emit a taker");
+    }
+
+    #[test]
+    fn active_flatten_on_persisted_favourite_emits_correct_side_and_size() {
+        // 30s dwell required. A long-YES favourite residual that has persisted
+        // unreduced past the dwell => SELL YES IOC bounded by the clip, >= floor.
+        let mut mm = flatten_shadow(30.0);
+        let market = MarketId::from("m");
+        let b = book(0.60, 100.0, 0.62, 100.0, 0.61);
+
+        // First sighting at t=10s (yes_mid 0.61, 120s to close => NOT late window):
+        // starts the dwell timer, no taker yet.
+        let first = mm.maybe_active_flatten(&market, &b, 0.61, 120.0, ResidualAction::Flatten, 12.0, 10_000);
+        assert!(first.is_none(), "no flatten before the dwell elapses");
+
+        // t=45s (35s later, >= 30s dwell), residual still long-YES favourite.
+        let out = mm
+            .maybe_active_flatten(&market, &b, 0.61, 120.0, ResidualAction::Flatten, 12.0, 45_000)
+            .expect("dwell elapsed => flatten taker");
+        assert_eq!(out.side, crate::types::TradeSide::Sell, "long YES => SELL YES");
+        assert_eq!(out.instrument_id.as_str(), "yes");
+        // Size = min(|skew|=12, clip=10) = 10, >= 5-share floor.
+        assert!((out.quantity - 10.0).abs() < 1e-9, "size bounded by clip, got {}", out.quantity);
+        assert!(out.quantity >= DEFAULT_MIN_ORDER_SHARES - 1e-9);
+        // Marketable at the bid (cross down), reduce-only, IOC-routing tag.
+        assert!((out.limit_price - 0.60).abs() < 1e-9, "SELL crosses at the bid");
+        assert!(out.reduce_only);
+        assert_eq!(out.quote_level_tag.as_deref(), Some(MM_FLATTEN_TAG));
+        assert_eq!(out.kind, crate::types::IntentKind::Close);
+    }
+
+    #[test]
+    fn active_flatten_long_no_buys_yes() {
+        // Long NO residual that wants flattening (e.g. over-cap excess) => BUY YES.
+        let mut mm = flatten_shadow(30.0);
+        let market = MarketId::from("m");
+        let b = book(0.38, 100.0, 0.40, 100.0, 0.39);
+        // skew < 0 (long NO); 10s to close (<= 45s late-pull) triggers regardless
+        // of dwell (yes_mid 0.39).
+        let out = mm
+            .maybe_active_flatten(&market, &b, 0.39, 10.0, ResidualAction::Flatten, -9.0, 5_000)
+            .expect("late-pull window triggers regardless of dwell");
+        assert_eq!(out.side, crate::types::TradeSide::Buy, "long NO => BUY YES");
+        assert_eq!(out.instrument_id.as_str(), "yes");
+        assert!((out.limit_price - 0.40).abs() < 1e-9, "BUY crosses at the ask");
+        // min(|skew|=9, clip=10)=9 shares.
+        assert!((out.quantity - 9.0).abs() < 1e-9, "got {}", out.quantity);
+    }
+
+    #[test]
+    fn active_flatten_never_touches_underdog_hold_or_submin() {
+        let mut mm = flatten_shadow(30.0);
+        let market = MarketId::from("m");
+        let b = book(0.38, 100.0, 0.40, 100.0, 0.39);
+
+        // HoldUnderdog (+EV held within cap) => NEVER flatten, even past dwell.
+        let held = mm.maybe_active_flatten(&market, &b, 120.0, 0.39, ResidualAction::HoldUnderdog, -9.0, 90_000);
+        assert!(held.is_none(), "a held +EV underdog within cap is never flattened");
+
+        // NoneAction (within band) => never flatten.
+        let none = mm.maybe_active_flatten(&market, &b, 120.0, 0.39, ResidualAction::NoneAction, 0.0, 90_000);
+        assert!(none.is_none(), "no residual => no flatten");
+
+        // Flatten target but a sub-minimum residual (|skew| < 5) => cannot emit.
+        let submin = mm.maybe_active_flatten(&market, &b, 5.0, 0.39, ResidualAction::Flatten, -3.0, 90_000);
+        assert!(submin.is_none(), "sub-5-share residual cannot be flattened");
+    }
+
+    #[test]
+    fn no_chase_up_holds_bid_when_touch_rises() {
+        // A resting BUY leg whose target rises (touch moved up) is HELD when
+        // no_chase_up is on: never repriced to a higher price. It IS repriced down,
+        // and ALWAYS repriced/cancelled when it would cross.
+        let leg = RestingLeg {
+            client_order_id: ClientOrderId::from("c"),
+            price: 0.49,
+            leg: "bidyes",
+            shares_ahead: 0.0,
+            submit_ms: 0,
+            clip: 10.0,
+            filled_so_far: 0.0,
+        };
+        // Touch rose: best_bid 0.51, target 0.51 (above resting 0.49), aged out.
+        let b = book(0.51, 50.0, 0.55, 50.0, 0.52);
+        let now = 1_000_000;
+
+        // no_chase_up ON => hold the deep bid (no requote up).
+        assert!(
+            !PairedMmLiveShadow::requote_due(&leg, 0.51, &b, now, 5_000, 0.01, true),
+            "no-chase-up must hold the resting bid when the touch rises"
+        );
+        // no_chase_up OFF => legacy chase up (aged + moved >= ticks).
+        assert!(
+            PairedMmLiveShadow::requote_due(&leg, 0.51, &b, now, 5_000, 0.01, false),
+            "with no-chase OFF the leg chases the touch up as before"
+        );
+        // Repricing DOWN is always allowed (target below resting price).
+        let down_book = book(0.45, 50.0, 0.55, 50.0, 0.46);
+        assert!(
+            PairedMmLiveShadow::requote_due(&leg, 0.45, &down_book, now, 5_000, 0.01, true),
+            "no-chase only blocks UP; repricing down must still fire"
+        );
+        // A would-CROSS resting price always reprices, even with no-chase on and a
+        // higher target (best_ask 0.49 means resting 0.49 crosses).
+        let cross_book = book(0.50, 50.0, 0.49, 50.0, 0.49);
+        assert!(
+            PairedMmLiveShadow::requote_due(&leg, 0.55, &cross_book, now, 5_000, 0.01, true),
+            "a crossed resting price must reprice/cancel regardless of no-chase"
+        );
     }
 }

@@ -3477,6 +3477,15 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("pairedmm-maker"));
+    // The calm-regime paired-MM ACTIVE-FLATTEN taker (`pairedmm-flatten`) is a
+    // marketable reduce-only IOC: it MUST cross the spread to pair the stranded
+    // residual down, so route it to the IOC/taker branch (never post_only). It
+    // already carries kind=Close, but tag it explicitly so the routing intent is
+    // legible and does not silently depend on the Close classification.
+    let is_paired_mm_flatten = intent
+        .quote_level_tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("pairedmm-flatten"));
     let is_late_fav_maker = intent
         .quote_level_tag
         .as_deref()
@@ -3491,14 +3500,16 @@ fn submit_request_from_intent(
                 && !is_br2_taker
                 && !is_late_bar_core
                 && !is_late_fav_maker
-                && !is_paired_mm_maker)
+                && !is_paired_mm_maker
+                && !is_paired_mm_flatten)
                 .then_some(observed_at_ms.saturating_add(execution_policy.live_order_ttl_ms))
         })
         .or_else(|| {
             (!execution_policy.paper_mode && is_late_bar_core)
                 .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
-    let (time_in_force, post_only) = if is_hedge_rescue || is_aggressive_late_fav || is_br2_taker {
+    let (time_in_force, post_only) =
+        if is_hedge_rescue || is_aggressive_late_fav || is_br2_taker || is_paired_mm_flatten {
         (TimeInForce::Ioc, false)
     } else if is_paired_mm_maker {
         // TINY-REAL paired-MM maker: resting post_only limit, GTC. post_only is
