@@ -295,6 +295,15 @@ impl BteLiveShadow {
                     now_ms,
                     tag_taker,
                 ) else {
+                    warn!(
+                        target: "bte_shadow",
+                        market = %market_id,
+                        market_u32 = order.market_id,
+                        side = ?order.side,
+                        has_no_token = no_token.is_some(),
+                        has_no_book = no_book.is_some(),
+                        "BTE-LIVE dropped shadow order during live-intent conversion"
+                    );
                     continue;
                 };
                 let intent = if self.live_trade_armed {
@@ -305,6 +314,16 @@ impl BteLiveShadow {
                 } else {
                     intent
                 };
+                info!(
+                    target: "bte_shadow",
+                    market = %market_id,
+                    client_order_id = %intent.client_order_id,
+                    side = ?intent.side,
+                    price = intent.limit_price,
+                    quantity = intent.quantity,
+                    notional_usd = intent.notional_usd(),
+                    "BTE-LIVE accepted live intent"
+                );
                 intents.push(intent);
             }
             intents
