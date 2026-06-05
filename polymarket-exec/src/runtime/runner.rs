@@ -1177,6 +1177,11 @@ async fn run_runtime_loop(
         config.paper_mode,
         config.live_kill_switch_path.as_deref(),
     );
+    let mut bte_shadow = crate::runtime::bte_live::BteLiveShadow::from_env(
+        config.paper_mode,
+        config.live_kill_switch_path.as_deref(),
+        config.strategy_profile.as_ref(),
+    );
     // Calm-regime PAIRED-MM overlay: OFF unless PM_BTC_5M_PAIRED_MM_SHADOW is
     // truthy. Shadow path decides + logs the two-sided touch quotes and a
     // simulated pairing/inventory/PnL and SUBMITS NOTHING. PAPER submission is
@@ -1226,6 +1231,24 @@ async fn run_runtime_loop(
             );
         }
     }
+    if let Some(shadow) = bte_shadow.as_ref() {
+        if shadow.live_trade_armed() {
+            warn!(
+                target: "bte_shadow",
+                "BTE live path enabled with REAL-MONEY submission armed. Real orders WILL be placed."
+            );
+        } else if shadow.paper_trade_armed() {
+            info!(
+                target: "bte_shadow",
+                "BTE live path enabled with PAPER submission armed (paper-fill sim only)"
+            );
+        } else {
+            info!(
+                target: "bte_shadow",
+                "BTE live shadow-decision path enabled (logging only; no submission)"
+            );
+        }
+    }
 
     loop {
         tokio::select! {
@@ -1243,6 +1266,14 @@ async fn run_runtime_loop(
                         runtime.on_btc_trade(event.price, ingested_at_ms);
                         metrics.observe_btc_regime(&runtime.btc_regime_snapshot(ingested_at_ms));
                         if let Some(shadow) = br2_shadow.as_mut() {
+                            shadow.on_spot_trade(
+                                event.price,
+                                event.quantity,
+                                event.observed_at_ms,
+                                event.is_buyer_maker,
+                            );
+                        }
+                        if let Some(shadow) = bte_shadow.as_mut() {
                             shadow.on_spot_trade(
                                 event.price,
                                 event.quantity,
@@ -1636,6 +1667,80 @@ async fn run_runtime_loop(
                                     br2_submit_intents = result.submit_intents;
                                 }
                             }
+                            let mut bte_submit_intents: Vec<OrderIntent> = Vec::new();
+                            if let Some(shadow) = bte_shadow.as_mut() {
+                                if let Some(record) = runtime.market_context_record(&market_id) {
+                                    let inventory = runtime.inventory();
+                                    let yes_shares = record
+                                        .instrument_ids
+                                        .first()
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let no_shares = record
+                                        .instrument_ids
+                                        .get(1)
+                                        .map(|id| {
+                                            inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let equity_usd =
+                                        inventory.total_cash_usd() + inventory.gross_exposure_usd();
+                                    let daily_loss_pct = if config.starting_cash_usd > 0.0 {
+                                        ((config.starting_cash_usd - equity_usd)
+                                            / config.starting_cash_usd)
+                                            .max(0.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let daily_loss_cap_pct =
+                                        if config.risk_limits.max_session_loss_bps > 0.0 {
+                                            config.risk_limits.max_session_loss_bps / 10_000.0
+                                        } else if config.risk_limits.max_session_loss_usd > 0.0
+                                            && config.starting_cash_usd > 0.0
+                                        {
+                                            config.risk_limits.max_session_loss_usd
+                                                / config.starting_cash_usd
+                                        } else {
+                                            1.0
+                                        };
+                                    let btc_regime = runtime.btc_regime_snapshot(now_unix_ms());
+                                    let pos =
+                                        crate::runtime::bte_shadow::BteDecisionPosition {
+                                            events_seen: 0,
+                                            yes_shares,
+                                            no_shares,
+                                            cash_usdc: inventory.free_cash_usd(),
+                                            btc_net_exposure_shares: yes_shares - no_shares,
+                                            eth_net_exposure_shares: 0.0,
+                                            daily_start_cash_usdc: config.starting_cash_usd,
+                                            daily_loss_cap_pct,
+                                            current_daily_loss_pct: daily_loss_pct,
+                                        };
+                                    let regime = crate::runtime::bte_shadow::BteRegimeInputs {
+                                        realized_vol_180s_bps: btc_regime
+                                            .realized_vol_5m_bps
+                                            .unwrap_or(0.0)
+                                            as f32,
+                                        ..crate::runtime::bte_shadow::BteRegimeInputs::default()
+                                    };
+                                    let no_book = match record.instrument_ids.get(1) {
+                                        Some(no_id) => books.snapshot(no_id.as_str()).await,
+                                        None => None,
+                                    };
+                                    let result = shadow.decide_tick(
+                                        &market_id,
+                                        &record,
+                                        &book,
+                                        pos,
+                                        regime,
+                                        no_book.as_ref(),
+                                        now_unix_ms(),
+                                    );
+                                    bte_submit_intents = result.submit_intents;
+                                }
+                            }
                             // Paired-MM overlay: logs the two-sided touch quotes +
                             // simulated pairing/PnL. On the PAPER arm (armed only
                             // when paper_mode), it also returns maker submit/cancel
@@ -1749,6 +1854,13 @@ async fn run_runtime_loop(
                             // (which requires paper_mode), so submission is
                             // impossible outside paper mode.
                             for intent in br2_submit_intents {
+                                outcome
+                                    .commands
+                                    .push(crate::types::RuntimeCommand::Submit(intent));
+                            }
+                            // BTE paper/live overlay submission: only non-empty
+                            // when explicitly armed by BTE-specific env gates.
+                            for intent in bte_submit_intents {
                                 outcome
                                     .commands
                                     .push(crate::types::RuntimeCommand::Submit(intent));
@@ -3453,14 +3565,12 @@ fn submit_request_from_intent(
         .quote_level_tag
         .as_deref()
         .is_some_and(|tag| tag.starts_with("mm-late-bar-core"));
-    // br2 is a marketable taker that sweeps to a limit: its intents MUST be IOC
-    // (immediate-or-cancel), never resting GTC and never post-only. The
-    // br2_live driver tags real-money br2 intents `br2-taker`; route them to the
-    // same IOC taker branch as the late-fav/cheap-tail takers below.
-    let is_br2_taker = intent
+    // Shared backtest takers sweep to a limit: their live intents MUST be IOC
+    // (immediate-or-cancel), never resting GTC and never post-only.
+    let is_shared_taker = intent
         .quote_level_tag
         .as_deref()
-        .is_some_and(|tag| tag.starts_with("br2-taker"));
+        .is_some_and(|tag| tag.starts_with("br2-taker") || tag.starts_with("bte-taker"));
     let is_aggressive_late_fav = intent.quote_level_tag.as_deref().is_some_and(|tag| {
         tag.starts_with("late-fav-taker")
             || tag.starts_with("cheap-tail-taker")
@@ -3497,7 +3607,7 @@ fn submit_request_from_intent(
                 && execution_policy.live_order_ttl_ms > 0
                 && !is_hedge_rescue
                 && !is_aggressive_late_fav
-                && !is_br2_taker
+                && !is_shared_taker
                 && !is_late_bar_core
                 && !is_late_fav_maker
                 && !is_paired_mm_maker
@@ -3509,28 +3619,28 @@ fn submit_request_from_intent(
                 .then_some(observed_at_ms.saturating_add(LATE_BAR_CORE_TTL_MS))
         });
     let (time_in_force, post_only) =
-        if is_hedge_rescue || is_aggressive_late_fav || is_br2_taker || is_paired_mm_flatten {
-        (TimeInForce::Ioc, false)
-    } else if is_paired_mm_maker {
-        // TINY-REAL paired-MM maker: resting post_only limit, GTC. post_only is
-        // forced true in LIVE (maker-only, reject/repost on cross) regardless of
-        // the global live_post_only flag; false in paper (sim guards crossing).
-        // The MM's own requote/cancel loop ages these out; the kill-switch
-        // cancels them via degrade_and_cancel_all (they are tracked orders).
-        (TimeInForce::Gtc, !execution_policy.paper_mode)
-    } else if is_late_bar_core {
-        (TimeInForce::Gtd, !execution_policy.paper_mode)
-    } else if live_expires_at_ms.is_some() {
-        (
-            TimeInForce::Gtd,
-            !execution_policy.paper_mode && execution_policy.live_post_only,
-        )
-    } else {
-        (
-            TimeInForce::Gtc,
-            !execution_policy.paper_mode && execution_policy.live_post_only,
-        )
-    };
+        if is_hedge_rescue || is_aggressive_late_fav || is_shared_taker || is_paired_mm_flatten {
+            (TimeInForce::Ioc, false)
+        } else if is_paired_mm_maker {
+            // TINY-REAL paired-MM maker: resting post_only limit, GTC. post_only is
+            // forced true in LIVE (maker-only, reject/repost on cross) regardless of
+            // the global live_post_only flag; false in paper (sim guards crossing).
+            // The MM's own requote/cancel loop ages these out; the kill-switch
+            // cancels them via degrade_and_cancel_all (they are tracked orders).
+            (TimeInForce::Gtc, !execution_policy.paper_mode)
+        } else if is_late_bar_core {
+            (TimeInForce::Gtd, !execution_policy.paper_mode)
+        } else if live_expires_at_ms.is_some() {
+            (
+                TimeInForce::Gtd,
+                !execution_policy.paper_mode && execution_policy.live_post_only,
+            )
+        } else {
+            (
+                TimeInForce::Gtc,
+                !execution_policy.paper_mode && execution_policy.live_post_only,
+            )
+        };
     // V2 SDK enforces strict decimal validation on order size: max 2 decimal
     // places. Strategy computes qty=clip_usd/price which produces values like
     // 9.0909090909 (15 decimals) that V1 silently accepted but V2 rejects with

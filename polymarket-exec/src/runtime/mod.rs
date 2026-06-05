@@ -5,6 +5,8 @@ mod audit;
 pub mod br2_live;
 pub mod br2_shadow;
 mod btc_signals;
+pub mod bte_live;
+pub mod bte_shadow;
 mod checkpoint;
 mod dashboard;
 mod execution_policy;

@@ -1682,6 +1682,28 @@ fn late_bar_core_submit_uses_gtd_with_60s_ttl_and_post_only() {
 }
 
 #[test]
+fn bte_taker_live_forces_ioc_and_non_post_only() {
+    let intent = OrderIntent {
+        client_order_id: ClientOrderId::from("bte-1-1000-buy-yes"),
+        market_id: MarketId::from("market-1"),
+        instrument_id: InstrumentId::from("token-1"),
+        side: TradeSide::Buy,
+        limit_price: 0.93,
+        quantity: 5.0,
+        reduce_only: false,
+        reason: "test bte taker".to_string(),
+        quote_level_tag: Some("bte-taker".to_string()),
+        created_at_ms: 10,
+        pair_id: None,
+        kind: crate::types::IntentKind::Entry,
+    };
+    let request = submit_request_from_intent(&intent, 1_000, &live_test_policy());
+    assert_eq!(request.time_in_force, TimeInForce::Ioc);
+    assert!(!request.post_only);
+    assert_eq!(request.expires_at_ms, None);
+}
+
+#[test]
 fn paired_mm_maker_live_forces_post_only_gtc_regardless_of_live_post_only() {
     // INC3: the pairedmm-maker tag MUST route to a post_only MAKER limit on the
     // live arm even when the global live_post_only flag is OFF, and must be GTC
@@ -1705,7 +1727,10 @@ fn paired_mm_maker_live_forces_post_only_gtc_regardless_of_live_post_only() {
         ..live_test_policy()
     };
     let request = submit_request_from_intent(&intent, 1_000, &policy);
-    assert!(request.post_only, "live maker MUST be post_only even when live_post_only=false");
+    assert!(
+        request.post_only,
+        "live maker MUST be post_only even when live_post_only=false"
+    );
     assert_eq!(request.time_in_force, TimeInForce::Gtc);
     assert_eq!(request.expires_at_ms, None, "maker quote is not TTL-aged");
 }

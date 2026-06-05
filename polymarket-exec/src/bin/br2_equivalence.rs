@@ -388,6 +388,7 @@ fn main() -> anyhow::Result<()> {
                 prior_market_range_7d: 0.0,
                 model_output: Some(ref_eval.output),
                 market_close_ns: spec.open_ns + MARKET_WINDOW_NS,
+                ..Ctx::default()
             };
             let ref_out: StrategyOutput =
                 ref_strategy.on_event(event, &ref_ctx, &spot_hist, &trades);

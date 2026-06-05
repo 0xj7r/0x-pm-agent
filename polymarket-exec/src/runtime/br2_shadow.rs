@@ -368,6 +368,7 @@ impl Br2ShadowAdapter {
             no_shares: 0.0,
             cash_usdc: self.cfg.bankroll_usdc,
             market_yes_range_so_far: yes_range_so_far,
+            regime_realized_vol_180s_bps: 0.0,
             // Prior-market ranges are portfolio-replay context. Live wiring should
             // supply trailing per-market YES-range means; 0.0 here keeps the
             // regime gate inert (it is disabled in the 062901 champion anyway).
@@ -376,6 +377,7 @@ impl Br2ShadowAdapter {
             prior_market_range_7d: 0.0,
             model_output: Some(model_eval.output),
             market_close_ns,
+            ..pm_strategy::Ctx::default()
         };
 
         let trades = TradeHistory::default();
@@ -443,11 +445,13 @@ impl Br2ShadowAdapter {
             no_shares: pos.no_shares,
             cash_usdc: pos.cash_usdc,
             market_yes_range_so_far: yes_range_so_far,
+            regime_realized_vol_180s_bps: 0.0,
             prior_market_range_1d: 0.0,
             prior_market_range_3d: 0.0,
             prior_market_range_7d: 0.0,
             model_output: Some(model_eval.output),
             market_close_ns,
+            ..pm_strategy::Ctx::default()
         };
 
         let out: StrategyOutput = market.strategy.on_event(event, &ctx, &spot_hist, trades);

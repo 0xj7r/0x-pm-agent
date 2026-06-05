@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use pm_strategy::BackToExploreConfig;
 use serde::{Deserialize, Serialize};
 
 use crate::core::risk::RiskLimits;
@@ -67,11 +68,51 @@ pub struct StrategyProfile {
     pub hybrid_mm: HybridMmSection,
     pub rescue: RescueSection,
     pub operational: OperationalSection,
+    pub back_to_explore: BackToExploreSection,
     pub core_hedge: CoreHedgeSection,
     pub paired_core: CoreHedgeSection,
     pub late_favorite: LateFavoriteSection,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackToExploreSection {
+    pub base_clip_usdc: Option<f64>,
+    pub max_clip_usdc: Option<f64>,
+    pub min_pair_cost_for_two_sided: Option<f64>,
+    pub pair_clip_multiplier: Option<f64>,
+    pub directional_strength_mult: Option<f64>,
+    pub residual_taper_start_frac: Option<f64>,
+    pub residual_min_clip_multiplier: Option<f64>,
+    pub range_soft_throttle: Option<f32>,
+    pub range_hard_throttle: Option<f32>,
+    pub range_min_clip_multiplier: Option<f64>,
+    pub range_repair_min_clip_multiplier: Option<f64>,
+    pub range_pair_min_clip_multiplier: Option<f64>,
+    pub range_chop_min_range: Option<f32>,
+    pub range_clean_path_efficiency: Option<f32>,
+    pub range_chop_sign_flip_rate: Option<f32>,
+    pub range_reversal_pressure: Option<f32>,
+    pub clean_path_directional_clip_multiplier: Option<f64>,
+    pub reversal_pressure_clip_multiplier: Option<f64>,
+    pub max_residual_shares: Option<f64>,
+    pub min_clip_multiplier_to_emit: Option<f64>,
+    pub refresh_secs: Option<f64>,
+    pub stop_secs_before_close: Option<f32>,
+    pub min_entry_price: Option<f32>,
+    pub max_entry_price: Option<f32>,
+    pub sweep_depth: Option<usize>,
+    pub market_window_ns: Option<i64>,
+    pub high_activity_hours: Option<Vec<u8>>,
+    pub base_participation_rate: Option<f64>,
+    pub two_sided_preference: Option<f64>,
+    pub target_risk_per_clip_frac: Option<f64>,
+    pub base_target_net_shares: Option<f64>,
+    pub good_hour_target_net_mult: Option<f64>,
+    pub external_risk_multiplier: Option<f64>,
+    pub debug_signals: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -345,6 +386,98 @@ impl StrategyProfile {
         BonereaperMmStrategyConfig {
             core_hedge: self.core_hedge_mm_config(),
             late_favorite: self.late_favorite_config(),
+        }
+    }
+
+    pub fn back_to_explore_config(&self) -> BackToExploreConfig {
+        let defaults = BackToExploreConfig::default();
+        let b = &self.back_to_explore;
+        BackToExploreConfig {
+            base_clip_usdc: b.base_clip_usdc.unwrap_or(defaults.base_clip_usdc),
+            max_clip_usdc: b.max_clip_usdc.unwrap_or(defaults.max_clip_usdc),
+            min_pair_cost_for_two_sided: b
+                .min_pair_cost_for_two_sided
+                .unwrap_or(defaults.min_pair_cost_for_two_sided),
+            pair_clip_multiplier: b
+                .pair_clip_multiplier
+                .unwrap_or(defaults.pair_clip_multiplier),
+            directional_strength_mult: b
+                .directional_strength_mult
+                .unwrap_or(defaults.directional_strength_mult),
+            residual_taper_start_frac: b
+                .residual_taper_start_frac
+                .unwrap_or(defaults.residual_taper_start_frac),
+            residual_min_clip_multiplier: b
+                .residual_min_clip_multiplier
+                .unwrap_or(defaults.residual_min_clip_multiplier),
+            range_soft_throttle: b
+                .range_soft_throttle
+                .unwrap_or(defaults.range_soft_throttle),
+            range_hard_throttle: b
+                .range_hard_throttle
+                .unwrap_or(defaults.range_hard_throttle),
+            range_min_clip_multiplier: b
+                .range_min_clip_multiplier
+                .unwrap_or(defaults.range_min_clip_multiplier),
+            range_repair_min_clip_multiplier: b
+                .range_repair_min_clip_multiplier
+                .or(b.range_pair_min_clip_multiplier)
+                .unwrap_or(defaults.range_repair_min_clip_multiplier),
+            range_chop_min_range: b
+                .range_chop_min_range
+                .unwrap_or(defaults.range_chop_min_range),
+            range_clean_path_efficiency: b
+                .range_clean_path_efficiency
+                .unwrap_or(defaults.range_clean_path_efficiency),
+            range_chop_sign_flip_rate: b
+                .range_chop_sign_flip_rate
+                .unwrap_or(defaults.range_chop_sign_flip_rate),
+            range_reversal_pressure: b
+                .range_reversal_pressure
+                .unwrap_or(defaults.range_reversal_pressure),
+            clean_path_directional_clip_multiplier: b
+                .clean_path_directional_clip_multiplier
+                .unwrap_or(defaults.clean_path_directional_clip_multiplier),
+            reversal_pressure_clip_multiplier: b
+                .reversal_pressure_clip_multiplier
+                .unwrap_or(defaults.reversal_pressure_clip_multiplier),
+            max_residual_shares: b
+                .max_residual_shares
+                .unwrap_or(defaults.max_residual_shares),
+            min_clip_multiplier_to_emit: b
+                .min_clip_multiplier_to_emit
+                .unwrap_or(defaults.min_clip_multiplier_to_emit),
+            refresh_secs: b.refresh_secs.unwrap_or(defaults.refresh_secs),
+            stop_secs_before_close: b
+                .stop_secs_before_close
+                .unwrap_or(defaults.stop_secs_before_close),
+            min_entry_price: b.min_entry_price.unwrap_or(defaults.min_entry_price),
+            max_entry_price: b.max_entry_price.unwrap_or(defaults.max_entry_price),
+            sweep_depth: b.sweep_depth.unwrap_or(defaults.sweep_depth),
+            market_window_ns: b.market_window_ns.unwrap_or(defaults.market_window_ns),
+            high_activity_hours: b
+                .high_activity_hours
+                .clone()
+                .unwrap_or(defaults.high_activity_hours),
+            base_participation_rate: b
+                .base_participation_rate
+                .unwrap_or(defaults.base_participation_rate),
+            two_sided_preference: b
+                .two_sided_preference
+                .unwrap_or(defaults.two_sided_preference),
+            target_risk_per_clip_frac: b
+                .target_risk_per_clip_frac
+                .unwrap_or(defaults.target_risk_per_clip_frac),
+            base_target_net_shares: b
+                .base_target_net_shares
+                .unwrap_or(defaults.base_target_net_shares),
+            good_hour_target_net_mult: b
+                .good_hour_target_net_mult
+                .unwrap_or(defaults.good_hour_target_net_mult),
+            external_risk_multiplier: b
+                .external_risk_multiplier
+                .unwrap_or(defaults.external_risk_multiplier),
+            debug_signals: b.debug_signals.unwrap_or(defaults.debug_signals),
         }
     }
 

@@ -1,0 +1,71 @@
+strategy: back_to_explore
+profile_name: back_to_explore_btc5m
+version: "1.0"
+last_updated: 2026-06-05
+description: |
+  BackToExplore BTC 5m conditional-risk profile ported from the shared
+  polymarket-backtest BTE strategy. The strategy section owns BTE behavior;
+  runtime caps stay in inventory and must not be overridden by legacy env vars.
+
+inventory:
+  max_open_orders_total: 120
+  max_open_orders_per_market: 48
+  max_order_notional_usd: 250.0
+  max_gross_notional_usd: 2000.0
+  max_net_notional_per_market_usd: 1200.0
+  max_position_quantity_per_instrument: 1500.0
+  min_free_cash_usd: 1.0
+  min_free_cash_bps: 0.0
+  max_session_loss_usd: 1000.0
+  max_session_loss_bps: 0.0
+
+health:
+  market_ws_stale_ms: 15000
+
+risk:
+  book_stale_ms: 5000
+
+pair:
+  merge_enabled: true
+  pressure_merge_enabled: false
+  min_merge_notional_usd: 5.0
+  merge_pressure_free_cash_ratio: 0.0
+  merge_pressure_gross_exposure_ratio: 999999.0
+  merge_market_exposure_pressure_usd: 999999.0
+
+back_to_explore:
+  base_clip_usdc: 7.24
+  max_clip_usdc: 200.0
+  min_pair_cost_for_two_sided: 0.96
+  pair_clip_multiplier: 0.95
+  directional_strength_mult: 1.6
+  residual_taper_start_frac: 0.55
+  residual_min_clip_multiplier: 0.35
+  max_residual_shares: 120.0
+  min_clip_multiplier_to_emit: 0.18
+
+  range_soft_throttle: 0.65
+  range_hard_throttle: 0.95
+  range_min_clip_multiplier: 0.20
+  range_repair_min_clip_multiplier: 0.70
+  range_chop_min_range: 0.20
+  range_clean_path_efficiency: 0.78
+  range_chop_sign_flip_rate: 0.35
+  range_reversal_pressure: 0.45
+  clean_path_directional_clip_multiplier: 1.25
+  reversal_pressure_clip_multiplier: 0.0
+
+  refresh_secs: 2.8
+  stop_secs_before_close: 4.0
+  min_entry_price: 0.02
+  max_entry_price: 0.99
+  sweep_depth: 6
+  high_activity_hours: [14, 15, 16, 17, 18, 19]
+
+  base_participation_rate: 0.90
+  two_sided_preference: 3.5
+  target_risk_per_clip_frac: 0.0025
+  base_target_net_shares: 6.0
+  good_hour_target_net_mult: 3.0
+  external_risk_multiplier: 1.0
+  debug_signals: false
