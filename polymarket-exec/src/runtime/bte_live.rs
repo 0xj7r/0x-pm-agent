@@ -23,6 +23,8 @@ use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, TradeSide
 
 const NS_PER_MS: i64 = 1_000_000;
 const DECISION_CADENCE_MS: u64 = 1_000;
+const DEFAULT_MIN_ORDER_SHARES: f64 = 5.0;
+const DEFAULT_MIN_ORDER_NOTIONAL_USD: f64 = 1.8;
 
 struct ActiveMarket {
     market_id: MarketId,
@@ -46,6 +48,8 @@ pub struct BteLiveShadow {
     live_trade_armed: bool,
     max_order_notional_usd: f64,
     max_market_notional_usd: f64,
+    min_order_shares: f64,
+    min_order_notional_usd: f64,
     submitted_notional_by_market: HashMap<String, f64>,
     warmup_skip_warned: bool,
 }
@@ -89,6 +93,10 @@ impl BteLiveShadow {
             .unwrap_or(false);
         let max_order_notional_usd = env_positive_f64("PM_BTC_5M_BTE_MAX_ORDER_NOTIONAL_USD");
         let max_market_notional_usd = env_positive_f64("PM_BTC_5M_BTE_MAX_MARKET_NOTIONAL_USD");
+        let min_order_shares =
+            env_positive_f64("PM_BTC_5M_BTE_MIN_ORDER_SHARES").unwrap_or(DEFAULT_MIN_ORDER_SHARES);
+        let min_order_notional_usd = env_positive_f64("PM_BTC_5M_BTE_MIN_ORDER_NOTIONAL_USD")
+            .unwrap_or(DEFAULT_MIN_ORDER_NOTIONAL_USD);
         let live_preconditions_ok = !paper_mode
             && kill_switch_configured
             && max_order_notional_usd.is_some()
@@ -110,6 +118,8 @@ impl BteLiveShadow {
                 target: "bte_shadow",
                 max_order_notional_usd = max_order_notional_usd.unwrap_or(0.0),
                 max_market_notional_usd = max_market_notional_usd.unwrap_or(0.0),
+                min_order_shares,
+                min_order_notional_usd,
                 kill_switch = ?live_kill_switch_path,
                 "BTE REAL-MONEY submission ARMED"
             );
@@ -122,6 +132,8 @@ impl BteLiveShadow {
             live_trade_armed,
             max_order_notional_usd: max_order_notional_usd.unwrap_or(0.0),
             max_market_notional_usd: max_market_notional_usd.unwrap_or(0.0),
+            min_order_shares,
+            min_order_notional_usd,
             submitted_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
         })
@@ -362,9 +374,51 @@ impl BteLiveShadow {
             return None;
         }
         let allowed_notional = self.max_order_notional_usd.min(market_headroom);
+        let min_qty_for_notional = self.min_order_notional_usd / price;
+        let min_qty = round_qty_up(self.min_order_shares.max(min_qty_for_notional));
+        if min_qty <= 0.0 || !min_qty.is_finite() {
+            return None;
+        }
+        let min_notional = min_qty * price;
+        if min_notional > allowed_notional {
+            warn!(
+                target: "bte_shadow",
+                market = %market_id,
+                min_qty,
+                min_notional_usd = min_notional,
+                allowed_notional_usd = allowed_notional,
+                "BTE-LIVE notional-cap: configured floor does not fit remaining cap; dropping"
+            );
+            return None;
+        }
+
+        if intent.quantity < min_qty {
+            warn!(
+                target: "bte_shadow",
+                market = %market_id,
+                from_qty = intent.quantity,
+                to_qty = min_qty,
+                min_order_shares = self.min_order_shares,
+                min_order_notional_usd = self.min_order_notional_usd,
+                "BTE-LIVE notional-floor: raising order quantity"
+            );
+            intent.quantity = min_qty;
+        }
+
         if intent.notional_usd() > allowed_notional {
-            let new_qty = ((allowed_notional / price).max(0.0) * 100.0).floor() / 100.0;
+            let new_qty = round_qty_down((allowed_notional / price).max(0.0));
             if new_qty <= 0.0 {
+                return None;
+            }
+            if new_qty < min_qty {
+                warn!(
+                    target: "bte_shadow",
+                    market = %market_id,
+                    clipped_qty = new_qty,
+                    min_qty,
+                    allowed_notional_usd = allowed_notional,
+                    "BTE-LIVE notional-cap: clipped quantity would violate floor; dropping"
+                );
                 return None;
             }
             warn!(
@@ -394,13 +448,12 @@ fn shadow_order_to_intent(
     now_ms: u64,
     tag_taker: bool,
 ) -> Option<OrderIntent> {
-    let yes_limit = order.limit_price.map(|p| p as f64);
     let mut intent = match order.side {
         Side::BuyYes => OrderIntent::new_buy(
             ClientOrderId::new(format!("bte-{}-{now_ms}-buy-yes", order.market_id)),
             market_id.clone(),
             yes_token.clone(),
-            yes_limit.unwrap_or(yes_book.best_ask),
+            live_price(yes_book.best_ask)?,
             order.shares,
             "bte taker buy yes",
             now_ms,
@@ -409,14 +462,14 @@ fn shadow_order_to_intent(
             ClientOrderId::new(format!("bte-{}-{now_ms}-sell-yes", order.market_id)),
             market_id.clone(),
             yes_token.clone(),
-            yes_limit.unwrap_or(yes_book.best_bid),
+            live_price(yes_book.best_bid)?,
             order.shares,
             "bte taker sell yes",
             now_ms,
         ),
         Side::BuyNo => {
             let no_token = no_token?.clone();
-            let no_px = yes_limit.map(|p| 1.0 - p).or(no_book.map(|b| b.best_ask))?;
+            let no_px = live_price(no_book?.best_ask)?;
             OrderIntent::new_buy(
                 ClientOrderId::new(format!("bte-{}-{now_ms}-buy-no", order.market_id)),
                 market_id.clone(),
@@ -429,7 +482,7 @@ fn shadow_order_to_intent(
         }
         Side::SellNo => {
             let no_token = no_token?.clone();
-            let no_px = yes_limit.map(|p| 1.0 - p).or(no_book.map(|b| b.best_bid))?;
+            let no_px = live_price(no_book?.best_bid)?;
             OrderIntent::new_sell(
                 ClientOrderId::new(format!("bte-{}-{now_ms}-sell-no", order.market_id)),
                 market_id.clone(),
@@ -451,6 +504,18 @@ fn shadow_order_to_intent(
         intent.reduce_only = false;
     }
     Some(intent)
+}
+
+fn live_price(price: f64) -> Option<f64> {
+    (price.is_finite() && price > 0.0 && price <= 1.0).then_some(price)
+}
+
+fn round_qty_down(quantity: f64) -> f64 {
+    (quantity * 100.0).floor() / 100.0
+}
+
+fn round_qty_up(quantity: f64) -> f64 {
+    ((quantity * 100.0) - 1e-9).ceil() / 100.0
 }
 
 fn stable_market_u32(market_id: &MarketId) -> u32 {
@@ -476,4 +541,111 @@ fn env_positive_f64(key: &str) -> Option<f64> {
         .ok()
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn book(asset_id: &str, bid: f64, ask: f64) -> BookState {
+        BookState::from_top_of_book(asset_id, bid, 100.0, ask, 100.0, 0.5 * (bid + ask), 1_000)
+    }
+
+    fn order(side: Side, shares: f64) -> BteShadowOrder {
+        BteShadowOrder {
+            market_id: 42,
+            side,
+            shares,
+            max_depth: 1,
+            limit_price: Some(0.982),
+            tag: "test",
+        }
+    }
+
+    #[test]
+    fn bte_buy_no_uses_live_no_ask_not_inverted_shadow_limit() {
+        let market = MarketId::from("m");
+        let yes = InstrumentId::from("yes");
+        let no = InstrumentId::from("no");
+        let yes_book = book("yes", 0.35, 0.37);
+        let no_book = book("no", 0.63, 0.65);
+
+        let intent = shadow_order_to_intent(
+            &order(Side::BuyNo, 5.0),
+            &market,
+            &yes,
+            Some(&no),
+            &yes_book,
+            Some(&no_book),
+            123,
+            true,
+        )
+        .expect("valid NO book should produce intent");
+
+        assert_eq!(intent.instrument_id.as_str(), "no");
+        assert_eq!(intent.side, TradeSide::Buy);
+        assert!((intent.limit_price - 0.65).abs() < 1e-9);
+        assert_eq!(intent.quote_level_tag.as_deref(), Some("bte-taker"));
+    }
+
+    #[test]
+    fn bte_live_notional_floor_raises_tiny_order_within_cap() {
+        let mut live = BteLiveShadow {
+            adapter: BteShadowAdapter::new(pm_strategy::BackToExploreConfig::default()),
+            active: None,
+            paper_trade_armed: false,
+            live_trade_armed: true,
+            max_order_notional_usd: 5.0,
+            max_market_notional_usd: 50.0,
+            min_order_shares: 5.0,
+            min_order_notional_usd: 1.8,
+            submitted_notional_by_market: HashMap::new(),
+            warmup_skip_warned: false,
+        };
+        let market = MarketId::from("m");
+        let intent = OrderIntent::new_buy(
+            ClientOrderId::from("c"),
+            market.clone(),
+            InstrumentId::from("no"),
+            0.12,
+            3.0,
+            "test",
+            1_000,
+        );
+
+        let capped = live
+            .apply_notional_caps(intent, &market)
+            .expect("floor fits within $5 cap");
+
+        assert!((capped.quantity - 15.0).abs() < 1e-9);
+        assert!((capped.notional_usd() - 1.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bte_live_notional_floor_drops_when_floor_exceeds_cap() {
+        let mut live = BteLiveShadow {
+            adapter: BteShadowAdapter::new(pm_strategy::BackToExploreConfig::default()),
+            active: None,
+            paper_trade_armed: false,
+            live_trade_armed: true,
+            max_order_notional_usd: 3.0,
+            max_market_notional_usd: 50.0,
+            min_order_shares: 5.0,
+            min_order_notional_usd: 1.8,
+            submitted_notional_by_market: HashMap::new(),
+            warmup_skip_warned: false,
+        };
+        let market = MarketId::from("m");
+        let intent = OrderIntent::new_buy(
+            ClientOrderId::from("c"),
+            market.clone(),
+            InstrumentId::from("yes"),
+            0.98,
+            1.0,
+            "test",
+            1_000,
+        );
+
+        assert!(live.apply_notional_caps(intent, &market).is_none());
+    }
 }
