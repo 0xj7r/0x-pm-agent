@@ -22,6 +22,7 @@ pub struct BteDecisionPosition {
     pub yes_shares: f64,
     pub no_shares: f64,
     pub cash_usdc: f64,
+    pub current_market_net_exposure_shares: f64,
     pub btc_net_exposure_shares: f64,
     pub eth_net_exposure_shares: f64,
     pub daily_start_cash_usdc: f64,

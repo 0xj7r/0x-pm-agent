@@ -1706,13 +1706,17 @@ async fn run_runtime_loop(
                                             1.0
                                         };
                                     let btc_regime = runtime.btc_regime_snapshot(now_unix_ms());
+                                    let current_market_net_exposure_shares = yes_shares - no_shares;
+                                    let btc_ladder_net_exposure_shares =
+                                        runtime.btc_ladder_net_exposure_shares(now_unix_ms());
                                     let pos =
                                         crate::runtime::bte_shadow::BteDecisionPosition {
                                             events_seen: 0,
                                             yes_shares,
                                             no_shares,
                                             cash_usdc: inventory.free_cash_usd(),
-                                            btc_net_exposure_shares: yes_shares - no_shares,
+                                            current_market_net_exposure_shares,
+                                            btc_net_exposure_shares: btc_ladder_net_exposure_shares,
                                             eth_net_exposure_shares: 0.0,
                                             daily_start_cash_usdc: config.starting_cash_usd,
                                             daily_loss_cap_pct,

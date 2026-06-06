@@ -253,6 +253,21 @@ impl<S: Strategy> Runtime<S> {
         self.market_contexts.get(market_id).cloned()
     }
 
+    pub fn btc_ladder_net_exposure_shares(&self, now_ms: EpochMillis) -> f64 {
+        self.market_contexts
+            .active_btc_5m_windows()
+            .into_iter()
+            .filter(|record| record.is_active_btc_5m_window(now_ms))
+            .filter_map(|record| {
+                let yes_id = record.instrument_ids.first()?;
+                let no_id = record.instrument_ids.get(1)?;
+                let yes_qty = self.inventory.position_qty(&InstrumentId::from(yes_id.as_str()));
+                let no_qty = self.inventory.position_qty(&InstrumentId::from(no_id.as_str()));
+                Some(yes_qty - no_qty)
+            })
+            .sum()
+    }
+
     fn canonical_market_id_for_instrument(
         &self,
         instrument_id: &InstrumentId,

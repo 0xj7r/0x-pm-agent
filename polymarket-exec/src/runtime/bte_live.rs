@@ -50,7 +50,7 @@ pub struct BteLiveShadow {
     max_market_notional_usd: f64,
     min_order_shares: f64,
     min_order_notional_usd: f64,
-    submitted_notional_by_market: HashMap<String, f64>,
+    risk_increasing_notional_by_market: HashMap<String, f64>,
     warmup_skip_warned: bool,
 }
 
@@ -134,7 +134,7 @@ impl BteLiveShadow {
             max_market_notional_usd: max_market_notional_usd.unwrap_or(0.0),
             min_order_shares,
             min_order_notional_usd,
-            submitted_notional_by_market: HashMap::new(),
+            risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
         })
     }
@@ -319,7 +319,7 @@ impl BteLiveShadow {
                     continue;
                 };
                 let intent = if self.live_trade_armed {
-                    match self.apply_notional_caps(intent, market_id) {
+                    match self.apply_notional_caps(intent, market_id, order.side, pos) {
                         Some(capped) => capped,
                         None => continue,
                     }
@@ -353,23 +353,33 @@ impl BteLiveShadow {
         &mut self,
         mut intent: OrderIntent,
         market_id: &MarketId,
+        order_side: Side,
+        pos: BteDecisionPosition,
     ) -> Option<OrderIntent> {
         let price = intent.limit_price;
         if price <= 0.0 {
             return None;
         }
+        let risk_increasing = order_increases_current_market_residual(order_side, pos);
         let already = *self
-            .submitted_notional_by_market
+            .risk_increasing_notional_by_market
             .get(market_id.as_str())
             .unwrap_or(&0.0);
-        let market_headroom = (self.max_market_notional_usd - already).max(0.0);
+        let current_residual_notional =
+            pos.current_market_net_exposure_shares.abs().max(0.0) * price;
+        let counted_risk_notional = already.max(current_residual_notional);
+        let market_headroom = if risk_increasing {
+            (self.max_market_notional_usd - counted_risk_notional).max(0.0)
+        } else {
+            self.max_market_notional_usd.max(self.max_order_notional_usd)
+        };
         if market_headroom <= 0.0 {
             warn!(
                 target: "bte_shadow",
                 market = %market_id,
-                cumulative_usd = already,
+                risk_increasing_usd = counted_risk_notional,
                 cap_usd = self.max_market_notional_usd,
-                "BTE-LIVE notional-cap: per-market cap hit"
+                "BTE-LIVE notional-cap: per-market directional cap hit"
             );
             return None;
         }
@@ -430,11 +440,22 @@ impl BteLiveShadow {
             );
             intent.quantity = new_qty;
         }
-        *self
-            .submitted_notional_by_market
-            .entry(market_id.as_str().to_string())
-            .or_insert(0.0) += intent.notional_usd();
+        if risk_increasing {
+            *self
+                .risk_increasing_notional_by_market
+                .entry(market_id.as_str().to_string())
+                .or_insert(0.0) += intent.notional_usd();
+        }
         Some(intent)
+    }
+}
+
+fn order_increases_current_market_residual(side: Side, pos: BteDecisionPosition) -> bool {
+    let residual = pos.current_market_net_exposure_shares;
+    match side {
+        Side::BuyYes => residual >= 0.0,
+        Side::BuyNo => residual <= 0.0,
+        Side::SellYes | Side::SellNo => false,
     }
 }
 
@@ -599,7 +620,7 @@ mod tests {
             max_market_notional_usd: 50.0,
             min_order_shares: 5.0,
             min_order_notional_usd: 1.8,
-            submitted_notional_by_market: HashMap::new(),
+            risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
         };
         let market = MarketId::from("m");
@@ -614,7 +635,15 @@ mod tests {
         );
 
         let capped = live
-            .apply_notional_caps(intent, &market)
+            .apply_notional_caps(
+                intent,
+                &market,
+                Side::BuyNo,
+                BteDecisionPosition {
+                    current_market_net_exposure_shares: 0.0,
+                    ..BteDecisionPosition::default()
+                },
+            )
             .expect("floor fits within $5 cap");
 
         assert!((capped.quantity - 15.0).abs() < 1e-9);
@@ -632,7 +661,7 @@ mod tests {
             max_market_notional_usd: 50.0,
             min_order_shares: 5.0,
             min_order_notional_usd: 1.8,
-            submitted_notional_by_market: HashMap::new(),
+            risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
         };
         let market = MarketId::from("m");
@@ -646,6 +675,66 @@ mod tests {
             1_000,
         );
 
-        assert!(live.apply_notional_caps(intent, &market).is_none());
+        assert!(live
+            .apply_notional_caps(
+                intent,
+                &market,
+                Side::BuyYes,
+                BteDecisionPosition {
+                    current_market_net_exposure_shares: 0.0,
+                    ..BteDecisionPosition::default()
+                },
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn bte_live_market_cap_blocks_same_side_risk_but_allows_repair() {
+        let mut live = BteLiveShadow {
+            adapter: BteShadowAdapter::new(pm_strategy::BackToExploreConfig::default()),
+            active: None,
+            paper_trade_armed: false,
+            live_trade_armed: true,
+            max_order_notional_usd: 15.0,
+            max_market_notional_usd: 50.0,
+            min_order_shares: 5.0,
+            min_order_notional_usd: 1.8,
+            risk_increasing_notional_by_market: HashMap::new(),
+            warmup_skip_warned: false,
+        };
+        let market = MarketId::from("m");
+        let add_yes = OrderIntent::new_buy(
+            ClientOrderId::from("add-yes"),
+            market.clone(),
+            InstrumentId::from("yes"),
+            0.60,
+            10.0,
+            "test",
+            1_000,
+        );
+        let repair_no = OrderIntent::new_buy(
+            ClientOrderId::from("repair-no"),
+            market.clone(),
+            InstrumentId::from("no"),
+            0.40,
+            10.0,
+            "test",
+            1_000,
+        );
+        let long_yes_at_cap = BteDecisionPosition {
+            current_market_net_exposure_shares: 90.0,
+            ..BteDecisionPosition::default()
+        };
+
+        assert!(
+            live.apply_notional_caps(add_yes, &market, Side::BuyYes, long_yes_at_cap)
+                .is_none(),
+            "same-side add should be blocked once current residual exceeds the market cap"
+        );
+
+        let capped = live
+            .apply_notional_caps(repair_no, &market, Side::BuyNo, long_yes_at_cap)
+            .expect("opposite-side repair should not be blocked by the market cap");
+        assert!((capped.notional_usd() - 4.0).abs() < 1e-9);
     }
 }
