@@ -3342,6 +3342,8 @@ impl<S: Strategy> Runtime<S> {
                 tag.starts_with("late-fav-taker")
                     || tag.starts_with("cheap-tail-taker")
                     || tag.starts_with("reversal-hedge-taker")
+                    || tag.starts_with("br2-taker")
+                    || tag.starts_with("bte-taker")
             })
             && self
                 .last_quotes
