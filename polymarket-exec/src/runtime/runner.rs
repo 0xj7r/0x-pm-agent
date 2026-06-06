@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -30,7 +30,7 @@ use crate::runtime::live_health::{
     needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
-    fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
+    RuntimeMarketUniverse, fetch_btc_5m_market_contexts, refresh_runtime_market_universe,
 };
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
@@ -44,7 +44,7 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
+use crate::wire::api::{DashboardSnapshot, DashboardUiState, serve_http};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, ExecutionError, MergePositionsRequest,
@@ -1858,12 +1858,15 @@ async fn run_runtime_loop(
                                     .commands
                                     .push(crate::types::RuntimeCommand::Submit(intent));
                             }
-                            // BTE paper/live overlay submission: only non-empty
-                            // when explicitly armed by BTE-specific env gates.
+                            // BTE paper/live overlay submission: first register
+                            // the external intent with the runtime so live
+                            // submit is tracked and passes the active-order
+                            // guard in execute_execution_adapter.
                             for intent in bte_submit_intents {
-                                outcome
-                                    .commands
-                                    .push(crate::types::RuntimeCommand::Submit(intent));
+                                let submit_outcome =
+                                    runtime.accept_external_intent(intent, now_mm_ms);
+                                outcome.commands.extend(submit_outcome.commands);
+                                outcome.event_seqs.extend(submit_outcome.event_seqs);
                             }
                             // Paired-MM paper Submit/Cancel commands (tracked above)
                             // flow through the same bridge as on_book_state's own.
