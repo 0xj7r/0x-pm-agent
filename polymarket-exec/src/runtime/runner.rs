@@ -63,6 +63,9 @@ use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 const LATE_FAV_MAKER_TTL_MS: u64 = 30_000;
 const ROUTER_ROUTE_CONFIRM_MS: u64 = 30_000;
+const ROUTER_ROUTE_SIGNAL_WINDOW_MS: u64 = 60_000;
+const ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS: usize = 8;
+const ROUTER_ROUTE_SIGNAL_MIN_SHARE: f32 = 0.60;
 const ROUTER_SESSION_GUARD_WINDOW_MS: u64 = 15 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_MIN_OBSERVATIONS: usize = 30;
@@ -76,6 +79,13 @@ struct MarketRouterState {
     pending_route: Option<MarketRoute>,
     pending_since_ms: Option<u64>,
     locked_route: Option<MarketRoute>,
+    route_observations: VecDeque<MarketRouteObservation>,
+}
+
+#[derive(Clone, Debug)]
+struct MarketRouteObservation {
+    observed_at_ms: u64,
+    route: MarketRoute,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +156,7 @@ struct RouteLatchReadout {
     selected_route: Option<MarketRoute>,
     locked_route: Option<MarketRoute>,
     confirm_pending: bool,
+    signal_route: Option<MarketRoute>,
 }
 
 #[derive(Clone, Debug)]
@@ -434,18 +445,72 @@ fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> MarketRoute {
     }
 }
 
+fn smoothed_market_route_signal(
+    state: &mut MarketRouterState,
+    observed_route: MarketRoute,
+    now_ms: u64,
+) -> Option<MarketRoute> {
+    state.route_observations.push_back(MarketRouteObservation {
+        observed_at_ms: now_ms,
+        route: observed_route,
+    });
+    while state.route_observations.front().is_some_and(|obs| {
+        now_ms.saturating_sub(obs.observed_at_ms) > ROUTER_ROUTE_SIGNAL_WINDOW_MS
+    }) {
+        state.route_observations.pop_front();
+    }
+
+    let observation_count = state.route_observations.len();
+    if observation_count < ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS {
+        return None;
+    }
+
+    let (bte_count, br2_count, risk_off_count) =
+        state
+            .route_observations
+            .iter()
+            .fold((0usize, 0usize, 0usize), |counts, obs| {
+                let (bte_count, br2_count, risk_off_count) = counts;
+                match obs.route {
+                    MarketRoute::Bte => (bte_count + 1, br2_count, risk_off_count),
+                    MarketRoute::Br2 => (bte_count, br2_count + 1, risk_off_count),
+                    MarketRoute::RiskOff => (bte_count, br2_count, risk_off_count + 1),
+                }
+            });
+    let (route, count) = [
+        (MarketRoute::Bte, bte_count),
+        (MarketRoute::Br2, br2_count),
+        (MarketRoute::RiskOff, risk_off_count),
+    ]
+    .into_iter()
+    .max_by_key(|(_, count)| *count)?;
+    let share = count as f32 / observation_count as f32;
+    (share >= ROUTER_ROUTE_SIGNAL_MIN_SHARE).then_some(route)
+}
+
 fn update_latched_router_route(
     state: &mut MarketRouterState,
-    model_route: MarketRoute,
+    observed_route: MarketRoute,
     now_ms: u64,
 ) -> RouteLatchReadout {
+    let signal_route = smoothed_market_route_signal(state, observed_route, now_ms);
     if let Some(locked_route) = state.locked_route {
         return RouteLatchReadout {
             selected_route: Some(locked_route),
             locked_route: Some(locked_route),
             confirm_pending: false,
+            signal_route,
         };
     }
+
+    let Some(model_route) = signal_route else {
+        return RouteLatchReadout {
+            selected_route: state.selected_route,
+            locked_route: state.locked_route,
+            confirm_pending: true,
+            signal_route: None,
+        };
+    };
 
     if model_route == MarketRoute::RiskOff {
         state.selected_route = Some(MarketRoute::RiskOff);
@@ -455,6 +520,7 @@ fn update_latched_router_route(
             selected_route: state.selected_route,
             locked_route: None,
             confirm_pending: false,
+            signal_route: Some(model_route),
         };
     }
 
@@ -465,6 +531,7 @@ fn update_latched_router_route(
             selected_route: Some(model_route),
             locked_route: state.locked_route,
             confirm_pending: false,
+            signal_route: Some(model_route),
         };
     }
 
@@ -486,18 +553,20 @@ fn update_latched_router_route(
             selected_route: Some(model_route),
             locked_route: Some(model_route),
             confirm_pending: false,
+            signal_route: Some(model_route),
         }
     } else {
         RouteLatchReadout {
             selected_route: state.selected_route,
             locked_route: state.locked_route,
             confirm_pending: true,
+            signal_route: Some(model_route),
         }
     }
 }
 
 fn classify_router_execution_permission(
-    market_route: MarketRoute,
+    _market_route: MarketRoute,
     session_guard: SessionGuard,
     latch: RouteLatchReadout,
 ) -> ExecutionPermission {
@@ -507,7 +576,7 @@ fn classify_router_execution_permission(
     if latch.confirm_pending {
         return ExecutionPermission::NoAddConfirmPending;
     }
-    if market_route == MarketRoute::RiskOff || latch.selected_route == Some(MarketRoute::RiskOff) {
+    if latch.selected_route.is_none() || latch.selected_route == Some(MarketRoute::RiskOff) {
         return ExecutionPermission::NoAddMarketRiskOff;
     }
     ExecutionPermission::AllowAdd
@@ -2343,11 +2412,25 @@ async fn run_runtime_loop(
                                                 whipsaw.sign_flip_rate,
                                                 whipsaw.realized_vol_180s_bps,
                                             );
+                                            let effective_router_route = raw_effective_router_route;
+                                            let latch_readout = {
+                                                let state = router_states
+                                                    .entry(market_id.clone())
+                                                    .or_default();
+                                                update_latched_router_route(
+                                                    state,
+                                                    effective_router_route,
+                                                    now_unix_ms(),
+                                                )
+                                            };
+                                            let session_observed_route = latch_readout
+                                                .signal_route
+                                                .unwrap_or(raw_effective_router_route);
                                             let router_session_readout =
                                                 update_router_session_regime(
                                                     &mut router_session_regime,
                                                     now_unix_ms(),
-                                                    raw_effective_router_route,
+                                                    session_observed_route,
                                                     cluster,
                                                     market_yes_range_so_far,
                                                     whipsaw.score,
@@ -2380,17 +2463,6 @@ async fn run_runtime_loop(
                                                     }
                                                 }
                                             }
-                                            let effective_router_route = raw_effective_router_route;
-                                            let latch_readout = {
-                                                let state = router_states
-                                                    .entry(market_id.clone())
-                                                    .or_default();
-                                                update_latched_router_route(
-                                                    state,
-                                                    effective_router_route,
-                                                    now_unix_ms(),
-                                                )
-                                            };
                                             let execution_permission =
                                                 classify_router_execution_permission(
                                                     effective_router_route,
@@ -2399,6 +2471,9 @@ async fn run_runtime_loop(
                                                 );
                                             let selected_router_route = latch_readout
                                                 .selected_route
+                                                .map_or("none", MarketRoute::as_str);
+                                            let route_signal_route = latch_readout
+                                                .signal_route
                                                 .map_or("none", MarketRoute::as_str);
                                             router_selected_route = latch_readout.selected_route;
                                             router_execution_permission = execution_permission;
@@ -2422,6 +2497,8 @@ async fn run_runtime_loop(
                                             let shadow_vote_route_str = shadow_vote_route.as_str();
                                             let session_guard_state =
                                                 router_session_readout.guard.as_str();
+                                            let session_observed_route_str =
+                                                session_observed_route.as_str();
                                             let execution_permission_str =
                                                 execution_permission.as_str();
                                             let btc_micro_regime =
@@ -2494,8 +2571,10 @@ async fn run_runtime_loop(
                                                     action_router_route,
                                                     locked_router_route,
                                                     session_guard_state,
+                                                    session_observed_route = session_observed_route_str,
                                                     execution_permission = execution_permission_str,
                                                     route_confirm_pending = latch_readout.confirm_pending,
+                                                    route_signal_route,
                                                     session_guard_active = router_session_readout.guard_active,
                                                     session_stress_fraction = router_session_readout.stress_fraction,
                                                     session_observation_count = router_session_readout.observation_count,

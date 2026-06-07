@@ -319,18 +319,22 @@ fn live_router_forces_risk_off_on_live_observed_violent_chop() {
 }
 
 #[test]
-fn router_route_latch_requires_consecutive_non_risk_ticks() {
+fn router_route_latch_requires_smoothed_persistent_signal() {
     let mut state = MarketRouterState::default();
 
-    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 1_000);
+    for i in 0..ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS - 1 {
+        let readout = update_latched_router_route(&mut state, MarketRoute::Bte, i as u64 * 1_000);
+        assert_eq!(readout.selected_route, None);
+        assert_eq!(readout.signal_route, None);
+        assert!(readout.confirm_pending);
+    }
+
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 7_000);
     assert_eq!(readout.selected_route, None);
+    assert_eq!(readout.signal_route, Some(MarketRoute::Bte));
     assert!(readout.confirm_pending);
 
-    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 20_000);
-    assert_eq!(readout.selected_route, None);
-    assert!(readout.confirm_pending);
-
-    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 31_000);
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 38_000);
     assert_eq!(readout.selected_route, Some(MarketRoute::Bte));
     assert_eq!(readout.locked_route, Some(MarketRoute::Bte));
     assert!(!readout.confirm_pending);
@@ -363,21 +367,48 @@ fn router_route_latch_requires_consecutive_non_risk_ticks() {
 }
 
 #[test]
+fn router_route_signal_ignores_noisy_single_tick_flips() {
+    let mut state = MarketRouterState::default();
+
+    for i in 0..ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS {
+        let route = if i == 3 {
+            MarketRoute::Br2
+        } else {
+            MarketRoute::Bte
+        };
+        let readout = update_latched_router_route(&mut state, route, i as u64 * 1_000);
+        if i + 1 < ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS {
+            assert_eq!(readout.signal_route, None);
+        }
+    }
+
+    let readout = update_latched_router_route(&mut state, MarketRoute::Br2, 8_000);
+    assert_eq!(readout.signal_route, Some(MarketRoute::Bte));
+    assert_eq!(readout.selected_route, None);
+    assert!(readout.confirm_pending);
+}
+
+#[test]
 fn router_route_latch_locks_confirmed_strategy_for_market() {
     let mut state = MarketRouterState::default();
 
-    assert!(update_latched_router_route(&mut state, MarketRoute::Bte, 1_000).confirm_pending);
+    for i in 0..ROUTER_ROUTE_SIGNAL_MIN_OBSERVATIONS {
+        assert!(
+            update_latched_router_route(&mut state, MarketRoute::Bte, i as u64 * 1_000)
+                .confirm_pending
+        );
+    }
     assert_eq!(
-        update_latched_router_route(&mut state, MarketRoute::Bte, 31_000).selected_route,
+        update_latched_router_route(&mut state, MarketRoute::Bte, 38_000).selected_route,
         Some(MarketRoute::Bte)
     );
 
     assert_eq!(
-        update_latched_router_route(&mut state, MarketRoute::Br2, 32_000).selected_route,
+        update_latched_router_route(&mut state, MarketRoute::Br2, 39_000).selected_route,
         Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, MarketRoute::RiskOff, 33_000).selected_route,
+        update_latched_router_route(&mut state, MarketRoute::RiskOff, 40_000).selected_route,
         Some(MarketRoute::Bte)
     );
 }
@@ -388,21 +419,33 @@ fn router_permission_keeps_market_owner_separate_from_overlays() {
         selected_route: Some(MarketRoute::Bte),
         locked_route: Some(MarketRoute::Bte),
         confirm_pending: false,
+        signal_route: Some(MarketRoute::Bte),
     };
 
     assert_eq!(
-        classify_router_execution_permission(MarketRoute::Br2, SessionGuard::Normal, locked_bte),
+        classify_router_execution_permission(
+            MarketRoute::RiskOff,
+            SessionGuard::Normal,
+            locked_bte
+        ),
         ExecutionPermission::AllowAdd
     );
     assert_eq!(
         classify_router_execution_permission(MarketRoute::Bte, SessionGuard::NoAdd, locked_bte),
         ExecutionPermission::NoAddSessionGuard
     );
+
+    let risk_off_owner = RouteLatchReadout {
+        selected_route: Some(MarketRoute::RiskOff),
+        locked_route: None,
+        confirm_pending: false,
+        signal_route: Some(MarketRoute::RiskOff),
+    };
     assert_eq!(
         classify_router_execution_permission(
             MarketRoute::RiskOff,
             SessionGuard::Normal,
-            locked_bte
+            risk_off_owner
         ),
         ExecutionPermission::NoAddMarketRiskOff
     );
@@ -411,6 +454,7 @@ fn router_permission_keeps_market_owner_separate_from_overlays() {
         selected_route: None,
         locked_route: None,
         confirm_pending: true,
+        signal_route: None,
     };
     assert_eq!(
         classify_router_execution_permission(MarketRoute::Bte, SessionGuard::Normal, pending),
