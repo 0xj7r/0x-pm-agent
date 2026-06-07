@@ -17,6 +17,7 @@ pub(super) struct LiveSafetyState {
     pub(super) consecutive_reconcile_mismatches: usize,
     pub(super) suspect_missing_local_orders: HashMap<ClientOrderId, MissingLocalOrderSuspect>,
     pub(super) last_venue_cash_usd: Option<f64>,
+    pub(super) session_equity_anchor_usd: Option<f64>,
     pub(super) last_venue_position_count: usize,
     pub(super) last_venue_balance_observed_at_ms: Option<u64>,
 }

@@ -29,7 +29,7 @@ use crate::runtime::live_auth::{connect_live_adapter, connect_live_session};
 use crate::runtime::live_health::portfolio_equity_floor_usd;
 use crate::runtime::live_health::{
     auto_recover_live_riskoff, enforce_capital_guard, enforce_live_health, live_kill_switch_reason,
-    needs_reconcile_order_count,
+    live_risk_anchor_usd, needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
     fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
@@ -1573,7 +1573,7 @@ async fn run_runtime_loop(
                     runtime,
                     metrics.as_ref(),
                     &config.risk_limits,
-                    config.starting_cash_usd,
+                    live_risk_anchor_usd(&config, &live_safety),
                     now_unix_ms(),
                     if config.paper_mode { "paper" } else { "live" },
                 );
@@ -4371,6 +4371,21 @@ async fn apply_sync_report(
         let reason = "live reconciliation mismatch; fail-closed risk-off";
         metrics.observe_riskoff_transition();
         outcome.extend(runtime.degrade_and_cancel_all(now_ms, reason));
+    }
+    if report.balance_synced && live_safety.session_equity_anchor_usd.is_none() {
+        if let Some(cash_usd) = live_safety.last_venue_cash_usd {
+            let marked_equity_usd = cash_usd + runtime.inventory().gross_exposure_usd();
+            if marked_equity_usd.is_finite() && marked_equity_usd > 0.0 {
+                live_safety.session_equity_anchor_usd = Some(marked_equity_usd);
+                info!(
+                    mode = "live",
+                    session_equity_anchor_usd = marked_equity_usd,
+                    venue_cash_usd = cash_usd,
+                    gross_exposure_usd = runtime.inventory().gross_exposure_usd(),
+                    "captured live session equity anchor"
+                );
+            }
+        }
     }
     outcome
 }

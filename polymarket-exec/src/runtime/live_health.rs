@@ -178,8 +178,9 @@ fn live_health_failures(
             config.risk_limits.max_gross_notional_usd
         ));
     }
+    let session_anchor_usd = live_risk_anchor_usd(config, live_safety);
     if let Some(equity_floor_usd) =
-        portfolio_equity_floor_usd(&config.risk_limits, config.starting_cash_usd)
+        portfolio_equity_floor_usd(&config.risk_limits, session_anchor_usd)
     {
         let local_equity_usd =
             runtime.inventory().total_cash_usd() + runtime.inventory().gross_exposure_usd();
@@ -213,14 +214,14 @@ pub(super) fn enforce_capital_guard(
     runtime: &mut Runtime<StrategyMode>,
     metrics: &AppMetrics,
     risk_limits: &RiskLimits,
-    starting_cash_usd: f64,
+    session_anchor_usd: f64,
     now_ms: u64,
     mode: &str,
 ) -> RuntimeOutcome {
     if runtime.status() != RuntimeStatus::Running {
         return RuntimeOutcome::default();
     }
-    let Some(equity_floor_usd) = portfolio_equity_floor_usd(risk_limits, starting_cash_usd) else {
+    let Some(equity_floor_usd) = portfolio_equity_floor_usd(risk_limits, session_anchor_usd) else {
         return RuntimeOutcome::default();
     };
 
@@ -244,4 +245,11 @@ pub(super) fn portfolio_equity_floor_usd(
     starting_cash_usd: f64,
 ) -> Option<f64> {
     risk_limits.portfolio_equity_floor_usd(starting_cash_usd)
+}
+
+pub(super) fn live_risk_anchor_usd(config: &AppConfig, live_safety: &LiveSafetyState) -> f64 {
+    live_safety
+        .session_equity_anchor_usd
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(config.starting_cash_usd)
 }

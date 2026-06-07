@@ -1873,6 +1873,84 @@ fn portfolio_equity_floor_uses_stricter_absolute_or_session_loss_floor() {
 }
 
 #[test]
+fn live_risk_anchor_prefers_first_synced_session_equity() {
+    let mut config = runner_test_config();
+    config.starting_cash_usd = 2_700.0;
+    let live_safety = LiveSafetyState {
+        session_equity_anchor_usd: Some(2_311.0),
+        ..LiveSafetyState::default()
+    };
+
+    assert_eq!(live_risk_anchor_usd(&config, &live_safety), 2_311.0);
+    assert_eq!(
+        portfolio_equity_floor_usd(
+            &RiskLimits {
+                max_session_loss_bps: 1_000.0,
+                ..RiskLimits::default()
+            },
+            live_risk_anchor_usd(&config, &live_safety),
+        ),
+        Some(2_079.9)
+    );
+}
+
+#[tokio::test]
+async fn sync_report_captures_live_session_equity_anchor_once() {
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 2_700.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        StrategyMode::Noop(NoopStrategy),
+        MarketContextStore::empty(),
+    );
+    let metrics = AppMetrics::new().expect("metrics");
+    let mut live_safety = LiveSafetyState::default();
+    let adapter = RecordingAdapter::default();
+
+    apply_sync_report(
+        &mut runtime,
+        &metrics,
+        &mut live_safety,
+        &live_test_policy(),
+        &[],
+        ExecutionSyncReport {
+            balance_synced: true,
+            venue_cash_usd: Some(2_311.0),
+            venue_position_count: 0,
+            venue_balance_observed_at_ms: Some(10_000),
+            ..ExecutionSyncReport::default()
+        },
+        10_000,
+        &adapter,
+    )
+    .await;
+    assert_eq!(live_safety.session_equity_anchor_usd, Some(2_311.0));
+
+    apply_sync_report(
+        &mut runtime,
+        &metrics,
+        &mut live_safety,
+        &live_test_policy(),
+        &[],
+        ExecutionSyncReport {
+            balance_synced: true,
+            venue_cash_usd: Some(3_000.0),
+            venue_position_count: 0,
+            venue_balance_observed_at_ms: Some(20_000),
+            ..ExecutionSyncReport::default()
+        },
+        20_000,
+        &adapter,
+    )
+    .await;
+    assert_eq!(live_safety.session_equity_anchor_usd, Some(2_311.0));
+}
+
+#[test]
 fn capital_guard_sets_riskoff_when_marked_equity_breaks_floor() {
     let mut runtime = Runtime::new(
         RuntimeConfig {
