@@ -2449,10 +2449,12 @@ fn kill_switch_degrade_cancels_paired_mm_maker_resting_orders() {
 
     let killed = runtime.degrade_and_cancel_all(3, "operator kill switch active");
     assert_eq!(runtime.status(), RuntimeStatus::Degraded);
-    let cancelled_our_leg = killed.commands.iter().any(|cmd| matches!(
-        cmd,
-        RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &leg_coid
-    ));
+    let cancelled_our_leg = killed.commands.iter().any(|cmd| {
+        matches!(
+            cmd,
+            RuntimeCommand::Cancel { client_order_id, .. } if client_order_id == &leg_coid
+        )
+    });
     assert!(
         cancelled_our_leg,
         "kill-switch degrade_and_cancel_all must cancel the MM's resting maker leg; got {:?}",
@@ -2549,6 +2551,44 @@ fn btc_mm_rejects_duplicate_active_buy_for_same_instrument() {
         "hedge-rescue intent must coexist with active paired-bid"
     );
     assert_eq!(runtime.open_orders().count(), 2);
+}
+
+#[test]
+fn bte_taker_is_not_suppressed_by_unresolved_drift_guard() {
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 100.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits::default(),
+        NoopStrategy,
+        MarketContextStore::empty(),
+    );
+    runtime
+        .markets_with_unresolved_drift
+        .insert(MarketId::from("market-bte"));
+
+    let mut intent = OrderIntent::new_buy(
+        ClientOrderId::from("bte-repair"),
+        MarketId::from("market-bte"),
+        InstrumentId::from("up"),
+        0.53,
+        5.0,
+        "bte repair",
+        2,
+    );
+    intent.quote_level_tag = Some("bte-taker:back_to_explore_range_repair".to_string());
+
+    let outcome = runtime.accept_external_intent(intent, 2);
+    assert!(
+        outcome
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Submit(_))),
+        "BTE taker repair should not be suppressed as generic drifted fresh entry"
+    );
 }
 
 #[test]

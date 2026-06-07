@@ -7,9 +7,7 @@
 //!
 //! Run: `cargo run -p polymarket-exec --bin br2_shadow_smoke [snapshot.json]`
 
-use polymarket_exec::runtime::br2_shadow::{
-    Br2ShadowAdapter, SpotTrade, YesTopOfBook,
-};
+use polymarket_exec::runtime::br2_shadow::{Br2ShadowAdapter, SpotTrade, YesTopOfBook};
 
 const NS_PER_MS: i64 = 1_000_000;
 const MARKET_WINDOW_NS: i64 = 300 * 1_000_000_000;

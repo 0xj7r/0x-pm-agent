@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::signals::{BtcRegimeSnapshot, MomentumEngine, MomentumSignal};
+use pm_strategy::regime::WhipsawRiskSnapshot;
 
 const BTC_SIGNAL_WINDOW_5M_MS: u64 = 5 * 60 * 1_000;
 const BTC_SIGNAL_WINDOW_15M_MS: u64 = 15 * 60 * 1_000;
@@ -59,6 +60,107 @@ impl BtcSignalStore {
     pub(super) fn momentum_signal(&self, now_ms: u64) -> MomentumSignal {
         let samples = self.price_samples.iter().copied().collect::<Vec<_>>();
         MomentumEngine::default().compute(now_ms, &samples)
+    }
+
+    pub(super) fn whipsaw_snapshot(&self, now_ms: u64) -> WhipsawRiskSnapshot {
+        const WINDOW_MS: u64 = 180_000;
+        const STEP_MS: u64 = 5_000;
+
+        let start_ms = now_ms.saturating_sub(WINDOW_MS);
+        let mut sampled = Vec::with_capacity((WINDOW_MS / STEP_MS) as usize + 1);
+        let mut next_ms = start_ms;
+        while next_ms <= now_ms {
+            if let Some(price) = self.price_at_or_before(next_ms) {
+                sampled.push((next_ms, price));
+            }
+            next_ms = next_ms.saturating_add(STEP_MS);
+            if next_ms == u64::MAX {
+                break;
+            }
+        }
+        if sampled.len() < 8 {
+            return WhipsawRiskSnapshot::default();
+        }
+
+        let first = sampled.first().map(|(_, price)| *price).unwrap_or(0.0);
+        let last = sampled.last().map(|(_, price)| *price).unwrap_or(0.0);
+        if first <= 0.0 || last <= 0.0 {
+            return WhipsawRiskSnapshot::default();
+        }
+
+        let mut path_abs = 0.0f64;
+        let mut sumsq = 0.0f64;
+        let mut returns = Vec::with_capacity(sampled.len().saturating_sub(1));
+        for pair in sampled.windows(2) {
+            let prev = pair[0].1;
+            let next = pair[1].1;
+            if prev <= 0.0 || next <= 0.0 {
+                continue;
+            }
+            let ret = (next / prev).ln();
+            if ret.is_finite() {
+                path_abs += ret.abs();
+                sumsq += ret * ret;
+                returns.push(ret);
+            }
+        }
+        if returns.len() < 7 || path_abs <= 0.0 {
+            return WhipsawRiskSnapshot::default();
+        }
+
+        let net_abs = (last / first).ln().abs();
+        let path_efficiency = (net_abs / path_abs).clamp(0.0, 1.0);
+        let realized_vol_180s_bps =
+            (sumsq / returns.len() as f64).sqrt() * (returns.len() as f64).sqrt() * 10_000.0;
+
+        let mut sign_flips = 0usize;
+        let mut prev_sign = 0i8;
+        for ret in &returns {
+            let sign = if *ret > 0.0 {
+                1
+            } else if *ret < 0.0 {
+                -1
+            } else {
+                0
+            };
+            if sign != 0 && prev_sign != 0 && sign != prev_sign {
+                sign_flips += 1;
+            }
+            if sign != 0 {
+                prev_sign = sign;
+            }
+        }
+        let sign_flip_rate = if returns.len() > 1 {
+            sign_flips as f64 / (returns.len() - 1) as f64
+        } else {
+            0.0
+        };
+
+        let mid = sampled.len() / 2;
+        let early = sampled
+            .get(mid)
+            .map(|(_, price)| (*price / first - 1.0) * 10_000.0)
+            .unwrap_or(0.0);
+        let late = (last / sampled[mid].1 - 1.0) * 10_000.0;
+        let reversal_pressure =
+            if early.is_finite() && late.is_finite() && early.signum() != late.signum() {
+                (early.abs().min(late.abs()) / 12.0).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+        let score =
+            ((1.0 - path_efficiency) * 0.45 + sign_flip_rate * 0.35 + reversal_pressure * 0.20)
+                .clamp(0.0, 1.0);
+
+        WhipsawRiskSnapshot {
+            score: score as f32,
+            path_efficiency: path_efficiency as f32,
+            sign_flip_rate: sign_flip_rate as f32,
+            realized_vol_180s_bps: realized_vol_180s_bps as f32,
+            reversal_pressure: reversal_pressure as f32,
+            sample_count: sampled.len(),
+        }
     }
 
     fn prune(&mut self, now_ms: u64) {
@@ -152,6 +254,14 @@ impl BtcSignalStore {
         }
         Some(((current / baseline) - 1.0) * 10_000.0)
     }
+
+    fn price_at_or_before(&self, target_ms: u64) -> Option<f64> {
+        self.price_samples
+            .iter()
+            .rev()
+            .find(|(sample_ms, price)| *sample_ms <= target_ms && price.is_finite() && *price > 0.0)
+            .map(|(_, price)| *price)
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +307,21 @@ mod tests {
         assert_eq!(snap.price_history_ms, 30_000);
         assert!(snap.return_30s_bps.is_some());
         assert_eq!(snap.return_60s_bps, None);
+    }
+
+    #[test]
+    fn whipsaw_snapshot_exports_path_features_after_warmup() {
+        let mut store = BtcSignalStore::default();
+        for i in 0..=36 {
+            let price = if i % 2 == 0 { 100.0 } else { 100.3 };
+            store.record_trade(price, i * 5_000);
+        }
+
+        let snap = store.whipsaw_snapshot(180_000);
+
+        assert!(snap.sample_count >= 30);
+        assert!(snap.sign_flip_rate > 0.8);
+        assert!(snap.path_efficiency < 0.2);
+        assert!(snap.score > 0.5);
     }
 }

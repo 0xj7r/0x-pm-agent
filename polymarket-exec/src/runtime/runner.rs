@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+use pm_strategy::regime::{classify_market_regime_cluster, MarketRegimeCluster};
 
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
@@ -30,7 +32,7 @@ use crate::runtime::live_health::{
     needs_reconcile_order_count,
 };
 use crate::runtime::market_universe::{
-    RuntimeMarketUniverse, fetch_btc_5m_market_contexts, refresh_runtime_market_universe,
+    fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
 };
 use crate::runtime::order_store::SqliteOrderStore;
 use crate::runtime::paper_fill::{
@@ -44,7 +46,7 @@ use crate::types::{
     ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
     RuntimeCommand, RuntimeStatus, TradeSide,
 };
-use crate::wire::api::{DashboardSnapshot, DashboardUiState, serve_http};
+use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
 use crate::wire::execution_adapter::{
     CancelOrderRequest, ExecutionAdapter, ExecutionError, MergePositionsRequest,
@@ -58,10 +60,83 @@ use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 const LATE_FAV_MAKER_TTL_MS: u64 = 30_000;
 
+fn router_high_range_chaos_risk_off(
+    market_yes_range_so_far: f32,
+    whipsaw_score: f32,
+    path_efficiency: f32,
+    sign_flip_rate: f32,
+    realized_vol_180s_bps: f32,
+) -> bool {
+    let wide_range_chaos = market_yes_range_so_far >= 0.50
+        && whipsaw_score >= 0.50
+        && realized_vol_180s_bps >= 6.0
+        && (path_efficiency <= 0.25 || sign_flip_rate >= 0.35);
+    let violent_low_efficiency_chop = market_yes_range_so_far >= 0.30
+        && whipsaw_score >= 0.60
+        && path_efficiency <= 0.05
+        && sign_flip_rate >= 0.35
+        && realized_vol_180s_bps >= 6.0;
+    wide_range_chaos || violent_low_efficiency_chop
+}
+
+fn static_cluster_router_route(cluster: MarketRegimeCluster) -> &'static str {
+    match cluster {
+        MarketRegimeCluster::CleanDirectionalPath
+        | MarketRegimeCluster::EarlyTightRange
+        | MarketRegimeCluster::LowEfficiencyNonreversal
+        | MarketRegimeCluster::MixedNeutral => "bte",
+        MarketRegimeCluster::ExpandedHighFlip
+        | MarketRegimeCluster::ExpandedReversalPressure
+        | MarketRegimeCluster::FlowAdverseVolCluster => "br2",
+        MarketRegimeCluster::CalmLowVol => "risk_off",
+    }
+}
+
+fn live_router_route(
+    cluster: MarketRegimeCluster,
+    market_yes_range_so_far: f32,
+    whipsaw_score: f32,
+    path_efficiency: f32,
+    sign_flip_rate: f32,
+    realized_vol_180s_bps: f32,
+) -> &'static str {
+    if router_high_range_chaos_risk_off(
+        market_yes_range_so_far,
+        whipsaw_score,
+        path_efficiency,
+        sign_flip_rate,
+        realized_vol_180s_bps,
+    ) {
+        return "risk_off";
+    }
+    static_cluster_router_route(cluster)
+}
+
+fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
+    if br2_orders > 0 {
+        "br2"
+    } else if bte_orders > 0 {
+        "bte"
+    } else {
+        "risk_off"
+    }
+}
+
 fn runtime_env(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn runtime_env_truthy(key: &str) -> bool {
+    runtime_env(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub async fn run() -> Result<()> {
@@ -1182,6 +1257,20 @@ async fn run_runtime_loop(
         config.live_kill_switch_path.as_deref(),
         config.strategy_profile.as_ref(),
     );
+    let router_shadow_enabled = runtime_env_truthy("PM_BTC_5M_ROUTER_SHADOW");
+    let router_enforce_enabled = runtime_env_truthy("PM_BTC_5M_ROUTER_ENFORCE");
+    let router_decision_enabled = router_shadow_enabled || router_enforce_enabled;
+    let mut router_yes_ranges: HashMap<MarketId, (f32, f32)> = HashMap::new();
+    if router_decision_enabled {
+        info!(
+            target: "router_shadow",
+            br2_shadow_enabled = br2_shadow.is_some(),
+            bte_shadow_enabled = bte_shadow.is_some(),
+            router_shadow_enabled,
+            router_enforce_enabled,
+            "router layer enabled: BTE-vs-BR2 selection diagnostics"
+        );
+    }
     // Calm-regime PAIRED-MM overlay: OFF unless PM_BTC_5M_PAIRED_MM_SHADOW is
     // truthy. Shadow path decides + logs the two-sided touch quotes and a
     // simulated pairing/inventory/PnL and SUBMITS NOTHING. PAPER submission is
@@ -1624,6 +1713,7 @@ async fn run_runtime_loop(
                             }
                             let mut br2_submit_intents: Vec<OrderIntent> = Vec::new();
                             let mut br2_quoting_this_market = false;
+                            let mut br2_shadow_order_count = 0usize;
                             if let Some(shadow) = br2_shadow.as_mut() {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
                                     // Thread the REAL paper position into br2's
@@ -1663,11 +1753,13 @@ async fn run_runtime_loop(
                                         no_book.as_ref(),
                                         now_unix_ms(),
                                     );
-                                    br2_quoting_this_market = !result.orders.is_empty();
+                                    br2_shadow_order_count = result.orders.len();
+                                    br2_quoting_this_market = br2_shadow_order_count > 0;
                                     br2_submit_intents = result.submit_intents;
                                 }
                             }
                             let mut bte_submit_intents: Vec<OrderIntent> = Vec::new();
+                            let mut bte_shadow_order_count = 0usize;
                             if let Some(shadow) = bte_shadow.as_mut() {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
                                     let inventory = runtime.inventory();
@@ -1705,7 +1797,7 @@ async fn run_runtime_loop(
                                         } else {
                                             1.0
                                         };
-                                    let btc_regime = runtime.btc_regime_snapshot(now_unix_ms());
+                                    let whipsaw = runtime.btc_whipsaw_snapshot(now_unix_ms());
                                     let current_market_net_exposure_shares = yes_shares - no_shares;
                                     let btc_ladder_net_exposure_shares =
                                         runtime.btc_ladder_net_exposure_shares(now_unix_ms());
@@ -1723,11 +1815,11 @@ async fn run_runtime_loop(
                                             current_daily_loss_pct: daily_loss_pct,
                                         };
                                     let regime = crate::runtime::bte_shadow::BteRegimeInputs {
-                                        realized_vol_180s_bps: btc_regime
-                                            .realized_vol_5m_bps
-                                            .unwrap_or(0.0)
-                                            as f32,
-                                        ..crate::runtime::bte_shadow::BteRegimeInputs::default()
+                                        whipsaw_score: whipsaw.score,
+                                        path_efficiency: whipsaw.path_efficiency,
+                                        reversal_pressure: whipsaw.reversal_pressure,
+                                        sign_flip_rate: whipsaw.sign_flip_rate,
+                                        realized_vol_180s_bps: whipsaw.realized_vol_180s_bps,
                                     };
                                     let no_book = match record.instrument_ids.get(1) {
                                         Some(no_id) => books.snapshot(no_id.as_str()).await,
@@ -1742,7 +1834,113 @@ async fn run_runtime_loop(
                                         no_book.as_ref(),
                                         now_unix_ms(),
                                     );
+                                    bte_shadow_order_count = result.orders.len();
                                     bte_submit_intents = result.submit_intents;
+                                }
+                            }
+                            let mut router_selected_route: Option<&'static str> = None;
+                            if router_decision_enabled {
+                                if let Some(record) = runtime.market_context_record(&market_id) {
+                                    let yes_book = if record
+                                        .instrument_ids
+                                        .first()
+                                        .is_some_and(|id| id == asset_id)
+                                    {
+                                        Some(book.clone())
+                                    } else {
+                                        match record.instrument_ids.first() {
+                                            Some(yes_id) => books.snapshot(yes_id.as_str()).await,
+                                            None => None,
+                                        }
+                                    };
+                                    if let Some(yes_book) = yes_book {
+                                        if yes_book.best_bid <= 0.0 || yes_book.best_ask <= 0.0 {
+                                            router_selected_route = Some("risk_off");
+                                        } else {
+                                            let yes_mid =
+                                                (0.5 * (yes_book.best_bid + yes_book.best_ask))
+                                                    as f32;
+                                            let (range_min, range_max) = router_yes_ranges
+                                                .entry(market_id.clone())
+                                                .and_modify(|(lo, hi)| {
+                                                    *lo = lo.min(yes_mid);
+                                                    *hi = hi.max(yes_mid);
+                                                })
+                                                .or_insert((yes_mid, yes_mid));
+                                            let market_yes_range_so_far =
+                                                (*range_max - *range_min).max(0.0);
+                                            let whipsaw = runtime.btc_whipsaw_snapshot(now_unix_ms());
+                                            let cluster = classify_market_regime_cluster(
+                                                market_yes_range_so_far,
+                                                whipsaw.path_efficiency,
+                                                whipsaw.reversal_pressure,
+                                                whipsaw.sign_flip_rate,
+                                                whipsaw.realized_vol_180s_bps,
+                                                None,
+                                            );
+                                            let btc_regime =
+                                                runtime.btc_regime_snapshot(now_unix_ms());
+                                            let static_cluster_route =
+                                                static_cluster_router_route(cluster);
+                                            let effective_router_route = live_router_route(
+                                                cluster,
+                                                market_yes_range_so_far,
+                                                whipsaw.score,
+                                                whipsaw.path_efficiency,
+                                                whipsaw.sign_flip_rate,
+                                                whipsaw.realized_vol_180s_bps,
+                                            );
+                                            router_selected_route = Some(effective_router_route);
+                                            let shadow_vote_route = shadow_vote_route(
+                                                br2_shadow_order_count,
+                                                bte_shadow_order_count,
+                                            );
+                                            if router_shadow_enabled {
+                                                info!(
+                                                    target: "router_shadow",
+                                                    market = %market_id,
+                                                    cluster = %cluster,
+                                                    static_cluster_route,
+                                                    effective_router_route,
+                                                    shadow_vote_route,
+                                                    router_enforce_enabled,
+                                                    br2_orders = br2_shadow_order_count,
+                                                    bte_orders = bte_shadow_order_count,
+                                                    yes_mid,
+                                                    market_yes_range_so_far,
+                                                    whipsaw_score = whipsaw.score,
+                                                    path_efficiency = whipsaw.path_efficiency,
+                                                    sign_flip_rate = whipsaw.sign_flip_rate,
+                                                    reversal_pressure = whipsaw.reversal_pressure,
+                                                    realized_vol_180s_bps = whipsaw.realized_vol_180s_bps,
+                                                    whipsaw_sample_count = whipsaw.sample_count,
+                                                    btc_micro_regime = ?btc_regime.regime(),
+                                                    "ROUTER-SHADOW selected strategy diagnostics"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if router_enforce_enabled {
+                                let route = router_selected_route.unwrap_or("risk_off");
+                                let br2_suppressed = route != "br2" && !br2_submit_intents.is_empty();
+                                let bte_suppressed = route != "bte" && !bte_submit_intents.is_empty();
+                                if route != "br2" {
+                                    br2_submit_intents.clear();
+                                }
+                                if route != "bte" {
+                                    bte_submit_intents.clear();
+                                }
+                                if br2_suppressed || bte_suppressed {
+                                    warn!(
+                                        target: "router_enforce",
+                                        market = %market_id,
+                                        route,
+                                        br2_suppressed,
+                                        bte_suppressed,
+                                        "ROUTER-ENFORCE suppressed non-routed live intents"
+                                    );
                                 }
                             }
                             // Paired-MM overlay: logs the two-sided touch quotes +
@@ -1867,8 +2065,29 @@ async fn run_runtime_loop(
                             // submit is tracked and passes the active-order
                             // guard in execute_execution_adapter.
                             for intent in bte_submit_intents {
+                                let client_order_id = intent.client_order_id.clone();
+                                let market_id = intent.market_id.clone();
+                                let instrument_id = intent.instrument_id.clone();
+                                let quote_level_tag = intent.quote_level_tag.clone();
                                 let submit_outcome =
                                     runtime.accept_external_intent(intent, now_mm_ms);
+                                let submit_accepted =
+                                    submit_outcome.commands.iter().any(|command| {
+                                        matches!(
+                                            command,
+                                            crate::types::RuntimeCommand::Submit(_)
+                                        )
+                                    });
+                                if !submit_accepted {
+                                    warn!(
+                                        target: "bte_shadow",
+                                        client_order_id = %client_order_id,
+                                        market = %market_id,
+                                        instrument = %instrument_id,
+                                        quote_level_tag = ?quote_level_tag,
+                                        "BTE-LIVE intent suppressed before runtime submit"
+                                    );
+                                }
                                 outcome.commands.extend(submit_outcome.commands);
                                 outcome.event_seqs.extend(submit_outcome.event_seqs);
                             }

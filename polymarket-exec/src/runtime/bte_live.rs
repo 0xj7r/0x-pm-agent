@@ -25,6 +25,11 @@ const NS_PER_MS: i64 = 1_000_000;
 const DECISION_CADENCE_MS: u64 = 1_000;
 const DEFAULT_MIN_ORDER_SHARES: f64 = 5.0;
 const DEFAULT_MIN_ORDER_NOTIONAL_USD: f64 = 1.8;
+const LIVE_REVERSAL_REPAIR_MIN_RESIDUAL_SHARES: f64 = 15.0;
+const LIVE_REVERSAL_REPAIR_MIN_PRESSURE: f32 = 0.20;
+const LIVE_REVERSAL_REPAIR_MIN_WHIPSAW: f32 = 0.52;
+const LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY: f32 = 0.30;
+const LIVE_REVERSAL_REPAIR_MIN_SIGN_FLIP_RATE: f32 = 0.30;
 
 struct ActiveMarket {
     market_id: MarketId,
@@ -297,8 +302,26 @@ impl BteLiveShadow {
             let tag_taker = self.live_trade_armed;
             let mut intents = Vec::new();
             for order in &orders {
+                let (order, forced_repair) = live_reversal_repair_order(order, pos, regime);
+                if forced_repair {
+                    warn!(
+                        target: "bte_shadow",
+                        market = %market_id,
+                        market_u32 = order.market_id,
+                        side = ?order.side,
+                        residual_shares = pos.current_market_net_exposure_shares,
+                        yes_shares = pos.yes_shares,
+                        no_shares = pos.no_shares,
+                        whipsaw_score = regime.whipsaw_score,
+                        path_efficiency = regime.path_efficiency,
+                        reversal_pressure = regime.reversal_pressure,
+                        sign_flip_rate = regime.sign_flip_rate,
+                        realized_vol_180s_bps = regime.realized_vol_180s_bps,
+                        "BTE-LIVE forcing opposite-side repair in reversal regime"
+                    );
+                }
                 let Some(intent) = shadow_order_to_intent(
-                    order,
+                    &order,
                     market_id,
                     &yes_token,
                     no_token.as_ref(),
@@ -371,7 +394,8 @@ impl BteLiveShadow {
         let market_headroom = if risk_increasing {
             (self.max_market_notional_usd - counted_risk_notional).max(0.0)
         } else {
-            self.max_market_notional_usd.max(self.max_order_notional_usd)
+            self.max_market_notional_usd
+                .max(self.max_order_notional_usd)
         };
         if market_headroom <= 0.0 {
             warn!(
@@ -459,6 +483,46 @@ fn order_increases_current_market_residual(side: Side, pos: BteDecisionPosition)
     }
 }
 
+fn live_reversal_repair_order(
+    order: &BteShadowOrder,
+    pos: BteDecisionPosition,
+    regime: BteRegimeInputs,
+) -> (BteShadowOrder, bool) {
+    if !matches!(order.side, Side::BuyYes | Side::BuyNo) {
+        return (order.clone(), false);
+    }
+    let residual = pos.current_market_net_exposure_shares;
+    if residual.abs() < LIVE_REVERSAL_REPAIR_MIN_RESIDUAL_SHARES {
+        return (order.clone(), false);
+    }
+    if !order_increases_current_market_residual(order.side, pos) {
+        return (order.clone(), false);
+    }
+    if !live_reversal_repair_regime(regime) {
+        return (order.clone(), false);
+    }
+
+    let mut repair = order.clone();
+    repair.side = if residual > 0.0 {
+        Side::BuyNo
+    } else {
+        Side::BuyYes
+    };
+    repair.tag = "back_to_explore_live_reversal_repair";
+    (repair, true)
+}
+
+fn live_reversal_repair_regime(regime: BteRegimeInputs) -> bool {
+    if regime.reversal_pressure >= LIVE_REVERSAL_REPAIR_MIN_PRESSURE
+        && regime.path_efficiency <= LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY
+    {
+        return true;
+    }
+    regime.whipsaw_score >= LIVE_REVERSAL_REPAIR_MIN_WHIPSAW
+        && regime.sign_flip_rate >= LIVE_REVERSAL_REPAIR_MIN_SIGN_FLIP_RATE
+        && regime.path_efficiency <= LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY
+}
+
 fn shadow_order_to_intent(
     order: &BteShadowOrder,
     market_id: &MarketId,
@@ -516,7 +580,7 @@ fn shadow_order_to_intent(
         }
     };
     if tag_taker {
-        intent.quote_level_tag = Some("bte-taker".to_string());
+        intent.quote_level_tag = Some(format!("bte-taker:{}", order.tag));
     }
     if intent.limit_price <= 0.0 || intent.quantity <= 0.0 {
         return None;
@@ -606,7 +670,7 @@ mod tests {
         assert_eq!(intent.instrument_id.as_str(), "no");
         assert_eq!(intent.side, TradeSide::Buy);
         assert!((intent.limit_price - 0.65).abs() < 1e-9);
-        assert_eq!(intent.quote_level_tag.as_deref(), Some("bte-taker"));
+        assert_eq!(intent.quote_level_tag.as_deref(), Some("bte-taker:test"));
     }
 
     #[test]
@@ -736,5 +800,53 @@ mod tests {
             .apply_notional_caps(repair_no, &market, Side::BuyNo, long_yes_at_cap)
             .expect("opposite-side repair should not be blocked by the market cap");
         assert!((capped.notional_usd() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bte_live_reversal_regime_forces_opposite_side_repair() {
+        let long_yes = BteDecisionPosition {
+            yes_shares: 45.0,
+            no_shares: 5.0,
+            current_market_net_exposure_shares: 40.0,
+            ..BteDecisionPosition::default()
+        };
+        let regime = BteRegimeInputs {
+            whipsaw_score: 0.56,
+            path_efficiency: 0.18,
+            reversal_pressure: 0.32,
+            sign_flip_rate: 0.34,
+            realized_vol_180s_bps: 8.8,
+        };
+
+        let (repair, forced) =
+            live_reversal_repair_order(&order(Side::BuyYes, 5.0), long_yes, regime);
+
+        assert!(forced);
+        assert_eq!(repair.side, Side::BuyNo);
+        assert_eq!(repair.tag, "back_to_explore_live_reversal_repair");
+    }
+
+    #[test]
+    fn bte_live_clean_path_keeps_same_side_order() {
+        let long_yes = BteDecisionPosition {
+            yes_shares: 45.0,
+            no_shares: 5.0,
+            current_market_net_exposure_shares: 40.0,
+            ..BteDecisionPosition::default()
+        };
+        let regime = BteRegimeInputs {
+            whipsaw_score: 0.20,
+            path_efficiency: 0.80,
+            reversal_pressure: 0.0,
+            sign_flip_rate: 0.12,
+            realized_vol_180s_bps: 5.0,
+        };
+
+        let (same, forced) =
+            live_reversal_repair_order(&order(Side::BuyYes, 5.0), long_yes, regime);
+
+        assert!(!forced);
+        assert_eq!(same.side, Side::BuyYes);
+        assert_eq!(same.tag, "test");
     }
 }

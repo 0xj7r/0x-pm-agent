@@ -261,8 +261,12 @@ impl<S: Strategy> Runtime<S> {
             .filter_map(|record| {
                 let yes_id = record.instrument_ids.first()?;
                 let no_id = record.instrument_ids.get(1)?;
-                let yes_qty = self.inventory.position_qty(&InstrumentId::from(yes_id.as_str()));
-                let no_qty = self.inventory.position_qty(&InstrumentId::from(no_id.as_str()));
+                let yes_qty = self
+                    .inventory
+                    .position_qty(&InstrumentId::from(yes_id.as_str()));
+                let no_qty = self
+                    .inventory
+                    .position_qty(&InstrumentId::from(no_id.as_str()));
                 Some(yes_qty - no_qty)
             })
             .sum()
@@ -2004,6 +2008,13 @@ impl<S: Strategy> Runtime<S> {
         self.btc_signals.snapshot(now_ms)
     }
 
+    pub fn btc_whipsaw_snapshot(
+        &self,
+        now_ms: EpochMillis,
+    ) -> pm_strategy::regime::WhipsawRiskSnapshot {
+        self.btc_signals.whipsaw_snapshot(now_ms)
+    }
+
     pub fn on_fill(&mut self, mut fill: FillReport) -> Result<RuntimeOutcome, RuntimeError> {
         fill.market_id =
             self.canonical_market_id_for_instrument(&fill.instrument_id, &fill.market_id);
@@ -2197,7 +2208,9 @@ impl<S: Strategy> Runtime<S> {
                             .entry(key)
                             .or_insert(0.0) += fill.quantity;
                     }
-                    AccountingLane::PairedCore | AccountingLane::Other => {}
+                    AccountingLane::PairedCore
+                    | AccountingLane::BackToExplore
+                    | AccountingLane::Other => {}
                 }
             }
             outcome.push_event(

@@ -130,16 +130,16 @@ const LATE_PULL_SECS: f64 = 45.0; // pull both legs in the last N seconds
 const DEFAULT_MIN_REQUOTE_AGE_MS: u64 = 5_000; // hold a resting leg >=5s before chasing
 const DEFAULT_REQUOTE_MIN_TICKS: f64 = 0.01; // and only chase once the touch moved >=1c
 const REPAIR_DELTA_SHARES: f64 = 2.0; // residual-cap band on |yes_long - no_long|
-// Polymarket rejects any order with size < 5 shares ("minimum"). bound_clip_to_caps
-// never emits 0 < size < this: it rounds a cap-shrunk leg UP to the floor when that
-// still fits the relevant HARD bound, else drops the leg. repair_delta is clamped
-// to >= this so the residual cap bites at a real, clip-granular boundary.
+                                      // Polymarket rejects any order with size < 5 shares ("minimum"). bound_clip_to_caps
+                                      // never emits 0 < size < this: it rounds a cap-shrunk leg UP to the floor when that
+                                      // still fits the relevant HARD bound, else drops the leg. repair_delta is clamped
+                                      // to >= this so the residual cap bites at a real, clip-granular boundary.
 const DEFAULT_MIN_ORDER_SHARES: f64 = 5.0;
 const RESIDUAL_CAP_FRAC: f64 = 0.05; // target residual <= 5% of paired volume (logged)
-// Side-aware EV-gated residual policy: extra directional budget (shares) we are
-// willing to HOLD on the +EV UNDERDOG side instead of re-pairing it away. 0.0
-// disables the policy entirely, so the residual handling is byte-identical to
-// the symmetric always-re-pair behavior (DEFAULT-OFF).
+                                     // Side-aware EV-gated residual policy: extra directional budget (shares) we are
+                                     // willing to HOLD on the +EV UNDERDOG side instead of re-pairing it away. 0.0
+                                     // disables the policy entirely, so the residual handling is byte-identical to
+                                     // the symmetric always-re-pair behavior (DEFAULT-OFF).
 const DEFAULT_UNDERDOG_HOLD_CAP_SHARES: f64 = 0.0;
 // Active-flatten: seconds a flatten-target residual must persist UNREDUCED (the
 // passive re-pair quote hasn't filled) before we pay the spread to exit it with a
@@ -460,7 +460,11 @@ fn residual_policy(
     // skew < 0 => net long NO (priced at 1 - yes_mid). FAVOURITE iff the leading
     // side's price > 0.5.
     let leading_long_yes = skew > 0.0;
-    let leading_price = if leading_long_yes { yes_mid } else { 1.0 - yes_mid };
+    let leading_price = if leading_long_yes {
+        yes_mid
+    } else {
+        1.0 - yes_mid
+    };
     let side = if leading_price > 0.5 {
         ResidualSide::Favourite
     } else {
@@ -582,7 +586,10 @@ impl QueueLog {
                     path = %path.display(),
                     "PAIRED-MM queue-modeling capture enabled (structured JSONL per maker-order lifecycle event)"
                 );
-                Some(Self { writer: BufWriter::new(file), path })
+                Some(Self {
+                    writer: BufWriter::new(file),
+                    path,
+                })
             }
             Err(error) => {
                 warn!(
@@ -607,7 +614,11 @@ impl QueueLog {
             }
         };
         line.push(b'\n');
-        if let Err(error) = self.writer.write_all(&line).and_then(|_| self.writer.flush()) {
+        if let Err(error) = self
+            .writer
+            .write_all(&line)
+            .and_then(|_| self.writer.flush())
+        {
             warn!(
                 target: "paired_mm",
                 path = %self.path.display(),
@@ -826,14 +837,17 @@ impl PairedMmLiveShadow {
                 live_kill_switch_path,
             );
         }
-        let clip_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_CLIP_SHARES").unwrap_or(DEFAULT_CLIP_SHARES);
+        let clip_shares =
+            env_positive_f64("PM_BTC_5M_PAIRED_MM_CLIP_SHARES").unwrap_or(DEFAULT_CLIP_SHARES);
         let rebate_on = env_truthy("PM_BTC_5M_PAIRED_MM_REBATE");
         let mid_lo = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MID_LO").unwrap_or(REGIME_MID_LO);
         let mid_hi = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MID_HI").unwrap_or(REGIME_MID_HI);
         let range_max = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_RANGE_MAX").unwrap_or(REGIME_RANGE_MAX);
-        let spot_vol_max = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_VOL_MAX").unwrap_or(REGIME_SPOT_VOL_MAX);
+        let spot_vol_max =
+            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_VOL_MAX").unwrap_or(REGIME_SPOT_VOL_MAX);
         let flip_min = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_FLIP_MIN").unwrap_or(REGIME_FLIP_MIN);
-        let late_pull_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS").unwrap_or(LATE_PULL_SECS);
+        let late_pull_secs =
+            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_LATE_PULL_SECS").unwrap_or(LATE_PULL_SECS);
         // Venue 5-share minimum order size. Cap-shrunk legs round UP to this or drop.
         let min_order_shares = env_positive_f64("PM_BTC_5M_PAIRED_MM_MIN_ORDER_SHARES")
             .unwrap_or(DEFAULT_MIN_ORDER_SHARES);
@@ -845,8 +859,9 @@ impl PairedMmLiveShadow {
             .unwrap_or(REPAIR_DELTA_SHARES)
             .max(min_order_shares);
         // DEFAULT-OFF: unset/0 => symmetric always-re-pair (byte-identical).
-        let underdog_hold_cap_shares = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_UNDERDOG_HOLD_CAP_SHARES")
-            .unwrap_or(DEFAULT_UNDERDOG_HOLD_CAP_SHARES);
+        let underdog_hold_cap_shares =
+            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_UNDERDOG_HOLD_CAP_SHARES")
+                .unwrap_or(DEFAULT_UNDERDOG_HOLD_CAP_SHARES);
         // DEFAULT-OFF: unset/0 => no active-flatten (passive re-pair only).
         let active_flatten_secs = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_ACTIVE_FLATTEN_SECS")
             .unwrap_or(DEFAULT_ACTIVE_FLATTEN_SECS);
@@ -857,8 +872,8 @@ impl PairedMmLiveShadow {
         let min_requote_age_ms = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_MIN_REQUOTE_AGE_MS")
             .map(|v| v as u64)
             .unwrap_or(DEFAULT_MIN_REQUOTE_AGE_MS);
-        let requote_min_ticks =
-            env_nonneg_f64("PM_BTC_5M_PAIRED_MM_REQUOTE_MIN_TICKS").unwrap_or(DEFAULT_REQUOTE_MIN_TICKS);
+        let requote_min_ticks = env_nonneg_f64("PM_BTC_5M_PAIRED_MM_REQUOTE_MIN_TICKS")
+            .unwrap_or(DEFAULT_REQUOTE_MIN_TICKS);
         info!(
             target: "paired_mm",
             clip_shares,
@@ -935,7 +950,10 @@ impl PairedMmLiveShadow {
         if !price.is_finite() || price <= 0.0 {
             return;
         }
-        self.spot.push_back(SpotSample { ts_ms: observed_at_ms, price });
+        self.spot.push_back(SpotSample {
+            ts_ms: observed_at_ms,
+            price,
+        });
         // Keep ~2x the active window so range/vol over the whole quoting window
         // is always covered.
         let horizon_ms = (ACTIVE_WIN_SECS as u64) * 2 * 1_000;
@@ -972,7 +990,8 @@ impl PairedMmLiveShadow {
         pos: PairedPosition,
         now_ms: u64,
     ) -> PairedMmTickResult {
-        let (Some(open_ms), Some(close_ms)) = (record.event_start_time_ms, record.event_end_time_ms)
+        let (Some(open_ms), Some(close_ms)) =
+            (record.event_start_time_ms, record.event_end_time_ms)
         else {
             return PairedMmTickResult::default();
         };
@@ -1000,7 +1019,10 @@ impl PairedMmLiveShadow {
         // Ignore ticks for markets not currently live; never re-open a resolved
         // window. (Any close-driven cancels above are still returned.)
         if now_ms > close_ms || now_ms < open_ms {
-            return PairedMmTickResult { cancel_ids, ..Default::default() };
+            return PairedMmTickResult {
+                cancel_ids,
+                ..Default::default()
+            };
         }
 
         // Roll to a new live BTC-5m window if the runtime moved on.
@@ -1050,11 +1072,20 @@ impl PairedMmLiveShadow {
             None => false,
         };
         if !should_decide {
-            return PairedMmTickResult { cancel_ids, ..Default::default() };
+            return PairedMmTickResult {
+                cancel_ids,
+                ..Default::default()
+            };
         }
         // Need a two-sided YES top-of-book.
-        if yes_book.best_bid <= 0.0 || yes_book.best_ask <= 0.0 || yes_book.best_ask < yes_book.best_bid {
-            return PairedMmTickResult { cancel_ids, ..Default::default() };
+        if yes_book.best_bid <= 0.0
+            || yes_book.best_ask <= 0.0
+            || yes_book.best_ask < yes_book.best_bid
+        {
+            return PairedMmTickResult {
+                cancel_ids,
+                ..Default::default()
+            };
         }
 
         let yes_mid = 0.5 * (yes_book.best_bid + yes_book.best_ask);
@@ -1074,7 +1105,11 @@ impl PairedMmLiveShadow {
         // legs (if any) so we never co-quote.
         if br2_quoting {
             self.drain_resting_legs(&mut cancel_ids);
-            let last = self.disjoint_skip_markets.get(market_id.as_str()).copied().unwrap_or(0);
+            let last = self
+                .disjoint_skip_markets
+                .get(market_id.as_str())
+                .copied()
+                .unwrap_or(0);
             if now_ms.saturating_sub(last) >= 15_000 {
                 info!(
                     target: "paired_mm",
@@ -1082,9 +1117,13 @@ impl PairedMmLiveShadow {
                     secs_to_close,
                     "PAIRED-MM abstaining: br2 is quoting this market (regime-disjoint)"
                 );
-                self.disjoint_skip_markets.insert(market_id.as_str().to_string(), now_ms);
+                self.disjoint_skip_markets
+                    .insert(market_id.as_str().to_string(), now_ms);
             }
-            return PairedMmTickResult { cancel_ids, ..Default::default() };
+            return PairedMmTickResult {
+                cancel_ids,
+                ..Default::default()
+            };
         }
 
         // First, simulate any fill since the last tick from a fresh taker print
@@ -1099,8 +1138,8 @@ impl PairedMmLiveShadow {
 
         // Regime quote-gate (evaluated on data SO FAR, no lookahead).
         let warmup_ok = self.spot_history_secs(now_ms) >= REGIME_WARMUP_SECS;
-        let in_window = (ACTIVE_WIN_SECS - secs_to_close.max(0.0)) >= 0.0
-            && secs_to_close <= ACTIVE_WIN_SECS;
+        let in_window =
+            (ACTIVE_WIN_SECS - secs_to_close.max(0.0)) >= 0.0 && secs_to_close <= ACTIVE_WIN_SECS;
         let mid_ok = (self.mid_lo..=self.mid_hi).contains(&yes_mid);
         let range = if mid_max.is_finite() && mid_min.is_finite() {
             mid_max - mid_min
@@ -1133,7 +1172,10 @@ impl PairedMmLiveShadow {
             );
             // Not quoting this tick: pull any resting legs.
             self.drain_resting_legs(&mut cancel_ids);
-            return PairedMmTickResult { cancel_ids, ..Default::default() };
+            return PairedMmTickResult {
+                cancel_ids,
+                ..Default::default()
+            };
         }
 
         // Dynamic gates: which legs are live this tick.
@@ -1155,7 +1197,10 @@ impl PairedMmLiveShadow {
         let skew = if self.submission_armed() {
             pos.skew()
         } else {
-            self.active.as_ref().map(|a| a.inventory.skew()).unwrap_or(0.0)
+            self.active
+                .as_ref()
+                .map(|a| a.inventory.skew())
+                .unwrap_or(0.0)
         };
         // Side-aware, EV-gated residual policy. With underdog_hold_cap_shares == 0
         // (default) this returns the EXACT symmetric re-pair the legacy gate did
@@ -1347,7 +1392,13 @@ impl PairedMmLiveShadow {
             residual_action.as_str(),
         );
 
-        PairedMmTickResult { quoting, bid_price, ask_price, submit_intents, cancel_ids }
+        PairedMmTickResult {
+            quoting,
+            bid_price,
+            ask_price,
+            submit_intents,
+            cancel_ids,
+        }
     }
 
     /// Common book/clock context fields shared by every queue-log record, so a
@@ -1389,19 +1440,33 @@ impl PairedMmLiveShadow {
         post_events: &[QueuePostEvent],
         cancel_events: &[QueueCancelEvent],
     ) {
-        let Some(queue_log) = self.queue_log.as_mut() else { return };
+        let Some(queue_log) = self.queue_log.as_mut() else {
+            return;
+        };
         for ev in cancel_events {
             let unfilled = (ev.clip - ev.filled_so_far).max(0.0);
             let mut rec = Self::queue_ctx(market_id, yes_book, yes_mid, secs_to_close, now_ms);
             if let serde_json::Value::Object(map) = &mut rec {
                 map.insert("event".to_string(), serde_json::json!("cancel"));
-                map.insert("client_order_id".to_string(), serde_json::json!(ev.client_order_id));
+                map.insert(
+                    "client_order_id".to_string(),
+                    serde_json::json!(ev.client_order_id),
+                );
                 map.insert("leg".to_string(), serde_json::json!(ev.leg));
                 map.insert("price".to_string(), serde_json::json!(ev.price));
                 map.insert("clip".to_string(), serde_json::json!(ev.clip));
-                map.insert("filled_so_far".to_string(), serde_json::json!(ev.filled_so_far));
-                map.insert("unfilled_remainder".to_string(), serde_json::json!(unfilled));
-                map.insert("time_rested_ms".to_string(), serde_json::json!(ev.time_rested_ms));
+                map.insert(
+                    "filled_so_far".to_string(),
+                    serde_json::json!(ev.filled_so_far),
+                );
+                map.insert(
+                    "unfilled_remainder".to_string(),
+                    serde_json::json!(unfilled),
+                );
+                map.insert(
+                    "time_rested_ms".to_string(),
+                    serde_json::json!(ev.time_rested_ms),
+                );
                 map.insert("reason".to_string(), serde_json::json!(ev.reason));
             }
             queue_log.append(&rec);
@@ -1411,7 +1476,10 @@ impl PairedMmLiveShadow {
             let mut rec = Self::queue_ctx(market_id, yes_book, yes_mid, secs_to_close, now_ms);
             if let serde_json::Value::Object(map) = &mut rec {
                 map.insert("event".to_string(), serde_json::json!("post"));
-                map.insert("client_order_id".to_string(), serde_json::json!(ev.client_order_id));
+                map.insert(
+                    "client_order_id".to_string(),
+                    serde_json::json!(ev.client_order_id),
+                );
                 map.insert("leg".to_string(), serde_json::json!(ev.leg));
                 map.insert("price".to_string(), serde_json::json!(ev.price));
                 map.insert("clip".to_string(), serde_json::json!(ev.clip));
@@ -1458,7 +1526,9 @@ impl PairedMmLiveShadow {
         let (taker_buy_qty_60s, taker_sell_qty_60s) = yes_book.taker_flow_qty_60s(now_ms);
         let last_trade_price = yes_book.last_trade_price;
         let legs: Vec<(String, &'static str, f64, f64, f64, f64)> = {
-            let Some(active) = self.active.as_ref() else { return };
+            let Some(active) = self.active.as_ref() else {
+                return;
+            };
             [active.bid_leg.as_ref(), active.no_leg.as_ref()]
                 .into_iter()
                 .flatten()
@@ -1497,9 +1567,18 @@ impl PairedMmLiveShadow {
                     "shares_ahead_at_submit".to_string(),
                     serde_json::json!(shares_ahead_at_submit),
                 );
-                map.insert("depth_at_level".to_string(), serde_json::json!(depth_at_level));
-                map.insert("filled_so_far".to_string(), serde_json::json!(filled_so_far));
-                map.insert("last_trade_price".to_string(), serde_json::json!(last_trade_price));
+                map.insert(
+                    "depth_at_level".to_string(),
+                    serde_json::json!(depth_at_level),
+                );
+                map.insert(
+                    "filled_so_far".to_string(),
+                    serde_json::json!(filled_so_far),
+                );
+                map.insert(
+                    "last_trade_price".to_string(),
+                    serde_json::json!(last_trade_price),
+                );
                 map.insert(
                     "taker_buy_qty_60s".to_string(),
                     serde_json::json!(taker_buy_qty_60s),
@@ -1508,8 +1587,14 @@ impl PairedMmLiveShadow {
                     "taker_sell_qty_60s".to_string(),
                     serde_json::json!(taker_sell_qty_60s),
                 );
-                map.insert("residual_side".to_string(), serde_json::json!(residual_side));
-                map.insert("residual_action".to_string(), serde_json::json!(residual_action));
+                map.insert(
+                    "residual_side".to_string(),
+                    serde_json::json!(residual_side),
+                );
+                map.insert(
+                    "residual_action".to_string(),
+                    serde_json::json!(residual_action),
+                );
             }
             queue_log.append(&rec);
         }
@@ -1584,9 +1669,14 @@ impl PairedMmLiveShadow {
         };
         let net_inventory_notional = pos.skew().abs() * yes_mid;
 
-        let Some(active) = self.active.as_mut() else { return };
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
         let yes_token = InstrumentId::from(active.yes_asset_id.as_str());
-        let no_token = active.no_asset_id.as_ref().map(|id| InstrumentId::from(id.as_str()));
+        let no_token = active
+            .no_asset_id
+            .as_ref()
+            .map(|id| InstrumentId::from(id.as_str()));
 
         // Headroom each leg sees: the per-market cap bounds NET inventory, so it is
         // measured against the (riskful) net position, NOT a cumulative submitted
@@ -1631,15 +1721,28 @@ impl PairedMmLiveShadow {
                     cancel_ids.push(existing.client_order_id);
                 }
                 let leg_clip = Self::bound_clip_to_caps(
-                    live_armed, clip, price, max_order, max_market, max_gross,
-                    net_inventory_notional, gross_resting_accum,
-                    bid_reduces_net, min_order_shares,
+                    live_armed,
+                    clip,
+                    price,
+                    max_order,
+                    max_market,
+                    max_gross,
+                    net_inventory_notional,
+                    gross_resting_accum,
+                    bid_reduces_net,
+                    min_order_shares,
                 );
                 if leg_clip > 1e-9 {
                     active.quote_seq += 1;
                     let coid = Self::leg_coid(market_id, "bidyes", active.quote_seq, now_ms);
-                    let intent =
-                        Self::maker_buy(coid.clone(), market_id, &yes_token, price, leg_clip, now_ms);
+                    let intent = Self::maker_buy(
+                        coid.clone(),
+                        market_id,
+                        &yes_token,
+                        price,
+                        leg_clip,
+                        now_ms,
+                    );
                     post_events.push(QueuePostEvent {
                         client_order_id: coid.as_str().to_string(),
                         leg: "bidyes",
@@ -1718,15 +1821,28 @@ impl PairedMmLiveShadow {
                         cancel_ids.push(existing.client_order_id);
                     }
                     let leg_clip = Self::bound_clip_to_caps(
-                        live_armed, clip, price, max_order, max_market, max_gross,
-                        net_inventory_notional, gross_resting_accum,
-                        ask_reduces_net, min_order_shares,
+                        live_armed,
+                        clip,
+                        price,
+                        max_order,
+                        max_market,
+                        max_gross,
+                        net_inventory_notional,
+                        gross_resting_accum,
+                        ask_reduces_net,
+                        min_order_shares,
                     );
                     if leg_clip > 1e-9 {
                         active.quote_seq += 1;
                         let coid = Self::leg_coid(market_id, "buyno", active.quote_seq, now_ms);
-                        let intent =
-                            Self::maker_buy(coid.clone(), market_id, &no_token, price, leg_clip, now_ms);
+                        let intent = Self::maker_buy(
+                            coid.clone(),
+                            market_id,
+                            &no_token,
+                            price,
+                            leg_clip,
+                            now_ms,
+                        );
                         post_events.push(QueuePostEvent {
                             client_order_id: coid.as_str().to_string(),
                             leg: "buyno",
@@ -1922,7 +2038,9 @@ impl PairedMmLiveShadow {
         // checker won't let us touch `self.queue_log` while `active` is held).
         let mut fill_records: Vec<serde_json::Value> = Vec::new();
         {
-            let Some(active) = self.active.as_mut() else { return };
+            let Some(active) = self.active.as_mut() else {
+                return;
+            };
             let now_ms = active.last_decision_ms;
             let market = active.market_id.clone();
             for leg_slot in [active.bid_leg.as_mut(), active.no_leg.as_mut()] {
@@ -1939,7 +2057,11 @@ impl PairedMmLiveShadow {
                 }
                 let incremental = cumulative - leg.filled_so_far;
                 leg.filled_so_far = cumulative;
-                let clip = if leg.clip > 0.0 { leg.clip } else { clip_default };
+                let clip = if leg.clip > 0.0 {
+                    leg.clip
+                } else {
+                    clip_default
+                };
                 // Backtest pro-rata expectation: the share of a clip we EXPECT to
                 // capture given the resting queue ahead of us at submit.
                 let pro_rata_expected = clip / (clip + leg.shares_ahead.max(0.0));
@@ -2087,14 +2209,22 @@ impl PairedMmLiveShadow {
         let want_flatten = residual_action == ResidualAction::Flatten;
         // +1 long YES, -1 long NO. Only meaningful past the band; the policy already
         // collapsed within-band to NoneAction (no flatten target).
-        let sign: i8 = if skew > 0.0 { 1 } else if skew < 0.0 { -1 } else { 0 };
+        let sign: i8 = if skew > 0.0 {
+            1
+        } else if skew < 0.0 {
+            -1
+        } else {
+            0
+        };
 
         let active_flatten_secs = self.active_flatten_secs;
         let late_pull_secs = self.late_pull_secs;
         let clip = self.clip_shares;
         let min_order_shares = self.min_order_shares;
 
-        let Some(active) = self.active.as_mut() else { return None };
+        let Some(active) = self.active.as_mut() else {
+            return None;
+        };
 
         // Maintain the dwell timer. The target persists only while the policy still
         // wants to flatten AND the sign is unchanged; anything else resets it.
@@ -2150,12 +2280,36 @@ impl PairedMmLiveShadow {
 
         let mut intent = if sign > 0 {
             // Long YES: SELL YES, marketable at the bid.
-            let price = if yes_book.best_bid > 0.0 { yes_book.best_bid } else { yes_mid };
-            OrderIntent::new_sell(coid, market_id.clone(), yes_token, price.clamp(0.0, 1.0), shares, reason, now_ms)
+            let price = if yes_book.best_bid > 0.0 {
+                yes_book.best_bid
+            } else {
+                yes_mid
+            };
+            OrderIntent::new_sell(
+                coid,
+                market_id.clone(),
+                yes_token,
+                price.clamp(0.0, 1.0),
+                shares,
+                reason,
+                now_ms,
+            )
         } else {
             // Long NO: BUY YES, marketable at the ask.
-            let price = if yes_book.best_ask > 0.0 { yes_book.best_ask } else { yes_mid };
-            OrderIntent::new_buy(coid, market_id.clone(), yes_token, price.clamp(0.0, 1.0), shares, reason, now_ms)
+            let price = if yes_book.best_ask > 0.0 {
+                yes_book.best_ask
+            } else {
+                yes_mid
+            };
+            OrderIntent::new_buy(
+                coid,
+                market_id.clone(),
+                yes_token,
+                price.clamp(0.0, 1.0),
+                shares,
+                reason,
+                now_ms,
+            )
         };
         intent.quote_level_tag = Some(MM_FLATTEN_TAG.to_string());
         // Reduce-only either way: this taker only ever pairs the residual DOWN.
@@ -2220,7 +2374,9 @@ impl PairedMmLiveShadow {
 
         let clip = self.clip_shares;
         let repair_delta = self.repair_delta;
-        let Some(active) = self.active.as_mut() else { return };
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
         let inv = &mut active.inventory;
 
         // Taker SELL hits our resting YES bid: print at/below best_bid. We buy
@@ -2270,7 +2426,9 @@ impl PairedMmLiveShadow {
     /// pairs redeem to $1; residual is marked to the last observed mid (never
     /// traded out). Pure logging.
     fn log_market_close(&self) {
-        let Some(active) = self.active.as_ref() else { return };
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
         let inv = &active.inventory;
         let last_mid = if active.mid_max.is_finite() && active.mid_min.is_finite() {
             0.5 * (active.mid_min + active.mid_max)
@@ -2348,7 +2506,11 @@ impl PairedMmLiveShadow {
         let var = rets.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / rets.len() as f64;
         let vol = var.sqrt();
         // Sign-flip fraction over nonzero returns.
-        let signs: Vec<f64> = rets.iter().map(|r| r.signum()).filter(|s| *s != 0.0).collect();
+        let signs: Vec<f64> = rets
+            .iter()
+            .map(|r| r.signum())
+            .filter(|s| *s != 0.0)
+            .collect();
         let flips = if signs.len() > 1 {
             let mut flip = 0usize;
             for w in signs.windows(2) {
@@ -2637,7 +2799,10 @@ mod tests {
         let paired = inv.paired();
         assert!(paired > 0.0, "expected a matched pair, got {paired}");
         let pair_cost = (inv.yes_long_cost / inv.yes_long) + (inv.no_long_cost / inv.no_long);
-        assert!((pair_cost - 0.99).abs() < 1e-9, "pair_cost={pair_cost} (must be 1 - spread)");
+        assert!(
+            (pair_cost - 0.99).abs() < 1e-9,
+            "pair_cost={pair_cost} (must be 1 - spread)"
+        );
         // Realized PnL on the pair is positive (the captured spread).
         assert!(inv.marked_pnl(0.495, false) > 0.0);
     }
@@ -2654,7 +2819,10 @@ mod tests {
         let mut mm = shadow_with_inv(0.0, inv);
         mm.simulate_fill(&book(0.49, 0.0, 0.50, 0.0, 0.495), 0.0, 0.495);
         let after = &mm.active.as_ref().unwrap().inventory;
-        assert_eq!(after.no_long, 0.0, "mid-spread print must not re-pair by crossing");
+        assert_eq!(
+            after.no_long, 0.0,
+            "mid-spread print must not re-pair by crossing"
+        );
         assert_eq!(after.yes_long, 5.0);
     }
 
@@ -2751,12 +2919,18 @@ mod tests {
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
         let refused = PairedMmLiveShadow::from_env(false, None);
         if let Some(refused) = refused {
-            assert!(!refused.paper_trade_armed(), "paper arm must be refused when !paper_mode");
+            assert!(
+                !refused.paper_trade_armed(),
+                "paper arm must be refused when !paper_mode"
+            );
         }
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
         let armed = PairedMmLiveShadow::from_env(true, None);
         if let Some(armed) = armed {
-            assert!(armed.paper_trade_armed(), "paper arm must arm under paper_mode");
+            assert!(
+                armed.paper_trade_armed(),
+                "paper arm must arm under paper_mode"
+            );
         }
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_PAPER_TRADE");
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_SHADOW");
@@ -2782,8 +2956,14 @@ mod tests {
         );
         assert_eq!(submits.len(), 2, "both legs should post on first tick");
         assert!(cancels.is_empty(), "nothing resting yet");
-        let yes_leg = submits.iter().find(|i| i.instrument_id.as_str() == "yes").unwrap();
-        let no_leg = submits.iter().find(|i| i.instrument_id.as_str() == "no").unwrap();
+        let yes_leg = submits
+            .iter()
+            .find(|i| i.instrument_id.as_str() == "yes")
+            .unwrap();
+        let no_leg = submits
+            .iter()
+            .find(|i| i.instrument_id.as_str() == "no")
+            .unwrap();
         assert_eq!(yes_leg.side, crate::types::TradeSide::Buy);
         assert!((yes_leg.limit_price - 0.49).abs() < 1e-9);
         assert_eq!(no_leg.side, crate::types::TradeSide::Buy);
@@ -2799,14 +2979,35 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.49),
+            Some(0.50),
+            pos,
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert_eq!(submits.len(), 2);
 
         // Same touch next tick: keep, no churn.
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
-        assert!(submits.is_empty() && cancels.is_empty(), "unchanged touch must not churn");
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.49),
+            Some(0.50),
+            pos,
+            2_000,
+            &mut submits,
+            &mut cancels,
+        );
+        assert!(
+            submits.is_empty() && cancels.is_empty(),
+            "unchanged touch must not churn"
+        );
 
         // Touch moves on the bid leg by 1c but leg age (2_000-1_000=1_000ms) is
         // below the 5s min-requote-age => REST-AND-HOLD keeps it (no churn). This
@@ -2814,7 +3015,16 @@ mod tests {
         // every sub-5s tick.
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 2_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.48),
+            Some(0.50),
+            pos,
+            2_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert!(
             submits.is_empty() && cancels.is_empty(),
             "young leg must HOLD even when the touch moved (rest-and-hold)"
@@ -2824,7 +3034,16 @@ mod tests {
         // bid leg only.
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 6_500, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.48),
+            Some(0.50),
+            pos,
+            6_500,
+            &mut submits,
+            &mut cancels,
+        );
         assert_eq!(submits.len(), 1, "only the aged+moved leg replaces");
         assert_eq!(cancels.len(), 1, "old bid leg cancelled");
         assert!((submits[0].limit_price - 0.48).abs() < 1e-9);
@@ -2840,12 +3059,30 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.49),
+            Some(0.50),
+            pos,
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert_eq!(submits.len(), 2);
         // Aged 9s, but bid moved only 1c (< 2c min): hold.
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b, Some(0.48), Some(0.50), pos, 10_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.48),
+            Some(0.50),
+            pos,
+            10_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert!(
             submits.is_empty() && cancels.is_empty(),
             "aged but sub-min-tick move must HOLD"
@@ -2863,7 +3100,16 @@ mod tests {
         let pos = PairedPosition::default();
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.mpl_test(&market, &b0, Some(0.49), Some(0.50), pos, 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b0,
+            Some(0.49),
+            Some(0.50),
+            pos,
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert_eq!(submits.len(), 2);
         // Market collapses: best_bid/ask drop to 0.47/0.48. Our resting YES bid at
         // 0.49 is now >= best_ask (0.48) => would cross. Target bid is 0.47, only
@@ -2871,9 +3117,21 @@ mod tests {
         let b1 = book(0.47, 5.0, 0.48, 5.0, 0.47);
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b1, Some(0.47), Some(0.48), pos, 1_200, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b1,
+            Some(0.47),
+            Some(0.48),
+            pos,
+            1_200,
+            &mut submits,
+            &mut cancels,
+        );
         let yes = submits.iter().find(|i| i.instrument_id.as_str() == "yes");
-        assert!(yes.is_some(), "crossing YES bid must reprice immediately despite young age");
+        assert!(
+            yes.is_some(),
+            "crossing YES bid must reprice immediately despite young age"
+        );
         assert!((yes.unwrap().limit_price - 0.47).abs() < 1e-9);
     }
 
@@ -2884,13 +3142,31 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.49),
+            Some(0.50),
+            PairedPosition::default(),
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert_eq!(submits.len(), 2);
 
         // Bid leg pulled (e.g. late-pull or repair skew) => cancel it, keep NO.
         submits.clear();
         cancels.clear();
-        mm.mpl_test(&market, &b, None, Some(0.50), PairedPosition::default(), 2_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            None,
+            Some(0.50),
+            PairedPosition::default(),
+            2_000,
+            &mut submits,
+            &mut cancels,
+        );
         assert!(submits.is_empty(), "no new posts when pulling");
         assert_eq!(cancels.len(), 1, "pulled bid leg cancelled");
         assert!(mm.active.as_ref().unwrap().bid_leg.is_none());
@@ -2904,7 +3180,16 @@ mod tests {
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
-        mm.mpl_test(&market, &b, Some(0.49), Some(0.50), PairedPosition::default(), 1_000, &mut submits, &mut cancels);
+        mm.mpl_test(
+            &market,
+            &b,
+            Some(0.49),
+            Some(0.50),
+            PairedPosition::default(),
+            1_000,
+            &mut submits,
+            &mut cancels,
+        );
         cancels.clear();
         mm.drain_resting_legs(&mut cancels);
         assert_eq!(cancels.len(), 2, "both resting legs pulled on drain");
@@ -2966,19 +3251,28 @@ mod tests {
         // !paper_mode but NO kill-switch path => refused.
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
         if let Some(mm) = PairedMmLiveShadow::from_env(false, None) {
-            assert!(!mm.live_trade_armed(), "live arm must refuse without kill-switch path");
+            assert!(
+                !mm.live_trade_armed(),
+                "live arm must refuse without kill-switch path"
+            );
         }
         // !paper_mode, kill-switch path, but a cap unset => refused.
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD");
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
         if let Some(mm) = PairedMmLiveShadow::from_env(false, Some(&kill)) {
-            assert!(!mm.live_trade_armed(), "live arm must refuse when a cap is unset");
+            assert!(
+                !mm.live_trade_armed(),
+                "live arm must refuse when a cap is unset"
+            );
         }
         // All preconditions hold => armed, and paper arm stays OFF.
         std::env::set_var("PM_BTC_5M_PAIRED_MM_MAX_GROSS_RESTING_USD", "10");
         std::env::set_var("PM_BTC_5M_PAIRED_MM_SHADOW", "true");
         if let Some(mm) = PairedMmLiveShadow::from_env(false, Some(&kill)) {
-            assert!(mm.live_trade_armed(), "live arm must arm with all preconditions");
+            assert!(
+                mm.live_trade_armed(),
+                "live arm must arm with all preconditions"
+            );
             assert!(!mm.paper_trade_armed(), "arms are mutually exclusive");
         }
 
@@ -3086,7 +3380,10 @@ mod tests {
         let mut mm = live_shadow_with_market(Some("no"));
         mm.max_market_notional_usd = 20.0;
         mm.max_gross_resting_usd = 100.0;
-        let pos = PairedPosition { yes_shares: 50.0, no_shares: 0.0 };
+        let pos = PairedPosition {
+            yes_shares: 50.0,
+            no_shares: 0.0,
+        };
         let b = book(0.49, 5.0, 0.50, 5.0, 0.49);
         let mut submits = Vec::new();
         let mut cancels = Vec::new();
@@ -3100,11 +3397,17 @@ mod tests {
             &mut submits,
             &mut cancels,
         );
-        assert!(submits.is_empty(), "near-cap net inventory => no fresh legs");
+        assert!(
+            submits.is_empty(),
+            "near-cap net inventory => no fresh legs"
+        );
 
         // Matched pairs are riskless and must NOT consume the cap: 40 YES + 40 NO
         // (net skew 0) leaves the full cap free, so legs rest again.
-        let paired = PairedPosition { yes_shares: 40.0, no_shares: 40.0 };
+        let paired = PairedPosition {
+            yes_shares: 40.0,
+            no_shares: 40.0,
+        };
         submits.clear();
         cancels.clear();
         mm.mpl_test(
@@ -3145,13 +3448,46 @@ mod tests {
             });
         }
         mm.observe_order_fills(&[(coid.clone(), 4.0)]);
-        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 4.0).abs() < 1e-9);
+        assert!(
+            (mm.active
+                .as_ref()
+                .unwrap()
+                .bid_leg
+                .as_ref()
+                .unwrap()
+                .filled_so_far
+                - 4.0)
+                .abs()
+                < 1e-9
+        );
         // Re-observe same cumulative => no change (no double count).
         mm.observe_order_fills(&[(coid.clone(), 4.0)]);
-        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 4.0).abs() < 1e-9);
+        assert!(
+            (mm.active
+                .as_ref()
+                .unwrap()
+                .bid_leg
+                .as_ref()
+                .unwrap()
+                .filled_so_far
+                - 4.0)
+                .abs()
+                < 1e-9
+        );
         // A further fill advances the watermark.
         mm.observe_order_fills(&[(coid, 7.5)]);
-        assert!((mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().filled_so_far - 7.5).abs() < 1e-9);
+        assert!(
+            (mm.active
+                .as_ref()
+                .unwrap()
+                .bid_leg
+                .as_ref()
+                .unwrap()
+                .filled_so_far
+                - 7.5)
+                .abs()
+                < 1e-9
+        );
     }
 
     // --- TASK 1: REAL position drives the armed quote-tick log (not SimInventory) ---
@@ -3163,21 +3499,34 @@ mod tests {
         // report the REAL residual (|skew| = 10), REAL matched pairs (min = 0),
         // and a REAL residual mark (10 * mid). These are exactly the helper
         // values the armed branch logs.
-        let pos = PairedPosition { yes_shares: 10.0, no_shares: 0.0 };
+        let pos = PairedPosition {
+            yes_shares: 10.0,
+            no_shares: 0.0,
+        };
         assert_eq!(pos.residual_shares(), 10.0, "real residual = |skew|");
         assert_eq!(pos.matched_pairs(), 0.0, "no matched pairs when one-sided");
         // 10 YES residual marked at mid 0.5 => 5.0 (NOT the sim's -0.14).
-        assert!((pos.marked_pnl(0.5) - 5.0).abs() < 1e-9, "got {}", pos.marked_pnl(0.5));
+        assert!(
+            (pos.marked_pnl(0.5) - 5.0).abs() < 1e-9,
+            "got {}",
+            pos.marked_pnl(0.5)
+        );
 
         // Fully paired: matched pairs = the shared count, residual = 0, and the
         // residual mark contributes nothing (matched pairs are ~riskless here).
-        let paired = PairedPosition { yes_shares: 8.0, no_shares: 8.0 };
+        let paired = PairedPosition {
+            yes_shares: 8.0,
+            no_shares: 8.0,
+        };
         assert_eq!(paired.matched_pairs(), 8.0);
         assert_eq!(paired.residual_shares(), 0.0);
         assert!((paired.marked_pnl(0.5)).abs() < 1e-9);
 
         // Net-NO residual marked at 1 - mid; bounded by the residual share count.
-        let net_no = PairedPosition { yes_shares: 2.0, no_shares: 5.0 };
+        let net_no = PairedPosition {
+            yes_shares: 2.0,
+            no_shares: 5.0,
+        };
         assert_eq!(net_no.residual_shares(), 3.0);
         assert!((net_no.marked_pnl(0.4) - 3.0 * 0.6).abs() < 1e-9);
         // Degenerate mid falls back to 0.5; residual mark stays <= residual shares.
@@ -3206,7 +3555,11 @@ mod tests {
         let mut mm = paper_shadow_with_market(Some("no"));
         mm.queue_log = Some(QueueLog {
             writer: BufWriter::new(
-                OpenOptions::new().create(true).append(true).open(&path).unwrap(),
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
             ),
             path: path.clone(),
         });
@@ -3219,11 +3572,29 @@ mod tests {
         let mut posts = Vec::new();
         let mut cancel_events = Vec::new();
         mm.manage_paper_legs(
-            &market, &book_ctx, Some(0.49), Some(0.50), false, false, PairedPosition::default(),
-            1_000, &mut submits, &mut cancels, &mut posts, &mut cancel_events,
+            &market,
+            &book_ctx,
+            Some(0.49),
+            Some(0.50),
+            false,
+            false,
+            PairedPosition::default(),
+            1_000,
+            &mut submits,
+            &mut cancels,
+            &mut posts,
+            &mut cancel_events,
         );
         assert_eq!(posts.len(), 2, "two POST events (YES bid + NO)");
-        mm.log_queue_posts_cancels(&market, &book_ctx, 0.495, 120.0, 1_000, &posts, &cancel_events);
+        mm.log_queue_posts_cancels(
+            &market,
+            &book_ctx,
+            0.495,
+            120.0,
+            1_000,
+            &posts,
+            &cancel_events,
+        );
 
         // TICK: snapshot the live legs.
         mm.log_queue_tick(&market, &book_ctx, 0.495, 119.0, 2_000, "none", "none");
@@ -3232,7 +3603,15 @@ mod tests {
         if let Some(active) = mm.active.as_mut() {
             active.last_decision_ms = 3_000;
         }
-        let yes_coid = mm.active.as_ref().unwrap().bid_leg.as_ref().unwrap().client_order_id.clone();
+        let yes_coid = mm
+            .active
+            .as_ref()
+            .unwrap()
+            .bid_leg
+            .as_ref()
+            .unwrap()
+            .client_order_id
+            .clone();
         mm.observe_order_fills(&[(yes_coid.clone(), 3.0)]);
 
         // CANCEL: pull both legs (target None) => two cancel events with remainder.
@@ -3241,8 +3620,18 @@ mod tests {
         let mut p2 = Vec::new();
         let mut ce2 = Vec::new();
         mm.manage_paper_legs(
-            &market, &book_ctx, None, None, false, false, PairedPosition::default(),
-            10_000, &mut s2, &mut c2, &mut p2, &mut ce2,
+            &market,
+            &book_ctx,
+            None,
+            None,
+            false,
+            false,
+            PairedPosition::default(),
+            10_000,
+            &mut s2,
+            &mut c2,
+            &mut p2,
+            &mut ce2,
         );
         assert_eq!(ce2.len(), 2, "both legs pulled");
         mm.log_queue_posts_cancels(&market, &book_ctx, 0.495, 110.0, 10_000, &p2, &ce2);
@@ -3262,9 +3651,19 @@ mod tests {
         // POST record carries the queue-model inputs.
         let post = &posts[0];
         for field in [
-            "client_order_id", "leg", "price", "clip", "shares_ahead_at_submit",
-            "pro_rata_expected_capture", "best_bid", "best_ask", "spread", "yes_mid",
-            "secs_to_close", "market", "ts_ms",
+            "client_order_id",
+            "leg",
+            "price",
+            "clip",
+            "shares_ahead_at_submit",
+            "pro_rata_expected_capture",
+            "best_bid",
+            "best_ask",
+            "spread",
+            "yes_mid",
+            "secs_to_close",
+            "market",
+            "ts_ms",
         ] {
             assert!(post.get(field).is_some(), "post missing {field}: {post}");
         }
@@ -3272,8 +3671,12 @@ mod tests {
         // TICK record carries depth-at-level + observed taker volume + cumulative fill.
         let tick = &ticks[0];
         for field in [
-            "depth_at_level", "shares_ahead_at_submit", "filled_so_far",
-            "taker_buy_qty_60s", "taker_sell_qty_60s", "last_trade_price",
+            "depth_at_level",
+            "shares_ahead_at_submit",
+            "filled_so_far",
+            "taker_buy_qty_60s",
+            "taker_sell_qty_60s",
+            "last_trade_price",
         ] {
             assert!(tick.get(field).is_some(), "tick missing {field}: {tick}");
         }
@@ -3281,8 +3684,12 @@ mod tests {
         // FILL record carries realized vs pro-rata + time-since-post.
         let fill = &fills[0];
         for field in [
-            "fill_incremental_shares", "fill_cumulative_shares", "time_since_post_ms",
-            "pro_rata_expected_capture", "realized_capture", "capture_ratio_realized_over_prorata",
+            "fill_incremental_shares",
+            "fill_cumulative_shares",
+            "time_since_post_ms",
+            "pro_rata_expected_capture",
+            "realized_capture",
+            "capture_ratio_realized_over_prorata",
         ] {
             assert!(fill.get(field).is_some(), "fill missing {field}: {fill}");
         }
@@ -3291,8 +3698,16 @@ mod tests {
 
         // CANCEL record carries time-rested + unfilled remainder.
         let cancel = &cancels_l[0];
-        for field in ["time_rested_ms", "filled_so_far", "unfilled_remainder", "reason"] {
-            assert!(cancel.get(field).is_some(), "cancel missing {field}: {cancel}");
+        for field in [
+            "time_rested_ms",
+            "filled_so_far",
+            "unfilled_remainder",
+            "reason",
+        ] {
+            assert!(
+                cancel.get(field).is_some(),
+                "cancel missing {field}: {cancel}"
+            );
         }
 
         let _ = std::fs::remove_file(&path);
@@ -3303,7 +3718,10 @@ mod tests {
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH");
         assert!(QueueLog::from_env().is_none(), "default-off when env unset");
         std::env::set_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH", "   ");
-        assert!(QueueLog::from_env().is_none(), "empty/whitespace path => off");
+        assert!(
+            QueueLog::from_env().is_none(),
+            "empty/whitespace path => off"
+        );
         std::env::remove_var("PM_BTC_5M_PAIRED_MM_QUEUE_LOG_PATH");
     }
 
@@ -3349,7 +3767,11 @@ mod tests {
             let (lb, la) = (skew > RD, skew < -RD);
             assert_eq!(sb, lb, "suppress_bid mismatch skew={skew} mid={mid}");
             assert_eq!(sa, la, "suppress_ask mismatch skew={skew} mid={mid}");
-            assert_eq!(act, ResidualAction::Flatten, "cap=0 always flattens past band");
+            assert_eq!(
+                act,
+                ResidualAction::Flatten,
+                "cap=0 always flattens past band"
+            );
         }
     }
 
@@ -3372,7 +3794,10 @@ mod tests {
         // skew > 0, yes_mid < 0.5 => leading YES is the UNDERDOG; |skew|+clip<=cap
         // (4+1<=5) => HOLD both legs (a further clip cannot overshoot the cap).
         let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0, 1.0);
-        assert!(!sb && !sa, "underdog comfortably within cap => neither leg suppressed (HOLD)");
+        assert!(
+            !sb && !sa,
+            "underdog comfortably within cap => neither leg suppressed (HOLD)"
+        );
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::HoldUnderdog);
         // skew < 0, yes_mid > 0.5 => leading NO priced 1-mid < 0.5 = UNDERDOG; HOLD.
@@ -3387,11 +3812,17 @@ mod tests {
         // Underdog past the hold cap: flatten the excess (same suppression as
         // favourite re-pair, draining the skew back toward the cap).
         let (sb, sa, side, act) = residual_policy(8.0, 0.42, RD, 5.0, 5.0);
-        assert!(sb && !sa, "underdog net-long YES over cap => suppress bid (flatten excess)");
+        assert!(
+            sb && !sa,
+            "underdog net-long YES over cap => suppress bid (flatten excess)"
+        );
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::Flatten);
         let (sb, sa, side, act) = residual_policy(-8.0, 0.58, RD, 5.0, 5.0);
-        assert!(!sb && sa, "underdog net-long NO over cap => suppress ask (flatten excess)");
+        assert!(
+            !sb && sa,
+            "underdog net-long NO over cap => suppress ask (flatten excess)"
+        );
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::Flatten);
     }
@@ -3399,11 +3830,23 @@ mod tests {
     #[test]
     fn residual_policy_classification_both_skew_signs() {
         // Net-long YES: favourite iff yes_mid > 0.5.
-        assert_eq!(residual_policy(10.0, 0.6, RD, 5.0, 5.0).2, ResidualSide::Favourite);
-        assert_eq!(residual_policy(10.0, 0.4, RD, 5.0, 5.0).2, ResidualSide::Underdog);
+        assert_eq!(
+            residual_policy(10.0, 0.6, RD, 5.0, 5.0).2,
+            ResidualSide::Favourite
+        );
+        assert_eq!(
+            residual_policy(10.0, 0.4, RD, 5.0, 5.0).2,
+            ResidualSide::Underdog
+        );
         // Net-long NO: leading price = 1 - yes_mid; favourite iff yes_mid < 0.5.
-        assert_eq!(residual_policy(-10.0, 0.4, RD, 5.0, 5.0).2, ResidualSide::Favourite);
-        assert_eq!(residual_policy(-10.0, 0.6, RD, 5.0, 5.0).2, ResidualSide::Underdog);
+        assert_eq!(
+            residual_policy(-10.0, 0.4, RD, 5.0, 5.0).2,
+            ResidualSide::Favourite
+        );
+        assert_eq!(
+            residual_policy(-10.0, 0.6, RD, 5.0, 5.0).2,
+            ResidualSide::Underdog
+        );
     }
 
     // Fix C: when the leading side is the UNDERDOG and one more clip-sized add
@@ -3414,13 +3857,19 @@ mod tests {
         // skew=4 (long YES underdog), cap=5, clip=5: 4+5=9 > 5 => suppress the
         // YES-ADD (bid) leg, keep the NO (ask) flatten leg quoting. Still HOLD action.
         let (sb, sa, side, act) = residual_policy(4.0, 0.42, RD, 5.0, 5.0);
-        assert!(sb && !sa, "overshoot-imminent underdog YES => suppress add (bid) leg only");
+        assert!(
+            sb && !sa,
+            "overshoot-imminent underdog YES => suppress add (bid) leg only"
+        );
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::HoldUnderdog);
         // Mirror: long NO underdog. skew=-4, cap=5, clip=5 => suppress the NO-ADD
         // (ask) leg, keep the YES (bid) flatten leg.
         let (sb, sa, side, act) = residual_policy(-4.0, 0.58, RD, 5.0, 5.0);
-        assert!(!sb && sa, "overshoot-imminent underdog NO => suppress add (ask) leg only");
+        assert!(
+            !sb && sa,
+            "overshoot-imminent underdog NO => suppress add (ask) leg only"
+        );
         assert_eq!(side, ResidualSide::Underdog);
         assert_eq!(act, ResidualAction::HoldUnderdog);
         // Boundary: exactly at the cap (4+1==5) still HOLDs both legs (no overshoot).
@@ -3439,7 +3888,10 @@ mod tests {
         let dropped = PairedMmLiveShadow::bound_clip_to_caps(
             true, 10.0, 0.50, 1.30, 1e9, 1e9, 0.0, 0.0, false, min,
         );
-        assert_eq!(dropped, 0.0, "sub-floor that cannot reach the floor must drop, not emit 2sh");
+        assert_eq!(
+            dropped, 0.0,
+            "sub-floor that cannot reach the floor must drop, not emit 2sh"
+        );
         // Per-order cap $2.60 at 0.50 allows 5.2 sh; clip=10 but a higher hard
         // gross headroom. Here raw allowed is 5.2 -> 5.2 floored to 5.2 (>=5), fine.
         let ok = PairedMmLiveShadow::bound_clip_to_caps(
@@ -3454,7 +3906,10 @@ mod tests {
         let rounded = PairedMmLiveShadow::bound_clip_to_caps(
             true, 4.0, 0.10, 1.00, 1e9, 1e9, 0.0, 0.0, false, min,
         );
-        assert!((rounded - 5.0).abs() < 1e-9, "4sh clip with room for 5 rounds UP to 5, got {rounded}");
+        assert!(
+            (rounded - 5.0).abs() < 1e-9,
+            "4sh clip with room for 5 rounds UP to 5, got {rounded}"
+        );
         // Paper path (live_armed=false) is untouched: full clip rests regardless.
         let paper = PairedMmLiveShadow::bound_clip_to_caps(
             false, 3.0, 0.50, 0.10, 0.10, 0.10, 0.0, 0.0, false, min,
@@ -3472,24 +3927,36 @@ mod tests {
         let growing = PairedMmLiveShadow::bound_clip_to_caps(
             true, 10.0, 0.50, 1e9, 8.0, 1e9, 8.0, 0.0, false, min,
         );
-        assert_eq!(growing, 0.0, "growing leg with net cap exhausted must get 0");
+        assert_eq!(
+            growing, 0.0,
+            "growing leg with net cap exhausted must get 0"
+        );
         // SAME state, but REDUCING leg: net cap is ignored, bounded only by
         // per-order ($1e9) + gross ($1e9) => full 10-share clip rests.
         let reducing = PairedMmLiveShadow::bound_clip_to_caps(
             true, 10.0, 0.50, 1e9, 8.0, 1e9, 8.0, 0.0, true, min,
         );
-        assert!((reducing - 10.0).abs() < 1e-9, "reducing leg ignores net cap, got {reducing}");
+        assert!(
+            (reducing - 10.0).abs() < 1e-9,
+            "reducing leg ignores net cap, got {reducing}"
+        );
         // The reducing leg IS still bounded by the per-order cap: $3.00 at 0.50 =>
         // 6 sh (>= floor), even with the net cap exhausted.
         let reducing_per_order = PairedMmLiveShadow::bound_clip_to_caps(
             true, 10.0, 0.50, 3.00, 8.0, 1e9, 8.0, 0.0, true, min,
         );
-        assert!((reducing_per_order - 6.0).abs() < 1e-9, "reducing leg still bounded by per-order, got {reducing_per_order}");
+        assert!(
+            (reducing_per_order - 6.0).abs() < 1e-9,
+            "reducing leg still bounded by per-order, got {reducing_per_order}"
+        );
         // And by the gross-resting cap: gross headroom $2.50 at 0.50 => 5 sh.
         let reducing_gross = PairedMmLiveShadow::bound_clip_to_caps(
             true, 10.0, 0.50, 1e9, 8.0, 5.0, 8.0, 2.50, true, min,
         );
-        assert!((reducing_gross - 5.0).abs() < 1e-9, "reducing leg still bounded by gross, got {reducing_gross}");
+        assert!(
+            (reducing_gross - 5.0).abs() < 1e-9,
+            "reducing leg still bounded by gross, got {reducing_gross}"
+        );
     }
 
     // Fix D: a configured residual_cap below the venue floor is clamped UP to the
@@ -3552,20 +4019,47 @@ mod tests {
 
         // First sighting at t=10s (yes_mid 0.61, 120s to close => NOT late window):
         // starts the dwell timer, no taker yet.
-        let first = mm.maybe_active_flatten(&market, &b, 0.61, 120.0, ResidualAction::Flatten, 12.0, 10_000);
+        let first = mm.maybe_active_flatten(
+            &market,
+            &b,
+            0.61,
+            120.0,
+            ResidualAction::Flatten,
+            12.0,
+            10_000,
+        );
         assert!(first.is_none(), "no flatten before the dwell elapses");
 
         // t=45s (35s later, >= 30s dwell), residual still long-YES favourite.
         let out = mm
-            .maybe_active_flatten(&market, &b, 0.61, 120.0, ResidualAction::Flatten, 12.0, 45_000)
+            .maybe_active_flatten(
+                &market,
+                &b,
+                0.61,
+                120.0,
+                ResidualAction::Flatten,
+                12.0,
+                45_000,
+            )
             .expect("dwell elapsed => flatten taker");
-        assert_eq!(out.side, crate::types::TradeSide::Sell, "long YES => SELL YES");
+        assert_eq!(
+            out.side,
+            crate::types::TradeSide::Sell,
+            "long YES => SELL YES"
+        );
         assert_eq!(out.instrument_id.as_str(), "yes");
         // Size = min(|skew|=12, clip=10) = 10, >= 5-share floor.
-        assert!((out.quantity - 10.0).abs() < 1e-9, "size bounded by clip, got {}", out.quantity);
+        assert!(
+            (out.quantity - 10.0).abs() < 1e-9,
+            "size bounded by clip, got {}",
+            out.quantity
+        );
         assert!(out.quantity >= DEFAULT_MIN_ORDER_SHARES - 1e-9);
         // Marketable at the bid (cross down), reduce-only, IOC-routing tag.
-        assert!((out.limit_price - 0.60).abs() < 1e-9, "SELL crosses at the bid");
+        assert!(
+            (out.limit_price - 0.60).abs() < 1e-9,
+            "SELL crosses at the bid"
+        );
         assert!(out.reduce_only);
         assert_eq!(out.quote_level_tag.as_deref(), Some(MM_FLATTEN_TAG));
         assert_eq!(out.kind, crate::types::IntentKind::Close);
@@ -3580,11 +4074,22 @@ mod tests {
         // skew < 0 (long NO); 10s to close (<= 45s late-pull) triggers regardless
         // of dwell (yes_mid 0.39).
         let out = mm
-            .maybe_active_flatten(&market, &b, 0.39, 10.0, ResidualAction::Flatten, -9.0, 5_000)
+            .maybe_active_flatten(
+                &market,
+                &b,
+                0.39,
+                10.0,
+                ResidualAction::Flatten,
+                -9.0,
+                5_000,
+            )
             .expect("late-pull window triggers regardless of dwell");
         assert_eq!(out.side, crate::types::TradeSide::Buy, "long NO => BUY YES");
         assert_eq!(out.instrument_id.as_str(), "yes");
-        assert!((out.limit_price - 0.40).abs() < 1e-9, "BUY crosses at the ask");
+        assert!(
+            (out.limit_price - 0.40).abs() < 1e-9,
+            "BUY crosses at the ask"
+        );
         // min(|skew|=9, clip=10)=9 shares.
         assert!((out.quantity - 9.0).abs() < 1e-9, "got {}", out.quantity);
     }
@@ -3596,15 +4101,42 @@ mod tests {
         let b = book(0.38, 100.0, 0.40, 100.0, 0.39);
 
         // HoldUnderdog (+EV held within cap) => NEVER flatten, even past dwell.
-        let held = mm.maybe_active_flatten(&market, &b, 120.0, 0.39, ResidualAction::HoldUnderdog, -9.0, 90_000);
-        assert!(held.is_none(), "a held +EV underdog within cap is never flattened");
+        let held = mm.maybe_active_flatten(
+            &market,
+            &b,
+            120.0,
+            0.39,
+            ResidualAction::HoldUnderdog,
+            -9.0,
+            90_000,
+        );
+        assert!(
+            held.is_none(),
+            "a held +EV underdog within cap is never flattened"
+        );
 
         // NoneAction (within band) => never flatten.
-        let none = mm.maybe_active_flatten(&market, &b, 120.0, 0.39, ResidualAction::NoneAction, 0.0, 90_000);
+        let none = mm.maybe_active_flatten(
+            &market,
+            &b,
+            120.0,
+            0.39,
+            ResidualAction::NoneAction,
+            0.0,
+            90_000,
+        );
         assert!(none.is_none(), "no residual => no flatten");
 
         // Flatten target but a sub-minimum residual (|skew| < 5) => cannot emit.
-        let submin = mm.maybe_active_flatten(&market, &b, 5.0, 0.39, ResidualAction::Flatten, -3.0, 90_000);
+        let submin = mm.maybe_active_flatten(
+            &market,
+            &b,
+            5.0,
+            0.39,
+            ResidualAction::Flatten,
+            -3.0,
+            90_000,
+        );
         assert!(submin.is_none(), "sub-5-share residual cannot be flattened");
     }
 

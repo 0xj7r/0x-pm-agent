@@ -22,12 +22,9 @@
 use std::collections::VecDeque;
 
 use pm_model::{ModelConfig, ModelMarketContext, ModelState, OnlineMetaCalibratorSnapshot};
-use pm_strategy::{
-    BonereaperV2, BonereaperV2Config, OrderRequest, Side, Strategy, StrategyOutput,
-};
+use pm_strategy::{BonereaperV2, BonereaperV2Config, OrderRequest, Side, Strategy, StrategyOutput};
 use pm_types::{
-    BookLevel, MarketId, ReplayEvent, ReplayFlags, SpotHistory, SpotTick, TradeHistory,
-    TAPE_DEPTH,
+    BookLevel, MarketId, ReplayEvent, ReplayFlags, SpotHistory, SpotTick, TradeHistory, TAPE_DEPTH,
 };
 
 /// Nanoseconds per millisecond.
@@ -114,16 +111,15 @@ impl ShadowOrder {
     pub fn log_line(&self) -> String {
         let (outcome, px) = match self.side {
             Side::BuyYes | Side::SellYes => ("YES", self.limit_price),
-            Side::BuyNo | Side::SellNo => (
-                "NO",
-                self.limit_price.map(|p| 1.0 - p),
-            ),
+            Side::BuyNo | Side::SellNo => ("NO", self.limit_price.map(|p| 1.0 - p)),
         };
         let action = match self.side {
             Side::BuyYes | Side::BuyNo => "BUY",
             Side::SellYes | Side::SellNo => "SELL",
         };
-        let px_str = px.map(|p| format!("{p:.4}")).unwrap_or_else(|| "MKT".to_string());
+        let px_str = px
+            .map(|p| format!("{p:.4}"))
+            .unwrap_or_else(|| "MKT".to_string());
         format!(
             "SHADOW market={} {} {} clip={:.2} price={} depth={} tag={}",
             self.market_id, action, outcome, self.shares, px_str, self.max_depth, self.tag

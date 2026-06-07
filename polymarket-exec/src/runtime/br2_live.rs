@@ -242,22 +242,27 @@ impl Br2LiveShadow {
             );
         }
 
-        let snapshot = match std::env::var("BR2_SNAPSHOT_PATH").ok().filter(|p| !p.trim().is_empty()) {
-            Some(path) => match Br2ShadowAdapter::load_snapshot_from_path(std::path::Path::new(&path)) {
-                Ok(snap) => {
-                    info!(target: "br2_shadow", path = %path, "BR2-SHADOW loaded frozen meta-calibrator snapshot");
-                    Some(snap)
+        let snapshot = match std::env::var("BR2_SNAPSHOT_PATH")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+        {
+            Some(path) => {
+                match Br2ShadowAdapter::load_snapshot_from_path(std::path::Path::new(&path)) {
+                    Ok(snap) => {
+                        info!(target: "br2_shadow", path = %path, "BR2-SHADOW loaded frozen meta-calibrator snapshot");
+                        Some(snap)
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "br2_shadow",
+                            path = %path,
+                            error = %error,
+                            "BR2-SHADOW failed to load snapshot; running with a fresh calibrator"
+                        );
+                        None
+                    }
                 }
-                Err(error) => {
-                    warn!(
-                        target: "br2_shadow",
-                        path = %path,
-                        error = %error,
-                        "BR2-SHADOW failed to load snapshot; running with a fresh calibrator"
-                    );
-                    None
-                }
-            },
+            }
             None => {
                 info!(target: "br2_shadow", "BR2-SHADOW enabled with a fresh meta-calibrator (no BR2_SNAPSHOT_PATH)");
                 None
@@ -335,7 +340,13 @@ impl Br2LiveShadow {
     /// Tap one live Binance aggTrade print into the adapter's trailing tape.
     /// Maps `is_buyer_maker: None -> false` (Coinbase / unknown aggressor side)
     /// and converts the ms event timestamp to ns.
-    pub fn on_spot_trade(&mut self, price: f64, quantity: f64, observed_at_ms: u64, is_buyer_maker: Option<bool>) {
+    pub fn on_spot_trade(
+        &mut self,
+        price: f64,
+        quantity: f64,
+        observed_at_ms: u64,
+        is_buyer_maker: Option<bool>,
+    ) {
         self.adapter.on_spot_trade(SpotTrade {
             ts_ns: (observed_at_ms as i64).saturating_mul(NS_PER_MS),
             price,
@@ -366,7 +377,8 @@ impl Br2LiveShadow {
         no_book: Option<&BookState>,
         now_ms: u64,
     ) -> Br2TickResult {
-        let (Some(open_ms), Some(close_ms)) = (record.event_start_time_ms, record.event_end_time_ms)
+        let (Some(open_ms), Some(close_ms)) =
+            (record.event_start_time_ms, record.event_end_time_ms)
         else {
             return Br2TickResult::default();
         };
@@ -517,7 +529,9 @@ impl Br2LiveShadow {
             let due = self
                 .active
                 .as_ref()
-                .map(|a| now_ms.saturating_sub(a.last_no_order_diag_ms) >= NO_ORDER_DIAG_THROTTLE_MS)
+                .map(|a| {
+                    now_ms.saturating_sub(a.last_no_order_diag_ms) >= NO_ORDER_DIAG_THROTTLE_MS
+                })
                 .unwrap_or(false);
             if due {
                 let secs_to_close = (close_ms as i64 - now_ms as i64) as f64 / 1000.0;
@@ -529,9 +543,8 @@ impl Br2LiveShadow {
                 let calibrated_p = model.map(|m| m.calibrated_p);
                 // YES-side edge vs mid, the value the external model gate checks
                 // for a YES-adding order (BuyYes). Clamped like the gate does.
-                let side_edge_vs_mid = model.map(|m| {
-                    pm_model::side_edge_vs_mid(&m, yes_mid as f32, true).clamp(0.0, 1.0)
-                });
+                let side_edge_vs_mid = model
+                    .map(|m| pm_model::side_edge_vs_mid(&m, yes_mid as f32, true).clamp(0.0, 1.0));
                 let gate = self.adapter.model_gate();
                 let stats = self.adapter.gate_stats();
                 info!(
@@ -567,7 +580,9 @@ impl Br2LiveShadow {
         // and the runner submits nothing (byte-identical to shadow-only).
         let submit_intents = if self.paper_trade_armed || self.live_trade_armed {
             let yes_token = InstrumentId::from(yes_asset_id.as_str());
-            let no_token = no_asset_id.as_ref().map(|id| InstrumentId::from(id.as_str()));
+            let no_token = no_asset_id
+                .as_ref()
+                .map(|id| InstrumentId::from(id.as_str()));
             // Tag intents as IOC takers ONLY on the real-money arm. The paper
             // arm leaves the tag None (byte-identical attribution to before this
             // increment); the paper-fill sim crosses immediately regardless.

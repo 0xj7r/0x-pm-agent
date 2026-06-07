@@ -243,6 +243,81 @@ fn cancel_only_submit_rejection_requires_immediate_live_stop() {
     ));
 }
 
+#[test]
+fn live_router_allows_bte_on_clean_directional_path() {
+    assert_eq!(
+        live_router_route(
+            MarketRegimeCluster::CleanDirectionalPath,
+            0.12,
+            0.15,
+            0.82,
+            0.08,
+            2.0,
+        ),
+        "bte"
+    );
+}
+
+#[test]
+fn live_router_does_not_route_bte_on_expanded_reversal_pressure() {
+    assert_eq!(
+        live_router_route(
+            MarketRegimeCluster::ExpandedReversalPressure,
+            0.32,
+            0.42,
+            0.24,
+            0.28,
+            8.0,
+        ),
+        "br2"
+    );
+}
+
+#[test]
+fn live_router_forces_risk_off_on_high_range_low_efficiency_chaos() {
+    assert_eq!(
+        live_router_route(
+            MarketRegimeCluster::LowEfficiencyNonreversal,
+            0.61,
+            0.58,
+            0.04,
+            0.38,
+            8.5,
+        ),
+        "risk_off"
+    );
+}
+
+#[test]
+fn live_router_forces_risk_off_on_wide_range_whipsaw_mixed_neutral() {
+    assert_eq!(
+        live_router_route(
+            MarketRegimeCluster::MixedNeutral,
+            0.56,
+            0.50,
+            0.17,
+            0.36,
+            6.5
+        ),
+        "risk_off"
+    );
+}
+
+#[test]
+fn live_router_forces_risk_off_on_live_observed_violent_chop() {
+    assert_eq!(
+        live_router_route(
+            MarketRegimeCluster::LowEfficiencyNonreversal,
+            0.36,
+            0.64,
+            0.013,
+            0.40,
+            7.06,
+        ),
+        "risk_off"
+    );
+}
+
 #[tokio::test]
 async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
     let mut config = runner_test_config();

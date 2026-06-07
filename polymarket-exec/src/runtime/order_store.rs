@@ -20,6 +20,7 @@ pub enum AccountingLane {
     LateFavorite,
     CheapTail,
     ReversalHedge,
+    BackToExplore,
     #[default]
     Other,
 }
@@ -37,6 +38,8 @@ impl AccountingLane {
             Self::PairedCore
         } else if tag.contains("reversal-hedge") {
             Self::ReversalHedge
+        } else if tag.starts_with("bte-taker") || tag.contains("back_to_explore") {
+            Self::BackToExplore
         } else if tag.starts_with("cheap-tail") || tag.contains("convex") {
             Self::CheapTail
         } else if tag.starts_with("late-fav") {
@@ -52,6 +55,7 @@ impl AccountingLane {
             Self::LateFavorite => "late_favorite",
             Self::CheapTail => "cheap_tail",
             Self::ReversalHedge => "reversal_hedge",
+            Self::BackToExplore => "back_to_explore",
             Self::Other => "other",
         }
     }
@@ -62,6 +66,7 @@ impl AccountingLane {
             "late_favorite" => Ok(Self::LateFavorite),
             "cheap_tail" => Ok(Self::CheapTail),
             "reversal_hedge" => Ok(Self::ReversalHedge),
+            "back_to_explore" => Ok(Self::BackToExplore),
             "other" => Ok(Self::Other),
             value => Err(OrderStoreError::Serialization(format!(
                 "invalid accounting lane `{value}`"
@@ -72,7 +77,7 @@ impl AccountingLane {
     pub fn is_directional(self) -> bool {
         matches!(
             self,
-            Self::LateFavorite | Self::CheapTail | Self::ReversalHedge
+            Self::LateFavorite | Self::CheapTail | Self::ReversalHedge | Self::BackToExplore
         )
     }
 }
@@ -281,6 +286,9 @@ impl SqliteOrderStore {
                             THEN 'paired_core'
                         WHEN lower(coalesce(quote_level_tag, '')) LIKE '%reversal-hedge%'
                             THEN 'reversal_hedge'
+                        WHEN lower(coalesce(quote_level_tag, '')) LIKE 'bte-taker%'
+                          OR lower(coalesce(quote_level_tag, '')) LIKE '%back_to_explore%'
+                            THEN 'back_to_explore'
                         WHEN lower(coalesce(quote_level_tag, '')) LIKE 'cheap-tail%'
                           OR lower(coalesce(quote_level_tag, '')) LIKE '%convex%'
                             THEN 'cheap_tail'
@@ -1014,6 +1022,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::runtime::types::ManagedOrderStatus;
+
+    #[test]
+    fn accounting_lane_classifies_bte_as_directional() {
+        let lane =
+            AccountingLane::from_quote_level_tag(Some("bte-taker:back_to_explore_range_repair"));
+        assert_eq!(lane, AccountingLane::BackToExplore);
+        assert!(lane.is_directional());
+        assert_eq!(lane.as_str(), "back_to_explore");
+    }
 
     #[test]
     fn store_insert_update_fill_cycle() -> anyhow::Result<()> {

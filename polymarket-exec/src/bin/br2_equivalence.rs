@@ -36,7 +36,9 @@
 
 use pm_model::{ModelMarketContext, ModelOutput, ModelState};
 use pm_strategy::{BonereaperV2, Ctx, OrderRequest, Side, Strategy, StrategyOutput};
-use pm_types::{BookLevel, MarketId, ReplayEvent, ReplayFlags, SpotHistory, SpotTick, TradeHistory, TAPE_DEPTH};
+use pm_types::{
+    BookLevel, MarketId, ReplayEvent, ReplayFlags, SpotHistory, SpotTick, TradeHistory, TAPE_DEPTH,
+};
 
 use polymarket_exec::runtime::br2_shadow::{
     order_adds_yes_exposure, order_requires_model_gate, Br2ShadowAdapter, DecisionPosition,
@@ -52,7 +54,7 @@ struct Decision {
     market_id: u32,
     event_idx: usize,
     side: Side,
-    shares_milli: i64,      // shares * 1000, rounded — exact integer compare
+    shares_milli: i64, // shares * 1000, rounded — exact integer compare
     max_depth: usize,
     limit_milli: Option<i64>, // limit * 10000, rounded
     tag: String,
@@ -117,7 +119,11 @@ fn build_spot_tape(spec: &MarketSpec) -> Vec<SpotTrade> {
             quantity: 4.0 + (step % 7) as f32,
             // aggressor: trend-aligned prints dominate. is_buyer_maker=true is a
             // seller-initiated (aggressive-sell) print; false is aggressive-buy.
-            is_buyer_maker: if spec.up { step % 4 == 0 } else { step % 4 != 0 },
+            is_buyer_maker: if spec.up {
+                step % 4 == 0
+            } else {
+                step % 4 != 0
+            },
         });
         t += NS_PER_S / 5; // 5 prints/sec
     }
@@ -127,7 +133,11 @@ fn build_spot_tape(spec: &MarketSpec) -> Vec<SpotTrade> {
 fn yes_book_at(spec: &MarketSpec, ts_ns: i64) -> (f32, f32, f32, f32) {
     // YES climbs toward favourite_ask in the last 120s; flat-ish early.
     let secs_to_close = ((spec.open_ns + MARKET_WINDOW_NS - ts_ns) as f64 / 1e9).max(0.0);
-    let target = if spec.up { spec.favourite_ask } else { 1.0 - spec.favourite_ask };
+    let target = if spec.up {
+        spec.favourite_ask
+    } else {
+        1.0 - spec.favourite_ask
+    };
     let ask = if secs_to_close < 120.0 {
         target
     } else if secs_to_close < 200.0 {
@@ -150,14 +160,26 @@ fn build_market_events(spec: &MarketSpec, spot_hist: &SpotHistory) -> Vec<Replay
         let (bid, ask, bid_sz, ask_sz) = yes_book_at(spec, t);
         let mut bids = [BookLevel::default(); TAPE_DEPTH];
         let mut asks = [BookLevel::default(); TAPE_DEPTH];
-        bids[0] = BookLevel { price: bid, size: bid_sz };
-        asks[0] = BookLevel { price: ask, size: ask_sz };
+        bids[0] = BookLevel {
+            price: bid,
+            size: bid_sz,
+        };
+        asks[0] = BookLevel {
+            price: ask,
+            size: ask_sz,
+        };
         if spec.deep_book {
             // Populate a few deeper levels so sweep-depth sizing is exercised.
             for lvl in 1..TAPE_DEPTH {
                 let d = lvl as f32 * 0.01;
-                bids[lvl] = BookLevel { price: (bid - d).max(0.01), size: 300.0 };
-                asks[lvl] = BookLevel { price: (ask + d).min(0.99), size: 300.0 };
+                bids[lvl] = BookLevel {
+                    price: (bid - d).max(0.01),
+                    size: 300.0,
+                };
+                asks[lvl] = BookLevel {
+                    price: (ask + d).min(0.99),
+                    size: 300.0,
+                };
             }
         }
         let yes_mid = 0.5 * (bid + ask);
@@ -192,8 +214,14 @@ fn depth_weighted_fill(event: &ReplayEvent, req: &Decision) -> Option<(f32, f64)
         let (price, size) = match req.side {
             Side::BuyYes => (event.asks[level].price, event.asks[level].size),
             Side::SellYes => (event.bids[level].price, event.bids[level].size),
-            Side::BuyNo => ((1.0 - event.bids[level].price).max(0.0), event.bids[level].size),
-            Side::SellNo => ((1.0 - event.asks[level].price).max(0.0), event.asks[level].size),
+            Side::BuyNo => (
+                (1.0 - event.bids[level].price).max(0.0),
+                event.bids[level].size,
+            ),
+            Side::SellNo => (
+                (1.0 - event.asks[level].price).max(0.0),
+                event.asks[level].size,
+            ),
         };
         if price <= 0.0 || price >= 1.0 || size <= 0.0 {
             continue;
@@ -485,7 +513,11 @@ fn main() -> anyhow::Result<()> {
     if mismatches == 0 {
         println!();
         println!("VERDICT: live == backtest. Decision streams are VALUE-IDENTICAL across");
-        println!("all {} markets / {} events. Live path faithfully reproduces the", specs.len(), total_events);
+        println!(
+            "all {} markets / {} events. Live path faithfully reproduces the",
+            specs.len(),
+            total_events
+        );
         println!("validated br2 strategy. Phase-3 equivalence gate: PASS. (NO live orders.)");
         Ok(())
     } else {
