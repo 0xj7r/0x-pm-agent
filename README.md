@@ -24,7 +24,7 @@ paper-mode simulation or unsigned/raw HTTP as tiny-live ready.
 
 - `PM_BTC_5M_ASSET_IDS`
 - `PM_BTC_5M_INSTRUMENT_MARKETS` as `asset_id:market_id[,asset_id:market_id...]`
-- `PM_BTC_5M_EXEC_STARTING_CASH_USD`
+- `PM_BTC_5M_EXEC_STARTING_CASH_USD` (paper/fallback seed only; live session risk anchors to the first venue balance sync)
 - `PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY`
 - `PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD`
 - `PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD`
