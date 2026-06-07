@@ -72,16 +72,86 @@ const ROUTER_SESSION_GUARD_PERSIST_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, Default)]
 struct MarketRouterState {
-    selected_route: Option<&'static str>,
-    pending_route: Option<&'static str>,
+    selected_route: Option<MarketRoute>,
+    pending_route: Option<MarketRoute>,
     pending_since_ms: Option<u64>,
-    locked_route: Option<&'static str>,
+    locked_route: Option<MarketRoute>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarketRoute {
+    Bte,
+    Br2,
+    RiskOff,
+}
+
+impl MarketRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bte => "bte",
+            Self::Br2 => "br2",
+            Self::RiskOff => "risk_off",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionGuard {
+    Normal,
+    NoAdd,
+}
+
+impl SessionGuard {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::NoAdd => "no_add",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionPermission {
+    AllowAdd,
+    NoAddMarketRiskOff,
+    NoAddConfirmPending,
+    NoAddSessionGuard,
+}
+
+impl ExecutionPermission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowAdd => "allow_add",
+            Self::NoAddMarketRiskOff => "no_add_market_risk_off",
+            Self::NoAddConfirmPending => "no_add_confirm_pending",
+            Self::NoAddSessionGuard => "no_add_session_guard",
+        }
+    }
+
+    fn allows_add_risk(self) -> bool {
+        self == Self::AllowAdd
+    }
+
+    fn legacy_action_route(self, selected_route: Option<MarketRoute>) -> &'static str {
+        if self.allows_add_risk() {
+            selected_route.map_or("risk_off", MarketRoute::as_str)
+        } else {
+            "risk_off"
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RouteLatchReadout {
+    selected_route: Option<MarketRoute>,
+    locked_route: Option<MarketRoute>,
+    confirm_pending: bool,
 }
 
 #[derive(Clone, Debug)]
 struct RouterSessionObservation {
     observed_at_ms: u64,
-    route: &'static str,
+    route: MarketRoute,
     stressed: bool,
 }
 
@@ -93,7 +163,7 @@ struct RouterSessionRegimeState {
 
 #[derive(Clone, Debug)]
 struct RouterSessionRegimeReadout {
-    route: &'static str,
+    guard: SessionGuard,
     guard_active: bool,
     stress_fraction: f32,
     observation_count: usize,
@@ -135,16 +205,16 @@ fn router_high_range_chaos_risk_off(
     wide_range_chaos || violent_low_efficiency_chop
 }
 
-fn static_cluster_router_route(cluster: MarketRegimeCluster) -> &'static str {
+fn static_cluster_router_route(cluster: MarketRegimeCluster) -> MarketRoute {
     match cluster {
         MarketRegimeCluster::CleanDirectionalPath
         | MarketRegimeCluster::EarlyTightRange
         | MarketRegimeCluster::LowEfficiencyNonreversal
-        | MarketRegimeCluster::MixedNeutral => "bte",
+        | MarketRegimeCluster::MixedNeutral => MarketRoute::Bte,
         MarketRegimeCluster::ExpandedHighFlip
         | MarketRegimeCluster::ExpandedReversalPressure
-        | MarketRegimeCluster::FlowAdverseVolCluster => "br2",
-        MarketRegimeCluster::CalmLowVol => "risk_off",
+        | MarketRegimeCluster::FlowAdverseVolCluster => MarketRoute::Br2,
+        MarketRegimeCluster::CalmLowVol => MarketRoute::RiskOff,
     }
 }
 
@@ -155,7 +225,7 @@ fn live_router_route(
     path_efficiency: f32,
     sign_flip_rate: f32,
     realized_vol_180s_bps: f32,
-) -> &'static str {
+) -> MarketRoute {
     if router_high_range_chaos_risk_off(
         market_yes_range_so_far,
         whipsaw_score,
@@ -163,14 +233,14 @@ fn live_router_route(
         sign_flip_rate,
         realized_vol_180s_bps,
     ) {
-        return "risk_off";
+        return MarketRoute::RiskOff;
     }
     static_cluster_router_route(cluster)
 }
 
 fn router_session_stressed(
     cluster: MarketRegimeCluster,
-    route: &'static str,
+    route: MarketRoute,
     market_yes_range_so_far: f32,
     whipsaw_score: f32,
     path_efficiency: f32,
@@ -190,13 +260,13 @@ fn router_session_stressed(
     let wide_range_chop = market_yes_range_so_far >= 0.30
         && realized_vol_180s_bps >= 6.0
         && (path_efficiency <= 0.25 || sign_flip_rate >= 0.35 || reversal_pressure >= 0.25);
-    route == "risk_off" || toxic_cluster || high_vol_chop || wide_range_chop
+    route == MarketRoute::RiskOff || toxic_cluster || high_vol_chop || wide_range_chop
 }
 
 fn update_router_session_regime(
     state: &mut RouterSessionRegimeState,
     now_ms: u64,
-    route: &'static str,
+    route: MarketRoute,
     cluster: MarketRegimeCluster,
     market_yes_range_so_far: f32,
     whipsaw_score: f32,
@@ -267,7 +337,11 @@ fn update_router_session_regime(
         .risk_off_until_ms
         .is_some_and(|risk_off_until_ms| now_ms < risk_off_until_ms);
     RouterSessionRegimeReadout {
-        route: if guard_active { "risk_off" } else { route },
+        guard: if guard_active {
+            SessionGuard::NoAdd
+        } else {
+            SessionGuard::Normal
+        },
         guard_active,
         stress_fraction,
         observation_count,
@@ -276,11 +350,11 @@ fn update_router_session_regime(
     }
 }
 
-fn canonical_router_route(route: &str) -> Option<&'static str> {
+fn canonical_router_route(route: &str) -> Option<MarketRoute> {
     match route {
-        "bte" => Some("bte"),
-        "br2" => Some("br2"),
-        "risk_off" => Some("risk_off"),
+        "bte" => Some(MarketRoute::Bte),
+        "br2" => Some(MarketRoute::Br2),
+        "risk_off" => Some(MarketRoute::RiskOff),
         _ => None,
     }
 }
@@ -337,7 +411,7 @@ fn persist_router_session_regime(
             .iter()
             .map(|obs| PersistedRouterSessionObservation {
                 observed_at_ms: obs.observed_at_ms,
-                route: obs.route.to_string(),
+                route: obs.route.as_str().to_string(),
                 stressed: obs.stressed,
             })
             .collect(),
@@ -350,36 +424,48 @@ fn persist_router_session_regime(
     Ok(())
 }
 
-fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
+fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> MarketRoute {
     if br2_orders > 0 {
-        "br2"
+        MarketRoute::Br2
     } else if bte_orders > 0 {
-        "bte"
+        MarketRoute::Bte
     } else {
-        "risk_off"
+        MarketRoute::RiskOff
     }
 }
 
 fn update_latched_router_route(
     state: &mut MarketRouterState,
-    model_route: &'static str,
+    model_route: MarketRoute,
     now_ms: u64,
-) -> &'static str {
+) -> RouteLatchReadout {
     if let Some(locked_route) = state.locked_route {
-        return locked_route;
+        return RouteLatchReadout {
+            selected_route: Some(locked_route),
+            locked_route: Some(locked_route),
+            confirm_pending: false,
+        };
     }
 
-    if model_route == "risk_off" {
-        state.selected_route = Some("risk_off");
+    if model_route == MarketRoute::RiskOff {
+        state.selected_route = Some(MarketRoute::RiskOff);
         state.pending_route = None;
         state.pending_since_ms = None;
-        return "risk_off";
+        return RouteLatchReadout {
+            selected_route: state.selected_route,
+            locked_route: None,
+            confirm_pending: false,
+        };
     }
 
     if state.selected_route == Some(model_route) {
         state.pending_route = None;
         state.pending_since_ms = None;
-        return model_route;
+        return RouteLatchReadout {
+            selected_route: Some(model_route),
+            locked_route: state.locked_route,
+            confirm_pending: false,
+        };
     }
 
     if state.pending_route != Some(model_route) {
@@ -396,36 +482,61 @@ fn update_latched_router_route(
         state.locked_route = Some(model_route);
         state.pending_route = None;
         state.pending_since_ms = None;
-        model_route
+        RouteLatchReadout {
+            selected_route: Some(model_route),
+            locked_route: Some(model_route),
+            confirm_pending: false,
+        }
     } else {
-        "risk_off"
+        RouteLatchReadout {
+            selected_route: state.selected_route,
+            locked_route: state.locked_route,
+            confirm_pending: true,
+        }
     }
+}
+
+fn classify_router_execution_permission(
+    market_route: MarketRoute,
+    session_guard: SessionGuard,
+    latch: RouteLatchReadout,
+) -> ExecutionPermission {
+    if session_guard == SessionGuard::NoAdd {
+        return ExecutionPermission::NoAddSessionGuard;
+    }
+    if latch.confirm_pending {
+        return ExecutionPermission::NoAddConfirmPending;
+    }
+    if market_route == MarketRoute::RiskOff || latch.selected_route == Some(MarketRoute::RiskOff) {
+        return ExecutionPermission::NoAddMarketRiskOff;
+    }
+    ExecutionPermission::AllowAdd
 }
 
 fn router_allows_strategy_intent(
-    owner_route: &'static str,
-    action_route: &'static str,
-    strategy_route: &'static str,
+    owner_route: Option<MarketRoute>,
+    permission: ExecutionPermission,
+    strategy_route: MarketRoute,
     intent: &OrderIntent,
 ) -> bool {
-    if owner_route == "risk_off" {
+    if owner_route.is_none() || owner_route == Some(MarketRoute::RiskOff) {
         return intent.kind == IntentKind::Close;
     }
-    if owner_route != strategy_route {
+    if owner_route != Some(strategy_route) {
         return false;
     }
-    action_route == strategy_route || intent.kind == IntentKind::Close
+    permission.allows_add_risk() || intent.kind == IntentKind::Close
 }
 
 fn retain_router_allowed_intents(
-    owner_route: &'static str,
-    action_route: &'static str,
-    strategy_route: &'static str,
+    owner_route: Option<MarketRoute>,
+    permission: ExecutionPermission,
+    strategy_route: MarketRoute,
     intents: &mut Vec<OrderIntent>,
 ) -> usize {
     let before = intents.len();
     intents.retain(|intent| {
-        router_allows_strategy_intent(owner_route, action_route, strategy_route, intent)
+        router_allows_strategy_intent(owner_route, permission, strategy_route, intent)
     });
     before.saturating_sub(intents.len())
 }
@@ -2176,8 +2287,9 @@ async fn run_runtime_loop(
                                     bte_submit_intents = result.submit_intents;
                                 }
                             }
-                            let mut router_selected_route: Option<&'static str> = None;
-                            let mut router_action_route: Option<&'static str> = None;
+                            let mut router_selected_route: Option<MarketRoute> = None;
+                            let mut router_execution_permission =
+                                ExecutionPermission::NoAddMarketRiskOff;
                             if router_decision_enabled {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
                                     let yes_book = if record
@@ -2194,8 +2306,9 @@ async fn run_runtime_loop(
                                     };
                                     if let Some(yes_book) = yes_book {
                                         if yes_book.best_bid <= 0.0 || yes_book.best_ask <= 0.0 {
-                                            router_selected_route = Some("risk_off");
-                                            router_action_route = Some("risk_off");
+                                            router_selected_route = Some(MarketRoute::RiskOff);
+                                            router_execution_permission =
+                                                ExecutionPermission::NoAddMarketRiskOff;
                                         } else {
                                             let yes_mid =
                                                 (0.5 * (yes_book.best_bid + yes_book.best_ask))
@@ -2267,9 +2380,8 @@ async fn run_runtime_loop(
                                                     }
                                                 }
                                             }
-                                            let effective_router_route = router_session_readout.route;
-                                            router_action_route = Some(effective_router_route);
-                                            let latched_router_route = {
+                                            let effective_router_route = raw_effective_router_route;
+                                            let latch_readout = {
                                                 let state = router_states
                                                     .entry(market_id.clone())
                                                     .or_default();
@@ -2279,17 +2391,39 @@ async fn run_runtime_loop(
                                                     now_unix_ms(),
                                                 )
                                             };
-                                            let selected_router_route = latched_router_route;
-                                            router_selected_route = Some(selected_router_route);
-                                            let action_router_route = effective_router_route;
-                                            let locked_router_route = router_states
-                                                .get(&market_id)
-                                                .and_then(|state| state.locked_route)
-                                                .unwrap_or("none");
+                                            let execution_permission =
+                                                classify_router_execution_permission(
+                                                    effective_router_route,
+                                                    router_session_readout.guard,
+                                                    latch_readout,
+                                                );
+                                            let selected_router_route = latch_readout
+                                                .selected_route
+                                                .map_or("none", MarketRoute::as_str);
+                                            router_selected_route = latch_readout.selected_route;
+                                            router_execution_permission = execution_permission;
+                                            let latched_router_route = selected_router_route;
+                                            let action_router_route =
+                                                execution_permission
+                                                    .legacy_action_route(latch_readout.selected_route);
+                                            let locked_router_route = latch_readout
+                                                .locked_route
+                                                .map_or("none", MarketRoute::as_str);
                                             let shadow_vote_route = shadow_vote_route(
                                                 br2_shadow_order_count,
                                                 bte_shadow_order_count,
                                             );
+                                            let static_cluster_route_str =
+                                                static_cluster_route.as_str();
+                                            let raw_effective_router_route_str =
+                                                raw_effective_router_route.as_str();
+                                            let effective_router_route_str =
+                                                effective_router_route.as_str();
+                                            let shadow_vote_route_str = shadow_vote_route.as_str();
+                                            let session_guard_state =
+                                                router_session_readout.guard.as_str();
+                                            let execution_permission_str =
+                                                execution_permission.as_str();
                                             let btc_micro_regime =
                                                 btc_regime.regime().map(|regime| regime.to_string());
                                             runtime.persist_router_decision(RouterDecisionRecord {
@@ -2297,11 +2431,11 @@ async fn run_runtime_loop(
                                                 observed_at_ms: now_unix_ms(),
                                                 market_id: market_id.clone(),
                                                 cluster: cluster.to_string(),
-                                                static_cluster_route: static_cluster_route
+                                                static_cluster_route: static_cluster_route_str
                                                     .to_string(),
                                                 raw_effective_router_route:
-                                                    raw_effective_router_route.to_string(),
-                                                effective_router_route: effective_router_route
+                                                    raw_effective_router_route_str.to_string(),
+                                                effective_router_route: effective_router_route_str
                                                     .to_string(),
                                                 latched_router_route: latched_router_route
                                                     .to_string(),
@@ -2311,7 +2445,7 @@ async fn run_runtime_loop(
                                                     .to_string(),
                                                 locked_router_route: locked_router_route
                                                     .to_string(),
-                                                shadow_vote_route: shadow_vote_route.to_string(),
+                                                shadow_vote_route: shadow_vote_route_str.to_string(),
                                                 router_enforce_enabled,
                                                 session_guard_active:
                                                     router_session_readout.guard_active,
@@ -2352,19 +2486,22 @@ async fn run_runtime_loop(
                                                     target: "router_shadow",
                                                     market = %market_id,
                                                     cluster = %cluster,
-                                                    static_cluster_route,
-                                                    raw_effective_router_route,
-                                                    effective_router_route,
+                                                    static_cluster_route = static_cluster_route_str,
+                                                    raw_effective_router_route = raw_effective_router_route_str,
+                                                    effective_router_route = effective_router_route_str,
                                                     latched_router_route,
                                                     selected_router_route,
                                                     action_router_route,
                                                     locked_router_route,
+                                                    session_guard_state,
+                                                    execution_permission = execution_permission_str,
+                                                    route_confirm_pending = latch_readout.confirm_pending,
                                                     session_guard_active = router_session_readout.guard_active,
                                                     session_stress_fraction = router_session_readout.stress_fraction,
                                                     session_observation_count = router_session_readout.observation_count,
                                                     session_action_switch_count = router_session_readout.action_switch_count,
                                                     session_risk_off_until_ms = router_session_readout.risk_off_until_ms,
-                                                    shadow_vote_route,
+                                                    shadow_vote_route = shadow_vote_route_str,
                                                     router_enforce_enabled,
                                                     br2_orders = br2_shadow_order_count,
                                                     bte_orders = bte_shadow_order_count,
@@ -2387,18 +2524,16 @@ async fn run_runtime_loop(
                                 }
                             }
                             if router_enforce_enabled {
-                                let owner_route = router_selected_route.unwrap_or("risk_off");
-                                let action_route = router_action_route.unwrap_or("risk_off");
                                 let br2_suppressed_count = retain_router_allowed_intents(
-                                    owner_route,
-                                    action_route,
-                                    "br2",
+                                    router_selected_route,
+                                    router_execution_permission,
+                                    MarketRoute::Br2,
                                     &mut br2_submit_intents,
                                 );
                                 let bte_suppressed_count = retain_router_allowed_intents(
-                                    owner_route,
-                                    action_route,
-                                    "bte",
+                                    router_selected_route,
+                                    router_execution_permission,
+                                    MarketRoute::Bte,
                                     &mut bte_submit_intents,
                                 );
                                 if bte_suppressed_count > 0 {
@@ -2410,8 +2545,11 @@ async fn run_runtime_loop(
                                     warn!(
                                         target: "router_enforce",
                                         market = %market_id,
-                                        owner_route,
-                                        action_route,
+                                        owner_route = router_selected_route
+                                            .map_or("none", MarketRoute::as_str),
+                                        execution_permission = router_execution_permission.as_str(),
+                                        action_route = router_execution_permission
+                                            .legacy_action_route(router_selected_route),
                                         br2_suppressed_count,
                                         bte_suppressed_count,
                                         "ROUTER-ENFORCE suppressed disallowed live intents"

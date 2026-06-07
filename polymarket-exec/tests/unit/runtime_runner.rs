@@ -254,7 +254,7 @@ fn live_router_allows_bte_on_clean_directional_path() {
             0.08,
             2.0,
         ),
-        "bte"
+        MarketRoute::Bte
     );
 }
 
@@ -269,7 +269,7 @@ fn live_router_does_not_route_bte_on_expanded_reversal_pressure() {
             0.28,
             8.0,
         ),
-        "br2"
+        MarketRoute::Br2
     );
 }
 
@@ -284,7 +284,7 @@ fn live_router_forces_risk_off_on_high_range_low_efficiency_chaos() {
             0.38,
             8.5,
         ),
-        "risk_off"
+        MarketRoute::RiskOff
     );
 }
 
@@ -299,7 +299,7 @@ fn live_router_forces_risk_off_on_wide_range_whipsaw_mixed_neutral() {
             0.36,
             6.5
         ),
-        "risk_off"
+        MarketRoute::RiskOff
     );
 }
 
@@ -314,7 +314,7 @@ fn live_router_forces_risk_off_on_live_observed_violent_chop() {
             0.40,
             7.06,
         ),
-        "risk_off"
+        MarketRoute::RiskOff
     );
 }
 
@@ -322,42 +322,43 @@ fn live_router_forces_risk_off_on_live_observed_violent_chop() {
 fn router_route_latch_requires_consecutive_non_risk_ticks() {
     let mut state = MarketRouterState::default();
 
-    assert_eq!(
-        update_latched_router_route(&mut state, "bte", 1_000),
-        "risk_off"
-    );
-    assert_eq!(
-        update_latched_router_route(&mut state, "bte", 20_000),
-        "risk_off"
-    );
-    assert_eq!(
-        update_latched_router_route(&mut state, "bte", 31_000),
-        "bte"
-    );
-    assert_eq!(
-        update_latched_router_route(&mut state, "bte", 32_000),
-        "bte"
-    );
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 1_000);
+    assert_eq!(readout.selected_route, None);
+    assert!(readout.confirm_pending);
+
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 20_000);
+    assert_eq!(readout.selected_route, None);
+    assert!(readout.confirm_pending);
+
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 31_000);
+    assert_eq!(readout.selected_route, Some(MarketRoute::Bte));
+    assert_eq!(readout.locked_route, Some(MarketRoute::Bte));
+    assert!(!readout.confirm_pending);
+
+    let readout = update_latched_router_route(&mut state, MarketRoute::Bte, 32_000);
+    assert_eq!(readout.selected_route, Some(MarketRoute::Bte));
+    assert_eq!(readout.locked_route, Some(MarketRoute::Bte));
+    assert!(!readout.confirm_pending);
 
     assert_eq!(
-        update_latched_router_route(&mut state, "br2", 33_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Br2, 33_000).selected_route,
+        Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, "risk_off", 34_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::RiskOff, 34_000).selected_route,
+        Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, "br2", 35_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Br2, 35_000).selected_route,
+        Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, "br2", 60_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Br2, 60_000).selected_route,
+        Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, "br2", 65_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Br2, 65_000).selected_route,
+        Some(MarketRoute::Bte)
     );
 }
 
@@ -365,22 +366,55 @@ fn router_route_latch_requires_consecutive_non_risk_ticks() {
 fn router_route_latch_locks_confirmed_strategy_for_market() {
     let mut state = MarketRouterState::default();
 
+    assert!(update_latched_router_route(&mut state, MarketRoute::Bte, 1_000).confirm_pending);
     assert_eq!(
-        update_latched_router_route(&mut state, "bte", 1_000),
-        "risk_off"
-    );
-    assert_eq!(
-        update_latched_router_route(&mut state, "bte", 31_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Bte, 31_000).selected_route,
+        Some(MarketRoute::Bte)
     );
 
     assert_eq!(
-        update_latched_router_route(&mut state, "br2", 32_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::Br2, 32_000).selected_route,
+        Some(MarketRoute::Bte)
     );
     assert_eq!(
-        update_latched_router_route(&mut state, "risk_off", 33_000),
-        "bte"
+        update_latched_router_route(&mut state, MarketRoute::RiskOff, 33_000).selected_route,
+        Some(MarketRoute::Bte)
+    );
+}
+
+#[test]
+fn router_permission_keeps_market_owner_separate_from_overlays() {
+    let locked_bte = RouteLatchReadout {
+        selected_route: Some(MarketRoute::Bte),
+        locked_route: Some(MarketRoute::Bte),
+        confirm_pending: false,
+    };
+
+    assert_eq!(
+        classify_router_execution_permission(MarketRoute::Br2, SessionGuard::Normal, locked_bte),
+        ExecutionPermission::AllowAdd
+    );
+    assert_eq!(
+        classify_router_execution_permission(MarketRoute::Bte, SessionGuard::NoAdd, locked_bte),
+        ExecutionPermission::NoAddSessionGuard
+    );
+    assert_eq!(
+        classify_router_execution_permission(
+            MarketRoute::RiskOff,
+            SessionGuard::Normal,
+            locked_bte
+        ),
+        ExecutionPermission::NoAddMarketRiskOff
+    );
+
+    let pending = RouteLatchReadout {
+        selected_route: None,
+        locked_route: None,
+        confirm_pending: true,
+    };
+    assert_eq!(
+        classify_router_execution_permission(MarketRoute::Bte, SessionGuard::Normal, pending),
+        ExecutionPermission::NoAddConfirmPending
     );
 }
 
@@ -392,7 +426,7 @@ fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
         let readout = update_router_session_regime(
             &mut state,
             i as u64 * 1_000,
-            "risk_off",
+            MarketRoute::RiskOff,
             MarketRegimeCluster::ExpandedReversalPressure,
             0.42,
             0.66,
@@ -409,7 +443,7 @@ fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
     let readout = update_router_session_regime(
         &mut state,
         ROUTER_SESSION_GUARD_MIN_OBSERVATIONS as u64 * 1_000,
-        "bte",
+        MarketRoute::Bte,
         MarketRegimeCluster::EarlyTightRange,
         0.02,
         0.35,
@@ -420,7 +454,7 @@ fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
     );
 
     assert!(readout.guard_active);
-    assert_eq!(readout.route, "risk_off");
+    assert_eq!(readout.guard, SessionGuard::NoAdd);
     assert!(readout.stress_fraction >= ROUTER_SESSION_GUARD_STRESS_FRACTION);
 }
 
@@ -429,7 +463,11 @@ fn router_session_guard_uses_action_switches_as_chop_signal() {
     let mut state = RouterSessionRegimeState::default();
 
     for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
-        let route = if i % 2 == 0 { "bte" } else { "risk_off" };
+        let route = if i % 2 == 0 {
+            MarketRoute::Bte
+        } else {
+            MarketRoute::RiskOff
+        };
         update_router_session_regime(
             &mut state,
             i as u64 * 1_000,
@@ -447,7 +485,7 @@ fn router_session_guard_uses_action_switches_as_chop_signal() {
     let readout = update_router_session_regime(
         &mut state,
         ROUTER_SESSION_GUARD_MIN_OBSERVATIONS as u64 * 1_000,
-        "bte",
+        MarketRoute::Bte,
         MarketRegimeCluster::EarlyTightRange,
         0.02,
         0.35,
@@ -458,7 +496,7 @@ fn router_session_guard_uses_action_switches_as_chop_signal() {
     );
 
     assert!(readout.guard_active);
-    assert_eq!(readout.route, "risk_off");
+    assert_eq!(readout.guard, SessionGuard::NoAdd);
     assert!(readout.action_switch_count >= ROUTER_SESSION_GUARD_SWITCH_COUNT);
 }
 
@@ -470,7 +508,7 @@ fn router_session_guard_allows_clean_session_to_route() {
         let readout = update_router_session_regime(
             &mut state,
             i as u64 * 1_000,
-            "bte",
+            MarketRoute::Bte,
             MarketRegimeCluster::EarlyTightRange,
             0.04,
             0.30,
@@ -480,7 +518,7 @@ fn router_session_guard_allows_clean_session_to_route() {
             3.0,
         );
         assert!(!readout.guard_active);
-        assert_eq!(readout.route, "bte");
+        assert_eq!(readout.guard, SessionGuard::Normal);
     }
 }
 
@@ -498,7 +536,7 @@ fn router_session_guard_persists_and_restores_recent_state() {
     update_router_session_regime(
         &mut state,
         now_ms - 1_000,
-        "risk_off",
+        MarketRoute::RiskOff,
         MarketRegimeCluster::ExpandedReversalPressure,
         0.42,
         0.66,
@@ -514,7 +552,7 @@ fn router_session_guard_persists_and_restores_recent_state() {
         load_router_session_regime(&path, now_ms).expect("restore router state from disk");
 
     assert_eq!(restored.observations.len(), 1);
-    assert_eq!(restored.observations[0].route, "risk_off");
+    assert_eq!(restored.observations[0].route, MarketRoute::RiskOff);
     assert!(restored.observations[0].stressed);
     assert_eq!(restored.risk_off_until_ms, Some(now_ms + 60_000));
 
@@ -552,7 +590,7 @@ fn router_session_guard_restore_prunes_stale_observations_and_expired_cooldown()
         load_router_session_regime(&path, now_ms).expect("restore router state from disk");
 
     assert_eq!(restored.observations.len(), 1);
-    assert_eq!(restored.observations[0].route, "bte");
+    assert_eq!(restored.observations[0].route, MarketRoute::Bte);
     assert!(!restored.observations[0].stressed);
     assert_eq!(restored.risk_off_until_ms, None);
 
@@ -581,11 +619,21 @@ fn router_enforce_allows_owner_entries_but_not_other_strategy_entries() {
     )];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "bte", "bte", &mut bte_intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::AllowAdd,
+            MarketRoute::Bte,
+            &mut bte_intents
+        ),
         0
     );
     assert_eq!(
-        retain_router_allowed_intents("bte", "bte", "br2", &mut br2_intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::AllowAdd,
+            MarketRoute::Br2,
+            &mut br2_intents
+        ),
         1
     );
     assert_eq!(bte_intents.len(), 1);
@@ -616,7 +664,12 @@ fn router_risk_off_blocks_entries_but_allows_close_intents() {
     ];
 
     assert_eq!(
-        retain_router_allowed_intents("risk_off", "risk_off", "bte", &mut intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::RiskOff),
+            ExecutionPermission::NoAddMarketRiskOff,
+            MarketRoute::Bte,
+            &mut intents
+        ),
         1
     );
     assert_eq!(intents.len(), 1);
@@ -648,7 +701,12 @@ fn router_action_risk_off_blocks_owner_entries_but_allows_owner_close() {
     ];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "risk_off", "bte", &mut intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::NoAddSessionGuard,
+            MarketRoute::Bte,
+            &mut intents
+        ),
         1
     );
     assert_eq!(intents.len(), 1);
@@ -657,7 +715,7 @@ fn router_action_risk_off_blocks_owner_entries_but_allows_owner_close() {
 }
 
 #[test]
-fn router_action_strategy_drift_blocks_owner_entries_but_allows_owner_close() {
+fn router_confirm_pending_blocks_owner_entries_but_allows_owner_close() {
     let mut intents = vec![
         OrderIntent::new_buy(
             ClientOrderId::from("bte-entry"),
@@ -680,7 +738,12 @@ fn router_action_strategy_drift_blocks_owner_entries_but_allows_owner_close() {
     ];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "br2", "bte", &mut intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::NoAddConfirmPending,
+            MarketRoute::Bte,
+            &mut intents
+        ),
         1
     );
     assert_eq!(intents.len(), 1);
@@ -701,7 +764,12 @@ fn router_does_not_handoff_close_intents_to_non_owner() {
     )];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "bte", "br2", &mut br2_intents),
+        retain_router_allowed_intents(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::AllowAdd,
+            MarketRoute::Br2,
+            &mut br2_intents
+        ),
         1
     );
     assert!(br2_intents.is_empty());
