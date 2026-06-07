@@ -19,7 +19,7 @@ use crate::runtime::bte_shadow::{
     BteDecisionPosition, BteRegimeInputs, BteShadowAdapter, BteShadowOrder,
 };
 use crate::strategy_profile::StrategyProfile;
-use crate::types::{ClientOrderId, InstrumentId, MarketId, OrderIntent, TradeSide};
+use crate::types::{ClientOrderId, InstrumentId, IntentKind, MarketId, OrderIntent, TradeSide};
 
 const NS_PER_MS: i64 = 1_000_000;
 const DECISION_CADENCE_MS: u64 = 1_000;
@@ -341,6 +341,7 @@ impl BteLiveShadow {
                     );
                     continue;
                 };
+                let intent = mark_forced_repair_intent(intent, forced_repair);
                 let intent = if self.live_trade_armed {
                     match self.apply_notional_caps(intent, market_id, order.side, pos) {
                         Some(capped) => capped,
@@ -521,6 +522,13 @@ fn live_reversal_repair_regime(regime: BteRegimeInputs) -> bool {
     regime.whipsaw_score >= LIVE_REVERSAL_REPAIR_MIN_WHIPSAW
         && regime.sign_flip_rate >= LIVE_REVERSAL_REPAIR_MIN_SIGN_FLIP_RATE
         && regime.path_efficiency <= LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY
+}
+
+fn mark_forced_repair_intent(mut intent: OrderIntent, forced_repair: bool) -> OrderIntent {
+    if forced_repair {
+        intent.kind = IntentKind::Close;
+    }
+    intent
 }
 
 fn shadow_order_to_intent(
@@ -824,6 +832,24 @@ mod tests {
         assert!(forced);
         assert_eq!(repair.side, Side::BuyNo);
         assert_eq!(repair.tag, "back_to_explore_live_reversal_repair");
+    }
+
+    #[test]
+    fn bte_live_forced_repair_intent_is_close_kind() {
+        let intent = OrderIntent::new_buy(
+            ClientOrderId::from("repair"),
+            MarketId::from("m"),
+            InstrumentId::from("no"),
+            0.44,
+            5.0,
+            "forced repair",
+            1_000,
+        );
+
+        let repaired = mark_forced_repair_intent(intent, true);
+
+        assert_eq!(repaired.kind, IntentKind::Close);
+        assert!(!repaired.reduce_only);
     }
 
     #[test]

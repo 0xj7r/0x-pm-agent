@@ -43,8 +43,8 @@ use crate::runtime::{Runtime, RuntimeConfig, RuntimeOutcome};
 use crate::signals::BtcRegimeSnapshot;
 use crate::strategy::{Strategy, StrategyMode, VenueMarketRules};
 use crate::types::{
-    ClientOrderId, FillLiquidity, FillReport, InstrumentId, MarketId, OrderId, OrderIntent,
-    RuntimeCommand, RuntimeStatus, TradeSide,
+    ClientOrderId, FillLiquidity, FillReport, InstrumentId, IntentKind, MarketId, OrderId,
+    OrderIntent, RuntimeCommand, RuntimeStatus, TradeSide,
 };
 use crate::wire::api::{serve_http, DashboardSnapshot, DashboardUiState};
 use crate::wire::eoa_polygon::usdc_units_to_f64;
@@ -131,18 +131,6 @@ fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
     }
 }
 
-fn confirmed_router_route(
-    model_route: &'static str,
-    br2_strategy_orders: usize,
-    bte_strategy_orders: usize,
-) -> &'static str {
-    match model_route {
-        "br2" if br2_strategy_orders > 0 => "br2",
-        "bte" if bte_strategy_orders > 0 => "bte",
-        _ => "risk_off",
-    }
-}
-
 fn update_latched_router_route(
     state: &mut MarketRouterState,
     model_route: &'static str,
@@ -183,6 +171,24 @@ fn update_latched_router_route(
     } else {
         "risk_off"
     }
+}
+
+fn router_allows_strategy_intent(
+    route: &'static str,
+    strategy_route: &'static str,
+    intent: &OrderIntent,
+) -> bool {
+    route == strategy_route || (route == "risk_off" && intent.kind == IntentKind::Close)
+}
+
+fn retain_router_allowed_intents(
+    route: &'static str,
+    strategy_route: &'static str,
+    intents: &mut Vec<OrderIntent>,
+) -> usize {
+    let before = intents.len();
+    intents.retain(|intent| router_allows_strategy_intent(route, strategy_route, intent));
+    before.saturating_sub(intents.len())
 }
 
 fn runtime_env(key: &str) -> Option<String> {
@@ -1964,12 +1970,8 @@ async fn run_runtime_loop(
                                                     now_unix_ms(),
                                                 )
                                             };
-                                            let confirmed_router_route = confirmed_router_route(
-                                                latched_router_route,
-                                                br2_shadow_order_count,
-                                                bte_shadow_order_count,
-                                            );
-                                            router_selected_route = Some(confirmed_router_route);
+                                            let selected_router_route = latched_router_route;
+                                            router_selected_route = Some(selected_router_route);
                                             let locked_router_route = router_states
                                                 .get(&market_id)
                                                 .and_then(|state| state.locked_route)
@@ -1986,7 +1988,7 @@ async fn run_runtime_loop(
                                                     static_cluster_route,
                                                     effective_router_route,
                                                     latched_router_route,
-                                                    confirmed_router_route,
+                                                    selected_router_route,
                                                     locked_router_route,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
@@ -2012,21 +2014,23 @@ async fn run_runtime_loop(
                             }
                             if router_enforce_enabled {
                                 let route = router_selected_route.unwrap_or("risk_off");
-                                let br2_suppressed = route != "br2" && !br2_submit_intents.is_empty();
-                                let bte_suppressed = route != "bte" && !bte_submit_intents.is_empty();
-                                if route != "br2" {
-                                    br2_submit_intents.clear();
-                                }
-                                if route != "bte" {
-                                    bte_submit_intents.clear();
-                                }
-                                if br2_suppressed || bte_suppressed {
+                                let br2_suppressed_count = retain_router_allowed_intents(
+                                    route,
+                                    "br2",
+                                    &mut br2_submit_intents,
+                                );
+                                let bte_suppressed_count = retain_router_allowed_intents(
+                                    route,
+                                    "bte",
+                                    &mut bte_submit_intents,
+                                );
+                                if br2_suppressed_count > 0 || bte_suppressed_count > 0 {
                                     warn!(
                                         target: "router_enforce",
                                         market = %market_id,
                                         route,
-                                        br2_suppressed,
-                                        bte_suppressed,
+                                        br2_suppressed_count,
+                                        bte_suppressed_count,
                                         "ROUTER-ENFORCE suppressed non-routed live intents"
                                     );
                                 }
