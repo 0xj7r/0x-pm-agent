@@ -61,6 +61,7 @@ pub struct Runtime<S: Strategy> {
     strategy: S,
     inventory: InventoryState,
     starting_cash_usd: f64,
+    session_risk_anchor_usd: Option<f64>,
     risk: RiskEngine,
     event_log: EventLog,
     run_id: String,
@@ -177,6 +178,7 @@ impl<S: Strategy> Runtime<S> {
             strategy,
             inventory: InventoryState::new(config.starting_cash_usd),
             starting_cash_usd: config.starting_cash_usd,
+            session_risk_anchor_usd: None,
             risk: RiskEngine::new(risk_limits),
             event_log: EventLog::new(config.event_log_capacity),
             run_id,
@@ -218,6 +220,18 @@ impl<S: Strategy> Runtime<S> {
 
     pub fn status(&self) -> RuntimeStatus {
         self.status
+    }
+
+    pub fn set_session_risk_anchor_usd(&mut self, anchor_usd: f64) {
+        if anchor_usd.is_finite() && anchor_usd > 0.0 {
+            self.session_risk_anchor_usd = Some(anchor_usd);
+        }
+    }
+
+    pub fn risk_anchor_usd(&self) -> f64 {
+        self.session_risk_anchor_usd
+            .filter(|anchor| anchor.is_finite() && *anchor > 0.0)
+            .unwrap_or(self.starting_cash_usd)
     }
 
     pub fn has_needs_reconcile_orders(&self) -> bool {
@@ -1418,7 +1432,7 @@ impl<S: Strategy> Runtime<S> {
     }
 
     fn merge_pressure_reason(&self, market_id: &MarketId) -> Option<String> {
-        let starting_cash = self.starting_cash_usd.max(0.0);
+        let starting_cash = self.risk_anchor_usd().max(0.0);
         let free_cash_pressure_ratio = self.merge_free_cash_pressure_ratio;
         let free_cash = self.inventory.free_cash_usd();
         if starting_cash > 0.0
@@ -3493,7 +3507,7 @@ impl<S: Strategy> Runtime<S> {
                 .open_signed_notional_for_market_usd(&intent.market_id),
             open_position_qty_for_instrument: self
                 .open_position_qty_for_instrument(&intent.instrument_id),
-            starting_cash_usd: self.starting_cash_usd,
+            starting_cash_usd: self.risk_anchor_usd(),
             now_ms,
         };
         let decision = self.risk.evaluate(&self.inventory, &intent, &risk_context);

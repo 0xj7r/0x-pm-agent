@@ -2115,9 +2115,11 @@ async fn run_runtime_loop(
                                         .unwrap_or(0.0);
                                     let equity_usd =
                                         inventory.total_cash_usd() + inventory.gross_exposure_usd();
-                                    let daily_loss_pct = if config.starting_cash_usd > 0.0 {
-                                        ((config.starting_cash_usd - equity_usd)
-                                            / config.starting_cash_usd)
+                                    let session_risk_anchor_usd =
+                                        live_risk_anchor_usd(&config, &live_safety);
+                                    let daily_loss_pct = if session_risk_anchor_usd > 0.0 {
+                                        ((session_risk_anchor_usd - equity_usd)
+                                            / session_risk_anchor_usd)
                                             .max(0.0)
                                     } else {
                                         0.0
@@ -2126,10 +2128,10 @@ async fn run_runtime_loop(
                                         if config.risk_limits.max_session_loss_bps > 0.0 {
                                             config.risk_limits.max_session_loss_bps / 10_000.0
                                         } else if config.risk_limits.max_session_loss_usd > 0.0
-                                            && config.starting_cash_usd > 0.0
+                                            && session_risk_anchor_usd > 0.0
                                         {
                                             config.risk_limits.max_session_loss_usd
-                                                / config.starting_cash_usd
+                                                / session_risk_anchor_usd
                                         } else {
                                             1.0
                                         };
@@ -2146,7 +2148,7 @@ async fn run_runtime_loop(
                                             current_market_net_exposure_shares,
                                             btc_net_exposure_shares: btc_ladder_net_exposure_shares,
                                             eth_net_exposure_shares: 0.0,
-                                            daily_start_cash_usdc: config.starting_cash_usd,
+                                            daily_start_cash_usdc: session_risk_anchor_usd,
                                             daily_loss_cap_pct,
                                             current_daily_loss_pct: daily_loss_pct,
                                         };
@@ -4850,6 +4852,7 @@ async fn apply_sync_report(
             let marked_equity_usd = cash_usd + runtime.inventory().gross_exposure_usd();
             if marked_equity_usd.is_finite() && marked_equity_usd > 0.0 {
                 live_safety.session_equity_anchor_usd = Some(marked_equity_usd);
+                runtime.set_session_risk_anchor_usd(marked_equity_usd);
                 info!(
                     mode = "live",
                     session_equity_anchor_usd = marked_equity_usd,

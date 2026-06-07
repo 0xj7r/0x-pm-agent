@@ -152,9 +152,8 @@ fn live_health_failures(
     if !snapshot.execution_adapter_connected {
         health_failures.push("execution adapter disconnected".to_string());
     }
-    let free_cash_floor_usd = config
-        .risk_limits
-        .free_cash_floor_usd(config.starting_cash_usd);
+    let session_anchor_usd = live_risk_anchor_usd(config, live_safety);
+    let free_cash_floor_usd = config.risk_limits.free_cash_floor_usd(session_anchor_usd);
     match live_safety.last_venue_cash_usd {
         Some(cash_usd) if cash_usd < free_cash_floor_usd => {
             risk_failures.push(format!(
@@ -178,7 +177,6 @@ fn live_health_failures(
             config.risk_limits.max_gross_notional_usd
         ));
     }
-    let session_anchor_usd = live_risk_anchor_usd(config, live_safety);
     if let Some(equity_floor_usd) =
         portfolio_equity_floor_usd(&config.risk_limits, session_anchor_usd)
     {

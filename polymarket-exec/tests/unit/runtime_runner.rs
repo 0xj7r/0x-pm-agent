@@ -2318,6 +2318,7 @@ async fn sync_report_captures_live_session_equity_anchor_once() {
     )
     .await;
     assert_eq!(live_safety.session_equity_anchor_usd, Some(2_311.0));
+    assert_eq!(runtime.risk_anchor_usd(), 2_311.0);
 
     apply_sync_report(
         &mut runtime,
@@ -2337,6 +2338,50 @@ async fn sync_report_captures_live_session_equity_anchor_once() {
     )
     .await;
     assert_eq!(live_safety.session_equity_anchor_usd, Some(2_311.0));
+    assert_eq!(runtime.risk_anchor_usd(), 2_311.0);
+}
+
+#[test]
+fn runtime_entry_risk_uses_dynamic_session_anchor() {
+    let mut runtime = Runtime::new(
+        RuntimeConfig {
+            starting_cash_usd: 2_700.0,
+            event_log_capacity: 128,
+            initial_status: RuntimeStatus::Running,
+            ..RuntimeConfig::default()
+        },
+        RiskLimits {
+            max_session_loss_bps: 1_000.0,
+            ..RiskLimits::default()
+        },
+        StrategyMode::Noop(NoopStrategy),
+        MarketContextStore::empty(),
+    );
+    runtime
+        .reconcile_venue_cash(2_311.0, 1)
+        .expect("reconcile venue cash");
+    runtime.set_session_risk_anchor_usd(2_311.0);
+
+    let outcome = runtime.accept_external_intent(
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-live-test"),
+            MarketId::from("market-1"),
+            InstrumentId::from("token-1"),
+            0.60,
+            5.0,
+            "bte taker buy",
+            2,
+        ),
+        2,
+    );
+
+    assert!(
+        outcome
+            .commands
+            .iter()
+            .any(|command| matches!(command, RuntimeCommand::Submit(_))),
+        "dynamic session anchor should prevent stale configured starting cash from rejecting live BTE entries"
+    );
 }
 
 #[test]
