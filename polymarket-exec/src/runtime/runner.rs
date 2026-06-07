@@ -60,6 +60,11 @@ use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 const LATE_FAV_MAKER_TTL_MS: u64 = 30_000;
 const ROUTER_ROUTE_CONFIRM_MS: u64 = 30_000;
+const ROUTER_SESSION_GUARD_WINDOW_MS: u64 = 15 * 60 * 1_000;
+const ROUTER_SESSION_GUARD_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
+const ROUTER_SESSION_GUARD_MIN_OBSERVATIONS: usize = 30;
+const ROUTER_SESSION_GUARD_STRESS_FRACTION: f32 = 0.60;
+const ROUTER_SESSION_GUARD_SWITCH_COUNT: usize = 8;
 
 #[derive(Clone, Debug, Default)]
 struct MarketRouterState {
@@ -67,6 +72,29 @@ struct MarketRouterState {
     pending_route: Option<&'static str>,
     pending_since_ms: Option<u64>,
     locked_route: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+struct RouterSessionObservation {
+    observed_at_ms: u64,
+    route: &'static str,
+    stressed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouterSessionRegimeState {
+    observations: VecDeque<RouterSessionObservation>,
+    risk_off_until_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RouterSessionRegimeReadout {
+    route: &'static str,
+    guard_active: bool,
+    stress_fraction: f32,
+    observation_count: usize,
+    action_switch_count: usize,
+    risk_off_until_ms: Option<u64>,
 }
 
 fn router_high_range_chaos_risk_off(
@@ -119,6 +147,114 @@ fn live_router_route(
         return "risk_off";
     }
     static_cluster_router_route(cluster)
+}
+
+fn router_session_stressed(
+    cluster: MarketRegimeCluster,
+    route: &'static str,
+    market_yes_range_so_far: f32,
+    whipsaw_score: f32,
+    path_efficiency: f32,
+    sign_flip_rate: f32,
+    reversal_pressure: f32,
+    realized_vol_180s_bps: f32,
+) -> bool {
+    let toxic_cluster = matches!(
+        cluster,
+        MarketRegimeCluster::ExpandedHighFlip
+            | MarketRegimeCluster::ExpandedReversalPressure
+            | MarketRegimeCluster::FlowAdverseVolCluster
+    );
+    let high_vol_chop = whipsaw_score >= 0.58
+        && realized_vol_180s_bps >= 8.0
+        && (path_efficiency <= 0.25 || sign_flip_rate >= 0.35 || reversal_pressure >= 0.30);
+    let wide_range_chop = market_yes_range_so_far >= 0.30
+        && realized_vol_180s_bps >= 6.0
+        && (path_efficiency <= 0.25 || sign_flip_rate >= 0.35 || reversal_pressure >= 0.25);
+    route == "risk_off" || toxic_cluster || high_vol_chop || wide_range_chop
+}
+
+fn update_router_session_regime(
+    state: &mut RouterSessionRegimeState,
+    now_ms: u64,
+    route: &'static str,
+    cluster: MarketRegimeCluster,
+    market_yes_range_so_far: f32,
+    whipsaw_score: f32,
+    path_efficiency: f32,
+    sign_flip_rate: f32,
+    reversal_pressure: f32,
+    realized_vol_180s_bps: f32,
+) -> RouterSessionRegimeReadout {
+    let stressed = router_session_stressed(
+        cluster,
+        route,
+        market_yes_range_so_far,
+        whipsaw_score,
+        path_efficiency,
+        sign_flip_rate,
+        reversal_pressure,
+        realized_vol_180s_bps,
+    );
+    state.observations.push_back(RouterSessionObservation {
+        observed_at_ms: now_ms,
+        route,
+        stressed,
+    });
+    while state.observations.front().is_some_and(|obs| {
+        now_ms.saturating_sub(obs.observed_at_ms) > ROUTER_SESSION_GUARD_WINDOW_MS
+    }) {
+        state.observations.pop_front();
+    }
+
+    let observation_count = state.observations.len();
+    let stressed_count = state.observations.iter().filter(|obs| obs.stressed).count();
+    let stress_fraction = if observation_count == 0 {
+        0.0
+    } else {
+        stressed_count as f32 / observation_count as f32
+    };
+    let action_switch_count = state
+        .observations
+        .iter()
+        .map(|obs| obs.route)
+        .fold((None, 0usize), |(previous, count), route| {
+            let switched = previous.is_some_and(|previous_route| previous_route != route);
+            (Some(route), count + usize::from(switched))
+        })
+        .1;
+
+    let sustained_stress = observation_count >= ROUTER_SESSION_GUARD_MIN_OBSERVATIONS
+        && stress_fraction >= ROUTER_SESSION_GUARD_STRESS_FRACTION;
+    let choppy_routing = observation_count >= ROUTER_SESSION_GUARD_MIN_OBSERVATIONS
+        && action_switch_count >= ROUTER_SESSION_GUARD_SWITCH_COUNT
+        && stress_fraction >= 0.35;
+    let violent_current_market = market_yes_range_so_far >= 0.55
+        && whipsaw_score >= 0.55
+        && realized_vol_180s_bps >= 8.0
+        && (path_efficiency <= 0.25 || reversal_pressure >= 0.35 || sign_flip_rate >= 0.35);
+    if sustained_stress || choppy_routing || violent_current_market {
+        let risk_off_until_ms = now_ms.saturating_add(ROUTER_SESSION_GUARD_COOLDOWN_MS);
+        state.risk_off_until_ms = Some(
+            state
+                .risk_off_until_ms
+                .map_or(risk_off_until_ms, |existing| {
+                    existing.max(risk_off_until_ms)
+                }),
+        );
+    }
+
+    let guard_active = state
+        .risk_off_until_ms
+        .is_some_and(|risk_off_until_ms| now_ms < risk_off_until_ms);
+    RouterSessionRegimeReadout {
+        route: if guard_active { "risk_off" } else { route },
+        guard_active,
+        stress_fraction,
+        observation_count,
+        action_switch_count,
+        risk_off_until_ms: state.risk_off_until_ms,
+    }
 }
 
 fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
@@ -1341,6 +1477,7 @@ async fn run_runtime_loop(
     let router_decision_enabled = router_shadow_enabled || router_enforce_enabled;
     let mut router_yes_ranges: HashMap<MarketId, (f32, f32)> = HashMap::new();
     let mut router_states: HashMap<MarketId, MarketRouterState> = HashMap::new();
+    let mut router_session_regime = RouterSessionRegimeState::default();
     if router_decision_enabled {
         info!(
             target: "router_shadow",
@@ -1964,7 +2101,7 @@ async fn run_runtime_loop(
                                                 runtime.btc_regime_snapshot(now_unix_ms());
                                             let static_cluster_route =
                                                 static_cluster_router_route(cluster);
-                                            let effective_router_route = live_router_route(
+                                            let raw_effective_router_route = live_router_route(
                                                 cluster,
                                                 market_yes_range_so_far,
                                                 whipsaw.score,
@@ -1972,6 +2109,20 @@ async fn run_runtime_loop(
                                                 whipsaw.sign_flip_rate,
                                                 whipsaw.realized_vol_180s_bps,
                                             );
+                                            let router_session_readout =
+                                                update_router_session_regime(
+                                                    &mut router_session_regime,
+                                                    now_unix_ms(),
+                                                    raw_effective_router_route,
+                                                    cluster,
+                                                    market_yes_range_so_far,
+                                                    whipsaw.score,
+                                                    whipsaw.path_efficiency,
+                                                    whipsaw.sign_flip_rate,
+                                                    whipsaw.reversal_pressure,
+                                                    whipsaw.realized_vol_180s_bps,
+                                                );
+                                            let effective_router_route = router_session_readout.route;
                                             router_action_route = Some(effective_router_route);
                                             let latched_router_route = {
                                                 let state = router_states
@@ -2000,11 +2151,17 @@ async fn run_runtime_loop(
                                                     market = %market_id,
                                                     cluster = %cluster,
                                                     static_cluster_route,
+                                                    raw_effective_router_route,
                                                     effective_router_route,
                                                     latched_router_route,
                                                     selected_router_route,
                                                     action_router_route,
                                                     locked_router_route,
+                                                    session_guard_active = router_session_readout.guard_active,
+                                                    session_stress_fraction = router_session_readout.stress_fraction,
+                                                    session_observation_count = router_session_readout.observation_count,
+                                                    session_action_switch_count = router_session_readout.action_switch_count,
+                                                    session_risk_off_until_ms = router_session_readout.risk_off_until_ms,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
                                                     br2_orders = br2_shadow_order_count,

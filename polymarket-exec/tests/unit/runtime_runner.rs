@@ -385,6 +385,106 @@ fn router_route_latch_locks_confirmed_strategy_for_market() {
 }
 
 #[test]
+fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
+    let mut state = RouterSessionRegimeState::default();
+
+    for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
+        let readout = update_router_session_regime(
+            &mut state,
+            i as u64 * 1_000,
+            "risk_off",
+            MarketRegimeCluster::ExpandedReversalPressure,
+            0.42,
+            0.66,
+            0.08,
+            0.45,
+            0.52,
+            12.0,
+        );
+        if i + 1 < ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
+            assert!(!readout.guard_active);
+        }
+    }
+
+    let readout = update_router_session_regime(
+        &mut state,
+        ROUTER_SESSION_GUARD_MIN_OBSERVATIONS as u64 * 1_000,
+        "bte",
+        MarketRegimeCluster::EarlyTightRange,
+        0.02,
+        0.35,
+        0.55,
+        0.10,
+        0.0,
+        3.0,
+    );
+
+    assert!(readout.guard_active);
+    assert_eq!(readout.route, "risk_off");
+    assert!(readout.stress_fraction >= ROUTER_SESSION_GUARD_STRESS_FRACTION);
+}
+
+#[test]
+fn router_session_guard_uses_action_switches_as_chop_signal() {
+    let mut state = RouterSessionRegimeState::default();
+
+    for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
+        let route = if i % 2 == 0 { "bte" } else { "risk_off" };
+        update_router_session_regime(
+            &mut state,
+            i as u64 * 1_000,
+            route,
+            MarketRegimeCluster::MixedNeutral,
+            0.20,
+            0.42,
+            0.40,
+            0.20,
+            0.0,
+            5.0,
+        );
+    }
+
+    let readout = update_router_session_regime(
+        &mut state,
+        ROUTER_SESSION_GUARD_MIN_OBSERVATIONS as u64 * 1_000,
+        "bte",
+        MarketRegimeCluster::EarlyTightRange,
+        0.02,
+        0.35,
+        0.55,
+        0.10,
+        0.0,
+        3.0,
+    );
+
+    assert!(readout.guard_active);
+    assert_eq!(readout.route, "risk_off");
+    assert!(readout.action_switch_count >= ROUTER_SESSION_GUARD_SWITCH_COUNT);
+}
+
+#[test]
+fn router_session_guard_allows_clean_session_to_route() {
+    let mut state = RouterSessionRegimeState::default();
+
+    for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
+        let readout = update_router_session_regime(
+            &mut state,
+            i as u64 * 1_000,
+            "bte",
+            MarketRegimeCluster::EarlyTightRange,
+            0.04,
+            0.30,
+            0.55,
+            0.10,
+            0.0,
+            3.0,
+        );
+        assert!(!readout.guard_active);
+        assert_eq!(readout.route, "bte");
+    }
+}
+
+#[test]
 fn router_enforce_allows_owner_entries_but_not_other_strategy_entries() {
     let mut bte_intents = vec![OrderIntent::new_buy(
         ClientOrderId::from("bte-entry"),
