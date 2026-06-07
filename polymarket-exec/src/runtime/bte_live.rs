@@ -373,6 +373,11 @@ impl BteLiveShadow {
         }
     }
 
+    pub fn clear_pending_market_cap_reservation(&mut self, market_id: &MarketId) {
+        self.risk_increasing_notional_by_market
+            .remove(market_id.as_str());
+    }
+
     fn apply_notional_caps(
         &mut self,
         mut intent: OrderIntent,
@@ -808,6 +813,61 @@ mod tests {
             .apply_notional_caps(repair_no, &market, Side::BuyNo, long_yes_at_cap)
             .expect("opposite-side repair should not be blocked by the market cap");
         assert!((capped.notional_usd() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bte_live_can_release_router_suppressed_cap_reservation() {
+        let mut live = BteLiveShadow {
+            adapter: BteShadowAdapter::new(pm_strategy::BackToExploreConfig::default()),
+            active: None,
+            paper_trade_armed: false,
+            live_trade_armed: true,
+            max_order_notional_usd: 5.0,
+            max_market_notional_usd: 6.0,
+            min_order_shares: 5.0,
+            min_order_notional_usd: 1.8,
+            risk_increasing_notional_by_market: HashMap::new(),
+            warmup_skip_warned: false,
+        };
+        let market = MarketId::from("m");
+        let pos = BteDecisionPosition {
+            current_market_net_exposure_shares: 0.0,
+            ..BteDecisionPosition::default()
+        };
+        let first = OrderIntent::new_buy(
+            ClientOrderId::from("first"),
+            market.clone(),
+            InstrumentId::from("yes"),
+            0.80,
+            5.0,
+            "test",
+            1_000,
+        );
+        let second = OrderIntent::new_buy(
+            ClientOrderId::from("second"),
+            market.clone(),
+            InstrumentId::from("yes"),
+            0.80,
+            5.0,
+            "test",
+            2_000,
+        );
+
+        assert!(live
+            .apply_notional_caps(first, &market, Side::BuyYes, pos)
+            .is_some());
+        assert!(
+            live.apply_notional_caps(second.clone(), &market, Side::BuyYes, pos)
+                .is_none(),
+            "the first accepted intent reserves live cap until submitted or explicitly released"
+        );
+
+        live.clear_pending_market_cap_reservation(&market);
+        assert!(
+            live.apply_notional_caps(second, &market, Side::BuyYes, pos)
+                .is_some(),
+            "router-suppressed intents should not poison the next real opportunity"
+        );
     }
 
     #[test]

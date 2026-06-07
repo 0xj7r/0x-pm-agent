@@ -2399,6 +2399,11 @@ async fn run_runtime_loop(
                                     "bte",
                                     &mut bte_submit_intents,
                                 );
+                                if bte_suppressed_count > 0 {
+                                    if let Some(shadow) = bte_shadow.as_mut() {
+                                        shadow.clear_pending_market_cap_reservation(&market_id);
+                                    }
+                                }
                                 if br2_suppressed_count > 0 || bte_suppressed_count > 0 {
                                     warn!(
                                         target: "router_enforce",
