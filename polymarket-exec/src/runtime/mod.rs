@@ -35,7 +35,7 @@ use crate::quote_engine::{DesiredQuoteSet, QuoteEngineConfig, StaleMode};
 use crate::quote_reconciler::{QuoteAction, QuoteReconciler};
 use crate::risk::{RiskContext, RiskEngine, RiskLimits};
 use crate::runtime::btc_signals::BtcSignalStore;
-use crate::runtime::order_store::{AccountingLane, OrderRecord, OrderStore};
+use crate::runtime::order_store::{AccountingLane, OrderRecord, OrderStore, RouterDecisionRecord};
 pub use crate::runtime::types::{
     ManagedOrder, ManagedOrderStatus, RuntimeConfig, RuntimeError, RuntimeOutcome,
 };
@@ -551,6 +551,21 @@ impl<S: Strategy> Runtime<S> {
                 status = ?status,
                 run_id = %run_id,
                 "failed to persist runtime status"
+            );
+        }
+    }
+
+    pub fn persist_router_decision(&mut self, mut record: RouterDecisionRecord) {
+        let run_id = self.run_id.clone();
+        record.run_id.clone_from(&run_id);
+        let Some(order_store) = self.order_store.as_mut() else {
+            return;
+        };
+        if let Err(error) = order_store.insert_router_decision(record) {
+            warn!(
+                error = ?error,
+                run_id = %run_id,
+                "failed to persist router decision"
             );
         }
     }

@@ -136,6 +136,44 @@ impl OrderRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RouterDecisionRecord {
+    pub run_id: String,
+    pub observed_at_ms: EpochMillis,
+    pub market_id: MarketId,
+    pub cluster: String,
+    pub static_cluster_route: String,
+    pub raw_effective_router_route: String,
+    pub effective_router_route: String,
+    pub latched_router_route: String,
+    pub selected_router_route: String,
+    pub action_router_route: String,
+    pub locked_router_route: String,
+    pub shadow_vote_route: String,
+    pub router_enforce_enabled: bool,
+    pub session_guard_active: bool,
+    pub session_stress_fraction: f64,
+    pub session_observation_count: u64,
+    pub session_action_switch_count: u64,
+    pub session_risk_off_until_ms: Option<EpochMillis>,
+    pub br2_orders: u64,
+    pub bte_orders: u64,
+    pub br2_submit_intents: u64,
+    pub bte_submit_intents: u64,
+    pub yes_mid: f64,
+    pub market_yes_range_so_far: f64,
+    pub whipsaw_score: f64,
+    pub path_efficiency: f64,
+    pub sign_flip_rate: f64,
+    pub reversal_pressure: f64,
+    pub realized_vol_180s_bps: f64,
+    pub whipsaw_sample_count: u64,
+    pub btc_micro_regime: Option<String>,
+    pub free_cash_usd: f64,
+    pub gross_exposure_usd: f64,
+    pub open_orders: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum OrderStoreError {
     Io(String),
     NotFound(ClientOrderId),
@@ -217,6 +255,14 @@ pub trait OrderStore {
         status: RuntimeStatus,
     ) -> std::result::Result<(), OrderStoreError>;
     fn latest_runtime_status(&self) -> std::result::Result<Option<RuntimeStatus>, OrderStoreError>;
+    fn insert_router_decision(
+        &mut self,
+        record: RouterDecisionRecord,
+    ) -> std::result::Result<(), OrderStoreError>;
+    fn list_recent_router_decisions(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<RouterDecisionRecord>, OrderStoreError>;
 }
 
 #[derive(Debug)]
@@ -240,8 +286,22 @@ impl SqliteOrderStore {
         let connection = Connection::open(&path)
             .map_err(|error| OrderStoreError::Sqlite(format!("failed to open sqlite: {error}")))?;
         let store = Self { connection };
+        store.configure_connection()?;
         store.migrate()?;
         Ok(store)
+    }
+
+    fn configure_connection(&self) -> std::result::Result<(), OrderStoreError> {
+        self.connection
+            .execute_batch(
+                "PRAGMA busy_timeout = 5000;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;",
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to configure sqlite connection: {error}"))
+            })?;
+        Ok(())
     }
 
     fn migrate(&self) -> std::result::Result<(), OrderStoreError> {
@@ -347,6 +407,87 @@ impl SqliteOrderStore {
             )
             .map_err(|error| {
                 OrderStoreError::Sqlite(format!("failed to create runtime_state table: {error}"))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS router_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    observed_at_ms INTEGER NOT NULL,
+                    market_id TEXT NOT NULL,
+                    cluster TEXT NOT NULL,
+                    static_cluster_route TEXT NOT NULL,
+                    raw_effective_router_route TEXT NOT NULL,
+                    effective_router_route TEXT NOT NULL,
+                    latched_router_route TEXT NOT NULL,
+                    selected_router_route TEXT NOT NULL,
+                    action_router_route TEXT NOT NULL,
+                    locked_router_route TEXT NOT NULL,
+                    shadow_vote_route TEXT NOT NULL,
+                    router_enforce_enabled INTEGER NOT NULL,
+                    session_guard_active INTEGER NOT NULL,
+                    session_stress_fraction REAL NOT NULL,
+                    session_observation_count INTEGER NOT NULL,
+                    session_action_switch_count INTEGER NOT NULL,
+                    session_risk_off_until_ms INTEGER,
+                    br2_orders INTEGER NOT NULL,
+                    bte_orders INTEGER NOT NULL,
+                    br2_submit_intents INTEGER NOT NULL,
+                    bte_submit_intents INTEGER NOT NULL,
+                    yes_mid REAL NOT NULL,
+                    market_yes_range_so_far REAL NOT NULL,
+                    whipsaw_score REAL NOT NULL,
+                    path_efficiency REAL NOT NULL,
+                    sign_flip_rate REAL NOT NULL,
+                    reversal_pressure REAL NOT NULL,
+                    realized_vol_180s_bps REAL NOT NULL,
+                    whipsaw_sample_count INTEGER NOT NULL,
+                    btc_micro_regime TEXT,
+                    free_cash_usd REAL NOT NULL,
+                    gross_exposure_usd REAL NOT NULL,
+                    open_orders INTEGER NOT NULL
+                )",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to create router_decisions table: {error}"))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_router_decisions_observed_at
+                 ON router_decisions (observed_at_ms)",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to create router observed_at index: {error}"
+                ))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_router_decisions_market_observed_at
+                 ON router_decisions (market_id, observed_at_ms)",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to create router market-observed_at index: {error}"
+                ))
+            })?;
+
+        self.connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_router_decisions_selected_route
+                 ON router_decisions (selected_router_route, action_router_route, observed_at_ms)",
+                (),
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to create router selected-route index: {error}"
+                ))
             })?;
 
         Ok(())
@@ -487,6 +628,45 @@ impl SqliteOrderStore {
             strategy_tag: row.get(15)?,
             quote_level_tag: row.get(16)?,
             accounting_lane,
+        })
+    }
+
+    fn row_to_router_decision(row: &Row<'_>) -> rusqlite::Result<RouterDecisionRecord> {
+        Ok(RouterDecisionRecord {
+            run_id: row.get(0)?,
+            observed_at_ms: row.get::<_, i64>(1)? as u64,
+            market_id: MarketId::from(row.get::<_, String>(2)?.as_str()),
+            cluster: row.get(3)?,
+            static_cluster_route: row.get(4)?,
+            raw_effective_router_route: row.get(5)?,
+            effective_router_route: row.get(6)?,
+            latched_router_route: row.get(7)?,
+            selected_router_route: row.get(8)?,
+            action_router_route: row.get(9)?,
+            locked_router_route: row.get(10)?,
+            shadow_vote_route: row.get(11)?,
+            router_enforce_enabled: row.get::<_, i64>(12)? != 0,
+            session_guard_active: row.get::<_, i64>(13)? != 0,
+            session_stress_fraction: row.get(14)?,
+            session_observation_count: row.get::<_, i64>(15)? as u64,
+            session_action_switch_count: row.get::<_, i64>(16)? as u64,
+            session_risk_off_until_ms: row.get::<_, Option<i64>>(17)?.map(|value| value as u64),
+            br2_orders: row.get::<_, i64>(18)? as u64,
+            bte_orders: row.get::<_, i64>(19)? as u64,
+            br2_submit_intents: row.get::<_, i64>(20)? as u64,
+            bte_submit_intents: row.get::<_, i64>(21)? as u64,
+            yes_mid: row.get(22)?,
+            market_yes_range_so_far: row.get(23)?,
+            whipsaw_score: row.get(24)?,
+            path_efficiency: row.get(25)?,
+            sign_flip_rate: row.get(26)?,
+            reversal_pressure: row.get(27)?,
+            realized_vol_180s_bps: row.get(28)?,
+            whipsaw_sample_count: row.get::<_, i64>(29)? as u64,
+            btc_micro_regime: row.get(30)?,
+            free_cash_usd: row.get(31)?,
+            gross_exposure_usd: row.get(32)?,
+            open_orders: row.get::<_, i64>(33)? as u64,
         })
     }
 
@@ -1008,11 +1188,169 @@ impl OrderStore for SqliteOrderStore {
         })
         .transpose()
     }
+
+    fn insert_router_decision(
+        &mut self,
+        record: RouterDecisionRecord,
+    ) -> std::result::Result<(), OrderStoreError> {
+        self.connection
+            .execute(
+                "INSERT INTO router_decisions (
+                    run_id,
+                    observed_at_ms,
+                    market_id,
+                    cluster,
+                    static_cluster_route,
+                    raw_effective_router_route,
+                    effective_router_route,
+                    latched_router_route,
+                    selected_router_route,
+                    action_router_route,
+                    locked_router_route,
+                    shadow_vote_route,
+                    router_enforce_enabled,
+                    session_guard_active,
+                    session_stress_fraction,
+                    session_observation_count,
+                    session_action_switch_count,
+                    session_risk_off_until_ms,
+                    br2_orders,
+                    bte_orders,
+                    br2_submit_intents,
+                    bte_submit_intents,
+                    yes_mid,
+                    market_yes_range_so_far,
+                    whipsaw_score,
+                    path_efficiency,
+                    sign_flip_rate,
+                    reversal_pressure,
+                    realized_vol_180s_bps,
+                    whipsaw_sample_count,
+                    btc_micro_regime,
+                    free_cash_usd,
+                    gross_exposure_usd,
+                    open_orders
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                    ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+                    ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34
+                )",
+                params![
+                    record.run_id,
+                    record.observed_at_ms as i64,
+                    record.market_id.as_str(),
+                    record.cluster,
+                    record.static_cluster_route,
+                    record.raw_effective_router_route,
+                    record.effective_router_route,
+                    record.latched_router_route,
+                    record.selected_router_route,
+                    record.action_router_route,
+                    record.locked_router_route,
+                    record.shadow_vote_route,
+                    if record.router_enforce_enabled { 1 } else { 0 },
+                    if record.session_guard_active { 1 } else { 0 },
+                    record.session_stress_fraction,
+                    record.session_observation_count as i64,
+                    record.session_action_switch_count as i64,
+                    record.session_risk_off_until_ms.map(|value| value as i64),
+                    record.br2_orders as i64,
+                    record.bte_orders as i64,
+                    record.br2_submit_intents as i64,
+                    record.bte_submit_intents as i64,
+                    record.yes_mid,
+                    record.market_yes_range_so_far,
+                    record.whipsaw_score,
+                    record.path_efficiency,
+                    record.sign_flip_rate,
+                    record.reversal_pressure,
+                    record.realized_vol_180s_bps,
+                    record.whipsaw_sample_count as i64,
+                    record.btc_micro_regime,
+                    record.free_cash_usd,
+                    record.gross_exposure_usd,
+                    record.open_orders as i64,
+                ],
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to insert router decision: {error}"))
+            })?;
+        Ok(())
+    }
+
+    fn list_recent_router_decisions(
+        &self,
+        limit: usize,
+    ) -> std::result::Result<Vec<RouterDecisionRecord>, OrderStoreError> {
+        let limit = limit.max(1).min(i64::MAX as usize) as i64;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    run_id,
+                    observed_at_ms,
+                    market_id,
+                    cluster,
+                    static_cluster_route,
+                    raw_effective_router_route,
+                    effective_router_route,
+                    latched_router_route,
+                    selected_router_route,
+                    action_router_route,
+                    locked_router_route,
+                    shadow_vote_route,
+                    router_enforce_enabled,
+                    session_guard_active,
+                    session_stress_fraction,
+                    session_observation_count,
+                    session_action_switch_count,
+                    session_risk_off_until_ms,
+                    br2_orders,
+                    bte_orders,
+                    br2_submit_intents,
+                    bte_submit_intents,
+                    yes_mid,
+                    market_yes_range_so_far,
+                    whipsaw_score,
+                    path_efficiency,
+                    sign_flip_rate,
+                    reversal_pressure,
+                    realized_vol_180s_bps,
+                    whipsaw_sample_count,
+                    btc_micro_regime,
+                    free_cash_usd,
+                    gross_exposure_usd,
+                    open_orders
+                 FROM router_decisions
+                 ORDER BY observed_at_ms DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!(
+                    "failed to prepare recent router decisions query: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(params![limit], Self::row_to_router_decision)
+            .map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to query recent router decisions: {error}"))
+            })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(|error| {
+                OrderStoreError::Sqlite(format!("failed to decode router decision: {error}"))
+            })?);
+        }
+        Ok(records)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountingLane, OrderStore, OrderStoreError, SqliteOrderStore};
+    use super::{
+        AccountingLane, OrderStore, OrderStoreError, RouterDecisionRecord, SqliteOrderStore,
+    };
     use crate::types::{
         ClientOrderId, EpochMillis, InstrumentId, MarketId, OrderId, OrderIntent, RuntimeStatus,
         TradeSide,
@@ -1374,6 +1712,60 @@ mod tests {
 
         store.put_runtime_status("run-2", 20, RuntimeStatus::Running)?;
         assert_eq!(store.latest_runtime_status()?, Some(RuntimeStatus::Running));
+        Ok(())
+    }
+
+    #[test]
+    fn router_decision_records_are_inserted_and_loaded() -> anyhow::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("polymarket-exec-router-decisions-{ts}.sqlite"));
+        let mut store = SqliteOrderStore::open(path)?;
+
+        store.insert_router_decision(RouterDecisionRecord {
+            run_id: "run-1".to_string(),
+            observed_at_ms: 123,
+            market_id: MarketId::from("market-1"),
+            cluster: "low_efficiency_nonreversal".to_string(),
+            static_cluster_route: "bte".to_string(),
+            raw_effective_router_route: "bte".to_string(),
+            effective_router_route: "risk_off".to_string(),
+            latched_router_route: "risk_off".to_string(),
+            selected_router_route: "risk_off".to_string(),
+            action_router_route: "risk_off".to_string(),
+            locked_router_route: "none".to_string(),
+            shadow_vote_route: "bte".to_string(),
+            router_enforce_enabled: true,
+            session_guard_active: true,
+            session_stress_fraction: 0.71,
+            session_observation_count: 1706,
+            session_action_switch_count: 200,
+            session_risk_off_until_ms: Some(456),
+            br2_orders: 0,
+            bte_orders: 1,
+            br2_submit_intents: 0,
+            bte_submit_intents: 1,
+            yes_mid: 0.43,
+            market_yes_range_so_far: 0.43,
+            whipsaw_score: 0.61,
+            path_efficiency: 0.03,
+            sign_flip_rate: 0.37,
+            reversal_pressure: 0.22,
+            realized_vol_180s_bps: 10.33,
+            whipsaw_sample_count: 37,
+            btc_micro_regime: Some("whipsaw".to_string()),
+            free_cash_usd: 2310.73,
+            gross_exposure_usd: 0.0,
+            open_orders: 0,
+        })?;
+
+        let records = store.list_recent_router_decisions(10)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].market_id, MarketId::from("market-1"));
+        assert_eq!(records[0].selected_router_route, "risk_off");
+        assert_eq!(records[0].btc_micro_regime.as_deref(), Some("whipsaw"));
         Ok(())
     }
 }

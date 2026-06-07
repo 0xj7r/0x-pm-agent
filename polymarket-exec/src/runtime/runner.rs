@@ -37,7 +37,7 @@ use crate::runtime::live_health::{
 use crate::runtime::market_universe::{
     fetch_btc_5m_market_contexts, refresh_runtime_market_universe, RuntimeMarketUniverse,
 };
-use crate::runtime::order_store::SqliteOrderStore;
+use crate::runtime::order_store::{RouterDecisionRecord, SqliteOrderStore};
 use crate::runtime::paper_fill::{
     deterministic_hash_0_95, paper_fill_from_book_snapshot, paper_post_only_should_reject,
 };
@@ -2288,6 +2288,63 @@ async fn run_runtime_loop(
                                                 br2_shadow_order_count,
                                                 bte_shadow_order_count,
                                             );
+                                            let btc_micro_regime =
+                                                btc_regime.regime().map(|regime| regime.to_string());
+                                            runtime.persist_router_decision(RouterDecisionRecord {
+                                                run_id: String::new(),
+                                                observed_at_ms: now_unix_ms(),
+                                                market_id: market_id.clone(),
+                                                cluster: cluster.to_string(),
+                                                static_cluster_route: static_cluster_route
+                                                    .to_string(),
+                                                raw_effective_router_route:
+                                                    raw_effective_router_route.to_string(),
+                                                effective_router_route: effective_router_route
+                                                    .to_string(),
+                                                latched_router_route: latched_router_route
+                                                    .to_string(),
+                                                selected_router_route: selected_router_route
+                                                    .to_string(),
+                                                action_router_route: action_router_route
+                                                    .to_string(),
+                                                locked_router_route: locked_router_route
+                                                    .to_string(),
+                                                shadow_vote_route: shadow_vote_route.to_string(),
+                                                router_enforce_enabled,
+                                                session_guard_active:
+                                                    router_session_readout.guard_active,
+                                                session_stress_fraction:
+                                                    router_session_readout.stress_fraction as f64,
+                                                session_observation_count:
+                                                    router_session_readout.observation_count as u64,
+                                                session_action_switch_count:
+                                                    router_session_readout.action_switch_count
+                                                        as u64,
+                                                session_risk_off_until_ms:
+                                                    router_session_readout.risk_off_until_ms,
+                                                br2_orders: br2_shadow_order_count as u64,
+                                                bte_orders: bte_shadow_order_count as u64,
+                                                br2_submit_intents: br2_submit_intents.len()
+                                                    as u64,
+                                                bte_submit_intents: bte_submit_intents.len()
+                                                    as u64,
+                                                yes_mid: yes_mid as f64,
+                                                market_yes_range_so_far:
+                                                    market_yes_range_so_far as f64,
+                                                whipsaw_score: whipsaw.score as f64,
+                                                path_efficiency: whipsaw.path_efficiency as f64,
+                                                sign_flip_rate: whipsaw.sign_flip_rate as f64,
+                                                reversal_pressure: whipsaw.reversal_pressure as f64,
+                                                realized_vol_180s_bps:
+                                                    whipsaw.realized_vol_180s_bps as f64,
+                                                whipsaw_sample_count: whipsaw.sample_count as u64,
+                                                btc_micro_regime: btc_micro_regime.clone(),
+                                                free_cash_usd: runtime.inventory().free_cash_usd(),
+                                                gross_exposure_usd: runtime
+                                                    .inventory()
+                                                    .gross_exposure_usd(),
+                                                open_orders: runtime.open_orders().count() as u64,
+                                            });
                                             if router_shadow_enabled {
                                                 info!(
                                                     target: "router_shadow",
@@ -2319,7 +2376,7 @@ async fn run_runtime_loop(
                                                     reversal_pressure = whipsaw.reversal_pressure,
                                                     realized_vol_180s_bps = whipsaw.realized_vol_180s_bps,
                                                     whipsaw_sample_count = whipsaw.sample_count,
-                                                    btc_micro_regime = ?btc_regime.regime(),
+                                                    btc_micro_regime = ?btc_micro_regime,
                                                     "ROUTER-SHADOW selected strategy diagnostics"
                                                 );
                                             }
