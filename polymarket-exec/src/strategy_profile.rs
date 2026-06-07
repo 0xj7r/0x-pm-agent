@@ -97,6 +97,9 @@ pub struct BackToExploreSection {
     pub range_reversal_pressure: Option<f32>,
     pub clean_path_directional_clip_multiplier: Option<f64>,
     pub reversal_pressure_clip_multiplier: Option<f64>,
+    pub reversal_pressure_directional_min_signal: Option<f64>,
+    pub reversal_pressure_directional_min_edge: Option<f64>,
+    pub reversal_pressure_directional_clip_multiplier: Option<f64>,
     pub max_residual_shares: Option<f64>,
     pub min_clip_multiplier_to_emit: Option<f64>,
     pub refresh_secs: Option<f64>,
@@ -441,6 +444,15 @@ impl StrategyProfile {
             reversal_pressure_clip_multiplier: b
                 .reversal_pressure_clip_multiplier
                 .unwrap_or(defaults.reversal_pressure_clip_multiplier),
+            reversal_pressure_directional_min_signal: b
+                .reversal_pressure_directional_min_signal
+                .unwrap_or(defaults.reversal_pressure_directional_min_signal),
+            reversal_pressure_directional_min_edge: b
+                .reversal_pressure_directional_min_edge
+                .unwrap_or(defaults.reversal_pressure_directional_min_edge),
+            reversal_pressure_directional_clip_multiplier: b
+                .reversal_pressure_directional_clip_multiplier
+                .unwrap_or(defaults.reversal_pressure_directional_clip_multiplier),
             max_residual_shares: b
                 .max_residual_shares
                 .unwrap_or(defaults.max_residual_shares),

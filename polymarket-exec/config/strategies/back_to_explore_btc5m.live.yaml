@@ -54,6 +54,9 @@ back_to_explore:
   range_reversal_pressure: 0.45
   clean_path_directional_clip_multiplier: 1.25
   reversal_pressure_clip_multiplier: 0.0
+  reversal_pressure_directional_min_signal: 1.05
+  reversal_pressure_directional_min_edge: 0.01
+  reversal_pressure_directional_clip_multiplier: 0.85
 
   refresh_secs: 2.8
   stop_secs_before_close: 4.0

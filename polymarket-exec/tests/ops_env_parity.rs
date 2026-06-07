@@ -241,6 +241,9 @@ fn btc_5m_bte_env_example_uses_overlay_profile_and_no_legacy_caps() {
         assert_eq!(profile.strategy.as_deref(), Some("back_to_explore"));
         assert_eq!(bte.clean_path_directional_clip_multiplier, 1.25);
         assert_eq!(bte.reversal_pressure_clip_multiplier, 0.0);
+        assert_eq!(bte.reversal_pressure_directional_min_signal, 1.05);
+        assert_eq!(bte.reversal_pressure_directional_min_edge, 0.01);
+        assert_eq!(bte.reversal_pressure_directional_clip_multiplier, 0.85);
         assert_eq!(bte.range_repair_min_clip_multiplier, 0.70);
     }
 }
