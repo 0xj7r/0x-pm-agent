@@ -1,10 +1,13 @@
 //! Runtime orchestration loop wiring books, websockets, execution adapter, and ops APIs.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -65,6 +68,7 @@ const ROUTER_SESSION_GUARD_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_MIN_OBSERVATIONS: usize = 30;
 const ROUTER_SESSION_GUARD_STRESS_FRACTION: f32 = 0.60;
 const ROUTER_SESSION_GUARD_SWITCH_COUNT: usize = 8;
+const ROUTER_SESSION_GUARD_PERSIST_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, Default)]
 struct MarketRouterState {
@@ -95,6 +99,21 @@ struct RouterSessionRegimeReadout {
     observation_count: usize,
     action_switch_count: usize,
     risk_off_until_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedRouterSessionRegimeState {
+    version: u8,
+    saved_at_ms: u64,
+    observations: Vec<PersistedRouterSessionObservation>,
+    risk_off_until_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedRouterSessionObservation {
+    observed_at_ms: u64,
+    route: String,
+    stressed: bool,
 }
 
 fn router_high_range_chaos_risk_off(
@@ -255,6 +274,80 @@ fn update_router_session_regime(
         action_switch_count,
         risk_off_until_ms: state.risk_off_until_ms,
     }
+}
+
+fn canonical_router_route(route: &str) -> Option<&'static str> {
+    match route {
+        "bte" => Some("bte"),
+        "br2" => Some("br2"),
+        "risk_off" => Some("risk_off"),
+        _ => None,
+    }
+}
+
+fn router_session_guard_state_path(config: &AppConfig) -> Option<PathBuf> {
+    if let Some(path) = runtime_env("PM_BTC_5M_ROUTER_SESSION_GUARD_STATE_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    config
+        .journal_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|parent| parent.join("router_session_guard.json"))
+}
+
+fn load_router_session_regime(path: &Path, now_ms: u64) -> Result<RouterSessionRegimeState> {
+    let body = fs::read_to_string(path)?;
+    let persisted: PersistedRouterSessionRegimeState = serde_json::from_str(&body)?;
+    let mut observations = VecDeque::with_capacity(persisted.observations.len());
+    for obs in persisted.observations {
+        if now_ms.saturating_sub(obs.observed_at_ms) > ROUTER_SESSION_GUARD_WINDOW_MS {
+            continue;
+        }
+        let Some(route) = canonical_router_route(obs.route.as_str()) else {
+            continue;
+        };
+        observations.push_back(RouterSessionObservation {
+            observed_at_ms: obs.observed_at_ms,
+            route,
+            stressed: obs.stressed,
+        });
+    }
+    Ok(RouterSessionRegimeState {
+        observations,
+        risk_off_until_ms: persisted
+            .risk_off_until_ms
+            .filter(|risk_off_until_ms| now_ms < *risk_off_until_ms),
+    })
+}
+
+fn persist_router_session_regime(
+    path: &Path,
+    state: &RouterSessionRegimeState,
+    now_ms: u64,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let persisted = PersistedRouterSessionRegimeState {
+        version: 1,
+        saved_at_ms: now_ms,
+        observations: state
+            .observations
+            .iter()
+            .map(|obs| PersistedRouterSessionObservation {
+                observed_at_ms: obs.observed_at_ms,
+                route: obs.route.to_string(),
+                stressed: obs.stressed,
+            })
+            .collect(),
+        risk_off_until_ms: state.risk_off_until_ms,
+    };
+    let body = serde_json::to_vec(&persisted)?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, body)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
 }
 
 fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
@@ -1477,7 +1570,32 @@ async fn run_runtime_loop(
     let router_decision_enabled = router_shadow_enabled || router_enforce_enabled;
     let mut router_yes_ranges: HashMap<MarketId, (f32, f32)> = HashMap::new();
     let mut router_states: HashMap<MarketId, MarketRouterState> = HashMap::new();
-    let mut router_session_regime = RouterSessionRegimeState::default();
+    let router_session_guard_path = router_session_guard_state_path(config);
+    let mut router_session_regime = match router_session_guard_path.as_deref() {
+        Some(path) if path.exists() => match load_router_session_regime(path, now_unix_ms()) {
+            Ok(state) => {
+                info!(
+                    target: "router_shadow",
+                    path = %path.display(),
+                    observation_count = state.observations.len(),
+                    risk_off_until_ms = state.risk_off_until_ms,
+                    "restored router session guard state"
+                );
+                state
+            }
+            Err(error) => {
+                warn!(
+                    target: "router_shadow",
+                    path = %path.display(),
+                    %error,
+                    "failed to restore router session guard state; starting fresh"
+                );
+                RouterSessionRegimeState::default()
+            }
+        },
+        _ => RouterSessionRegimeState::default(),
+    };
+    let mut router_session_guard_last_persist_ms = now_unix_ms();
     if router_decision_enabled {
         info!(
             target: "router_shadow",
@@ -1485,6 +1603,7 @@ async fn run_runtime_loop(
             bte_shadow_enabled = bte_shadow.is_some(),
             router_shadow_enabled,
             router_enforce_enabled,
+            router_session_guard_path = ?router_session_guard_path,
             "router layer enabled: BTE-vs-BR2 selection diagnostics"
         );
     }
@@ -2122,6 +2241,30 @@ async fn run_runtime_loop(
                                                     whipsaw.reversal_pressure,
                                                     whipsaw.realized_vol_180s_bps,
                                                 );
+                                            if let Some(path) = router_session_guard_path.as_deref()
+                                            {
+                                                let now_ms = now_unix_ms();
+                                                if now_ms.saturating_sub(
+                                                    router_session_guard_last_persist_ms,
+                                                ) >= ROUTER_SESSION_GUARD_PERSIST_INTERVAL_MS
+                                                {
+                                                    router_session_guard_last_persist_ms = now_ms;
+                                                    if let Err(error) =
+                                                        persist_router_session_regime(
+                                                            path,
+                                                            &router_session_regime,
+                                                            now_ms,
+                                                        )
+                                                    {
+                                                        warn!(
+                                                            target: "router_shadow",
+                                                            path = %path.display(),
+                                                            %error,
+                                                            "failed to persist router session guard state"
+                                                        );
+                                                    }
+                                                }
+                                            }
                                             let effective_router_route = router_session_readout.route;
                                             router_action_route = Some(effective_router_route);
                                             let latched_router_route = {

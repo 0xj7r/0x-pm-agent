@@ -484,6 +484,81 @@ fn router_session_guard_allows_clean_session_to_route() {
     }
 }
 
+fn router_session_guard_test_path(prefix: &str) -> std::path::PathBuf {
+    static ROUTER_SESSION_GUARD_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let suffix = ROUTER_SESSION_GUARD_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{suffix}.json", std::process::id()))
+}
+
+#[test]
+fn router_session_guard_persists_and_restores_recent_state() {
+    let path = router_session_guard_test_path("router-session-guard");
+    let now_ms = 100_000;
+    let mut state = RouterSessionRegimeState::default();
+    update_router_session_regime(
+        &mut state,
+        now_ms - 1_000,
+        "risk_off",
+        MarketRegimeCluster::ExpandedReversalPressure,
+        0.42,
+        0.66,
+        0.08,
+        0.45,
+        0.52,
+        12.0,
+    );
+    state.risk_off_until_ms = Some(now_ms + 60_000);
+
+    persist_router_session_regime(&path, &state, now_ms).expect("persist router state");
+    let restored =
+        load_router_session_regime(&path, now_ms).expect("restore router state from disk");
+
+    assert_eq!(restored.observations.len(), 1);
+    assert_eq!(restored.observations[0].route, "risk_off");
+    assert!(restored.observations[0].stressed);
+    assert_eq!(restored.risk_off_until_ms, Some(now_ms + 60_000));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn router_session_guard_restore_prunes_stale_observations_and_expired_cooldown() {
+    let path = router_session_guard_test_path("router-session-guard-prune");
+    let now_ms = 1_000_000;
+    let persisted = PersistedRouterSessionRegimeState {
+        version: 1,
+        saved_at_ms: now_ms,
+        observations: vec![
+            PersistedRouterSessionObservation {
+                observed_at_ms: now_ms - ROUTER_SESSION_GUARD_WINDOW_MS - 1,
+                route: "risk_off".to_string(),
+                stressed: true,
+            },
+            PersistedRouterSessionObservation {
+                observed_at_ms: now_ms - 1_000,
+                route: "bte".to_string(),
+                stressed: false,
+            },
+        ],
+        risk_off_until_ms: Some(now_ms - 1),
+    };
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&persisted).expect("serialize persisted state"),
+    )
+    .expect("write persisted state");
+
+    let restored =
+        load_router_session_regime(&path, now_ms).expect("restore router state from disk");
+
+    assert_eq!(restored.observations.len(), 1);
+    assert_eq!(restored.observations[0].route, "bte");
+    assert!(!restored.observations[0].stressed);
+    assert_eq!(restored.risk_off_until_ms, None);
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn router_enforce_allows_owner_entries_but_not_other_strategy_entries() {
     let mut bte_intents = vec![OrderIntent::new_buy(
