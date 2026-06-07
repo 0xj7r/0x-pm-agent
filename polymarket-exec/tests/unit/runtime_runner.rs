@@ -319,7 +319,7 @@ fn live_router_forces_risk_off_on_live_observed_violent_chop() {
 }
 
 #[test]
-fn confirmed_router_requires_same_route_submit_intent() {
+fn confirmed_router_requires_same_route_strategy_order() {
     assert_eq!(confirmed_router_route("bte", 0, 1), "bte");
     assert_eq!(confirmed_router_route("br2", 1, 0), "br2");
     assert_eq!(confirmed_router_route("bte", 1, 0), "risk_off");
@@ -355,19 +355,42 @@ fn router_route_latch_requires_consecutive_non_risk_ticks() {
     );
     assert_eq!(
         update_latched_router_route(&mut state, "risk_off", 34_000),
-        "risk_off"
+        "bte"
     );
     assert_eq!(
         update_latched_router_route(&mut state, "br2", 35_000),
-        "risk_off"
+        "bte"
     );
     assert_eq!(
         update_latched_router_route(&mut state, "br2", 60_000),
-        "risk_off"
+        "bte"
     );
     assert_eq!(
         update_latched_router_route(&mut state, "br2", 65_000),
-        "br2"
+        "bte"
+    );
+}
+
+#[test]
+fn router_route_latch_locks_confirmed_strategy_for_market() {
+    let mut state = MarketRouterState::default();
+
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 1_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 31_000),
+        "bte"
+    );
+
+    assert_eq!(
+        update_latched_router_route(&mut state, "br2", 32_000),
+        "bte"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "risk_off", 33_000),
+        "bte"
     );
 }
 

@@ -66,6 +66,7 @@ struct MarketRouterState {
     selected_route: Option<&'static str>,
     pending_route: Option<&'static str>,
     pending_since_ms: Option<u64>,
+    locked_route: Option<&'static str>,
 }
 
 fn router_high_range_chaos_risk_off(
@@ -147,6 +148,10 @@ fn update_latched_router_route(
     model_route: &'static str,
     now_ms: u64,
 ) -> &'static str {
+    if let Some(locked_route) = state.locked_route {
+        return locked_route;
+    }
+
     if model_route == "risk_off" {
         state.selected_route = Some("risk_off");
         state.pending_route = None;
@@ -171,11 +176,12 @@ fn update_latched_router_route(
         .unwrap_or(0);
     if pending_age_ms >= ROUTER_ROUTE_CONFIRM_MS {
         state.selected_route = Some(model_route);
+        state.locked_route = Some(model_route);
         state.pending_route = None;
         state.pending_since_ms = None;
         model_route
     } else {
-        state.selected_route.unwrap_or("risk_off")
+        "risk_off"
     }
 }
 
@@ -1964,6 +1970,10 @@ async fn run_runtime_loop(
                                                 bte_shadow_order_count,
                                             );
                                             router_selected_route = Some(confirmed_router_route);
+                                            let locked_router_route = router_states
+                                                .get(&market_id)
+                                                .and_then(|state| state.locked_route)
+                                                .unwrap_or("none");
                                             let shadow_vote_route = shadow_vote_route(
                                                 br2_shadow_order_count,
                                                 bte_shadow_order_count,
@@ -1977,6 +1987,7 @@ async fn run_runtime_loop(
                                                     effective_router_route,
                                                     latched_router_route,
                                                     confirmed_router_route,
+                                                    locked_router_route,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
                                                     br2_orders = br2_shadow_order_count,
