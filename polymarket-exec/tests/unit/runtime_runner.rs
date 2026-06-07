@@ -328,6 +328,49 @@ fn confirmed_router_requires_same_route_submit_intent() {
     assert_eq!(confirmed_router_route("risk_off", 1, 1), "risk_off");
 }
 
+#[test]
+fn router_route_latch_requires_consecutive_non_risk_ticks() {
+    let mut state = MarketRouterState::default();
+
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 1_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 20_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 31_000),
+        "bte"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "bte", 32_000),
+        "bte"
+    );
+
+    assert_eq!(
+        update_latched_router_route(&mut state, "br2", 33_000),
+        "bte"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "risk_off", 34_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "br2", 35_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "br2", 60_000),
+        "risk_off"
+    );
+    assert_eq!(
+        update_latched_router_route(&mut state, "br2", 65_000),
+        "br2"
+    );
+}
+
 #[tokio::test]
 async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
     let mut config = runner_test_config();

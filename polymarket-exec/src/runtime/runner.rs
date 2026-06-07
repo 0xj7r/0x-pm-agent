@@ -59,6 +59,14 @@ use crate::wire::user_ws::{UserOrderEvent, UserWsClient};
 
 const LATE_BAR_CORE_TTL_MS: u64 = 60_000;
 const LATE_FAV_MAKER_TTL_MS: u64 = 30_000;
+const ROUTER_ROUTE_CONFIRM_MS: u64 = 30_000;
+
+#[derive(Clone, Debug, Default)]
+struct MarketRouterState {
+    selected_route: Option<&'static str>,
+    pending_route: Option<&'static str>,
+    pending_since_ms: Option<u64>,
+}
 
 fn router_high_range_chaos_risk_off(
     market_yes_range_so_far: f32,
@@ -131,6 +139,43 @@ fn confirmed_router_route(
         "br2" if br2_submit_intents > 0 => "br2",
         "bte" if bte_submit_intents > 0 => "bte",
         _ => "risk_off",
+    }
+}
+
+fn update_latched_router_route(
+    state: &mut MarketRouterState,
+    model_route: &'static str,
+    now_ms: u64,
+) -> &'static str {
+    if model_route == "risk_off" {
+        state.selected_route = Some("risk_off");
+        state.pending_route = None;
+        state.pending_since_ms = None;
+        return "risk_off";
+    }
+
+    if state.selected_route == Some(model_route) {
+        state.pending_route = None;
+        state.pending_since_ms = None;
+        return model_route;
+    }
+
+    if state.pending_route != Some(model_route) {
+        state.pending_route = Some(model_route);
+        state.pending_since_ms = Some(now_ms);
+    }
+
+    let pending_age_ms = state
+        .pending_since_ms
+        .map(|since_ms| now_ms.saturating_sub(since_ms))
+        .unwrap_or(0);
+    if pending_age_ms >= ROUTER_ROUTE_CONFIRM_MS {
+        state.selected_route = Some(model_route);
+        state.pending_route = None;
+        state.pending_since_ms = None;
+        model_route
+    } else {
+        state.selected_route.unwrap_or("risk_off")
     }
 }
 
@@ -1273,6 +1318,7 @@ async fn run_runtime_loop(
     let router_enforce_enabled = runtime_env_truthy("PM_BTC_5M_ROUTER_ENFORCE");
     let router_decision_enabled = router_shadow_enabled || router_enforce_enabled;
     let mut router_yes_ranges: HashMap<MarketId, (f32, f32)> = HashMap::new();
+    let mut router_states: HashMap<MarketId, MarketRouterState> = HashMap::new();
     if router_decision_enabled {
         info!(
             target: "router_shadow",
@@ -1902,8 +1948,18 @@ async fn run_runtime_loop(
                                                 whipsaw.sign_flip_rate,
                                                 whipsaw.realized_vol_180s_bps,
                                             );
+                                            let latched_router_route = {
+                                                let state = router_states
+                                                    .entry(market_id.clone())
+                                                    .or_default();
+                                                update_latched_router_route(
+                                                    state,
+                                                    effective_router_route,
+                                                    now_unix_ms(),
+                                                )
+                                            };
                                             let confirmed_router_route = confirmed_router_route(
-                                                effective_router_route,
+                                                latched_router_route,
                                                 br2_submit_intents.len(),
                                                 bte_submit_intents.len(),
                                             );
@@ -1919,6 +1975,7 @@ async fn run_runtime_loop(
                                                     cluster = %cluster,
                                                     static_cluster_route,
                                                     effective_router_route,
+                                                    latched_router_route,
                                                     confirmed_router_route,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
