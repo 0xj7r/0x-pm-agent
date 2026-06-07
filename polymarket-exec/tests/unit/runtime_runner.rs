@@ -318,6 +318,16 @@ fn live_router_forces_risk_off_on_live_observed_violent_chop() {
     );
 }
 
+#[test]
+fn confirmed_router_requires_same_route_submit_intent() {
+    assert_eq!(confirmed_router_route("bte", 0, 1), "bte");
+    assert_eq!(confirmed_router_route("br2", 1, 0), "br2");
+    assert_eq!(confirmed_router_route("bte", 1, 0), "risk_off");
+    assert_eq!(confirmed_router_route("br2", 0, 1), "risk_off");
+    assert_eq!(confirmed_router_route("bte", 0, 0), "risk_off");
+    assert_eq!(confirmed_router_route("risk_off", 1, 1), "risk_off");
+}
+
 #[tokio::test]
 async fn pusd_auto_wrap_after_redeem_uses_live_wrap_threshold() {
     let mut config = runner_test_config();

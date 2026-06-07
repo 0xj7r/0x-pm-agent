@@ -122,6 +122,18 @@ fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
     }
 }
 
+fn confirmed_router_route(
+    model_route: &'static str,
+    br2_submit_intents: usize,
+    bte_submit_intents: usize,
+) -> &'static str {
+    match model_route {
+        "br2" if br2_submit_intents > 0 => "br2",
+        "bte" if bte_submit_intents > 0 => "bte",
+        _ => "risk_off",
+    }
+}
+
 fn runtime_env(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -1890,7 +1902,12 @@ async fn run_runtime_loop(
                                                 whipsaw.sign_flip_rate,
                                                 whipsaw.realized_vol_180s_bps,
                                             );
-                                            router_selected_route = Some(effective_router_route);
+                                            let confirmed_router_route = confirmed_router_route(
+                                                effective_router_route,
+                                                br2_submit_intents.len(),
+                                                bte_submit_intents.len(),
+                                            );
+                                            router_selected_route = Some(confirmed_router_route);
                                             let shadow_vote_route = shadow_vote_route(
                                                 br2_shadow_order_count,
                                                 bte_shadow_order_count,
@@ -1902,10 +1919,13 @@ async fn run_runtime_loop(
                                                     cluster = %cluster,
                                                     static_cluster_route,
                                                     effective_router_route,
+                                                    confirmed_router_route,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
                                                     br2_orders = br2_shadow_order_count,
                                                     bte_orders = bte_shadow_order_count,
+                                                    br2_submit_intents = br2_submit_intents.len(),
+                                                    bte_submit_intents = bte_submit_intents.len(),
                                                     yes_mid,
                                                     market_yes_range_so_far,
                                                     whipsaw_score = whipsaw.score,
