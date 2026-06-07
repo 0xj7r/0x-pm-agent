@@ -428,7 +428,7 @@ fn router_permission_keeps_market_owner_separate_from_overlays() {
             SessionGuard::Normal,
             locked_bte
         ),
-        ExecutionPermission::AllowAdd
+        ExecutionPermission::NoAddMarketRiskOff
     );
     assert_eq!(
         classify_router_execution_permission(MarketRoute::Bte, SessionGuard::NoAdd, locked_bte),
@@ -503,7 +503,7 @@ fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
 }
 
 #[test]
-fn router_session_guard_uses_action_switches_as_chop_signal() {
+fn router_session_guard_does_not_cool_down_on_switch_chop_alone() {
     let mut state = RouterSessionRegimeState::default();
 
     for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
@@ -539,9 +539,9 @@ fn router_session_guard_uses_action_switches_as_chop_signal() {
         3.0,
     );
 
-    assert!(readout.guard_active);
-    assert_eq!(readout.guard, SessionGuard::NoAdd);
-    assert!(readout.action_switch_count >= ROUTER_SESSION_GUARD_SWITCH_COUNT);
+    assert!(!readout.guard_active);
+    assert_eq!(readout.guard, SessionGuard::Normal);
+    assert!(readout.action_switch_count >= 8);
 }
 
 #[test]

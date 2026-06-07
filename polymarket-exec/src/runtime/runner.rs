@@ -70,7 +70,6 @@ const ROUTER_SESSION_GUARD_WINDOW_MS: u64 = 15 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_MIN_OBSERVATIONS: usize = 30;
 const ROUTER_SESSION_GUARD_STRESS_FRACTION: f32 = 0.60;
-const ROUTER_SESSION_GUARD_SWITCH_COUNT: usize = 8;
 const ROUTER_SESSION_GUARD_PERSIST_INTERVAL_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, Default)]
@@ -326,14 +325,11 @@ fn update_router_session_regime(
 
     let sustained_stress = observation_count >= ROUTER_SESSION_GUARD_MIN_OBSERVATIONS
         && stress_fraction >= ROUTER_SESSION_GUARD_STRESS_FRACTION;
-    let choppy_routing = observation_count >= ROUTER_SESSION_GUARD_MIN_OBSERVATIONS
-        && action_switch_count >= ROUTER_SESSION_GUARD_SWITCH_COUNT
-        && stress_fraction >= 0.35;
     let violent_current_market = market_yes_range_so_far >= 0.55
         && whipsaw_score >= 0.55
         && realized_vol_180s_bps >= 8.0
         && (path_efficiency <= 0.25 || reversal_pressure >= 0.35 || sign_flip_rate >= 0.35);
-    if sustained_stress || choppy_routing || violent_current_market {
+    if sustained_stress || violent_current_market {
         let risk_off_until_ms = now_ms.saturating_add(ROUTER_SESSION_GUARD_COOLDOWN_MS);
         state.risk_off_until_ms = Some(
             state
@@ -566,18 +562,21 @@ fn update_latched_router_route(
 }
 
 fn classify_router_execution_permission(
-    _market_route: MarketRoute,
+    market_route: MarketRoute,
     session_guard: SessionGuard,
     latch: RouteLatchReadout,
 ) -> ExecutionPermission {
-    if session_guard == SessionGuard::NoAdd {
-        return ExecutionPermission::NoAddSessionGuard;
-    }
     if latch.confirm_pending {
         return ExecutionPermission::NoAddConfirmPending;
     }
-    if latch.selected_route.is_none() || latch.selected_route == Some(MarketRoute::RiskOff) {
+    if market_route == MarketRoute::RiskOff
+        || latch.selected_route.is_none()
+        || latch.selected_route == Some(MarketRoute::RiskOff)
+    {
         return ExecutionPermission::NoAddMarketRiskOff;
+    }
+    if session_guard == SessionGuard::NoAdd {
+        return ExecutionPermission::NoAddSessionGuard;
     }
     ExecutionPermission::AllowAdd
 }
