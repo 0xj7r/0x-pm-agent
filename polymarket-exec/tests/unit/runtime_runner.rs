@@ -406,11 +406,11 @@ fn router_enforce_allows_owner_entries_but_not_other_strategy_entries() {
     )];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "bte", &mut bte_intents),
+        retain_router_allowed_intents("bte", "bte", "bte", &mut bte_intents),
         0
     );
     assert_eq!(
-        retain_router_allowed_intents("bte", "br2", &mut br2_intents),
+        retain_router_allowed_intents("bte", "bte", "br2", &mut br2_intents),
         1
     );
     assert_eq!(bte_intents.len(), 1);
@@ -441,11 +441,75 @@ fn router_risk_off_blocks_entries_but_allows_close_intents() {
     ];
 
     assert_eq!(
-        retain_router_allowed_intents("risk_off", "bte", &mut intents),
+        retain_router_allowed_intents("risk_off", "risk_off", "bte", &mut intents),
         1
     );
     assert_eq!(intents.len(), 1);
     assert_eq!(intents[0].client_order_id.as_str(), "close");
+    assert_eq!(intents[0].kind, IntentKind::Close);
+}
+
+#[test]
+fn router_action_risk_off_blocks_owner_entries_but_allows_owner_close() {
+    let mut intents = vec![
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-entry"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.55,
+            5.0,
+            "bte entry",
+            1_000,
+        ),
+        OrderIntent::new_sell(
+            ClientOrderId::from("bte-close"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.54,
+            5.0,
+            "bte close",
+            1_000,
+        ),
+    ];
+
+    assert_eq!(
+        retain_router_allowed_intents("bte", "risk_off", "bte", &mut intents),
+        1
+    );
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].client_order_id.as_str(), "bte-close");
+    assert_eq!(intents[0].kind, IntentKind::Close);
+}
+
+#[test]
+fn router_action_strategy_drift_blocks_owner_entries_but_allows_owner_close() {
+    let mut intents = vec![
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-entry"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.55,
+            5.0,
+            "bte entry",
+            1_000,
+        ),
+        OrderIntent::new_sell(
+            ClientOrderId::from("bte-close"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.54,
+            5.0,
+            "bte close",
+            1_000,
+        ),
+    ];
+
+    assert_eq!(
+        retain_router_allowed_intents("bte", "br2", "bte", &mut intents),
+        1
+    );
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0].client_order_id.as_str(), "bte-close");
     assert_eq!(intents[0].kind, IntentKind::Close);
 }
 
@@ -462,7 +526,7 @@ fn router_does_not_handoff_close_intents_to_non_owner() {
     )];
 
     assert_eq!(
-        retain_router_allowed_intents("bte", "br2", &mut br2_intents),
+        retain_router_allowed_intents("bte", "bte", "br2", &mut br2_intents),
         1
     );
     assert!(br2_intents.is_empty());

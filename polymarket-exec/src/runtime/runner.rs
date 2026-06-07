@@ -174,20 +174,30 @@ fn update_latched_router_route(
 }
 
 fn router_allows_strategy_intent(
-    route: &'static str,
+    owner_route: &'static str,
+    action_route: &'static str,
     strategy_route: &'static str,
     intent: &OrderIntent,
 ) -> bool {
-    route == strategy_route || (route == "risk_off" && intent.kind == IntentKind::Close)
+    if owner_route == "risk_off" {
+        return intent.kind == IntentKind::Close;
+    }
+    if owner_route != strategy_route {
+        return false;
+    }
+    action_route == strategy_route || intent.kind == IntentKind::Close
 }
 
 fn retain_router_allowed_intents(
-    route: &'static str,
+    owner_route: &'static str,
+    action_route: &'static str,
     strategy_route: &'static str,
     intents: &mut Vec<OrderIntent>,
 ) -> usize {
     let before = intents.len();
-    intents.retain(|intent| router_allows_strategy_intent(route, strategy_route, intent));
+    intents.retain(|intent| {
+        router_allows_strategy_intent(owner_route, action_route, strategy_route, intent)
+    });
     before.saturating_sub(intents.len())
 }
 
@@ -1909,6 +1919,7 @@ async fn run_runtime_loop(
                                 }
                             }
                             let mut router_selected_route: Option<&'static str> = None;
+                            let mut router_action_route: Option<&'static str> = None;
                             if router_decision_enabled {
                                 if let Some(record) = runtime.market_context_record(&market_id) {
                                     let yes_book = if record
@@ -1926,6 +1937,7 @@ async fn run_runtime_loop(
                                     if let Some(yes_book) = yes_book {
                                         if yes_book.best_bid <= 0.0 || yes_book.best_ask <= 0.0 {
                                             router_selected_route = Some("risk_off");
+                                            router_action_route = Some("risk_off");
                                         } else {
                                             let yes_mid =
                                                 (0.5 * (yes_book.best_bid + yes_book.best_ask))
@@ -1960,6 +1972,7 @@ async fn run_runtime_loop(
                                                 whipsaw.sign_flip_rate,
                                                 whipsaw.realized_vol_180s_bps,
                                             );
+                                            router_action_route = Some(effective_router_route);
                                             let latched_router_route = {
                                                 let state = router_states
                                                     .entry(market_id.clone())
@@ -1972,6 +1985,7 @@ async fn run_runtime_loop(
                                             };
                                             let selected_router_route = latched_router_route;
                                             router_selected_route = Some(selected_router_route);
+                                            let action_router_route = effective_router_route;
                                             let locked_router_route = router_states
                                                 .get(&market_id)
                                                 .and_then(|state| state.locked_route)
@@ -1989,6 +2003,7 @@ async fn run_runtime_loop(
                                                     effective_router_route,
                                                     latched_router_route,
                                                     selected_router_route,
+                                                    action_router_route,
                                                     locked_router_route,
                                                     shadow_vote_route,
                                                     router_enforce_enabled,
@@ -2013,14 +2028,17 @@ async fn run_runtime_loop(
                                 }
                             }
                             if router_enforce_enabled {
-                                let route = router_selected_route.unwrap_or("risk_off");
+                                let owner_route = router_selected_route.unwrap_or("risk_off");
+                                let action_route = router_action_route.unwrap_or("risk_off");
                                 let br2_suppressed_count = retain_router_allowed_intents(
-                                    route,
+                                    owner_route,
+                                    action_route,
                                     "br2",
                                     &mut br2_submit_intents,
                                 );
                                 let bte_suppressed_count = retain_router_allowed_intents(
-                                    route,
+                                    owner_route,
+                                    action_route,
                                     "bte",
                                     &mut bte_submit_intents,
                                 );
@@ -2028,10 +2046,11 @@ async fn run_runtime_loop(
                                     warn!(
                                         target: "router_enforce",
                                         market = %market_id,
-                                        route,
+                                        owner_route,
+                                        action_route,
                                         br2_suppressed_count,
                                         bte_suppressed_count,
-                                        "ROUTER-ENFORCE suppressed non-routed live intents"
+                                        "ROUTER-ENFORCE suppressed disallowed live intents"
                                     );
                                 }
                             }
