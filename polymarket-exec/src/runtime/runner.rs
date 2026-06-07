@@ -132,12 +132,12 @@ fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> &'static str {
 
 fn confirmed_router_route(
     model_route: &'static str,
-    br2_submit_intents: usize,
-    bte_submit_intents: usize,
+    br2_strategy_orders: usize,
+    bte_strategy_orders: usize,
 ) -> &'static str {
     match model_route {
-        "br2" if br2_submit_intents > 0 => "br2",
-        "bte" if bte_submit_intents > 0 => "bte",
+        "br2" if br2_strategy_orders > 0 => "br2",
+        "bte" if bte_strategy_orders > 0 => "bte",
         _ => "risk_off",
     }
 }
@@ -1960,8 +1960,8 @@ async fn run_runtime_loop(
                                             };
                                             let confirmed_router_route = confirmed_router_route(
                                                 latched_router_route,
-                                                br2_submit_intents.len(),
-                                                bte_submit_intents.len(),
+                                                br2_shadow_order_count,
+                                                bte_shadow_order_count,
                                             );
                                             router_selected_route = Some(confirmed_router_route);
                                             let shadow_vote_route = shadow_vote_route(
