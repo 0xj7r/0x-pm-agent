@@ -18,7 +18,7 @@ use pm_strategy::regime::{classify_market_regime_cluster, MarketRegimeCluster};
 
 use crate::book::{BookState, BookStore};
 use crate::config::{AppConfig, UserWsAuth};
-use crate::inventory::VenuePositionSnapshot;
+use crate::inventory::{InventoryState, VenuePositionSnapshot};
 use crate::journal::JournalFanout;
 use crate::market_context::MarketContextStore;
 use crate::metrics::AppMetrics;
@@ -71,6 +71,8 @@ const ROUTER_SESSION_GUARD_COOLDOWN_MS: u64 = 5 * 60 * 1_000;
 const ROUTER_SESSION_GUARD_MIN_OBSERVATIONS: usize = 30;
 const ROUTER_SESSION_GUARD_STRESS_FRACTION: f32 = 0.60;
 const ROUTER_SESSION_GUARD_PERSIST_INTERVAL_MS: u64 = 5_000;
+const ROUTER_SESSION_DAMPED_MAX_GROSS_FRAC: f64 = 0.015;
+const ROUTER_SESSION_DAMPED_MAX_GROSS_USD: f64 = 35.0;
 
 #[derive(Clone, Debug, Default)]
 struct MarketRouterState {
@@ -107,6 +109,7 @@ impl MarketRoute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionGuard {
     Normal,
+    DampedAdd,
     NoAdd,
 }
 
@@ -114,6 +117,7 @@ impl SessionGuard {
     fn as_str(self) -> &'static str {
         match self {
             Self::Normal => "normal",
+            Self::DampedAdd => "damped_add",
             Self::NoAdd => "no_add",
         }
     }
@@ -122,6 +126,7 @@ impl SessionGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutionPermission {
     AllowAdd,
+    DampedAddSessionGuard,
     NoAddMarketRiskOff,
     NoAddConfirmPending,
     NoAddSessionGuard,
@@ -131,6 +136,7 @@ impl ExecutionPermission {
     fn as_str(self) -> &'static str {
         match self {
             Self::AllowAdd => "allow_add",
+            Self::DampedAddSessionGuard => "damped_add_session_guard",
             Self::NoAddMarketRiskOff => "no_add_market_risk_off",
             Self::NoAddConfirmPending => "no_add_confirm_pending",
             Self::NoAddSessionGuard => "no_add_session_guard",
@@ -138,7 +144,7 @@ impl ExecutionPermission {
     }
 
     fn allows_add_risk(self) -> bool {
-        self == Self::AllowAdd
+        matches!(self, Self::AllowAdd | Self::DampedAddSessionGuard)
     }
 
     fn legacy_action_route(self, selected_route: Option<MarketRoute>) -> &'static str {
@@ -344,10 +350,12 @@ fn update_router_session_regime(
         .risk_off_until_ms
         .is_some_and(|risk_off_until_ms| now_ms < risk_off_until_ms);
     RouterSessionRegimeReadout {
-        guard: if guard_active {
+        guard: if !guard_active {
+            SessionGuard::Normal
+        } else if violent_current_market || route == MarketRoute::RiskOff {
             SessionGuard::NoAdd
         } else {
-            SessionGuard::Normal
+            SessionGuard::DampedAdd
         },
         guard_active,
         stress_fraction,
@@ -578,7 +586,58 @@ fn classify_router_execution_permission(
     if session_guard == SessionGuard::NoAdd {
         return ExecutionPermission::NoAddSessionGuard;
     }
+    if session_guard == SessionGuard::DampedAdd {
+        return ExecutionPermission::DampedAddSessionGuard;
+    }
     ExecutionPermission::AllowAdd
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouterIntentBudget {
+    current_market_gross_exposure_usd: f64,
+    damped_max_market_gross_exposure_usd: f64,
+}
+
+impl RouterIntentBudget {
+    #[cfg(test)]
+    fn unlimited() -> Self {
+        Self {
+            current_market_gross_exposure_usd: 0.0,
+            damped_max_market_gross_exposure_usd: f64::INFINITY,
+        }
+    }
+}
+
+fn router_session_damped_max_gross_usd(equity_usd: f64) -> f64 {
+    let frac = runtime_env_f64_or(
+        "PM_BTC_5M_ROUTER_SESSION_DAMPED_MAX_GROSS_FRAC",
+        ROUTER_SESSION_DAMPED_MAX_GROSS_FRAC,
+    )
+    .max(0.0);
+    let fixed_cap = runtime_env_f64_or(
+        "PM_BTC_5M_ROUTER_SESSION_DAMPED_MAX_GROSS_USD",
+        ROUTER_SESSION_DAMPED_MAX_GROSS_USD,
+    )
+    .max(0.0);
+    let frac_cap = equity_usd.max(0.0) * frac;
+    if fixed_cap > 0.0 {
+        frac_cap.min(fixed_cap)
+    } else {
+        frac_cap
+    }
+}
+
+fn router_market_gross_exposure_usd(inventory: &InventoryState, market_id: &MarketId) -> f64 {
+    let exposure = inventory
+        .positions()
+        .filter(|position| &position.market_id == market_id)
+        .map(|position| position.gross_notional_usd())
+        .sum::<f64>();
+    if exposure.abs() < 1e-9 {
+        0.0
+    } else {
+        exposure
+    }
 }
 
 fn router_allows_strategy_intent(
@@ -596,15 +655,50 @@ fn router_allows_strategy_intent(
     permission.allows_add_risk() || intent.kind == IntentKind::Close
 }
 
+#[cfg(test)]
 fn retain_router_allowed_intents(
     owner_route: Option<MarketRoute>,
     permission: ExecutionPermission,
     strategy_route: MarketRoute,
     intents: &mut Vec<OrderIntent>,
 ) -> usize {
+    retain_router_allowed_intents_with_budget(
+        owner_route,
+        permission,
+        strategy_route,
+        intents,
+        RouterIntentBudget::unlimited(),
+    )
+}
+
+fn retain_router_allowed_intents_with_budget(
+    owner_route: Option<MarketRoute>,
+    permission: ExecutionPermission,
+    strategy_route: MarketRoute,
+    intents: &mut Vec<OrderIntent>,
+    budget: RouterIntentBudget,
+) -> usize {
     let before = intents.len();
+    let mut projected_market_gross_usd = budget.current_market_gross_exposure_usd.max(0.0);
     intents.retain(|intent| {
-        router_allows_strategy_intent(owner_route, permission, strategy_route, intent)
+        if !router_allows_strategy_intent(owner_route, permission, strategy_route, intent) {
+            return false;
+        }
+        if permission == ExecutionPermission::DampedAddSessionGuard
+            && intent.kind == IntentKind::Entry
+        {
+            let notional_usd = intent.notional_usd();
+            if !notional_usd.is_finite() || notional_usd <= 0.0 {
+                return false;
+            }
+            if projected_market_gross_usd + notional_usd
+                > budget.damped_max_market_gross_exposure_usd + f64::EPSILON
+            {
+                return false;
+            }
+            projected_market_gross_usd += notional_usd;
+        }
+        true
     });
     before.saturating_sub(intents.len())
 }
@@ -613,6 +707,13 @@ fn runtime_env(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+fn runtime_env_f64_or(key: &str, default: f64) -> f64 {
+    runtime_env(key)
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
 }
 
 fn runtime_env_truthy(key: &str) -> bool {
@@ -2602,17 +2703,44 @@ async fn run_runtime_loop(
                                 }
                             }
                             if router_enforce_enabled {
-                                let br2_suppressed_count = retain_router_allowed_intents(
+                                let router_inventory = runtime.inventory();
+                                let router_equity_usd = router_inventory.free_cash_usd()
+                                    + router_inventory.gross_exposure_usd();
+                                let current_market_working_buy_notional_usd = runtime
+                                    .open_orders()
+                                    .filter(|managed| {
+                                        !managed.status.is_terminal()
+                                            && managed.intent.kind == IntentKind::Entry
+                                            && managed.intent.side == TradeSide::Buy
+                                            && managed.intent.market_id == market_id
+                                    })
+                                    .map(|managed| {
+                                        managed.intent.limit_price * managed.remaining_qty()
+                                    })
+                                    .sum::<f64>();
+                                let current_market_gross_exposure_usd =
+                                    router_market_gross_exposure_usd(router_inventory, &market_id)
+                                        + current_market_working_buy_notional_usd;
+                                let router_intent_budget = RouterIntentBudget {
+                                    current_market_gross_exposure_usd,
+                                    damped_max_market_gross_exposure_usd:
+                                        router_session_damped_max_gross_usd(router_equity_usd),
+                                };
+                                let br2_suppressed_count =
+                                    retain_router_allowed_intents_with_budget(
                                     router_selected_route,
                                     router_execution_permission,
                                     MarketRoute::Br2,
                                     &mut br2_submit_intents,
+                                    router_intent_budget,
                                 );
-                                let bte_suppressed_count = retain_router_allowed_intents(
+                                let bte_suppressed_count =
+                                    retain_router_allowed_intents_with_budget(
                                     router_selected_route,
                                     router_execution_permission,
                                     MarketRoute::Bte,
                                     &mut bte_submit_intents,
+                                    router_intent_budget,
                                 );
                                 if bte_suppressed_count > 0 {
                                     if let Some(shadow) = bte_shadow.as_mut() {

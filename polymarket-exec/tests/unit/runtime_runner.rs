@@ -434,6 +434,10 @@ fn router_permission_keeps_market_owner_separate_from_overlays() {
         classify_router_execution_permission(MarketRoute::Bte, SessionGuard::NoAdd, locked_bte),
         ExecutionPermission::NoAddSessionGuard
     );
+    assert_eq!(
+        classify_router_execution_permission(MarketRoute::Bte, SessionGuard::DampedAdd, locked_bte),
+        ExecutionPermission::DampedAddSessionGuard
+    );
 
     let risk_off_owner = RouteLatchReadout {
         selected_route: Some(MarketRoute::RiskOff),
@@ -463,7 +467,7 @@ fn router_permission_keeps_market_owner_separate_from_overlays() {
 }
 
 #[test]
-fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
+fn router_session_guard_damps_clean_tick_after_sustained_whipsaw() {
     let mut state = RouterSessionRegimeState::default();
 
     for i in 0..ROUTER_SESSION_GUARD_MIN_OBSERVATIONS {
@@ -498,7 +502,7 @@ fn router_session_guard_blocks_clean_tick_after_sustained_whipsaw() {
     );
 
     assert!(readout.guard_active);
-    assert_eq!(readout.guard, SessionGuard::NoAdd);
+    assert_eq!(readout.guard, SessionGuard::DampedAdd);
     assert!(readout.stress_fraction >= ROUTER_SESSION_GUARD_STRESS_FRACTION);
 }
 
@@ -722,7 +726,7 @@ fn router_risk_off_blocks_entries_but_allows_close_intents() {
 }
 
 #[test]
-fn router_action_risk_off_blocks_owner_entries_but_allows_owner_close() {
+fn router_no_add_session_guard_blocks_owner_entries_but_allows_owner_close() {
     let mut intents = vec![
         OrderIntent::new_buy(
             ClientOrderId::from("bte-entry"),
@@ -756,6 +760,97 @@ fn router_action_risk_off_blocks_owner_entries_but_allows_owner_close() {
     assert_eq!(intents.len(), 1);
     assert_eq!(intents[0].client_order_id.as_str(), "bte-close");
     assert_eq!(intents[0].kind, IntentKind::Close);
+}
+
+#[test]
+fn router_damped_session_guard_allows_owner_entries_within_budget() {
+    let mut intents = vec![
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-entry"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.55,
+            5.0,
+            "bte entry",
+            1_000,
+        ),
+        OrderIntent::new_sell(
+            ClientOrderId::from("bte-close"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.54,
+            5.0,
+            "bte close",
+            1_000,
+        ),
+    ];
+
+    assert_eq!(
+        retain_router_allowed_intents_with_budget(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::DampedAddSessionGuard,
+            MarketRoute::Bte,
+            &mut intents,
+            RouterIntentBudget {
+                current_market_gross_exposure_usd: 0.0,
+                damped_max_market_gross_exposure_usd: 5.0,
+            },
+        ),
+        0
+    );
+    assert_eq!(intents.len(), 2);
+    assert_eq!(intents[0].client_order_id.as_str(), "bte-entry");
+    assert_eq!(intents[1].client_order_id.as_str(), "bte-close");
+}
+
+#[test]
+fn router_damped_session_guard_caps_owner_entries() {
+    let mut intents = vec![
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-entry-1"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.55,
+            5.0,
+            "bte entry one",
+            1_000,
+        ),
+        OrderIntent::new_buy(
+            ClientOrderId::from("bte-entry-2"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.55,
+            5.0,
+            "bte entry two",
+            1_000,
+        ),
+        OrderIntent::new_sell(
+            ClientOrderId::from("bte-close"),
+            MarketId::from("market"),
+            InstrumentId::from("yes"),
+            0.54,
+            5.0,
+            "bte close",
+            1_000,
+        ),
+    ];
+
+    assert_eq!(
+        retain_router_allowed_intents_with_budget(
+            Some(MarketRoute::Bte),
+            ExecutionPermission::DampedAddSessionGuard,
+            MarketRoute::Bte,
+            &mut intents,
+            RouterIntentBudget {
+                current_market_gross_exposure_usd: 2.0,
+                damped_max_market_gross_exposure_usd: 5.0,
+            },
+        ),
+        1
+    );
+    assert_eq!(intents.len(), 2);
+    assert_eq!(intents[0].client_order_id.as_str(), "bte-entry-1");
+    assert_eq!(intents[1].client_order_id.as_str(), "bte-close");
 }
 
 #[test]
