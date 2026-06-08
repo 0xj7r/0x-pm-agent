@@ -34,6 +34,7 @@ const DEFAULT_EV_MAX_GUARANTEED_LOSS_USD: f64 = 1.00;
 const DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD: f64 = 5.00;
 const DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD: f64 = 0.10;
 const DEFAULT_EV_MIN_MARGINAL_EV_USD: f64 = 0.0;
+const DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD: f64 = 0.0;
 const DEFAULT_WHIPSAW_ENTRY_DELAY_SECS: f64 = 60.0;
 const ENTRY_DELAY_LOG_INTERVAL_MS: u64 = 10_000;
 
@@ -134,6 +135,7 @@ pub struct BteLiveShadow {
     ev_max_worst_terminal_loss_usd: f64,
     ev_min_worst_improvement_usd: f64,
     ev_min_marginal_ev_usd: f64,
+    ev_min_best_pnl_after_repair_usd: f64,
     whipsaw_entry_delay_secs: f64,
     risk_increasing_notional_by_market: HashMap<String, f64>,
     warmup_skip_warned: bool,
@@ -194,6 +196,9 @@ impl BteLiveShadow {
                 .unwrap_or(DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD);
         let ev_min_marginal_ev_usd = env_f64("PM_BTC_5M_BTE_EV_MIN_MARGINAL_EV_USD")
             .unwrap_or(DEFAULT_EV_MIN_MARGINAL_EV_USD);
+        let ev_min_best_pnl_after_repair_usd =
+            env_f64("PM_BTC_5M_BTE_EV_MIN_BEST_PNL_AFTER_REPAIR_USD")
+                .unwrap_or(DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD);
         let whipsaw_entry_delay_secs =
             env_nonnegative_f64("PM_BTC_5M_BTE_WHIPSAW_ENTRY_DELAY_SECS")
                 .unwrap_or(DEFAULT_WHIPSAW_ENTRY_DELAY_SECS);
@@ -225,6 +230,7 @@ impl BteLiveShadow {
                 ev_max_worst_terminal_loss_usd,
                 ev_min_worst_improvement_usd,
                 ev_min_marginal_ev_usd,
+                ev_min_best_pnl_after_repair_usd,
                 whipsaw_entry_delay_secs,
                 kill_switch = ?live_kill_switch_path,
                 "BTE REAL-MONEY submission ARMED"
@@ -245,6 +251,7 @@ impl BteLiveShadow {
             ev_max_worst_terminal_loss_usd,
             ev_min_worst_improvement_usd,
             ev_min_marginal_ev_usd,
+            ev_min_best_pnl_after_repair_usd,
             whipsaw_entry_delay_secs,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -715,6 +722,7 @@ impl BteLiveShadow {
             forced_repair = ev_context.forced_repair,
             worst_improvement_usd,
             best_change_usd,
+            min_best_pnl_after_repair_usd = self.ev_min_best_pnl_after_repair_usd,
             real_pair_taker_cost = real_pair_taker_cost(ev_context.yes_book, ev_context.no_book),
             "BTE-EV candidate terminal accounting"
         );
@@ -730,11 +738,14 @@ impl BteLiveShadow {
         let marginal_ev_ok = marginal_ev_usd
             .map(|ev| ev >= self.ev_min_marginal_ev_usd)
             .unwrap_or(false);
+        let preserves_positive_branch = !repair_like
+            || before.best_terminal_pnl_usd <= self.ev_min_best_pnl_after_repair_usd
+            || after.best_terminal_pnl_usd >= self.ev_min_best_pnl_after_repair_usd;
 
         let allowed = if !guaranteed_loss_too_large && !worst_terminal_loss_too_large {
-            true
+            preserves_positive_branch
         } else if repair_like || ev_context.forced_repair {
-            improves_worst_enough || marginal_ev_ok
+            preserves_positive_branch && (improves_worst_enough || marginal_ev_ok)
         } else {
             marginal_ev_ok && worst_improvement_usd >= -self.ev_min_worst_improvement_usd
         };
@@ -758,6 +769,9 @@ impl BteLiveShadow {
             min_marginal_ev_usd = self.ev_min_marginal_ev_usd,
             worst_improvement_usd,
             min_worst_improvement_usd = self.ev_min_worst_improvement_usd,
+            best_terminal_pnl_before_usd = before.best_terminal_pnl_usd,
+            min_best_pnl_after_repair_usd = self.ev_min_best_pnl_after_repair_usd,
+            preserves_positive_branch,
             risk_increasing,
             repair_like,
             forced_repair = ev_context.forced_repair,
@@ -1114,6 +1128,7 @@ mod tests {
             ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
+            ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1213,7 +1228,7 @@ mod tests {
         let pos = BteDecisionPosition {
             yes_shares: 40.0,
             no_shares: 0.0,
-            yes_avg_price: 0.95,
+            yes_avg_price: 0.50,
             no_avg_price: 0.0,
             current_market_net_exposure_shares: 40.0,
             ..BteDecisionPosition::default()
@@ -1238,6 +1253,48 @@ mod tests {
             )
             .is_some(),
             "opposite-side repair should remain available when it improves worst terminal PnL"
+        );
+    }
+
+    #[test]
+    fn bte_ev_guard_blocks_repair_that_erases_positive_terminal_branch() {
+        let mut live = live_fixture();
+        live.ev_max_guaranteed_loss_usd = 0.10;
+        let market = MarketId::from("m");
+        let yes_book = book("yes", 0.23, 0.24);
+        let no_book = book("no", 0.75, 0.76);
+        let pos = BteDecisionPosition {
+            yes_shares: 5.0188,
+            no_shares: 0.0,
+            yes_avg_price: 2.65946212 / 5.0188,
+            no_avg_price: 0.0,
+            current_market_net_exposure_shares: 5.0188,
+            ..BteDecisionPosition::default()
+        };
+        let expensive_repair_no = OrderIntent::new_buy(
+            ClientOrderId::from("expensive-repair-no"),
+            market.clone(),
+            InstrumentId::from("no"),
+            0.76,
+            5.0,
+            "test",
+            1_000,
+        );
+
+        assert!(
+            BteTerminalSnapshot::from_position(pos).best_terminal_pnl_usd > 0.0,
+            "fixture should start with a profitable YES terminal branch"
+        );
+        assert!(
+            live.apply_notional_caps(
+                expensive_repair_no,
+                &market,
+                Side::BuyNo,
+                pos,
+                Some(ev_context(&yes_book, &no_book)),
+            )
+            .is_none(),
+            "opposite-side repair should not lock both terminal outcomes negative"
         );
     }
 
@@ -1313,6 +1370,7 @@ mod tests {
             ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
+            ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1361,6 +1419,7 @@ mod tests {
             ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
+            ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1406,6 +1465,7 @@ mod tests {
             ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
+            ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1462,6 +1522,7 @@ mod tests {
             ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
+            ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
