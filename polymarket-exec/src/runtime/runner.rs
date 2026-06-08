@@ -2386,11 +2386,29 @@ async fn run_runtime_loop(
                                             inventory.position_qty(&InstrumentId::from(id.as_str()))
                                         })
                                         .unwrap_or(0.0);
+                                    let yes_avg_price = record
+                                        .instrument_ids
+                                        .first()
+                                        .and_then(|id| {
+                                            inventory
+                                                .position(&InstrumentId::from(id.as_str()))
+                                                .map(|position| position.avg_price.max(0.0))
+                                        })
+                                        .unwrap_or(0.0);
                                     let no_shares = record
                                         .instrument_ids
                                         .get(1)
                                         .map(|id| {
                                             inventory.position_qty(&InstrumentId::from(id.as_str()))
+                                        })
+                                        .unwrap_or(0.0);
+                                    let no_avg_price = record
+                                        .instrument_ids
+                                        .get(1)
+                                        .and_then(|id| {
+                                            inventory
+                                                .position(&InstrumentId::from(id.as_str()))
+                                                .map(|position| position.avg_price.max(0.0))
                                         })
                                         .unwrap_or(0.0);
                                     let equity_usd =
@@ -2424,6 +2442,8 @@ async fn run_runtime_loop(
                                             events_seen: 0,
                                             yes_shares,
                                             no_shares,
+                                            yes_avg_price,
+                                            no_avg_price,
                                             cash_usdc: inventory.free_cash_usd(),
                                             current_market_net_exposure_shares,
                                             btc_net_exposure_shares: btc_ladder_net_exposure_shares,

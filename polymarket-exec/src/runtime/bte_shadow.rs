@@ -21,6 +21,8 @@ pub struct BteDecisionPosition {
     pub events_seen: u64,
     pub yes_shares: f64,
     pub no_shares: f64,
+    pub yes_avg_price: f64,
+    pub no_avg_price: f64,
     pub cash_usdc: f64,
     pub current_market_net_exposure_shares: f64,
     pub btc_net_exposure_shares: f64,
