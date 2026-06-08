@@ -35,6 +35,8 @@ const DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD: f64 = 5.00;
 const DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD: f64 = 0.10;
 const DEFAULT_EV_MIN_MARGINAL_EV_USD: f64 = 0.0;
 const DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD: f64 = 0.0;
+const DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO: f64 = 2.0;
+const DEFAULT_EV_MAX_PAIR_TAKER_COST: f64 = 1.012;
 const DEFAULT_WHIPSAW_ENTRY_DELAY_SECS: f64 = 60.0;
 const ENTRY_DELAY_LOG_INTERVAL_MS: u64 = 10_000;
 
@@ -136,6 +138,8 @@ pub struct BteLiveShadow {
     ev_min_worst_improvement_usd: f64,
     ev_min_marginal_ev_usd: f64,
     ev_min_best_pnl_after_repair_usd: f64,
+    ev_max_worst_to_best_loss_ratio: f64,
+    ev_max_pair_taker_cost: f64,
     whipsaw_entry_delay_secs: f64,
     risk_increasing_notional_by_market: HashMap<String, f64>,
     warmup_skip_warned: bool,
@@ -199,6 +203,11 @@ impl BteLiveShadow {
         let ev_min_best_pnl_after_repair_usd =
             env_f64("PM_BTC_5M_BTE_EV_MIN_BEST_PNL_AFTER_REPAIR_USD")
                 .unwrap_or(DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD);
+        let ev_max_worst_to_best_loss_ratio =
+            env_nonnegative_f64("PM_BTC_5M_BTE_EV_MAX_WORST_TO_BEST_LOSS_RATIO")
+                .unwrap_or(DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO);
+        let ev_max_pair_taker_cost = env_nonnegative_f64("PM_BTC_5M_BTE_EV_MAX_PAIR_TAKER_COST")
+            .unwrap_or(DEFAULT_EV_MAX_PAIR_TAKER_COST);
         let whipsaw_entry_delay_secs =
             env_nonnegative_f64("PM_BTC_5M_BTE_WHIPSAW_ENTRY_DELAY_SECS")
                 .unwrap_or(DEFAULT_WHIPSAW_ENTRY_DELAY_SECS);
@@ -231,6 +240,8 @@ impl BteLiveShadow {
                 ev_min_worst_improvement_usd,
                 ev_min_marginal_ev_usd,
                 ev_min_best_pnl_after_repair_usd,
+                ev_max_worst_to_best_loss_ratio,
+                ev_max_pair_taker_cost,
                 whipsaw_entry_delay_secs,
                 kill_switch = ?live_kill_switch_path,
                 "BTE REAL-MONEY submission ARMED"
@@ -252,6 +263,8 @@ impl BteLiveShadow {
             ev_min_worst_improvement_usd,
             ev_min_marginal_ev_usd,
             ev_min_best_pnl_after_repair_usd,
+            ev_max_worst_to_best_loss_ratio,
+            ev_max_pair_taker_cost,
             whipsaw_entry_delay_secs,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -693,6 +706,7 @@ impl BteLiveShadow {
         let repair_like = !risk_increasing && pos.current_market_net_exposure_shares.abs() > 1e-9;
         let guaranteed_loss_after_usd = after.guaranteed_loss_usd();
         let worst_terminal_loss_after_usd = after.worst_terminal_loss_usd();
+        let pair_taker_cost = real_pair_taker_cost(ev_context.yes_book, ev_context.no_book);
 
         info!(
             target: "bte_ev",
@@ -723,7 +737,7 @@ impl BteLiveShadow {
             worst_improvement_usd,
             best_change_usd,
             min_best_pnl_after_repair_usd = self.ev_min_best_pnl_after_repair_usd,
-            real_pair_taker_cost = real_pair_taker_cost(ev_context.yes_book, ev_context.no_book),
+            real_pair_taker_cost = pair_taker_cost,
             "BTE-EV candidate terminal accounting"
         );
 
@@ -741,13 +755,24 @@ impl BteLiveShadow {
         let preserves_positive_branch = !repair_like
             || before.best_terminal_pnl_usd <= self.ev_min_best_pnl_after_repair_usd
             || after.best_terminal_pnl_usd >= self.ev_min_best_pnl_after_repair_usd;
+        let worst_to_best_loss_ratio = terminal_worst_to_best_loss_ratio(&after);
+        let terminal_asymmetry_ok =
+            terminal_asymmetry_ok(&after, self.ev_max_worst_to_best_loss_ratio);
+        let pair_taker_cost_ok = pair_taker_cost_ok(pair_taker_cost, self.ev_max_pair_taker_cost);
 
-        let allowed = if !guaranteed_loss_too_large && !worst_terminal_loss_too_large {
-            preserves_positive_branch
-        } else if repair_like || ev_context.forced_repair {
+        let allowed = if ev_context.forced_repair {
             preserves_positive_branch && (improves_worst_enough || marginal_ev_ok)
+        } else if repair_like {
+            pair_taker_cost_ok
+                && preserves_positive_branch
+                && (improves_worst_enough || marginal_ev_ok)
+        } else if !guaranteed_loss_too_large && !worst_terminal_loss_too_large {
+            preserves_positive_branch && terminal_asymmetry_ok && pair_taker_cost_ok
         } else {
-            marginal_ev_ok && worst_improvement_usd >= -self.ev_min_worst_improvement_usd
+            terminal_asymmetry_ok
+                && pair_taker_cost_ok
+                && marginal_ev_ok
+                && worst_improvement_usd >= -self.ev_min_worst_improvement_usd
         };
 
         if allowed {
@@ -765,6 +790,12 @@ impl BteLiveShadow {
             max_guaranteed_loss_usd = self.ev_max_guaranteed_loss_usd,
             worst_terminal_loss_after_usd,
             max_worst_terminal_loss_usd = self.ev_max_worst_terminal_loss_usd,
+            worst_to_best_loss_ratio = worst_to_best_loss_ratio,
+            max_worst_to_best_loss_ratio = self.ev_max_worst_to_best_loss_ratio,
+            terminal_asymmetry_ok,
+            real_pair_taker_cost = pair_taker_cost,
+            max_pair_taker_cost = self.ev_max_pair_taker_cost,
+            pair_taker_cost_ok,
             marginal_ev_usd = marginal_ev_usd,
             min_marginal_ev_usd = self.ev_min_marginal_ev_usd,
             worst_improvement_usd,
@@ -805,6 +836,31 @@ fn marginal_buy_ev_usd(side: Side, quantity: f64, price: f64, p_yes: f64) -> Opt
         Side::BuyNo => Some(quantity * ((1.0 - p_yes) - price)),
         Side::SellYes | Side::SellNo => None,
     }
+}
+
+fn terminal_worst_to_best_loss_ratio(snapshot: &BteTerminalSnapshot) -> Option<f64> {
+    let worst_loss = snapshot.worst_terminal_loss_usd();
+    if worst_loss <= 1e-9 {
+        return Some(0.0);
+    }
+    if snapshot.best_terminal_pnl_usd <= 1e-9 {
+        return None;
+    }
+    Some(worst_loss / snapshot.best_terminal_pnl_usd)
+}
+
+fn terminal_asymmetry_ok(snapshot: &BteTerminalSnapshot, max_ratio: f64) -> bool {
+    if max_ratio <= 0.0 || !max_ratio.is_finite() {
+        return true;
+    }
+    terminal_worst_to_best_loss_ratio(snapshot).is_some_and(|ratio| ratio <= max_ratio)
+}
+
+fn pair_taker_cost_ok(pair_taker_cost: Option<f64>, max_pair_taker_cost: f64) -> bool {
+    if max_pair_taker_cost <= 0.0 || !max_pair_taker_cost.is_finite() {
+        return true;
+    }
+    pair_taker_cost.is_some_and(|cost| cost <= max_pair_taker_cost)
 }
 
 fn real_pair_taker_cost(yes_book: &BookState, no_book: Option<&BookState>) -> Option<f64> {
@@ -1129,6 +1185,8 @@ mod tests {
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
+            ev_max_worst_to_best_loss_ratio: DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO,
+            ev_max_pair_taker_cost: DEFAULT_EV_MAX_PAIR_TAKER_COST,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1179,6 +1237,56 @@ mod tests {
         assert!((snapshot.best_terminal_pnl_usd + 4.8365).abs() < 1e-9);
         assert!((snapshot.guaranteed_loss_usd() - 4.8365).abs() < 1e-9);
         assert!((snapshot.worst_terminal_loss_usd() - 15.4675).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bte_ev_guard_flags_bad_worst_to_best_terminal_ratio() {
+        let snapshot = BteTerminalSnapshot::new(80.2, 70.1, 77.22);
+
+        assert!(snapshot.best_terminal_pnl_usd > 0.0);
+        assert!(snapshot.worst_terminal_loss_usd() > snapshot.best_terminal_pnl_usd);
+        assert!(
+            !terminal_asymmetry_ok(&snapshot, DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO),
+            "roughly -$7 worst branch vs +$3 best branch should be too asymmetric"
+        );
+    }
+
+    #[test]
+    fn bte_ev_guard_blocks_overpaid_ordinary_repair_pair() {
+        let mut live = live_fixture();
+        live.ev_max_pair_taker_cost = 1.012;
+        let market = MarketId::from("m");
+        let yes_book = book("yes", 0.100, 0.105);
+        let no_book = book("no", 0.895, 0.911);
+        let pos = BteDecisionPosition {
+            yes_shares: 54.1,
+            no_shares: 0.0,
+            yes_avg_price: 0.10,
+            no_avg_price: 0.0,
+            current_market_net_exposure_shares: 54.1,
+            ..BteDecisionPosition::default()
+        };
+        let overpaid_repair_no = OrderIntent::new_buy(
+            ClientOrderId::from("overpaid-repair-no"),
+            market.clone(),
+            InstrumentId::from("no"),
+            0.911,
+            35.1,
+            "test",
+            1_000,
+        );
+
+        assert!(
+            live.apply_notional_caps(
+                overpaid_repair_no,
+                &market,
+                Side::BuyNo,
+                pos,
+                Some(ev_context(&yes_book, &no_book)),
+            )
+            .is_none(),
+            "ordinary repair should not overpay when combined taker pair cost is above the live cap"
+        );
     }
 
     #[test]
@@ -1371,6 +1479,8 @@ mod tests {
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
+            ev_max_worst_to_best_loss_ratio: DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO,
+            ev_max_pair_taker_cost: DEFAULT_EV_MAX_PAIR_TAKER_COST,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1420,6 +1530,8 @@ mod tests {
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
+            ev_max_worst_to_best_loss_ratio: DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO,
+            ev_max_pair_taker_cost: DEFAULT_EV_MAX_PAIR_TAKER_COST,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1466,6 +1578,8 @@ mod tests {
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
+            ev_max_worst_to_best_loss_ratio: DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO,
+            ev_max_pair_taker_cost: DEFAULT_EV_MAX_PAIR_TAKER_COST,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,
@@ -1523,6 +1637,8 @@ mod tests {
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             ev_min_best_pnl_after_repair_usd: DEFAULT_EV_MIN_BEST_PNL_AFTER_REPAIR_USD,
+            ev_max_worst_to_best_loss_ratio: DEFAULT_EV_MAX_WORST_TO_BEST_LOSS_RATIO,
+            ev_max_pair_taker_cost: DEFAULT_EV_MAX_PAIR_TAKER_COST,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
             risk_increasing_notional_by_market: HashMap::new(),
             warmup_skip_warned: false,

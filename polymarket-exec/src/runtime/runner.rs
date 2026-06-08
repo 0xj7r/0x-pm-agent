@@ -226,10 +226,10 @@ fn static_cluster_router_route(cluster: MarketRegimeCluster) -> MarketRoute {
         MarketRegimeCluster::CleanDirectionalPath
         | MarketRegimeCluster::EarlyTightRange
         | MarketRegimeCluster::LowEfficiencyNonreversal
-        | MarketRegimeCluster::MixedNeutral => MarketRoute::Bte,
-        MarketRegimeCluster::ExpandedHighFlip
+        | MarketRegimeCluster::MixedNeutral
+        | MarketRegimeCluster::ExpandedHighFlip
         | MarketRegimeCluster::ExpandedReversalPressure
-        | MarketRegimeCluster::FlowAdverseVolCluster => MarketRoute::Br2,
+        | MarketRegimeCluster::FlowAdverseVolCluster => MarketRoute::Bte,
         MarketRegimeCluster::CalmLowVol => MarketRoute::RiskOff,
     }
 }
@@ -368,7 +368,7 @@ fn update_router_session_regime(
 fn canonical_router_route(route: &str) -> Option<MarketRoute> {
     match route {
         "bte" => Some(MarketRoute::Bte),
-        "br2" => Some(MarketRoute::Br2),
+        "br2" => Some(MarketRoute::Bte),
         "risk_off" => Some(MarketRoute::RiskOff),
         _ => None,
     }
@@ -440,9 +440,8 @@ fn persist_router_session_regime(
 }
 
 fn shadow_vote_route(br2_orders: usize, bte_orders: usize) -> MarketRoute {
-    if br2_orders > 0 {
-        MarketRoute::Br2
-    } else if bte_orders > 0 {
+    let _ = br2_orders;
+    if bte_orders > 0 {
         MarketRoute::Bte
     } else {
         MarketRoute::RiskOff

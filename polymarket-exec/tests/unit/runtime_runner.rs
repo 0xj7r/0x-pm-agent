@@ -259,7 +259,7 @@ fn live_router_allows_bte_on_clean_directional_path() {
 }
 
 #[test]
-fn live_router_does_not_route_bte_on_expanded_reversal_pressure() {
+fn live_router_keeps_bte_on_expanded_reversal_pressure() {
     assert_eq!(
         live_router_route(
             MarketRegimeCluster::ExpandedReversalPressure,
@@ -269,8 +269,13 @@ fn live_router_does_not_route_bte_on_expanded_reversal_pressure() {
             0.28,
             8.0,
         ),
-        MarketRoute::Br2
+        MarketRoute::Bte
     );
+}
+
+#[test]
+fn router_canonicalizes_legacy_br2_route_to_bte() {
+    assert_eq!(canonical_router_route("br2"), Some(MarketRoute::Bte));
 }
 
 #[test]
