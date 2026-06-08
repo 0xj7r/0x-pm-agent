@@ -31,6 +31,7 @@ const LIVE_REVERSAL_REPAIR_MIN_WHIPSAW: f32 = 0.52;
 const LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY: f32 = 0.30;
 const LIVE_REVERSAL_REPAIR_MIN_SIGN_FLIP_RATE: f32 = 0.30;
 const DEFAULT_EV_MAX_GUARANTEED_LOSS_USD: f64 = 1.00;
+const DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD: f64 = 5.00;
 const DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD: f64 = 0.10;
 const DEFAULT_EV_MIN_MARGINAL_EV_USD: f64 = 0.0;
 const DEFAULT_WHIPSAW_ENTRY_DELAY_SECS: f64 = 60.0;
@@ -100,6 +101,10 @@ impl BteTerminalSnapshot {
         (-self.best_terminal_pnl_usd).max(0.0)
     }
 
+    fn worst_terminal_loss_usd(self) -> f64 {
+        (-self.worst_terminal_pnl_usd).max(0.0)
+    }
+
     fn new(yes_qty: f64, no_qty: f64, total_cost_usd: f64) -> Self {
         let pnl_if_yes = yes_qty - total_cost_usd;
         let pnl_if_no = no_qty - total_cost_usd;
@@ -126,6 +131,7 @@ pub struct BteLiveShadow {
     min_order_notional_usd: f64,
     ev_guard_enabled: bool,
     ev_max_guaranteed_loss_usd: f64,
+    ev_max_worst_terminal_loss_usd: f64,
     ev_min_worst_improvement_usd: f64,
     ev_min_marginal_ev_usd: f64,
     whipsaw_entry_delay_secs: f64,
@@ -180,6 +186,9 @@ impl BteLiveShadow {
         let ev_max_guaranteed_loss_usd =
             env_nonnegative_f64("PM_BTC_5M_BTE_EV_MAX_GUARANTEED_LOSS_USD")
                 .unwrap_or(DEFAULT_EV_MAX_GUARANTEED_LOSS_USD);
+        let ev_max_worst_terminal_loss_usd =
+            env_nonnegative_f64("PM_BTC_5M_BTE_EV_MAX_WORST_TERMINAL_LOSS_USD")
+                .unwrap_or(DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD);
         let ev_min_worst_improvement_usd =
             env_nonnegative_f64("PM_BTC_5M_BTE_EV_MIN_WORST_IMPROVEMENT_USD")
                 .unwrap_or(DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD);
@@ -213,6 +222,7 @@ impl BteLiveShadow {
                 min_order_notional_usd,
                 ev_guard_enabled,
                 ev_max_guaranteed_loss_usd,
+                ev_max_worst_terminal_loss_usd,
                 ev_min_worst_improvement_usd,
                 ev_min_marginal_ev_usd,
                 whipsaw_entry_delay_secs,
@@ -232,6 +242,7 @@ impl BteLiveShadow {
             min_order_notional_usd,
             ev_guard_enabled,
             ev_max_guaranteed_loss_usd,
+            ev_max_worst_terminal_loss_usd,
             ev_min_worst_improvement_usd,
             ev_min_marginal_ev_usd,
             whipsaw_entry_delay_secs,
@@ -429,7 +440,7 @@ impl BteLiveShadow {
             let tag_taker = self.live_trade_armed;
             let mut intents = Vec::new();
             for order in &orders {
-                let (order, forced_repair) = live_reversal_repair_order(order, pos, regime);
+                let (mut order, mut forced_repair) = live_reversal_repair_order(order, pos, regime);
                 if forced_repair {
                     warn!(
                         target: "bte_shadow",
@@ -446,6 +457,41 @@ impl BteLiveShadow {
                         realized_vol_180s_bps = regime.realized_vol_180s_bps,
                         "BTE-LIVE forcing opposite-side repair in reversal regime"
                     );
+                }
+                if !forced_repair {
+                    let (terminal_order, terminal_repair) = live_terminal_repair_order(
+                        &order,
+                        pos,
+                        yes_book,
+                        no_book,
+                        self.ev_max_guaranteed_loss_usd,
+                        self.ev_max_worst_terminal_loss_usd,
+                        self.ev_min_worst_improvement_usd,
+                    );
+                    if terminal_repair {
+                        let before = BteTerminalSnapshot::from_position(pos);
+                        let after =
+                            buy_ask_price(terminal_order.side, yes_book, no_book).map(|price| {
+                                before.after_buy(terminal_order.side, terminal_order.shares, price)
+                            });
+                        warn!(
+                            target: "bte_shadow",
+                            market = %market_id,
+                            market_u32 = terminal_order.market_id,
+                            original_side = ?order.side,
+                            repair_side = ?terminal_order.side,
+                            residual_shares = pos.current_market_net_exposure_shares,
+                            yes_shares = pos.yes_shares,
+                            no_shares = pos.no_shares,
+                            worst_terminal_pnl_before_usd = before.worst_terminal_pnl_usd,
+                            best_terminal_pnl_before_usd = before.best_terminal_pnl_usd,
+                            worst_terminal_pnl_after_usd = after.map(|snapshot| snapshot.worst_terminal_pnl_usd),
+                            best_terminal_pnl_after_usd = after.map(|snapshot| snapshot.best_terminal_pnl_usd),
+                            "BTE-LIVE converting same-side add to terminal repair"
+                        );
+                        order = terminal_order;
+                        forced_repair = true;
+                    }
                 }
                 let Some(intent) = shadow_order_to_intent(
                     &order,
@@ -639,6 +685,7 @@ impl BteLiveShadow {
         let risk_increasing = order_increases_current_market_residual(order_side, pos);
         let repair_like = !risk_increasing && pos.current_market_net_exposure_shares.abs() > 1e-9;
         let guaranteed_loss_after_usd = after.guaranteed_loss_usd();
+        let worst_terminal_loss_after_usd = after.worst_terminal_loss_usd();
 
         info!(
             target: "bte_ev",
@@ -660,6 +707,7 @@ impl BteLiveShadow {
             worst_terminal_pnl_after_usd = after.worst_terminal_pnl_usd,
             best_terminal_pnl_after_usd = after.best_terminal_pnl_usd,
             guaranteed_loss_after_usd,
+            worst_terminal_loss_after_usd,
             p_yes = p_yes,
             marginal_ev_usd = marginal_ev_usd,
             risk_increasing,
@@ -676,12 +724,14 @@ impl BteLiveShadow {
         }
 
         let guaranteed_loss_too_large = guaranteed_loss_after_usd > self.ev_max_guaranteed_loss_usd;
+        let worst_terminal_loss_too_large =
+            worst_terminal_loss_after_usd > self.ev_max_worst_terminal_loss_usd;
         let improves_worst_enough = worst_improvement_usd >= self.ev_min_worst_improvement_usd;
         let marginal_ev_ok = marginal_ev_usd
             .map(|ev| ev >= self.ev_min_marginal_ev_usd)
             .unwrap_or(false);
 
-        let allowed = if !guaranteed_loss_too_large {
+        let allowed = if !guaranteed_loss_too_large && !worst_terminal_loss_too_large {
             true
         } else if repair_like || ev_context.forced_repair {
             improves_worst_enough || marginal_ev_ok
@@ -702,6 +752,8 @@ impl BteLiveShadow {
             quantity = intent.quantity,
             guaranteed_loss_after_usd,
             max_guaranteed_loss_usd = self.ev_max_guaranteed_loss_usd,
+            worst_terminal_loss_after_usd,
+            max_worst_terminal_loss_usd = self.ev_max_worst_terminal_loss_usd,
             marginal_ev_usd = marginal_ev_usd,
             min_marginal_ev_usd = self.ev_min_marginal_ev_usd,
             worst_improvement_usd,
@@ -810,6 +862,70 @@ fn live_reversal_repair_regime(regime: BteRegimeInputs) -> bool {
     regime.whipsaw_score >= LIVE_REVERSAL_REPAIR_MIN_WHIPSAW
         && regime.sign_flip_rate >= LIVE_REVERSAL_REPAIR_MIN_SIGN_FLIP_RATE
         && regime.path_efficiency <= LIVE_REVERSAL_REPAIR_MAX_PATH_EFFICIENCY
+}
+
+fn live_terminal_repair_order(
+    order: &BteShadowOrder,
+    pos: BteDecisionPosition,
+    yes_book: &BookState,
+    no_book: Option<&BookState>,
+    max_guaranteed_loss_usd: f64,
+    max_worst_terminal_loss_usd: f64,
+    min_worst_improvement_usd: f64,
+) -> (BteShadowOrder, bool) {
+    if !matches!(order.side, Side::BuyYes | Side::BuyNo) {
+        return (order.clone(), false);
+    }
+    if !order_increases_current_market_residual(order.side, pos) {
+        return (order.clone(), false);
+    }
+    let before = BteTerminalSnapshot::from_position(pos);
+    let terminal_stressed = before.guaranteed_loss_usd() > max_guaranteed_loss_usd
+        || before.worst_terminal_loss_usd() > max_worst_terminal_loss_usd;
+    if !terminal_stressed {
+        return (order.clone(), false);
+    }
+
+    let Some(original_price) = buy_ask_price(order.side, yes_book, no_book) else {
+        return (order.clone(), false);
+    };
+    let after_original = before.after_buy(order.side, order.shares, original_price);
+    if after_original.worst_terminal_pnl_usd >= before.worst_terminal_pnl_usd {
+        return (order.clone(), false);
+    }
+
+    let Some(repair_side) = opposite_buy_side(order.side) else {
+        return (order.clone(), false);
+    };
+    let Some(repair_price) = buy_ask_price(repair_side, yes_book, no_book) else {
+        return (order.clone(), false);
+    };
+    let after_repair = before.after_buy(repair_side, order.shares, repair_price);
+    let worst_improvement = after_repair.worst_terminal_pnl_usd - before.worst_terminal_pnl_usd;
+    if worst_improvement < min_worst_improvement_usd {
+        return (order.clone(), false);
+    }
+
+    let mut repair = order.clone();
+    repair.side = repair_side;
+    repair.tag = "back_to_explore_live_terminal_repair";
+    (repair, true)
+}
+
+fn opposite_buy_side(side: Side) -> Option<Side> {
+    match side {
+        Side::BuyYes => Some(Side::BuyNo),
+        Side::BuyNo => Some(Side::BuyYes),
+        Side::SellYes | Side::SellNo => None,
+    }
+}
+
+fn buy_ask_price(side: Side, yes_book: &BookState, no_book: Option<&BookState>) -> Option<f64> {
+    match side {
+        Side::BuyYes => live_price(yes_book.best_ask),
+        Side::BuyNo => live_price(no_book?.best_ask),
+        Side::SellYes | Side::SellNo => None,
+    }
 }
 
 fn should_delay_whipsaw_entry(
@@ -995,6 +1111,7 @@ mod tests {
             min_order_notional_usd: 1.8,
             ev_guard_enabled: true,
             ev_max_guaranteed_loss_usd: DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
@@ -1046,6 +1163,7 @@ mod tests {
         assert!((snapshot.worst_terminal_pnl_usd + 15.4675).abs() < 1e-9);
         assert!((snapshot.best_terminal_pnl_usd + 4.8365).abs() < 1e-9);
         assert!((snapshot.guaranteed_loss_usd() - 4.8365).abs() < 1e-9);
+        assert!((snapshot.worst_terminal_loss_usd() - 15.4675).abs() < 1e-9);
     }
 
     #[test]
@@ -1124,6 +1242,62 @@ mod tests {
     }
 
     #[test]
+    fn bte_terminal_repair_flips_same_side_add_when_worst_tail_is_stressed() {
+        let yes_book = book("yes", 0.96, 0.98);
+        let no_book = book("no", 0.02, 0.03);
+        let pos = BteDecisionPosition {
+            yes_shares: 30.0,
+            no_shares: 25.0,
+            yes_avg_price: 0.50,
+            no_avg_price: 0.74,
+            current_market_net_exposure_shares: 5.0,
+            ..BteDecisionPosition::default()
+        };
+
+        let (repair, converted) = live_terminal_repair_order(
+            &order(Side::BuyYes, 5.0),
+            pos,
+            &yes_book,
+            Some(&no_book),
+            DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
+            DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
+        );
+
+        assert!(converted);
+        assert_eq!(repair.side, Side::BuyNo);
+        assert_eq!(repair.tag, "back_to_explore_live_terminal_repair");
+    }
+
+    #[test]
+    fn bte_terminal_repair_does_not_flip_without_worst_improvement() {
+        let yes_book = book("yes", 0.96, 0.98);
+        let no_book = book("no", 0.98, 0.99);
+        let pos = BteDecisionPosition {
+            yes_shares: 30.0,
+            no_shares: 25.0,
+            yes_avg_price: 0.50,
+            no_avg_price: 0.74,
+            current_market_net_exposure_shares: 5.0,
+            ..BteDecisionPosition::default()
+        };
+
+        let (same, converted) = live_terminal_repair_order(
+            &order(Side::BuyYes, 5.0),
+            pos,
+            &yes_book,
+            Some(&no_book),
+            DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
+            DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
+        );
+
+        assert!(!converted);
+        assert_eq!(same.side, Side::BuyYes);
+        assert_eq!(same.tag, "test");
+    }
+
+    #[test]
     fn bte_live_notional_floor_raises_tiny_order_within_cap() {
         let mut live = BteLiveShadow {
             adapter: BteShadowAdapter::new(pm_strategy::BackToExploreConfig::default()),
@@ -1136,6 +1310,7 @@ mod tests {
             min_order_notional_usd: 1.8,
             ev_guard_enabled: true,
             ev_max_guaranteed_loss_usd: DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
@@ -1183,6 +1358,7 @@ mod tests {
             min_order_notional_usd: 1.8,
             ev_guard_enabled: true,
             ev_max_guaranteed_loss_usd: DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
@@ -1227,6 +1403,7 @@ mod tests {
             min_order_notional_usd: 1.8,
             ev_guard_enabled: true,
             ev_max_guaranteed_loss_usd: DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
@@ -1282,6 +1459,7 @@ mod tests {
             min_order_notional_usd: 1.8,
             ev_guard_enabled: true,
             ev_max_guaranteed_loss_usd: DEFAULT_EV_MAX_GUARANTEED_LOSS_USD,
+            ev_max_worst_terminal_loss_usd: DEFAULT_EV_MAX_WORST_TERMINAL_LOSS_USD,
             ev_min_worst_improvement_usd: DEFAULT_EV_MIN_WORST_IMPROVEMENT_USD,
             ev_min_marginal_ev_usd: DEFAULT_EV_MIN_MARGINAL_EV_USD,
             whipsaw_entry_delay_secs: DEFAULT_WHIPSAW_ENTRY_DELAY_SECS,
