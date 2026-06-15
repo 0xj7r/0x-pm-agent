@@ -41,13 +41,10 @@ hostname = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 
-# Proven BTC-5m br2 strategy crates (path deps from polymarket-backtest).
-# Shadow-mode only for now: the adapter calls BonereaperV2::on_event and logs
-# the orders it WOULD place. No execution wiring here.
-pm-types    = { workspace = true }
-pm-model    = { workspace = true }
-pm-risk     = { workspace = true }
-pm-strategy = { workspace = true }
+# Shared backtest SSOT crates (path deps from polymarket-backtest).
+# fade_live drives its decision through pm_alpha::decide_entry.
+pm-types = { workspace = true }
+pm-alpha = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -60,9 +57,5 @@ name = "live_collector"
 path = "src/bin/live_collector.rs"
 
 [[bin]]
-name = "br2_shadow_smoke"
-path = "src/bin/br2_shadow_smoke.rs"
-
-[[bin]]
-name = "br2_equivalence"
-path = "src/bin/br2_equivalence.rs"
+name = "fade_live"
+path = "src/bin/fade_live.rs"

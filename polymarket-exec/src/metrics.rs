@@ -10,7 +10,6 @@ use prometheus::{
 };
 
 use crate::book::BookState;
-use crate::signals::BtcRegimeSnapshot;
 use crate::types::{FillLiquidity, FillReport};
 
 #[derive(Debug, Clone, Copy)]
@@ -509,15 +508,6 @@ impl AppMetrics {
         self.spot_last_trade_age_ms
             .with_label_values(&[source])
             .set(age_ms(observed_at_ms));
-    }
-
-    pub fn observe_btc_regime(&self, snapshot: &BtcRegimeSnapshot) {
-        self.btc_regime_ready
-            .set(if snapshot.regime().is_some() { 1 } else { 0 });
-        self.btc_trade_count_5m
-            .set(snapshot.trade_count_5m.min(i64::MAX as u64) as i64);
-        self.btc_realized_vol_5m_bps
-            .set(snapshot.realized_vol_5m_bps.unwrap_or(-1.0));
     }
 
     pub fn observe_book(&self, book: &BookState, stale_after: Duration) {

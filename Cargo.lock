@@ -3882,34 +3882,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
-name = "pm-model"
-version = "0.1.0"
-dependencies = [
- "pm-types",
- "serde",
-]
-
-[[package]]
-name = "pm-risk"
-version = "0.1.0"
-dependencies = [
- "pm-types",
- "serde",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "pm-strategy"
+name = "pm-alpha"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "pm-model",
- "pm-risk",
  "pm-types",
  "serde",
- "thiserror 2.0.18",
- "tracing",
+ "serde_json",
 ]
 
 [[package]]
@@ -3978,9 +3957,7 @@ dependencies = [
  "hostname",
  "http-body-util",
  "libc",
- "pm-model",
- "pm-risk",
- "pm-strategy",
+ "pm-alpha",
  "pm-types",
  "polymarket-client-sdk",
  "polymarket_client_sdk_v2",

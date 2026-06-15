@@ -41,7 +41,11 @@ stopped + masked; no resting orders; no fills since 12:28 UTC 2026-06-08).
    equivalent behavior with no behavioral overlay.
 3. Re-validate br2 on recent (May–June) data before any redeploy.
 4. Leave the architecture parameterizable by (token, duration) so Phase 2
-   expansion is tractable — without building expansion now.
+   expansion is tractable — without building expansion now. Multi-market is
+   **core to the end-state**, not optional: the target wallet's edge today was
+   concentrated in ETH and the 4h markets, and BTC-5m is the most contested
+   book. Phase 1 therefore must NOT entrench BTC-5m hardcoding further; where
+   the BTE/router removal touches BTC-5m-bound code, leave a clean seam.
 
 ## Non-goals (explicitly out of scope for Phase 1)
 

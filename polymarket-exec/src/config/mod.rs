@@ -16,7 +16,6 @@ use crate::config::parser::{
     split_csv_optional, split_csv_required,
 };
 use crate::risk::RiskLimits;
-use crate::strategy::StrategyProfile;
 
 const DEFAULT_BINANCE_REST_BOOTSTRAP_URL: &str = "https://api.binance.com/api/v3/aggTrades";
 const DEFAULT_COINBASE_SPOT_WS_URL: &str = "wss://advanced-trade-ws.coinbase.com";
@@ -111,8 +110,6 @@ pub struct AppConfig {
     pub event_log_capacity: usize,
     pub market_id_by_asset: HashMap<String, String>,
     pub risk_limits: RiskLimits,
-    pub strategy_profile_path: Option<PathBuf>,
-    pub strategy_profile: Option<StrategyProfile>,
     pub user_auth: Option<UserWsAuth>,
     pub dashboard_whale_events_path: Option<std::path::PathBuf>,
     pub dashboard_refresh_ms: u64,
@@ -223,27 +220,7 @@ impl AppConfig {
             .unwrap_or_else(|| "polymarket-exec".to_string());
         let strategy_name =
             env_value("PM_BTC_5M_STRATEGY").unwrap_or_else(|| "paired_mm".to_string());
-        let strategy_profile_paths = parse_strategy_profile_paths();
-        let strategy_profile_path = strategy_profile_paths.first().cloned();
-        let strategy_profile = if strategy_profile_paths.is_empty() {
-            None
-        } else if strategy_profile_paths.len() == 1 {
-            Some(StrategyProfile::load(&strategy_profile_paths[0])?)
-        } else {
-            Some(StrategyProfile::load_merged(&strategy_profile_paths)?)
-        };
         let paper_mode = parse_bool("PM_BTC_5M_PAPER_MODE", true)?;
-        if !paper_mode
-            && strategy_profile.is_none()
-            && strategy_name
-                .split([',', '+'])
-                .map(str::trim)
-                .any(|name| !name.is_empty() && name != "noop")
-        {
-            anyhow::bail!(
-                "live strategy `{strategy_name}` requires PM_BTC_5M_STRATEGY_PROFILE_PATH or PM_BTC_5M_STRATEGY_PROFILE_PATHS"
-            );
-        }
         let log_level = env_or("RUST_LOG", "info");
         let log_format = parse_log_format(&env_or("PM_BTC_5M_EXEC_LOG_FORMAT", "pretty"))?;
         let metrics_bind = parse_socket_addr("PM_BTC_5M_EXEC_METRICS_BIND", "0.0.0.0:9108")?;
@@ -351,11 +328,7 @@ impl AppConfig {
         let order_store_path = parse_path_optional("PM_BTC_5M_ORDER_STORE_PATH");
         let runtime_run_id =
             env_value("PM_BTC_5M_RUNTIME_RUN_ID").filter(|value| !value.trim().is_empty());
-        let book_stale_after = strategy_profile
-            .as_ref()
-            .and_then(|profile| profile.risk.book_stale_ms)
-            .map(Duration::from_millis)
-            .unwrap_or(parse_duration_ms("PM_BTC_5M_EXEC_BOOK_STALE_MS", 2_000)?);
+        let book_stale_after = parse_duration_ms("PM_BTC_5M_EXEC_BOOK_STALE_MS", 2_000)?;
         let ping_interval = parse_duration_ms("PM_BTC_5M_EXEC_PING_INTERVAL_MS", 10_000)?;
         let spot_ws_conn_stale_timeout =
             parse_duration_ms("PM_BTC_5M_EXEC_SPOT_WS_CONN_STALE_TIMEOUT_MS", 30_000)?;
@@ -379,64 +352,62 @@ impl AppConfig {
         let event_log_capacity = parse_usize("PM_BTC_5M_EXEC_EVENT_LOG_CAPACITY", 4_096)?;
         let market_id_by_asset =
             parse_asset_market_map(&env_value("PM_BTC_5M_INSTRUMENT_MARKETS").unwrap_or_default())?;
-        let profile_inventory = strategy_profile.as_ref().map(|profile| &profile.inventory);
         let risk_limits = RiskLimits {
             max_order_notional_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_ORDER_NOTIONAL_USD",
-                profile_inventory.and_then(|profile| profile.max_order_notional_usd),
+                None,
                 250.0,
             )?,
             max_gross_notional_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_GROSS_NOTIONAL_USD",
-                profile_inventory.and_then(|profile| profile.max_gross_notional_usd),
+                None,
                 1_000.0,
             )?,
             max_net_notional_per_market_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_NET_NOTIONAL_PER_MARKET_USD",
-                profile_inventory.and_then(|profile| profile.max_net_notional_per_market_usd),
+                None,
                 500.0,
             )?,
             max_position_quantity_per_instrument: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_POSITION_QTY_PER_INSTRUMENT",
-                profile_inventory.and_then(|profile| profile.max_position_quantity_per_instrument),
+                None,
                 10_000.0,
             )?,
             min_free_cash_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MIN_FREE_CASH_USD",
-                profile_inventory.and_then(|profile| profile.min_free_cash_usd),
+                None,
                 0.0,
             )?,
             min_free_cash_bps: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MIN_FREE_CASH_BPS",
-                profile_inventory.and_then(|profile| profile.min_free_cash_bps),
+                None,
                 0.0,
             )?,
             min_portfolio_equity_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MIN_PORTFOLIO_EQUITY_USD",
-                profile_inventory.and_then(|profile| profile.min_portfolio_equity_usd),
+                None,
                 0.0,
             )?,
             min_portfolio_equity_bps: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MIN_PORTFOLIO_EQUITY_BPS",
-                profile_inventory.and_then(|profile| profile.min_portfolio_equity_bps),
+                None,
                 0.0,
             )?,
             max_session_loss_usd: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_USD",
-                profile_inventory.and_then(|profile| profile.max_session_loss_usd),
+                None,
                 0.0,
             )?,
             max_session_loss_bps: parse_f64_or_profile(
                 "PM_BTC_5M_EXEC_MAX_SESSION_LOSS_BPS",
-                profile_inventory.and_then(|profile| profile.max_session_loss_bps),
+                None,
                 0.0,
             )?,
-            max_open_orders_total: profile_inventory
-                .and_then(|profile| profile.max_open_orders_total)
-                .unwrap_or(parse_usize("PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL", 32)?),
-            max_open_orders_per_market: profile_inventory
-                .and_then(|profile| profile.max_open_orders_per_market)
-                .unwrap_or(parse_usize("PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET", 8)?),
+            max_open_orders_total: parse_usize("PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_TOTAL", 32)?,
+            max_open_orders_per_market: parse_usize(
+                "PM_BTC_5M_EXEC_MAX_OPEN_ORDERS_PER_MARKET",
+                8,
+            )?,
         };
         let user_auth = load_user_auth();
         let dashboard_whale_events_path =
@@ -588,8 +559,6 @@ impl AppConfig {
             event_log_capacity,
             market_id_by_asset,
             risk_limits,
-            strategy_profile_path,
-            strategy_profile,
             user_auth,
             dashboard_whale_events_path,
             dashboard_refresh_ms,
@@ -666,20 +635,6 @@ fn parse_optional_url_with_default(key: &str, default: &str) -> Option<String> {
             }
         })
         .or_else(|| Some(default.to_string()))
-}
-
-fn parse_strategy_profile_paths() -> Vec<PathBuf> {
-    env_value("PM_BTC_5M_STRATEGY_PROFILE_PATHS")
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from)
-                .collect::<Vec<_>>()
-        })
-        .filter(|paths| !paths.is_empty())
-        .or_else(|| parse_path_optional("PM_BTC_5M_STRATEGY_PROFILE_PATH").map(|path| vec![path]))
-        .unwrap_or_default()
 }
 
 fn effective_quote_min_order_age(paper_mode: bool, configured: Duration) -> Duration {
