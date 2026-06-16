@@ -1,3 +1,19 @@
+//! **DEPRECATED — DO NOT USE FOR LIVE TRADING.**
+//!
+//! This binary reimplements the fade input pipeline (`FadeCore`) separately from
+//! the validated `pm-shadow` engine. It diverged from `shadow-final` and lost
+//! ~$700 overnight (2026-06-15 → 2026-06-16) while the shared engine made money
+//! on identical config/feeds. See `docs/postmortem-2026-06-16-fade-live-divergence.md`.
+//!
+//! Use `shadow_live` instead — it runs the EXACT `pm-shadow` engine with
+//! `frozen_shadow_final_args`. Live execution will attach to
+//! `run_shadow_with_sink` after trade-by-trade decision parity is proven (P4).
+//!
+//! This binary is HALTED by default. Set `PM_FADE_ALLOW_DEPRECATED=1` only for
+//! local debugging of the execution adapter — never for real money.
+//!
+//! ---
+//!
 //! Lean LIVE runtime for the exogenous-fade strategy (BTC-5m).
 //!
 //! Runs ONLY the fade: no br2, no market-making. Every WHETHER/HOW-to-enter
@@ -47,17 +63,18 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use pm_alpha::harness::{EntryMode, Side};
+use pm_alpha::harness::Side;
 use pm_alpha::{
-    decide_entry, AlphaModel, AlphaModelConfig, DecideConfig, DecisionInputs, EntryAction,
-    EntryState, ExoState, MarketMeta, PerpState, Token, VolEstimator,
+    decide_entry, frozen_fade_decide_config, AlphaModel, AlphaModelConfig, DecideConfig,
+    DecisionInputs, EntryAction, EntryState, ExoState, MarketMeta, PerpState, Token, VolEstimator,
 };
 use pm_types::{SpotHistory, SpotTick};
 
 use polymarket_exec::types::{ClientOrderId, InstrumentId, MarketId, TradeSide};
 use polymarket_exec::wire::execution_adapter::{
-    ExecutionAdapter, PolymarketExecutionAdapter, PolymarketL1Credentials,
-    PolymarketSignatureType, RedeemPositionsRequest, SubmitOrderRequest, TimeInForce,
+    ClobProtocolVersion, ExecutionAdapter, PolymarketConfig, PolymarketCredentials,
+    PolymarketExecutionAdapter, PolymarketL1Credentials, PolymarketSignatureType,
+    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce,
 };
 
 /// Spot ticks retained in the rolling buffer. vol3600 needs >= 1h; keep
@@ -92,32 +109,8 @@ fn now_unix_ms() -> i64 {
     now_unix_ns() / 1_000_000
 }
 
-// Frozen LIVE decision config (matches decide.rs::tests::live_cfg, the proven
-// hold@0.12 candidate). edge 0.12, marginal 0.04, sigma floor 3.0, skip-Sat,
-// rearm 0.08, cooldown 5s, hold-to-redemption (exit_after_s = 0), 90s
-// pre-close stop. notional is wired in at runtime from PM_FADE_CLIP_USD.
 fn decide_cfg(notional_usdc: f64) -> DecideConfig {
-    DecideConfig {
-        edge_threshold: 0.12,
-        min_marginal_edge: 0.04,
-        min_entry_sigma_bps: 3.0,
-        max_entry_sigma_bps: 0.0,
-        skip_saturday: true,
-        rearm_edge: 0.08,
-        clip_cooldown_ms: 5_000,
-        exit_after_s: 0,
-        enter_within_close_s: 0,
-        stop_before_close_s: 90,
-        notional_usdc,
-        kelly_sizing: false,
-        vol_sizing_ref_bps: 0.0,
-        vol_sizing_lo: 0.5,
-        vol_sizing_hi: 2.0,
-        basis_mom_agree: 1.0,
-        basis_mom_disagree: 1.0,
-        entry_mode: EntryMode::Fade,
-        align_min_mid: 0.55,
-    }
+    frozen_fade_decide_config(notional_usdc)
 }
 
 // Frozen model config (vol3600 realized, perp blend 0.75, momentum off).
@@ -163,6 +156,38 @@ impl Ladder {
     fn mid(&self) -> Option<f64> {
         Some((self.best_bid()? + self.best_ask()?) / 2.0)
     }
+
+    /// Volume-weighted average price to fill `notional` USDC by walking the
+    /// asks up to `cap_price` at full depth. Mirrors the backtest fill()
+    /// (depth_capture_frac = 1.0): the marketable order sweeps level by level
+    /// to the limit, so sizing shares off this VWAP (not the touch) makes the
+    /// deployed notional land near the clip instead of overrunning. Returns the
+    /// VWAP of whatever fills within the cap (partial if the book is thin), or
+    /// None if no asks are at or below the cap.
+    fn vwap_for_notional(&self, notional: f64, cap_price: f64) -> Option<f64> {
+        if !(notional > 0.0) {
+            return None;
+        }
+        let mut remaining = notional;
+        let mut shares = 0.0;
+        for (k, &size) in self.asks.iter() {
+            let price = key_price(*k);
+            if price > cap_price + 1e-9 {
+                break;
+            }
+            if size <= 0.0 {
+                continue;
+            }
+            let take_notional = remaining.min(price * size);
+            shares += take_notional / price;
+            remaining -= take_notional;
+            if remaining <= 1e-9 {
+                break;
+            }
+        }
+        let filled = notional - remaining;
+        (shares > 0.0 && filled > 0.0).then_some(filled / shares)
+    }
 }
 
 /// One discovered btc-updown-5m window + its per-market entry state. The
@@ -176,6 +201,11 @@ struct MarketWindow {
     close_ts_s: i64,
     up_token: String,
     down_token: String,
+    /// CTF binary index set for each outcome token: 1 << (position in
+    /// clobTokenIds). For these 2-token markets one side is 1, the other 2.
+    /// Redeeming the wrong set claims nothing, so we track per-side.
+    up_index_set: u64,
+    down_index_set: u64,
     /// CTF condition id (for redemption); None until Gamma supplies it.
     condition_id: Option<String>,
     entry: EntryState,
@@ -196,6 +226,19 @@ struct HeldLot {
     is_paper: bool,
 }
 
+/// A real on-chain position awaiting post-close redemption, persisted to the
+/// redeem ledger so a restart never orphans an open lot (held lots are otherwise
+/// in-memory only). `index_sets` are the CTF binary index sets actually held for
+/// this market (Side::Yes -> up_index_set, Side::No -> down_index_set), deduped:
+/// same-side clips -> 1 set, a clip-2 side-flip -> both.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct PendingRedeem {
+    condition_id: String,
+    slug: String,
+    close_ns: i64,
+    index_sets: Vec<u64>,
+}
+
 /// All decision/bookkeeping state. Pure w.r.t. I/O: feeds push events in, the
 /// runner polls `decide` out at 1s cadence.
 struct FadeCore {
@@ -208,6 +251,13 @@ struct FadeCore {
     /// CTF condition ids already redeemed. Idempotency guard: a market is never
     /// redeemed twice even if its window lingers across several sweeps.
     redeemed: HashSet<String>,
+    /// Real positions awaiting on-chain redemption, persisted to the redeem
+    /// ledger so a restart resumes (not re-derives) open redemptions. The REAL
+    /// redemption source of truth; paper lots are NOT tracked here.
+    pending_redeems: Vec<PendingRedeem>,
+    /// Path to the redeem ledger JSON (PM_FADE_REDEEM_LEDGER_PATH, default
+    /// "fade_redeem_ledger.json"). `pending_redeems` is mirrored here on change.
+    redeem_ledger_path: PathBuf,
     /// Running fee-net paper P&L (USDC) across all locally-settled paper lots.
     /// Live lots never touch this; it is bookkeeping for the paper arm only.
     paper_pnl_total: f64,
@@ -217,6 +267,13 @@ struct FadeCore {
 
 impl FadeCore {
     fn new(cfg: DecideConfig) -> Self {
+        let redeem_ledger_path = PathBuf::from(
+            std::env::var("PM_FADE_REDEEM_LEDGER_PATH")
+                .unwrap_or_else(|_| "fade_redeem_ledger.json".to_string()),
+        );
+        // Resume any redemptions left pending by a prior run so a restart never
+        // orphans an open position. Missing/corrupt ledger -> empty (safe).
+        let pending_redeems = Self::load_pending(&redeem_ledger_path);
         Self {
             model: model(),
             cfg,
@@ -225,8 +282,51 @@ impl FadeCore {
             books: HashMap::new(),
             markets: HashMap::new(),
             redeemed: HashSet::new(),
+            pending_redeems,
+            redeem_ledger_path,
             paper_pnl_total: 0.0,
             paper_lots_settled: 0,
+        }
+    }
+
+    /// Read+parse the redeem ledger. Best-effort: a missing file or parse error
+    /// yields an empty Vec (a fresh run, or a hand-edited/corrupt ledger we will
+    /// not crash on). Real positions still redeem via `redeemed` idempotency.
+    fn load_pending(path: &std::path::Path) -> Vec<PendingRedeem> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
+                warn!(
+                    target: "fade_live",
+                    path = %path.display(),
+                    error = %error,
+                    "redeem ledger parse failed; starting with empty pending set"
+                );
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mirror `pending_redeems` to the ledger. Best-effort: an IO error is
+    /// logged (never panics) so a transient disk fault cannot crash the live
+    /// agent; the in-memory set still drives redemption this run.
+    fn persist_pending(&self) {
+        match serde_json::to_string(&self.pending_redeems) {
+            Ok(json) => {
+                if let Err(error) = std::fs::write(&self.redeem_ledger_path, json) {
+                    warn!(
+                        target: "fade_live",
+                        path = %self.redeem_ledger_path.display(),
+                        error = %error,
+                        "redeem ledger write failed; pending set held in memory only"
+                    );
+                }
+            }
+            Err(error) => warn!(
+                target: "fade_live",
+                error = %error,
+                "redeem ledger serialize failed; skipping persist"
+            ),
         }
     }
 
@@ -345,15 +445,23 @@ impl FadeCore {
         })
     }
 
-    /// True once the spot buffer spans the model vol lookback. Below this the
-    /// belief runs on a truncated window and produces off-model output the
-    /// full-history backtest would never hold (shadow's warm-up gate).
+    /// True once BOTH the spot and perp buffers span the model vol lookback.
+    /// Below this the belief runs on a truncated window and produces off-model
+    /// output the full-history backtest would never hold. Perp is gated too (a
+    /// divergence from shadow, which never restarts so its perp tape is always
+    /// warm): the live config blends perp price at 0.75, so trading before the
+    /// perp tape spans the lookback runs a spot-only belief, not the validated
+    /// one. Perp is pre-warmed from klines on startup so this normally clears
+    /// immediately; if that fetch fails we stand down until perp builds live.
     fn warmed_up(&self) -> bool {
-        matches!(
-            (self.spot.front(), self.spot.back()),
-            (Some(first), Some(last))
-                if last.ts_ns - first.ts_ns >= VOL_LOOKBACK_S as i64 * 1_000_000_000
-        )
+        let spans = |buf: &VecDeque<SpotTick>| {
+            matches!(
+                (buf.front(), buf.back()),
+                (Some(first), Some(last))
+                    if last.ts_ns - first.ts_ns >= VOL_LOOKBACK_S as i64 * 1_000_000_000
+            )
+        };
+        spans(&self.spot) && spans(&self.perp_buf)
     }
 
     /// One decision pass over all active windows. Returns the `Enter`
@@ -514,35 +622,71 @@ impl FadeCore {
         if shares > 0.0 {
             m.held.push(HeldLot { side, avg_price, shares, is_paper });
         }
+        // Persist REAL positions to the redeem ledger so a restart resumes the
+        // open redemption (paper lots settle locally and are never tracked here).
+        if shares > 0.0 && !is_paper {
+            let index_set = match side {
+                Side::Yes => m.up_index_set,
+                Side::No => m.down_index_set,
+            };
+            if let Some(condition_id) = m.condition_id.clone() {
+                let close_ns = m.close_ts_s * 1_000_000_000;
+                let slug = m.slug.clone();
+                if let Some(pr) = self
+                    .pending_redeems
+                    .iter_mut()
+                    .find(|pr| pr.condition_id == condition_id)
+                {
+                    if !pr.index_sets.contains(&index_set) {
+                        pr.index_sets.push(index_set);
+                    }
+                } else {
+                    self.pending_redeems.push(PendingRedeem {
+                        condition_id,
+                        slug,
+                        close_ns,
+                        index_sets: vec![index_set],
+                    });
+                }
+                self.persist_pending();
+            } else {
+                // No condition id yet means we cannot redeem on-chain; the lot is
+                // still held in-memory and a later Gamma update supplies the id.
+                warn!(
+                    target: "fade_live",
+                    slug = %m.slug,
+                    "real lot committed before condition id known; not yet ledgered"
+                );
+            }
+        }
     }
 
-    /// Collect redemption candidates: markets that hold real lots, have a known
-    /// CTF condition id, closed at least `REDEEM_MARGIN_S` ago (resolution had
-    /// time to settle), and have not been redeemed yet. Returns (slug,
-    /// condition_id) pairs; the caller submits the on-chain redeem. Read-only:
+    /// Collect redemption candidates from the persisted `pending_redeems`: each
+    /// entry whose market closed at least `REDEEM_MARGIN_S` ago (resolution had
+    /// time to settle) and is not already in the `redeemed` idempotency set.
+    /// Returns the full `PendingRedeem` so the caller has the held index sets;
     /// state changes only via `mark_redeemed` after a successful submit.
-    fn redeem_candidates(&self, now_ns: i64) -> Vec<(String, String)> {
-        let cutoff_s = now_ns / 1_000_000_000 - REDEEM_MARGIN_S;
-        self.markets
-            .values()
-            .filter(|m| m.held.iter().any(|l| !l.is_paper) && m.close_ts_s <= cutoff_s)
-            .filter_map(|m| {
-                m.condition_id
-                    .as_ref()
-                    .filter(|cid| !self.redeemed.contains(*cid))
-                    .map(|cid| (m.slug.clone(), cid.clone()))
-            })
+    fn redeem_candidates(&self, now_ns: i64) -> Vec<PendingRedeem> {
+        let margin_ns = REDEEM_MARGIN_S * 1_000_000_000;
+        self.pending_redeems
+            .iter()
+            .filter(|pr| now_ns >= pr.close_ns + margin_ns)
+            .filter(|pr| !self.redeemed.contains(&pr.condition_id))
+            .cloned()
             .collect()
     }
 
-    /// Mark a market's lots redeemed: record the condition id (idempotency) and
-    /// clear the held lots so a later sweep never resubmits.
+    /// Mark a pending redemption complete: record the condition id (idempotency),
+    /// remove it from `pending_redeems`, clear any matching in-memory real lots,
+    /// and persist the trimmed ledger so a later sweep never resubmits.
     fn mark_redeemed(&mut self, slug: &str, condition_id: &str) {
         self.redeemed.insert(condition_id.to_string());
+        self.pending_redeems.retain(|pr| pr.condition_id != condition_id);
         if let Some(m) = self.markets.get_mut(slug) {
             // Only real lots redeem on-chain; paper lots settle locally.
             m.held.retain(|l| l.is_paper);
         }
+        self.persist_pending();
     }
 
     /// Locally settle paper lots whose market closed at least `REDEEM_MARGIN_S`
@@ -796,6 +940,17 @@ impl LiveArm {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+
+    if std::env::var("PM_FADE_ALLOW_DEPRECATED").ok().as_deref() != Some("1") {
+        anyhow::bail!(
+            "fade_live is HALTED: its reimplemented FadeCore diverged from the validated \
+             pm-shadow engine and lost ~$700 overnight while shadow-final made money on \
+             identical config (see docs/postmortem-2026-06-16-fade-live-divergence.md). \
+             Use `cargo run -p polymarket-exec --bin shadow_live` instead. \
+             Set PM_FADE_ALLOW_DEPRECATED=1 only for local adapter debugging — never real money."
+        );
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -830,6 +985,48 @@ async fn main() -> Result<()> {
     };
 
     let core = Arc::new(Mutex::new(FadeCore::new(cfg)));
+
+    // FadeCore::new already loaded the redeem ledger; report any pre-restart
+    // pending redemptions the sweep will now resume.
+    {
+        let c = core.lock().expect("fade core poisoned");
+        if !c.pending_redeems.is_empty() {
+            info!(
+                target: "fade_live",
+                pending_redeems = c.pending_redeems.len(),
+                ledger = %c.redeem_ledger_path.display(),
+                "resumed pending redemptions from ledger"
+            );
+        }
+    }
+
+    // Pre-warm the spot vol buffer from Binance 1m klines so the strategy clears
+    // the vol-lookback gate immediately instead of accumulating ~1h of live
+    // tape. Best-effort: on failure, fall back to the natural live warm-up.
+    match bootstrap_spot_from_klines(&core).await {
+        Ok(n) => {
+            let warm = core.lock().expect("fade core poisoned").warmed_up();
+            info!(target: "fade_live", klines = n, warmed_up = warm,
+                "spot buffer pre-warmed from Binance klines");
+        }
+        Err(e) => warn!(target: "fade_live", error = %e,
+            "spot klines pre-warm failed; falling back to live warm-up (~1h)"),
+    }
+
+    // Pre-warm perp the same way: the model weights perp price at 0.75, so
+    // without this the belief runs spot-only until the live perp tape spans the
+    // lookback. Best-effort; warmed_up() gates on perp too, so a failed fetch
+    // stands the strategy down rather than trading a degraded belief.
+    match bootstrap_perp_from_klines(&core).await {
+        Ok(n) => {
+            let warm = core.lock().expect("fade core poisoned").warmed_up();
+            info!(target: "fade_live", klines = n, warmed_up = warm,
+                "perp buffer pre-warmed from Binance futures klines");
+        }
+        Err(e) => warn!(target: "fade_live", error = %e,
+            "perp klines pre-warm failed; falling back to live warm-up (~1h)"),
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (assets_tx, assets_rx) = watch::channel(Vec::<String>::new());
 
@@ -962,16 +1159,33 @@ async fn handle_enter(
 
     let mut filled_shares = 0.0;
     let mut filled_price = 0.0;
+    // Set when a real Live submit was attempted (venue_qty > 0) but the venue
+    // rejected it without a fill (the "no orders found to match with FAK order"
+    // case at the thin open of a new window). We then skip the state advance so
+    // `decide()` re-emits next tick and the marketable taker retries, bounded by
+    // the edge gate and the close-90s entry cutoff.
+    let mut live_miss = false;
     let is_paper = matches!(action, FillAction::Paper);
 
-    // A marketable taker fills at the TOUCH (the bought side's best ask), never
-    // above the protective `limit` cap. This mirrors the backtest fill() in
-    // replay.rs, where entry_cost = the side ask and a small clip fills at the
-    // touch. `limit` (= model_side_prob - min_marginal_edge) sits well above the
-    // touch, so pricing or sizing off the cap would book a fill ~9c worse than
-    // reality, understating P&L. Size shares = notional / touch, like the backtest.
+    // Size shares off the expected fill VWAP (book-walk to the limit), not the
+    // touch. A marketable taker sweeps the thin touch level up to `limit`, so
+    // dividing the clip by the touch overshoots the deployed notional (~20% on
+    // a thin book). Walking the live asks for `capped_notional` (full depth,
+    // matching the backtest fill() with depth_capture_frac=1.0) yields the
+    // realistic VWAP, so venue_qty = notional / VWAP deploys ~the clip. Falls
+    // back to the touch if the book is unavailable.
     let limit = intent.limit_price.clamp(0.0, 1.0);
-    let fill_px = intent.fill_ask.clamp(0.0, 1.0).min(limit);
+    let walk_vwap = {
+        let core_g = core.lock().expect("fade core poisoned");
+        core_g
+            .books
+            .get(&intent.token_id)
+            .and_then(|l| l.vwap_for_notional(capped_notional, limit))
+    };
+    let fill_px = walk_vwap
+        .unwrap_or_else(|| intent.fill_ask)
+        .clamp(0.0, 1.0)
+        .min(limit);
     let venue_qty = if fill_px > 0.0 {
         ((capped_notional / fill_px) * 100.0).floor() / 100.0
     } else {
@@ -1089,17 +1303,25 @@ async fn handle_enter(
                             );
                         }
                         Err(error) => {
+                            live_miss = true;
                             warn!(
                                 target: "fade_live",
                                 slug = %intent.slug,
                                 error = %error,
-                                "fade submit FAILED; advancing state with zero fill"
+                                "fade submit MISS (no fill); retrying next tick"
                             );
                         }
                     }
                 }
             }
         }
+    }
+
+    // A real Live submit that the venue rejected without a fill: leave the
+    // per-market state untouched (clip not burned, still armed) so the next
+    // decide tick re-emits and the taker retries into the building book.
+    if live_miss {
+        return;
     }
 
     // Advance the SSOT per-market state (cooldown/arming/clip + held lot).
@@ -1122,10 +1344,11 @@ async fn handle_enter(
     // relayer/CTF rejects an unresolved market, which is a safe failure.
 }
 
-/// Periodic post-close redemption sweep. For each market that holds real lots
-/// and closed at least `REDEEM_MARGIN_S` ago, submit an on-chain redeem of both
-/// index sets (the winning leg pays $1/share; the losing leg returns nothing
-/// but the call succeeds atomically). Mirrors `redeem_once.rs`'s request
+/// Periodic post-close redemption sweep. For each persisted `PendingRedeem`
+/// whose market closed at least `REDEEM_MARGIN_S` ago, submit an on-chain redeem
+/// of the index sets actually held (the winning leg pays $1/share; a held losing
+/// leg returns nothing but the call succeeds). Sourced from the redeem ledger so
+/// a restart resumes open redemptions. Mirrors `redeem_once.rs`'s request
 /// construction via the already-connected adapter (no second signer).
 ///
 /// Gated identically to submission: only runs when armed and the kill-switch is
@@ -1164,15 +1387,18 @@ async fn redeem_sweep(
         core.redeem_candidates(now_ns)
     };
 
-    for (slug, condition_id) in candidates {
+    for pending in candidates {
+        let PendingRedeem { condition_id, slug, index_sets, .. } = pending;
+        // Redeem only the index sets we actually hold (empty -> both, as a
+        // safety fallback so a winning leg is never stranded).
+        let index_sets = if index_sets.is_empty() { vec![1, 2] } else { index_sets };
         let req = RedeemPositionsRequest {
             command_id: ClientOrderId::from(format!("exo-fade-redeem:{slug}:{now_ns}")),
             market_id: MarketId::from(slug.as_str()),
             condition_id: condition_id.clone(),
-            // Default collateral (active trading collateral); both index sets so
-            // the winning leg is claimed regardless of which side resolved.
+            // Default collateral (active trading collateral).
             collateral_token_address: None,
-            index_sets: vec![1, 2],
+            index_sets: index_sets.clone(),
             submitted_at_ms: now_unix_ms() as u64,
         };
         info!(
@@ -1180,7 +1406,8 @@ async fn redeem_sweep(
             kind = "redeem_submit",
             slug = %slug,
             condition_id = %condition_id,
-            "fade SUBMITTING redeem (both index sets)"
+            index_sets = ?index_sets,
+            "fade SUBMITTING redeem (held index sets)"
         );
         match adapter.redeem_positions(req).await {
             Ok(ack) => {
@@ -1249,6 +1476,61 @@ fn paper_settle_sweep(core: &Arc<Mutex<FadeCore>>, now_ns: i64) {
 
 /// Build the live CLOB execution adapter from the standard Polymarket env
 /// (same names redeem_once.rs / the runtime use). Only called when armed.
+/// Pre-warm the spot vol buffer from Binance 1m klines (last ~70 min) so the
+/// strategy clears the vol-lookback warm-up gate immediately on (re)start rather
+/// than accumulating ~1h of live tape. Each kline contributes one point at its
+/// closeTime (ms) + close price; the realized-vol estimate from 1m sampling is a
+/// sound proxy and is refined by incoming ticks once the WS feed catches up.
+async fn bootstrap_spot_from_klines(core: &Arc<Mutex<FadeCore>>) -> Result<usize> {
+    bootstrap_klines(
+        core,
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=70",
+        false,
+    )
+    .await
+}
+
+/// Perp counterpart: the model blends the perp price at 0.75 weight, so a fresh
+/// process must pre-warm `perp_buf` too or it trades a spot-only belief until the
+/// live perp tape spans the lookback (~1h). USDT-M futures klines, same shape.
+async fn bootstrap_perp_from_klines(core: &Arc<Mutex<FadeCore>>) -> Result<usize> {
+    bootstrap_klines(
+        core,
+        "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=70",
+        true,
+    )
+    .await
+}
+
+async fn bootstrap_klines(
+    core: &Arc<Mutex<FadeCore>>,
+    url: &str,
+    perp: bool,
+) -> Result<usize> {
+    let body: serde_json::Value = reqwest::get(url).await?.json().await?;
+    let arr = body
+        .as_array()
+        .context("binance klines response was not an array")?;
+    let mut core = core.lock().expect("fade core poisoned");
+    let mut n = 0usize;
+    for k in arr {
+        let close_ms = k.get(6).and_then(serde_json::Value::as_i64);
+        let close_px = k
+            .get(4)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse::<f64>().ok());
+        if let (Some(ms), Some(px)) = (close_ms, close_px) {
+            if perp {
+                core.push_perp(ms, px, 0.0);
+            } else {
+                core.push_spot(ms, px, 0.0, false);
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 async fn connect_live_adapter() -> Result<PolymarketExecutionAdapter> {
     let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
         .or_else(|_| std::env::var("METAMASK_PRIVATE_KEY"))
@@ -1264,9 +1546,70 @@ async fn connect_live_adapter() -> Result<PolymarketExecutionAdapter> {
     let credentials = PolymarketL1Credentials {
         private_key,
         signature_type,
-        funder_address,
+        funder_address: funder_address.clone(),
     };
-    PolymarketExecutionAdapter::connect_with_l1(credentials)
+
+    // Build the full execution config (V2 protocol + relayer), mirroring the
+    // proven redeem_once / runner env reads. poly_1271 deposit wallets REQUIRE
+    // the CLOB V2 path + relayer creds; the bare connect_with_l1 (V1 default)
+    // errors on them (as_legacy_sdk). Start from defaults (correct CTF /
+    // collateral / builder constants, neg_risk=false for BTC-5m) and override
+    // only the env-driven fields.
+    let env_some =
+        |a: &str, b: &str| std::env::var(a).ok().or_else(|| std::env::var(b).ok());
+    let mut config = PolymarketConfig::default();
+    if let Ok(v) = std::env::var("POLYMARKET_CLOB_API_URL") {
+        config.api_url = v;
+    }
+    if let Ok(v) = std::env::var("POLYMARKET_DATA_API_URL") {
+        config.data_api_url = v;
+    }
+    if let Ok(v) = std::env::var("POLYMARKET_RELAYER_URL") {
+        config.relayer_url = v;
+    }
+    config.relayer_api_key = env_some("RELAYER_API_KEY", "POLYMARKET_RELAYER_API_KEY");
+    config.relayer_api_key_address =
+        env_some("RELAYER_API_KEY_ADDRESS", "POLYMARKET_RELAYER_API_KEY_ADDRESS");
+    if let Ok(v) = std::env::var("POLYMARKET_CTF_CONTRACT_ADDRESS") {
+        config.ctf_contract_address = v;
+    }
+    if let Some(v) = env_some(
+        "POLYMARKET_CTF_COLLATERAL_TOKEN_ADDRESS",
+        "POLYMARKET_COLLATERAL_TOKEN_ADDRESS",
+    ) {
+        config.ctf_collateral_token_address = v;
+    }
+    if let Ok(v) = std::env::var("POLYMARKET_COLLATERAL_TOKEN_ADDRESS") {
+        config.collateral_token_address = v;
+    }
+    config.proxy_wallet_address = funder_address;
+    config.polygon_rpc_url = std::env::var("POLYGON_RPC_URL").ok();
+    config.protocol = ClobProtocolVersion::parse(
+        &std::env::var("POLYMARKET_CLOB_VERSION").unwrap_or_else(|_| "v2".to_string()),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_CLOB_VERSION: {e:?}"))?;
+
+    // Use the EXISTING L2 API creds: the V2 SDK consumes config.credentials and
+    // skips POST /auth/api-key, which 400s with "Could not create api key" when
+    // the account already has a key (as ours does). Without these it tries to
+    // create a key and every order fails. Falls back to None (create/derive)
+    // only if any are unset.
+    if let (Ok(api_key), Ok(api_secret), Ok(api_passphrase)) = (
+        std::env::var("POLYMARKET_API_KEY"),
+        std::env::var("POLYMARKET_API_SECRET"),
+        std::env::var("POLYMARKET_API_PASSPHRASE"),
+    ) {
+        config.credentials = Some(PolymarketCredentials {
+            api_key,
+            api_secret,
+            api_passphrase,
+            private_key: credentials.private_key.clone(),
+            signature_type: credentials.signature_type,
+            funder_address: credentials.funder_address.clone(),
+        });
+    }
+
+    PolymarketExecutionAdapter::connect_with_l1_config(config, credentials)
         .await
         .map_err(|e| anyhow::anyhow!("failed to connect live execution adapter: {e}"))
 }
@@ -1285,7 +1628,7 @@ mod feeds {
     use serde_json::Value;
     use tokio::sync::watch;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
-    use tracing::{debug, warn};
+    use tracing::{debug, info, warn};
 
     const BINANCE_SPOT_WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@trade";
     const BINANCE_PERP_WS_URL: &str = "wss://fstream.binance.com/ws/btcusdt@aggTrade";
@@ -1530,6 +1873,10 @@ mod feeds {
         let tokens = parse_json_string_list(item.get("clobTokenIds"));
         let outcomes = parse_json_string_list(item.get("outcomes"));
         let (up_token, down_token) = order_up_down(&tokens, &outcomes)?;
+        // CTF index set = 1 << (token position in clobTokenIds). `order_up_down`
+        // already guaranteed tokens.len() >= 2; tokens[0] is set 1, else set 2.
+        let up_index_set: u64 = if up_token == tokens[0] { 1 } else { 2 };
+        let down_index_set: u64 = if down_token == tokens[0] { 1 } else { 2 };
         let condition_id = item
             .get("conditionId")
             .or_else(|| item.get("condition_id"))
@@ -1541,6 +1888,8 @@ mod feeds {
             close_ts_s: open_ts_s + 300,
             up_token,
             down_token,
+            up_index_set,
+            down_index_set,
             condition_id,
             entry: EntryState { armed: true, next_entry_ns: i64::MIN },
             n_clips: 0,
@@ -1585,6 +1934,11 @@ mod feeds {
 
     // Polymarket book websocket
 
+    enum BookExit {
+        Shutdown,
+        AssetsChanged,
+    }
+
     pub async fn polymarket_book_feed(
         core: Core,
         mut assets_rx: watch::Receiver<Vec<String>>,
@@ -1601,7 +1955,11 @@ mod feeds {
                 }
             }
             match book_once(&core, &assets, &mut assets_rx, &mut shutdown).await {
-                Ok(()) => { backoff = Duration::from_secs(1); }
+                Ok(BookExit::Shutdown) => return,
+                Ok(BookExit::AssetsChanged) => {
+                    backoff = Duration::from_secs(1);
+                    info!(target: "fade_live", "book subscription set changed; resubscribing");
+                }
                 Err(error) => {
                     warn!(target: "fade_live", ?error, "book feed failed; reconnecting");
                     backoff_sleep(&mut backoff).await;
@@ -1615,7 +1973,7 @@ mod feeds {
         assets: &[String],
         assets_rx: &mut watch::Receiver<Vec<String>>,
         shutdown: &mut watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> Result<BookExit> {
         let (stream, _) = connect_async(PM_BOOK_WS_URL)
             .await
             .context("connecting polymarket book ws")?;
@@ -1623,26 +1981,26 @@ mod feeds {
         let subscribe = serde_json::json!({
             "assets_ids": assets,
             "type": "market",
-            "initial_dump": true,
         });
         write
             .send(Message::Text(subscribe.to_string().into()))
             .await
             .context("book subscribe")?;
-        let mut pings = tokio::time::interval(Duration::from_secs(15));
+        let mut pings = tokio::time::interval(Duration::from_secs(10));
         pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_frame = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
                     let _ = write.send(Message::Close(None)).await;
-                    return Ok(());
+                    return Ok(BookExit::Shutdown);
                 }
                 _ = assets_rx.changed() => {
-                    anyhow::bail!("asset subscription changed");
+                    let _ = write.send(Message::Close(None)).await;
+                    return Ok(BookExit::AssetsChanged);
                 }
                 _ = pings.tick() => {
-                    if last_frame.elapsed() > Duration::from_secs(60) {
+                    if last_frame.elapsed() > Duration::from_secs(45) {
                         anyhow::bail!("book ws stale");
                     }
                     write.send(Message::Text("PING".to_string().into())).await.context("book ping")?;
@@ -1748,5 +2106,70 @@ mod feeds {
             }
             _ => {}
         }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use serde_json::json;
+
+        // up_token == tokens[0] -> up_index_set 1, down_index_set 2.
+        #[test]
+        fn index_set_maps_to_token_position() {
+            let item = json!({
+                "slug": "btc-updown-5m-1700000000",
+                "clobTokenIds": ["TOK_UP", "TOK_DOWN"],
+                "outcomes": ["Up", "Down"],
+                "conditionId": "0xCID",
+            });
+            let m = super::parse_gamma_market(&item, "btc-updown-5m-1700000000")
+                .expect("market should parse");
+            assert_eq!(m.up_token, "TOK_UP");
+            assert_eq!(m.down_token, "TOK_DOWN");
+            assert_eq!(m.up_index_set, 1);
+            assert_eq!(m.down_index_set, 2);
+        }
+
+        // Reversed token order: down is tokens[0] -> down_index_set 1, up 2.
+        #[test]
+        fn index_set_maps_reversed_token_order() {
+            let item = json!({
+                "slug": "btc-updown-5m-1700000300",
+                "clobTokenIds": ["TOK_DOWN", "TOK_UP"],
+                "outcomes": ["Down", "Up"],
+                "conditionId": "0xCID2",
+            });
+            let m = super::parse_gamma_market(&item, "btc-updown-5m-1700000300")
+                .expect("market should parse");
+            assert_eq!(m.up_token, "TOK_UP");
+            assert_eq!(m.down_token, "TOK_DOWN");
+            assert_eq!(m.down_index_set, 1);
+            assert_eq!(m.up_index_set, 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingRedeem;
+
+    #[test]
+    fn pending_redeem_serde_roundtrip() {
+        let entries = vec![
+            PendingRedeem {
+                condition_id: "0xabc".to_string(),
+                slug: "btc-updown-5m-1700000000".to_string(),
+                close_ns: 1_700_000_300_000_000_000,
+                index_sets: vec![1],
+            },
+            PendingRedeem {
+                condition_id: "0xdef".to_string(),
+                slug: "btc-updown-5m-1700000300".to_string(),
+                close_ns: 1_700_000_600_000_000_000,
+                index_sets: vec![1, 2],
+            },
+        ];
+        let json = serde_json::to_string(&entries).expect("serialize");
+        let back: Vec<PendingRedeem> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entries, back);
     }
 }

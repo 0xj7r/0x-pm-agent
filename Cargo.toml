@@ -8,7 +8,5 @@ resolver = "2"
 # the backtest uses. Read-only: never edit the br2 crates from here.
 [workspace.dependencies]
 pm-types    = { path = "../polymarket-backtest/crates/pm-types" }
-pm-model    = { path = "../polymarket-backtest/crates/pm-model" }
-pm-risk     = { path = "../polymarket-backtest/crates/pm-risk" }
-pm-strategy = { path = "../polymarket-backtest/crates/pm-strategy" }
 pm-alpha    = { path = "../polymarket-backtest/crates/pm-alpha" }
+pm-shadow   = { path = "../polymarket-backtest/crates/pm-shadow" }

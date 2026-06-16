@@ -45,6 +45,7 @@ libc = "0.2"
 # fade_live drives its decision through pm_alpha::decide_entry.
 pm-types = { workspace = true }
 pm-alpha = { workspace = true }
+pm-shadow = { workspace = true }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -59,3 +60,7 @@ path = "src/bin/live_collector.rs"
 [[bin]]
 name = "fade_live"
 path = "src/bin/fade_live.rs"
+
+[[bin]]
+name = "shadow_live"
+path = "src/bin/shadow_live.rs"
