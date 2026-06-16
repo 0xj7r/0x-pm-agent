@@ -9,6 +9,7 @@ pub mod infra;
 pub mod logging;
 pub mod markets;
 pub mod metrics;
+pub mod shadow_exec;
 pub mod wire;
 
 pub use core::{book, inventory, lot_ledger, market_context, risk, types};

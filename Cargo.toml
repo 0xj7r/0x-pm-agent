@@ -2,10 +2,10 @@
 members = ["polymarket-exec"]
 resolver = "2"
 
-# Path dependencies on the proven BTC-5m br2 strategy crates living in the
-# sibling polymarket-backtest workspace. These crates are Nautilus-free, so the
-# live agent can run the EXACT SAME BonereaperV2::on_event decision logic that
-# the backtest uses. Read-only: never edit the br2 crates from here.
+# Path dependencies on the validated BTC-5m fade strategy crates in the sibling
+# polymarket-backtest workspace. shadow_live runs the EXACT pm-shadow engine
+# (decide_entry + feeds) that backtest/shadow-final validated. Edit SSOT in
+# polymarket-backtest; agent consumes via these path deps.
 [workspace.dependencies]
 pm-types    = { path = "../polymarket-backtest/crates/pm-types" }
 pm-alpha    = { path = "../polymarket-backtest/crates/pm-alpha" }

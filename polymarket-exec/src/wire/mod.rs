@@ -7,7 +7,6 @@ pub mod execution_adapter;
 mod execution_types;
 pub mod market_ws;
 pub mod polygon_rpc;
-pub mod perp_ws;
 pub mod raw_frame;
 mod raw_trades;
 pub mod relayer;

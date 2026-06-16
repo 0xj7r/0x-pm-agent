@@ -1,25 +1,18 @@
-//! Agent-side runner for the SHARED `pm-shadow` engine.
+//! Agent runner for the SHARED `pm-shadow` engine (validated backtest parity).
 //!
-//! This runs the EXACT `ShadowCore` engine + feeds + `decide()` that the backtest
-//! and the validated `shadow` use — no reimplementation. It is the foundation of
-//! the live-execution rebuild after `fade_live` (a separate reimplementation)
-//! diverged and lost money (see `docs/postmortem-2026-06-16-fade-live-divergence.md`).
-//!
-//! CURRENTLY LOG-ONLY (pure shadow): it places NO orders. Live execution will be
-//! added by consuming `pm_shadow::run_shadow_with_sink`'s `ExecIntent` channel and
-//! routing it to the proven execution adapter — gated behind a parity proof and an
-//! explicit arm flag. Until then this binary is safe to run anywhere.
-//!
-//! Config comes from `pm_shadow::frozen_shadow_final_args` — the SSOT for the
-//! validated `shadow-final` twin (edge 0.12, perp 0.75, realized vol / 3600s,
-//! hold-to-redemption, rearm 0.08, max_clips 2, sigma floor 3.0, skip-Saturday,
-//! 90s pre-close stop).
+//! Decisions flow ONLY through `pm_shadow::ShadowCore` + `decide_entry` SSOT.
+//! Optional live/paper execution consumes `ExecIntent` from the engine — never
+//! a reimplemented input pipeline. See `docs/postmortem-2026-06-16-fade-live-divergence.md`.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use std::path::PathBuf;
+use polymarket_exec::shadow_exec::{connect_live_adapter, run_execution_loop, LiveArm};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -31,18 +24,30 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "shadow-agent".to_string());
 
     let args = pm_shadow::frozen_shadow_final_args(PathBuf::from(&out_dir));
+    let arm = Arc::new(Mutex::new(LiveArm::from_env()));
 
     tracing::warn!(
         out_dir = %out_dir,
         edge = args.edge_threshold,
         perp = args.perp_price_weight,
-        vol_lookback_s = args.vol_lookback_s,
-        rearm = args.rearm_edge,
-        max_clips = args.max_clips,
-        sigma_floor = args.min_entry_sigma_bps,
-        skip_saturday = args.skip_saturday,
-        "agent shadow_live starting: SHARED pm-shadow engine, LOG-ONLY (no orders)"
+        live = arm.lock().expect("arm").live_trade_armed,
+        paper = arm.lock().expect("arm").paper_trade_armed,
+        "shadow_live: SHARED pm-shadow engine"
     );
 
-    pm_shadow::run_shadow(args).await
+    let (intent_tx, commit_rx) = if arm.lock().expect("arm").wants_execution() {
+        let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
+        let (ctx, crx) = tokio::sync::mpsc::unbounded_channel();
+        let adapter = if arm.lock().expect("arm").live_trade_armed {
+            Some(Arc::new(connect_live_adapter().await?))
+        } else {
+            None
+        };
+        tokio::spawn(run_execution_loop(irx, ctx, arm.clone(), adapter));
+        (Some(itx), Some(crx))
+    } else {
+        (None, None)
+    };
+
+    pm_shadow::run_shadow_with_sink(args, intent_tx, commit_rx).await
 }

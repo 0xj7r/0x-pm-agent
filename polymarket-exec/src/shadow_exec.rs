@@ -1,0 +1,492 @@
+//! Live execution consumer for the shared `pm-shadow` engine.
+//!
+//! Decisions come ONLY from `pm_shadow::ExecIntent` (the validated engine).
+//! This module handles arming, caps, kill-switch, adapter submit, and redemption.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use pm_shadow::{EntryCommit, ExecIntent};
+use tracing::{info, warn};
+
+use crate::types::{ClientOrderId, InstrumentId, MarketId, TradeSide};
+use crate::wire::execution_adapter::{
+    ClobProtocolVersion, ExecutionAdapter, PolymarketConfig, PolymarketCredentials,
+    PolymarketExecutionAdapter, PolymarketL1Credentials, PolymarketSignatureType,
+    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce,
+};
+
+const REDEEM_MARGIN_S: i64 = 60;
+
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn env_truthy(names: &[&str]) -> bool {
+    names.iter().any(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+fn env_positive_f64(names: &[&str]) -> Option<f64> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    })
+}
+
+fn env_first(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| std::env::var(name).ok().map(|v| v.trim().to_string()))
+        .filter(|v| !v.is_empty())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PendingRedeem {
+    condition_id: String,
+    slug: String,
+    close_ts_s: i64,
+    index_sets: Vec<u64>,
+}
+
+struct RedeemLedger {
+    path: PathBuf,
+    pending: Vec<PendingRedeem>,
+    redeemed: HashSet<String>,
+}
+
+impl RedeemLedger {
+    fn load() -> Self {
+        let path = PathBuf::from(
+            env_first(&["PM_SHADOW_REDEEM_LEDGER_PATH", "PM_FADE_REDEEM_LEDGER_PATH"])
+                .unwrap_or_else(|| "shadow_redeem_ledger.json".to_string()),
+        );
+        let pending = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            pending,
+            redeemed: HashSet::new(),
+        }
+    }
+
+    fn persist(&self) {
+        if let Ok(json) = serde_json::to_string(&self.pending) {
+            let _ = std::fs::write(&self.path, json);
+        }
+    }
+
+    fn record_fill(&mut self, intent: &ExecIntent) {
+        let Some(condition_id) = intent.condition_id.clone() else {
+            return;
+        };
+        let index_set = if intent.side == "up" {
+            intent.up_index_set
+        } else {
+            intent.down_index_set
+        };
+        if let Some(pr) = self
+            .pending
+            .iter_mut()
+            .find(|pr| pr.condition_id == condition_id)
+        {
+            if !pr.index_sets.contains(&index_set) {
+                pr.index_sets.push(index_set);
+            }
+        } else {
+            self.pending.push(PendingRedeem {
+                condition_id,
+                slug: intent.slug.clone(),
+                close_ts_s: intent.close_ts_s,
+                index_sets: vec![index_set],
+            });
+        }
+        self.persist();
+    }
+
+    fn due(&self, now_s: i64) -> Vec<PendingRedeem> {
+        self.pending
+            .iter()
+            .filter(|pr| now_s >= pr.close_ts_s + REDEEM_MARGIN_S)
+            .filter(|pr| !self.redeemed.contains(&pr.condition_id))
+            .cloned()
+            .collect()
+    }
+
+    fn mark_redeemed(&mut self, condition_id: &str) {
+        self.redeemed.insert(condition_id.to_string());
+        self.pending.retain(|pr| pr.condition_id != condition_id);
+        self.persist();
+    }
+}
+
+/// Safe-by-default arming (shadow / paper / live). Accepts `PM_SHADOW_*` with
+/// `PM_FADE_*` fallbacks for existing deploy env.
+pub struct LiveArm {
+    pub live_trade_armed: bool,
+    pub paper_trade_armed: bool,
+    max_order_notional_usd: f64,
+    max_market_notional_usd: f64,
+    kill_switch_path: Option<PathBuf>,
+    submitted_by_market: HashMap<String, f64>,
+}
+
+impl LiveArm {
+    pub fn from_env() -> Self {
+        let live_trade_requested = env_truthy(&["PM_SHADOW_LIVE_TRADE", "PM_FADE_LIVE_TRADE"]);
+        let paper_mode = env_first(&["PM_SHADOW_PAPER_MODE", "PM_FADE_PAPER_MODE"])
+            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no"))
+            .unwrap_or(true);
+        let kill_switch_path = env_first(&["PM_SHADOW_LIVE_KILL_SWITCH_PATH", "PM_FADE_LIVE_KILL_SWITCH_PATH"])
+            .map(PathBuf::from);
+        let max_order_notional_usd =
+            env_positive_f64(&["PM_SHADOW_MAX_ORDER_NOTIONAL_USD", "PM_FADE_MAX_ORDER_NOTIONAL_USD"]);
+        let max_market_notional_usd =
+            env_positive_f64(&["PM_SHADOW_MAX_MARKET_NOTIONAL_USD", "PM_FADE_MAX_MARKET_NOTIONAL_USD"]);
+
+        let preconditions_ok = !paper_mode
+            && kill_switch_path.is_some()
+            && max_order_notional_usd.is_some()
+            && max_market_notional_usd.is_some();
+        let live_trade_armed = live_trade_requested && preconditions_ok;
+        let paper_trade_armed =
+            env_truthy(&["PM_SHADOW_PAPER_TRADE", "PM_FADE_PAPER_TRADE"]) && paper_mode;
+
+        if live_trade_requested && !live_trade_armed {
+            warn!(
+                "PM_SHADOW_LIVE_TRADE set but preconditions missing; staying shadow-only"
+            );
+        }
+        if live_trade_armed {
+            warn!("SHADOW REAL-MONEY submission ARMED");
+        }
+
+        Self {
+            live_trade_armed,
+            paper_trade_armed,
+            max_order_notional_usd: max_order_notional_usd.unwrap_or(0.0),
+            max_market_notional_usd: max_market_notional_usd.unwrap_or(0.0),
+            kill_switch_path,
+            submitted_by_market: HashMap::new(),
+        }
+    }
+
+    pub fn wants_execution(&self) -> bool {
+        self.live_trade_armed || self.paper_trade_armed
+    }
+
+    fn kill_switch_tripped(&self) -> bool {
+        self.kill_switch_path
+            .as_ref()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+
+    fn cap_notional(&self, slug: &str, candidate: f64) -> f64 {
+        let already = *self.submitted_by_market.get(slug).unwrap_or(&0.0);
+        let headroom = (self.max_market_notional_usd - already).max(0.0);
+        candidate.min(self.max_order_notional_usd).min(headroom)
+    }
+
+    fn record_submitted(&mut self, slug: &str, notional: f64) {
+        *self.submitted_by_market.entry(slug.to_string()).or_insert(0.0) += notional;
+    }
+}
+
+pub async fn connect_live_adapter() -> Result<PolymarketExecutionAdapter> {
+    let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
+        .or_else(|_| std::env::var("METAMASK_PRIVATE_KEY"))
+        .context("POLYMARKET_PRIVATE_KEY required for live arm")?;
+    let signature_type = PolymarketSignatureType::parse(
+        &std::env::var("POLYMARKET_SIGNATURE_TYPE").unwrap_or_else(|_| "eoa".to_string()),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_SIGNATURE_TYPE: {e:?}"))?;
+    let funder_address = std::env::var("POLYMARKET_FUNDER_ADDRESS")
+        .ok()
+        .or_else(|| std::env::var("POLYMARKET_PROXY_WALLET_ADDRESS").ok());
+
+    let credentials = PolymarketL1Credentials {
+        private_key,
+        signature_type,
+        funder_address: funder_address.clone(),
+    };
+
+    let env_some = |a: &str, b: &str| std::env::var(a).ok().or_else(|| std::env::var(b).ok());
+    let mut config = PolymarketConfig::default();
+    if let Ok(v) = std::env::var("POLYMARKET_CLOB_API_URL") {
+        config.api_url = v;
+    }
+    if let Ok(v) = std::env::var("POLYMARKET_DATA_API_URL") {
+        config.data_api_url = v;
+    }
+    if let Ok(v) = std::env::var("POLYMARKET_RELAYER_URL") {
+        config.relayer_url = v;
+    }
+    config.relayer_api_key = env_some("RELAYER_API_KEY", "POLYMARKET_RELAYER_API_KEY");
+    config.relayer_api_key_address =
+        env_some("RELAYER_API_KEY_ADDRESS", "POLYMARKET_RELAYER_API_KEY_ADDRESS");
+    config.proxy_wallet_address = funder_address;
+    config.polygon_rpc_url = std::env::var("POLYGON_RPC_URL").ok();
+    config.protocol = ClobProtocolVersion::parse(
+        &std::env::var("POLYMARKET_CLOB_VERSION").unwrap_or_else(|_| "v2".to_string()),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid POLYMARKET_CLOB_VERSION: {e:?}"))?;
+
+    if let (Ok(api_key), Ok(api_secret), Ok(api_passphrase)) = (
+        std::env::var("POLYMARKET_API_KEY"),
+        std::env::var("POLYMARKET_API_SECRET"),
+        std::env::var("POLYMARKET_API_PASSPHRASE"),
+    ) {
+        config.credentials = Some(PolymarketCredentials {
+            api_key,
+            api_secret,
+            api_passphrase,
+            private_key: credentials.private_key.clone(),
+            signature_type: credentials.signature_type,
+            funder_address: credentials.funder_address.clone(),
+        });
+    }
+
+    PolymarketExecutionAdapter::connect_with_l1_config(config, credentials)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect live adapter: {e}"))
+}
+
+pub async fn run_execution_loop(
+    mut intent_rx: tokio::sync::mpsc::UnboundedReceiver<ExecIntent>,
+    commit_tx: tokio::sync::mpsc::UnboundedSender<EntryCommit>,
+    arm: Arc<Mutex<LiveArm>>,
+    adapter: Option<Arc<PolymarketExecutionAdapter>>,
+) {
+    let ledger = Arc::new(Mutex::new(RedeemLedger::load()));
+    let mut redeem_tick = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            intent = intent_rx.recv() => {
+                let Some(intent) = intent else { break };
+                handle_intent(intent, &arm, adapter.as_deref(), &commit_tx, &ledger).await;
+            }
+            _ = redeem_tick.tick() => {
+                redeem_sweep(&arm, adapter.as_deref(), &ledger, now_unix_ms() / 1000).await;
+            }
+        }
+    }
+}
+
+async fn handle_intent(
+    intent: ExecIntent,
+    arm: &Arc<Mutex<LiveArm>>,
+    adapter: Option<&PolymarketExecutionAdapter>,
+    commit_tx: &tokio::sync::mpsc::UnboundedSender<EntryCommit>,
+    ledger: &Arc<Mutex<RedeemLedger>>,
+) {
+    info!(
+        target: "shadow_live",
+        kind = "would_enter",
+        slug = %intent.slug,
+        side = %intent.side,
+        edge = intent.edge,
+        touch = intent.touch_price,
+        limit = intent.marketable_limit_price,
+        clip = intent.clip,
+        "shadow WOULD_ENTER"
+    );
+
+    let clip_usd = env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0);
+    let capped = {
+        let mut a = arm.lock().expect("arm poisoned");
+        if a.kill_switch_tripped() {
+            a.live_trade_armed = false;
+            a.paper_trade_armed = false;
+            warn!(slug = %intent.slug, "kill-switch: disarmed");
+            let _ = commit_tx.send(EntryCommit {
+                slug: intent.slug.clone(),
+                filled: false,
+            });
+            return;
+        }
+        if a.live_trade_armed || a.paper_trade_armed {
+            a.cap_notional(&intent.slug, clip_usd.min(intent.target_notional))
+        } else {
+            let _ = commit_tx.send(EntryCommit {
+                slug: intent.slug.clone(),
+                filled: true,
+            });
+            return;
+        }
+    };
+
+    if capped <= 0.0 {
+        let _ = commit_tx.send(EntryCommit {
+            slug: intent.slug.clone(),
+            filled: false,
+        });
+        return;
+    }
+
+    let limit = intent.marketable_limit_price.clamp(0.0, 1.0);
+    let fill_px = intent.touch_price.clamp(0.0, 1.0).min(limit);
+    let qty = if fill_px > 0.0 {
+        ((capped / fill_px) * 100.0).floor() / 100.0
+    } else {
+        0.0
+    };
+
+    let live = arm.lock().expect("arm poisoned").live_trade_armed;
+    let mut filled = false;
+
+    if live && qty > 0.0 {
+        if let Some(adapter) = adapter {
+            let req = SubmitOrderRequest {
+                client_order_id: ClientOrderId::from(format!(
+                    "shadow-live:{}:{}:{}",
+                    intent.slug, intent.side, now_unix_ms()
+                )),
+                market_id: MarketId::from(intent.slug.as_str()),
+                instrument_id: InstrumentId::from(intent.token_id.as_str()),
+                side: TradeSide::Buy,
+                limit_price: limit,
+                quantity: qty,
+                post_only: false,
+                time_in_force: TimeInForce::Ioc,
+                expires_at_ms: None,
+                strategy_tag: "exo-fade".to_string(),
+                quote_level_tag: Some("exo-fade-taker".to_string()),
+                submitted_at_ms: now_unix_ms() as u64,
+            };
+            match adapter.submit(req).await {
+                Ok(ack) => {
+                    filled = true;
+                    arm.lock()
+                        .expect("arm poisoned")
+                        .record_submitted(&intent.slug, fill_px * qty);
+                    ledger.lock().expect("ledger poisoned").record_fill(&intent);
+                    info!(
+                        target: "shadow_live",
+                        slug = %intent.slug,
+                        accepted = ack.accepted,
+                        "shadow SUBMITTED"
+                    );
+                }
+                Err(error) => {
+                    warn!(target: "shadow_live", slug = %intent.slug, error = %error, "submit miss");
+                }
+            }
+        }
+    } else if qty > 0.0 {
+        filled = true;
+        arm.lock()
+            .expect("arm poisoned")
+            .record_submitted(&intent.slug, fill_px * qty);
+        info!(target: "shadow_live", slug = %intent.slug, "shadow PAPER_FILL");
+    }
+
+    let _ = commit_tx.send(EntryCommit {
+        slug: intent.slug,
+        filled,
+    });
+}
+
+async fn redeem_sweep(
+    arm: &Arc<Mutex<LiveArm>>,
+    adapter: Option<&PolymarketExecutionAdapter>,
+    ledger: &Arc<Mutex<RedeemLedger>>,
+    now_s: i64,
+) {
+    let live = {
+        let mut a = arm.lock().expect("arm poisoned");
+        if !a.live_trade_armed {
+            return;
+        }
+        if a.kill_switch_tripped() {
+            a.live_trade_armed = false;
+            return;
+        }
+        true
+    };
+    if !live {
+        return;
+    }
+    let Some(adapter) = adapter else {
+        return;
+    };
+
+    let candidates = ledger.lock().expect("ledger poisoned").due(now_s);
+    for pending in candidates {
+        let index_sets = if pending.index_sets.is_empty() {
+            vec![1, 2]
+        } else {
+            pending.index_sets.clone()
+        };
+        let req = RedeemPositionsRequest {
+            command_id: ClientOrderId::from(format!(
+                "shadow-redeem:{}:{}",
+                pending.slug, now_unix_ms()
+            )),
+            market_id: MarketId::from(pending.slug.as_str()),
+            condition_id: pending.condition_id.clone(),
+            collateral_token_address: None,
+            index_sets: index_sets.clone(),
+            submitted_at_ms: now_unix_ms() as u64,
+        };
+        match adapter.redeem_positions(req).await {
+            Ok(ack) if ack.accepted => {
+                ledger
+                    .lock()
+                    .expect("ledger poisoned")
+                    .mark_redeemed(&pending.condition_id);
+                info!(
+                    target: "shadow_live",
+                    slug = %pending.slug,
+                    "shadow redeem OK"
+                );
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use pm_alpha::frozen_fade_decide_config;
+    use pm_shadow::frozen_shadow_final_args;
+
+    /// Agent must use the same frozen config as shadow-final / backtest SSOT.
+    #[test]
+    fn frozen_shadow_final_args_matches_decide_ssot() {
+        let args = frozen_shadow_final_args(PathBuf::from("shadow-agent"));
+        let decide = frozen_fade_decide_config(50.0);
+
+        assert_eq!(args.edge_threshold, decide.edge_threshold);
+        assert_eq!(args.min_entry_sigma_bps, decide.min_entry_sigma_bps);
+        assert_eq!(args.rearm_edge, decide.rearm_edge);
+        assert_eq!(args.max_clips, 2);
+        assert_eq!(args.exit_after_s, decide.exit_after_s);
+        assert_eq!(args.stop_before_close_s, decide.stop_before_close_s);
+        assert!(args.skip_saturday);
+        assert!((args.perp_price_weight - 0.75).abs() < f64::EPSILON);
+        assert_eq!(args.vol_lookback_s, 3600);
+        assert_eq!(args.vol_estimator, "realized");
+        assert!(!args.lane_late_fav);
+        assert_eq!(args.enter_within_close_s, 0);
+        assert_eq!(args.latency_probe_ms, 150);
+    }
+}
