@@ -417,7 +417,8 @@ async fn handle_intent(
     let clip_usd = env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0);
     let capped = {
         let mut a = arm.lock().expect("arm poisoned");
-        if a.kill_switch_tripped() {
+        // Paper parity audits must run with fade.kill in place; only block live money.
+        if a.kill_switch_tripped() && !paper_mode {
             a.live_trade_armed = false;
             a.paper_trade_armed = false;
             warn!(slug = %intent.slug, "kill-switch: disarmed");
