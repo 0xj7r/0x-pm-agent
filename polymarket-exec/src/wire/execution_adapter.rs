@@ -215,6 +215,8 @@ impl ExecutionAdapter for PaperExecutionAdapter {
             accepted: true,
             accepted_at_ms: req.submitted_at_ms,
             venue_message: None,
+            filled_qty: None,
+            avg_fill_price: None,
         })
     }
 
@@ -876,12 +878,19 @@ impl PolymarketExecutionAdapter {
         })?;
 
         let now_ms = now_unix_ms();
+        let (filled_qty, avg_fill_price) = if req.side == TradeSide::Buy {
+            buy_fill_from_making_taking(&resp.making_amount, &resp.taking_amount)
+        } else {
+            (None, None)
+        };
         Ok(SubmitOrderAck {
             client_order_id: req.client_order_id,
             venue_order_id: Some(OrderId::from(resp.order_id.to_string())),
             accepted: true,
             accepted_at_ms: now_ms,
             venue_message: Some(format!("v2-sdk status={:?}", resp.status)),
+            filled_qty,
+            avg_fill_price,
         })
     }
 
@@ -935,6 +944,8 @@ impl PolymarketExecutionAdapter {
             venue_message: response
                 .error_msg
                 .or_else(|| Some("v2-sdk poly1271 deposit-wallet post accepted".to_string())),
+            filled_qty: None,
+            avg_fill_price: None,
         };
         if ack.accepted {
             if let Some(order_id) = ack.venue_order_id.clone() {
@@ -1036,6 +1047,8 @@ impl PolymarketExecutionAdapter {
             accepted: response.success,
             accepted_at_ms: now_unix_ms(),
             venue_message: response.error_msg,
+            filled_qty: None,
+            avg_fill_price: None,
         };
         if ack.accepted {
             if let Some(order_id) = ack.venue_order_id.clone() {
@@ -1698,6 +1711,8 @@ impl ExecutionAdapter for PolymarketExecutionAdapter {
             accepted,
             accepted_at_ms: now_unix_ms(),
             venue_message: response.error_msg,
+            filled_qty: None,
+            avg_fill_price: None,
         };
 
         if accepted {
@@ -1981,6 +1996,35 @@ struct RawPostOrderResponse {
     #[serde(rename = "orderID")]
     pub order_id: String,
     pub success: bool,
+}
+
+/// Matched BUY post-order: `makingAmount` = shares, `takingAmount` = USDC.
+fn buy_fill_from_making_taking(
+    making: &polymarket_client_sdk_v2::types::Decimal,
+    taking: &polymarket_client_sdk_v2::types::Decimal,
+) -> (Option<f64>, Option<f64>) {
+    let making_f = match decimal_to_positive_f64(making) {
+        Some(v) => v,
+        None => return (None, None),
+    };
+    let taking_f = match decimal_to_positive_f64(taking) {
+        Some(v) => v,
+        None => return (None, None),
+    };
+    let price = taking_f / making_f;
+    if price.is_finite() && price > 0.0 {
+        (Some(making_f), Some(price))
+    } else {
+        (None, None)
+    }
+}
+
+fn decimal_to_positive_f64(value: &polymarket_client_sdk_v2::types::Decimal) -> Option<f64> {
+    value
+        .to_string()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 fn map_sdk_error(error: polymarket_client_sdk::error::Error) -> ExecutionError {

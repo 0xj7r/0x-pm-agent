@@ -60,3 +60,11 @@ path = "src/bin/live_collector.rs"
 [[bin]]
 name = "shadow_live"
 path = "src/bin/shadow_live.rs"
+
+[[bin]]
+name = "shadow_exec_tail"
+path = "src/bin/shadow_exec_tail.rs"
+
+[[bin]]
+name = "balance_once"
+path = "src/bin/balance_once.rs"

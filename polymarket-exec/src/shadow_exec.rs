@@ -12,14 +12,17 @@ use anyhow::{Context, Result};
 use pm_shadow::{EntryCommit, ExecIntent};
 use tracing::{info, warn};
 
+use crate::shadow_parity::{now_unix_s, SharedParityGate};
 use crate::types::{ClientOrderId, InstrumentId, MarketId, TradeSide};
 use crate::wire::execution_adapter::{
     ClobProtocolVersion, ExecutionAdapter, PolymarketConfig, PolymarketCredentials,
     PolymarketExecutionAdapter, PolymarketL1Credentials, PolymarketSignatureType,
-    RedeemPositionsRequest, SubmitOrderRequest, TimeInForce,
+    RedeemPositionsRequest, SubmitOrderAck, SubmitOrderRequest, TimeInForce,
 };
 
 const REDEEM_MARGIN_S: i64 = 60;
+const FILL_POLL_ATTEMPTS: u32 = 5;
+const FILL_POLL_BASE_MS: u64 = 120;
 
 fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +55,61 @@ fn env_first(names: &[&str]) -> Option<String> {
         .iter()
         .find_map(|name| std::env::var(name).ok().map(|v| v.trim().to_string()))
         .filter(|v| !v.is_empty())
+}
+
+async fn poll_venue_fill(
+    adapter: &PolymarketExecutionAdapter,
+    ack: &SubmitOrderAck,
+    token_id: &str,
+    submit_ms: i64,
+) -> (Option<f64>, Option<f64>) {
+    let Some(venue_order_id) = ack.venue_order_id.as_ref() else {
+        return (None, None);
+    };
+    let after_ms = (submit_ms.saturating_sub(5_000)).max(0) as u64;
+    for attempt in 0..FILL_POLL_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(
+                FILL_POLL_BASE_MS * u64::from(attempt),
+            ))
+            .await;
+        }
+        let Ok(fills) = adapter.sync_recent_fills(after_ms).await else {
+            continue;
+        };
+        let mut total_qty = 0.0;
+        let mut notional = 0.0;
+        for fill in fills {
+            if fill.venue_order_id.as_str() != venue_order_id.as_str()
+                || fill.instrument_id.as_str() != token_id
+            {
+                continue;
+            }
+            total_qty += fill.quantity;
+            notional += fill.price * fill.quantity;
+        }
+        if total_qty > 0.0 && notional > 0.0 {
+            let price = notional / total_qty;
+            if price.is_finite() && price > 0.0 {
+                return (Some(total_qty), Some(price));
+            }
+        }
+    }
+    (None, None)
+}
+
+async fn resolve_fill_stats(
+    adapter: &PolymarketExecutionAdapter,
+    ack: &SubmitOrderAck,
+    token_id: &str,
+    submit_ms: i64,
+) -> (Option<f64>, Option<f64>) {
+    if let (Some(price), Some(qty)) = (ack.avg_fill_price, ack.filled_qty) {
+        if price.is_finite() && price > 0.0 && qty > 0.0 {
+            return (Some(price), Some(qty));
+        }
+    }
+    poll_venue_fill(adapter, ack, token_id, submit_ms).await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -198,14 +256,38 @@ impl LiveArm {
     }
 
     fn cap_notional(&self, slug: &str, candidate: f64) -> f64 {
+        // Paper mode may run without live cap env vars; only enforce when configured.
+        if self.max_order_notional_usd <= 0.0 && self.max_market_notional_usd <= 0.0 {
+            return candidate;
+        }
         let already = *self.submitted_by_market.get(slug).unwrap_or(&0.0);
         let headroom = (self.max_market_notional_usd - already).max(0.0);
-        candidate.min(self.max_order_notional_usd).min(headroom)
+        let order_cap = if self.max_order_notional_usd > 0.0 {
+            self.max_order_notional_usd
+        } else {
+            candidate
+        };
+        candidate.min(order_cap).min(headroom)
     }
 
     fn record_submitted(&mut self, slug: &str, notional: f64) {
         *self.submitted_by_market.entry(slug.to_string()).or_insert(0.0) += notional;
     }
+}
+
+/// V2 FAK/IOC buys spend `limit_price * quantity` USDC on the market-order path.
+/// Size shares off the limit (not touch) so venue spend matches the capped clip.
+fn market_buy_qty(capped_usd: f64, limit_price: f64) -> f64 {
+    if capped_usd > 0.0 && limit_price > 0.0 {
+        ((capped_usd / limit_price) * 100.0).floor() / 100.0
+    } else {
+        0.0
+    }
+}
+
+/// USDC the venue will debit for a shadow FAK buy at `limit_price`.
+fn market_buy_usdc(limit_price: f64, quantity: f64) -> f64 {
+    limit_price * quantity
 }
 
 pub async fn connect_live_adapter() -> Result<PolymarketExecutionAdapter> {
@@ -272,18 +354,38 @@ pub async fn run_execution_loop(
     commit_tx: tokio::sync::mpsc::UnboundedSender<EntryCommit>,
     arm: Arc<Mutex<LiveArm>>,
     adapter: Option<Arc<PolymarketExecutionAdapter>>,
+    parity: Option<SharedParityGate>,
+    paper_mode: bool,
 ) {
     let ledger = Arc::new(Mutex::new(RedeemLedger::load()));
     let mut redeem_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut parity_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
             intent = intent_rx.recv() => {
                 let Some(intent) = intent else { break };
-                handle_intent(intent, &arm, adapter.as_deref(), &commit_tx, &ledger).await;
+                handle_intent(
+                    intent,
+                    &arm,
+                    adapter.as_deref(),
+                    &commit_tx,
+                    &ledger,
+                    parity.as_ref(),
+                    paper_mode,
+                )
+                .await;
             }
             _ = redeem_tick.tick() => {
                 redeem_sweep(&arm, adapter.as_deref(), &ledger, now_unix_ms() / 1000).await;
+            }
+            _ = parity_tick.tick() => {
+                if let Some(gate) = parity.as_ref() {
+                    let now_s = now_unix_s();
+                    let mut g = gate.lock().expect("parity gate poisoned");
+                    g.tick_expired(now_s);
+                    g.maybe_log_stats(now_s);
+                }
             }
         }
     }
@@ -295,12 +397,16 @@ async fn handle_intent(
     adapter: Option<&PolymarketExecutionAdapter>,
     commit_tx: &tokio::sync::mpsc::UnboundedSender<EntryCommit>,
     ledger: &Arc<Mutex<RedeemLedger>>,
+    parity: Option<&SharedParityGate>,
+    paper_mode: bool,
 ) {
     info!(
         target: "shadow_live",
         kind = "would_enter",
         slug = %intent.slug,
         side = %intent.side,
+        p_exo = intent.p_exo,
+        p_side = intent.p_side,
         edge = intent.edge,
         touch = intent.touch_price,
         limit = intent.marketable_limit_price,
@@ -321,7 +427,7 @@ async fn handle_intent(
             });
             return;
         }
-        if a.live_trade_armed || a.paper_trade_armed {
+        if a.live_trade_armed || a.paper_trade_armed || paper_mode {
             a.cap_notional(&intent.slug, clip_usd.min(intent.target_notional))
         } else {
             let _ = commit_tx.send(EntryCommit {
@@ -341,17 +447,55 @@ async fn handle_intent(
     }
 
     let limit = intent.marketable_limit_price.clamp(0.0, 1.0);
-    let fill_px = intent.touch_price.clamp(0.0, 1.0).min(limit);
-    let qty = if fill_px > 0.0 {
-        ((capped / fill_px) * 100.0).floor() / 100.0
-    } else {
-        0.0
-    };
+    let qty = market_buy_qty(capped, limit);
 
-    let live = arm.lock().expect("arm poisoned").live_trade_armed;
+    let (live, paper) = {
+        let a = arm.lock().expect("arm poisoned");
+        (a.live_trade_armed && !paper_mode, a.paper_trade_armed && !paper_mode)
+    };
     let mut filled = false;
 
-    if live && qty > 0.0 {
+    if qty > 0.0 {
+        if let Some(gate) = parity {
+            if !gate
+                .lock()
+                .expect("parity gate poisoned")
+                .authorize_submit(&intent, now_unix_s())
+            {
+                let _ = commit_tx.send(EntryCommit {
+                    slug: intent.slug.clone(),
+                    filled: false,
+                });
+                return;
+            }
+        }
+    }
+
+    if paper_mode && qty > 0.0 {
+        filled = true;
+        arm.lock()
+            .expect("arm poisoned")
+            .record_submitted(&intent.slug, capped);
+        info!(
+            target: "shadow_live",
+            "LIVE ENTER {} {} p_up={:.3} p_side={:.3} touch={:.2} edge={:.3} clip={}",
+            intent.side.to_uppercase(),
+            intent.slug,
+            intent.p_exo,
+            intent.p_side,
+            intent.touch_price,
+            intent.edge,
+            intent.clip,
+        );
+        info!(
+            target: "shadow_live",
+            slug = %intent.slug,
+            limit = limit,
+            qty,
+            notional = capped,
+            "shadow SUBMITTED (paper)"
+        );
+    } else if live && qty > 0.0 {
         if let Some(adapter) = adapter {
             let req = SubmitOrderRequest {
                 client_order_id: ClientOrderId::from(format!(
@@ -370,30 +514,74 @@ async fn handle_intent(
                 quote_level_tag: Some("exo-fade-taker".to_string()),
                 submitted_at_ms: now_unix_ms() as u64,
             };
+            let submit_ms = now_unix_ms();
             match adapter.submit(req).await {
                 Ok(ack) => {
                     filled = true;
                     arm.lock()
                         .expect("arm poisoned")
-                        .record_submitted(&intent.slug, fill_px * qty);
+                        .record_submitted(&intent.slug, capped);
                     ledger.lock().expect("ledger poisoned").record_fill(&intent);
                     info!(
                         target: "shadow_live",
-                        slug = %intent.slug,
-                        accepted = ack.accepted,
-                        "shadow SUBMITTED"
+                        "LIVE ENTER {} {} p_up={:.3} p_side={:.3} touch={:.2} edge={:.3} clip={}",
+                        intent.side.to_uppercase(),
+                        intent.slug,
+                        intent.p_exo,
+                        intent.p_side,
+                        intent.touch_price,
+                        intent.edge,
+                        intent.clip,
                     );
+                    let (avg_fill_price, filled_qty) = resolve_fill_stats(
+                        adapter,
+                        &ack,
+                        intent.token_id.as_str(),
+                        submit_ms,
+                    )
+                    .await;
+                    match (avg_fill_price, filled_qty) {
+                        (Some(price), Some(qty)) => info!(
+                            target: "shadow_live",
+                            slug = %intent.slug,
+                            accepted = ack.accepted,
+                            "shadow SUBMITTED avg_fill_price={price:.4} filled_qty={qty:.2}"
+                        ),
+                        (Some(price), None) => info!(
+                            target: "shadow_live",
+                            slug = %intent.slug,
+                            accepted = ack.accepted,
+                            "shadow SUBMITTED avg_fill_price={price:.4}"
+                        ),
+                        _ => info!(
+                            target: "shadow_live",
+                            slug = %intent.slug,
+                            accepted = ack.accepted,
+                            "shadow SUBMITTED"
+                        ),
+                    }
                 }
                 Err(error) => {
                     warn!(target: "shadow_live", slug = %intent.slug, error = %error, "submit miss");
                 }
             }
         }
-    } else if qty > 0.0 {
+    } else if paper && qty > 0.0 && !paper_mode {
         filled = true;
         arm.lock()
             .expect("arm poisoned")
-            .record_submitted(&intent.slug, fill_px * qty);
+            .record_submitted(&intent.slug, capped);
+        info!(
+            target: "shadow_live",
+            "LIVE ENTER {} {} p_up={:.3} p_side={:.3} touch={:.2} edge={:.3} clip={} (paper)",
+            intent.side.to_uppercase(),
+            intent.slug,
+            intent.p_exo,
+            intent.p_side,
+            intent.touch_price,
+            intent.edge,
+            intent.clip,
+        );
         info!(target: "shadow_live", slug = %intent.slug, "shadow PAPER_FILL");
     }
 
@@ -457,7 +645,24 @@ async fn redeem_sweep(
                     "shadow redeem OK"
                 );
             }
-            Ok(_) | Err(_) => {}
+            Ok(ack) => {
+                warn!(
+                    target: "shadow_live",
+                    slug = %pending.slug,
+                    condition_id = %pending.condition_id,
+                    accepted = ack.accepted,
+                    "shadow redeem rejected by venue"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    target: "shadow_live",
+                    slug = %pending.slug,
+                    condition_id = %pending.condition_id,
+                    error = %error,
+                    "shadow redeem error"
+                );
+            }
         }
     }
 }
@@ -468,6 +673,22 @@ mod tests {
 
     use pm_alpha::frozen_fade_decide_config;
     use pm_shadow::frozen_shadow_final_args;
+
+    #[test]
+    fn market_buy_qty_caps_usdc_at_limit_not_touch() {
+        // 8:40 ET tail: touch 7c, limit 15.2c, $25 clip.
+        let qty = super::market_buy_qty(25.0, 0.152);
+        assert!((super::market_buy_usdc(0.152, qty) - 25.0).abs() < 0.01);
+        // Old touch-based sizing would have sent ~$54.
+        let bad_qty = ((25.0_f64 / 0.07) * 100.0).floor() / 100.0;
+        assert!(super::market_buy_usdc(0.152, bad_qty) > 50.0);
+    }
+
+    #[test]
+    fn market_buy_qty_down_clip_stays_within_cap() {
+        let qty = super::market_buy_qty(25.0, 0.584);
+        assert!((super::market_buy_usdc(0.584, qty) - 25.0).abs() < 0.01);
+    }
 
     /// Agent must use the same frozen config as shadow-final / backtest SSOT.
     #[test]

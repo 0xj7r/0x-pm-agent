@@ -26,12 +26,19 @@ async fn main() -> Result<()> {
     let args = pm_shadow::frozen_shadow_final_args(PathBuf::from(&out_dir));
     let arm = Arc::new(Mutex::new(LiveArm::from_env()));
 
+    // Read arm state once. Locking the std Mutex twice in a single statement
+    // (e.g. inside one warn! invocation) deadlocks, because both MutexGuard
+    // temporaries live until the end of the statement.
+    let (live_armed, paper_armed) = {
+        let a = arm.lock().expect("arm");
+        (a.live_trade_armed, a.paper_trade_armed)
+    };
     tracing::warn!(
         out_dir = %out_dir,
         edge = args.edge_threshold,
         perp = args.perp_price_weight,
-        live = arm.lock().expect("arm").live_trade_armed,
-        paper = arm.lock().expect("arm").paper_trade_armed,
+        live = live_armed,
+        paper = paper_armed,
         "shadow_live: SHARED pm-shadow engine"
     );
 
@@ -43,7 +50,7 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        tokio::spawn(run_execution_loop(irx, ctx, arm.clone(), adapter));
+        tokio::spawn(run_execution_loop(irx, ctx, arm.clone(), adapter, None, false));
         (Some(itx), Some(crx))
     } else {
         (None, None)

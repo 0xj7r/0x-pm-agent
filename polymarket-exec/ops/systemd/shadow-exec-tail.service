@@ -1,0 +1,23 @@
+[Unit]
+Description=shadow-final JSONL tail executor (no belief recompute)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/go/polymarket-agent
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+EnvironmentFile=-%h/.config/polymarket-exec/shadow_exec_tail.env
+ExecStart=%h/go/polymarket-agent/target/release/shadow_exec_tail
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shadow-exec-tail
+
+[Install]
+WantedBy=default.target

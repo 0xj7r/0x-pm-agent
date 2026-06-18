@@ -10,6 +10,9 @@ pub mod logging;
 pub mod markets;
 pub mod metrics;
 pub mod shadow_exec;
+pub mod shadow_gamma;
+pub mod shadow_jsonl;
+pub mod shadow_parity;
 pub mod wire;
 
 pub use core::{book, inventory, lot_ledger, market_context, risk, types};

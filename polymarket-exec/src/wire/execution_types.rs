@@ -50,6 +50,10 @@ pub struct SubmitOrderAck {
     pub accepted: bool,
     pub accepted_at_ms: EpochMillis,
     pub venue_message: Option<String>,
+    /// Shares filled (venue `makingAmount` on matched BUY).
+    pub filled_qty: Option<f64>,
+    /// Volume-weighted fill price in [0, 1] (USDC / share).
+    pub avg_fill_price: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
