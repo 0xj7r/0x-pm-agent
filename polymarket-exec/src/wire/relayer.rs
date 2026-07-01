@@ -1,4 +1,4 @@
-//! Polymarket builder-relayer helpers for CTF merge transactions.
+//! Polymarket builder-relayer helpers for CTF split/merge/redeem transactions.
 
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +32,15 @@ const DEFAULT_PROXY_GAS_LIMIT: u64 = 10_000_000;
 const DEFAULT_WALLET_BATCH_DEADLINE_SECS: u64 = 600;
 
 sol! {
+    #[derive(Debug, PartialEq)]
+    function splitPosition(
+        address collateralToken,
+        bytes32 parentCollectionId,
+        bytes32 conditionId,
+        uint256[] partition,
+        uint256 amount
+    );
+
     #[derive(Debug, PartialEq)]
     function mergePositions(
         address collateralToken,
@@ -104,6 +113,15 @@ pub struct CtfRelayerClient {
 
 #[derive(Clone, Debug)]
 pub struct CtfMergeRequest {
+    pub signer: PrivateKeySigner,
+    pub condition_id: String,
+    pub quantity: f64,
+    pub metadata: String,
+}
+
+/// Split pUSD into a full Up+Down set (same shape as merge).
+#[derive(Clone, Debug)]
+pub struct CtfSplitRequest {
     pub signer: PrivateKeySigner,
     pub condition_id: String,
     pub quantity: f64,
@@ -245,6 +263,93 @@ impl CtfRelayerClient {
         }
     }
 
+    pub async fn split_positions(
+        &self,
+        request: CtfSplitRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        match self.config.signature_type_code {
+            1 | 2 => {
+                let from = request.signer.address();
+                let relay_payload = self.relay_payload(from, "PROXY").await?;
+                let body = self
+                    .build_proxy_split_transaction_request(
+                        &request.signer,
+                        relay_payload,
+                        &request.condition_id,
+                        request.quantity,
+                        request.metadata,
+                    )
+                    .await?;
+                self.submit(body).await
+            }
+            3 => self.submit_wallet_split(&request).await,
+            0 => self.submit_eoa_split(&request).await,
+            other => Err(ExecutionError::BadRequest(format!(
+                "CTF relayer split supports POLYMARKET_SIGNATURE_TYPE=0 (EOA), =1 (proxy), =2 (gnosis_safe), or =3 (poly_1271), got {other}",
+            ))),
+        }
+    }
+
+    pub async fn dry_run_split_positions(
+        &self,
+        request: &CtfSplitRequest,
+    ) -> Result<CtfMergeDryRunReport, ExecutionError> {
+        let rpc_url = self.config.polygon_rpc_url.as_ref().ok_or_else(|| {
+            ExecutionError::BadRequest(
+                "CTF split dry-run requires POLYGON_RPC_URL to be configured".to_string(),
+            )
+        })?;
+        let submitter = EoaPolygonSubmitter::from_env(rpc_url.clone());
+        let to = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let from = self.merge_actor_address(&request.signer)?;
+        let calldata = self.split_positions_calldata(&request.condition_id, request.quantity)?;
+        submitter
+            .simulate_call(from, to, Bytes::from(calldata.clone()))
+            .await?;
+        Ok(CtfMergeDryRunReport {
+            from,
+            to,
+            calldata_hex: calldata.encode_hex_with_prefix(),
+        })
+    }
+
+    pub async fn dry_run_split_submission_envelope(
+        &self,
+        request: &CtfSplitRequest,
+    ) -> Result<CtfRelayerEnvelopeDryRunReport, ExecutionError> {
+        match self.config.signature_type_code {
+            3 => {
+                let calldata =
+                    self.split_positions_calldata(&request.condition_id, request.quantity)?;
+                let body = self
+                    .build_wallet_transaction_request(
+                        &request.signer,
+                        vec![wallet_call_request(
+                            &self.config.ctf_contract_address,
+                            Bytes::from(calldata),
+                        )?],
+                        request.metadata.clone(),
+                    )
+                    .await?;
+                Ok(CtfRelayerEnvelopeDryRunReport {
+                    tx_type: body.tx_type,
+                    from: parse_address(&body.from, "dry-run from")?,
+                    to: parse_address(&body.to, "dry-run to")?,
+                    deposit_wallet: Some(parse_address(
+                        &body.deposit_wallet_params.deposit_wallet,
+                        "dry-run deposit wallet",
+                    )?),
+                    nonce: body.nonce,
+                    call_count: body.deposit_wallet_params.calls.len(),
+                    signature_bytes: signature_hex_len_bytes(&body.signature)?,
+                })
+            }
+            other => Err(ExecutionError::BadRequest(format!(
+                "split relayer envelope dry-run is implemented for POLYMARKET_SIGNATURE_TYPE=3 (poly_1271), got {other}",
+            ))),
+        }
+    }
+
     pub async fn merge_positions(
         &self,
         request: CtfMergeRequest,
@@ -365,6 +470,27 @@ impl CtfRelayerClient {
         }
     }
 
+    async fn submit_eoa_split(
+        &self,
+        request: &CtfSplitRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let submitter = self.eoa_submitter.as_ref().ok_or_else(|| {
+            ExecutionError::BadRequest(
+                "EOA mode CTF split requires POLYGON_RPC_URL to be configured".to_string(),
+            )
+        })?;
+        let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let calldata = self.split_positions_calldata(&request.condition_id, request.quantity)?;
+        let tx_hash = submitter
+            .submit_call(&request.signer, ctf, Bytes::from(calldata))
+            .await?;
+        Ok(RelayerSubmitAck {
+            transaction_id: None,
+            state: Some("MINED".to_string()),
+            transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
+        })
+    }
+
     async fn submit_eoa_merge(
         &self,
         request: &CtfMergeRequest,
@@ -420,6 +546,24 @@ impl CtfRelayerClient {
             state: Some("MINED".to_string()),
             transaction_hash: Some(tx_hash.encode_hex_with_prefix()),
         })
+    }
+
+    async fn submit_wallet_split(
+        &self,
+        request: &CtfSplitRequest,
+    ) -> Result<RelayerSubmitAck, ExecutionError> {
+        let calldata = self.split_positions_calldata(&request.condition_id, request.quantity)?;
+        let body = self
+            .build_wallet_transaction_request(
+                &request.signer,
+                vec![wallet_call_request(
+                    &self.config.ctf_contract_address,
+                    Bytes::from(calldata),
+                )?],
+                request.metadata.clone(),
+            )
+            .await?;
+        self.submit(body).await
     }
 
     async fn submit_wallet_merge(
@@ -618,6 +762,64 @@ impl CtfRelayerClient {
         })
     }
 
+    async fn build_proxy_split_transaction_request(
+        &self,
+        signer: &PrivateKeySigner,
+        relay_payload: RelayPayload,
+        condition_id_raw: &str,
+        quantity: f64,
+        metadata: String,
+    ) -> Result<TransactionRequest, ExecutionError> {
+        let from = signer.address();
+        let relay = parse_address(&relay_payload.address, "relayer relay address")?;
+        let nonce = relay_payload.nonce;
+        let ctf = parse_address(&self.config.ctf_contract_address, "CTF contract")?;
+        let split_data = self.split_positions_calldata(condition_id_raw, quantity)?;
+        let proxy_data = proxyCall {
+            transactions: vec![ProxyTransactionCall {
+                to: ctf,
+                typeCode: 1,
+                data: Bytes::from(split_data),
+                value: U256::ZERO,
+            }],
+        }
+        .abi_encode();
+        let proxy_data_hex = proxy_data.encode_hex_with_prefix();
+        let tx_hash = proxy_relay_hash(
+            from,
+            POLYMARKET_PROXY_FACTORY,
+            &proxy_data,
+            &nonce,
+            POLYMARKET_RELAY_HUB,
+            relay,
+        )?;
+        let signature = signer
+            .sign_message(tx_hash.as_slice())
+            .await
+            .map_err(|error| {
+                ExecutionError::AuthFailure(format!("failed to sign CTF proxy split: {error}"))
+            })?
+            .to_string();
+
+        Ok(TransactionRequest {
+            tx_type: "PROXY".to_string(),
+            from: from.to_string(),
+            to: POLYMARKET_PROXY_FACTORY.to_string(),
+            proxy_wallet: self.proxy_wallet(from)?.to_string(),
+            data: proxy_data_hex,
+            nonce,
+            signature,
+            signature_params: ProxySignatureParams {
+                gas_price: "0".to_string(),
+                gas_limit: DEFAULT_PROXY_GAS_LIMIT.to_string(),
+                relayer_fee: "0".to_string(),
+                relay_hub: POLYMARKET_RELAY_HUB.to_string(),
+                relay: relay.to_string(),
+            },
+            metadata,
+        })
+    }
+
     async fn build_proxy_merge_transaction_request(
         &self,
         signer: &PrivateKeySigner,
@@ -753,6 +955,24 @@ impl CtfRelayerClient {
             parentCollectionId: B256::ZERO,
             conditionId: condition_id,
             indexSets: index_sets_u256,
+        }
+        .abi_encode())
+    }
+
+    fn split_positions_calldata(
+        &self,
+        condition_id_raw: &str,
+        quantity: f64,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        let collateral = parse_address(&self.config.collateral_token_address, "collateral token")?;
+        let condition_id = parse_b256(condition_id_raw, "condition id")?;
+        let amount = scaled_token_amount(quantity, self.config.collateral_decimals)?;
+        Ok(splitPositionCall {
+            collateralToken: collateral,
+            parentCollectionId: B256::ZERO,
+            conditionId: condition_id,
+            partition: vec![U256::from(1_u8), U256::from(2_u8)],
+            amount,
         }
         .abi_encode())
     }
@@ -1163,6 +1383,28 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(decoded.indexSets, vec![U256::from(1_u8), U256::from(2_u8)]);
+    }
+
+    #[test]
+    fn split_calldata_uses_configured_ctf_collateral_token() {
+        let mut config = test_config();
+        config.collateral_token_address = DEFAULT_PUSD_ADDRESS.to_string();
+        let client = CtfRelayerClient::new(config);
+        let calldata = client
+            .split_positions_calldata(
+                "0xf3eb9227564ea848dc5d95a577c06e11b67d3223046ff2decf53c63144d14908",
+                1111.0,
+            )
+            .expect("split calldata");
+        let decoded =
+            splitPositionCall::abi_decode(&calldata).expect("generated calldata decodes");
+
+        assert_eq!(
+            decoded.collateralToken,
+            Address::from_str(DEFAULT_PUSD_ADDRESS).unwrap()
+        );
+        assert_eq!(decoded.amount, U256::from(1_111_000_000_u64));
+        assert_eq!(decoded.partition, vec![U256::from(1_u8), U256::from(2_u8)]);
     }
 
     #[test]

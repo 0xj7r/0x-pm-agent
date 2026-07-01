@@ -68,3 +68,15 @@ path = "src/bin/shadow_exec_tail.rs"
 [[bin]]
 name = "balance_once"
 path = "src/bin/balance_once.rs"
+
+[[bin]]
+name = "merge_once"
+path = "src/bin/merge_once.rs"
+
+[[bin]]
+name = "redeem_once"
+path = "src/bin/redeem_once.rs"
+
+[[bin]]
+name = "split_once"
+path = "src/bin/split_once.rs"
