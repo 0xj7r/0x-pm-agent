@@ -57,6 +57,39 @@ fn env_first(names: &[&str]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Venue cash snapshot for fractional clip sizing. Refreshed from
+/// `sync_balances` in the execution loop; stale reads size DOWN (see
+/// [`effective_clip_usd`]).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BalanceCache {
+    pub cash_usd: Option<f64>,
+    pub fetched_at_s: i64,
+}
+
+const BALANCE_REFRESH_S: i64 = 300;
+const BALANCE_STALE_S: i64 = 1800;
+
+/// Clip sizing invariant: automation may only REDUCE size, never increase it.
+/// The env clip (PM_SHADOW_CLIP_USD / PM_FADE_CLIP_USD) is a hard ceiling.
+/// With PM_SHADOW_CLIP_FRAC set, the clip is frac x venue cash, capped by the
+/// ceiling; if the balance is unknown or stale past 30min, fall back to the
+/// SMALLER of the ceiling and $10 rather than trading blind at full size.
+fn effective_clip_usd(cache: &BalanceCache, now_s: i64) -> f64 {
+    let ceiling = env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0);
+    let frac = env_positive_f64(&["PM_SHADOW_CLIP_FRAC"]);
+    clip_from_parts(ceiling, frac, cache, now_s)
+}
+
+fn clip_from_parts(ceiling: f64, frac: Option<f64>, cache: &BalanceCache, now_s: i64) -> f64 {
+    let Some(frac) = frac else {
+        return ceiling;
+    };
+    match cache.cash_usd {
+        Some(cash) if now_s - cache.fetched_at_s <= BALANCE_STALE_S => (frac * cash).min(ceiling),
+        _ => ceiling.min(10.0),
+    }
+}
+
 async fn poll_venue_fill(
     adapter: &PolymarketExecutionAdapter,
     ack: &SubmitOrderAck,
@@ -360,6 +393,8 @@ pub async fn run_execution_loop(
     let ledger = Arc::new(Mutex::new(RedeemLedger::load()));
     let mut redeem_tick = tokio::time::interval(Duration::from_secs(1));
     let mut parity_tick = tokio::time::interval(Duration::from_secs(1));
+    let mut balance = BalanceCache::default();
+    let mut balance_tick = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
@@ -373,11 +408,29 @@ pub async fn run_execution_loop(
                     &ledger,
                     parity.as_ref(),
                     paper_mode,
+                    &balance,
                 )
                 .await;
             }
             _ = redeem_tick.tick() => {
                 redeem_sweep(&arm, adapter.as_deref(), &ledger, now_unix_ms() / 1000).await;
+            }
+            _ = balance_tick.tick() => {
+                let now_s = now_unix_ms() / 1000;
+                if now_s - balance.fetched_at_s >= BALANCE_REFRESH_S {
+                    if let Some(a) = adapter.as_deref() {
+                        match a.sync_balances().await {
+                            Ok(b) => {
+                                balance = BalanceCache { cash_usd: Some(b.cash_usd), fetched_at_s: now_s };
+                                info!(target: "shadow_live", cash_usd = b.cash_usd, "balance refresh");
+                            }
+                            Err(e) => {
+                                warn!(target: "shadow_live", error = %e, "balance refresh failed");
+                                balance.fetched_at_s = now_s - BALANCE_REFRESH_S + 60;
+                            }
+                        }
+                    }
+                }
             }
             _ = parity_tick.tick() => {
                 if let Some(gate) = parity.as_ref() {
@@ -399,6 +452,7 @@ async fn handle_intent(
     ledger: &Arc<Mutex<RedeemLedger>>,
     parity: Option<&SharedParityGate>,
     paper_mode: bool,
+    balance: &BalanceCache,
 ) {
     info!(
         target: "shadow_live",
@@ -414,7 +468,7 @@ async fn handle_intent(
         "shadow WOULD_ENTER"
     );
 
-    let clip_usd = env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0);
+    let clip_usd = effective_clip_usd(balance, now_unix_ms() / 1000);
     let capped = {
         let mut a = arm.lock().expect("arm poisoned");
         // Paper parity audits must run with fade.kill in place; only block live money.
@@ -710,5 +764,25 @@ mod tests {
         assert!(!args.lane_late_fav);
         assert_eq!(args.enter_within_close_s, 0);
         assert_eq!(args.latency_probe_ms, 150);
+    }
+
+    #[test]
+    fn clip_sizing_only_reduces_never_increases() {
+        let fresh = super::BalanceCache { cash_usd: Some(1000.0), fetched_at_s: 1000 };
+        // No fraction configured: ceiling passes through.
+        assert_eq!(super::clip_from_parts(15.0, None, &fresh, 1000), 15.0);
+        // Fractional sizing below the ceiling.
+        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &fresh, 1000), 10.0);
+        // Fraction can never exceed the ceiling even with a big balance.
+        let rich = super::BalanceCache { cash_usd: Some(1_000_000.0), fetched_at_s: 1000 };
+        assert_eq!(super::clip_from_parts(15.0, Some(0.01), &rich, 1000), 15.0);
+        // Unknown balance with fraction configured: conservative floor, not the ceiling.
+        let unknown = super::BalanceCache::default();
+        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &unknown, 1000), 10.0);
+        // Stale balance (>30min) also sizes down.
+        let stale = super::BalanceCache { cash_usd: Some(1000.0), fetched_at_s: 0 };
+        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &stale, 2000), 10.0);
+        // Ceiling below the $10 fallback stays authoritative.
+        assert_eq!(super::clip_from_parts(5.0, Some(0.01), &unknown, 1000), 5.0);
     }
 }
