@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
     shadow_args.open_fav_ask_max = 0.62;
     shadow_args.open_fav_secs = 300;
     shadow_args.slug_prefix = args.slug_prefix.clone();
+    shadow_args.decide_interval_ms = args.decide_interval_ms;
 
     let arm = Arc::new(Mutex::new(LiveArm::from_env()));
     // Read arm state once: locking the std Mutex twice in one statement
