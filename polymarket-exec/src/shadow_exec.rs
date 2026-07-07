@@ -494,9 +494,14 @@ async fn handle_intent(
     };
 
     if capped <= 0.0 {
+        // Deterministic rejection (caps exhausted): report filled=true so the
+        // deferred entry state COMMITS and the engine stops re-emitting this
+        // intent every decide tick. filled=false is reserved for transient
+        // venue misses where a retry can succeed.
+        warn!(slug = %intent.slug, "notional cap exhausted; consuming intent");
         let _ = commit_tx.send(EntryCommit {
             slug: intent.slug.clone(),
-            filled: false,
+            filled: true,
         });
         return;
     }

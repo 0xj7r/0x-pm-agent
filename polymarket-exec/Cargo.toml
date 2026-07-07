@@ -66,6 +66,10 @@ name = "shadow_exec_tail"
 path = "src/bin/shadow_exec_tail.rs"
 
 [[bin]]
+name = "fast_live"
+path = "src/bin/fast_live.rs"
+
+[[bin]]
 name = "balance_once"
 path = "src/bin/balance_once.rs"
 
