@@ -30,6 +30,12 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     decide_interval_ms: u64,
 
+    /// Evaluate decisions on the next poll tick after any input event,
+    /// floored by 20ms spacing; decide-interval-ms becomes the fallback
+    /// heartbeat.
+    #[arg(long)]
+    decide_on_event: bool,
+
     /// Force paper mode: log SUBMITTED without sending real orders.
     /// Paper is also the default whenever --live is absent or unarmed.
     #[arg(long)]
@@ -63,6 +69,7 @@ async fn main() -> Result<()> {
     shadow_args.open_fav_secs = 300;
     shadow_args.slug_prefix = args.slug_prefix.clone();
     shadow_args.decide_interval_ms = args.decide_interval_ms;
+    shadow_args.decide_on_event = args.decide_on_event;
 
     let arm = Arc::new(Mutex::new(LiveArm::from_env()));
     // Read arm state once: locking the std Mutex twice in one statement
@@ -84,6 +91,7 @@ async fn main() -> Result<()> {
     tracing::warn!(
         mode = if paper_mode { "PAPER" } else { "LIVE" },
         decide_interval_ms = args.decide_interval_ms,
+        decide_on_event = args.decide_on_event,
         out_dir = %args.out_dir.display(),
         slug_prefix = %args.slug_prefix,
         live = live_armed,
