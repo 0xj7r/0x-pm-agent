@@ -74,18 +74,34 @@ const BALANCE_STALE_S: i64 = 1800;
 /// With PM_SHADOW_CLIP_FRAC set, the clip is frac x venue cash, capped by the
 /// ceiling; if the balance is unknown or stale past 30min, fall back to the
 /// SMALLER of the ceiling and $10 rather than trading blind at full size.
+/// PM_SHADOW_CLIP_CEIL_FRAC (optional) lifts the ceiling with equity so the
+/// fractional clip is not flattened once frac x cash exceeds the fixed floor;
+/// the floor stays authoritative for small/stale balances.
 fn effective_clip_usd(cache: &BalanceCache, now_s: i64) -> f64 {
     let ceiling = env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0);
+    let ceil_frac = env_positive_f64(&["PM_SHADOW_CLIP_CEIL_FRAC"]);
     let frac = env_positive_f64(&["PM_SHADOW_CLIP_FRAC"]);
-    clip_from_parts(ceiling, frac, cache, now_s)
+    clip_from_parts(ceiling, ceil_frac, frac, cache, now_s)
 }
 
-fn clip_from_parts(ceiling: f64, frac: Option<f64>, cache: &BalanceCache, now_s: i64) -> f64 {
+fn clip_from_parts(
+    ceiling: f64,
+    ceil_frac: Option<f64>,
+    frac: Option<f64>,
+    cache: &BalanceCache,
+    now_s: i64,
+) -> f64 {
     let Some(frac) = frac else {
         return ceiling;
     };
     match cache.cash_usd {
-        Some(cash) if now_s - cache.fetched_at_s <= BALANCE_STALE_S => (frac * cash).min(ceiling),
+        Some(cash) if now_s - cache.fetched_at_s <= BALANCE_STALE_S => {
+            let effective_ceiling = match ceil_frac {
+                Some(cf) => ceiling.max(cf * cash),
+                None => ceiling,
+            };
+            (frac * cash).min(effective_ceiling)
+        }
         _ => ceiling.min(10.0),
     }
 }
@@ -775,19 +791,30 @@ mod tests {
     fn clip_sizing_only_reduces_never_increases() {
         let fresh = super::BalanceCache { cash_usd: Some(1000.0), fetched_at_s: 1000 };
         // No fraction configured: ceiling passes through.
-        assert_eq!(super::clip_from_parts(15.0, None, &fresh, 1000), 15.0);
+        assert_eq!(super::clip_from_parts(15.0, None, None, &fresh, 1000), 15.0);
         // Fractional sizing below the ceiling.
-        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &fresh, 1000), 10.0);
+        assert_eq!(super::clip_from_parts(50.0, None, Some(0.01), &fresh, 1000), 10.0);
         // Fraction can never exceed the ceiling even with a big balance.
         let rich = super::BalanceCache { cash_usd: Some(1_000_000.0), fetched_at_s: 1000 };
-        assert_eq!(super::clip_from_parts(15.0, Some(0.01), &rich, 1000), 15.0);
+        assert_eq!(super::clip_from_parts(15.0, None, Some(0.01), &rich, 1000), 15.0);
         // Unknown balance with fraction configured: conservative floor, not the ceiling.
         let unknown = super::BalanceCache::default();
-        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &unknown, 1000), 10.0);
+        assert_eq!(super::clip_from_parts(50.0, None, Some(0.01), &unknown, 1000), 10.0);
         // Stale balance (>30min) also sizes down.
         let stale = super::BalanceCache { cash_usd: Some(1000.0), fetched_at_s: 0 };
-        assert_eq!(super::clip_from_parts(50.0, Some(0.01), &stale, 2000), 10.0);
+        assert_eq!(super::clip_from_parts(50.0, None, Some(0.01), &stale, 2000), 10.0);
         // Ceiling below the $10 fallback stays authoritative.
-        assert_eq!(super::clip_from_parts(5.0, Some(0.01), &unknown, 1000), 5.0);
+        assert_eq!(super::clip_from_parts(5.0, None, Some(0.01), &unknown, 1000), 5.0);
+        // ceil_frac unset => byte-identical to today: fixed floor wins.
+        let big = super::BalanceCache { cash_usd: Some(5000.0), fetched_at_s: 1000 };
+        assert_eq!(super::clip_from_parts(10.0, None, Some(0.0075), &big, 1000), 10.0);
+        // ceil_frac lifts the ceiling with equity so sizing stays fractional.
+        assert_eq!(super::clip_from_parts(10.0, Some(0.012), Some(0.0075), &big, 1000), 37.5);
+        // Fixed floor still wins for small accounts.
+        let small = super::BalanceCache { cash_usd: Some(850.0), fetched_at_s: 1000 };
+        assert_eq!(super::clip_from_parts(10.0, Some(0.012), Some(0.0075), &small, 1000), 6.375);
+        // Stale/unknown balance ignores ceil_frac and falls back to the floor.
+        assert_eq!(super::clip_from_parts(50.0, Some(0.012), Some(0.01), &unknown, 1000), 10.0);
+        assert_eq!(super::clip_from_parts(50.0, Some(0.012), Some(0.01), &stale, 2000), 10.0);
     }
 }
