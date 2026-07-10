@@ -324,6 +324,39 @@ impl LiveArm {
     }
 }
 
+/// Startup executor env fingerprint: the RESOLVED sizing/arming values the
+/// execution loop will actually use. Values only, from a fixed allowlist;
+/// nothing matching KEY/SECRET/TOKEN/PRIVATE is ever serialized.
+pub fn exec_env_fingerprint(arm: &LiveArm, paper_mode: bool) -> serde_json::Value {
+    exec_env_json(
+        env_positive_f64(&["PM_SHADOW_CLIP_FRAC"]),
+        env_positive_f64(&["PM_SHADOW_CLIP_CEIL_FRAC"]),
+        env_positive_f64(&["PM_SHADOW_CLIP_USD", "PM_FADE_CLIP_USD"]).unwrap_or(15.0),
+        paper_mode,
+        arm,
+    )
+}
+
+fn exec_env_json(
+    clip_frac: Option<f64>,
+    clip_ceil_frac: Option<f64>,
+    clip_usd_ceiling: f64,
+    paper_mode: bool,
+    arm: &LiveArm,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "exec_env",
+        "clip_frac": clip_frac,
+        "clip_ceil_frac": clip_ceil_frac,
+        "clip_usd_ceiling": clip_usd_ceiling,
+        "paper_mode": paper_mode,
+        "live_trade_armed": arm.live_trade_armed,
+        "max_order_notional": arm.max_order_notional_usd,
+        "max_market_notional": arm.max_market_notional_usd,
+        "kill_path": arm.kill_switch_path.as_ref().map(|p| p.display().to_string()),
+    })
+}
+
 /// V2 FAK/IOC buys spend `limit_price * quantity` USDC on the market-order path.
 /// Size shares off the limit (not touch) so venue spend matches the capped clip.
 fn market_buy_qty(capped_usd: f64, limit_price: f64) -> f64 {
@@ -749,6 +782,38 @@ mod tests {
 
     use pm_alpha::frozen_fade_decide_config;
     use pm_shadow::frozen_shadow_final_args;
+
+    #[test]
+    fn exec_env_fingerprint_shape_and_no_secret_keys() {
+        let arm = super::LiveArm {
+            live_trade_armed: false,
+            paper_trade_armed: true,
+            max_order_notional_usd: 40.0,
+            max_market_notional_usd: 80.0,
+            kill_switch_path: Some(PathBuf::from("/srv/fade.kill")),
+            submitted_by_market: std::collections::HashMap::new(),
+        };
+        let v = super::exec_env_json(Some(0.014), Some(0.05), 15.0, true, &arm);
+        assert_eq!(v["type"], "exec_env");
+        assert_eq!(v["clip_frac"], 0.014);
+        assert_eq!(v["clip_ceil_frac"], 0.05);
+        assert_eq!(v["clip_usd_ceiling"], 15.0);
+        assert_eq!(v["paper_mode"], true);
+        assert_eq!(v["live_trade_armed"], false);
+        assert_eq!(v["max_order_notional"], 40.0);
+        assert_eq!(v["max_market_notional"], 80.0);
+        assert_eq!(v["kill_path"], "/srv/fade.kill");
+        for key in v.as_object().expect("object").keys() {
+            let upper = key.to_ascii_uppercase();
+            for banned in ["KEY", "SECRET", "TOKEN", "PRIVATE"] {
+                assert!(!upper.contains(banned), "leaky key name: {key}");
+            }
+        }
+        // Unset optional values serialize as null, never as absent keys.
+        let v = super::exec_env_json(None, None, 15.0, true, &arm);
+        assert!(v["clip_frac"].is_null());
+        assert!(v["clip_ceil_frac"].is_null());
+    }
 
     #[test]
     fn market_buy_qty_caps_usdc_at_limit_not_touch() {

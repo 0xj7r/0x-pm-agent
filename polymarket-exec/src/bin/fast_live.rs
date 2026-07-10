@@ -11,12 +11,50 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use clap::Parser;
-use polymarket_exec::shadow_exec::{connect_live_adapter, run_execution_loop, LiveArm};
+use clap::{Parser, ValueEnum};
+use polymarket_exec::shadow_exec::{
+    connect_live_adapter, exec_env_fingerprint, run_execution_loop, LiveArm,
+};
+
+/// Named engine config profile. The full decide config comes from the
+/// pm-shadow SSOT builders; nothing strategy-shaped is compiled in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Profile {
+    /// Frozen leading config (ungated), validated backtest + shadow-final.
+    Frozen,
+    /// Frozen + validated live gate package (mom30 / lottery floor /
+    /// prod_gap_full).
+    Gated,
+    /// Current backtest-recommended config from the backtest repo SSOT.
+    Recommended,
+}
+
+impl Profile {
+    fn shadow_args(self, out_dir: PathBuf) -> pm_shadow::ShadowArgs {
+        match self {
+            Self::Frozen => pm_shadow::frozen_shadow_final_args(out_dir),
+            Self::Gated => pm_shadow::gated_shadow_final_args(out_dir),
+            Self::Recommended => pm_shadow::recommended_shadow_final_args(out_dir),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Frozen => "frozen",
+            Self::Gated => "gated",
+            Self::Recommended => "recommended",
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "fast_live")]
 struct Args {
+    /// Engine config profile (required: the config is chosen at launch,
+    /// never compiled in).
+    #[arg(long, value_enum)]
+    profile: Profile,
+
     /// Shadow JSONL output directory.
     #[arg(long)]
     out_dir: PathBuf,
@@ -58,15 +96,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Frozen config + the validated live gate package, matching
-    // scripts/shadow_final_gated_flags.sh (== pm_shadow::gated_shadow_final_args).
-    let mut shadow_args = pm_shadow::frozen_shadow_final_args(args.out_dir.clone());
-    shadow_args.skip_spot_misalign_s = 30;
-    shadow_args.min_entry_ask = 0.45;
-    shadow_args.skip_open_fav_gap = true;
-    shadow_args.open_fav_p_min = 0.88;
-    shadow_args.open_fav_ask_max = 0.62;
-    shadow_args.open_fav_secs = 300;
+    // Full decide config from the pm-shadow SSOT profile builder; only
+    // runtime plumbing (out_dir / slug / cadence) is applied on top.
+    let mut shadow_args = args.profile.shadow_args(args.out_dir.clone());
     shadow_args.slug_prefix = args.slug_prefix.clone();
     shadow_args.decide_interval_ms = args.decide_interval_ms;
     shadow_args.decide_on_event = args.decide_on_event;
@@ -90,6 +122,7 @@ async fn main() -> Result<()> {
 
     tracing::warn!(
         mode = if paper_mode { "PAPER" } else { "LIVE" },
+        profile = args.profile.name(),
         decide_interval_ms = args.decide_interval_ms,
         decide_on_event = args.decide_on_event,
         out_dir = %args.out_dir.display(),
@@ -98,6 +131,14 @@ async fn main() -> Result<()> {
         paper = paper_armed,
         "fast_live: in-process pm-shadow engine + execution (no tail hop)"
     );
+
+    // Executor env fingerprint: resolved sizing/arming values, one JSON line.
+    // The engine emits the matching decide-config event as the first JSONL
+    // record via run_shadow_with_sink.
+    {
+        let a = arm.lock().expect("arm");
+        println!("{}", exec_env_fingerprint(&a, paper_mode));
+    }
 
     let (intent_tx, intent_rx) = tokio::sync::mpsc::unbounded_channel();
     let (commit_tx, commit_rx) = tokio::sync::mpsc::unbounded_channel();
